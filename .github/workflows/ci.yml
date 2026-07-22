@@ -19,6 +19,8 @@ jobs:
     runs-on: tinyland-nix
     timeout-minutes: 15
     env:
+      # GF #ci exposes its pinned Bazelisk shim under the compatibility name.
+      BAZEL_BIN: bazel
       # Pull requests are cache-read-only. Only the trusted main push may
       # publish Bazel action results; tag verification remains read-only.
       GF_BAZEL_REMOTE_UPLOAD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}

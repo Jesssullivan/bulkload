@@ -60,6 +60,8 @@ def validate_workflow(workflow: str) -> None:
     flake = "github:tinyland-inc/GloriousFlywheel/" + GF_REV + "#ci"
     if action not in workflow or flake not in workflow:
         raise ContractError("GloriousFlywheel action and devshell must share one pin")
+    if re.search(r"(?m)^\s+BAZEL_BIN:\s*bazel\s*$", workflow) is None:
+        raise ContractError("CI must select the Bazel shim exposed by GF #ci")
     if 'push-cache: "false"' not in workflow:
         raise ContractError("Attic publication must remain disabled")
     upload_gate = (
@@ -120,6 +122,7 @@ class CiContractTest(unittest.TestCase):
                 "'refs/heads/main' && 'true' || 'false' }}",
                 "true",
             ),
+            self.workflow.replace("BAZEL_BIN: bazel", "BAZEL_BIN: bazelisk"),
         ]
         for unsafe in unsafe_variants:
             with self.assertRaises(ContractError):
