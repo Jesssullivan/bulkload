@@ -1,0 +1,4 @@
+common --enable_bzlmod
+build --announce_rc
+test --test_output=errors
+test --incompatible_strict_action_env

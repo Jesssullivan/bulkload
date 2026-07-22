@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Bazel contract and fixture tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan committed history for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - name: Evaluate pinned development shell
+        run: nix flake check --no-build --no-write-lock-file
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - name: Build canonical skill executable
+        run: bazel build //:bulkload
+      - name: Validate checked-out skill bundle
+        run: python3 scripts/validate_skill.py --self-test .agents/skills/bulkload
+      - name: Lint Python
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+        with:
+          version: "0.15.22"
+          args: check
+          src: >-
+            .agents/skills/bulkload/scripts/**/*.py
+            scripts/**/*.py
+            tests/**/*.py
+      - name: Check Python formatting
+        run: ruff format --check .agents/skills/bulkload/scripts scripts tests
+      - name: Lint shell
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+        with:
+          scandir: ./scripts
+      - name: Run contracts and end-to-end fixtures
+        run: bazel test //:tests
