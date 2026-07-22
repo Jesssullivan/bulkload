@@ -63,6 +63,23 @@ py_test(
     ],
 )
 
+py_test(
+    name = "ci_contract_test",
+    legacy_create_init = 0,
+    main = "tests/test_ci_contract.py",
+    size = "small",
+    srcs = ["tests/test_ci_contract.py"],
+    data = [
+        ".bazelrc",
+        ".bazelrc.flywheel",
+        ".github/actionlint.yaml",
+        ".github/workflows/ci.yml",
+        "justfile",
+        "justfile.flywheel",
+        "tinyland.repo.json",
+    ],
+)
+
 filegroup(
     name = "skill_bundle",
     srcs = glob([".agents/skills/bulkload/**"]),
@@ -73,6 +90,7 @@ test_suite(
     name = "tests",
     tests = [
         ":bulkload_tests",
+        ":ci_contract_test",
         ":installer_test",
         ":repo_contract_test",
         ":skill_contract_test",

@@ -1,4 +1,5 @@
 /.direnv/
+/.env.flywheel.local
 /.bulkload/
 /bazel-*
 /build/

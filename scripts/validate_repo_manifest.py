@@ -23,7 +23,16 @@ def validate(value: Any) -> None:
     if not isinstance(value, dict):
         raise ContractError("manifest root must be an object")
     require_keys(
-        value, {"schema_version", "repo", "taxonomy", "contracts", "boundaries"}, "root"
+        value,
+        {
+            "schema_version",
+            "repo",
+            "taxonomy",
+            "contracts",
+            "enrollment",
+            "boundaries",
+        },
+        "root",
     )
     if value["schema_version"] != 1:
         raise ContractError("schema_version must be 1")
@@ -39,8 +48,23 @@ def validate(value: Any) -> None:
         raise ContractError("taxonomy layers must be non-empty")
     contracts = value["contracts"]
     require_keys(
-        contracts, {"agent", "operator", "build", "design", "skill"}, "contracts"
+        contracts,
+        {"agent", "operator", "build", "ci", "design", "flywheel", "skill"},
+        "contracts",
     )
+    if contracts["ci"] != ".github/workflows/ci.yml":
+        raise ContractError("CI contract path drift")
+    if contracts["flywheel"] != "justfile.flywheel":
+        raise ContractError("Flywheel contract path drift")
+    enrollment = value["enrollment"]
+    required_enrollment = {
+        "forgeScope": "Jesssullivan",
+        "operatorOverlay": "jesssullivan-infra",
+        "executionPool": "tinyland-nix",
+        "substrateMode": "shared-cache-backed",
+    }
+    if enrollment != required_enrollment:
+        raise ContractError("GloriousFlywheel enrollment drift")
     boundaries = value["boundaries"]
     required_boundaries = {
         "default_read_only": True,
@@ -67,8 +91,16 @@ def self_test() -> None:
             "agent": "a",
             "operator": "o",
             "build": "b",
+            "ci": ".github/workflows/ci.yml",
             "design": "d",
+            "flywheel": "justfile.flywheel",
             "skill": "s",
+        },
+        "enrollment": {
+            "forgeScope": "Jesssullivan",
+            "operatorOverlay": "jesssullivan-infra",
+            "executionPool": "tinyland-nix",
+            "substrateMode": "shared-cache-backed",
         },
         "boundaries": {
             "default_read_only": True,
@@ -85,8 +117,16 @@ def self_test() -> None:
     try:
         validate(invalid)
     except ContractError:
+        pass
+    else:
+        raise AssertionError("invalid boundary was accepted")
+    invalid = json.loads(json.dumps(valid))
+    invalid["enrollment"]["executionPool"] = "ubuntu-latest"
+    try:
+        validate(invalid)
+    except ContractError:
         return
-    raise AssertionError("invalid boundary was accepted")
+    raise AssertionError("invalid enrollment was accepted")
 
 
 def main() -> int:

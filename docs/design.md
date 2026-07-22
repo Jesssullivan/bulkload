@@ -325,7 +325,12 @@ remain blockers or follow-up work.
 
 - `.agents/skills/bulkload/`: canonical portable skill and executable Python.
 - `BUILD.bazel`: build/test SSOT for the exact skill code.
-- `justfile`: human and agent entrypoint; delegates build/test to Bazel.
+- `justfile`: human and agent entrypoint; delegates normal build/test to the
+  GloriousFlywheel wrapper.
+- `justfile.flywheel` and `.bazelrc.flywheel`: generated, endpoint-free
+  GloriousFlywheel front-door kit pinned by CI to an immutable core revision.
+- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation; no
+  hosted or dynamic runner fallback.
 - `scripts/install-skill.sh`: atomic user-scope installation.
 - `tests/`: deterministic fixture tests for catalogs, barriers, plans, apply,
   verification, traversal rejection, and installer behavior.
@@ -345,7 +350,7 @@ Included:
 6. NUL allowlist export for reviewed rsync transport.
 7. Independent verification.
 8. Portable Agent Skill and authenticated one-line private install.
-9. Bazel tests and CI.
+9. Bazel tests on the sanctioned GloriousFlywheel cache-first ARC path.
 
 Deferred:
 

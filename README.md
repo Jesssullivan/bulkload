@@ -24,10 +24,23 @@ Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
 For development:
 
 ```bash
-nix develop
+nix develop github:tinyland-inc/GloriousFlywheel/ba391f344d71bff4ee902ed8d9928b98546d5f06#ci
+just flywheel-doctor
+just flywheel-verify
 just check
 just demo
 ```
+
+The normal build/test path is attached to GloriousFlywheel and fails closed if
+the fleet profile is missing or contradictory. CI uses only the on-prem
+`tinyland-nix` capability-class ARC pool, the endpoint-free front-door kit, and
+the canonical `gloriousflywheel-bazel` wrapper. Pull requests cannot upload
+Bazel results; trusted `main` pushes may warm the shared cache. A cache hit is
+cache evidence, not proof of REAPI remote execution.
+
+For a source-only check on an intentionally unattached machine, run
+`nix develop --command just check-local`. That fallback is not CI or enrollment
+evidence and must never replace the shared runner path.
 
 The protocol is in [docs/design.md](docs/design.md), and the dated real-world
 evidence is in [docs/neo-sting-retrospective.md](docs/neo-sting-retrospective.md).
