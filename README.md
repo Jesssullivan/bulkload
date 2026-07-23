@@ -27,7 +27,7 @@ Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
 For development:
 
 ```bash
-nix develop github:tinyland-inc/GloriousFlywheel/ba391f344d71bff4ee902ed8d9928b98546d5f06#ci
+nix develop github:tinyland-inc/GloriousFlywheel/eb50ca7da6cce315867de963bef2184cfd924b26#ci
 just flywheel-doctor
 just flywheel-verify
 just check

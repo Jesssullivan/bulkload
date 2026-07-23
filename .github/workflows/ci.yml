@@ -38,10 +38,10 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: GloriousFlywheel cache-first validation
-        uses: tinyland-inc/GloriousFlywheel/.github/actions/nix-job@ba391f344d71bff4ee902ed8d9928b98546d5f06
+        uses: tinyland-inc/GloriousFlywheel/.github/actions/nix-job@eb50ca7da6cce315867de963bef2184cfd924b26
         with:
           push-cache: "false"
           command: |
             test -n "${BAZEL_REMOTE_CACHE:-}"
             test "${GF_BAZEL_SUBSTRATE_MODE:-}" = shared-cache-backed
-            nix develop github:tinyland-inc/GloriousFlywheel/ba391f344d71bff4ee902ed8d9928b98546d5f06#ci -c just ci
+            nix develop github:tinyland-inc/GloriousFlywheel/eb50ca7da6cce315867de963bef2184cfd924b26#ci -c just ci

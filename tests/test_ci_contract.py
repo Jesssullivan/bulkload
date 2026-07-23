@@ -9,7 +9,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 
-GF_REV = "ba391f344d71bff4ee902ed8d9928b98546d5f06"
+GF_REV = "eb50ca7da6cce315867de963bef2184cfd924b26"
 CHECKOUT_REV = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 EXPECTED_SHA_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
