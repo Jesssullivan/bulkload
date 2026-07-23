@@ -28,6 +28,39 @@ from .model import (
 
 DEFAULT_MAX_FILES = 250_000
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024 * 1024
+MAX_RECOVERY_AUTHORITY_BYTES = 64 * 1024 * 1024
+MAX_RECOVERY_CANDIDATES = 4_096
+MAX_RECOVERY_REFLOGS = 4_096
+PSEUDO_REF_NAMES = (
+    "AUTO_MERGE",
+    "BISECT_HEAD",
+    "CHERRY_PICK_HEAD",
+    "FETCH_HEAD",
+    "MERGE_HEAD",
+    "ORIG_HEAD",
+    "REBASE_HEAD",
+    "REVERT_HEAD",
+)
+GIT_OPERATION_MARKERS = (
+    ("bisect", "BISECT_ANCESTORS_OK"),
+    ("bisect", "BISECT_EXPECTED_REV"),
+    ("bisect", "BISECT_HEAD"),
+    ("bisect", "BISECT_LOG"),
+    ("bisect", "BISECT_NAMES"),
+    ("bisect", "BISECT_START"),
+    ("bisect", "BISECT_TERMS"),
+    ("bisect", "refs/bisect"),
+    ("cherry-pick", "CHERRY_PICK_HEAD"),
+    ("merge", "MERGE_HEAD"),
+    ("rebase", "REBASE_HEAD"),
+    ("rebase", "rebase-apply"),
+    ("rebase", "rebase-merge"),
+    ("revert", "REVERT_HEAD"),
+    ("sequencer", "sequencer"),
+)
+GIT_OPERATION_STATE_NAMES = frozenset(
+    operation for operation, _marker in GIT_OPERATION_MARKERS
+)
 
 
 def _git_environment() -> dict[str, str]:
@@ -80,6 +113,24 @@ def _decode_path(value: bytes) -> str:
     return normalize_relative(decoded)
 
 
+def _decode_git_text(value: bytes, label: str) -> str:
+    try:
+        return value.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise BulkloadError(
+            f"non-UTF-8 Git metadata is unsupported: {label}"
+        ) from error
+
+
+def _decode_git_ascii(value: bytes, label: str) -> str:
+    try:
+        return value.decode("ascii", "strict")
+    except UnicodeDecodeError as error:
+        raise BulkloadError(
+            f"non-ASCII Git metadata is unsupported: {label}"
+        ) from error
+
+
 def _nul_paths(payload: bytes) -> list[str]:
     return [_decode_path(part) for part in payload.split(b"\0") if part]
 
@@ -96,9 +147,9 @@ def _parse_index(payload: bytes) -> dict[str, list[dict[str, Any]]]:
         mode, object_id, stage = fields
         path = _decode_path(raw_path)
         entry = {
-            "mode": mode.decode("ascii"),
-            "object": object_id.decode("ascii"),
-            "stage": int(stage.decode("ascii")),
+            "mode": _decode_git_ascii(mode, "index mode"),
+            "object": _decode_git_ascii(object_id, "index object ID"),
+            "stage": int(_decode_git_ascii(stage, "index stage")),
         }
         entries.setdefault(path, []).append(entry)
     for values in entries.values():
@@ -120,17 +171,92 @@ def _parse_tree(payload: bytes) -> dict[str, dict[str, str]]:
         if path in entries:
             raise BulkloadError(f"duplicate git ls-tree path: {path}")
         entries[path] = {
-            "mode": mode.decode("ascii", "strict"),
-            "object": object_id.decode("ascii", "strict"),
-            "type": object_type.decode("ascii", "strict"),
+            "mode": _decode_git_ascii(mode, "tree mode"),
+            "object": _decode_git_ascii(object_id, "tree object ID"),
+            "type": _decode_git_ascii(object_type, "tree object type"),
         }
     return entries
+
+
+def _git_marker_error(repo: Path) -> str | None:
+    marker = repo / ".git"
+    try:
+        info = marker.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"cannot inspect .git authority at {marker}: {type(error).__name__}"
+    if stat.S_ISLNK(info.st_mode):
+        return f"symlink .git authority is unsupported: {marker}"
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        return f"special .git authority is unsupported: {marker}"
+    return ""
+
+
+def _bare_repository_error(repo: Path) -> str | None:
+    required = {
+        "HEAD": stat.S_ISREG,
+        "config": stat.S_ISREG,
+        "objects": stat.S_ISDIR,
+    }
+    records: dict[str, os.stat_result] = {}
+    for name in required:
+        try:
+            records[name] = (repo / name).lstat()
+        except FileNotFoundError:
+            return None
+    invalid = [
+        name
+        for name, predicate in required.items()
+        if not predicate(records[name].st_mode)
+    ]
+    if invalid:
+        return f"bare Git authority uses symlink or special paths: {repo}: {sorted(invalid)}"
+    ref_authorities = {
+        "packed-refs": stat.S_ISREG,
+        "refs": stat.S_ISDIR,
+        "reftable": stat.S_ISDIR,
+    }
+    found_ref_authority = False
+    invalid_ref_authorities: list[str] = []
+    for name, predicate in ref_authorities.items():
+        try:
+            info = (repo / name).lstat()
+        except FileNotFoundError:
+            continue
+        found_ref_authority = True
+        if not predicate(info.st_mode):
+            invalid_ref_authorities.append(name)
+    if not found_ref_authority:
+        return None
+    if invalid_ref_authorities:
+        return (
+            f"bare Git authority uses symlink or special paths: {repo}: "
+            f"{sorted(invalid_ref_authorities)}"
+        )
+    is_bare = _decode_git_ascii(
+        _git(repo, "rev-parse", "--is-bare-repository"),
+        "bare repository state",
+    ).strip()
+    if is_bare == "true":
+        return f"bare Git repository is unsupported in v1: {repo}"
+    if is_bare != "false":
+        return f"invalid bare repository state at {repo}"
+    return None
 
 
 def discover_repositories(root: Path, mode: str) -> tuple[list[Path], list[str]]:
     root = root.expanduser().resolve()
     if mode == "repo":
-        top = _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
+        marker_error = _git_marker_error(root)
+        if marker_error:
+            raise BulkloadError(marker_error)
+        bare_error = _bare_repository_error(root)
+        if bare_error:
+            raise BulkloadError(bare_error)
+        top = _decode_git_text(
+            _git(root, "rev-parse", "--show-toplevel"), "repository top-level"
+        ).strip()
         if Path(top).resolve() != root:
             raise BulkloadError(f"repo root must be the Git top-level: {top}")
         return [root], []
@@ -151,7 +277,16 @@ def discover_repositories(root: Path, mode: str) -> tuple[list[Path], list[str]]
         current = Path(directory)
         marker_present = ".git" in dirnames or ".git" in filenames
         if marker_present:
-            repositories.append(current.resolve())
+            marker_error = _git_marker_error(current)
+            if marker_error:
+                errors.append(marker_error)
+            else:
+                repositories.append(current.resolve())
+            dirnames[:] = []
+            continue
+        bare_error = _bare_repository_error(current)
+        if bare_error:
+            errors.append(bare_error)
             dirnames[:] = []
             continue
         retained: list[str] = []
@@ -179,8 +314,10 @@ def _parse_worktrees(payload: bytes) -> list[dict[str, Any]]:
                 current = {}
             continue
         key, separator, value = raw.partition(b" ")
-        decoded_key = key.decode("ascii", "strict")
-        decoded_value = value.decode("utf-8", "strict") if separator else True
+        decoded_key = _decode_git_ascii(key, "worktree record key")
+        decoded_value = (
+            _decode_git_text(value, "worktree record value") if separator else True
+        )
         if decoded_key == "worktree":
             current["path"] = decoded_value
         elif decoded_key == "HEAD":
@@ -383,7 +520,8 @@ def _mode_matches_index(item: dict[str, Any], index_mode: str) -> bool:
     mode = item.get("mode")
     if not isinstance(mode, str):
         return False
-    return bool(int(mode, 8) & 0o111) == (index_mode == "100755")
+    expected = 0o755 if index_mode == "100755" else 0o644
+    return int(mode, 8) == expected
 
 
 def _derive_status(
@@ -439,10 +577,10 @@ def _derive_status(
 
 def _capture_remotes(repo: Path) -> list[dict[str, Any]]:
     remotes: list[dict[str, Any]] = []
-    for name in _git(repo, "remote").decode("utf-8").splitlines():
-        urls = (
-            _git(repo, "remote", "get-url", "--all", name).decode("utf-8").splitlines()
-        )
+    for name in _decode_git_text(_git(repo, "remote"), "remote name").splitlines():
+        urls = _decode_git_text(
+            _git(repo, "remote", "get-url", "--all", name), "remote URL"
+        ).splitlines()
         remotes.append(
             {
                 "name": name,
@@ -465,9 +603,9 @@ def _capture_refs(repo: Path) -> list[dict[str, str | None]]:
         fields = raw.split(b"\0")
         if len(fields) != 3:
             raise BulkloadError("git for-each-ref emitted an incomplete record")
-        refname = fields[0].decode("utf-8", "strict")
-        object_name = fields[1].decode("ascii", "strict")
-        symref_text = fields[2].decode("utf-8", "strict")
+        refname = _decode_git_text(fields[0], "ref name")
+        object_name = _decode_git_ascii(fields[1], "ref object ID")
+        symref_text = _decode_git_text(fields[2], "symbolic ref target")
         refs.append(
             {
                 "name": refname,
@@ -478,10 +616,224 @@ def _capture_refs(repo: Path) -> list[dict[str, str | None]]:
     return sorted(refs, key=lambda item: item["name"])
 
 
+def _read_git_admin_file(path: Path, label: str) -> bytes | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise BulkloadError(f"Git authority is not a regular file: {label}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if _stat_identity(opened) != _stat_identity(info):
+            raise BulkloadError(f"Git authority changed while opening: {label}")
+        payload = b""
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            payload += chunk
+            if len(payload) > 16 * 1024 * 1024:
+                raise BulkloadError(f"Git authority is unreasonably large: {label}")
+        after = os.fstat(descriptor)
+        if _stat_identity(after) != _stat_identity(info):
+            raise BulkloadError(f"Git authority changed while reading: {label}")
+    finally:
+        os.close(descriptor)
+    return payload
+
+
+def _capture_git_operation_state(git_dir: Path) -> list[str]:
+    """Type active Git administration without following marker paths."""
+    active: set[str] = set()
+    for operation, relative in GIT_OPERATION_MARKERS:
+        marker = git_dir.joinpath(*relative.split("/"))
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise BulkloadError(
+                f"cannot inspect Git operation marker {relative}: {error}"
+            ) from error
+        active.add(operation)
+    return sorted(active)
+
+
+def _pseudo_ref_objects(git_dir: Path, object_length: int) -> tuple[set[str], int]:
+    values: set[str] = set()
+    observed_bytes = 0
+    for name in PSEUDO_REF_NAMES:
+        payload = _read_git_admin_file(git_dir / name, f"pseudo-ref {name}")
+        if payload is None:
+            continue
+        observed_bytes += len(payload)
+        if observed_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
+            raise BulkloadError("recovery authority byte budget exceeded")
+        for line in payload.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            object_id = _decode_git_ascii(fields[0], f"{name} object ID")
+            if len(object_id) != object_length or any(
+                character not in "0123456789abcdef" for character in object_id
+            ):
+                raise BulkloadError(f"invalid Git pseudo-ref object ID: {name}")
+            values.add(object_id)
+            if len(values) > MAX_RECOVERY_CANDIDATES:
+                raise BulkloadError("recovery root budget exceeded")
+    return values, observed_bytes
+
+
+def _reachable_recovery_candidates(
+    repo: Path,
+    roots: set[str],
+    candidates: set[str],
+    object_length: int,
+) -> set[str]:
+    if not candidates:
+        return set()
+    process = subprocess.Popen(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(repo),
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--stdin",
+            "--missing=error",
+        ],
+        env=_git_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    reachable: set[str] = set()
+    try:
+        process.stdin.write(("\n".join(sorted(roots)) + "\n").encode("ascii"))
+        process.stdin.close()
+        for line in process.stdout:
+            object_id = _decode_git_ascii(
+                line.strip(), "local ref reachability object ID"
+            )
+            if len(object_id) != object_length or any(
+                character not in "0123456789abcdef" for character in object_id
+            ):
+                raise BulkloadError("invalid Git object ID in local ref reachability")
+            if object_id in candidates:
+                reachable.add(object_id)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.stdout.close()
+    returncode = process.wait()
+    if returncode != 0:
+        raise BulkloadError(f"Git local ref reachability failed in {repo}")
+    return reachable
+
+
+def _capture_recovery_roots(
+    repo: Path,
+    git_dir: Path,
+    common_dir: Path,
+    head: str,
+    refs: list[dict[str, str | None]],
+) -> list[str]:
+    object_length = len(head)
+    local_roots = {
+        head,
+        *(
+            str(item["object"])
+            for item in refs
+            if not str(item["name"]).startswith("refs/remotes/")
+        ),
+    }
+    reflog_objects: set[str] = set()
+    reflog_names = _decode_git_text(
+        _git(repo, "reflog", "list"), "reflog name"
+    ).splitlines()
+    local_reflog_names: list[str] = []
+    for name in reflog_names:
+        if name == "HEAD":
+            local_reflog_names.append(name)
+        elif name.startswith("refs/remotes/"):
+            continue
+        elif name.startswith("refs/"):
+            local_reflog_names.append(name)
+        else:
+            raise BulkloadError(f"invalid Git reflog name: {name!r}")
+    reflog_names = local_reflog_names
+    if len(reflog_names) > MAX_RECOVERY_REFLOGS:
+        raise BulkloadError(
+            f"recovery reflog budget exceeded: {len(reflog_names)} > {MAX_RECOVERY_REFLOGS}"
+        )
+    observed_authority_bytes = 0
+    for name in reflog_names:
+        if name != "HEAD" and any(
+            component in {"", ".", ".."} for component in name.split("/")
+        ):
+            raise BulkloadError(f"invalid Git reflog name: {name!r}")
+        worktree_local = name == "HEAD" or name.startswith(
+            ("refs/bisect/", "refs/rewritten/", "refs/worktree/")
+        )
+        authority_root = git_dir if worktree_local else common_dir
+        payload = _read_git_admin_file(authority_root / "logs" / name, f"reflog {name}")
+        if payload is None:
+            raise BulkloadError(f"listed Git reflog is absent: {name}")
+        observed_authority_bytes += len(payload)
+        if observed_authority_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
+            raise BulkloadError("recovery authority byte budget exceeded")
+        for line in payload.splitlines():
+            header = line.partition(b"\t")[0]
+            fields = header.split(b" ", 2)
+            if len(fields) != 3:
+                raise BulkloadError(f"invalid Git reflog record: {name}")
+            for raw_object_id in fields[:2]:
+                object_id = _decode_git_ascii(raw_object_id, f"{name} reflog object ID")
+                if object_id == "0" * object_length:
+                    continue
+                if len(object_id) != object_length or any(
+                    character not in "0123456789abcdef" for character in object_id
+                ):
+                    raise BulkloadError(f"invalid Git reflog object ID: {name}")
+                reflog_objects.add(object_id)
+                if len(reflog_objects - local_roots) > MAX_RECOVERY_CANDIDATES:
+                    raise BulkloadError("recovery root budget exceeded")
+    pseudo_objects, pseudo_bytes = _pseudo_ref_objects(git_dir, object_length)
+    observed_authority_bytes += pseudo_bytes
+    if observed_authority_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
+        raise BulkloadError(
+            "recovery authority byte budget exceeded: "
+            f"{observed_authority_bytes} > {MAX_RECOVERY_AUTHORITY_BYTES}"
+        )
+    candidates = (reflog_objects | pseudo_objects) - local_roots
+    if len(candidates) > MAX_RECOVERY_CANDIDATES:
+        raise BulkloadError(
+            f"recovery root budget exceeded: {len(candidates)} > {MAX_RECOVERY_CANDIDATES}"
+        )
+    reachable = _reachable_recovery_candidates(
+        repo, local_roots, candidates, object_length
+    )
+    return sorted(candidates - reachable)
+
+
 def _verify_local_ref_object_closure(
     repo: Path,
     head: str,
     refs: list[dict[str, str | None]],
+    recovery_roots: list[str],
 ) -> None:
     roots = sorted(
         {
@@ -491,6 +843,7 @@ def _verify_local_ref_object_closure(
                 for item in refs
                 if not str(item["name"]).startswith("refs/remotes/")
             ),
+            *recovery_roots,
         }
     )
     _git(
@@ -523,7 +876,7 @@ def _optional_git_text(repo: Path, *arguments: str) -> str | None:
     )
     if process.returncode != 0:
         return None
-    return process.stdout.decode("utf-8").strip() or None
+    return _decode_git_text(process.stdout, "optional Git query").strip() or None
 
 
 def _git_config_value(repo: Path, *arguments: str) -> tuple[bool, str]:
@@ -547,14 +900,14 @@ def _git_config_value(repo: Path, *arguments: str) -> tuple[bool, str]:
         return False, ""
     if process.returncode != 0:
         raise BulkloadError("effective Git configuration query failed")
-    return True, process.stdout.decode("utf-8", "strict").strip()
+    return True, _decode_git_text(process.stdout, "Git configuration value").strip()
 
 
 def _has_promisor_configuration(repo: Path) -> bool:
     present, _ = _git_config_value(repo, "--get", "extensions.partialClone")
     if present:
         return True
-    for name in _git(repo, "remote").decode("utf-8", "strict").splitlines():
+    for name in _decode_git_text(_git(repo, "remote"), "remote name").splitlines():
         present, _ = _git_config_value(
             repo, "--get", f"remote.{name}.partialclonefilter"
         )
@@ -594,8 +947,8 @@ def _effective_filters(repo: Path, paths: list[str]) -> set[str]:
         seen: set[str] = set()
         for index in range(0, len(fields), 3):
             path = _decode_path(fields[index])
-            attribute = fields[index + 1].decode("ascii", "strict")
-            value = fields[index + 2].decode("utf-8", "strict")
+            attribute = _decode_git_ascii(fields[index + 1], "attribute name")
+            value = _decode_git_text(fields[index + 2], "attribute value")
             if attribute != "filter" or path not in expected or path in seen:
                 raise BulkloadError(
                     "git check-attr emitted an unexpected filter record"
@@ -610,7 +963,7 @@ def _effective_filters(repo: Path, paths: list[str]) -> set[str]:
 
 def _has_unportable_attribute_authority(repo: Path) -> bool:
     info_raw = _git(repo, "rev-parse", "--git-path", "info/attributes")
-    info_path = Path(info_raw.decode("utf-8", "strict").strip())
+    info_path = Path(_decode_git_text(info_raw, "attributes path").strip())
     if not info_path.is_absolute():
         info_path = repo / info_path
     try:
@@ -649,6 +1002,7 @@ def capture_git_runtime(repo: Path) -> dict[str, Any]:
         raise BulkloadError(f"runtime capture is incomplete: {record['errors']}")
     return {
         "branch": record["branch"],
+        "git_operation_state": record["git_operation_state"],
         "has_alternates": record["has_alternates"],
         "has_content_filters": record["has_content_filters"],
         "has_grafts": record["has_grafts"],
@@ -662,6 +1016,8 @@ def capture_git_runtime(repo: Path) -> dict[str, Any]:
             if not item["name"].startswith("refs/remotes/")
         ],
         "local_refs_sha256": record["local_refs_sha256"],
+        "recovery_roots": record["recovery_roots"],
+        "recovery_roots_sha256": record["recovery_roots_sha256"],
         "refs_sha256": record["refs_sha256"],
         "status": record["status"],
         "status_sha256": record["status_sha256"],
@@ -690,17 +1046,15 @@ def capture_repository(
         raise BulkloadError("partial/promisor Git repositories are unsupported in v1")
     errors: list[str] = []
     branch = _optional_git_text(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-    head = _git(repo, "rev-parse", "HEAD").decode("ascii", "strict").strip()
-    object_format = (
-        _git(repo, "rev-parse", "--show-object-format").decode("ascii").strip()
-    )
+    head = _decode_git_ascii(_git(repo, "rev-parse", "HEAD"), "HEAD").strip()
+    object_format = _decode_git_ascii(
+        _git(repo, "rev-parse", "--show-object-format"), "object format"
+    ).strip()
     if object_format not in {"sha1", "sha256"}:
         raise BulkloadError(f"unsupported Git object format: {object_format}")
-    shallow = (
-        _git(repo, "rev-parse", "--is-shallow-repository")
-        .decode("ascii", "strict")
-        .strip()
-    )
+    shallow = _decode_git_ascii(
+        _git(repo, "rev-parse", "--is-shallow-repository"), "shallow state"
+    ).strip()
     if shallow not in {"true", "false"}:
         raise BulkloadError("git rev-parse emitted an invalid shallow-state value")
     if shallow == "true":
@@ -771,11 +1125,7 @@ def capture_repository(
                     f"{item['path']}: unsupported clean tracked index mode {entry['mode']}"
                 )
             continue
-        expected_kind = "symlink" if entry["mode"] == "120000" else "file"
-        mode_matches = item.get("kind") == expected_kind
-        if expected_kind == "file" and isinstance(item.get("mode"), str):
-            executable = bool(int(item["mode"], 8) & 0o111)
-            mode_matches = mode_matches and executable == (entry["mode"] == "100755")
+        mode_matches = _mode_matches_index(item, entry["mode"])
         content_matches = item.get("git_blob_oid") == entry["object"]
         if item.get("status") is None and (not mode_matches or not content_matches):
             errors.append(
@@ -788,27 +1138,39 @@ def capture_repository(
             f"casefold or Unicode-normalization path collisions: {collisions}"
         )
 
-    common_dir_raw = _git(repo, "rev-parse", "--git-common-dir").decode("utf-8").strip()
+    common_dir_raw = _decode_git_text(
+        _git(repo, "rev-parse", "--git-common-dir"), "Git common directory"
+    ).strip()
     common_dir = (
         (repo / common_dir_raw).resolve()
         if not Path(common_dir_raw).is_absolute()
         else Path(common_dir_raw).resolve()
     )
-    git_dir_raw = _git(repo, "rev-parse", "--git-dir").decode("utf-8").strip()
+    git_dir_raw = _decode_git_text(
+        _git(repo, "rev-parse", "--git-dir"), "Git directory"
+    ).strip()
     git_dir = (
         (repo / git_dir_raw).resolve()
         if not Path(git_dir_raw).is_absolute()
         else Path(git_dir_raw).resolve()
     )
+    git_operation_state = _capture_git_operation_state(git_dir)
+    if git_operation_state:
+        errors.append(
+            f"active Git operation state is unsupported in v1: {git_operation_state}"
+        )
     alternates = Path(
-        _git(repo, "rev-parse", "--git-path", "objects/info/alternates")
-        .decode("utf-8")
-        .strip()
+        _decode_git_text(
+            _git(repo, "rev-parse", "--git-path", "objects/info/alternates"),
+            "alternates path",
+        ).strip()
     )
     if not alternates.is_absolute():
         alternates = repo / alternates
     grafts = Path(
-        _git(repo, "rev-parse", "--git-path", "info/grafts").decode("utf-8").strip()
+        _decode_git_text(
+            _git(repo, "rev-parse", "--git-path", "info/grafts"), "grafts path"
+        ).strip()
     )
     if not grafts.is_absolute():
         grafts = repo / grafts
@@ -831,7 +1193,8 @@ def capture_repository(
         errors.append(f"Git attributes: {type(error).__name__}: {error}")
 
     refs = _capture_refs(repo)
-    _verify_local_ref_object_closure(repo, head, refs)
+    recovery_roots = _capture_recovery_roots(repo, git_dir, common_dir, head, refs)
+    _verify_local_ref_object_closure(repo, head, refs, recovery_roots)
     local_refs = [item for item in refs if not item["name"].startswith("refs/remotes/")]
 
     return {
@@ -840,6 +1203,7 @@ def capture_repository(
         "errors": errors,
         "files": sorted(files, key=lambda item: (item["path"], item["git_class"])),
         "git_dir": str(git_dir),
+        "git_operation_state": git_operation_state,
         "has_alternates": alternates.exists(),
         "has_content_filters": has_content_filters,
         "has_grafts": grafts.exists() and grafts.stat().st_size > 0,
@@ -856,6 +1220,8 @@ def capture_repository(
         "logical_path": logical_path,
         "local_refs_sha256": sha256_bytes(canonical_bytes(local_refs)),
         "observed_bytes": observed_bytes,
+        "recovery_roots": recovery_roots,
+        "recovery_roots_sha256": sha256_bytes(canonical_bytes(recovery_roots)),
         "refs": refs,
         "refs_sha256": sha256_bytes(canonical_bytes(refs)),
         "remotes": _capture_remotes(repo),

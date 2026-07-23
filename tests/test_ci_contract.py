@@ -10,13 +10,174 @@ import unittest
 sys.dont_write_bytecode = True
 
 GF_REV = "ba391f344d71bff4ee902ed8d9928b98546d5f06"
+CHECKOUT_REV = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+EXPECTED_SHA_EXPRESSION = (
+    "${{ github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.sha || github.sha }}"
+)
+AUDITED_JOB_RUNNERS = {"test": "tinyland-nix"}
 HOSTED_RUNNER_PATTERN = re.compile(
     r"(?:ubuntu|macos|windows)-(?:latest|[0-9][A-Za-z0-9.-]*)", re.IGNORECASE
+)
+PERMISSIONS_DECLARATION_PATTERN = re.compile(
+    r"""^(?:    )?(?:permissions|["']permissions["']):(?:\s*.*)?$"""
 )
 
 
 class ContractError(ValueError):
     pass
+
+
+def parse_job_contract(workflow: str) -> dict[str, dict[str, list[str]]]:
+    """Parse the closed-world subset of workflow YAML used for job routing."""
+    lines = workflow.splitlines()
+    jobs_markers = [index for index, line in enumerate(lines) if line == "jobs:"]
+    if len(jobs_markers) != 1:
+        raise ContractError("CI must declare exactly one block-style jobs mapping")
+
+    jobs: dict[str, dict[str, list[str]]] = {}
+    current_job: str | None = None
+    for line in lines[jobs_markers[0] + 1 :]:
+        if line and not line.startswith((" ", "\t", "#")):
+            break
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+
+        job_match = re.fullmatch(r"  ([A-Za-z_][A-Za-z0-9_-]*):", line)
+        if job_match:
+            current_job = job_match.group(1)
+            if current_job in jobs:
+                raise ContractError(f"duplicate workflow job: {current_job}")
+            jobs[current_job] = {}
+            continue
+
+        if re.match(r"^  \S", line):
+            raise ContractError("workflow jobs must use the audited block mapping form")
+        if current_job is None:
+            raise ContractError("workflow job property appears before a job identifier")
+
+        property_match = re.fullmatch(
+            r"    ([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*))?", line
+        )
+        if property_match:
+            key = property_match.group(1)
+            value = property_match.group(2) or ""
+            jobs[current_job].setdefault(key, []).append(value)
+            continue
+        if line.startswith("    ") and not line.startswith("      "):
+            raise ContractError(
+                "workflow job properties must use literal block mapping keys"
+            )
+
+    if not jobs:
+        raise ContractError("CI must declare at least one audited job")
+    return jobs
+
+
+def validate_job_routing(workflow: str) -> None:
+    jobs = parse_job_contract(workflow)
+    if set(jobs) != set(AUDITED_JOB_RUNNERS):
+        unexpected = sorted(set(jobs) - set(AUDITED_JOB_RUNNERS))
+        missing = sorted(set(AUDITED_JOB_RUNNERS) - set(jobs))
+        raise ContractError(
+            f"workflow job inventory is not audited (unexpected={unexpected}, missing={missing})"
+        )
+
+    for job, expected_runner in AUDITED_JOB_RUNNERS.items():
+        properties = jobs[job]
+        if properties.get("uses"):
+            raise ContractError(f"job-level reusable workflow is forbidden: {job}")
+        if properties.get("runs-on") != [expected_runner]:
+            raise ContractError(
+                f"job {job} must declare exactly runs-on: {expected_runner}"
+            )
+
+    declarations = [
+        line
+        for line in workflow.splitlines()
+        if "runs-on:" in line and not line.lstrip().startswith("#")
+    ]
+    expected_declarations = [
+        f"    runs-on: {runner}" for runner in AUDITED_JOB_RUNNERS.values()
+    ]
+    if declarations != expected_declarations:
+        raise ContractError("every runs-on declaration must be an audited exact scalar")
+
+
+def validate_permissions(workflow: str) -> None:
+    lines = workflow.splitlines()
+    declarations = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if PERMISSIONS_DECLARATION_PATTERN.fullmatch(line) is not None
+    ]
+    if len(declarations) != 1 or declarations[0][1] != "permissions:":
+        raise ContractError(
+            "cache-only CI must declare one top-level permissions block only"
+        )
+
+    start = declarations[0][0]
+    block: list[str] = []
+    for line in lines[start + 1 :]:
+        if line and not line.startswith((" ", "\t", "#")):
+            break
+        if line.strip() and not line.lstrip().startswith("#"):
+            block.append(line)
+    if block != ["  contents: read"]:
+        raise ContractError("cache-only CI permissions must be exactly contents: read")
+
+
+def parse_action_refs(workflow: str) -> list[str]:
+    """Parse the closed-world block-style step subset and return action refs."""
+    lines = workflow.splitlines()
+    step_blocks = [index for index, line in enumerate(lines) if line == "    steps:"]
+    if len(step_blocks) != len(AUDITED_JOB_RUNNERS):
+        raise ContractError("every audited job must declare one block-style steps list")
+
+    action_refs: list[str] = []
+    for start in step_blocks:
+        current_properties: set[str] | None = None
+        for line in lines[start + 1 :]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if "\t" in line:
+                raise ContractError("workflow steps must not use tab indentation")
+            indentation = len(line) - len(line.lstrip(" "))
+            if indentation <= 4:
+                break
+            if indentation == 6:
+                if re.fullmatch(r"      - name: \S.*", line) is None:
+                    raise ContractError(
+                        "workflow steps must begin with a canonical named block mapping"
+                    )
+                current_properties = {"name"}
+                continue
+            if indentation == 8:
+                if current_properties is None:
+                    raise ContractError("workflow step property precedes a named step")
+                property_match = re.fullmatch(
+                    r"        ([A-Za-z_][A-Za-z0-9_-]*):(?:\s*(.*))?", line
+                )
+                if property_match is None:
+                    raise ContractError(
+                        "workflow step properties must use literal block mapping keys"
+                    )
+                key = property_match.group(1)
+                value = property_match.group(2) or ""
+                if key not in {"env", "run", "uses", "with"}:
+                    raise ContractError(f"unaudited workflow step property: {key}")
+                if key in current_properties:
+                    raise ContractError(f"duplicate workflow step property: {key}")
+                current_properties.add(key)
+                if key == "uses":
+                    action_ref = value.split(" #", 1)[0].strip()
+                    if not action_ref:
+                        raise ContractError("action reference must be an exact scalar")
+                    action_refs.append(action_ref)
+                continue
+            if indentation < 10 or current_properties is None:
+                raise ContractError("workflow steps use unaudited indentation")
+    return action_refs
 
 
 def find_workspace() -> Path:
@@ -34,8 +195,8 @@ def find_workspace() -> Path:
 
 
 def validate_workflow(workflow: str) -> None:
-    if "runs-on: tinyland-nix" not in workflow:
-        raise ContractError("CI must use the tinyland-nix capability class")
+    validate_job_routing(workflow)
+    validate_permissions(workflow)
     if HOSTED_RUNNER_PATTERN.search(workflow):
         raise ContractError("GitHub-hosted runner label is forbidden")
     if re.search(r"(?m)^\s*runs-on:\s*\$\{\{", workflow):
@@ -49,13 +210,23 @@ def validate_workflow(workflow: str) -> None:
         or "cachix/install-nix-action" in workflow
     ):
         raise ContractError("hosted bootstrap/cache actions are forbidden")
-    if "permissions:\n  contents: read" not in workflow or "id-token:" in workflow:
-        raise ContractError("cache-only CI must have contents-read permissions only")
-    if re.search(r"(?m)^\s+[A-Za-z-]+:\s*write\s*$", workflow):
-        raise ContractError("cache-only CI must not grant write permissions")
-    for action_ref in re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", workflow):
+    if "id-token:" in workflow:
+        raise ContractError("cache-only CI must not request an OIDC token")
+    action_refs = parse_action_refs(workflow)
+    for action_ref in action_refs:
         if not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action_ref):
             raise ContractError("every external action must use an immutable SHA")
+    checkout = f"actions/checkout@{CHECKOUT_REV}"
+    if workflow.count(checkout) != 1:
+        raise ContractError("CI must use exactly one pinned checkout step")
+    if workflow.count(f"ref: {EXPECTED_SHA_EXPRESSION}") != 1:
+        raise ContractError("checkout must select the exact PR head or push SHA")
+    if workflow.count("persist-credentials: false") != 1:
+        raise ContractError("checkout credentials must not persist")
+    if workflow.count(f"EXPECTED_SHA: {EXPECTED_SHA_EXPRESSION}") != 1:
+        raise ContractError("checkout verification must bind the same event SHA")
+    if 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"' not in workflow:
+        raise ContractError("CI must verify the checked-out commit before execution")
     action = "tinyland-inc/GloriousFlywheel/.github/actions/nix-job@" + GF_REV
     flake = "github:tinyland-inc/GloriousFlywheel/" + GF_REV + "#ci"
     if action not in workflow or flake not in workflow:
@@ -105,6 +276,22 @@ class CiContractTest(unittest.TestCase):
                 with self.assertRaises(ContractError):
                     validate_workflow(unsafe)
 
+    def test_unaudited_jobs_and_reusable_workflows_fail_closed(self) -> None:
+        unsafe_variants = [
+            self.workflow
+            + "\n  unrelated:\n    runs-on: tinyland-nix\n    steps: []\n",
+            self.workflow.replace(
+                "    runs-on: tinyland-nix",
+                "    uses: example/workflows/.github/workflows/test.yml@" + "0" * 40,
+            ),
+            self.workflow.replace(
+                "    runs-on: tinyland-nix", '    runs-on: "tinyland-nix"'
+            ),
+        ]
+        for unsafe in unsafe_variants:
+            with self.assertRaises(ContractError):
+                validate_workflow(unsafe)
+
     def test_hosted_bootstrap_regression_fails_closed(self) -> None:
         unsafe = self.workflow + "\n# uses: bazel-contrib/setup-bazel@deadbeef\n"
         with self.assertRaises(ContractError):
@@ -118,11 +305,60 @@ class CiContractTest(unittest.TestCase):
             ),
             self.workflow.replace("contents: read", "contents: write"),
             self.workflow.replace(
+                "    runs-on: tinyland-nix",
+                "    runs-on: tinyland-nix\n    permissions: write-all",
+            ),
+            self.workflow.replace(
+                "    runs-on: tinyland-nix",
+                "    runs-on: tinyland-nix\n    permissions: {contents: write}",
+            ),
+            self.workflow.replace(
+                "    runs-on: tinyland-nix",
+                '    runs-on: tinyland-nix\n    "permissions": write-all',
+            ),
+            self.workflow.replace(
+                "      - name: Verify exact checked out revision",
+                "      - uses: example/action@main\n"
+                "      - name: Verify exact checked out revision",
+            ),
+            self.workflow.replace(
+                "      - name: Verify exact checked out revision",
+                "      - uses : example/action@main\n"
+                "      - name: Verify exact checked out revision",
+            ),
+            self.workflow.replace(
+                "      - name: Verify exact checked out revision",
+                "      - 'uses' : example/action@main\n"
+                "      - name: Verify exact checked out revision",
+            ),
+            self.workflow.replace(
+                "      - name: Verify exact checked out revision",
+                "      - {uses: example/action@main}\n"
+                "      - name: Verify exact checked out revision",
+            ),
+            self.workflow.replace(
                 "${{ github.event_name == 'push' && github.ref == "
                 "'refs/heads/main' && 'true' || 'false' }}",
                 "true",
             ),
             self.workflow.replace("BAZEL_BIN: bazel", "BAZEL_BIN: bazelisk"),
+        ]
+        for unsafe in unsafe_variants:
+            with self.assertRaises(ContractError):
+                validate_workflow(unsafe)
+
+    def test_checkout_identity_and_credentials_regressions_fail_closed(self) -> None:
+        unsafe_variants = [
+            self.workflow.replace(
+                f"ref: {EXPECTED_SHA_EXPRESSION}", "ref: ${{ github.sha }}"
+            ),
+            self.workflow.replace(
+                "persist-credentials: false", "persist-credentials: true"
+            ),
+            self.workflow.replace(
+                'run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+                "run: git rev-parse HEAD",
+            ),
         ]
         for unsafe in unsafe_variants:
             with self.assertRaises(ContractError):

@@ -125,6 +125,19 @@ destination dirt is a subset of source dirt. Apply repeats those relationships
 from fresh live captures and derives its allowed destination dirt from the live
 source status body before any copy.
 
+The same preconditions bind recovery-only Git roots found in local reflogs and
+known pseudo-refs. A source recovery root is retained only when the destination
+has an explicit anchor at that exact object: HEAD, a non-remote ref tip, or its
+own recovery-root catalog. Merely being an ancestor of a destination ref is
+deliberately insufficient proof in v1. Serializing every object reachable from
+every destination ref would make repo and fleet manifests grow outside the file
+and byte budgets and can add millions of OIDs. The bounded remediation is to
+create a temporary reviewed destination retention ref at each missing OID,
+recapture, and keep that ref through verification. Capture caps recovery
+acquisition at 4,096 local reflogs, 16 MiB per authority file, 64 MiB total
+authority bytes, and 4,096 candidate roots; exceeding any cap is incomplete,
+never an omitted ready plan.
+
 ### 4.5 Independent verification
 
 Verification consumes a fresh destination capture, not the apply process's
@@ -140,6 +153,12 @@ not expand the authority of the plan.
 
 The snapshot schema is `dev.tinyland.bulkload.snapshot.v1`.
 
+Repository discovery recognizes a worktree only when `.git` is a real directory
+or a regular Git pointer file. A symlink or special-file `.git` authority makes
+capture incomplete. Bare repositories are detected explicitly and also make v1
+capture incomplete: they require a separate object/ref transport rather than
+being silently omitted from a fleet manifest.
+
 Each envelope records:
 
 - capture time, hostname, logical root, and mode (`repo` or `fleet`);
@@ -151,8 +170,12 @@ Each envelope records:
 Each repository records logical path, real path, Git common directory, branch,
 HEAD, upstream, sanitized remotes, every name under `refs/` with its resolved
 object and symbolic target, a canonical full `refs_sha256`, a
-`local_refs_sha256` that excludes host-local `refs/remotes/`, worktree records,
-status facts, and file facts. Supported network and scp-style remote locators
+`local_refs_sha256` that excludes host-local `refs/remotes/`, recovery-only
+roots and their digest, worktree records, status facts, and file facts.
+Recovery acquisition reads both old and new OIDs from real reflog records plus
+`AUTO_MERGE`, `BISECT_HEAD`, `CHERRY_PICK_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`,
+`ORIG_HEAD`, `REBASE_HEAD`, and `REVERT_HEAD`; remote-tracking reflogs remain
+host-local and are excluded. Supported network and scp-style remote locators
 have user-info and query or fragment data removed; local-path remotes are
 represented by a typed digest, and remote-helper, unknown-scheme, or malformed
 locators make capture incomplete without serializing the raw value. File facts
@@ -162,18 +185,29 @@ remote-tracking movement remains
 recorded by the repeated catalog barrier but does not invalidate an already
 reviewed working-byte plan.
 
+Object reachability is not resumable-operation parity. Capture therefore
+inspects worktree-local Git administration markers without following them and
+records a sorted typed `git_operation_state`. Any active rebase, apply-mailbox,
+sequencer, bisect, merge, cherry-pick, or revert makes the repository and
+envelope incomplete; apply repeats the same live capture fence.
+
 Every tracked regular file and symlink is also compared with its stage-zero Git
-index blob and executable mode. Status is derived from the HEAD tree, index
-stages, direct no-follow byte hashes, and untracked enumeration; capture never
+index blob and canonical full regular-file permission mode (`0644` or `0755`).
+A `0600` file backed by a `100644` index entry is therefore typed as mode dirt,
+copied with `0600`, and verified with that exact mode rather than falsely
+passing on content alone. Status is derived from the HEAD tree, index stages,
+direct no-follow byte hashes, and untracked enumeration; capture never
 runs `git status`, `git diff`, or another worktree conversion command. A path
 whose raw working bytes differ from the index is therefore classified as dirty
 even when assume-unchanged, skip-worktree, or stat-cache metadata would hide it
 from normal Git status.
 
-Capture also walks the object closure reachable from detached HEAD and every
-non-remote ref with replacement semantics and lazy fetching disabled. A missing
-commit, tag, tree, or blob therefore makes the capture incomplete before a plan
-can become ready; a ref name and OID alone are not a completeness proof. Shallow
+Capture also walks the object closure reachable from detached HEAD, every
+non-remote ref, and every recovery-only root with replacement semantics and
+lazy fetching disabled. A missing commit, tag, tree, or blob therefore makes
+the capture incomplete before a plan can become ready; a ref name and OID alone
+are not a completeness proof. The closure is checked but not serialized as an
+unbounded object inventory. Shallow
 repositories are incomplete in v1 because a shallow boundary deliberately
 hides ancestry that this protocol promises to retain. Effective
 partial/promisor configuration from repository, worktree, include, global, or
@@ -241,6 +275,9 @@ Git reconciliation remains explicit:
 - fetch/push or a verified Git bundle moves refs and objects;
 - every source non-remote ref must exist at the same object and symbolic target
   on the destination, with its reachable object closure present;
+- every source recovery-only reflog or pseudo-ref root must have an explicit
+  destination anchor at the same OID; use a temporary retention ref and
+  recapture rather than relying on an unbounded ancestry catalog;
 - destination-only local refs are retained and reported, never deleted; an
   extra replacement ref blocks because it changes ordinary Git object semantics;
 - remote-tracking refs remain host-local evidence and are not parity authority;
@@ -305,7 +342,8 @@ legacy importer and audit adapter rather than remain a second sync system.
 ## 9. Threat model
 
 Primary hazards are source mutation during capture, path traversal, symlink
-escape or payload disclosure, incomplete reachable Git objects, unsafe remote
+escape or payload disclosure, incomplete reachable Git objects, omitted
+reflog/pseudo-ref recovery roots, unsafe remote
 helpers, case-folding collisions, stale remote refs, filename encoding,
 AppleDouble sidecars, unbounded ignored trees, secret-bearing untracked files,
 concurrent destination edits, partial transfer, and false confidence from a
@@ -331,7 +369,8 @@ remain blockers or follow-up work.
   GloriousFlywheel front-door kit pinned by CI to an immutable core revision.
 - `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation; no
   hosted or dynamic runner fallback.
-- `scripts/install-skill.sh`: atomic user-scope installation.
+- `scripts/install-skill.sh`: locked user-scope installation with fail-before-
+  mutation destination preflight and no-follow private backup containment.
 - `tests/`: deterministic fixture tests for catalogs, barriers, plans, apply,
   verification, traversal rejection, and installer behavior.
 - `docs/design.md`: design and evidence authority.

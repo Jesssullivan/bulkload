@@ -19,6 +19,9 @@ and the cloned tag object and checked-out commit exactly match that API proof.
 
 Codex and Pi discover the canonical copy at `~/.agents/skills/bulkload`.
 Claude receives a symlink at `~/.claude/skills/bulkload` to that same copy.
+The installer validates the canonical, private-backup, and Claude destinations
+before mutation, refuses symlinked directory authority, and preserves a forced
+replacement under `~/.agents/backups/bulkload` before installing it.
 Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
 
 For development:

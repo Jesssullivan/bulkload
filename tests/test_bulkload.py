@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,11 @@ from bulkload_lib.planner import (  # noqa: E402
     validate_plan,
     validate_snapshot,
 )
-from bulkload_lib.scanner import _path_collisions, capture_snapshot  # noqa: E402
+from bulkload_lib.scanner import (  # noqa: E402
+    _path_collisions,
+    capture_git_runtime,
+    capture_snapshot,
+)
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -832,6 +837,185 @@ class BulkloadProtocolTest(unittest.TestCase):
                 {item["code"] for item in replace_extra["intent"]["blockers"]},
             )
 
+    def test_reflog_and_pseudo_ref_roots_require_explicit_destination_anchors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = make_pair(Path(directory))
+            base = git(source, "rev-parse", "HEAD")
+            (source / "tracked.txt").write_text("reflog-only\n", encoding="utf-8")
+            git(source, "add", "tracked.txt")
+            git(
+                source,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "reflog-only",
+            )
+            reflog_only = git(source, "rev-parse", "HEAD")
+            git(source, "reset", "-q", "--hard", base)
+
+            tree = git(source, "rev-parse", "HEAD^{tree}")
+            pseudo_only = git(
+                source,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit-tree",
+                tree,
+                "-m",
+                "pseudo-only",
+            )
+            git(source, "update-ref", "ORIG_HEAD", pseudo_only)
+
+            with mock.patch("bulkload_lib.scanner.MAX_RECOVERY_CANDIDATES", 1):
+                over_budget = capture_snapshot(source, "repo")
+            self.assertFalse(over_budget["complete"])
+            self.assertTrue(
+                any(
+                    "recovery root budget exceeded" in error
+                    for error in over_budget["errors"]
+                ),
+                over_budget["errors"],
+            )
+
+            source_a = capture_snapshot(source, "repo")
+            source_b = capture_snapshot(source, "repo")
+            recovery_roots = source_b["catalog"][0]["recovery_roots"]
+            self.assertEqual(recovery_roots, sorted([pseudo_only, reflog_only]))
+            blocked = compile_plan(
+                source_a, source_b, capture_snapshot(destination, "repo")
+            )
+            recovery_blocker = next(
+                item
+                for item in blocked["intent"]["blockers"]
+                if item["code"] == "git-recovery-roots-missing"
+            )
+            self.assertEqual(
+                recovery_blocker["objects"], sorted([pseudo_only, reflog_only])
+            )
+            stripped = json.loads(json.dumps(blocked))
+            stripped["intent"]["blockers"] = []
+            stripped["intent"]["ready"] = True
+            stripped["plan_sha256"] = sha256_bytes(canonical_bytes(stripped["intent"]))
+            stripped["envelope_sha256"] = object_digest(stripped, "envelope_sha256")
+            with self.assertRaisesRegex(
+                BulkloadError, "destination lacks source recovery roots"
+            ):
+                validate_plan(stripped)
+
+            for name, object_id in (
+                ("reflog-export", reflog_only),
+                ("pseudo-export", pseudo_only),
+            ):
+                git(source, "update-ref", f"refs/heads/{name}", object_id)
+                git(
+                    destination,
+                    "fetch",
+                    "-q",
+                    str(source),
+                    f"refs/heads/{name}:refs/heads/{name}",
+                )
+                git(source, "update-ref", "-d", f"refs/heads/{name}")
+
+            retained_tree = git(destination, "rev-parse", "HEAD^{tree}")
+            retainer = git(
+                destination,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit-tree",
+                retained_tree,
+                "-p",
+                reflog_only,
+                "-p",
+                pseudo_only,
+                "-m",
+                "retain source recovery closure",
+            )
+            git(destination, "update-ref", "refs/heads/recovery-retainer", retainer)
+            git(destination, "update-ref", "-d", "refs/heads/reflog-export")
+            git(destination, "update-ref", "-d", "refs/heads/pseudo-export")
+
+            destination_snapshot = capture_snapshot(destination, "repo")
+            ancestor_only = compile_plan(
+                capture_snapshot(source, "repo"),
+                capture_snapshot(source, "repo"),
+                destination_snapshot,
+            )
+            self.assertIn(
+                "git-recovery-roots-missing",
+                {item["code"] for item in ancestor_only["intent"]["blockers"]},
+            )
+
+            git(
+                destination,
+                "update-ref",
+                "refs/heads/bulkload-retain-reflog",
+                reflog_only,
+            )
+            git(
+                destination,
+                "update-ref",
+                "refs/heads/bulkload-retain-pseudo",
+                pseudo_only,
+            )
+            ready = compile_plan(
+                capture_snapshot(source, "repo"),
+                capture_snapshot(source, "repo"),
+                capture_snapshot(destination, "repo"),
+            )
+            self.assertTrue(ready["intent"]["ready"], ready["intent"]["blockers"])
+
+    def test_tracked_permission_mode_is_migrated_and_verified_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = make_pair(root)
+            os.chmod(source / "tracked.txt", 0o600)
+            source_a = capture_snapshot(source, "repo")
+            source_b = capture_snapshot(source, "repo")
+            source_repo = source_b["catalog"][0]
+            self.assertEqual(
+                source_repo["status"],
+                [{"index": " ", "path": "tracked.txt", "worktree": "T"}],
+            )
+            plan = compile_plan(
+                source_a, source_b, capture_snapshot(destination, "repo")
+            )
+            self.assertTrue(plan["intent"]["ready"], plan["intent"]["blockers"])
+            self.assertEqual(plan["intent"]["operations"][0]["after"]["mode"], "0600")
+            apply_plan(
+                plan,
+                source_root=source,
+                destination_root=destination,
+                accepted_digest=plan["plan_sha256"],
+                state_root=root / "state",
+                receipt_path=root / "receipt.json",
+            )
+            self.assertEqual(
+                stat.S_IMODE((destination / "tracked.txt").stat().st_mode), 0o600
+            )
+            verified = verify_plan(
+                plan, capture_snapshot(destination, "repo"), plan["plan_sha256"]
+            )
+            self.assertTrue(verified["verified"], verified["failures"])
+
+            os.chmod(destination / "tracked.txt", 0o644)
+            drifted = verify_plan(
+                plan, capture_snapshot(destination, "repo"), plan["plan_sha256"]
+            )
+            self.assertFalse(drifted["verified"])
+            self.assertIn(
+                "file-identity-mismatch",
+                {item["code"] for item in drifted["failures"]},
+            )
+
     def test_replace_objects_are_neutralized_and_grafts_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source, destination = make_pair(Path(directory))
@@ -1477,6 +1661,65 @@ class BulkloadProtocolTest(unittest.TestCase):
                 {item["path"] for item in snapshot["catalog"][0]["files"]},
             )
 
+    def test_clean_stopped_rebase_is_typed_and_blocks_v1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = make_pair(Path(directory))
+            git(source, "switch", "-q", "-c", "topic")
+            git(
+                source,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "topic",
+            )
+            stopped = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(source),
+                    "rebase",
+                    "--exec",
+                    "false",
+                    "main",
+                ],
+                env={**os.environ, "GIT_EDITOR": "true"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertEqual(git(source, "status", "--porcelain"), "")
+            self.assertTrue((source / ".git/rebase-merge").is_dir())
+
+            snapshot = capture_snapshot(source, "repo")
+            self.assertFalse(snapshot["complete"])
+            self.assertEqual(snapshot["catalog"][0]["git_operation_state"], ["rebase"])
+            self.assertTrue(
+                any(
+                    "active Git operation state" in error
+                    for error in snapshot["errors"]
+                ),
+                snapshot["errors"],
+            )
+            with self.assertRaisesRegex(BulkloadError, "active Git operation state"):
+                validate_snapshot(snapshot)
+            with self.assertRaisesRegex(BulkloadError, "runtime capture is incomplete"):
+                capture_git_runtime(source)
+            with self.assertRaises(BulkloadError):
+                compile_plan(
+                    snapshot,
+                    capture_snapshot(source, "repo"),
+                    capture_snapshot(destination, "repo"),
+                )
+
     def test_effective_lfs_attributes_block_without_comment_false_positive(
         self,
     ) -> None:
@@ -1605,6 +1848,100 @@ class BulkloadProtocolTest(unittest.TestCase):
             forged["snapshot_sha256"] = object_digest(forged, "snapshot_sha256")
             with self.assertRaisesRegex(BulkloadError, "non-canonical"):
                 validate_snapshot(forged)
+
+    def test_fleet_bare_and_symlink_git_authority_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = make_pair(root / "pair")
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "-q",
+                    "--bare",
+                    str(source),
+                    str(root / "archive.git"),
+                ],
+                check=True,
+            )
+            alias = root / "alias"
+            alias.mkdir()
+            os.symlink(source / ".git", alias / ".git", target_is_directory=True)
+            special = root / "special"
+            special.mkdir()
+            os.mkfifo(special / ".git")
+
+            snapshot = capture_snapshot(root, "fleet")
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any(
+                    "bare Git repository is unsupported" in error
+                    for error in snapshot["errors"]
+                ),
+                snapshot["errors"],
+            )
+            self.assertTrue(
+                any(
+                    "symlink .git authority is unsupported" in error
+                    for error in snapshot["errors"]
+                ),
+                snapshot["errors"],
+            )
+            self.assertTrue(
+                any(
+                    "special .git authority is unsupported" in error
+                    for error in snapshot["errors"]
+                ),
+                snapshot["errors"],
+            )
+            logical_paths = {item["logical_path"] for item in snapshot["catalog"]}
+            self.assertNotIn("archive.git", logical_paths)
+            self.assertNotIn("alias", logical_paths)
+            self.assertNotIn("special", logical_paths)
+
+            with self.assertRaisesRegex(BulkloadError, "symlink .git authority"):
+                capture_snapshot(alias, "repo")
+
+    def test_non_utf8_git_metadata_is_an_incomplete_exit_three_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = make_pair(root)
+            with (source / ".git" / "config").open("ab") as config:
+                config.write(
+                    b'\n[remote "invalid-\xff"]\n\turl = https://example.invalid/repo.git\n'
+                )
+
+            snapshot = capture_snapshot(source, "repo")
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any("non-UTF-8 Git metadata" in error for error in snapshot["errors"]),
+                snapshot["errors"],
+            )
+            self.assertNotIn(
+                "UnicodeDecodeError", canonical_bytes(snapshot).decode("utf-8")
+            )
+
+            output = root / "capture.json"
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), mock.patch("sys.stdout", new=io.StringIO()):
+                result = cli_main(
+                    [
+                        "capture",
+                        "--root",
+                        str(source),
+                        "--mode",
+                        "repo",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(result, 3)
+            self.assertEqual(stderr.getvalue(), "")
+            written = read_json(output)
+            self.assertFalse(written["complete"])
+            self.assertTrue(
+                any("non-UTF-8 Git metadata" in error for error in written["errors"])
+            )
 
     def test_relative_path_aliases_are_rejected(self) -> None:
         for value in ("a//b", "a/./b", "a/b/", "./a"):

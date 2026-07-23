@@ -214,16 +214,27 @@ def _preflight_plan(
                 )
         for field in (
             "branch",
+            "git_operation_state",
             "head",
             "local_refs",
             "local_refs_sha256",
+            "recovery_roots",
+            "recovery_roots_sha256",
             "status",
             "status_sha256",
         ):
             if source_runtime.get(field) != source_expected.get(field):
                 raise BulkloadError(f"source Git {field} changed: {logical}")
         destination_expected = expected_destinations[logical]
-        for field in ("branch", "head", "local_refs", "local_refs_sha256"):
+        for field in (
+            "branch",
+            "git_operation_state",
+            "head",
+            "local_refs",
+            "local_refs_sha256",
+            "recovery_roots",
+            "recovery_roots_sha256",
+        ):
             if destination_runtime.get(field) != destination_expected.get(field):
                 raise BulkloadError(f"destination Git {field} changed: {logical}")
         for field in ("branch", "head"):
@@ -636,7 +647,19 @@ def verify_plan(
                     "repo": logical,
                 }
             )
-
+        if before is None or actual.get("recovery_roots_sha256") != before.get(
+            "recovery_roots_sha256"
+        ):
+            failures.append(
+                {
+                    "actual": actual.get("recovery_roots_sha256"),
+                    "code": "repository-recovery_roots_sha256-mismatch",
+                    "expected": (
+                        before.get("recovery_roots_sha256") if before else None
+                    ),
+                    "repo": logical,
+                }
+            )
     for expected in intent.get("expected_files", []):
         logical = expected["repo"]
         repo = repositories.get(logical)

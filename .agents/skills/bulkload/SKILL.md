@@ -96,8 +96,9 @@ python3 scripts/bulkload.py plan \
 ```
 
 Planning refuses a moving source. It records blockers for divergent Git heads,
-missing or different source local refs, missing repositories, staged/index
-state, conflicts, deletions, sensitive paths, symlink mutations, submodules,
+missing or different source local refs, missing explicit destination anchors for
+reflog/pseudo-ref recovery roots, missing repositories, staged/index state,
+conflicts, active Git operations, deletions, sensitive paths, symlink mutations, submodules,
 effective LFS or other content filters, legacy grafts, unportable Git attribute
 authorities, shallow or partial/promisor history, alternates, and
 destination-only dirt.
@@ -109,10 +110,18 @@ and dirt relationships; apply repeats those relationships from live captures.
 Capture derives raw working status from HEAD, index stages, direct no-follow
 hashing, and untracked enumeration. It never runs `git status` or a Git diff
 command, so repository-configured clean/process filters are not executed. It
-catalogs every name under `refs/`, disables replacement-object semantics for
-tree identity, blocks legacy graft authority, and walks the object closure from
-HEAD and every non-remote ref with lazy fetching disabled. A missing reachable
-commit, tag, tree, or blob makes capture incomplete. Shallow repositories are
+classifies a tracked regular file whose full permission mode differs from the
+canonical index projection (`0644` or `0755`) as mode dirt; apply and verify bind
+the exact four-octal source mode. It catalogs every name under `refs/`, disables
+replacement-object semantics for tree identity, blocks legacy graft authority,
+and walks the object closure from
+HEAD, every non-remote ref, and every recovery-only local reflog or known
+pseudo-ref root with lazy fetching disabled. A missing reachable commit, tag,
+tree, or blob makes capture incomplete. Recovery acquisition is bounded; a
+reflog, authority-byte, or candidate-root budget excess makes capture
+incomplete. Active rebase, apply-mailbox, sequencer, bisect, merge,
+cherry-pick, and revert markers are inspected without following them, recorded
+as typed state, and make v1 capture incomplete. Shallow repositories are
 also incomplete in v1 because their declared boundary can legitimize missing
 ancestry. Effective partial/promisor configuration from repository, worktree,
 included, global, or system scope is rejected before object reads so capture
@@ -122,7 +131,9 @@ non-remote-ref digest; `refs/remotes/` remains repeated-catalog evidence rather
 than cross-host parity authority. Supported URL and scp-style remote locators
 are credential-sanitized, local paths are digest-redacted, and helper, unknown,
 or malformed locator forms make capture incomplete without recording the raw
-value. Symlink payloads are hashed, never serialized verbatim.
+value. Symlink payloads are hashed, never serialized verbatim. Fleet discovery
+also fails closed on bare repositories and symlink or special-file `.git`
+authority instead of silently omitting or following it.
 
 Review the exact plan body and repeat its `plan_sha256` only after every
 operation and blocker is understood. Never edit the plan by hand; recapture
@@ -138,6 +149,10 @@ available. Any suspected credential or decrypted secret blocks acceptance.
 Use fetch/push or a verified Git bundle for commits and refs. Reconcile every
 source non-remote ref, including stash, notes, replace, and custom namespaces;
 each must retain the same object, symbolic target, and reachable object closure.
+For each source recovery-only reflog or pseudo-ref OID, create a reviewed
+temporary destination retention ref at that exact OID before recapture. V1 does
+not serialize every reachable destination object, so ancestry without an exact
+anchor remains a conservative blocker.
 Destination-only local refs are reported and preserved, except extra replacement
 refs, which block. Recreate a clean worktree from the exact reviewed ref. Never
 copy `.git`, `.git/worktrees`, or a linked-worktree `.git` pointer between

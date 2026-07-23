@@ -20,7 +20,7 @@ from .model import (
     sha256_bytes,
     utc_now,
 )
-from .scanner import catalog_map, dirty_paths, find_file
+from .scanner import GIT_OPERATION_STATE_NAMES, catalog_map, dirty_paths, find_file
 
 
 def validate_snapshot(snapshot: dict[str, Any]) -> None:
@@ -80,6 +80,7 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
             "errors",
             "files",
             "git_dir",
+            "git_operation_state",
             "has_alternates",
             "has_content_filters",
             "has_grafts",
@@ -90,6 +91,8 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
             "logical_path",
             "local_refs_sha256",
             "observed_bytes",
+            "recovery_roots",
+            "recovery_roots_sha256",
             "refs",
             "refs_sha256",
             "remotes",
@@ -112,6 +115,20 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         ):
             if not isinstance(repository[flag], bool):
                 raise BulkloadError(f"{label}.{flag} must be Boolean")
+        operation_state = repository["git_operation_state"]
+        if (
+            not isinstance(operation_state, list)
+            or not all(
+                isinstance(item, str) and item in GIT_OPERATION_STATE_NAMES
+                for item in operation_state
+            )
+            or operation_state != sorted(set(operation_state))
+        ):
+            raise BulkloadError(
+                f"{label}.git_operation_state must be a sorted unique typed list"
+            )
+        if operation_state:
+            raise BulkloadError(f"{label} has active Git operation state")
         logical = repository["logical_path"]
         if logical != ".":
             normalize_relative(logical)
@@ -129,6 +146,10 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
             raise BulkloadError(f"{label}.head must be a Git object ID") from error
         _require_sha256(repository["status_sha256"], f"{label}.status_sha256")
         _require_sha256(repository["local_refs_sha256"], f"{label}.local_refs_sha256")
+        _require_sha256(
+            repository["recovery_roots_sha256"],
+            f"{label}.recovery_roots_sha256",
+        )
         _require_sha256(repository["refs_sha256"], f"{label}.refs_sha256")
         if not isinstance(repository["files"], list) or not isinstance(
             repository["status"], list
@@ -190,6 +211,17 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         expected_local_refs = sha256_bytes(canonical_bytes(local_refs))
         if repository["local_refs_sha256"] != expected_local_refs:
             raise BulkloadError(f"{label}.local_refs_sha256 mismatch")
+        recovery_roots = _validate_object_ids(
+            repository["recovery_roots"],
+            f"{label}.recovery_roots",
+            len(head),
+        )
+        expected_recovery_roots = sha256_bytes(canonical_bytes(recovery_roots))
+        if repository["recovery_roots_sha256"] != expected_recovery_roots:
+            raise BulkloadError(f"{label}.recovery_roots_sha256 mismatch")
+        direct_roots = {head, *(item["object"] for item in local_refs)}
+        if direct_roots & set(recovery_roots):
+            raise BulkloadError(f"{label}.recovery_roots must be recovery-only")
     require_digest(snapshot, "snapshot_sha256")
     expected_catalog = sha256_bytes(canonical_bytes(snapshot.get("catalog")))
     if snapshot.get("catalog_sha256") != expected_catalog:
@@ -260,6 +292,23 @@ def _validate_ref_catalog(
         ):
             raise BulkloadError(
                 f"{ref_label}.symref must be null or a canonical refs/ name"
+            )
+    return values
+
+
+def _validate_object_ids(values: Any, label: str, object_length: int) -> list[str]:
+    if not isinstance(values, list):
+        raise BulkloadError(f"{label} must be a list")
+    if values != sorted(set(values)):
+        raise BulkloadError(f"{label} must be sorted and unique")
+    for index, object_id in enumerate(values):
+        if (
+            not isinstance(object_id, str)
+            or len(object_id) != object_length
+            or not re.fullmatch(r"[0-9a-f]+", object_id)
+        ):
+            raise BulkloadError(
+                f"{label}[{index}] must match the repository object format"
             )
     return values
 
@@ -372,10 +421,13 @@ def _validate_repository_preconditions(
             {
                 "branch",
                 "dirty_paths",
+                "git_operation_state",
                 "head",
                 "logical_path",
                 "local_refs",
                 "local_refs_sha256",
+                "recovery_roots",
+                "recovery_roots_sha256",
                 "status",
                 "status_sha256",
             },
@@ -389,6 +441,8 @@ def _validate_repository_preconditions(
         repositories[logical] = item
         if item["branch"] is not None and not isinstance(item["branch"], str):
             raise BulkloadError(f"{item_label}.branch must be a string or null")
+        if item["git_operation_state"] != []:
+            raise BulkloadError(f"{item_label}.git_operation_state must be empty")
         head = item["head"]
         if not isinstance(head, str) or len(head) not in {40, 64}:
             raise BulkloadError(f"{item_label}.head must be a Git object ID")
@@ -398,6 +452,10 @@ def _validate_repository_preconditions(
             raise BulkloadError(f"{item_label}.head must be a Git object ID") from error
         _require_sha256(item["status_sha256"], f"{item_label}.status_sha256")
         _require_sha256(item["local_refs_sha256"], f"{item_label}.local_refs_sha256")
+        _require_sha256(
+            item["recovery_roots_sha256"],
+            f"{item_label}.recovery_roots_sha256",
+        )
         local_refs = _validate_ref_catalog(
             item["local_refs"],
             f"{item_label}.local_refs",
@@ -407,6 +465,17 @@ def _validate_repository_preconditions(
         expected_local_refs = sha256_bytes(canonical_bytes(local_refs))
         if item["local_refs_sha256"] != expected_local_refs:
             raise BulkloadError(f"{item_label}.local_refs_sha256 mismatch")
+        recovery_roots = _validate_object_ids(
+            item["recovery_roots"],
+            f"{item_label}.recovery_roots",
+            len(head),
+        )
+        expected_recovery_roots = sha256_bytes(canonical_bytes(recovery_roots))
+        if item["recovery_roots_sha256"] != expected_recovery_roots:
+            raise BulkloadError(f"{item_label}.recovery_roots_sha256 mismatch")
+        direct_roots = {head, *(ref["object"] for ref in local_refs)}
+        if direct_roots & set(recovery_roots):
+            raise BulkloadError(f"{item_label}.recovery_roots must be recovery-only")
         status = _validate_status_catalog(item["status"], f"{item_label}.status")
         expected_status = sha256_bytes(canonical_bytes(status))
         if item["status_sha256"] != expected_status:
@@ -553,6 +622,19 @@ def validate_plan(plan: dict[str, Any]) -> None:
                     "ready plan destination has extra replacement refs: "
                     f"{logical}: {extra_replace_refs}"
                 )
+            destination_recovery_coverage = {
+                destination["head"],
+                *(item["object"] for item in destination["local_refs"]),
+                *destination["recovery_roots"],
+            }
+            missing_recovery_roots = sorted(
+                set(source["recovery_roots"]) - destination_recovery_coverage
+            )
+            if missing_recovery_roots:
+                raise BulkloadError(
+                    "ready plan destination lacks source recovery roots: "
+                    f"{logical}: {missing_recovery_roots}"
+                )
 
     if not isinstance(intent["expected_files"], list):
         raise BulkloadError("plan.intent.expected_files must be a list")
@@ -698,6 +780,7 @@ def compile_plan(
             {
                 "branch": source_repo.get("branch"),
                 "dirty_paths": sorted(dirty_paths(source_repo)),
+                "git_operation_state": source_repo.get("git_operation_state"),
                 "head": source_repo.get("head"),
                 "logical_path": logical_path,
                 "local_refs": [
@@ -706,6 +789,8 @@ def compile_plan(
                     if not item["name"].startswith("refs/remotes/")
                 ],
                 "local_refs_sha256": source_repo.get("local_refs_sha256"),
+                "recovery_roots": source_repo.get("recovery_roots"),
+                "recovery_roots_sha256": source_repo.get("recovery_roots_sha256"),
                 "status": source_repo.get("status"),
                 "status_sha256": source_repo.get("status_sha256"),
             }
@@ -719,6 +804,7 @@ def compile_plan(
             {
                 "branch": destination_repo.get("branch"),
                 "dirty_paths": sorted(dirty_paths(destination_repo)),
+                "git_operation_state": destination_repo.get("git_operation_state"),
                 "head": destination_repo.get("head"),
                 "logical_path": logical_path,
                 "local_refs": [
@@ -727,6 +813,8 @@ def compile_plan(
                     if not item["name"].startswith("refs/remotes/")
                 ],
                 "local_refs_sha256": destination_repo.get("local_refs_sha256"),
+                "recovery_roots": destination_repo.get("recovery_roots"),
+                "recovery_roots_sha256": destination_repo.get("recovery_roots_sha256"),
                 "status": destination_repo.get("status"),
                 "status_sha256": destination_repo.get("status_sha256"),
             }
@@ -793,6 +881,25 @@ def compile_plan(
                         **details,
                     }
                 )
+        destination_recovery_coverage = {
+            destination_repo.get("head"),
+            *(
+                item["object"]
+                for item in destination_repo.get("refs", [])
+                if not item["name"].startswith("refs/remotes/")
+            ),
+            *destination_repo.get("recovery_roots", []),
+        }
+        missing_recovery_roots = sorted(
+            set(source_repo.get("recovery_roots", [])) - destination_recovery_coverage
+        )
+        if missing_recovery_roots:
+            _block(
+                blockers,
+                "git-recovery-roots-missing",
+                objects=missing_recovery_roots,
+                repo=logical_path,
+            )
         for side, repository in (
             ("source", source_repo),
             ("destination", destination_repo),

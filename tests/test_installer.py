@@ -135,14 +135,155 @@ class InstallerTest(unittest.TestCase):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                for _ in range(2)
+                for _ in range(8)
             ]
             results = [process.communicate(timeout=30) for process in processes]
             self.assertEqual(
-                [process.returncode for process in processes], [0, 0], results
+                [process.returncode for process in processes], [0] * 8, results
             )
             canonical = home / ".agents/skills/bulkload"
             self.assertTrue((canonical / "SKILL.md").is_file())
+
+    def test_force_backup_is_private_recoverable_and_not_discoverable(self) -> None:
+        workspace = find_workspace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = materialize_installer(workspace, root)
+            home = root / "home"
+            home.mkdir()
+            environment = test_environment(home, root)
+            subprocess.run(
+                [str(installer), "--all"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+            canonical = home / ".agents/skills/bulkload"
+            marker = canonical / "operator-recovery-marker"
+            marker.write_text("preserve me\n", encoding="utf-8")
+            forced = subprocess.run(
+                [str(installer), "--all", "--force"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+            preserved = [
+                Path(line.removeprefix("PRESERVED "))
+                for line in forced.stdout.splitlines()
+                if line.startswith("PRESERVED ")
+            ]
+            self.assertEqual(len(preserved), 1, forced.stdout)
+            backup = preserved[0]
+            backup_root = home / ".agents/backups/bulkload"
+            discovery_root = home / ".agents/skills"
+            self.assertTrue(backup.is_relative_to(backup_root))
+            self.assertFalse(backup.is_relative_to(discovery_root))
+            self.assertEqual(
+                (backup / "operator-recovery-marker").read_text(encoding="utf-8"),
+                "preserve me\n",
+            )
+            self.assertFalse((canonical / "operator-recovery-marker").exists())
+            self.assertEqual(
+                sorted(path.name for path in discovery_root.iterdir()), ["bulkload"]
+            )
+            for private_directory in [
+                home / ".agents",
+                home / ".agents/backups",
+                backup_root,
+                backup,
+            ]:
+                self.assertEqual(private_directory.stat().st_mode & 0o077, 0)
+
+            subprocess.run(
+                [str(installer), "--doctor"],
+                env=environment,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+    def test_foreign_claude_path_fails_before_canonical_mutation(self) -> None:
+        workspace = find_workspace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = materialize_installer(workspace, root)
+            home = root / "home"
+            home.mkdir()
+            environment = test_environment(home, root)
+            subprocess.run(
+                [str(installer), "--all"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            canonical = home / ".agents/skills/bulkload"
+            marker = canonical / "operator-recovery-marker"
+            marker.write_text("retain original\n", encoding="utf-8")
+            claude = home / ".claude/skills/bulkload"
+            claude.unlink()
+            claude.mkdir()
+            (claude / "foreign-marker").write_text("foreign\n", encoding="utf-8")
+
+            rejected = subprocess.run(
+                [str(installer), "--all", "--force"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("refusing existing Claude path", rejected.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "retain original\n")
+            self.assertFalse((home / ".agents/backups").exists())
+
+    def test_symlinked_backup_ancestor_fails_without_escape_or_mutation(self) -> None:
+        workspace = find_workspace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = materialize_installer(workspace, root)
+            home = root / "home"
+            home.mkdir()
+            environment = test_environment(home, root)
+            subprocess.run(
+                [str(installer), "--all"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            canonical = home / ".agents/skills/bulkload"
+            marker = canonical / "operator-recovery-marker"
+            marker.write_text("retain original\n", encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir(mode=0o755)
+            outside.chmod(0o755)
+            os.symlink(outside, home / ".agents/backups")
+
+            rejected = subprocess.run(
+                [str(installer), "--all", "--force"],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("refusing symlinked directory authority", rejected.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "retain original\n")
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
 
     def test_installer_rejects_symlinked_bundle_content(self) -> None:
         workspace = find_workspace()
