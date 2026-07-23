@@ -1,6 +1,6 @@
 # Neo to Sting one-off sync retrospective
 
-Evidence cutoff: 2026-07-22. Classification: `DONE_WITH_CONCERNS`.
+Evidence cutoff: 2026-07-23. Classification: `DONE_WITH_CONCERNS`.
 
 ## Outcome
 
@@ -73,16 +73,22 @@ ownership distinctions.
   TODO, and boundary payloads without tool calls. This proved live auth,
   persistence, lookup, and dialog continuity.
 
-### July 22: exact active-lane convergence
+### July 22–23: exact active-lane convergence
 
 - The Sting clean lane was initially at `e5ea08104a462d84df158c004554100735df0a7a`
   while live remote and Neo had advanced four commits.
 - A targeted fetch and `merge --ff-only` moved only the clean Sting lane to
   signed head `36d8c0f67c12d4a1d1164a925f71c8b4885c68bd`.
+- The live branch subsequently advanced by one signed source commit,
+  `0d7654791cef4b6f533b661eb029738408d85369`
+  (`fix(sync): type non-linux inventory iterator`). A second targeted fetch and
+  `merge --ff-only` moved only the clean Sting lane to that exact head.
 - Current dated proof: Neo and Sting are both clean at that exact branch and
-  HEAD, `0/0` from their branch upstream. The branch contains current main and
-  is twenty commits ahead. No PR/check suite exists, so it remains
-  source-only/digestless.
+  HEAD, `0/0` from their branch upstream. Live `origin/main` is an ancestor and
+  the branch is twenty-one commits ahead. Draft PR #565 exists and exact head
+  `0d765479` has eleven green checks, but every check ran on GitHub-hosted
+  runners rather than the sanctioned GloriousFlywheel ARC pools. Those checks
+  are not durable CI authority; the lane remains source-only/digestless.
 
 ## Current classification manifest
 
@@ -93,8 +99,9 @@ ownership distinctions.
 - Sting:
   `/srv/fast-local/jess/git/tummycrypt.worktrees/tin2864-root-plan`
 - Branch: `codex/tin-2864-root-plan-20260719`
-- HEAD: `36d8c0f67c12d4a1d1164a925f71c8b4885c68bd`
-- State: clean, exact, remote-backed, signature valid.
+- HEAD: `0d7654791cef4b6f533b661eb029738408d85369`
+- State: clean, exact, and remote-backed. The signature is valid on Neo and
+  GitHub; Sting's local verifier lacks the public key.
 - Constraint: never copy either linked worktree's host-specific `.git` pointer.
 
 ### `PROTECTED_PARITY`
@@ -230,12 +237,13 @@ Done now:
 
 Remaining concerns, explicitly deferred:
 
-- supersede the original `e5ea081` handoff text with `36d8c0f` in the active
-  conversation if not already done;
+- supersede the retained clean-lane handoff text with `0d765479` in the active
+  Sting conversation before frontier work;
 - durable default `umask 077` rather than per-launch discipline;
 - nonfatal MCP connectivity/login warnings;
 - Sting public GPG verification-key availability;
-- durable TIN-2864 CI and exact-head source review;
+- GloriousFlywheel-backed durable TIN-2864 CI and independent exact-head source
+  review;
 - attended Home Manager activation after its own gates;
 - separate credential rotation/containment; and
 - TCFS runtime and ceremony fences.
