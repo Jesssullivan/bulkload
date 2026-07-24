@@ -1,6 +1,6 @@
 # Bulkload v1 design
 
-Status: implementation sprint, 2026-07-22
+Status: implementation complete; landing held on GF listener proof, 2026-07-24
 
 ## 1. Decision
 
@@ -418,6 +418,14 @@ Deferred:
 - Git attributes manual: check-in conversion and external clean/process filter
   execution, which is why capture derives raw status without `git status` or
   diff commands, <https://git-scm.com/docs/gitattributes>.
+- Linux `rename(2)` and `fsync(2)` contracts: same-filesystem atomic name
+  replacement plus the separate directory sync needed to persist a directory
+  entry, <https://man7.org/linux/man-pages/man2/rename.2.html> and
+  <https://man7.org/linux/man-pages/man2/fsync.2.html>.
+- Chandy and Lamport, *Distributed Snapshots: Determining Global States of
+  Distributed Systems*: coordinated consistent global-state capture in an
+  asynchronous system,
+  <https://lamport.azurewebsites.net/pubs/chandy.pdf>.
 - Agent Skills specification: portable `SKILL.md`, scripts, references, and
   progressive disclosure, <https://agentskills.io/specification>.
 - Codex skill documentation: repository and user discovery under
@@ -429,6 +437,16 @@ Deferred:
   `.claude/skills`, <https://code.claude.com/docs/en/agent-sdk/skills>.
 - Bazel Central Registry, `rules_python` 2.2.0; this repository pins and tests
   Bazel 8.2.1, <https://registry.bazel.build/modules/rules_python>.
+
+These sources constrain, rather than broaden, the protocol. Bulkload treats
+worktree administration as path-bound; bundles remain object/ref transports;
+and rsync is restricted to reviewed `--from0 --files-from` transfers into
+quarantine. On Linux filesystems honoring the cited contracts, same-directory
+rename plus file/directory sync remains the durability primitive. Equal A/B
+catalogs are only an observational stability barrier, not a Chandy-Lamport-style
+coordinated consistent cut and not an atomic point-in-time snapshot. Concurrent
+writers still require quiescence or a stronger snapshot authority, and any scan
+error, changed catalog, or live precondition mismatch fails closed.
 
 ## 13. Acceptance criteria
 
