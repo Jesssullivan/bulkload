@@ -45,8 +45,9 @@ Stop before application when any of these is true:
 - a source or destination writer cannot be quiesced enough to get stable passes;
 - source and destination Git heads diverge;
 - the destination has dirt absent from the source;
-- a path is staged, conflicted, deleted, special, sensitive, absolute,
-  traverses a symlink, or is itself a dirty or untracked symlink mutation;
+- a path is staged, conflicted, deleted, special, absolute, traverses a symlink,
+  or is itself a dirty or untracked symlink mutation;
+- a sensitive path requires a working-byte operation;
 - Git LFS or another content filter, local/external attribute authority,
   legacy grafts, shallow or partial/promisor history, submodules, or object
   alternates lack a separate reviewed plan;

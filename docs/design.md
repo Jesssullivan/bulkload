@@ -98,9 +98,11 @@ planning.
 The planner emits operations, findings, and blockers. Safe v1 operations are
 limited to additive or replacing copies of regular files. Clean tracked
 symlinks are attested against the Git index and recreated through Git; dirty or
-untracked symlink mutations block the plan. Deletions, conflicts, sensitive
-paths, missing repositories, and divergent Git heads are blockers or operator
-instructions, never implicit file operations.
+untracked symlink mutations block the plan. A clean tracked sensitive path is
+privately attested against the Git index but remains redacted and ineligible.
+Deletions, conflicts, sensitive working-byte changes, missing repositories, and
+divergent Git heads are blockers or operator instructions, never implicit file
+operations.
 
 ### 4.4 Immutable acceptance
 

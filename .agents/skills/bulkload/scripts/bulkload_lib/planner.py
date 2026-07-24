@@ -22,6 +22,25 @@ from .model import (
 )
 from .scanner import GIT_OPERATION_STATE_NAMES, catalog_map, dirty_paths, find_file
 
+FILE_RECORD_KEYS = frozenset(
+    {
+        "blocked_reason",
+        "eligible",
+        "git_blob_oid",
+        "git_class",
+        "index_entries",
+        "kind",
+        "mode",
+        "path",
+        "sha256",
+        "size",
+        "status",
+    }
+)
+REDACTED_FILE_KEYS = frozenset(
+    {"blocked_reason", "eligible", "git_class", "kind", "path", "status"}
+)
+
 
 def validate_snapshot(snapshot: dict[str, Any]) -> None:
     if not isinstance(snapshot, dict):
@@ -159,16 +178,26 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         for file_index, item in enumerate(repository["files"]):
             if not isinstance(item, dict):
                 raise BulkloadError(f"{label}.files[{file_index}] must be an object")
+            item_label = f"{label}.files[{file_index}]"
             if not {"eligible", "git_class", "kind", "path", "status"} <= set(item):
+                raise BulkloadError(f"{item_label} lacks required fields")
+            unexpected = set(item) - FILE_RECORD_KEYS
+            if unexpected:
                 raise BulkloadError(
-                    f"{label}.files[{file_index}] lacks required fields"
+                    f"{item_label} has unexpected fields: {sorted(unexpected)}"
                 )
             path = _content_path(item["path"], allow_ineligible=True)
             git_class = item["git_class"]
             if git_class not in {"tracked", "untracked", "ignored"}:
-                raise BulkloadError(
-                    f"{label}.files[{file_index}] has invalid Git class"
-                )
+                raise BulkloadError(f"{item_label} has invalid Git class")
+            if item["kind"] == "redacted":
+                _require_exact_keys(item, set(REDACTED_FILE_KEYS), item_label)
+                if item["eligible"] is not False or not isinstance(
+                    item["blocked_reason"], str
+                ):
+                    raise BulkloadError(
+                        f"{item_label} must be an ineligible redacted record"
+                    )
             if path in file_paths:
                 raise BulkloadError(f"duplicate snapshot file record: {logical}/{path}")
             file_paths.add(path)

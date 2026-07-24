@@ -61,6 +61,7 @@ GIT_OPERATION_MARKERS = (
 GIT_OPERATION_STATE_NAMES = frozenset(
     operation for operation, _marker in GIT_OPERATION_MARKERS
 )
+PRIVATE_WORKTREE_PREFIX = "_bulkload_private_"
 
 
 def _git_environment() -> dict[str, str]:
@@ -362,16 +363,20 @@ def _stable_file_digest(
     before: os.stat_result,
     maximum_bytes: int | None,
     git_object_format: str | None,
-) -> tuple[str, int, str | None]:
+    redact_budget_details: bool = False,
+    include_sha256: bool = True,
+) -> tuple[str | None, int, str | None]:
     if not stat.S_ISREG(before.st_mode):
         raise BulkloadError(f"not a regular file: {display_path}")
     if maximum_bytes is not None and before.st_size > maximum_bytes:
+        if redact_budget_details:
+            raise BulkloadError("file exceeds remaining byte budget")
         raise BulkloadError(
             f"file exceeds remaining byte budget: {before.st_size} > {maximum_bytes}"
         )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
-    digest = hashlib.sha256()
+    digest = hashlib.sha256() if include_sha256 else None
     git_digest = (
         hashlib.new(git_object_format) if git_object_format is not None else None
     )
@@ -386,7 +391,8 @@ def _stable_file_digest(
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
-            digest.update(chunk)
+            if digest is not None:
+                digest.update(chunk)
             if git_digest is not None:
                 git_digest.update(chunk)
         after_open = os.fstat(descriptor)
@@ -396,7 +402,7 @@ def _stable_file_digest(
     if _stat_identity(after_open) != identity or _stat_identity(after_path) != identity:
         raise BulkloadError(f"file changed while hashing: {display_path}")
     return (
-        digest.hexdigest(),
+        digest.hexdigest() if digest is not None else None,
         before.st_size,
         git_digest.hexdigest() if git_digest is not None else None,
     )
@@ -419,6 +425,7 @@ def inspect_path(
     status: dict[str, Any] | None,
     maximum_bytes: int | None = None,
     git_object_format: str | None = None,
+    redact_budget_details: bool = False,
 ) -> dict[str, Any]:
     path = root / relative
     record: dict[str, Any] = {
@@ -426,8 +433,11 @@ def inspect_path(
         "path": relative,
         "status": status,
     }
-    reason = sensitive_reason(relative) or portability_reason(relative)
-    if reason is not None:
+    sensitive = sensitive_reason(relative)
+    portability = portability_reason(relative)
+    inspect_tracked_sensitive = sensitive is not None and git_class == "tracked"
+    reason = sensitive or portability
+    if reason is not None and not inspect_tracked_sensitive:
         record.update(
             {
                 "blocked_reason": reason,
@@ -450,6 +460,14 @@ def inspect_path(
                     }
                 )
             elif stat.S_ISREG(info.st_mode):
+                if (
+                    inspect_tracked_sensitive
+                    and maximum_bytes is not None
+                    and info.st_size > maximum_bytes
+                ):
+                    raise BulkloadError(
+                        "redacted tracked file exceeds remaining byte budget"
+                    )
                 digest, size, git_blob = _stable_file_digest(
                     parent_descriptor,
                     leaf,
@@ -457,15 +475,18 @@ def inspect_path(
                     info,
                     maximum_bytes,
                     git_object_format,
+                    redact_budget_details,
+                    include_sha256=not inspect_tracked_sensitive,
                 )
                 record.update(
                     {
                         "eligible": git_class != "ignored",
                         "kind": "file",
-                        "sha256": digest,
                         "size": size,
                     }
                 )
+                if digest is not None:
+                    record["sha256"] = digest
                 if git_blob is not None:
                     record["git_blob_oid"] = git_blob
             elif stat.S_ISLNK(info.st_mode):
@@ -476,6 +497,8 @@ def inspect_path(
                 target_bytes = os.fsencode(target)
                 target_size = len(target_bytes)
                 if maximum_bytes is not None and target_size > maximum_bytes:
+                    if inspect_tracked_sensitive or redact_budget_details:
+                        raise BulkloadError("symlink exceeds remaining byte budget")
                     raise BulkloadError(
                         f"symlink exceeds remaining byte budget: {target_size} > {maximum_bytes}"
                     )
@@ -484,10 +507,11 @@ def inspect_path(
                         "blocked_reason": "symlink mutations are unsupported in v1",
                         "eligible": False,
                         "kind": "symlink",
-                        "sha256": hashlib.sha256(target_bytes).hexdigest(),
                         "size": target_size,
                     }
                 )
+                if not inspect_tracked_sensitive:
+                    record["sha256"] = hashlib.sha256(target_bytes).hexdigest()
                 if git_object_format is not None:
                     git_digest = hashlib.new(git_object_format)
                     git_digest.update(f"blob {target_size}\0".encode("ascii"))
@@ -509,15 +533,32 @@ def inspect_path(
                 "kind": "missing",
             }
         )
+    if inspect_tracked_sensitive:
+        for field in ("kind", "mode", "size", "git_blob_oid"):
+            if field in record:
+                record[f"{PRIVATE_WORKTREE_PREFIX}{field}"] = record.pop(field)
+        record.pop("sha256", None)
+        record.update(
+            {
+                "blocked_reason": sensitive,
+                "eligible": False,
+                "kind": "redacted",
+            }
+        )
     return record
 
 
+def _worktree_field(item: dict[str, Any], field: str) -> Any:
+    return item.get(f"{PRIVATE_WORKTREE_PREFIX}{field}", item.get(field))
+
+
 def _mode_matches_index(item: dict[str, Any], index_mode: str) -> bool:
+    kind = _worktree_field(item, "kind")
     if index_mode == "120000":
-        return item.get("kind") == "symlink"
-    if index_mode not in {"100644", "100755"} or item.get("kind") != "file":
+        return kind == "symlink"
+    if index_mode not in {"100644", "100755"} or kind != "file":
         return False
-    mode = item.get("mode")
+    mode = _worktree_field(item, "mode")
     if not isinstance(mode, str):
         return False
     expected = 0o755 if index_mode == "100755" else 0o644
@@ -556,11 +597,11 @@ def _derive_status(
             index_code = " "
 
         item = tracked_files.get(path)
-        if item is None or item.get("kind") == "missing":
+        if item is None or _worktree_field(item, "kind") == "missing":
             worktree_code = "D"
         elif not _mode_matches_index(item, index_entry["mode"]):
             worktree_code = "T"
-        elif item.get("git_blob_oid") != index_entry["object"]:
+        elif _worktree_field(item, "git_blob_oid") != index_entry["object"]:
             worktree_code = "M"
         else:
             worktree_code = " "
@@ -1084,6 +1125,8 @@ def capture_repository(
 
     files: list[dict[str, Any]] = []
     observed_bytes = 0
+    budget_bytes = 0
+    has_redacted_bytes = False
     for relative, git_class in classified:
         try:
             item = inspect_path(
@@ -1091,17 +1134,27 @@ def capture_repository(
                 relative,
                 git_class,
                 None,
-                max_bytes - observed_bytes,
+                max_bytes - budget_bytes,
                 object_format if git_class == "tracked" else None,
+                has_redacted_bytes,
             )
         except (BulkloadError, OSError) as error:
             errors.append(f"{relative}: {type(error).__name__}: {error}")
             continue
-        size = item.get("size")
-        if isinstance(size, int):
-            observed_bytes += size
-        if observed_bytes > max_bytes:
-            errors.append(f"byte budget exceeded: {observed_bytes} > {max_bytes}")
+        budget_size = _worktree_field(item, "size")
+        if isinstance(budget_size, int):
+            budget_bytes += budget_size
+        public_size = item.get("size")
+        if isinstance(public_size, int):
+            observed_bytes += public_size
+        elif isinstance(budget_size, int):
+            has_redacted_bytes = True
+        if budget_bytes > max_bytes:
+            errors.append(
+                "byte budget exceeded"
+                if has_redacted_bytes
+                else f"byte budget exceeded: {budget_bytes} > {max_bytes}"
+            )
             break
         files.append(item)
 
@@ -1114,7 +1167,8 @@ def capture_repository(
         if item["git_class"] != "tracked":
             continue
         entries = index_entries.get(item["path"], [])
-        item["index_entries"] = entries
+        if item["kind"] != "redacted":
+            item["index_entries"] = entries
         stage_zero = [entry for entry in entries if entry["stage"] == 0]
         if len(stage_zero) != 1:
             continue
@@ -1126,11 +1180,27 @@ def capture_repository(
                 )
             continue
         mode_matches = _mode_matches_index(item, entry["mode"])
-        content_matches = item.get("git_blob_oid") == entry["object"]
+        content_matches = _worktree_field(item, "git_blob_oid") == entry["object"]
         if item.get("status") is None and (not mode_matches or not content_matches):
             errors.append(
                 f"{item['path']}: clean status hides tracked bytes or mode differing from index"
             )
+
+    for item in files:
+        for field in tuple(item):
+            if field.startswith(PRIVATE_WORKTREE_PREFIX):
+                del item[field]
+        if any(field.startswith(PRIVATE_WORKTREE_PREFIX) for field in item):
+            raise BulkloadError("private worktree identity escaped snapshot scrubbing")
+        if item.get("kind") == "redacted" and set(item) != {
+            "blocked_reason",
+            "eligible",
+            "git_class",
+            "kind",
+            "path",
+            "status",
+        }:
+            raise BulkloadError("redacted worktree record contains identity metadata")
 
     collisions = _path_collisions(item["path"] for item in files)
     if collisions:

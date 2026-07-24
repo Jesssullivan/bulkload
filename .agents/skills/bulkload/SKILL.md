@@ -291,6 +291,9 @@ Never report “all worktrees synced” merely because the active lane is ready.
 - `5`: verification evidence was written and reports one or more failures.
 - `6`: `doctor` could not find Git.
 
-A sensitive path intentionally blocks the whole v1 plan. Preserve that owner
-checkout, use a clean reconstruction for safe work, and report
-`EXCLUDE_PRESERVE`; do not invent an exclude flag or silently weaken the plan.
+A sensitive path that requires a working-byte operation intentionally blocks
+the whole v1 plan. A clean tracked sensitive path is privately attested against
+the Git index, remains redacted and ineligible, and never becomes a copy
+operation. Preserve an owner checkout with sensitive dirt, use a clean
+reconstruction for safe work, and report `EXCLUDE_PRESERVE`; do not invent an
+exclude flag or silently weaken the plan.

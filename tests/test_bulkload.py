@@ -277,6 +277,201 @@ class BulkloadProtocolTest(unittest.TestCase):
                 {item["code"] for item in plan["intent"]["blockers"]},
             )
 
+    def test_clean_tracked_sensitive_path_is_privately_attested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = make_pair(root)
+            sensitive_content = "tracked-sensitive-placeholder\n"
+            base_observed_bytes = capture_snapshot(source, "repo")["catalog"][0][
+                "observed_bytes"
+            ]
+            (source / ".envrc").write_text(sensitive_content, encoding="utf-8")
+            git(source, "add", ".envrc")
+            git(
+                source,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "tracked sensitive fixture",
+            )
+            git(destination, "fetch", "-q", "origin")
+            git(destination, "reset", "-q", "--hard", "origin/main")
+
+            source_a = capture_snapshot(source, "repo")
+            source_b = capture_snapshot(source, "repo")
+            destination_before = capture_snapshot(destination, "repo")
+            record = next(
+                item
+                for item in source_b["catalog"][0]["files"]
+                if item["path"] == ".envrc"
+            )
+
+            self.assertIsNone(record["status"])
+            self.assertEqual(record["kind"], "redacted")
+            self.assertFalse(record["eligible"])
+            for field in ("git_blob_oid", "index_entries", "mode", "sha256", "size"):
+                self.assertNotIn(field, record)
+            self.assertEqual(
+                source_b["catalog"][0]["observed_bytes"], base_observed_bytes
+            )
+            serialized = canonical_bytes(source_b).decode()
+            self.assertNotIn(sensitive_content, serialized)
+            self.assertNotIn("_bulkload_private_", serialized)
+            self.assertFalse(
+                any(field.startswith("_bulkload_private_") for field in record)
+            )
+
+            plan = compile_plan(source_a, source_b, destination_before)
+            self.assertTrue(plan["intent"]["ready"], plan["intent"]["blockers"])
+            self.assertEqual(plan["intent"]["operations"], [])
+            verification = verify_plan(
+                plan,
+                capture_snapshot(destination, "repo"),
+                plan["plan_sha256"],
+            )
+            self.assertTrue(verification["verified"], verification["failures"])
+
+            forbidden_fields = {
+                "_bulkload_private_git_blob_oid": "0" * 40,
+                "content": sensitive_content,
+                "git_blob_oid": "0" * 40,
+                "index_entries": [],
+                "mode": "0644",
+                "sha256": "0" * 64,
+                "size": len(sensitive_content),
+            }
+            for field, value in forbidden_fields.items():
+                with self.subTest(forged_field=field):
+                    forged = json.loads(json.dumps(source_b))
+                    forged_record = next(
+                        item
+                        for item in forged["catalog"][0]["files"]
+                        if item["path"] == ".envrc"
+                    )
+                    forged_record[field] = value
+                    forged["catalog_sha256"] = sha256_bytes(
+                        canonical_bytes(forged["catalog"])
+                    )
+                    forged["snapshot_sha256"] = object_digest(forged, "snapshot_sha256")
+                    with self.assertRaisesRegex(
+                        BulkloadError, "unexpected fields|keys differ"
+                    ):
+                        validate_snapshot(forged)
+
+    def test_tracked_sensitive_size_does_not_leak_through_budget_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, _destination = make_pair(Path(directory))
+            sensitive_content = "tracked-sensitive-placeholder\n"
+            (source / ".envrc").write_text(sensitive_content, encoding="utf-8")
+            git(source, "add", ".envrc")
+            git(
+                source,
+                "-c",
+                "user.name=Bulkload Test",
+                "-c",
+                "user.email=bulkload@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "tracked sensitive fixture",
+            )
+
+            snapshot = capture_snapshot(
+                source,
+                "repo",
+                max_bytes=len(sensitive_content.encode()) + 2,
+            )
+            self.assertFalse(snapshot["complete"])
+            joined_errors = "\n".join(snapshot["errors"])
+            self.assertIn("file exceeds remaining byte budget", joined_errors)
+            self.assertNotIn(" > ", joined_errors)
+            self.assertNotIn(str(len(sensitive_content.encode())), joined_errors)
+
+    def test_tracked_sensitive_drift_is_redacted_and_blocked(self) -> None:
+        variants = {
+            "content": "M",
+            "delete": "D",
+            "mode": "T",
+            "symlink": "T",
+        }
+        for variant, expected_status in variants.items():
+            with (
+                self.subTest(variant=variant),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                source, destination = make_pair(root)
+                sensitive_path = source / ".envrc"
+                sensitive_path.write_text(
+                    "tracked-sensitive-placeholder\n", encoding="utf-8"
+                )
+                git(source, "add", ".envrc")
+                git(
+                    source,
+                    "-c",
+                    "user.name=Bulkload Test",
+                    "-c",
+                    "user.email=bulkload@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "tracked sensitive fixture",
+                )
+                git(destination, "fetch", "-q", "origin")
+                git(destination, "reset", "-q", "--hard", "origin/main")
+
+                if variant == "content":
+                    sensitive_path.write_text(
+                        "changed-sensitive-placeholder\n", encoding="utf-8"
+                    )
+                elif variant == "delete":
+                    sensitive_path.unlink()
+                elif variant == "mode":
+                    sensitive_path.chmod(0o600)
+                else:
+                    sensitive_path.unlink()
+                    sensitive_path.symlink_to("sensitive-target")
+
+                source_a = capture_snapshot(source, "repo")
+                source_b = capture_snapshot(source, "repo")
+                record = next(
+                    item
+                    for item in source_b["catalog"][0]["files"]
+                    if item["path"] == ".envrc"
+                )
+
+                self.assertEqual(record["status"]["worktree"], expected_status)
+                self.assertEqual(record["kind"], "redacted")
+                self.assertFalse(record["eligible"])
+                for field in (
+                    "git_blob_oid",
+                    "index_entries",
+                    "mode",
+                    "sha256",
+                    "size",
+                ):
+                    self.assertNotIn(field, record)
+                serialized = canonical_bytes(source_b).decode()
+                self.assertNotIn("changed-sensitive-placeholder", serialized)
+                self.assertNotIn("sensitive-target", serialized)
+                self.assertNotIn("_bulkload_private_", serialized)
+                self.assertFalse(
+                    any(field.startswith("_bulkload_private_") for field in record)
+                )
+
+                plan = compile_plan(
+                    source_a, source_b, capture_snapshot(destination, "repo")
+                )
+                self.assertFalse(plan["intent"]["ready"])
+                self.assertIn(
+                    "source-path-ineligible",
+                    {item["code"] for item in plan["intent"]["blockers"]},
+                )
+
     def test_sensitive_variants_and_symlink_mutations_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
