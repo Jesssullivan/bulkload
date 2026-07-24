@@ -9,7 +9,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 
-GF_REV = "eb50ca7da6cce315867de963bef2184cfd924b26"
+GF_REV = "693574567f9b879486782f1fb7f432c54a2fe294"
 CHECKOUT_REV = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 EXPECTED_SHA_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
@@ -233,8 +233,21 @@ def validate_workflow(workflow: str) -> None:
         raise ContractError("GloriousFlywheel action and devshell must share one pin")
     if re.search(r"(?m)^\s+BAZEL_BIN:\s*bazel\s*$", workflow) is None:
         raise ContractError("CI must select the Bazel shim exposed by GF #ci")
-    if 'push-cache: "false"' not in workflow:
-        raise ContractError("Attic publication must remain disabled")
+    public_read_contract = (
+        '          attic-enabled: "true"',
+        '          attic-public-key: "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="',
+        '          attic-public-read-only: "true"',
+        '          attic-public-read-site: "bulkload-ci"',
+        '          push-cache: "false"',
+        '          require-cache-push: "false"',
+    )
+    for declaration in public_read_contract:
+        if workflow.count(declaration) != 1:
+            raise ContractError(
+                f"CI must declare the exact token-free Attic contract: {declaration.strip()}"
+            )
+    if "ATTIC_TOKEN" in workflow or "secrets." in workflow:
+        raise ContractError("pull-request CI must not reference cache credentials")
     upload_gate = (
         "GF_BAZEL_REMOTE_UPLOAD: "
         "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
@@ -358,6 +371,36 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(
                 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
                 "run: git rev-parse HEAD",
+            ),
+        ]
+        for unsafe in unsafe_variants:
+            with self.assertRaises(ContractError):
+                validate_workflow(unsafe)
+
+    def test_attic_public_read_regressions_fail_closed(self) -> None:
+        unsafe_variants = [
+            self.workflow.replace(
+                'attic-public-read-only: "true"',
+                'attic-public-read-only: "false"',
+            ),
+            self.workflow.replace(
+                'attic-public-read-site: "bulkload-ci"',
+                'attic-public-read-site: ""',
+            ),
+            self.workflow.replace(
+                'attic-public-key: "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="',
+                'attic-public-key: ""',
+            ),
+            self.workflow.replace('attic-enabled: "true"', 'attic-enabled: "false"'),
+            self.workflow.replace('push-cache: "false"', 'push-cache: "true"'),
+            self.workflow.replace(
+                'require-cache-push: "false"',
+                'require-cache-push: "true"',
+            ),
+            self.workflow.replace(
+                "    env:",
+                "    env:\n      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}",
+                1,
             ),
         ]
         for unsafe in unsafe_variants:

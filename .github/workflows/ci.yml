@@ -38,10 +38,15 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: GloriousFlywheel cache-first validation
-        uses: tinyland-inc/GloriousFlywheel/.github/actions/nix-job@eb50ca7da6cce315867de963bef2184cfd924b26
+        uses: tinyland-inc/GloriousFlywheel/.github/actions/nix-job@693574567f9b879486782f1fb7f432c54a2fe294
         with:
+          attic-enabled: "true"
+          attic-public-key: "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
+          attic-public-read-only: "true"
+          attic-public-read-site: "bulkload-ci"
           push-cache: "false"
+          require-cache-push: "false"
           command: |
             test -n "${BAZEL_REMOTE_CACHE:-}"
             test "${GF_BAZEL_SUBSTRATE_MODE:-}" = shared-cache-backed
-            nix develop github:tinyland-inc/GloriousFlywheel/eb50ca7da6cce315867de963bef2184cfd924b26#ci -c just ci
+            nix develop github:tinyland-inc/GloriousFlywheel/693574567f9b879486782f1fb7f432c54a2fe294#ci -c just ci

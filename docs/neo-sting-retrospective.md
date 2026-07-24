@@ -1,6 +1,6 @@
 # Neo to Sting one-off sync retrospective
 
-Evidence cutoff: 2026-07-23. Classification: `DONE_WITH_CONCERNS`.
+Evidence cutoff: 2026-07-24. Classification: `DONE_WITH_CONCERNS`.
 
 ## Outcome
 
@@ -73,7 +73,7 @@ ownership distinctions.
   TODO, and boundary payloads without tool calls. This proved live auth,
   persistence, lookup, and dialog continuity.
 
-### July 22–23: exact active-lane convergence
+### July 22–24: exact active-lane convergence
 
 - The Sting clean lane was initially at `e5ea08104a462d84df158c004554100735df0a7a`
   while live remote and Neo had advanced four commits.
@@ -83,12 +83,18 @@ ownership distinctions.
   `0d7654791cef4b6f533b661eb029738408d85369`
   (`fix(sync): type non-linux inventory iterator`). A second targeted fetch and
   `merge --ff-only` moved only the clean Sting lane to that exact head.
-- Current dated proof: Neo and Sting are both clean at that exact branch and
-  HEAD, `0/0` from their branch upstream. Live `origin/main` is an ancestor and
-  the branch is twenty-one commits ahead. Draft PR #565 exists and exact head
-  `0d765479` has eleven green checks, but every check ran on GitHub-hosted
-  runners rather than the sanctioned GloriousFlywheel ARC pools. Those checks
-  are not durable CI authority; the lane remains source-only/digestless.
+- The branch subsequently advanced through signed catalog-writer,
+  finalization, and composed-main checkpoints to
+  `854d52802881aa6ec72a9685ea8c9622745f4ed5`.
+- Current dated proof: Sting is clean and exactly `0/0` from the branch
+  upstream at `854d528`; GitHub verifies the signature. Live `main` is an
+  ancestor and draft PR #565 is twenty-eight commits ahead.
+- Exact-head durable CI is still absent. Five `tinyland-nix` jobs and one
+  `tinyland-dind` job have remained queued without an assigned runner since
+  2026-07-23T22:38:02Z. The only `ubuntu-24.04` matrix surface is skipped and
+  did not execute. Two Darwin-held jobs deliberately fail when scheduled, so
+  restoring listeners alone cannot make the PR green. The lane remains
+  source-only/digestless.
 
 ## Current classification manifest
 
@@ -99,7 +105,7 @@ ownership distinctions.
 - Sting:
   `/srv/fast-local/jess/git/tummycrypt.worktrees/tin2864-root-plan`
 - Branch: `codex/tin-2864-root-plan-20260719`
-- HEAD: `0d7654791cef4b6f533b661eb029738408d85369`
+- HEAD: `854d52802881aa6ec72a9685ea8c9622745f4ed5`
 - State: clean, exact, and remote-backed. The signature is valid on Neo and
   GitHub; Sting's local verifier lacks the public key.
 - Constraint: never copy either linked worktree's host-specific `.git` pointer.
@@ -237,13 +243,13 @@ Done now:
 
 Remaining concerns, explicitly deferred:
 
-- supersede the retained clean-lane handoff text with `0d765479` in the active
+- supersede the retained clean-lane handoff text with `854d528` in the active
   Sting conversation before frontier work;
 - durable default `umask 077` rather than per-launch discipline;
 - nonfatal MCP connectivity/login warnings;
 - Sting public GPG verification-key availability;
-- GloriousFlywheel-backed durable TIN-2864 CI and independent exact-head source
-  review;
+- GloriousFlywheel-backed durable TIN-2864 CI, TIN-2998 Darwin authority, and
+  completion of the in-progress independent exact-head source review;
 - attended Home Manager activation after its own gates;
 - separate credential rotation/containment; and
 - TCFS runtime and ceremony fences.
