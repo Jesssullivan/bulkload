@@ -34,21 +34,41 @@ establishes which is authoritative. Never overwrite the longer destination
 with a shorter source.
 
 Use `bulkload codex-capture` only after both Codex writers are quiescent. It
-hashes and validates rollout JSONL bytes, requires current-user regular files
-and directories that are not writable by group/other, binds the filename UUID
-to the first `session_meta` record, and records legacy group/world-readable
-source modes. Every proposed destination mode is still `0600`. It fails closed
-on unexpected files, duplicate UUIDs, symlinks, special files, writable or
-foreign authority, malformed JSONL, budget exhaustion, or an observed
-file/directory identity or byte change during its descriptor-pinned read.
-Pass A and pass B must have distinct capture IDs and identical catalogs.
+requires an explicit `source` or `destination` role plus the
+`--acknowledge-writers-quiesced` assertion and a canonical, non-secret
+`--host-authority-id`. Reuse one authority ID for every capture that can address
+the same physical filesystem namespace, including a renamed host or shared
+storage; use a different ID for an independent host-local namespace. Source
+evidence may record legacy group/world-readable files and directories, but
+nothing writable by group/other. Destination evidence requires exact `0600`
+files under exact `0700` directories. Regular files must be current-user,
+single-link, and non-symlink.
 
-Use `bulkload codex-plan` to compare the stable source catalog with one
-destination catalog. Its only positive proposal is `copy-if-absent` for a UUID
-missing from the destination. Same-UUID/same-hash is a no-op;
-destination-only is preserved; same-UUID/different-hash is a blocker. The v1
-adapter is deliberately dry-run-only and has no copy/apply operation. Keep its
-UUID-bearing evidence owner-private and outside both session roots.
+Capture uses strict UTF-8 JSON parsing: duplicate keys and non-finite values are
+invalid, the first record must be `session_meta`, exactly one such record may
+exist, and its canonical UUID must match the filename. It fails closed on
+unexpected files, duplicate or portable-colliding paths, special files,
+hardlinks, foreign authority, budget exhaustion, or an observed file,
+directory, subtree, or root-identity change. Every traversal, content, error,
+catalog, and output surface is bounded. Candidate files and their stable sizes
+are charged before JSON parsing, so malformed rollouts cannot multiply the
+configured file or byte allowance.
+
+Use `bulkload codex-plan` only with distinct source A/B and destination A/B
+captures. Each pair must have identical catalog bodies, hosts, roots, roles,
+filesystem identities, typed directory claims, root lineage, authority IDs,
+and budgets; all writers must be acknowledged quiescent. Within one host
+authority, equal or nested source and destination roots are rejected through
+their resolved paths and recorded lineage. Its only positive proposal is
+`copy-if-absent` for a UUID missing from the destination.
+Same-UUID/same-hash is a no-op; destination-only is preserved;
+same-UUID/different-hash and cross-input portable file/file, file/directory, or
+ancestor-prefix collisions are blockers. One blocker suppresses every copy
+candidate. Snapshot and plan artifacts use the Codex v2 schemas. Inputs must be
+exact `0600`, current-user, single-link regular files; the CLI pins them and a
+private output parent until the atomic rename. The adapter remains
+dry-run-only and has no copy/apply operation. Keep its UUID-bearing evidence
+owner-private and outside both session roots.
 
 Compaction is a semantic boundary: raw historical bytes may remain in JSONL
 while the resumed model receives only the newest replacement history. A

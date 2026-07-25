@@ -317,11 +317,37 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
 The v1 CLI implements repository catalogs and content plans. Its first
 provider-specific extension is a read-only Codex rollout catalog and
 collision-gated absent-only UUID union plan. It validates JSONL identity and
-current-user ownership, rejects files writable by group or other, and requires
-two byte-stable source passes, but deliberately exposes no session apply
-command. Claude, Pi, provider indexes, history, memory, and authentication
-remain procedural follow-ups because their formats and refresh semantics change
-independently.
+current-user ownership, rejects hardlinks and files writable by group or other,
+and requires explicit writer quiescence plus two byte-stable observations of
+both the source and destination. Destination custody is stricter than legacy
+source evidence: every destination rollout must be exactly `0600` beneath
+exactly `0700` directories.
+
+The Codex snapshot and plan use v2 schemas. Each capture binds a non-secret,
+operator-assigned host-authority UUID to the resolved root, its device/inode
+lineage, and typed directory records. One authority ID names one physical
+filesystem namespace even when a hostname changes or storage is shared; an
+independent namespace receives a different ID.
+
+The scanner holds descriptor authority while traversing, rejects duplicate
+JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
+`session_meta`, and revalidates the resolved root, lineage, and every completed
+directory after the scan. Candidate file count and stable size are reserved
+before parsing, so malformed content cannot multiply the aggregate limits.
+Entry, directory, record, path, catalog, error, and output budgets make
+incomplete discovery explicit.
+
+Planning compares exact catalog bodies rather than trusting a digest alone.
+Within one host authority, equal or ancestor/descendant roots are rejected by
+resolved path and recorded lineage. Directory claims close the namespace before
+classification: same-UUID byte divergence and portable file/file,
+file/directory, or ancestor-prefix collisions are blockers, and any blocker
+suppresses all copy candidates. Codex planning reads bounded exact-`0600`
+single-link evidence through pinned descriptors, revalidates it before output,
+and writes through a pinned private output directory. The extension
+deliberately exposes no session apply command. Claude, Pi, provider indexes,
+history, memory, and authentication remain procedural follow-ups because their
+formats and refresh semantics change independently.
 
 ## 8. Relationship to TCFS
 
@@ -349,20 +375,22 @@ legacy importer and audit adapter rather than remain a second sync system.
 
 ## 9. Threat model
 
-Primary hazards are source mutation during capture, path traversal, symlink
-escape or payload disclosure, incomplete reachable Git objects, omitted
+Primary hazards are source or destination mutation during capture, path
+traversal, symlink or hardlink aliasing, payload disclosure, incomplete
+reachable Git objects, omitted
 reflog/pseudo-ref recovery roots, unsafe remote
 helpers, case-folding collisions, stale remote refs, filename encoding,
 AppleDouble sidecars, unbounded ignored trees, secret-bearing untracked files,
 concurrent destination edits, partial transfer, and false confidence from a
 green transport exit code.
 
-V1 mitigations are canonical sorted catalogs, the A/B barrier, no content in
-manifests, path normalization, a v1 block on symlink mutations, sensitive-path
-blocks re-enforced during plan validation, no deletion, pre-copy source rehash,
-external backups, atomic replacement, durable journal/directory entries, fresh
-verification, evidence outputs that neither overlap captured roots nor alias
-their input artifacts, and explicit incomplete/error states. Cross-filesystem
+V1 mitigations are canonical sorted catalogs, role-specific A/B barriers, no
+content in manifests, path normalization, a v1 block on symlink mutations,
+sensitive-path blocks re-enforced during plan validation, no deletion,
+pre-copy source rehash, external backups, atomic replacement, durable
+journal/directory entries, fresh verification, Codex evidence inputs and output
+parents pinned across final rename, pathname overlap guards for the repository
+adapter, and explicit incomplete/error states. Cross-filesystem
 atomicity, ACL/xattr fidelity, sparse files, hardlink identity, special files,
 case-insensitive collisions, submodule worktrees, and live concurrent writers
 remain blockers or follow-up work.

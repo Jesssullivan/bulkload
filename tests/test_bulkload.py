@@ -50,6 +50,9 @@ from bulkload_lib.sessions import (  # noqa: E402
     validate_codex_session_snapshot,
 )
 
+TEST_HOST_AUTHORITY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OTHER_HOST_AUTHORITY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
 
 def git(repo: Path, *arguments: str) -> str:
     process = subprocess.run(
@@ -157,6 +160,33 @@ def write_codex_rollout(
     return path
 
 
+def capture_codex(
+    root: Path,
+    *,
+    role: str = "source",
+    host_authority_id: str = TEST_HOST_AUTHORITY_ID,
+    **budgets: int,
+) -> dict:
+    return capture_codex_sessions(
+        root,
+        role=role,
+        acknowledge_writers_quiesced=True,
+        host_authority_id=host_authority_id,
+        **budgets,
+    )
+
+
+def refresh_codex_snapshot(snapshot: dict) -> None:
+    catalog = {
+        "directories": snapshot["directories"],
+        "sessions": snapshot["sessions"],
+        "non_private_file_count": snapshot["non_private_file_count"],
+        "non_private_directory_count": snapshot["non_private_directory_count"],
+    }
+    snapshot["catalog_sha256"] = sha256_bytes(canonical_bytes(catalog))
+    snapshot["snapshot_sha256"] = object_digest(snapshot, "snapshot_sha256")
+
+
 class BulkloadProtocolTest(unittest.TestCase):
     def test_codex_session_union_is_stable_absent_only_and_preserving(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -171,9 +201,10 @@ class BulkloadProtocolTest(unittest.TestCase):
             write_codex_rollout(destination, common, message="same")
             write_codex_rollout(destination, destination_only, message="destination")
 
-            source_a = capture_codex_sessions(source)
-            source_b = capture_codex_sessions(source)
-            destination_capture = capture_codex_sessions(destination)
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
             validate_codex_session_snapshot(source_a)
             self.assertTrue(source_a["complete"], source_a["errors"])
             self.assertNotEqual(source_a["capture_id"], source_b["capture_id"])
@@ -181,7 +212,10 @@ class BulkloadProtocolTest(unittest.TestCase):
             self.assertEqual(source_a["non_private_file_count"], 2)
 
             plan = compile_codex_session_union_plan(
-                source_a, source_b, destination_capture
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
             )
             self.assertTrue(plan["intent"]["ready_for_attended_copy"])
             self.assertEqual(
@@ -212,9 +246,10 @@ class BulkloadProtocolTest(unittest.TestCase):
             write_codex_rollout(destination, session_id, message="destination tail")
 
             plan = compile_codex_session_union_plan(
-                capture_codex_sessions(source),
-                capture_codex_sessions(source),
-                capture_codex_sessions(destination),
+                capture_codex(source),
+                capture_codex(source),
+                capture_codex(destination, role="destination"),
+                capture_codex(destination, role="destination"),
             )
             self.assertFalse(plan["intent"]["ready_for_attended_copy"])
             self.assertEqual(
@@ -232,7 +267,7 @@ class BulkloadProtocolTest(unittest.TestCase):
             write_codex_rollout(root, session_id)
             (root / "unexpected.db").write_bytes(b"not portable")
             (root / "unexpected.db").chmod(0o600)
-            incomplete = capture_codex_sessions(root)
+            incomplete = capture_codex(root)
             self.assertFalse(incomplete["complete"])
             self.assertTrue(
                 any(
@@ -241,7 +276,7 @@ class BulkloadProtocolTest(unittest.TestCase):
             )
 
             (root / "unexpected.db").unlink()
-            bounded = capture_codex_sessions(root, max_record_bytes=8)
+            bounded = capture_codex(root, max_record_bytes=8)
             self.assertFalse(bounded["complete"])
             self.assertTrue(
                 any(
@@ -250,15 +285,15 @@ class BulkloadProtocolTest(unittest.TestCase):
                 )
             )
             write_codex_rollout(root, session_id, mode=0o620)
-            writable = capture_codex_sessions(root)
+            writable = capture_codex(root)
             self.assertFalse(writable["complete"])
             self.assertTrue(
                 any("non-writable-by-others" in error for error in writable["errors"])
             )
             write_codex_rollout(root, session_id)
-            first = capture_codex_sessions(root)
+            first = capture_codex(root)
             write_codex_rollout(root, session_id, message="changed")
-            second = capture_codex_sessions(root)
+            second = capture_codex(root)
             destination = Path(directory) / "destination"
             write_codex_rollout(
                 destination,
@@ -268,7 +303,8 @@ class BulkloadProtocolTest(unittest.TestCase):
                 compile_codex_session_union_plan(
                     first,
                     second,
-                    capture_codex_sessions(destination),
+                    capture_codex(destination, role="destination"),
+                    capture_codex(destination, role="destination"),
                 )
 
     def test_codex_capture_cli_forwards_record_budget(self) -> None:
@@ -289,6 +325,11 @@ class BulkloadProtocolTest(unittest.TestCase):
                         str(sessions),
                         "--output",
                         str(output),
+                        "--role",
+                        "source",
+                        "--acknowledge-writers-quiesced",
+                        "--host-authority-id",
+                        TEST_HOST_AUTHORITY_ID,
                         "--max-record-bytes",
                         "8",
                     ]
@@ -303,6 +344,307 @@ class BulkloadProtocolTest(unittest.TestCase):
                     for error in snapshot["errors"]
                 )
             )
+
+    def test_codex_capture_never_creates_evidence_inside_failed_root(self) -> None:
+        for case in ("missing", "symlink", "invalid-custody"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                sessions = parent / "sessions"
+                if case == "symlink":
+                    actual = parent / "actual"
+                    actual.mkdir(mode=0o700)
+                    sessions.symlink_to(actual, target_is_directory=True)
+                elif case == "invalid-custody":
+                    sessions.mkdir(mode=0o700)
+                    sessions.chmod(0o733)
+                output = sessions / "capture.json"
+
+                with (
+                    redirect_stderr(io.StringIO()),
+                    mock.patch("sys.stdout", new=io.StringIO()),
+                ):
+                    result = cli_main(
+                        [
+                            "codex-capture",
+                            "--root",
+                            str(sessions),
+                            "--output",
+                            str(output),
+                            "--role",
+                            "source",
+                            "--acknowledge-writers-quiesced",
+                            "--host-authority-id",
+                            TEST_HOST_AUTHORITY_ID,
+                        ]
+                    )
+
+                self.assertEqual(result, 2)
+                self.assertFalse(output.exists())
+                if case == "missing":
+                    self.assertFalse(sessions.exists())
+                elif case == "symlink":
+                    self.assertFalse((actual / "capture.json").exists())
+                    self.assertTrue(sessions.is_symlink())
+
+    def test_codex_plan_cli_requires_both_destination_captures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "77887788-7788-4788-8788-778877887788",
+            )
+            write_codex_rollout(
+                destination,
+                "77997799-7799-4799-8799-779977997799",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            output = evidence / "plan.json"
+
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            plan = read_json(output)
+            self.assertEqual(
+                plan["destination"]["capture_ids"],
+                [
+                    artifacts["destination-a"]["capture_id"],
+                    artifacts["destination-b"]["capture_id"],
+                ],
+            )
+
+    def test_codex_plan_cli_protects_local_roots_after_hostname_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "77aa77aa-77aa-47aa-87aa-77aa77aa77aa",
+            )
+            write_codex_rollout(
+                destination,
+                "77bb77bb-77bb-47bb-87bb-77bb77bb77bb",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for snapshot in artifacts.values():
+                snapshot["host"] = "prior-hostname.example.invalid"
+                refresh_codex_snapshot(snapshot)
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            output = source / "plan.json"
+
+            with (
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
+
+    def test_codex_plan_cli_rechecks_swapped_output_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            inside = source / "captured-empty-directory"
+            inside.mkdir(parents=True, mode=0o700)
+            source.chmod(0o700)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            output_parent = root / "output-parent"
+            output_parent.symlink_to(outside, target_is_directory=True)
+            write_codex_rollout(
+                source,
+                "77cc77cc-77cc-47cc-87cc-77cc77cc77cc",
+            )
+            write_codex_rollout(
+                destination,
+                "77dd77dd-77dd-47dd-87dd-77dd77dd77dd",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            output = output_parent / "plan.json"
+            real_compile = compile_codex_session_union_plan
+            swapped = False
+
+            def swap_parent(*args: object, **kwargs: object) -> dict:
+                nonlocal swapped
+                plan = real_compile(*args, **kwargs)
+                output_parent.unlink()
+                output_parent.symlink_to(inside, target_is_directory=True)
+                swapped = True
+                return plan
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli.compile_codex_session_union_plan",
+                    side_effect=swap_parent,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, 2)
+            self.assertFalse((inside / "plan.json").exists())
+
+    def test_codex_plan_cli_revalidates_pinned_inputs_before_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "77ee77ee-77ee-47ee-87ee-77ee77ee77ee",
+            )
+            write_codex_rollout(
+                destination,
+                "77ff77ff-77ff-47ff-87ff-77ff77ff77ff",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            source_a_path = evidence / "source-a.json"
+            output = evidence / "plan.json"
+            real_compile = compile_codex_session_union_plan
+            replaced = False
+
+            def replace_input(*args: object, **kwargs: object) -> dict:
+                nonlocal replaced
+                plan = real_compile(*args, **kwargs)
+                atomic_write_json(source_a_path, artifacts["source-a"])
+                replaced = True
+                return plan
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli.compile_codex_session_union_plan",
+                    side_effect=replace_input,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(source_a_path),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(replaced)
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
 
     def test_repo_capture_cli_does_not_require_session_record_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,7 +721,7 @@ class BulkloadProtocolTest(unittest.TestCase):
                 "_open_directory",
                 side_effect=swap_before_open,
             ):
-                snapshot = capture_codex_sessions(sessions)
+                snapshot = capture_codex(sessions)
 
             self.assertTrue(raced)
             self.assertFalse(snapshot["complete"])
@@ -407,7 +749,7 @@ class BulkloadProtocolTest(unittest.TestCase):
                 "_capture_rollout",
                 side_effect=report_larger_capture,
             ):
-                snapshot = capture_codex_sessions(
+                snapshot = capture_codex(
                     sessions,
                     max_bytes=max_bytes,
                 )
@@ -419,6 +761,57 @@ class BulkloadProtocolTest(unittest.TestCase):
                 any("byte budget exceeded" in error for error in snapshot["errors"])
             )
 
+    def test_codex_capture_charges_malformed_candidates_to_file_and_byte_budgets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            first = write_codex_rollout(
+                sessions,
+                "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a",
+                day="2026/07/24",
+            )
+            second = write_codex_rollout(
+                sessions,
+                "9b9b9b9b-9b9b-4b9b-8b9b-9b9b9b9b9b9b",
+                day="2026/07/25",
+            )
+            for rollout in (first, second):
+                payload = rollout.read_bytes()
+                self.assertTrue(payload.endswith(b"}\n"))
+                rollout.write_bytes(payload[:-2] + b"!\n")
+
+            byte_bounded = capture_codex(
+                sessions,
+                max_bytes=first.stat().st_size,
+            )
+            self.assertFalse(byte_bounded["complete"])
+            self.assertTrue(
+                any(
+                    "total byte budget exceeded" in error
+                    for error in byte_bounded["errors"]
+                )
+            )
+            self.assertEqual(
+                sum("strict UTF-8 JSONL" in error for error in byte_bounded["errors"]),
+                1,
+            )
+
+            file_bounded = capture_codex(
+                sessions,
+                max_files=1,
+                max_bytes=first.stat().st_size + second.stat().st_size,
+            )
+            self.assertFalse(file_bounded["complete"])
+            self.assertTrue(
+                any("file budget exceeded" in error for error in file_bounded["errors"])
+            )
+            self.assertEqual(
+                sum("strict UTF-8 JSONL" in error for error in file_bounded["errors"]),
+                1,
+            )
+
     def test_codex_snapshot_rejects_path_uuid_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sessions = Path(directory) / "sessions"
@@ -426,7 +819,7 @@ class BulkloadProtocolTest(unittest.TestCase):
                 sessions,
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             )
-            snapshot = capture_codex_sessions(sessions)
+            snapshot = capture_codex(sessions)
             snapshot["sessions"][0]["relative_path"] = (
                 "2026/07/24/"
                 "rollout-2026-07-24T00-00-00-bbbbbbbb-bbbb-4bbb-8bbb-"
@@ -448,6 +841,666 @@ class BulkloadProtocolTest(unittest.TestCase):
                 "record identity is invalid",
             ):
                 validate_codex_session_snapshot(snapshot)
+
+    def test_codex_capture_requires_explicit_quiescence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "writer-quiescence acknowledgement",
+            ):
+                capture_codex_sessions(
+                    Path(directory) / "sessions",
+                    role="source",
+                    acknowledge_writers_quiesced=False,
+                    host_authority_id=TEST_HOST_AUTHORITY_ID,
+                )
+
+    def test_codex_destination_requires_private_files_and_directories(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_root = root / "file-mode"
+            write_codex_rollout(
+                file_root,
+                "abababab-abab-4bab-8bab-abababababab",
+                mode=0o644,
+            )
+            file_capture = capture_codex(file_root, role="destination")
+            self.assertFalse(file_capture["complete"])
+            self.assertTrue(
+                any("exactly 0600" in error for error in file_capture["errors"])
+            )
+
+            directory_root = root / "directory-mode"
+            write_codex_rollout(
+                directory_root,
+                "acacacac-acac-4cac-8cac-acacacacacac",
+            )
+            (directory_root / "2026").chmod(0o755)
+            directory_capture = capture_codex(
+                directory_root,
+                role="destination",
+            )
+            self.assertFalse(directory_capture["complete"])
+            self.assertTrue(
+                any("exactly 0700" in error for error in directory_capture["errors"])
+            )
+
+    def test_codex_plan_requires_stable_destination_pair_and_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            write_codex_rollout(
+                source,
+                "adadadad-adad-4dad-8dad-adadadadadad",
+            )
+            destination_id = "aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae"
+            write_codex_rollout(destination, destination_id, message="first")
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            write_codex_rollout(destination, destination_id, message="second")
+            destination_b = capture_codex(destination, role="destination")
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "destination pass A and pass B differ",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+
+            wrong_role_a = capture_codex(destination)
+            wrong_role_b = capture_codex(destination)
+            with self.assertRaisesRegex(BulkloadError, "wrong role"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    wrong_role_a,
+                    wrong_role_b,
+                )
+
+            stable_destination_a = capture_codex(
+                destination,
+                role="destination",
+            )
+            empty = destination / "empty-directory"
+            empty.mkdir(mode=0o700)
+            stable_destination_b = capture_codex(
+                destination,
+                role="destination",
+            )
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "destination pass A and pass B differ",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    stable_destination_a,
+                    stable_destination_b,
+                )
+
+    def test_codex_stability_barrier_compares_catalog_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "aeeeeeee-aeee-4eee-8eee-aeeeeeeeeeee",
+            )
+            source_a = capture_codex(sessions)
+            source_b = capture_codex(sessions)
+            source_b["sessions"][0]["sha256"] = "f" * 64
+            forced_digest = "e" * 64
+            for snapshot in (source_a, source_b):
+                snapshot["catalog_sha256"] = forced_digest
+                snapshot["snapshot_sha256"] = object_digest(
+                    snapshot,
+                    "snapshot_sha256",
+                )
+
+            with (
+                mock.patch.object(
+                    session_catalogs,
+                    "sha256_bytes",
+                    return_value=forced_digest,
+                ),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "source pass A and pass B differ",
+                ),
+            ):
+                session_catalogs._validate_stable_capture_pair(
+                    source_a,
+                    source_b,
+                    role="source",
+                )
+
+    def test_codex_plan_requires_four_distinct_capture_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            write_codex_rollout(
+                source,
+                "afafafaf-afaf-4faf-8faf-afafafafafaf",
+            )
+            write_codex_rollout(
+                destination,
+                "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
+            )
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            destination_a["capture_id"] = source_a["capture_id"]
+            refresh_codex_snapshot(destination_a)
+
+            with self.assertRaisesRegex(BulkloadError, "four distinct"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+
+    def test_codex_plan_rejects_same_root_through_ancestor_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real"
+            sessions = real_parent / "sessions"
+            alias_parent = root / "alias"
+            write_codex_rollout(
+                sessions,
+                "b0c0b0c0-b0c0-40c0-80c0-b0c0b0c0b0c0",
+            )
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            aliased_sessions = alias_parent / "sessions"
+
+            source_a = capture_codex(sessions)
+            source_b = capture_codex(sessions)
+            destination_a = capture_codex(
+                aliased_sessions,
+                role="destination",
+            )
+            destination_b = capture_codex(
+                aliased_sessions,
+                role="destination",
+            )
+
+            self.assertNotEqual(source_a["root"], destination_a["root"])
+            self.assertEqual(
+                source_a["root_identity"],
+                destination_a["root_identity"],
+            )
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "source and destination must differ",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+
+    def test_codex_plan_rejects_nested_root_custody(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sessions"
+            destination = source / "nested-destination"
+            write_codex_rollout(
+                source,
+                "b0d0b0d0-b0d0-40d0-80d0-b0d0b0d0b0d0",
+                day="2026/07/24",
+            )
+            write_codex_rollout(
+                destination,
+                "b0e0b0e0-b0e0-40e0-80e0-b0e0b0e0b0e0",
+                day="2026/07/25",
+            )
+
+            with self.assertRaisesRegex(BulkloadError, "roots overlap"):
+                compile_codex_session_union_plan(
+                    capture_codex(source),
+                    capture_codex(source),
+                    capture_codex(destination, role="destination"),
+                    capture_codex(destination, role="destination"),
+                )
+
+    def test_codex_plan_rejects_same_custody_after_hostname_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "b0f0b0f0-b0f0-40f0-80f0-b0f0b0f0b0f0",
+            )
+            source_a = capture_codex(sessions)
+            source_b = capture_codex(sessions)
+            destination_a = capture_codex(sessions, role="destination")
+            destination_b = capture_codex(sessions, role="destination")
+            for snapshot in (destination_a, destination_b):
+                snapshot["host"] = "renamed-host.example.invalid"
+                refresh_codex_snapshot(snapshot)
+
+            with self.assertRaisesRegex(BulkloadError, "roots overlap"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+
+    def test_codex_plan_scopes_equal_root_identity_by_host_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "b1a1b1a1-b1a1-41a1-81a1-b1a1b1a1b1a1",
+            )
+            plan = compile_codex_session_union_plan(
+                capture_codex(sessions),
+                capture_codex(sessions),
+                capture_codex(
+                    sessions,
+                    role="destination",
+                    host_authority_id=OTHER_HOST_AUTHORITY_ID,
+                ),
+                capture_codex(
+                    sessions,
+                    role="destination",
+                    host_authority_id=OTHER_HOST_AUTHORITY_ID,
+                ),
+            )
+
+            self.assertTrue(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(plan["intent"]["copy_if_absent"], [])
+            self.assertEqual(
+                plan["source"]["host_authority_id"],
+                TEST_HOST_AUTHORITY_ID,
+            )
+            self.assertEqual(
+                plan["destination"]["host_authority_id"],
+                OTHER_HOST_AUTHORITY_ID,
+            )
+
+    def test_codex_any_blocker_suppresses_all_copy_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            divergent = "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1"
+            absent = "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2"
+            write_codex_rollout(source, divergent, message="source")
+            write_codex_rollout(source, absent, message="absent")
+            write_codex_rollout(
+                destination,
+                divergent,
+                message="destination",
+            )
+
+            plan = compile_codex_session_union_plan(
+                capture_codex(source),
+                capture_codex(source),
+                capture_codex(destination, role="destination"),
+                capture_codex(destination, role="destination"),
+            )
+
+            self.assertFalse(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(plan["intent"]["copy_if_absent"], [])
+            self.assertEqual(
+                [item["code"] for item in plan["intent"]["blockers"]],
+                ["same-uuid-different-bytes"],
+            )
+
+    def test_codex_cross_input_path_collision_is_a_global_blocker(self) -> None:
+        source = [
+            {
+                "session_id": "b3b3b3b3-b3b3-43b3-83b3-b3b3b3b3b3b3",
+                "relative_path": "Day/Rollout.jsonl",
+                "sha256": "1" * 64,
+                "size": 1,
+                "mode": "0600",
+                "records": 1,
+            },
+            {
+                "session_id": "b4b4b4b4-b4b4-44b4-84b4-b4b4b4b4b4b4",
+                "relative_path": "other/rollout.jsonl",
+                "sha256": "2" * 64,
+                "size": 1,
+                "mode": "0600",
+                "records": 1,
+            },
+        ]
+        destination = [
+            {
+                "session_id": "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5",
+                "relative_path": "day/rollout.jsonl",
+                "sha256": "3" * 64,
+                "size": 1,
+                "mode": "0600",
+                "records": 1,
+            }
+        ]
+
+        classified = session_catalogs._classify_codex_session_union(
+            source,
+            destination,
+            [],
+            [],
+        )
+
+        self.assertEqual(classified["copy_if_absent"], [])
+        self.assertEqual(
+            [item["code"] for item in classified["blockers"]],
+            ["relative-path-namespace-collision"],
+        )
+
+    def test_codex_plan_blocks_file_directory_namespace_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source_rollout = write_codex_rollout(
+                source,
+                "b5c5b5c5-b5c5-45c5-85c5-b5c5b5c5b5c5",
+            )
+            occupied = destination / source_rollout.relative_to(source)
+            occupied.mkdir(parents=True, mode=0o700)
+            destination.chmod(0o700)
+            current = destination
+            for component in occupied.relative_to(destination).parts:
+                current /= component
+                current.chmod(0o700)
+
+            plan = compile_codex_session_union_plan(
+                capture_codex(source),
+                capture_codex(source),
+                capture_codex(destination, role="destination"),
+                capture_codex(destination, role="destination"),
+            )
+
+            self.assertFalse(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(plan["intent"]["copy_if_absent"], [])
+            self.assertEqual(
+                [item["code"] for item in plan["intent"]["blockers"]],
+                ["relative-path-type-collision"],
+            )
+
+            prefix_source = root / "prefix-source"
+            prefix_destination = root / "prefix-destination"
+            ancestor_id = "b5d5b5d5-b5d5-45d5-85d5-b5d5b5d5b5d5"
+            ancestor = write_codex_rollout(
+                prefix_destination,
+                ancestor_id,
+                day="",
+            )
+            write_codex_rollout(
+                prefix_source,
+                "b5e5b5e5-b5e5-45e5-85e5-b5e5b5e5b5e5",
+                day=ancestor.name,
+            )
+
+            prefix_plan = compile_codex_session_union_plan(
+                capture_codex(prefix_source),
+                capture_codex(prefix_source),
+                capture_codex(prefix_destination, role="destination"),
+                capture_codex(prefix_destination, role="destination"),
+            )
+            self.assertFalse(prefix_plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(prefix_plan["intent"]["copy_if_absent"], [])
+            self.assertEqual(
+                [item["code"] for item in prefix_plan["intent"]["blockers"]],
+                ["relative-path-type-collision"],
+            )
+
+    def test_codex_capture_rejects_strict_json_and_identity_violations(
+        self,
+    ) -> None:
+        cases = {
+            "duplicate": (
+                b'{"type":"session_meta","type":"session_meta","payload":{"id":"%s"}}\n'
+            ),
+            "nonfinite": (
+                b'{"type":"session_meta","payload":{"id":"%s"},"value":NaN}\n'
+            ),
+            "overflow": (
+                b'{"type":"session_meta","payload":{"id":"%s"},"value":1e999}\n'
+            ),
+            "not-first": b'{"type":"event_msg","payload":{"id":"%s"}}\n',
+            "noncanonical": (b'{"type":"session_meta","payload":{"id":"%s"}}\n'),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (name, template) in enumerate(cases.items(), start=1):
+                session_id = f"b6b6b6b{index}-b6b6-46b6-86b6-b6b6b6b6b6b6"
+                case_root = root / name
+                rollout = write_codex_rollout(case_root, session_id)
+                embedded_id = (
+                    session_id.upper() if name == "noncanonical" else session_id
+                )
+                rollout.write_bytes(template % embedded_id.encode("ascii"))
+                snapshot = capture_codex(case_root)
+                self.assertFalse(snapshot["complete"], name)
+
+            utf16_root = root / "utf16"
+            utf16_id = "b6c6b6c6-b6c6-46c6-86c6-b6c6b6c6b6c6"
+            utf16_rollout = write_codex_rollout(utf16_root, utf16_id)
+            utf16_record = (
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": utf16_id},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            utf16_rollout.write_bytes(b"\xfe\xff" + utf16_record.encode("utf-16-be"))
+            utf16_snapshot = capture_codex(utf16_root)
+            self.assertFalse(utf16_snapshot["complete"])
+            self.assertTrue(
+                any("strict UTF-8 JSONL" in error for error in utf16_snapshot["errors"])
+            )
+
+            duplicate_meta_root = root / "duplicate-meta"
+            duplicate_meta_id = "b7b7b7b7-b7b7-47b7-87b7-b7b7b7b7b7b7"
+            duplicate_meta = write_codex_rollout(
+                duplicate_meta_root,
+                duplicate_meta_id,
+            )
+            meta = (
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": duplicate_meta_id},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            duplicate_meta.write_text(meta + meta, encoding="utf-8")
+            snapshot = capture_codex(duplicate_meta_root)
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any("multiple session_meta" in error for error in snapshot["errors"])
+            )
+
+    def test_codex_capture_rejects_external_hardlink_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            rollout = write_codex_rollout(
+                sessions,
+                "b8b8b8b8-b8b8-48b8-88b8-b8b8b8b8b8b8",
+            )
+            os.link(rollout, root / "external-alias.jsonl")
+
+            snapshot = capture_codex(sessions)
+
+            self.assertFalse(snapshot["complete"])
+            self.assertEqual(snapshot["sessions"], [])
+            self.assertTrue(
+                any(
+                    "hardlinks are unsupported" in error for error in snapshot["errors"]
+                )
+            )
+
+    def test_codex_capture_emits_valid_bounded_duplicate_uuid_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            session_id = "b8c8b8c8-b8c8-48c8-88c8-b8c8b8c8b8c8"
+            write_codex_rollout(sessions, session_id, day="2026/07/24")
+            write_codex_rollout(sessions, session_id, day="2026/07/25")
+
+            snapshot = capture_codex(sessions)
+
+            self.assertFalse(snapshot["complete"])
+            self.assertEqual(snapshot["sessions"], [])
+            self.assertTrue(
+                any(
+                    "duplicate Codex session UUID" in error
+                    for error in snapshot["errors"]
+                )
+            )
+            validate_codex_session_snapshot(snapshot)
+
+    def test_codex_capture_revalidates_root_path_after_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            displaced = root / "displaced"
+            write_codex_rollout(
+                sessions,
+                "b9b9b9b9-b9b9-49b9-89b9-b9b9b9b9b9b9",
+            )
+            real_capture = session_catalogs._capture_rollout
+            swapped = False
+
+            def swap_root(*args: object, **kwargs: object) -> dict:
+                nonlocal swapped
+                record = real_capture(*args, **kwargs)
+                if not swapped:
+                    sessions.rename(displaced)
+                    sessions.mkdir(mode=0o700)
+                    swapped = True
+                return record
+
+            with mock.patch.object(
+                session_catalogs,
+                "_capture_rollout",
+                side_effect=swap_root,
+            ):
+                snapshot = capture_codex(sessions)
+
+            self.assertTrue(swapped)
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any(
+                    "root path changed" in error
+                    or "root authority changed" in error
+                    or "root changed during capture" in error
+                    for error in snapshot["errors"]
+                )
+            )
+
+    def test_codex_capture_revalidates_closed_subtrees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "bab0bab0-bab0-4ab0-8ab0-bab0bab0bab0",
+            )
+            year = sessions / "2026"
+            real_open_relative = session_catalogs._open_relative_directory
+            mutated = False
+
+            def mutate_closed_subtree(
+                root_descriptor: int,
+                relative_path: str,
+            ) -> int:
+                nonlocal mutated
+                if relative_path == "2026" and not mutated:
+                    year.chmod(0o750)
+                    mutated = True
+                return real_open_relative(root_descriptor, relative_path)
+
+            with mock.patch.object(
+                session_catalogs,
+                "_open_relative_directory",
+                side_effect=mutate_closed_subtree,
+            ):
+                snapshot = capture_codex(sessions)
+
+            self.assertTrue(mutated)
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any("changed after its scan" in error for error in snapshot["errors"])
+            )
+
+    def test_codex_capture_enforces_traversal_record_and_error_budgets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            write_codex_rollout(
+                sessions,
+                "bbb1bbb1-bbb1-4bb1-8bb1-bbb1bbb1bbb1",
+            )
+            entries = capture_codex(sessions, max_entries=1)
+            self.assertFalse(entries["complete"])
+            self.assertTrue(
+                any("entry budget exceeded" in error for error in entries["errors"])
+            )
+
+            records = capture_codex(sessions, max_records_per_file=1)
+            self.assertFalse(records["complete"])
+            self.assertTrue(
+                any(
+                    "record-count budget exceeded" in error
+                    for error in records["errors"]
+                )
+            )
+
+            error_root = root / "errors"
+            error_root.mkdir(mode=0o700)
+            for name in ("a.db", "b.db"):
+                (error_root / name).write_bytes(b"x")
+                (error_root / name).chmod(0o600)
+            bounded_errors = capture_codex(error_root, max_errors=1)
+            self.assertFalse(bounded_errors["complete"])
+            self.assertEqual(len(bounded_errors["errors"]), 1)
+
+    def test_codex_capture_enforces_catalog_and_output_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "bbb2bbb2-bbb2-4bb2-8bb2-bbb2bbb2bbb2",
+            )
+            catalog = capture_codex(sessions, max_catalog_bytes=1)
+            self.assertFalse(catalog["complete"])
+            self.assertEqual(catalog["sessions"], [])
+            self.assertTrue(
+                any(
+                    "catalog byte budget exceeded" in error
+                    for error in catalog["errors"]
+                )
+            )
+
+            with self.assertRaisesRegex(BulkloadError, "bounded failure envelope"):
+                capture_codex(
+                    sessions,
+                    max_catalog_bytes=1,
+                    max_output_bytes=1,
+                )
 
     def test_stable_plan_apply_and_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

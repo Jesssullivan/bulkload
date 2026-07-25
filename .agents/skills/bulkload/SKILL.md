@@ -59,11 +59,12 @@ writer, so pass A and pass B must have the same `catalog_sha256`. Treat any
 scan error or budget exceedance as incomplete.
 
 Keep capture, plan, and verification evidence outside every local source and
-destination root. The CLI rejects overlapping file outputs so writing evidence
-cannot create new dirt after the claim it records. An output or apply receipt
-must also be distinct from every input evidence artifact; the CLI rejects
-aliases before mutation. When emitting `-` over SSH, redirect only to a
-controller-side path outside the controller's captured roots.
+destination root. The repository adapter rejects resolved overlaps and input
+aliases before mutation; that pathname guard does not replace private,
+quiescent evidence custody. The Codex adapter additionally pins bounded input
+descriptors and its private output directory through the final atomic rename.
+When emitting `-` over SSH, redirect only to a controller-side path outside the
+controller's captured roots.
 
 ## Capture the destination
 
@@ -88,33 +89,67 @@ untrusted hostname or path.
 ## Catalog a Codex session union
 
 Read [references/agent-context.md](references/agent-context.md), quiesce both
-Codex writers, and capture the source twice plus the destination once:
+Codex writers, and capture two distinct observations of each role:
 
 ```bash
 python3 scripts/bulkload.py codex-capture \
   --root /absolute/source/.codex/sessions \
+  --role source \
+  --host-authority-id 11111111-1111-4111-8111-111111111111 \
+  --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-source-a.json
 python3 scripts/bulkload.py codex-capture \
   --root /absolute/source/.codex/sessions \
+  --role source \
+  --host-authority-id 11111111-1111-4111-8111-111111111111 \
+  --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-source-b.json
 python3 scripts/bulkload.py codex-capture \
   --root /absolute/destination/.codex/sessions \
-  --output /secure/evidence/codex-destination.json
+  --role destination \
+  --host-authority-id 22222222-2222-4222-8222-222222222222 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-destination-a.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/destination/.codex/sessions \
+  --role destination \
+  --host-authority-id 22222222-2222-4222-8222-222222222222 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-destination-b.json
 python3 scripts/bulkload.py codex-plan \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
-  --destination /secure/evidence/codex-destination.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
   --output /secure/evidence/codex-union-plan.json
 ```
 
-The capture accepts only current-user regular rollout JSONL files that are not
-writable by group/other and whose first `session_meta` identity matches the
-filename. It records legacy group/world-readable source modes; every proposed
-destination mode remains `0600`. The plan proposes only destination-absent
-UUIDs, preserves destination-only sessions, and blocks every same-UUID byte
-divergence. It is a dry-run report: v1 intentionally has no Codex-session apply
-command. Never run it against active writers or treat path/size equality as
-content proof.
+Assign one non-secret canonical host-authority UUID to each filesystem
+namespace for this operation. Reuse it for every capture that can address the
+same physical namespace, including shared storage or a renamed host; use a
+different ID for an independent host-local namespace.
+
+Source capture accepts only current-user, single-link regular rollout JSONL
+files that are owner-readable and not writable by group/other. Destination
+capture additionally requires every file to be exactly `0600` and every
+directory to be exactly `0700`. Strict JSON parsing rejects duplicate keys and
+non-finite values; the first and only `session_meta` must carry the canonical
+UUID bound by the filename. Capture reserves every candidate file and its full
+stable size before parsing, bounds entries, directories, records, paths,
+errors, catalogs, and output, then revalidates the resolved root, root lineage,
+and every scanned directory.
+
+Planning requires four unique capture IDs, exact A/B catalog bodies for both
+roles, explicit quiescence, and distinct source/destination custody. Within one
+host authority it rejects equal, ancestor, descendant, symlinked, or bind-aliased
+roots from recorded filesystem lineage. It proposes only destination-absent
+UUIDs, preserves destination-only sessions, and blocks same-UUID byte
+divergence plus portable file/file, file/directory, and ancestor-prefix
+namespace collisions. Any blocker suppresses the complete copy candidate list.
+Codex evidence inputs must be owner-only, single-link regular files; the CLI
+pins them and the output directory through the final atomic rename. It is a
+dry-run report: v1 intentionally has no Codex-session apply command. Never run
+it against active writers or treat path/size equality as content proof.
 
 ## Compile and review the plan
 
