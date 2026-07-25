@@ -43,6 +43,12 @@ from bulkload_lib.scanner import (  # noqa: E402
     capture_git_runtime,
     capture_snapshot,
 )
+import bulkload_lib.sessions as session_catalogs  # noqa: E402
+from bulkload_lib.sessions import (  # noqa: E402
+    capture_codex_sessions,
+    compile_codex_session_union_plan,
+    validate_codex_session_snapshot,
+)
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -111,7 +117,338 @@ def make_pair(root: Path) -> tuple[Path, Path]:
     return source, destination
 
 
+def write_codex_rollout(
+    root: Path,
+    session_id: str,
+    *,
+    day: str = "2026/07/24",
+    message: str = "payload",
+    mode: int = 0o600,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    directory = root / day
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    current = root
+    for component in day.split("/"):
+        current /= component
+        current.chmod(0o700)
+    path = directory / f"rollout-2026-07-24T00-00-00-{session_id}.jsonl"
+    records = [
+        {
+            "timestamp": "2026-07-24T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": session_id},
+        },
+        {
+            "timestamp": "2026-07-24T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"message": message},
+        },
+    ]
+    path.write_text(
+        "".join(
+            json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(mode)
+    return path
+
+
 class BulkloadProtocolTest(unittest.TestCase):
+    def test_codex_session_union_is_stable_absent_only_and_preserving(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            common = "11111111-1111-4111-8111-111111111111"
+            source_only = "22222222-2222-4222-8222-222222222222"
+            destination_only = "33333333-3333-4333-8333-333333333333"
+            write_codex_rollout(source, common, message="same", mode=0o644)
+            write_codex_rollout(source, source_only, message="source", mode=0o644)
+            write_codex_rollout(destination, common, message="same")
+            write_codex_rollout(destination, destination_only, message="destination")
+
+            source_a = capture_codex_sessions(source)
+            source_b = capture_codex_sessions(source)
+            destination_capture = capture_codex_sessions(destination)
+            validate_codex_session_snapshot(source_a)
+            self.assertTrue(source_a["complete"], source_a["errors"])
+            self.assertNotEqual(source_a["capture_id"], source_b["capture_id"])
+            self.assertEqual(source_a["catalog_sha256"], source_b["catalog_sha256"])
+            self.assertEqual(source_a["non_private_file_count"], 2)
+
+            plan = compile_codex_session_union_plan(
+                source_a, source_b, destination_capture
+            )
+            self.assertTrue(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(
+                [item["session_id"] for item in plan["intent"]["copy_if_absent"]],
+                [source_only],
+            )
+            self.assertEqual(
+                [item["session_id"] for item in plan["intent"]["exact_common"]],
+                [common],
+            )
+            self.assertEqual(
+                [item["session_id"] for item in plan["intent"]["preserve_destination"]],
+                [destination_only],
+            )
+            self.assertEqual(
+                plan["intent"]["custody_findings"]["source_non_private_files"],
+                2,
+            )
+            self.assertEqual(plan["intent"]["blockers"], [])
+
+    def test_codex_session_union_blocks_same_uuid_different_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "44444444-4444-4444-8444-444444444444"
+            write_codex_rollout(source, session_id, message="source tail")
+            write_codex_rollout(destination, session_id, message="destination tail")
+
+            plan = compile_codex_session_union_plan(
+                capture_codex_sessions(source),
+                capture_codex_sessions(source),
+                capture_codex_sessions(destination),
+            )
+            self.assertFalse(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(
+                [item["code"] for item in plan["intent"]["blockers"]],
+                ["same-uuid-different-bytes"],
+            )
+            self.assertEqual(plan["intent"]["copy_if_absent"], [])
+
+    def test_codex_session_capture_fails_closed_on_unknown_or_moving_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions"
+            session_id = "55555555-5555-4555-8555-555555555555"
+            write_codex_rollout(root, session_id)
+            (root / "unexpected.db").write_bytes(b"not portable")
+            (root / "unexpected.db").chmod(0o600)
+            incomplete = capture_codex_sessions(root)
+            self.assertFalse(incomplete["complete"])
+            self.assertTrue(
+                any(
+                    "unexpected regular file" in error for error in incomplete["errors"]
+                )
+            )
+
+            (root / "unexpected.db").unlink()
+            bounded = capture_codex_sessions(root, max_record_bytes=8)
+            self.assertFalse(bounded["complete"])
+            self.assertTrue(
+                any(
+                    "record byte budget exceeded" in error
+                    for error in bounded["errors"]
+                )
+            )
+            write_codex_rollout(root, session_id, mode=0o620)
+            writable = capture_codex_sessions(root)
+            self.assertFalse(writable["complete"])
+            self.assertTrue(
+                any("non-writable-by-others" in error for error in writable["errors"])
+            )
+            write_codex_rollout(root, session_id)
+            first = capture_codex_sessions(root)
+            write_codex_rollout(root, session_id, message="changed")
+            second = capture_codex_sessions(root)
+            destination = Path(directory) / "destination"
+            write_codex_rollout(
+                destination,
+                "66666666-6666-4666-8666-666666666666",
+            )
+            with self.assertRaisesRegex(BulkloadError, "pass A and pass B differ"):
+                compile_codex_session_union_plan(
+                    first,
+                    second,
+                    capture_codex_sessions(destination),
+                )
+
+    def test_codex_capture_cli_forwards_record_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            output = root / "capture.json"
+            write_codex_rollout(
+                sessions,
+                "77777777-7777-4777-8777-777777777777",
+            )
+
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                result = cli_main(
+                    [
+                        "codex-capture",
+                        "--root",
+                        str(sessions),
+                        "--output",
+                        str(output),
+                        "--max-record-bytes",
+                        "8",
+                    ]
+                )
+
+            self.assertEqual(result, 3)
+            snapshot = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(snapshot["complete"])
+            self.assertTrue(
+                any(
+                    "record byte budget exceeded" in error
+                    for error in snapshot["errors"]
+                )
+            )
+
+    def test_repo_capture_cli_does_not_require_session_record_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            output = root / "capture.json"
+            snapshot = {
+                "catalog_sha256": "a" * 64,
+                "catalog": [],
+                "complete": True,
+            }
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli.capture_snapshot",
+                    return_value=snapshot,
+                ) as capture,
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "capture",
+                        "--root",
+                        str(repository),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertNotIn("max_record_bytes", capture.call_args.kwargs)
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                snapshot,
+            )
+
+    def test_codex_capture_pins_directories_against_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            child = sessions / "2026"
+            child.mkdir(parents=True, mode=0o700)
+            sessions.chmod(0o700)
+            child.chmod(0o700)
+            outside = root / "outside"
+            write_codex_rollout(
+                outside,
+                "88888888-8888-4888-8888-888888888888",
+                day="",
+            )
+            real_open_directory = session_catalogs._open_directory
+            raced = False
+
+            def swap_before_open(
+                name: str | Path,
+                *,
+                parent_descriptor: int | None,
+                path: Path,
+            ) -> int:
+                nonlocal raced
+                if parent_descriptor is not None and name == "2026" and not raced:
+                    raced = True
+                    child.rmdir()
+                    child.symlink_to(outside, target_is_directory=True)
+                return real_open_directory(
+                    name,
+                    parent_descriptor=parent_descriptor,
+                    path=path,
+                )
+
+            with mock.patch.object(
+                session_catalogs,
+                "_open_directory",
+                side_effect=swap_before_open,
+            ):
+                snapshot = capture_codex_sessions(sessions)
+
+            self.assertTrue(raced)
+            self.assertFalse(snapshot["complete"])
+            self.assertEqual(snapshot["sessions"], [])
+            self.assertTrue(
+                any("without following links" in error for error in snapshot["errors"])
+            )
+
+    def test_codex_capture_checks_actual_size_against_total_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            rollout = write_codex_rollout(
+                sessions,
+                "99999999-9999-4999-8999-999999999999",
+            )
+            max_bytes = rollout.stat().st_size
+            real_capture_rollout = session_catalogs._capture_rollout
+
+            def report_larger_capture(*args: object, **kwargs: object) -> dict:
+                record = real_capture_rollout(*args, **kwargs)
+                return {**record, "size": max_bytes + 1}
+
+            with mock.patch.object(
+                session_catalogs,
+                "_capture_rollout",
+                side_effect=report_larger_capture,
+            ):
+                snapshot = capture_codex_sessions(
+                    sessions,
+                    max_bytes=max_bytes,
+                )
+
+            self.assertFalse(snapshot["complete"])
+            self.assertEqual(snapshot["sessions"], [])
+            self.assertEqual(snapshot["total_bytes"], 0)
+            self.assertTrue(
+                any("byte budget exceeded" in error for error in snapshot["errors"])
+            )
+
+    def test_codex_snapshot_rejects_path_uuid_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            write_codex_rollout(
+                sessions,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+            snapshot = capture_codex_sessions(sessions)
+            snapshot["sessions"][0]["relative_path"] = (
+                "2026/07/24/"
+                "rollout-2026-07-24T00-00-00-bbbbbbbb-bbbb-4bbb-8bbb-"
+                "bbbbbbbbbbbb.jsonl"
+            )
+            catalog = {
+                "sessions": snapshot["sessions"],
+                "non_private_file_count": snapshot["non_private_file_count"],
+                "non_private_directory_count": snapshot["non_private_directory_count"],
+            }
+            snapshot["catalog_sha256"] = sha256_bytes(canonical_bytes(catalog))
+            snapshot["snapshot_sha256"] = object_digest(
+                snapshot,
+                "snapshot_sha256",
+            )
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "record identity is invalid",
+            ):
+                validate_codex_session_snapshot(snapshot)
+
     def test_stable_plan_apply_and_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

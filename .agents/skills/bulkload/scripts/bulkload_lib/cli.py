@@ -17,6 +17,13 @@ from .executor import apply_plan, export_copy_paths, verify_plan
 from .model import BulkloadError, atomic_write_json, canonical_bytes, read_json
 from .planner import compile_plan
 from .scanner import DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, capture_snapshot
+from .sessions import (
+    DEFAULT_MAX_SESSION_BYTES,
+    DEFAULT_MAX_SESSION_FILES,
+    DEFAULT_MAX_SESSION_RECORD_BYTES,
+    capture_codex_sessions,
+    compile_codex_session_union_plan,
+)
 
 
 def _reject_output_overlap(output: str, roots: Sequence[Path]) -> None:
@@ -185,6 +192,54 @@ def _doctor(_: argparse.Namespace) -> int:
     return 0 if tools["git"]["available"] and report["python_supported"] else 6
 
 
+def _codex_capture(arguments: argparse.Namespace) -> int:
+    root = Path(arguments.root).expanduser().resolve()
+    _reject_output_overlap(arguments.output, [root])
+    snapshot = capture_codex_sessions(
+        root,
+        max_files=arguments.max_files,
+        max_bytes=arguments.max_bytes,
+        max_record_bytes=arguments.max_record_bytes,
+    )
+    _write_json(arguments.output, snapshot)
+    if arguments.output != "-":
+        print(
+            f"catalog={snapshot['catalog_sha256']} "
+            f"sessions={len(snapshot['sessions'])} "
+            f"complete={str(snapshot['complete']).lower()}"
+        )
+    return 0 if snapshot["complete"] else 3
+
+
+def _codex_plan(arguments: argparse.Namespace) -> int:
+    if arguments.output != "-":
+        _reject_output_input_alias(
+            arguments.output,
+            [arguments.source_a, arguments.source_b, arguments.destination],
+        )
+    source_a = read_json(Path(arguments.source_a))
+    source_b = read_json(Path(arguments.source_b))
+    destination = read_json(Path(arguments.destination))
+    local_roots = [
+        Path(snapshot["root"])
+        for snapshot in (source_a, source_b, destination)
+        if snapshot.get("host") == socket.gethostname()
+        and isinstance(snapshot.get("root"), str)
+    ]
+    _reject_output_overlap(arguments.output, local_roots)
+    plan = compile_codex_session_union_plan(source_a, source_b, destination)
+    _write_json(arguments.output, plan)
+    if arguments.output != "-":
+        intent = plan["intent"]
+        print(
+            f"plan={plan['plan_sha256']} "
+            f"ready={str(intent['ready_for_attended_copy']).lower()} "
+            f"copy_if_absent={len(intent['copy_if_absent'])} "
+            f"blockers={len(intent['blockers'])}"
+        )
+    return 0 if intent["ready_for_attended_copy"] else 4
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkload",
@@ -242,6 +297,35 @@ def build_parser() -> argparse.ArgumentParser:
     files.add_argument("--accept-plan", required=True)
     files.add_argument("--null", action="store_true")
     files.set_defaults(handler=_files)
+
+    codex_capture = commands.add_parser(
+        "codex-capture",
+        help="capture a read-only, owner-private Codex rollout catalog",
+    )
+    codex_capture.add_argument("--root", required=True)
+    codex_capture.add_argument("--output", required=True)
+    codex_capture.add_argument(
+        "--max-files", type=int, default=DEFAULT_MAX_SESSION_FILES
+    )
+    codex_capture.add_argument(
+        "--max-bytes", type=int, default=DEFAULT_MAX_SESSION_BYTES
+    )
+    codex_capture.add_argument(
+        "--max-record-bytes",
+        type=int,
+        default=DEFAULT_MAX_SESSION_RECORD_BYTES,
+    )
+    codex_capture.set_defaults(handler=_codex_capture)
+
+    codex_plan = commands.add_parser(
+        "codex-plan",
+        help="compile a dry-run absent-only Codex session union plan",
+    )
+    codex_plan.add_argument("--source-a", required=True)
+    codex_plan.add_argument("--source-b", required=True)
+    codex_plan.add_argument("--destination", required=True)
+    codex_plan.add_argument("--output", required=True)
+    codex_plan.set_defaults(handler=_codex_plan)
 
     doctor = commands.add_parser("doctor", help="report local runtime prerequisites")
     doctor.set_defaults(handler=_doctor)

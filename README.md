@@ -4,7 +4,9 @@
 protocol: capture two stable source catalogs, capture the destination, compile
 an immutable plan, apply only explicitly safe file operations, and verify the
 accepted plan against fresh destination truth while emitting a verification
-receipt.
+receipt. It also provides a dry-run-only Codex rollout adapter that proposes
+destination-absent UUIDs and blocks divergent common sessions without copying
+auth, indexes, history databases, or live writers.
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:

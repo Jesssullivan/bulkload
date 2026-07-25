@@ -33,6 +33,23 @@ When two same-name rollouts exist, preserve both until prefix/superset evidence
 establishes which is authoritative. Never overwrite the longer destination
 with a shorter source.
 
+Use `bulkload codex-capture` only after both Codex writers are quiescent. It
+hashes and validates rollout JSONL bytes, requires current-user regular files
+and directories that are not writable by group/other, binds the filename UUID
+to the first `session_meta` record, and records legacy group/world-readable
+source modes. Every proposed destination mode is still `0600`. It fails closed
+on unexpected files, duplicate UUIDs, symlinks, special files, writable or
+foreign authority, malformed JSONL, budget exhaustion, or an observed
+file/directory identity or byte change during its descriptor-pinned read.
+Pass A and pass B must have distinct capture IDs and identical catalogs.
+
+Use `bulkload codex-plan` to compare the stable source catalog with one
+destination catalog. Its only positive proposal is `copy-if-absent` for a UUID
+missing from the destination. Same-UUID/same-hash is a no-op;
+destination-only is preserved; same-UUID/different-hash is a blocker. The v1
+adapter is deliberately dry-run-only and has no copy/apply operation. Keep its
+UUID-bearing evidence owner-private and outside both session roots.
+
 Compaction is a semantic boundary: raw historical bytes may remain in JSONL
 while the resumed model receives only the newest replacement history. A
 successful session lookup therefore does not prove exact old checklist recall.

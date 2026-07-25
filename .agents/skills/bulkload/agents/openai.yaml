@@ -1,4 +1,4 @@
 interface:
   display_name: "Bulkload"
-  short_description: "Plan and verify safe repository migrations"
-  default_prompt: "Use $bulkload to inventory, plan, and verify a one-way repository or ~/git migration."
+  short_description: "Plan safe repo and Codex session migrations"
+  default_prompt: "Use $bulkload to inventory and verify a one-way repository or collision-gated Codex session migration."

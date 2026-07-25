@@ -1,6 +1,7 @@
 # Bulkload v1 design
 
-Status: implementation complete; landing held on GF listener proof, 2026-07-24
+Status: repository v1 complete; Codex session-union dry-run extension in review,
+2026-07-24
 
 ## 1. Decision
 
@@ -313,9 +314,14 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
 - Treat compaction as a semantic retention boundary. A transcript's presence
   does not prove every old instruction remains in active model context.
 
-The v1 CLI implements repository catalogs and content plans. The skill carries
-the typed agent-context procedure while provider-specific adapters remain a
-follow-up, because their formats and refresh semantics change independently.
+The v1 CLI implements repository catalogs and content plans. Its first
+provider-specific extension is a read-only Codex rollout catalog and
+collision-gated absent-only UUID union plan. It validates JSONL identity and
+current-user ownership, rejects files writable by group or other, and requires
+two byte-stable source passes, but deliberately exposes no session apply
+command. Claude, Pi, provider indexes, history, memory, and authentication
+remain procedural follow-ups because their formats and refresh semantics change
+independently.
 
 ## 8. Relationship to TCFS
 

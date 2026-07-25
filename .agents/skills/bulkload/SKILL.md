@@ -1,6 +1,6 @@
 ---
 name: bulkload
-description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, selected agent transcripts, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep credentials, live databases, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
+description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated absent-only Codex session union, selected agent transcripts, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep credentials, live databases, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
 ---
 
 # Bulkload
@@ -84,6 +84,37 @@ trap - EXIT
 
 Keep the shell path literal and operator-reviewed. Do not interpolate an
 untrusted hostname or path.
+
+## Catalog a Codex session union
+
+Read [references/agent-context.md](references/agent-context.md), quiesce both
+Codex writers, and capture the source twice plus the destination once:
+
+```bash
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/source/.codex/sessions \
+  --output /secure/evidence/codex-source-a.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/source/.codex/sessions \
+  --output /secure/evidence/codex-source-b.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/destination/.codex/sessions \
+  --output /secure/evidence/codex-destination.json
+python3 scripts/bulkload.py codex-plan \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination /secure/evidence/codex-destination.json \
+  --output /secure/evidence/codex-union-plan.json
+```
+
+The capture accepts only current-user regular rollout JSONL files that are not
+writable by group/other and whose first `session_meta` identity matches the
+filename. It records legacy group/world-readable source modes; every proposed
+destination mode remains `0600`. The plan proposes only destination-absent
+UUIDs, preserves destination-only sessions, and blocks every same-UUID byte
+divergence. It is a dry-run report: v1 intentionally has no Codex-session apply
+command. Never run it against active writers or treat path/size equality as
+content proof.
 
 ## Compile and review the plan
 
