@@ -11,17 +11,19 @@ from typing import Any
 from .model import BulkloadError, canonical_bytes, sha256_bytes
 
 
-PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v3.json"
-PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v3"
+PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v4.json"
+PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v4"
 PRIVATE_RUNTIME_AUTHORITY_SCHEMA = (
     "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
 )
-PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-destination-sqlite-preserve-v3"
+PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-plan-v4"
 PRIVATE_RUNTIME_SOURCE_KEYS = {
     "scripts/bulkload_lib/cli.py",
     "scripts/bulkload_lib/private_apply.py",
     "scripts/bulkload_lib/private_quiescence.py",
+    "scripts/bulkload_lib/private_sqlite_plan.py",
     "scripts/bulkload_lib/private_state.py",
+    "scripts/bulkload_lib/sessions.py",
 }
 PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-capture",
@@ -38,6 +40,7 @@ PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
+    "codex-private-sqlite-compose-plan",
     "codex-private-verify",
 ]
 PRIVATE_FORBIDDEN_COMMANDS = [
@@ -78,11 +81,16 @@ PRIVATE_STATE_CLASSES = {
         "default": "opt-in",
         "preservation_implemented": True,
         "live_sidecars": "reject-wal-shm-journal",
+        "post_plan_close_required": True,
         "provider_writer_proof": False,
+        "publisher_implemented": False,
         "raw_database_wal_shm_copy": False,
         "reader_implemented": True,
         "runtime_acceptance_required": True,
+        "session_union_execution_verified": False,
         "source_sqlite_required_for_auth_install": False,
+        "sqlite_compose_plan_implemented": True,
+        "sqlite_compose_plan_scope": "four-pass-opening-request-only",
         "wal_aware_capture": False,
     },
 }
@@ -254,7 +262,9 @@ def _validate_policy(
         or policy["readiness"]
         != {
             "auth_install": True,
+            "sqlite_compose_plan": True,
             "sqlite_compose": False,
+            "sqlite_publish": False,
             "combined": False,
         }
     ):

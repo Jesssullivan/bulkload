@@ -52,7 +52,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 for path in sorted((skill_root / "scripts").rglob("*.py"))
             }
             policy_path = (
-                skill_root / "references" / "codex-private-state-policy.v3.json"
+                skill_root / "references" / "codex-private-state-policy.v4.json"
             )
             policy = json.loads(policy_path.read_text())
             policy["runtime_source_sha256"] = bootstrap._runtime_digest(
@@ -81,7 +81,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             skill_root = root / "bulkload"
             shutil.copytree(BOOTSTRAP_PATH.parents[1], skill_root)
             policy_path = (
-                skill_root / "references" / "codex-private-state-policy.v3.json"
+                skill_root / "references" / "codex-private-state-policy.v4.json"
             )
             runtime_payloads = {
                 path.relative_to(skill_root).as_posix(): path.read_bytes()
@@ -111,7 +111,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             runfiles = root / "runfiles"
             shutil.copytree(BOOTSTRAP_PATH.parents[1], source)
             launcher_relative = Path("scripts/bulkload.py")
-            policy_relative = Path("references/codex-private-state-policy.v3.json")
+            policy_relative = Path("references/codex-private-state-policy.v4.json")
             leaves = [
                 *(
                     path.relative_to(source)
@@ -221,7 +221,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 path.relative_to(skill_a).as_posix(): path.read_bytes()
                 for path in sorted((skill_a / "scripts").rglob("*.py"))
             }
-            policy_path = skill_a / "references" / "codex-private-state-policy.v3.json"
+            policy_path = skill_a / "references" / "codex-private-state-policy.v4.json"
             policy = json.loads(policy_path.read_text())
             policy["runtime_source_sha256"] = bootstrap._runtime_digest(
                 runtime_payloads

@@ -1,6 +1,6 @@
 # Codex private auth install
 
-This runbook covers policy v3's only private-state mutation: an attended,
+This runbook covers policy v4's only private-state mutation: an attended,
 typed replacement of an existing destination `CODEX_HOME/auth.json`.
 
 It does not authorize SQLite union, composition, installation, combined
@@ -8,7 +8,7 @@ auth-plus-SQLite apply, Codex activation, deployment, or TCFS runtime work.
 
 ## Exact boundary
 
-Read `codex-private-state-policy.v3.json` before proceeding.
+Read `codex-private-state-policy.v4.json` before proceeding.
 
 - Preferred inputs: source selects `auth`; destination selects `auth` and
   `sqlite`.
@@ -36,7 +36,7 @@ Read `codex-private-state-policy.v3.json` before proceeding.
   A fresh attended provider turn is required before claiming working auth.
 
 Use the reviewed `scripts/bulkload.py` entrypoint or its Bazel-built
-equivalent. The entrypoint pins policy v3 and the complete Python runtime
+equivalent. The entrypoint pins policy v4 and the complete Python runtime
 source inventory before importing command code. Compatibility and install
 plans bind that runtime authority; every later private operation revalidates
 it. Do not import and call the implementation modules directly.

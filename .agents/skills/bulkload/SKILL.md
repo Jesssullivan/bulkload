@@ -26,11 +26,12 @@ every boundary.
    - authentication or credentials.
 4. Keep credentials and databases outside the generic repository adapter.
    Codex `auth.json` and provider-owned SQLite families are copy-eligible only
-   through an explicit typed opt-in plan. Policy v3 implements only attended
-   atomic auth replacement while preserving destination SQLite exact with zero
-   mutations. SQLite union/composition/installation and combined apply remain
-   false. Never log credential values. Any live SQLite WAL, SHM, or rollback
-   journal hard-stops immutable capture.
+   through an explicit typed opt-in plan. Policy v4 implements attended atomic
+   auth replacement plus a separate four-pass, session-bound SQLite
+   classification opening request. Destination SQLite remains exact with zero
+   auth-install mutations. SQLite composition, publication, installation, and
+   combined apply remain false. Never log credential values. Any live SQLite
+   WAL, SHM, or rollback journal hard-stops immutable capture.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
@@ -39,10 +40,12 @@ Read [references/migration-contract.md](references/migration-contract.md) for
 the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
-[references/codex-private-state-policy.v3.json](references/codex-private-state-policy.v3.json)
+[references/codex-private-state-policy.v4.json](references/codex-private-state-policy.v4.json)
 before classifying Codex auth or SQLite, and use
 [references/codex-private-auth-install.md](references/codex-private-auth-install.md)
-for the attended private workflow.
+for the attended auth workflow. Read
+[references/codex-private-sqlite-compose-plan.md](references/codex-private-sqlite-compose-plan.md)
+before compiling the non-actionable SQLite opening request.
 
 ## Capture two stable source passes
 
@@ -274,11 +277,14 @@ capture or operation. It is an operator procedural fence with
 cooperating Bulkload processes. Any SQLite WAL, SHM, or rollback journal blocks
 immutable capture.
 
-The private entrypoint pins policy v3 and the full Python runtime closure before
+The private entrypoint pins policy v4 and the full Python runtime closure before
 import, and the compatibility/install plans bind that authority. Review and
 accept both exact plan digests before attended auth apply. Offline receipts do
 not prove provider authentication. Require a fresh attended provider turn.
 Never infer SQLite authority, compose/install SQLite, or use a combined apply.
+The SQLite opening command consumes private and session A/B evidence, an exact
+registry and path map, and always leaves compose, publish, and apply false.
+Fresh post-plan closing captures belong to a later reviewed slice.
 
 ## Compile and review the plan
 
