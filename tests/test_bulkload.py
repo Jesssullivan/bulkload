@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 
+import bulkload_lib.cli as bulkload_cli  # noqa: E402
 from bulkload_lib.cli import main as cli_main  # noqa: E402
 from bulkload_lib.executor import (  # noqa: E402
     apply_plan,
@@ -45,8 +46,16 @@ from bulkload_lib.scanner import (  # noqa: E402
 )
 import bulkload_lib.sessions as session_catalogs  # noqa: E402
 from bulkload_lib.sessions import (  # noqa: E402
+    capture_codex_session_close_capture,
+    capture_codex_session_prefix_proof,
     capture_codex_sessions,
+    compile_codex_session_close_request,
+    compile_codex_session_prefix_request,
     compile_codex_session_union_plan,
+    validate_codex_session_close_capture,
+    validate_codex_session_close_request,
+    validate_codex_session_prefix_proof,
+    validate_codex_session_prefix_request,
     validate_codex_session_snapshot,
 )
 
@@ -187,6 +196,62 @@ def refresh_codex_snapshot(snapshot: dict) -> None:
     snapshot["snapshot_sha256"] = object_digest(snapshot, "snapshot_sha256")
 
 
+def append_codex_event(path: Path, message: str) -> None:
+    record = {
+        "timestamp": "2026-07-24T00:00:02Z",
+        "type": "event_msg",
+        "payload": {"message": message},
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def refresh_codex_prefix_proof(proof: dict) -> None:
+    proof["proofs_sha256"] = sha256_bytes(canonical_bytes(proof["proofs"]))
+    proof["proof_sha256"] = object_digest(proof, "proof_sha256")
+
+
+def refresh_codex_close_capture(close_capture: dict) -> None:
+    refresh_codex_snapshot(close_capture["snapshot"])
+    close_capture["close_capture_sha256"] = object_digest(
+        close_capture,
+        "close_capture_sha256",
+    )
+
+
+def capture_codex_closes(
+    source: Path,
+    destination: Path,
+    close_request: dict,
+) -> dict[str, dict]:
+    return {
+        "source_close_a": capture_codex_session_close_capture(
+            source,
+            role="source",
+            close_request=close_request,
+            acknowledge_writers_quiesced=True,
+        ),
+        "source_close_b": capture_codex_session_close_capture(
+            source,
+            role="source",
+            close_request=close_request,
+            acknowledge_writers_quiesced=True,
+        ),
+        "destination_close_a": capture_codex_session_close_capture(
+            destination,
+            role="destination",
+            close_request=close_request,
+            acknowledge_writers_quiesced=True,
+        ),
+        "destination_close_b": capture_codex_session_close_capture(
+            destination,
+            role="destination",
+            close_request=close_request,
+            acknowledge_writers_quiesced=True,
+        ),
+    }
+
+
 class BulkloadProtocolTest(unittest.TestCase):
     def test_codex_session_union_is_stable_absent_only_and_preserving(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -254,9 +319,706 @@ class BulkloadProtocolTest(unittest.TestCase):
             self.assertFalse(plan["intent"]["ready_for_attended_copy"])
             self.assertEqual(
                 [item["code"] for item in plan["intent"]["blockers"]],
-                ["same-uuid-different-bytes"],
+                ["same-uuid-prefix-proof-required"],
             )
             self.assertEqual(plan["intent"]["copy_if_absent"], [])
+
+    def test_codex_session_union_promotes_only_repeated_source_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "45454545-4545-4545-8545-454545454545"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="base")
+            append_codex_event(source_path, "source continuation")
+
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            validate_codex_session_prefix_request(request)
+            self.assertEqual(
+                [
+                    (item["session_id"], item["longer_role"])
+                    for item in request["requests"]
+                ],
+                [(session_id, "source")],
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            validate_codex_session_prefix_proof(proof_a)
+            self.assertNotEqual(proof_a["capture_id"], proof_b["capture_id"])
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+            validate_codex_session_close_request(close_request)
+            closes = capture_codex_closes(source, destination, close_request)
+
+            plan = compile_codex_session_union_plan(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                prefix_request=request,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+                close_request=close_request,
+                **closes,
+            )
+
+            self.assertTrue(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(plan["intent"]["blockers"], [])
+            self.assertNotIn("close_request_sha256", source_a)
+            self.assertEqual(
+                source_a["schema"],
+                "dev.tinyland.bulkload.codex-sessions.v2",
+            )
+            self.assertEqual(
+                plan["prefix_evidence"]["close_request_sha256"],
+                close_request["close_request_sha256"],
+            )
+            self.assertEqual(
+                [
+                    item["session_id"]
+                    for item in plan["intent"]["promote_source_superset"]
+                ],
+                [session_id],
+            )
+            self.assertEqual(
+                plan["prefix_evidence"]["source_prefix_proofs"],
+                [
+                    {
+                        "capture_id": proof_a["capture_id"],
+                        "proof_sha256": proof_a["proof_sha256"],
+                    },
+                    {
+                        "capture_id": proof_b["capture_id"],
+                        "proof_sha256": proof_b["proof_sha256"],
+                    },
+                ],
+            )
+            self.assertEqual(
+                plan["prefix_evidence"]["source_close_snapshots"],
+                [
+                    {
+                        "capture_id": closes["source_close_a"]["snapshot"][
+                            "capture_id"
+                        ],
+                        "snapshot_sha256": closes["source_close_a"]["snapshot"][
+                            "snapshot_sha256"
+                        ],
+                        "close_capture_sha256": closes["source_close_a"][
+                            "close_capture_sha256"
+                        ],
+                    },
+                    {
+                        "capture_id": closes["source_close_b"]["snapshot"][
+                            "capture_id"
+                        ],
+                        "snapshot_sha256": closes["source_close_b"]["snapshot"][
+                            "snapshot_sha256"
+                        ],
+                        "close_capture_sha256": closes["source_close_b"][
+                            "close_capture_sha256"
+                        ],
+                    },
+                ],
+            )
+
+    def test_codex_session_union_preserves_destination_prefix_superset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "46464646-4646-4646-8646-464646464646"
+            write_codex_rollout(source, session_id, message="base")
+            destination_path = write_codex_rollout(
+                destination,
+                session_id,
+                message="base",
+            )
+            append_codex_event(destination_path, "destination continuation")
+
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                destination,
+                role="destination",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                destination,
+                role="destination",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                destination_prefix_a=proof_a,
+                destination_prefix_b=proof_b,
+            )
+            closes = capture_codex_closes(source, destination, close_request)
+            plan = compile_codex_session_union_plan(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                prefix_request=request,
+                destination_prefix_a=proof_a,
+                destination_prefix_b=proof_b,
+                close_request=close_request,
+                **closes,
+            )
+
+            self.assertTrue(plan["intent"]["ready_for_attended_copy"])
+            self.assertEqual(plan["intent"]["promote_source_superset"], [])
+            self.assertEqual(
+                [
+                    item["session_id"]
+                    for item in plan["intent"]["preserve_destination_superset"]
+                ],
+                [session_id],
+            )
+            self.assertEqual(
+                plan["prefix_evidence"]["destination_prefix_proofs"],
+                [
+                    {
+                        "capture_id": proof_a["capture_id"],
+                        "proof_sha256": proof_a["proof_sha256"],
+                    },
+                    {
+                        "capture_id": proof_b["capture_id"],
+                        "proof_sha256": proof_b["proof_sha256"],
+                    },
+                ],
+            )
+
+    def test_codex_session_union_blocks_missing_or_divergent_prefix_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "47474747-4747-4747-8747-474747474747"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="baSe")
+            append_codex_event(source_path, "source continuation")
+
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+            closes = capture_codex_closes(source, destination, close_request)
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "source prefix proof requires pass A and pass B",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    close_request=close_request,
+                    **closes,
+                )
+            divergent = compile_codex_session_union_plan(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                prefix_request=request,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+                close_request=close_request,
+                **closes,
+            )
+            self.assertEqual(
+                [item["code"] for item in divergent["intent"]["blockers"]],
+                ["same-uuid-divergent-bytes"],
+            )
+            self.assertEqual(
+                divergent["intent"]["promote_source_superset"],
+                [],
+            )
+
+    def test_codex_session_union_rejects_prefix_pass_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "48484848-4848-4848-8848-484848484848"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="base")
+            append_codex_event(source_path, "source continuation")
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+            closes = capture_codex_closes(source, destination, close_request)
+            proof_b["proofs"][0]["prefix_ends_at_record"] = False
+            refresh_codex_prefix_proof(proof_b)
+
+            with self.assertRaisesRegex(BulkloadError, "pass A and pass B differ"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                    close_request=close_request,
+                    **closes,
+                )
+
+    def test_codex_prefix_plan_rejects_stale_source_or_destination_close(
+        self,
+    ) -> None:
+        for stale_role in ("source", "destination"):
+            with (
+                self.subTest(stale_role=stale_role),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                source = root / "source-sessions"
+                destination = root / "destination-sessions"
+                session_id = "49494949-4949-4949-8949-494949494949"
+                source_path = write_codex_rollout(source, session_id, message="base")
+                destination_path = write_codex_rollout(
+                    destination,
+                    session_id,
+                    message="base",
+                )
+                append_codex_event(source_path, "source continuation")
+                source_a = capture_codex(source)
+                source_b = capture_codex(source)
+                destination_a = capture_codex(destination, role="destination")
+                destination_b = capture_codex(destination, role="destination")
+                request = compile_codex_session_prefix_request(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+                proof_a = capture_codex_session_prefix_proof(
+                    source,
+                    role="source",
+                    prefix_request=request,
+                    source_a=source_a,
+                    source_b=source_b,
+                    destination_a=destination_a,
+                    destination_b=destination_b,
+                    acknowledge_writers_quiesced=True,
+                )
+                proof_b = capture_codex_session_prefix_proof(
+                    source,
+                    role="source",
+                    prefix_request=request,
+                    source_a=source_a,
+                    source_b=source_b,
+                    destination_a=destination_a,
+                    destination_b=destination_b,
+                    acknowledge_writers_quiesced=True,
+                )
+                close_request = compile_codex_session_close_request(
+                    request,
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                )
+                append_codex_event(
+                    source_path if stale_role == "source" else destination_path,
+                    f"{stale_role} changed after proof",
+                )
+
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    rf"{stale_role} close capture differs from requested custody",
+                ):
+                    capture_codex_session_close_capture(
+                        source if stale_role == "source" else destination,
+                        role=stale_role,
+                        close_request=close_request,
+                        acknowledge_writers_quiesced=True,
+                    )
+
+    def test_codex_prefix_plan_rejects_preproof_stale_close_snapshots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "49a949a9-49a9-49a9-89a9-49a949a949a9"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            destination_path = write_codex_rollout(
+                destination,
+                session_id,
+                message="base",
+            )
+            append_codex_event(source_path, "source continuation")
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+
+            stale_closes = {
+                "source_close_a": capture_codex(source),
+                "source_close_b": capture_codex(source),
+                "destination_close_a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination_close_b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            append_codex_event(destination_path, "destination changed")
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "Codex session close capture has unexpected fields",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                    close_request=close_request,
+                    **stale_closes,
+                )
+
+    def test_codex_prefix_plan_requires_fresh_distinct_close_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "4a4a4a4a-4a4a-4a4a-8a4a-4a4a4a4a4a4a"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="base")
+            append_codex_event(source_path, "source continuation")
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            with self.assertRaisesRegex(BulkloadError, "close pass A and pass B"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                )
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "source prefix proof requires pass A and pass B",
+            ):
+                compile_codex_session_close_request(
+                    request,
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    source_prefix_a=proof_a,
+                )
+
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+            closes = capture_codex_closes(source, destination, close_request)
+            reused_source = json.loads(json.dumps(closes["source_close_a"]))
+            reused_source["snapshot"]["capture_id"] = source_a["capture_id"]
+            refresh_codex_close_capture(reused_source)
+            reused = {
+                **closes,
+                "source_close_a": reused_source,
+            }
+            with self.assertRaisesRegex(BulkloadError, "globally distinct"):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                    close_request=close_request,
+                    **reused,
+                )
+
+    def test_codex_prefix_plan_rejects_replayed_close_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            session_id = "4b4b4b4b-4b4b-4b4b-8b4b-4b4b4b4b4b4b"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="base")
+            append_codex_event(source_path, "source continuation")
+            source_a = capture_codex(source)
+            source_b = capture_codex(source)
+            destination_a = capture_codex(destination, role="destination")
+            destination_b = capture_codex(destination, role="destination")
+            request = compile_codex_session_prefix_request(
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+            proof_a = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            proof_b = capture_codex_session_prefix_proof(
+                source,
+                role="source",
+                prefix_request=request,
+                source_a=source_a,
+                source_b=source_b,
+                destination_a=destination_a,
+                destination_b=destination_b,
+                acknowledge_writers_quiesced=True,
+            )
+            close_request = compile_codex_session_close_request(
+                request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=proof_a,
+                source_prefix_b=proof_b,
+            )
+            closes = capture_codex_closes(source, destination, close_request)
+            replayed_request = json.loads(json.dumps(close_request))
+            replayed_request["created_at"] = "2026-07-28T23:59:59Z"
+            replayed_request["close_request_sha256"] = object_digest(
+                replayed_request,
+                "close_request_sha256",
+            )
+            validate_codex_session_close_request(replayed_request)
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "source close capture binding is invalid",
+            ):
+                compile_codex_session_union_plan(
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                    prefix_request=request,
+                    source_prefix_a=proof_a,
+                    source_prefix_b=proof_b,
+                    close_request=replayed_request,
+                    **closes,
+                )
 
     def test_codex_session_capture_fails_closed_on_unknown_or_moving_state(
         self,
@@ -344,6 +1106,49 @@ class BulkloadProtocolTest(unittest.TestCase):
                     for error in snapshot["errors"]
                 )
             )
+
+    def test_codex_evidence_output_parent_rejects_any_group_or_world_bits(
+        self,
+    ) -> None:
+        for mode in (0o750, 0o705, 0o744):
+            with (
+                self.subTest(mode=f"{mode:04o}"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                sessions = root / "sessions"
+                evidence = root / "evidence"
+                evidence.mkdir(mode=0o700)
+                evidence.chmod(mode)
+                write_codex_rollout(
+                    sessions,
+                    "76767676-7676-4676-8676-767676767676",
+                )
+                output = evidence / "capture.json"
+                stderr = io.StringIO()
+
+                with (
+                    redirect_stderr(stderr),
+                    mock.patch("sys.stdout", new=io.StringIO()),
+                ):
+                    result = cli_main(
+                        [
+                            "codex-capture",
+                            "--root",
+                            str(sessions),
+                            "--output",
+                            str(output),
+                            "--role",
+                            "source",
+                            "--acknowledge-writers-quiesced",
+                            "--host-authority-id",
+                            TEST_HOST_AUTHORITY_ID,
+                        ]
+                    )
+
+                self.assertEqual(result, 2)
+                self.assertFalse(output.exists())
+                self.assertIn("not owner-private", stderr.getvalue())
 
     def test_codex_capture_never_creates_evidence_inside_failed_root(self) -> None:
         for case in ("missing", "symlink", "invalid-custody"):
@@ -443,6 +1248,218 @@ class BulkloadProtocolTest(unittest.TestCase):
                     artifacts["destination-b"]["capture_id"],
                 ],
             )
+
+    def test_codex_prefix_cli_compiles_repeated_proof_into_plan_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            session_id = "77a177a1-77a1-47a1-87a1-77a177a177a1"
+            source_path = write_codex_rollout(source, session_id, message="base")
+            write_codex_rollout(destination, session_id, message="base")
+            append_codex_event(source_path, "source continuation")
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            common = [
+                "--source-a",
+                str(evidence / "source-a.json"),
+                "--source-b",
+                str(evidence / "source-b.json"),
+                "--destination-a",
+                str(evidence / "destination-a.json"),
+                "--destination-b",
+                str(evidence / "destination-b.json"),
+            ]
+            request_path = evidence / "request.json"
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                request_result = cli_main(
+                    [
+                        "codex-prefix-request",
+                        *common,
+                        "--output",
+                        str(request_path),
+                    ]
+                )
+            self.assertEqual(request_result, 0)
+
+            proof_paths = [evidence / "proof-a.json", evidence / "proof-b.json"]
+            for proof_path in proof_paths:
+                with mock.patch("sys.stdout", new=io.StringIO()):
+                    proof_result = cli_main(
+                        [
+                            "codex-prefix-proof",
+                            "--prefix-request",
+                            str(request_path),
+                            *common,
+                            "--root",
+                            str(source),
+                            "--role",
+                            "source",
+                            "--acknowledge-writers-quiesced",
+                            "--output",
+                            str(proof_path),
+                        ]
+                    )
+                self.assertEqual(proof_result, 0)
+
+            close_request_path = evidence / "close-request.json"
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                close_request_result = cli_main(
+                    [
+                        "codex-close-request",
+                        "--prefix-request",
+                        str(request_path),
+                        *common,
+                        "--source-prefix-a",
+                        str(proof_paths[0]),
+                        "--source-prefix-b",
+                        str(proof_paths[1]),
+                        "--output",
+                        str(close_request_path),
+                    ]
+                )
+            self.assertEqual(close_request_result, 0)
+            close_request = read_json(close_request_path)
+            validate_codex_session_close_request(close_request)
+
+            missing_close_plan = evidence / "missing-close-plan.json"
+            with (
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                missing_close_result = cli_main(
+                    [
+                        "codex-plan",
+                        *common,
+                        "--prefix-request",
+                        str(request_path),
+                        "--close-request",
+                        str(close_request_path),
+                        "--source-prefix-a",
+                        str(proof_paths[0]),
+                        "--source-prefix-b",
+                        str(proof_paths[1]),
+                        "--output",
+                        str(missing_close_plan),
+                    ]
+                )
+            self.assertEqual(missing_close_result, 2)
+            self.assertFalse(missing_close_plan.exists())
+
+            close_paths: dict[str, Path] = {}
+            closes: dict[str, dict] = {}
+            for option, close_root, role in (
+                ("source-close-a", source, "source"),
+                ("source-close-b", source, "source"),
+                ("destination-close-a", destination, "destination"),
+                ("destination-close-b", destination, "destination"),
+            ):
+                path = evidence / f"{option}.json"
+                with mock.patch("sys.stdout", new=io.StringIO()):
+                    close_result = cli_main(
+                        [
+                            "codex-close-capture",
+                            "--close-request",
+                            str(close_request_path),
+                            "--root",
+                            str(close_root),
+                            "--role",
+                            role,
+                            "--acknowledge-writers-quiesced",
+                            "--output",
+                            str(path),
+                        ]
+                    )
+                self.assertEqual(close_result, 0)
+                close_paths[option] = path
+                closes[option.replace("-", "_")] = read_json(path)
+                validate_codex_session_close_capture(closes[option.replace("-", "_")])
+            close_arguments = [
+                argument
+                for option, path in close_paths.items()
+                for argument in (f"--{option}", str(path))
+            ]
+            plan_path = evidence / "plan-v3.json"
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                plan_result = cli_main(
+                    [
+                        "codex-plan",
+                        *common,
+                        "--prefix-request",
+                        str(request_path),
+                        "--close-request",
+                        str(close_request_path),
+                        "--source-prefix-a",
+                        str(proof_paths[0]),
+                        "--source-prefix-b",
+                        str(proof_paths[1]),
+                        *close_arguments,
+                        "--output",
+                        str(plan_path),
+                    ]
+                )
+            self.assertEqual(plan_result, 0)
+            plan = read_json(plan_path)
+            self.assertEqual(
+                plan["schema"],
+                "dev.tinyland.bulkload.codex-session-union-plan.v3",
+            )
+            self.assertEqual(
+                [
+                    item["session_id"]
+                    for item in plan["intent"]["promote_source_superset"]
+                ],
+                [session_id],
+            )
+            self.assertEqual(
+                plan["prefix_evidence"]["destination_close_snapshots"],
+                [
+                    {
+                        "capture_id": closes["destination_close_a"]["snapshot"][
+                            "capture_id"
+                        ],
+                        "snapshot_sha256": closes["destination_close_a"]["snapshot"][
+                            "snapshot_sha256"
+                        ],
+                        "close_capture_sha256": closes["destination_close_a"][
+                            "close_capture_sha256"
+                        ],
+                    },
+                    {
+                        "capture_id": closes["destination_close_b"]["snapshot"][
+                            "capture_id"
+                        ],
+                        "snapshot_sha256": closes["destination_close_b"]["snapshot"][
+                            "snapshot_sha256"
+                        ],
+                        "close_capture_sha256": closes["destination_close_b"][
+                            "close_capture_sha256"
+                        ],
+                    },
+                ],
+            )
+            for path in [
+                request_path,
+                *proof_paths,
+                close_request_path,
+                *close_paths.values(),
+                plan_path,
+            ]:
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_codex_plan_cli_protects_local_roots_after_hostname_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -645,6 +1662,401 @@ class BulkloadProtocolTest(unittest.TestCase):
             self.assertTrue(replaced)
             self.assertEqual(result, 2)
             self.assertFalse(output.exists())
+
+    def test_codex_plan_cli_revalidates_pinned_inputs_at_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "78007800-7800-4800-8800-780078007800",
+            )
+            write_codex_rollout(
+                destination,
+                "78017801-7801-4801-8801-780178017801",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            source_a_path = evidence / "source-a.json"
+            output = evidence / "plan.json"
+            real_fsync = os.fsync
+            mutated = False
+
+            def mutate_input_during_temp_fsync(descriptor: int) -> None:
+                nonlocal mutated
+                if not mutated and stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    source_a_path.write_text("{}\n", encoding="utf-8")
+                    mutated = True
+                real_fsync(descriptor)
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli.os.fsync",
+                    side_effect=mutate_input_during_temp_fsync,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(source_a_path),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(mutated)
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
+
+    def test_codex_plan_cli_never_overwrites_target_inserted_at_publish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "78027802-7802-4802-8802-780278027802",
+            )
+            write_codex_rollout(
+                destination,
+                "78037803-7803-4803-8803-780378037803",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            source_a_path = evidence / "source-a.json"
+            source_a_bytes = source_a_path.read_bytes()
+            output = evidence / "plan.json"
+            real_publish = bulkload_cli._rename_codex_output_noreplace
+            inserted = False
+
+            def insert_input_at_target(*args: object) -> None:
+                nonlocal inserted
+                source_a_path.rename(output)
+                inserted = True
+                real_publish(*args)
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli._rename_codex_output_noreplace",
+                    side_effect=insert_input_at_target,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(source_a_path),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(inserted)
+            self.assertEqual(result, 2)
+            self.assertFalse(source_a_path.exists())
+            self.assertEqual(output.read_bytes(), source_a_bytes)
+
+    def test_codex_plan_cli_rejects_temp_bytes_changed_at_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "78047804-7804-4804-8804-780478047804",
+            )
+            write_codex_rollout(
+                destination,
+                "78057805-7805-4805-8805-780578057805",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            output = evidence / "plan.json"
+            real_publish = bulkload_cli._rename_codex_output_noreplace
+            changed = False
+
+            def change_temp_then_link(
+                source_directory: int,
+                source_name: str,
+                destination_directory: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal changed
+                descriptor = os.open(
+                    source_name,
+                    os.O_WRONLY,
+                    dir_fd=source_directory,
+                )
+                try:
+                    size = os.fstat(descriptor).st_size
+                    os.ftruncate(descriptor, 0)
+                    os.write(descriptor, b"x" * size)
+                finally:
+                    os.close(descriptor)
+                changed = True
+                real_publish(
+                    source_directory,
+                    source_name,
+                    destination_directory,
+                    destination_name,
+                )
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli._rename_codex_output_noreplace",
+                    side_effect=change_temp_then_link,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(result, 2)
+            self.assertTrue(output.exists())
+            self.assertEqual(set(output.read_bytes()), {ord("x")})
+
+    def test_codex_plan_cli_rejects_parent_moved_during_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "78067806-7806-4806-8806-780678067806",
+            )
+            write_codex_rollout(
+                destination,
+                "78077807-7807-4807-8807-780778077807",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            moved = root / "evidence-moved"
+            output = evidence / "plan.json"
+            real_publish = bulkload_cli._rename_codex_output_noreplace
+            moved_parent = False
+
+            def move_parent_then_publish(*args: object) -> None:
+                nonlocal moved_parent
+                evidence.rename(moved)
+                evidence.mkdir(mode=0o700)
+                moved_parent = True
+                real_publish(*args)
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli._rename_codex_output_noreplace",
+                    side_effect=move_parent_then_publish,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(moved_parent)
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
+            self.assertTrue((moved / "plan.json").exists())
+
+    def test_codex_plan_cli_rejects_target_replaced_during_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-sessions"
+            destination = root / "destination-sessions"
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            write_codex_rollout(
+                source,
+                "78087808-7808-4808-8808-780878087808",
+            )
+            write_codex_rollout(
+                destination,
+                "78097809-7809-4809-8809-780978097809",
+            )
+            artifacts = {
+                "source-a": capture_codex(source),
+                "source-b": capture_codex(source),
+                "destination-a": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+                "destination-b": capture_codex(
+                    destination,
+                    role="destination",
+                ),
+            }
+            for name, snapshot in artifacts.items():
+                atomic_write_json(evidence / f"{name}.json", snapshot)
+            output = evidence / "plan.json"
+            stolen = evidence / "stolen.json"
+            bogus = b'{"bogus":true}\n'
+            real_publish = bulkload_cli._rename_codex_output_noreplace
+            replaced = False
+
+            def replace_target_after_publish(
+                source_directory: int,
+                source_name: str,
+                destination_directory: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal replaced
+                real_publish(
+                    source_directory,
+                    source_name,
+                    destination_directory,
+                    destination_name,
+                )
+                os.rename(
+                    destination_name,
+                    stolen.name,
+                    src_dir_fd=destination_directory,
+                    dst_dir_fd=destination_directory,
+                )
+                descriptor = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_directory,
+                )
+                try:
+                    os.write(descriptor, bogus)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                replaced = True
+
+            with (
+                mock.patch(
+                    "bulkload_lib.cli._rename_codex_output_noreplace",
+                    side_effect=replace_target_after_publish,
+                ),
+                redirect_stderr(io.StringIO()),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-plan",
+                        "--source-a",
+                        str(evidence / "source-a.json"),
+                        "--source-b",
+                        str(evidence / "source-b.json"),
+                        "--destination-a",
+                        str(evidence / "destination-a.json"),
+                        "--destination-b",
+                        str(evidence / "destination-b.json"),
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertTrue(replaced)
+            self.assertEqual(result, 2)
+            self.assertEqual(output.read_bytes(), bogus)
+            self.assertTrue(stolen.exists())
 
     def test_repo_capture_cli_does_not_require_session_record_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1154,7 +2566,7 @@ class BulkloadProtocolTest(unittest.TestCase):
             self.assertEqual(plan["intent"]["copy_if_absent"], [])
             self.assertEqual(
                 [item["code"] for item in plan["intent"]["blockers"]],
-                ["same-uuid-different-bytes"],
+                ["same-uuid-prefix-proof-required"],
             )
 
     def test_codex_cross_input_path_collision_is_a_global_blocker(self) -> None:

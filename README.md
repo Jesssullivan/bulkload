@@ -5,11 +5,17 @@ protocol: capture two stable source catalogs, capture the destination, compile
 an immutable plan, apply only explicitly safe file operations, and verify the
 accepted plan against fresh destination truth while emitting a verification
 receipt. It also provides a dry-run-only Codex rollout adapter that proposes
-destination-absent UUIDs only after stable source and destination A/B captures.
-Its v2 evidence binds typed directory claims and root lineage to an explicit
-filesystem-authority ID, blocks divergent common sessions and portable
-file/directory collisions, and pins bounded evidence I/O without copying auth,
-indexes, history databases, or live writers.
+destination-absent UUIDs and proof-bound source-superset promotions only after
+stable source and destination A/B captures. Its v2 capture evidence binds typed
+directory claims and root lineage to an explicit filesystem-authority ID,
+blocks divergent common sessions and portable file/directory collisions, and
+pins bounded evidence I/O. The in-review v3 planner recognizes proof-bound
+append-only prefix/superset histories, compiles a close request from every
+required proof digest, and only then accepts fresh source and destination A/B
+captures wrapped against that request. Codex auth and SQLite families are
+explicitly copy-eligible, opt-in state classes, but remain plan-only until
+their dedicated private snapshot, rollback, atomic install, and acceptance
+executor exists; generic file copying remains forbidden for them.
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:
@@ -28,6 +34,8 @@ The installer validates the canonical, private-backup, and Claude destinations
 before mutation, refuses symlinked directory authority, and preserves a forced
 replacement under `~/.agents/backups/bulkload` before installing it.
 Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
+Codex evidence file publication requires macOS or Linux for an OS-backed atomic
+no-replace rename.
 
 For development:
 

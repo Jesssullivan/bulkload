@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import math
 import os
@@ -41,8 +43,16 @@ from .sessions import (
     DEFAULT_MAX_SESSION_RECORDS_PER_FILE,
     MAX_CODEX_ROOT_LINEAGE,
     MAX_CODEX_SESSION_SNAPSHOT_BYTES,
+    capture_codex_session_close_capture,
+    capture_codex_session_prefix_proof,
     capture_codex_sessions,
+    compile_codex_session_close_request,
+    compile_codex_session_prefix_request,
     compile_codex_session_union_plan,
+    validate_codex_session_close_capture,
+    validate_codex_session_close_request,
+    validate_codex_session_prefix_proof,
+    validate_codex_session_prefix_request,
     validate_codex_session_snapshot,
 )
 
@@ -216,11 +226,100 @@ def _directory_identity_lineage(descriptor: int) -> set[tuple[int, int]]:
     raise BulkloadError("Codex evidence output parent lineage is unbounded")
 
 
+def _validate_codex_output_descriptor(
+    descriptor: int,
+    payload: bytes,
+    *,
+    expected_links: int,
+) -> tuple[int, int]:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size != len(payload)
+        or info.st_nlink != expected_links
+    ):
+        raise BulkloadError("Codex evidence temporary output custody changed")
+    offset = 0
+    while offset < len(payload):
+        expected = payload[offset : offset + 1024 * 1024]
+        observed = os.pread(descriptor, len(expected), offset)
+        if observed != expected:
+            raise BulkloadError("Codex evidence temporary output bytes changed")
+        offset += len(expected)
+    return (info.st_dev, info.st_ino)
+
+
+def _rename_codex_output_noreplace(
+    source_directory: int,
+    source_name: str,
+    destination_directory: int,
+    destination_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        rename = libc.renameatx_np
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_directory,
+            source,
+            destination_directory,
+            destination,
+            0x00000004,
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as error:
+            raise BulkloadError(
+                "atomic no-replace evidence publication is unavailable"
+            ) from error
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_directory,
+            source,
+            destination_directory,
+            destination,
+            1,
+        )
+    else:
+        raise BulkloadError(
+            f"atomic no-replace evidence publication is unsupported on {sys.platform}"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise BulkloadError("Codex evidence output already exists")
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        destination_name,
+    )
+
+
 def _write_pinned_codex_json(
     output: str,
     value: dict[str, Any],
     snapshots: Sequence[dict[str, Any]],
-    input_identities: Sequence[tuple[int, ...]],
+    pinned_inputs: Sequence[tuple[str, int, tuple[int, ...]]],
     *,
     protected_roots: Sequence[Path] = (),
 ) -> None:
@@ -263,6 +362,7 @@ def _write_pinned_codex_json(
             f"cannot pin Codex evidence output parent: {parent}"
         ) from error
     temporary_name: str | None = None
+    temporary_descriptor: int | None = None
     try:
         parent_info = os.fstat(parent_descriptor)
         parent_expected = (
@@ -273,10 +373,10 @@ def _write_pinned_codex_json(
         )
         if (
             parent_info.st_uid != os.getuid()
-            or stat.S_IMODE(parent_info.st_mode) & 0o022
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
         ):
             raise BulkloadError(
-                f"Codex evidence output parent is not private: {parent}"
+                f"Codex evidence output parent is not owner-private: {parent}"
             )
         protected_identities = {
             (snapshot["root_identity"]["device"], snapshot["root_identity"]["inode"])
@@ -295,18 +395,15 @@ def _write_pinned_codex_json(
             )
         except FileNotFoundError:
             target_info = None
-        if target_info is not None and any(
-            (target_info.st_dev, target_info.st_ino) == (identity[0], identity[1])
-            for identity in input_identities
-        ):
-            raise BulkloadError("Codex evidence output aliases an input artifact")
+        if target_info is not None:
+            raise BulkloadError("Codex evidence output already exists")
         payload = canonical_bytes(value) + b"\n"
         for _ in range(128):
             candidate = f".{requested.name}.bulkload-{secrets.token_hex(8)}"
             try:
                 temporary_descriptor = os.open(
                     candidate,
-                    os.O_WRONLY
+                    os.O_RDWR
                     | os.O_CREAT
                     | os.O_EXCL
                     | getattr(os, "O_NOFOLLOW", 0)
@@ -320,17 +417,21 @@ def _write_pinned_codex_json(
                 continue
         else:
             raise BulkloadError("cannot allocate Codex evidence temporary file")
-        try:
-            os.fchmod(temporary_descriptor, 0o600)
-            offset = 0
-            while offset < len(payload):
-                written = os.write(temporary_descriptor, payload[offset:])
-                if written < 1:
-                    raise BulkloadError("cannot write Codex evidence output")
-                offset += written
-            os.fsync(temporary_descriptor)
-        finally:
-            os.close(temporary_descriptor)
+        os.fchmod(temporary_descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(temporary_descriptor, payload[offset:])
+            if written < 1:
+                raise BulkloadError("cannot write Codex evidence output")
+            offset += written
+        os.fsync(temporary_descriptor)
+        temporary_identity = _validate_codex_output_descriptor(
+            temporary_descriptor,
+            payload,
+            expected_links=1,
+        )
+        for path, descriptor, expected in pinned_inputs:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
         current_parent = os.stat(parent, follow_symlinks=False)
         if (
             current_parent.st_dev,
@@ -338,19 +439,94 @@ def _write_pinned_codex_json(
             current_parent.st_uid,
             stat.S_IMODE(current_parent.st_mode),
         ) != parent_expected:
-            raise BulkloadError("Codex evidence output parent changed before rename")
-        os.rename(
+            raise BulkloadError("Codex evidence output parent changed before publish")
+        if (
+            _validate_codex_output_descriptor(
+                temporary_descriptor,
+                payload,
+                expected_links=1,
+            )
+            != temporary_identity
+        ):
+            raise BulkloadError("Codex evidence temporary output identity changed")
+        _rename_codex_output_noreplace(
+            parent_descriptor,
             temporary_name,
+            parent_descriptor,
             requested.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
         )
         temporary_name = None
+        for path, descriptor, expected in pinned_inputs:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
+        if (
+            _validate_codex_output_descriptor(
+                temporary_descriptor,
+                payload,
+                expected_links=1,
+            )
+            != temporary_identity
+        ):
+            raise BulkloadError("Codex evidence output changed during publish")
+        published_info = os.stat(
+            requested.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(published_info.st_mode)
+            or published_info.st_uid != os.getuid()
+            or stat.S_IMODE(published_info.st_mode) != 0o600
+            or published_info.st_size != len(payload)
+            or published_info.st_nlink != 1
+            or (published_info.st_dev, published_info.st_ino) != temporary_identity
+        ):
+            raise BulkloadError("Codex evidence target changed during publish")
+        current_parent = os.stat(parent, follow_symlinks=False)
+        if (
+            current_parent.st_dev,
+            current_parent.st_ino,
+            current_parent.st_uid,
+            stat.S_IMODE(current_parent.st_mode),
+        ) != parent_expected:
+            raise BulkloadError("Codex evidence output parent changed during publish")
         os.fsync(parent_descriptor)
+        for path, descriptor, expected in pinned_inputs:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
+        if (
+            _validate_codex_output_descriptor(
+                temporary_descriptor,
+                payload,
+                expected_links=1,
+            )
+            != temporary_identity
+        ):
+            raise BulkloadError("Codex evidence output changed after publish")
+        published_info = os.stat(
+            requested.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(published_info.st_mode)
+            or published_info.st_uid != os.getuid()
+            or stat.S_IMODE(published_info.st_mode) != 0o600
+            or published_info.st_size != len(payload)
+            or published_info.st_nlink != 1
+            or (published_info.st_dev, published_info.st_ino) != temporary_identity
+        ):
+            raise BulkloadError("Codex evidence target changed after publish")
+        current_parent = os.stat(parent, follow_symlinks=False)
+        if (
+            current_parent.st_dev,
+            current_parent.st_ino,
+            current_parent.st_uid,
+            stat.S_IMODE(current_parent.st_mode),
+        ) != parent_expected:
+            raise BulkloadError("Codex evidence output parent changed after publish")
     finally:
-        if temporary_name is not None:
+        if temporary_descriptor is not None:
             try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                os.close(temporary_descriptor)
             except OSError:
                 pass
         os.close(parent_descriptor)
@@ -521,6 +697,206 @@ def _codex_capture(arguments: argparse.Namespace) -> int:
     return 0 if snapshot["complete"] else 3
 
 
+def _codex_prefix_request(arguments: argparse.Namespace) -> int:
+    inputs = [
+        arguments.source_a,
+        arguments.source_b,
+        arguments.destination_a,
+        arguments.destination_b,
+    ]
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    try:
+        snapshots: list[dict[str, Any]] = []
+        for path in inputs:
+            snapshot, descriptor, expected = _read_pinned_codex_json(path)
+            pinned.append((path, descriptor, expected))
+            validate_codex_session_snapshot(snapshot)
+            snapshots.append(snapshot)
+        request = compile_codex_session_prefix_request(*snapshots)
+        for path, descriptor, expected in pinned:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
+        _write_pinned_codex_json(
+            arguments.output,
+            request,
+            snapshots,
+            pinned,
+        )
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"request={request['request_sha256']} prefixes={len(request['requests'])}"
+        )
+    return 0
+
+
+def _codex_prefix_proof(arguments: argparse.Namespace) -> int:
+    inputs = [
+        arguments.prefix_request,
+        arguments.source_a,
+        arguments.source_b,
+        arguments.destination_a,
+        arguments.destination_b,
+    ]
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    try:
+        documents: list[dict[str, Any]] = []
+        for index, path in enumerate(inputs):
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            pinned.append((path, descriptor, expected))
+            if index == 0:
+                validate_codex_session_prefix_request(document)
+            else:
+                validate_codex_session_snapshot(document)
+            documents.append(document)
+        request, source_a, source_b, destination_a, destination_b = documents
+        root = Path(os.path.abspath(Path(arguments.root).expanduser()))
+        proof = capture_codex_session_prefix_proof(
+            root,
+            role=arguments.role,
+            prefix_request=request,
+            source_a=source_a,
+            source_b=source_b,
+            destination_a=destination_a,
+            destination_b=destination_b,
+            acknowledge_writers_quiesced=arguments.acknowledge_writers_quiesced,
+        )
+        validate_codex_session_prefix_proof(proof)
+        for path, descriptor, expected in pinned:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
+        _write_pinned_codex_json(
+            arguments.output,
+            proof,
+            [source_a, source_b, destination_a, destination_b],
+            pinned,
+            protected_roots=[root],
+        )
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"proof={proof['proof_sha256']} "
+            f"role={proof['role']} prefixes={len(proof['proofs'])}"
+        )
+    return 0
+
+
+def _codex_close_request(arguments: argparse.Namespace) -> int:
+    required_inputs = [
+        ("prefix_request", arguments.prefix_request),
+        ("source_a", arguments.source_a),
+        ("source_b", arguments.source_b),
+        ("destination_a", arguments.destination_a),
+        ("destination_b", arguments.destination_b),
+    ]
+    optional_inputs = [
+        ("source_prefix_a", arguments.source_prefix_a),
+        ("source_prefix_b", arguments.source_prefix_b),
+        ("destination_prefix_a", arguments.destination_prefix_a),
+        ("destination_prefix_b", arguments.destination_prefix_b),
+    ]
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    try:
+        documents: dict[str, dict[str, Any] | None] = {}
+        for name, path in [*required_inputs, *optional_inputs]:
+            if path is None:
+                documents[name] = None
+                continue
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            pinned.append((path, descriptor, expected))
+            if name == "prefix_request":
+                validate_codex_session_prefix_request(document)
+            elif "prefix" in name:
+                validate_codex_session_prefix_proof(document)
+            else:
+                validate_codex_session_snapshot(document)
+            documents[name] = document
+        close_request = compile_codex_session_close_request(
+            documents["prefix_request"],
+            documents["source_a"],
+            documents["source_b"],
+            documents["destination_a"],
+            documents["destination_b"],
+            source_prefix_a=documents["source_prefix_a"],
+            source_prefix_b=documents["source_prefix_b"],
+            destination_prefix_a=documents["destination_prefix_a"],
+            destination_prefix_b=documents["destination_prefix_b"],
+        )
+        for path, descriptor, expected in pinned:
+            _revalidate_pinned_codex_input(path, descriptor, expected)
+        snapshots = [
+            documents["source_a"],
+            documents["source_b"],
+            documents["destination_a"],
+            documents["destination_b"],
+        ]
+        _write_pinned_codex_json(
+            arguments.output,
+            close_request,
+            snapshots,
+            pinned,
+        )
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(f"close_request={close_request['close_request_sha256']}")
+    return 0
+
+
+def _codex_close_capture(arguments: argparse.Namespace) -> int:
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    try:
+        close_request, descriptor, expected = _read_pinned_codex_json(
+            arguments.close_request
+        )
+        pinned.append((arguments.close_request, descriptor, expected))
+        validate_codex_session_close_request(close_request)
+        root = Path(os.path.abspath(Path(arguments.root).expanduser()))
+        close_capture = capture_codex_session_close_capture(
+            root,
+            role=arguments.role,
+            close_request=close_request,
+            acknowledge_writers_quiesced=arguments.acknowledge_writers_quiesced,
+        )
+        validate_codex_session_close_capture(close_capture)
+        _revalidate_pinned_codex_input(
+            arguments.close_request,
+            descriptor,
+            expected,
+        )
+        _write_pinned_codex_json(
+            arguments.output,
+            close_capture,
+            [close_capture["snapshot"]],
+            pinned,
+            protected_roots=[root],
+        )
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"close_capture={close_capture['close_capture_sha256']} "
+            f"capture={close_capture['snapshot']['capture_id']}"
+        )
+    return 0
+
+
 def _codex_plan(arguments: argparse.Namespace) -> int:
     inputs = [
         arguments.source_a,
@@ -537,19 +913,63 @@ def _codex_plan(arguments: argparse.Namespace) -> int:
             validate_codex_session_snapshot(snapshot)
             snapshots.append(snapshot)
         source_a, source_b, destination_a, destination_b = snapshots
+        optional_documents: dict[str, dict[str, Any] | None] = {
+            "prefix_request": None,
+            "source_prefix_a": None,
+            "source_prefix_b": None,
+            "destination_prefix_a": None,
+            "destination_prefix_b": None,
+            "close_request": None,
+            "source_close_a": None,
+            "source_close_b": None,
+            "destination_close_a": None,
+            "destination_close_b": None,
+        }
+        for name in optional_documents:
+            path = getattr(arguments, name)
+            if path is None:
+                continue
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            pinned.append((path, descriptor, expected))
+            if name == "prefix_request":
+                validate_codex_session_prefix_request(document)
+            elif name == "close_request":
+                validate_codex_session_close_request(document)
+            elif "_close_" in name:
+                validate_codex_session_close_capture(document)
+            else:
+                validate_codex_session_prefix_proof(document)
+            optional_documents[name] = document
         plan = compile_codex_session_union_plan(
             source_a,
             source_b,
             destination_a,
             destination_b,
+            prefix_request=optional_documents["prefix_request"],
+            source_prefix_a=optional_documents["source_prefix_a"],
+            source_prefix_b=optional_documents["source_prefix_b"],
+            destination_prefix_a=optional_documents["destination_prefix_a"],
+            destination_prefix_b=optional_documents["destination_prefix_b"],
+            close_request=optional_documents["close_request"],
+            source_close_a=optional_documents["source_close_a"],
+            source_close_b=optional_documents["source_close_b"],
+            destination_close_a=optional_documents["destination_close_a"],
+            destination_close_b=optional_documents["destination_close_b"],
         )
         for path, descriptor, expected in pinned:
             _revalidate_pinned_codex_input(path, descriptor, expected)
         _write_pinned_codex_json(
             arguments.output,
             plan,
-            snapshots,
-            [expected for _, _, expected in pinned],
+            [
+                *snapshots,
+                *[
+                    document["snapshot"]
+                    for name, document in optional_documents.items()
+                    if "_close_" in name and document is not None
+                ],
+            ],
+            pinned,
         )
     finally:
         for _, descriptor, _ in pinned:
@@ -563,6 +983,7 @@ def _codex_plan(arguments: argparse.Namespace) -> int:
             f"plan={plan['plan_sha256']} "
             f"ready={str(intent['ready_for_attended_copy']).lower()} "
             f"copy_if_absent={len(intent['copy_if_absent'])} "
+            f"promote_superset={len(intent['promote_source_superset'])} "
             f"blockers={len(intent['blockers'])}"
         )
     return 0 if intent["ready_for_attended_copy"] else 4
@@ -703,14 +1124,94 @@ def build_parser() -> argparse.ArgumentParser:
     )
     codex_capture.set_defaults(handler=_codex_capture)
 
+    codex_prefix_request = commands.add_parser(
+        "codex-prefix-request",
+        aliases=("codex-prefix-requests",),
+        help="compile immutable requests for same-UUID prefix observations",
+    )
+    codex_prefix_request.add_argument("--source-a", required=True)
+    codex_prefix_request.add_argument("--source-b", required=True)
+    codex_prefix_request.add_argument("--destination-a", required=True)
+    codex_prefix_request.add_argument("--destination-b", required=True)
+    codex_prefix_request.add_argument("--output", required=True)
+    codex_prefix_request.set_defaults(handler=_codex_prefix_request)
+
+    codex_prefix_proof = commands.add_parser(
+        "codex-prefix-proof",
+        help="capture one role-bound pass over requested byte prefixes",
+    )
+    codex_prefix_proof.add_argument("--prefix-request", required=True)
+    codex_prefix_proof.add_argument("--source-a", required=True)
+    codex_prefix_proof.add_argument("--source-b", required=True)
+    codex_prefix_proof.add_argument("--destination-a", required=True)
+    codex_prefix_proof.add_argument("--destination-b", required=True)
+    codex_prefix_proof.add_argument("--root", required=True)
+    codex_prefix_proof.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+    )
+    codex_prefix_proof.add_argument(
+        "--acknowledge-writers-quiesced",
+        action="store_true",
+        help="assert that every writer to this rollout root is stopped",
+    )
+    codex_prefix_proof.add_argument("--output", required=True)
+    codex_prefix_proof.set_defaults(handler=_codex_prefix_proof)
+
+    codex_close_request = commands.add_parser(
+        "codex-close-request",
+        help="bind every required prefix proof before close capture",
+    )
+    codex_close_request.add_argument("--prefix-request", required=True)
+    codex_close_request.add_argument("--source-a", required=True)
+    codex_close_request.add_argument("--source-b", required=True)
+    codex_close_request.add_argument("--destination-a", required=True)
+    codex_close_request.add_argument("--destination-b", required=True)
+    codex_close_request.add_argument("--source-prefix-a")
+    codex_close_request.add_argument("--source-prefix-b")
+    codex_close_request.add_argument("--destination-prefix-a")
+    codex_close_request.add_argument("--destination-prefix-b")
+    codex_close_request.add_argument("--output", required=True)
+    codex_close_request.set_defaults(handler=_codex_close_request)
+
+    codex_close_capture = commands.add_parser(
+        "codex-close-capture",
+        help="capture one fresh v2 snapshot bound to a close request",
+    )
+    codex_close_capture.add_argument("--close-request", required=True)
+    codex_close_capture.add_argument("--root", required=True)
+    codex_close_capture.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+    )
+    codex_close_capture.add_argument(
+        "--acknowledge-writers-quiesced",
+        action="store_true",
+        help="assert that every writer to this rollout root is stopped",
+    )
+    codex_close_capture.add_argument("--output", required=True)
+    codex_close_capture.set_defaults(handler=_codex_close_capture)
+
     codex_plan = commands.add_parser(
         "codex-plan",
-        help="compile a dry-run absent-only Codex session union plan",
+        help="compile a dry-run Codex session union plan",
     )
     codex_plan.add_argument("--source-a", required=True)
     codex_plan.add_argument("--source-b", required=True)
     codex_plan.add_argument("--destination-a", required=True)
     codex_plan.add_argument("--destination-b", required=True)
+    codex_plan.add_argument("--prefix-request")
+    codex_plan.add_argument("--source-prefix-a")
+    codex_plan.add_argument("--source-prefix-b")
+    codex_plan.add_argument("--destination-prefix-a")
+    codex_plan.add_argument("--destination-prefix-b")
+    codex_plan.add_argument("--close-request")
+    codex_plan.add_argument("--source-close-a")
+    codex_plan.add_argument("--source-close-b")
+    codex_plan.add_argument("--destination-close-a")
+    codex_plan.add_argument("--destination-close-b")
     codex_plan.add_argument("--output", required=True)
     codex_plan.set_defaults(handler=_codex_plan)
 

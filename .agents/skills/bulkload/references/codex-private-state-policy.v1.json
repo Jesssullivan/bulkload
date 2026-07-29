@@ -1,0 +1,77 @@
+{
+  "schema": "dev.tinyland.bulkload.codex-private-state-policy.v1",
+  "implementation": "plan-only",
+  "ready_for_apply": false,
+  "cli_source_sha256": "950a0ea71d9b3544c7e8d67f3c18354bf9481b7b5b3b9562d0d9fdd62c72ce24",
+  "allowed_codex_cli_commands": [
+    "codex-capture",
+    "codex-close-capture",
+    "codex-close-request",
+    "codex-plan",
+    "codex-prefix-proof",
+    "codex-prefix-request",
+    "codex-prefix-requests"
+  ],
+  "state_classes": {
+    "auth_file": {
+      "classification": "copy-eligible",
+      "default": "opt-in",
+      "authority": "CODEX_HOME/auth.json",
+      "reader_implemented": false,
+      "executor_implemented": false,
+      "copy_method": "private-atomic-file",
+      "requirements": [
+        "explicit-source-and-destination",
+        "no-value-logging",
+        "regular-single-link-current-user-file",
+        "source-and-destination-backup",
+        "exact-owner-and-mode",
+        "same-directory-atomic-install",
+        "file-and-directory-fsync",
+        "rollback-retained"
+      ],
+      "acceptance": [
+        "destination-file-private",
+        "codex-authentication-succeeds",
+        "fresh-provider-turn-succeeds"
+      ]
+    },
+    "sqlite_families": {
+      "classification": "copy-eligible",
+      "default": "opt-in",
+      "authority_resolution": [
+        "sqlite_home",
+        "CODEX_SQLITE_HOME",
+        "CODEX_HOME"
+      ],
+      "discovery": "enumerate-provider-owned-sqlite-families",
+      "reader_implemented": false,
+      "executor_implemented": false,
+      "copy_method": "sqlite-online-backup-or-quiesced-backup-api",
+      "raw_database_wal_shm_copy": false,
+      "requirements": [
+        "enumerate-all-provider-owned-families",
+        "matching-codex-version",
+        "compatible-migration-and-schema",
+        "writer-quiescence-or-online-backup",
+        "source-quick-check",
+        "destination-backup",
+        "canonical-destination-rollout-paths",
+        "same-directory-atomic-install",
+        "file-and-directory-fsync",
+        "rollback-retained"
+      ],
+      "acceptance": [
+        "destination-quick-check",
+        "no-stale-source-rollout-paths",
+        "thread-and-spawn-edge-parity",
+        "history-picker-parity",
+        "representative-historical-resume",
+        "fresh-turn-persists"
+      ]
+    }
+  },
+  "forbidden_commands": [
+    "codex-state-apply"
+  ]
+}

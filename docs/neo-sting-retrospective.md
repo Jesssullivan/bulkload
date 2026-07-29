@@ -235,7 +235,7 @@ Done now:
 - active Sting lane exact and ready for source-only work;
 - protected owner state exact and frozen;
 - native Sting Codex continuity proven;
-- credential state kept local;
+- credential state was kept local in that execution window;
 - AppleDouble blocker quarantined;
 - dirty/rescue worktrees classified as preserve/exclude;
 - no `cmux`, live TCFS, deploy, activation, deletion, or ceremony entered the
@@ -254,5 +254,21 @@ Remaining concerns, explicitly deferred:
 - separate credential rotation/containment; and
 - TCFS runtime and ceremony fences.
 
-No further repository or Codex-state copy is required before resuming TCFS on
-Sting.
+The narrow continuity proof did not require another copy before resuming TCFS
+on Sting.
+
+### 2026-07-28 portability ruling and parity follow-up
+
+The earlier execution choice is not a policy ban. The operator explicitly
+ratified Codex auth and SQLite as copy-eligible typed state, and published
+Codex guidance documents trusted `auth.json` movement for headless machines.
+Full Neo-to-Sting parity therefore remains valid follow-up work.
+
+Read-only live evidence found append-only composition rather than conflict:
+all 20 differing shared rollout UUIDs and `history.jsonl` are exact
+Sting-prefix/Neo-superset cases. Both hosts now run Codex 0.145.0, but their
+SQLite schemas and thread sets differ, and provider SQLite includes state,
+logs, goals, and memories families. Auth and SQLite must use dedicated private
+plans, consistent SQLite backups, path/schema reconciliation, rollback, and
+historical-resume acceptance. They must never enter the generic repo-file
+adapter or logs as values.

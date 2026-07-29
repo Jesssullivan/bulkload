@@ -1,4 +1,4 @@
-"""Read-only Codex rollout catalogs and absent-only union plans."""
+"""Read-only Codex rollout catalogs and evidence-bound union plans."""
 
 from __future__ import annotations
 
@@ -27,7 +27,19 @@ from .model import (
 )
 
 CODEX_SESSION_SNAPSHOT_SCHEMA = "dev.tinyland.bulkload.codex-sessions.v2"
-CODEX_SESSION_PLAN_SCHEMA = "dev.tinyland.bulkload.codex-session-union-plan.v2"
+CODEX_SESSION_PREFIX_REQUEST_SCHEMA = (
+    "dev.tinyland.bulkload.codex-session-prefix-request.v1"
+)
+CODEX_SESSION_PREFIX_PROOF_SCHEMA = (
+    "dev.tinyland.bulkload.codex-session-prefix-proof.v1"
+)
+CODEX_SESSION_CLOSE_REQUEST_SCHEMA = (
+    "dev.tinyland.bulkload.codex-session-close-request.v1"
+)
+CODEX_SESSION_CLOSE_CAPTURE_SCHEMA = (
+    "dev.tinyland.bulkload.codex-session-close-capture.v1"
+)
+CODEX_SESSION_PLAN_SCHEMA = "dev.tinyland.bulkload.codex-session-union-plan.v3"
 DEFAULT_MAX_SESSION_FILES = 10_000
 DEFAULT_MAX_SESSION_ENTRIES = 20_000
 DEFAULT_MAX_SESSION_DIRECTORIES = 10_000
@@ -1380,11 +1392,1206 @@ def _validate_stable_capture_pair(
         raise BulkloadError(f"Codex session {role} pass A and pass B differ")
 
 
+def _capture_pair_binding(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "host": first["host"],
+        "host_authority_id": first["host_authority_id"],
+        "root": first["root"],
+        "resolved_root": first["resolved_root"],
+        "root_identity": first["root_identity"],
+        "root_lineage": first["root_lineage"],
+        "catalog_sha256": first["catalog_sha256"],
+        "capture_ids": [first["capture_id"], second["capture_id"]],
+    }
+
+
+def _validate_union_capture_set(
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+) -> None:
+    _validate_stable_capture_pair(source_a, source_b, role="source")
+    _validate_stable_capture_pair(
+        destination_a,
+        destination_b,
+        role="destination",
+    )
+    capture_ids = {
+        source_a["capture_id"],
+        source_b["capture_id"],
+        destination_a["capture_id"],
+        destination_b["capture_id"],
+    }
+    if len(capture_ids) != 4:
+        raise BulkloadError("Codex session planning requires four distinct captures")
+    if source_a["host_authority_id"] != destination_a["host_authority_id"]:
+        return
+    source_root_identity = (
+        source_a["root_identity"]["device"],
+        source_a["root_identity"]["inode"],
+    )
+    destination_root_identity = (
+        destination_a["root_identity"]["device"],
+        destination_a["root_identity"]["inode"],
+    )
+    source_lineage = {
+        (identity["device"], identity["inode"]) for identity in source_a["root_lineage"]
+    }
+    destination_lineage = {
+        (identity["device"], identity["inode"])
+        for identity in destination_a["root_lineage"]
+    }
+    source_resolved = Path(source_a["resolved_root"])
+    destination_resolved = Path(destination_a["resolved_root"])
+    paths_overlap = False
+    for candidate, possible_parent in (
+        (source_resolved, destination_resolved),
+        (destination_resolved, source_resolved),
+    ):
+        try:
+            candidate.relative_to(possible_parent)
+            paths_overlap = True
+        except ValueError:
+            pass
+    if (
+        source_root_identity in destination_lineage
+        or destination_root_identity in source_lineage
+        or paths_overlap
+    ):
+        raise BulkloadError(
+            "Codex session source and destination roots overlap; "
+            "source and destination must differ"
+        )
+
+
+def _validate_closing_capture_pair(
+    opening_a: dict[str, Any],
+    opening_b: dict[str, Any],
+    closing_a: dict[str, Any],
+    closing_b: dict[str, Any],
+    *,
+    role: str,
+) -> None:
+    _validate_stable_capture_pair(closing_a, closing_b, role=role)
+    stable_fields = (
+        "role",
+        "host",
+        "host_authority_id",
+        "root",
+        "resolved_root",
+        "root_identity",
+        "root_lineage",
+        "budgets",
+        "catalog_sha256",
+    )
+    if (
+        any(opening_a[field] != closing_a[field] for field in stable_fields)
+        or any(opening_b[field] != closing_b[field] for field in stable_fields)
+        or canonical_bytes(_catalog_body(opening_a))
+        != canonical_bytes(_catalog_body(closing_a))
+        or canonical_bytes(_catalog_body(opening_b))
+        != canonical_bytes(_catalog_body(closing_b))
+    ):
+        raise BulkloadError(f"Codex session {role} opening and close captures differ")
+
+
+def _proof_evidence_binding(proof: dict[str, Any]) -> dict[str, str]:
+    return {
+        "capture_id": proof["capture_id"],
+        "proof_sha256": proof["proof_sha256"],
+    }
+
+
+def _prefix_requests(
+    source_sessions: list[dict[str, Any]],
+    destination_sessions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_by_id = {item["session_id"]: item for item in source_sessions}
+    destination_by_id = {item["session_id"]: item for item in destination_sessions}
+    requests: list[dict[str, Any]] = []
+    for session_id in sorted(set(source_by_id) & set(destination_by_id)):
+        source = source_by_id[session_id]
+        destination = destination_by_id[session_id]
+        if (
+            source["sha256"] == destination["sha256"]
+            and source["size"] == destination["size"]
+        ) or source["size"] == destination["size"]:
+            continue
+        if source["size"] > destination["size"]:
+            longer_role, longer = "source", source
+            shorter_role, shorter = "destination", destination
+        else:
+            longer_role, longer = "destination", destination
+            shorter_role, shorter = "source", source
+        requests.append(
+            {
+                "session_id": session_id,
+                "longer_role": longer_role,
+                "longer_relative_path": longer["relative_path"],
+                "longer_sha256": longer["sha256"],
+                "longer_size": longer["size"],
+                "shorter_role": shorter_role,
+                "shorter_relative_path": shorter["relative_path"],
+                "shorter_sha256": shorter["sha256"],
+                "shorter_size": shorter["size"],
+            }
+        )
+    return requests
+
+
+def compile_codex_session_prefix_request(
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+) -> dict[str, Any]:
+    """Compile immutable requests for byte-prefix observations."""
+    _validate_union_capture_set(
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+    request: dict[str, Any] = {
+        "schema": CODEX_SESSION_PREFIX_REQUEST_SCHEMA,
+        "created_at": utc_now(),
+        "source": _capture_pair_binding(source_a, source_b),
+        "destination": _capture_pair_binding(destination_a, destination_b),
+        "requests": _prefix_requests(
+            source_a["sessions"],
+            destination_a["sessions"],
+        ),
+    }
+    request["request_sha256"] = object_digest(request, "request_sha256")
+    if len(canonical_bytes(request)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session prefix request output byte budget exceeded")
+    return request
+
+
+def compile_codex_session_prefix_requests(
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+) -> dict[str, Any]:
+    """Compatibility spelling for callers treating the manifest as a set."""
+    return compile_codex_session_prefix_request(
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+
+
+def _valid_prefix_binding(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "host",
+        "host_authority_id",
+        "root",
+        "resolved_root",
+        "root_identity",
+        "root_lineage",
+        "catalog_sha256",
+        "capture_ids",
+    }:
+        return False
+    capture_ids = value.get("capture_ids")
+    return (
+        isinstance(value.get("host"), str)
+        and bool(value["host"])
+        and "\x00" not in value["host"]
+        and _utf8_size(value["host"], "Codex session prefix host") <= 255
+        and isinstance(value.get("host_authority_id"), str)
+        and _canonical_host_authority_id(value["host_authority_id"])
+        == value["host_authority_id"]
+        and isinstance(value.get("root"), str)
+        and "\x00" not in value["root"]
+        and _utf8_size(value["root"], "Codex session prefix root")
+        <= _BUDGET_LIMITS["max_path_bytes"]
+        and Path(value["root"]).is_absolute()
+        and os.path.normpath(value["root"]) == value["root"]
+        and value["root"] != Path(value["root"]).anchor
+        and isinstance(value.get("resolved_root"), str)
+        and "\x00" not in value["resolved_root"]
+        and _utf8_size(
+            value["resolved_root"],
+            "Codex session prefix resolved root",
+        )
+        <= _BUDGET_LIMITS["max_path_bytes"]
+        and Path(value["resolved_root"]).is_absolute()
+        and os.path.normpath(value["resolved_root"]) == value["resolved_root"]
+        and value["resolved_root"] != Path(value["resolved_root"]).anchor
+        and _valid_identity_record(value.get("root_identity"))
+        and isinstance(value.get("root_lineage"), list)
+        and 0 < len(value["root_lineage"]) <= MAX_CODEX_ROOT_LINEAGE
+        and value["root_lineage"][0] == value["root_identity"]
+        and all(_valid_identity_record(item) for item in value["root_lineage"])
+        and len({(item["device"], item["inode"]) for item in value["root_lineage"]})
+        == len(value["root_lineage"])
+        and isinstance(value.get("catalog_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["catalog_sha256"]) is not None
+        and isinstance(capture_ids, list)
+        and len(capture_ids) == 2
+        and len(set(capture_ids)) == 2
+        and all(
+            isinstance(capture_id, str) and re.fullmatch(r"[0-9a-f]{32}", capture_id)
+            for capture_id in capture_ids
+        )
+    )
+
+
+def validate_codex_session_prefix_request(request: dict[str, Any]) -> None:
+    if set(request) != {
+        "schema",
+        "created_at",
+        "source",
+        "destination",
+        "requests",
+        "request_sha256",
+    }:
+        raise BulkloadError("Codex session prefix request has unexpected fields")
+    if request.get("schema") != CODEX_SESSION_PREFIX_REQUEST_SCHEMA:
+        raise BulkloadError("unsupported Codex session prefix request schema")
+    if (
+        not isinstance(request.get("created_at"), str)
+        or not request["created_at"]
+        or not _valid_prefix_binding(request.get("source"))
+        or not _valid_prefix_binding(request.get("destination"))
+    ):
+        raise BulkloadError("Codex session prefix request envelope is invalid")
+    capture_ids = [
+        *request["source"]["capture_ids"],
+        *request["destination"]["capture_ids"],
+    ]
+    if len(set(capture_ids)) != 4:
+        raise BulkloadError(
+            "Codex session prefix request requires four distinct captures"
+        )
+    requests = request.get("requests")
+    if not isinstance(requests, list) or len(requests) > _BUDGET_LIMITS["max_files"]:
+        raise BulkloadError("Codex session prefix requests are invalid")
+    seen: set[str] = set()
+    path_budgets = {
+        "max_path_bytes": _BUDGET_LIMITS["max_path_bytes"],
+        "max_path_components": _BUDGET_LIMITS["max_path_components"],
+    }
+    for item in requests:
+        if not isinstance(item, dict) or set(item) != {
+            "session_id",
+            "longer_role",
+            "longer_relative_path",
+            "longer_sha256",
+            "longer_size",
+            "shorter_role",
+            "shorter_relative_path",
+            "shorter_sha256",
+            "shorter_size",
+        }:
+            raise BulkloadError("Codex session prefix request record is invalid")
+        try:
+            session_id = _canonical_session_id(
+                item["session_id"],
+                Path(str(item.get("longer_relative_path", ""))),
+            )
+            longer_path = _validate_relative_path(
+                item["longer_relative_path"],
+                path_budgets,
+            )
+            shorter_path = _validate_relative_path(
+                item["shorter_relative_path"],
+                path_budgets,
+            )
+        except (BulkloadError, TypeError) as error:
+            raise BulkloadError(
+                "Codex session prefix request record is invalid"
+            ) from error
+        if (
+            session_id != item["session_id"]
+            or session_id in seen
+            or longer_path != item["longer_relative_path"]
+            or shorter_path != item["shorter_relative_path"]
+            or item["longer_role"] not in {"source", "destination"}
+            or item["shorter_role"] not in {"source", "destination"}
+            or item["longer_role"] == item["shorter_role"]
+            or not isinstance(item["longer_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["longer_sha256"]) is None
+            or not isinstance(item["shorter_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["shorter_sha256"]) is None
+            or type(item["longer_size"]) is not int
+            or type(item["shorter_size"]) is not int
+            or item["shorter_size"] < 1
+            or item["longer_size"] <= item["shorter_size"]
+            or item["longer_size"] > _BUDGET_LIMITS["max_file_bytes"]
+        ):
+            raise BulkloadError("Codex session prefix request record is invalid")
+        seen.add(session_id)
+    if requests != sorted(requests, key=lambda item: item["session_id"]):
+        raise BulkloadError("Codex session prefix requests are not canonically ordered")
+    if len(canonical_bytes(request)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session prefix request output byte budget exceeded")
+    require_digest(request, "request_sha256")
+
+
+def _validate_prefix_request_against_captures(
+    request: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+) -> None:
+    validate_codex_session_prefix_request(request)
+    _validate_union_capture_set(
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+    if (
+        request["source"] != _capture_pair_binding(source_a, source_b)
+        or request["destination"] != _capture_pair_binding(destination_a, destination_b)
+        or request["requests"]
+        != _prefix_requests(source_a["sessions"], destination_a["sessions"])
+    ):
+        raise BulkloadError(
+            "Codex session prefix request does not bind the supplied captures"
+        )
+
+
+def _capture_requested_prefix(
+    root_descriptor: int,
+    root: Path,
+    *,
+    role: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    relative_path = request["longer_relative_path"]
+    parent_text = PurePosixPath(relative_path).parent.as_posix()
+    if parent_text == ".":
+        parent_text = ""
+    parent_descriptor = _open_relative_directory(root_descriptor, parent_text)
+    name = PurePosixPath(relative_path).name
+    path = root / relative_path
+    try:
+        parent_before = _stable_stat(os.fstat(parent_descriptor))
+        entry_before = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _stable_user_regular(entry_before, path, role=role)
+        if entry_before.st_size != request["longer_size"]:
+            raise BulkloadError(
+                f"Codex rollout size changed before prefix proof: {path}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        full_digest = hashlib.sha256()
+        prefix_digest = hashlib.sha256()
+        prefix_remaining = request["shorter_size"]
+        prefix_last_byte: int | None = None
+        bytes_read = 0
+        try:
+            descriptor_before = os.fstat(descriptor)
+            _stable_user_regular(descriptor_before, path, role=role)
+            if _stable_stat(descriptor_before) != _stable_stat(entry_before):
+                raise BulkloadError(
+                    f"Codex rollout changed before prefix proof: {path}"
+                )
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                bytes_read += len(block)
+                if bytes_read > request["longer_size"]:
+                    raise BulkloadError(
+                        f"Codex rollout grew during prefix proof: {path}"
+                    )
+                full_digest.update(block)
+                if prefix_remaining:
+                    prefix_block = block[:prefix_remaining]
+                    prefix_digest.update(prefix_block)
+                    prefix_remaining -= len(prefix_block)
+                    if prefix_block:
+                        prefix_last_byte = prefix_block[-1]
+            descriptor_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        entry_after = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _stable_stat(descriptor_before) != _stable_stat(descriptor_after)
+            or _stable_stat(descriptor_before) != _stable_stat(entry_after)
+            or bytes_read != request["longer_size"]
+            or prefix_remaining != 0
+            or full_digest.hexdigest() != request["longer_sha256"]
+        ):
+            raise BulkloadError(f"Codex rollout changed during prefix proof: {path}")
+        if _stable_stat(os.fstat(parent_descriptor)) != parent_before:
+            raise BulkloadError(
+                f"Codex session directory changed during prefix proof: {path.parent}"
+            )
+    finally:
+        os.close(parent_descriptor)
+    reopened_parent = _open_relative_directory(root_descriptor, parent_text)
+    try:
+        if _stable_stat(os.fstat(reopened_parent)) != parent_before:
+            raise BulkloadError(
+                f"Codex session directory changed during prefix proof: {path.parent}"
+            )
+    finally:
+        os.close(reopened_parent)
+    return {
+        "session_id": request["session_id"],
+        "relative_path": relative_path,
+        "sha256": full_digest.hexdigest(),
+        "size": bytes_read,
+        "prefix_sha256": prefix_digest.hexdigest(),
+        "prefix_size": request["shorter_size"],
+        "prefix_ends_at_record": prefix_last_byte == ord("\n"),
+    }
+
+
+def capture_codex_session_prefix_proof(
+    root: Path,
+    *,
+    role: str,
+    prefix_request: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+    acknowledge_writers_quiesced: bool,
+) -> dict[str, Any]:
+    """Capture one repeated, role-bound observation of requested prefixes."""
+    if role not in {"source", "destination"}:
+        raise BulkloadError("Codex session prefix proof role is invalid")
+    if acknowledge_writers_quiesced is not True:
+        raise BulkloadError(
+            "Codex session prefix proof requires explicit writer quiescence"
+        )
+    _validate_prefix_request_against_captures(
+        prefix_request,
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+    snapshot = source_a if role == "source" else destination_a
+    requested = [
+        item for item in prefix_request["requests"] if item["longer_role"] == role
+    ]
+    if not requested:
+        raise BulkloadError(f"Codex session prefix request has no {role} observations")
+    sessions = {item["session_id"]: item for item in snapshot["sessions"]}
+    for item in requested:
+        session = sessions.get(item["session_id"])
+        if (
+            session is None
+            or session["relative_path"] != item["longer_relative_path"]
+            or session["sha256"] != item["longer_sha256"]
+            or session["size"] != item["longer_size"]
+        ):
+            raise BulkloadError(
+                "Codex session prefix request is absent from the bound catalog"
+            )
+
+    root = root.expanduser()
+    root_text = os.fspath(root)
+    if (
+        not root.is_absolute()
+        or os.path.normpath(root_text) != root_text
+        or root_text != snapshot["root"]
+    ):
+        raise BulkloadError("Codex session prefix proof root does not match capture")
+    root_info = root.lstat()
+    _validate_stable_directory(root, root_info, role=role)
+    root_descriptor = _open_directory(root, parent_descriptor=None, path=root)
+    try:
+        descriptor_info = os.fstat(root_descriptor)
+        _validate_stable_directory(root, descriptor_info, role=role)
+        expected_root_identity = (
+            snapshot["root_identity"]["device"],
+            snapshot["root_identity"]["inode"],
+        )
+        if (
+            _stable_stat(descriptor_info) != _stable_stat(root_info)
+            or (descriptor_info.st_dev, descriptor_info.st_ino)
+            != expected_root_identity
+            or str(root.resolve(strict=True)) != snapshot["resolved_root"]
+            or _directory_lineage(root_descriptor) != snapshot["root_lineage"]
+        ):
+            raise BulkloadError("Codex session prefix proof root authority changed")
+        proofs = [
+            _capture_requested_prefix(
+                root_descriptor,
+                root,
+                role=role,
+                request=item,
+            )
+            for item in requested
+        ]
+        descriptor_after = os.fstat(root_descriptor)
+        if (
+            _stable_stat(descriptor_after) != _stable_stat(descriptor_info)
+            or _stable_stat(root.lstat()) != _stable_stat(root_info)
+            or str(root.resolve(strict=True)) != snapshot["resolved_root"]
+            or _directory_lineage(root_descriptor) != snapshot["root_lineage"]
+        ):
+            raise BulkloadError(
+                "Codex session prefix proof root authority changed during capture"
+            )
+        reopened = _open_directory(root, parent_descriptor=None, path=root)
+        try:
+            if _stable_stat(os.fstat(reopened)) != _stable_stat(descriptor_info):
+                raise BulkloadError(
+                    "Codex session prefix proof root authority changed during capture"
+                )
+        finally:
+            os.close(reopened)
+    finally:
+        os.close(root_descriptor)
+    proof: dict[str, Any] = {
+        "schema": CODEX_SESSION_PREFIX_PROOF_SCHEMA,
+        "captured_at": utc_now(),
+        "capture_id": secrets.token_hex(16),
+        "role": role,
+        "writers_quiesced": True,
+        "request_sha256": prefix_request["request_sha256"],
+        "binding": _capture_pair_binding(
+            source_a if role == "source" else destination_a,
+            source_b if role == "source" else destination_b,
+        ),
+        "proofs": proofs,
+    }
+    proof["proofs_sha256"] = sha256_bytes(canonical_bytes(proofs))
+    proof["proof_sha256"] = object_digest(proof, "proof_sha256")
+    if len(canonical_bytes(proof)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session prefix proof output byte budget exceeded")
+    return proof
+
+
+def validate_codex_session_prefix_proof(proof: dict[str, Any]) -> None:
+    if set(proof) != {
+        "schema",
+        "captured_at",
+        "capture_id",
+        "role",
+        "writers_quiesced",
+        "request_sha256",
+        "binding",
+        "proofs",
+        "proofs_sha256",
+        "proof_sha256",
+    }:
+        raise BulkloadError("Codex session prefix proof has unexpected fields")
+    if proof.get("schema") != CODEX_SESSION_PREFIX_PROOF_SCHEMA:
+        raise BulkloadError("unsupported Codex session prefix proof schema")
+    if (
+        not isinstance(proof.get("captured_at"), str)
+        or not proof["captured_at"]
+        or not isinstance(proof.get("capture_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", proof["capture_id"]) is None
+        or proof.get("role") not in {"source", "destination"}
+        or proof.get("writers_quiesced") is not True
+        or not isinstance(proof.get("request_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", proof["request_sha256"]) is None
+        or not _valid_prefix_binding(proof.get("binding"))
+    ):
+        raise BulkloadError("Codex session prefix proof envelope is invalid")
+    proofs = proof.get("proofs")
+    if not isinstance(proofs, list) or len(proofs) > _BUDGET_LIMITS["max_files"]:
+        raise BulkloadError("Codex session prefix proof records are invalid")
+    seen: set[str] = set()
+    path_budgets = {
+        "max_path_bytes": _BUDGET_LIMITS["max_path_bytes"],
+        "max_path_components": _BUDGET_LIMITS["max_path_components"],
+    }
+    for item in proofs:
+        if not isinstance(item, dict) or set(item) != {
+            "session_id",
+            "relative_path",
+            "sha256",
+            "size",
+            "prefix_sha256",
+            "prefix_size",
+            "prefix_ends_at_record",
+        }:
+            raise BulkloadError("Codex session prefix proof record is invalid")
+        try:
+            session_id = _canonical_session_id(
+                item["session_id"],
+                Path(str(item.get("relative_path", ""))),
+            )
+            relative_path = _validate_relative_path(
+                item["relative_path"],
+                path_budgets,
+            )
+        except (BulkloadError, TypeError) as error:
+            raise BulkloadError(
+                "Codex session prefix proof record is invalid"
+            ) from error
+        if (
+            session_id != item["session_id"]
+            or session_id in seen
+            or relative_path != item["relative_path"]
+            or not isinstance(item["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+            or not isinstance(item["prefix_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["prefix_sha256"]) is None
+            or type(item["size"]) is not int
+            or type(item["prefix_size"]) is not int
+            or item["size"] <= item["prefix_size"]
+            or item["prefix_size"] < 1
+            or item["size"] > _BUDGET_LIMITS["max_file_bytes"]
+            or type(item["prefix_ends_at_record"]) is not bool
+        ):
+            raise BulkloadError("Codex session prefix proof record is invalid")
+        seen.add(session_id)
+    if proofs != sorted(proofs, key=lambda item: item["session_id"]):
+        raise BulkloadError("Codex session prefix proofs are not canonically ordered")
+    if proof.get("proofs_sha256") != sha256_bytes(canonical_bytes(proofs)):
+        raise BulkloadError("Codex session prefix proof record digest mismatch")
+    if len(canonical_bytes(proof)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session prefix proof output byte budget exceeded")
+    require_digest(proof, "proof_sha256")
+
+
+def _validate_prefix_proof_pair(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    role: str,
+    request: dict[str, Any],
+    binding: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    expected_requests = [
+        item for item in request["requests"] if item["longer_role"] == role
+    ]
+    if not expected_requests:
+        raise BulkloadError(f"Codex session {role} prefix proof is unexpected")
+    for proof in (first, second):
+        validate_codex_session_prefix_proof(proof)
+        if (
+            proof["role"] != role
+            or proof["request_sha256"] != request["request_sha256"]
+            or proof["binding"] != binding
+        ):
+            raise BulkloadError(f"Codex session {role} prefix proof binding is invalid")
+    if first["capture_id"] == second["capture_id"]:
+        raise BulkloadError(
+            f"Codex session {role} prefix passes must be distinct captures"
+        )
+    if first["proofs"] != second["proofs"]:
+        raise BulkloadError(f"Codex session {role} prefix pass A and pass B differ")
+    expected_by_id = {item["session_id"]: item for item in expected_requests}
+    proof_by_id = {item["session_id"]: item for item in first["proofs"]}
+    if set(proof_by_id) != set(expected_by_id):
+        raise BulkloadError(f"Codex session {role} prefix proof set is incomplete")
+    for session_id, item in proof_by_id.items():
+        expected = expected_by_id[session_id]
+        if (
+            item["relative_path"] != expected["longer_relative_path"]
+            or item["sha256"] != expected["longer_sha256"]
+            or item["size"] != expected["longer_size"]
+            or item["prefix_size"] != expected["shorter_size"]
+        ):
+            raise BulkloadError(f"Codex session {role} prefix proof claim is invalid")
+    return proof_by_id
+
+
+def _validate_required_prefix_proofs(
+    request: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+    *,
+    source_prefix_a: dict[str, Any] | None,
+    source_prefix_b: dict[str, Any] | None,
+    destination_prefix_a: dict[str, Any] | None,
+    destination_prefix_b: dict[str, Any] | None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    list[dict[str, str]],
+    list[dict[str, str]],
+    list[str],
+]:
+    prefix_proofs: dict[str, dict[str, Any]] = {}
+    proof_bindings_by_role: dict[str, list[dict[str, str]]] = {
+        "source": [],
+        "destination": [],
+    }
+    proof_capture_ids: list[str] = []
+    for role, first, second, binding in (
+        (
+            "source",
+            source_prefix_a,
+            source_prefix_b,
+            _capture_pair_binding(source_a, source_b),
+        ),
+        (
+            "destination",
+            destination_prefix_a,
+            destination_prefix_b,
+            _capture_pair_binding(destination_a, destination_b),
+        ),
+    ):
+        role_requests = [
+            item for item in request["requests"] if item["longer_role"] == role
+        ]
+        if role_requests and (first is None or second is None):
+            raise BulkloadError(
+                f"Codex session {role} prefix proof requires pass A and pass B"
+            )
+        if not role_requests and (first is not None or second is not None):
+            raise BulkloadError(f"Codex session {role} prefix proof is unexpected")
+        if not role_requests:
+            continue
+        validated = _validate_prefix_proof_pair(
+            first,
+            second,
+            role=role,
+            request=request,
+            binding=binding,
+        )
+        prefix_proofs.update(validated)
+        proof_bindings_by_role[role] = [
+            _proof_evidence_binding(first),
+            _proof_evidence_binding(second),
+        ]
+        proof_capture_ids.extend([first["capture_id"], second["capture_id"]])
+    return (
+        prefix_proofs,
+        proof_bindings_by_role["source"],
+        proof_bindings_by_role["destination"],
+        proof_capture_ids,
+    )
+
+
+def _close_custody_binding(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    return {
+        "role": role,
+        **_capture_pair_binding(first, second),
+        "budgets": first["budgets"],
+    }
+
+
+def _validate_close_custody(value: Any, *, role: str) -> None:
+    expected_keys = {
+        "role",
+        "host",
+        "host_authority_id",
+        "root",
+        "resolved_root",
+        "root_identity",
+        "root_lineage",
+        "catalog_sha256",
+        "capture_ids",
+        "budgets",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise BulkloadError(f"Codex session {role} close custody is invalid")
+    binding = {
+        key: item for key, item in value.items() if key not in {"role", "budgets"}
+    }
+    budgets = value["budgets"]
+    if (
+        value["role"] != role
+        or not _valid_prefix_binding(binding)
+        or not isinstance(budgets, dict)
+        or set(budgets) != set(_BUDGET_LIMITS)
+    ):
+        raise BulkloadError(f"Codex session {role} close custody is invalid")
+    validated_budgets = _capture_budgets(
+        max_files=budgets.get("max_files"),
+        max_entries=budgets.get("max_entries"),
+        max_directories=budgets.get("max_directories"),
+        max_bytes=budgets.get("max_total_bytes"),
+        max_file_bytes=budgets.get("max_file_bytes"),
+        max_record_bytes=budgets.get("max_record_bytes"),
+        max_records_per_file=budgets.get("max_records_per_file"),
+        max_path_bytes=budgets.get("max_path_bytes"),
+        max_path_components=budgets.get("max_path_components"),
+        max_catalog_bytes=budgets.get("max_catalog_bytes"),
+        max_errors=budgets.get("max_errors"),
+        max_output_bytes=budgets.get("max_output_bytes"),
+    )
+    if budgets != validated_budgets:
+        raise BulkloadError(f"Codex session {role} close custody is invalid")
+
+
+def _validate_proof_evidence_bindings(value: Any, *, role: str) -> None:
+    if not isinstance(value, list) or len(value) not in {0, 2}:
+        raise BulkloadError(f"Codex session {role} proof bindings are invalid")
+    seen: set[str] = set()
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"capture_id", "proof_sha256"}
+            or not isinstance(item["capture_id"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", item["capture_id"]) is None
+            or item["capture_id"] in seen
+            or not isinstance(item["proof_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["proof_sha256"]) is None
+        ):
+            raise BulkloadError(f"Codex session {role} proof bindings are invalid")
+        seen.add(item["capture_id"])
+
+
+def compile_codex_session_close_request(
+    prefix_request: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+    *,
+    source_prefix_a: dict[str, Any] | None = None,
+    source_prefix_b: dict[str, Any] | None = None,
+    destination_prefix_a: dict[str, Any] | None = None,
+    destination_prefix_b: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind every required prefix proof before any close capture begins."""
+    _validate_prefix_request_against_captures(
+        prefix_request,
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+    if not prefix_request["requests"]:
+        raise BulkloadError("Codex session close request requires prefix observations")
+    (
+        _,
+        source_proof_bindings,
+        destination_proof_bindings,
+        proof_capture_ids,
+    ) = _validate_required_prefix_proofs(
+        prefix_request,
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+        source_prefix_a=source_prefix_a,
+        source_prefix_b=source_prefix_b,
+        destination_prefix_a=destination_prefix_a,
+        destination_prefix_b=destination_prefix_b,
+    )
+    opening_capture_ids = [
+        source_a["capture_id"],
+        source_b["capture_id"],
+        destination_a["capture_id"],
+        destination_b["capture_id"],
+    ]
+    if len(set([*opening_capture_ids, *proof_capture_ids])) != len(
+        [*opening_capture_ids, *proof_capture_ids]
+    ):
+        raise BulkloadError(
+            "Codex session opening and proof captures must be globally distinct"
+        )
+    close_request: dict[str, Any] = {
+        "schema": CODEX_SESSION_CLOSE_REQUEST_SCHEMA,
+        "created_at": utc_now(),
+        "prefix_request_sha256": prefix_request["request_sha256"],
+        "source": _close_custody_binding(source_a, source_b, role="source"),
+        "destination": _close_custody_binding(
+            destination_a,
+            destination_b,
+            role="destination",
+        ),
+        "source_prefix_proofs": source_proof_bindings,
+        "destination_prefix_proofs": destination_proof_bindings,
+    }
+    close_request["close_request_sha256"] = object_digest(
+        close_request,
+        "close_request_sha256",
+    )
+    if len(canonical_bytes(close_request)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session close request output byte budget exceeded")
+    return close_request
+
+
+def validate_codex_session_close_request(
+    close_request: dict[str, Any],
+) -> None:
+    if set(close_request) != {
+        "schema",
+        "created_at",
+        "prefix_request_sha256",
+        "source",
+        "destination",
+        "source_prefix_proofs",
+        "destination_prefix_proofs",
+        "close_request_sha256",
+    }:
+        raise BulkloadError("Codex session close request has unexpected fields")
+    if close_request.get("schema") != CODEX_SESSION_CLOSE_REQUEST_SCHEMA:
+        raise BulkloadError("unsupported Codex session close request schema")
+    if (
+        not isinstance(close_request.get("created_at"), str)
+        or not close_request["created_at"]
+        or not isinstance(close_request.get("prefix_request_sha256"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            close_request["prefix_request_sha256"],
+        )
+        is None
+    ):
+        raise BulkloadError("Codex session close request envelope is invalid")
+    _validate_close_custody(close_request.get("source"), role="source")
+    _validate_close_custody(
+        close_request.get("destination"),
+        role="destination",
+    )
+    _validate_proof_evidence_bindings(
+        close_request.get("source_prefix_proofs"),
+        role="source",
+    )
+    _validate_proof_evidence_bindings(
+        close_request.get("destination_prefix_proofs"),
+        role="destination",
+    )
+    if not (
+        close_request["source_prefix_proofs"]
+        or close_request["destination_prefix_proofs"]
+    ):
+        raise BulkloadError("Codex session close request has no prefix proofs")
+    capture_ids = [
+        *close_request["source"]["capture_ids"],
+        *close_request["destination"]["capture_ids"],
+        *[item["capture_id"] for item in close_request["source_prefix_proofs"]],
+        *[item["capture_id"] for item in close_request["destination_prefix_proofs"]],
+    ]
+    if len(set(capture_ids)) != len(capture_ids):
+        raise BulkloadError(
+            "Codex session close request capture IDs are not globally distinct"
+        )
+    if len(canonical_bytes(close_request)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session close request output byte budget exceeded")
+    require_digest(close_request, "close_request_sha256")
+
+
+def _validate_close_request_against_inputs(
+    close_request: dict[str, Any],
+    prefix_request: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+    *,
+    source_prefix_a: dict[str, Any] | None,
+    source_prefix_b: dict[str, Any] | None,
+    destination_prefix_a: dict[str, Any] | None,
+    destination_prefix_b: dict[str, Any] | None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    list[dict[str, str]],
+    list[dict[str, str]],
+    list[str],
+]:
+    validate_codex_session_close_request(close_request)
+    _validate_prefix_request_against_captures(
+        prefix_request,
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+    )
+    (
+        prefix_proofs,
+        source_proof_bindings,
+        destination_proof_bindings,
+        proof_capture_ids,
+    ) = _validate_required_prefix_proofs(
+        prefix_request,
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+        source_prefix_a=source_prefix_a,
+        source_prefix_b=source_prefix_b,
+        destination_prefix_a=destination_prefix_a,
+        destination_prefix_b=destination_prefix_b,
+    )
+    if (
+        close_request["prefix_request_sha256"] != prefix_request["request_sha256"]
+        or close_request["source"]
+        != _close_custody_binding(source_a, source_b, role="source")
+        or close_request["destination"]
+        != _close_custody_binding(
+            destination_a,
+            destination_b,
+            role="destination",
+        )
+        or close_request["source_prefix_proofs"] != source_proof_bindings
+        or close_request["destination_prefix_proofs"] != destination_proof_bindings
+    ):
+        raise BulkloadError(
+            "Codex session close request does not bind the supplied prefix evidence"
+        )
+    return (
+        prefix_proofs,
+        source_proof_bindings,
+        destination_proof_bindings,
+        proof_capture_ids,
+    )
+
+
+def capture_codex_session_close_capture(
+    root: Path,
+    *,
+    role: str,
+    close_request: dict[str, Any],
+    acknowledge_writers_quiesced: bool,
+) -> dict[str, Any]:
+    """Capture a fresh v2 snapshot chained after a validated close request."""
+    validate_codex_session_close_request(close_request)
+    if role not in {"source", "destination"}:
+        raise BulkloadError("Codex session close capture role is invalid")
+    custody = close_request[role]
+    root = root.expanduser()
+    root_text = os.fspath(root)
+    if (
+        not root.is_absolute()
+        or os.path.normpath(root_text) != root_text
+        or root_text != custody["root"]
+    ):
+        raise BulkloadError("Codex session close capture root does not match custody")
+    budgets = custody["budgets"]
+    snapshot = capture_codex_sessions(
+        root,
+        role=role,
+        acknowledge_writers_quiesced=acknowledge_writers_quiesced,
+        host_authority_id=custody["host_authority_id"],
+        max_files=budgets["max_files"],
+        max_entries=budgets["max_entries"],
+        max_directories=budgets["max_directories"],
+        max_bytes=budgets["max_total_bytes"],
+        max_file_bytes=budgets["max_file_bytes"],
+        max_record_bytes=budgets["max_record_bytes"],
+        max_records_per_file=budgets["max_records_per_file"],
+        max_path_bytes=budgets["max_path_bytes"],
+        max_path_components=budgets["max_path_components"],
+        max_catalog_bytes=budgets["max_catalog_bytes"],
+        max_errors=budgets["max_errors"],
+        max_output_bytes=budgets["max_output_bytes"],
+    )
+    validate_codex_session_snapshot(snapshot)
+    if (
+        not snapshot["complete"]
+        or snapshot["role"] != role
+        or snapshot["host"] != custody["host"]
+        or snapshot["host_authority_id"] != custody["host_authority_id"]
+        or snapshot["root"] != custody["root"]
+        or snapshot["resolved_root"] != custody["resolved_root"]
+        or snapshot["root_identity"] != custody["root_identity"]
+        or snapshot["root_lineage"] != custody["root_lineage"]
+        or snapshot["budgets"] != custody["budgets"]
+        or snapshot["catalog_sha256"] != custody["catalog_sha256"]
+    ):
+        raise BulkloadError(
+            f"Codex session {role} close capture differs from requested custody"
+        )
+    close_capture: dict[str, Any] = {
+        "schema": CODEX_SESSION_CLOSE_CAPTURE_SCHEMA,
+        "created_at": utc_now(),
+        "close_request_sha256": close_request["close_request_sha256"],
+        "snapshot": snapshot,
+    }
+    close_capture["close_capture_sha256"] = object_digest(
+        close_capture,
+        "close_capture_sha256",
+    )
+    if len(canonical_bytes(close_capture)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session close capture output byte budget exceeded")
+    return close_capture
+
+
+def validate_codex_session_close_capture(
+    close_capture: dict[str, Any],
+) -> None:
+    if set(close_capture) != {
+        "schema",
+        "created_at",
+        "close_request_sha256",
+        "snapshot",
+        "close_capture_sha256",
+    }:
+        raise BulkloadError("Codex session close capture has unexpected fields")
+    if close_capture.get("schema") != CODEX_SESSION_CLOSE_CAPTURE_SCHEMA:
+        raise BulkloadError("unsupported Codex session close capture schema")
+    if (
+        not isinstance(close_capture.get("created_at"), str)
+        or not close_capture["created_at"]
+        or not isinstance(close_capture.get("close_request_sha256"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            close_capture["close_request_sha256"],
+        )
+        is None
+        or not isinstance(close_capture.get("snapshot"), dict)
+    ):
+        raise BulkloadError("Codex session close capture envelope is invalid")
+    validate_codex_session_snapshot(close_capture["snapshot"])
+    if len(canonical_bytes(close_capture)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session close capture output byte budget exceeded")
+    require_digest(close_capture, "close_capture_sha256")
+
+
+def _validate_close_capture_against_request(
+    close_capture: dict[str, Any],
+    close_request: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    validate_codex_session_close_capture(close_capture)
+    snapshot = close_capture["snapshot"]
+    custody = close_request[role]
+    if (
+        close_capture["close_request_sha256"] != close_request["close_request_sha256"]
+        or snapshot["role"] != role
+        or snapshot["host"] != custody["host"]
+        or snapshot["host_authority_id"] != custody["host_authority_id"]
+        or snapshot["root"] != custody["root"]
+        or snapshot["resolved_root"] != custody["resolved_root"]
+        or snapshot["root_identity"] != custody["root_identity"]
+        or snapshot["root_lineage"] != custody["root_lineage"]
+        or snapshot["budgets"] != custody["budgets"]
+        or snapshot["catalog_sha256"] != custody["catalog_sha256"]
+    ):
+        raise BulkloadError(f"Codex session {role} close capture binding is invalid")
+    return snapshot
+
+
+def _close_capture_evidence_binding(
+    close_capture: dict[str, Any],
+) -> dict[str, str]:
+    snapshot = close_capture["snapshot"]
+    return {
+        "capture_id": snapshot["capture_id"],
+        "snapshot_sha256": snapshot["snapshot_sha256"],
+        "close_capture_sha256": close_capture["close_capture_sha256"],
+    }
+
+
 def _classify_codex_session_union(
     source_sessions: list[dict[str, Any]],
     destination_sessions: list[dict[str, Any]],
     source_directories: list[dict[str, Any]],
     destination_directories: list[dict[str, Any]],
+    *,
+    prefix_proofs: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     source_by_id = {item["session_id"]: item for item in source_sessions}
     destination_by_id = {item["session_id"]: item for item in destination_sessions}
@@ -1404,7 +2611,10 @@ def _classify_codex_session_union(
     copy_if_absent: list[dict[str, Any]] = []
     exact_common: list[dict[str, Any]] = []
     preserve_destination: list[dict[str, Any]] = []
+    promote_source_superset: list[dict[str, Any]] = []
+    preserve_destination_superset: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
+    prefix_proofs = prefix_proofs or {}
 
     for path_key in sorted(set(source_by_path) & set(destination_by_path)):
         source = source_by_path[path_key]
@@ -1470,6 +2680,70 @@ def _classify_codex_session_union(
                     "sha256": source["sha256"],
                 }
             )
+        elif source["size"] != target["size"]:
+            if source["size"] > target["size"]:
+                longer_role, longer = "source", source
+                shorter = target
+            else:
+                longer_role, longer = "destination", target
+                shorter = source
+            proof = prefix_proofs.get(session_id)
+            blocker = {
+                "session_id": session_id,
+                "source_relative_path": source["relative_path"],
+                "destination_relative_path": target["relative_path"],
+                "source_sha256": source["sha256"],
+                "destination_sha256": target["sha256"],
+                "source_size": source["size"],
+                "destination_size": target["size"],
+            }
+            if proof is None:
+                blockers.append(
+                    {
+                        "code": "same-uuid-prefix-proof-required",
+                        **blocker,
+                    }
+                )
+            elif (
+                proof["prefix_sha256"] != shorter["sha256"]
+                or proof["prefix_size"] != shorter["size"]
+                or proof["sha256"] != longer["sha256"]
+                or proof["size"] != longer["size"]
+                or proof["prefix_ends_at_record"] is not True
+            ):
+                blockers.append(
+                    {
+                        "code": "same-uuid-divergent-bytes",
+                        **blocker,
+                    }
+                )
+            elif longer_role == "source":
+                promote_source_superset.append(
+                    {
+                        "action": "replace-with-proven-source-superset",
+                        "session_id": session_id,
+                        "source_relative_path": longer["relative_path"],
+                        "destination_relative_path": shorter["relative_path"],
+                        "source_sha256": longer["sha256"],
+                        "source_size": longer["size"],
+                        "destination_before_sha256": shorter["sha256"],
+                        "destination_before_size": shorter["size"],
+                        "destination_mode": "0600",
+                    }
+                )
+            else:
+                preserve_destination_superset.append(
+                    {
+                        "session_id": session_id,
+                        "source_relative_path": shorter["relative_path"],
+                        "destination_relative_path": longer["relative_path"],
+                        "source_sha256": shorter["sha256"],
+                        "source_size": shorter["size"],
+                        "destination_sha256": longer["sha256"],
+                        "destination_size": longer["size"],
+                        "reason": "destination-is-proven-superset",
+                    }
+                )
         else:
             blockers.append(
                 {
@@ -1496,10 +2770,13 @@ def _classify_codex_session_union(
         )
     if blockers:
         copy_if_absent = []
+        promote_source_superset = []
     return {
         "copy_if_absent": copy_if_absent,
         "exact_common": exact_common,
         "preserve_destination": preserve_destination,
+        "promote_source_superset": promote_source_superset,
+        "preserve_destination_superset": preserve_destination_superset,
         "blockers": blockers,
     }
 
@@ -1509,72 +2786,163 @@ def compile_codex_session_union_plan(
     source_b: dict[str, Any],
     destination_a: dict[str, Any],
     destination_b: dict[str, Any],
+    *,
+    prefix_request: dict[str, Any] | None = None,
+    source_prefix_a: dict[str, Any] | None = None,
+    source_prefix_b: dict[str, Any] | None = None,
+    destination_prefix_a: dict[str, Any] | None = None,
+    destination_prefix_b: dict[str, Any] | None = None,
+    close_request: dict[str, Any] | None = None,
+    source_close_a: dict[str, Any] | None = None,
+    source_close_b: dict[str, Any] | None = None,
+    destination_close_a: dict[str, Any] | None = None,
+    destination_close_b: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compile a read-only, absent-only UUID union report."""
-    _validate_stable_capture_pair(source_a, source_b, role="source")
-    _validate_stable_capture_pair(
+    """Compile a read-only UUID union report with optional prefix evidence."""
+    _validate_union_capture_set(
+        source_a,
+        source_b,
         destination_a,
         destination_b,
-        role="destination",
     )
-    capture_ids = {
+    proof_arguments = (
+        source_prefix_a,
+        source_prefix_b,
+        destination_prefix_a,
+        destination_prefix_b,
+    )
+    close_arguments = (
+        source_close_a,
+        source_close_b,
+        destination_close_a,
+        destination_close_b,
+    )
+    if prefix_request is None and any(
+        item is not None for item in (close_request, *proof_arguments, *close_arguments)
+    ):
+        raise BulkloadError("Codex session prefix evidence requires a prefix request")
+    prefix_proofs: dict[str, dict[str, Any]] = {}
+    source_proof_bindings: list[dict[str, str]] = []
+    destination_proof_bindings: list[dict[str, str]] = []
+    source_close_bindings: list[dict[str, str]] = []
+    destination_close_bindings: list[dict[str, str]] = []
+    all_capture_ids = [
         source_a["capture_id"],
         source_b["capture_id"],
         destination_a["capture_id"],
         destination_b["capture_id"],
-    }
-    if len(capture_ids) != 4:
-        raise BulkloadError("Codex session planning requires four distinct captures")
-    if source_a["host_authority_id"] == destination_a["host_authority_id"]:
-        source_root_identity = (
-            source_a["root_identity"]["device"],
-            source_a["root_identity"]["inode"],
+    ]
+    if prefix_request is not None:
+        _validate_prefix_request_against_captures(
+            prefix_request,
+            source_a,
+            source_b,
+            destination_a,
+            destination_b,
         )
-        destination_root_identity = (
-            destination_a["root_identity"]["device"],
-            destination_a["root_identity"]["inode"],
-        )
-        source_lineage = {
-            (identity["device"], identity["inode"])
-            for identity in source_a["root_lineage"]
-        }
-        destination_lineage = {
-            (identity["device"], identity["inode"])
-            for identity in destination_a["root_lineage"]
-        }
-        source_resolved = Path(source_a["resolved_root"])
-        destination_resolved = Path(destination_a["resolved_root"])
-        paths_overlap = False
-        for candidate, possible_parent in (
-            (source_resolved, destination_resolved),
-            (destination_resolved, source_resolved),
-        ):
-            try:
-                candidate.relative_to(possible_parent)
-                paths_overlap = True
-            except ValueError:
-                pass
-        if (
-            source_root_identity in destination_lineage
-            or destination_root_identity in source_lineage
-            or paths_overlap
+        has_observations = bool(prefix_request["requests"])
+        if has_observations and (
+            close_request is None or any(item is None for item in close_arguments)
         ):
             raise BulkloadError(
-                "Codex session source and destination roots overlap; "
-                "source and destination must differ"
+                "Codex session prefix planning requires a close request and "
+                "source and destination close pass A and pass B"
             )
+        if not has_observations and any(
+            item is not None
+            for item in (close_request, *proof_arguments, *close_arguments)
+        ):
+            raise BulkloadError(
+                "Codex session prefix evidence is unexpected without observations"
+            )
+        if has_observations:
+            (
+                prefix_proofs,
+                source_proof_bindings,
+                destination_proof_bindings,
+                proof_capture_ids,
+            ) = _validate_close_request_against_inputs(
+                close_request,
+                prefix_request,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+                source_prefix_a=source_prefix_a,
+                source_prefix_b=source_prefix_b,
+                destination_prefix_a=destination_prefix_a,
+                destination_prefix_b=destination_prefix_b,
+            )
+            source_close_snapshot_a = _validate_close_capture_against_request(
+                source_close_a,
+                close_request,
+                role="source",
+            )
+            source_close_snapshot_b = _validate_close_capture_against_request(
+                source_close_b,
+                close_request,
+                role="source",
+            )
+            destination_close_snapshot_a = _validate_close_capture_against_request(
+                destination_close_a,
+                close_request,
+                role="destination",
+            )
+            destination_close_snapshot_b = _validate_close_capture_against_request(
+                destination_close_b,
+                close_request,
+                role="destination",
+            )
+            _validate_closing_capture_pair(
+                source_a,
+                source_b,
+                source_close_snapshot_a,
+                source_close_snapshot_b,
+                role="source",
+            )
+            _validate_closing_capture_pair(
+                destination_a,
+                destination_b,
+                destination_close_snapshot_a,
+                destination_close_snapshot_b,
+                role="destination",
+            )
+            source_close_bindings = [
+                _close_capture_evidence_binding(source_close_a),
+                _close_capture_evidence_binding(source_close_b),
+            ]
+            destination_close_bindings = [
+                _close_capture_evidence_binding(destination_close_a),
+                _close_capture_evidence_binding(destination_close_b),
+            ]
+            all_capture_ids.extend(
+                [
+                    *proof_capture_ids,
+                    source_close_snapshot_a["capture_id"],
+                    source_close_snapshot_b["capture_id"],
+                    destination_close_snapshot_a["capture_id"],
+                    destination_close_snapshot_b["capture_id"],
+                ]
+            )
+    if len(set(all_capture_ids)) != len(all_capture_ids):
+        raise BulkloadError(
+            "Codex session opening, proof, and close captures must be globally distinct"
+        )
     classified = _classify_codex_session_union(
         source_a["sessions"],
         destination_a["sessions"],
         source_a["directories"],
         destination_a["directories"],
+        prefix_proofs=prefix_proofs,
     )
 
     intent = {
         "ready_for_attended_copy": not classified["blockers"],
         "copy_if_absent": classified["copy_if_absent"],
+        "promote_source_superset": classified["promote_source_superset"],
         "exact_common": classified["exact_common"],
         "preserve_destination": classified["preserve_destination"],
+        "preserve_destination_superset": classified["preserve_destination_superset"],
         "custody_findings": {
             "source_non_private_files": source_a["non_private_file_count"],
             "source_non_private_directories": source_a["non_private_directory_count"],
@@ -1590,28 +2958,21 @@ def compile_codex_session_union_plan(
     plan: dict[str, Any] = {
         "schema": CODEX_SESSION_PLAN_SCHEMA,
         "created_at": utc_now(),
-        "source": {
-            "host": source_a["host"],
-            "host_authority_id": source_a["host_authority_id"],
-            "root": source_a["root"],
-            "resolved_root": source_a["resolved_root"],
-            "root_identity": source_a["root_identity"],
-            "root_lineage": source_a["root_lineage"],
-            "catalog_sha256": source_a["catalog_sha256"],
-            "capture_ids": [source_a["capture_id"], source_b["capture_id"]],
-        },
-        "destination": {
-            "host": destination_a["host"],
-            "host_authority_id": destination_a["host_authority_id"],
-            "root": destination_a["root"],
-            "resolved_root": destination_a["resolved_root"],
-            "root_identity": destination_a["root_identity"],
-            "root_lineage": destination_a["root_lineage"],
-            "catalog_sha256": destination_a["catalog_sha256"],
-            "capture_ids": [
-                destination_a["capture_id"],
-                destination_b["capture_id"],
-            ],
+        "source": _capture_pair_binding(source_a, source_b),
+        "destination": _capture_pair_binding(destination_a, destination_b),
+        "prefix_evidence": {
+            "request_sha256": (
+                prefix_request["request_sha256"] if prefix_request is not None else None
+            ),
+            "close_request_sha256": (
+                close_request["close_request_sha256"]
+                if close_request is not None
+                else None
+            ),
+            "source_prefix_proofs": source_proof_bindings,
+            "destination_prefix_proofs": destination_proof_bindings,
+            "source_close_snapshots": source_close_bindings,
+            "destination_close_snapshots": destination_close_bindings,
         },
         "intent": intent,
     }
