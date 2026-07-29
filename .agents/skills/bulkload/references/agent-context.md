@@ -21,9 +21,9 @@ Portable candidates include closed rollout JSONL files, append-only
 `history.jsonl`, reviewed durable memory, `auth.json`, and provider-owned
 SQLite families. Keep `config.toml`, rules directories, caches, installation
 IDs, shell snapshots, and active rollouts out of generic copying. Handle auth
-and SQLite only through the exact plan-only policy in
-`codex-private-state-policy.v1.json`; the current skill has no private-state
-reader or executor.
+and SQLite only through the exact policy in
+`codex-private-state-policy.v2.json`; the current skill has a private capture
+reader and compatibility planner but no installer.
 
 Before copying a rollout:
 
@@ -98,10 +98,11 @@ the source file before and after.
 
 ## Codex private state
 
-Read `codex-private-state-policy.v1.json` before planning auth or SQLite.
+Read `codex-private-state-policy.v2.json` before planning auth or SQLite.
 
-- Resolve SQLite authority in this order: `sqlite_home`,
-  `CODEX_SQLITE_HOME`, then `CODEX_HOME`.
+- Resolve SQLite authority in this order: configured `sqlite_home`,
+  `CODEX_SQLITE_HOME`, then `CODEX_HOME`. Pass that resolved absolute path
+  explicitly as `--sqlite-home`; private capture does not infer it.
 - Enumerate all provider-owned SQLite families. Do not chase one remembered
   filename; state, logs, goals, and memories have all carried durable runtime
   state.
@@ -115,8 +116,36 @@ Read `codex-private-state-policy.v1.json` before planning auth or SQLite.
   owner-only custody, no value logging, atomic replacement, rollback, and a
   fresh authenticated turn.
 
-These are design requirements today. `implementation=plan-only` and
-`ready_for_apply=false` are enforced by the skill validator.
+Capture source and destination separately:
+
+```bash
+python3 scripts/bulkload.py codex-private-capture \
+  --codex-home /absolute/private/codex-home \
+  --sqlite-home /absolute/effective/sqlite-home \
+  --role source \
+  --host-authority-id 11111111-1111-4111-8111-111111111111 \
+  --codex-version 0.145.0 \
+  --include-auth --include-sqlite \
+  --acknowledge-private-capture \
+  --output-directory /secure/evidence/source-private
+```
+
+Repeat with role `destination` and a distinct authority ID, then run
+`codex-private-plan` against the two bundle directories. Capture requires an
+existing `0700` output parent, publishes the bundle with an atomic no-replace
+rename, stores artifacts and its manifest as `0600`, and retains any failed
+staging directory for attended quarantine. SQLite capture enumerates every
+top-level `*.sqlite` family, uses the online backup API, normalizes the snapshot
+to delete-journal mode, and never transfers source WAL/SHM files. The manifest
+binds the opt-in state classes, effective authorities, and count/byte/time
+budgets; family discovery is repeated after backup.
+
+The compatibility planner rehashes every private artifact and records
+version/family/schema/migration/header mismatches plus bounded thread/path set
+relations. It does not merge or install auth, state, logs, goals, or memories.
+The validator
+enforces `implementation=capture-and-compatibility-plan`,
+`ready_for_apply=false`, and the absence of `codex-private-apply`.
 
 Quarantine AppleDouble `._*` files outside interpreted rules/skill/config
 directories. Record path, size, mode, type, and SHA-256; do not silently delete

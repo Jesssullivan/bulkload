@@ -19,10 +19,10 @@ operation is read-only.
   files, private keys, kubeconfigs, or decrypted secret material through the
   generic repository-file adapter. Codex `auth.json` and provider-owned SQLite
   families are copy-eligible only through an explicit typed, private,
-  provider-specific plan. The current implementation is plan-only: it has no
-  auth/SQLite reader or executor. Never log credential values or raw database
-  contents, and never copy a live SQLite database/WAL/SHM triplet as ordinary
-  files.
+  provider-specific plan. The current implementation has an owner-private auth
+  reader, SQLite online-backup reader, and compatibility planner, but no
+  composer or installer. Never log credential values or raw database contents,
+  and never copy a live SQLite database/WAL/SHM triplet as ordinary files.
 - Never delete source data. Never delete destination data in v1.
 - Never apply a plan without an exact plan digest supplied by the operator.
 - Require two byte-stable source catalogs before creating an actionable plan.

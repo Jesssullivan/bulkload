@@ -26,6 +26,15 @@ py_test(
 )
 
 py_test(
+    name = "private_state_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_state.py",
+    size = "medium",
+    srcs = ["tests/test_private_state.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "repo_contract_test",
     legacy_create_init = 0,
     main = "scripts/validate_repo_manifest.py",
@@ -92,6 +101,7 @@ test_suite(
         ":bulkload_tests",
         ":ci_contract_test",
         ":installer_test",
+        ":private_state_tests",
         ":repo_contract_test",
         ":skill_contract_test",
     ],

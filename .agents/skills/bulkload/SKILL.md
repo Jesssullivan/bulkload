@@ -1,6 +1,6 @@
 ---
 name: bulkload
-description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed plan-only Codex auth and SQLite state, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
+description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed private Codex auth/SQLite capture and compatibility planning, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
 ---
 
 # Bulkload
@@ -26,9 +26,10 @@ every boundary.
    - authentication or credentials.
 4. Keep credentials and databases outside the generic repository adapter.
    Codex `auth.json` and provider-owned SQLite families are copy-eligible only
-   through an explicit typed opt-in plan. The current private-state contract is
-   plan-only and has no reader or executor. Never log credential values or copy
-   a live database/WAL/SHM triplet as ordinary files.
+   through an explicit typed opt-in plan. The current private-state reader
+   produces owner-private captures and a compatibility plan, but has no install
+   executor. Never log credential values or copy a live database/WAL/SHM
+   triplet as ordinary files.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
@@ -37,7 +38,7 @@ Read [references/migration-contract.md](references/migration-contract.md) for
 the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
-[references/codex-private-state-policy.v1.json](references/codex-private-state-policy.v1.json)
+[references/codex-private-state-policy.v2.json](references/codex-private-state-policy.v2.json)
 before classifying Codex auth or SQLite.
 
 ## Capture two stable source passes
@@ -254,6 +255,33 @@ is a dry-run report: the protocol intentionally has no Codex-session apply
 command. Any future attended copier must recheck the exact source and
 `destination_before` hashes and sizes immediately before replacement. Never
 run it against active writers or treat path/size equality as content proof.
+
+## Capture private Codex state
+
+Read [references/agent-context.md](references/agent-context.md), then run
+`codex-private-capture` separately on source and destination with explicit
+`--include-auth` and/or `--include-sqlite`,
+`--acknowledge-private-capture`, role, host-authority UUID, Codex version, and
+an owner-private output directory. When SQLite is selected, resolve its
+effective authority first and pass it explicitly with `--sqlite-home`; the
+reader never guesses from ambient configuration. Keep outputs outside both
+Codex homes.
+
+The reader pins and privately copies `auth.json`; it enumerates every top-level
+`*.sqlite` family and uses SQLite's online backup API. It normalizes capture
+journals to `DELETE`, runs `quick_check`, fingerprints schema, migrations,
+header values, and bounded thread/path indexes, emits no credential values,
+and never copies WAL/SHM companions. The capture digest binds the selected
+state classes and all completeness budgets.
+
+Run `codex-private-plan --source-bundle ... --destination-bundle ... --output
+...` only against complete bundles. It verifies every artifact digest,
+compares versions, family sets, schemas, migrations, SQLite header values, and
+state thread/path relations, and records the required auth and family-specific
+composers. Planning revalidates every input before and after atomic publication
+and refuses to write into either bundle or any recorded live root.
+Private planning intentionally exits `4` and emits
+`ready_for_apply=false`: there is no `codex-private-apply` command.
 
 ## Compile and review the plan
 

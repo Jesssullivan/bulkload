@@ -27,6 +27,19 @@ from .model import (
     read_json,
 )
 from .planner import compile_plan
+from .private_state import (
+    DEFAULT_BACKUP_TIMEOUT_SECONDS,
+    DEFAULT_MAX_METADATA_BYTES,
+    DEFAULT_MAX_METADATA_ENTRIES,
+    DEFAULT_MAX_SQLITE_FAMILIES,
+    DEFAULT_MAX_THREAD_ENTRIES,
+    DEFAULT_MAX_THREAD_INDEX_BYTES,
+    DEFAULT_MAX_TOTAL_SQLITE_BYTES,
+    capture_codex_private_state,
+    compile_codex_private_state_plan,
+    revalidate_codex_private_bundles,
+    write_private_json_noreplace,
+)
 from .scanner import DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, capture_snapshot
 from .sessions import (
     DEFAULT_MAX_SESSION_BYTES,
@@ -989,6 +1002,75 @@ def _codex_plan(arguments: argparse.Namespace) -> int:
     return 0 if intent["ready_for_attended_copy"] else 4
 
 
+def _codex_private_capture(arguments: argparse.Namespace) -> int:
+    capture = capture_codex_private_state(
+        Path(arguments.codex_home),
+        Path(arguments.output_directory),
+        role=arguments.role,
+        host_authority_id=arguments.host_authority_id,
+        codex_version=arguments.codex_version,
+        sqlite_home=(
+            Path(arguments.sqlite_home) if arguments.sqlite_home is not None else None
+        ),
+        include_auth=arguments.include_auth,
+        include_sqlite=arguments.include_sqlite,
+        acknowledge_private_capture=arguments.acknowledge_private_capture,
+        max_sqlite_families=arguments.max_sqlite_families,
+        max_total_sqlite_bytes=arguments.max_total_sqlite_bytes,
+        backup_timeout_seconds=arguments.backup_timeout_seconds,
+        max_thread_entries=arguments.max_thread_entries,
+        max_thread_index_bytes=arguments.max_thread_index_bytes,
+        max_metadata_entries=arguments.max_metadata_entries,
+        max_metadata_bytes=arguments.max_metadata_bytes,
+    )
+    print(
+        f"capture={capture['capture_sha256']} "
+        f"auth={str(capture['auth'] is not None).lower()} "
+        f"sqlite_families={len(capture['sqlite_families'])} "
+        "ready_for_apply=false"
+    )
+    return 0
+
+
+def _codex_private_plan(arguments: argparse.Namespace) -> int:
+    source = Path(arguments.source_bundle)
+    destination = Path(arguments.destination_bundle)
+    plan = compile_codex_private_state_plan(source, destination)
+    live_roots = (
+        *plan["protected_live_roots"]["source"],
+        *plan["protected_live_roots"]["destination"],
+    )
+    revalidate_codex_private_bundles(
+        source,
+        destination,
+        expected_source_capture_sha256=plan["source_capture_sha256"],
+        expected_destination_capture_sha256=plan["destination_capture_sha256"],
+    )
+    write_private_json_noreplace(
+        Path(arguments.output),
+        plan,
+        protected_directories=(source, destination),
+        recorded_protected_directories=tuple(Path(root) for root in live_roots),
+    )
+    try:
+        revalidate_codex_private_bundles(
+            source,
+            destination,
+            expected_source_capture_sha256=plan["source_capture_sha256"],
+            expected_destination_capture_sha256=plan["destination_capture_sha256"],
+        )
+    except BulkloadError as error:
+        raise BulkloadError(
+            "private plan inputs changed after publication; "
+            f"fail-held evidence: {arguments.output}"
+        ) from error
+    print(
+        f"plan={plan['plan_sha256']} "
+        f"blockers={len(plan['blockers'])} ready_for_apply=false"
+    )
+    return 4
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkload",
@@ -1214,6 +1296,76 @@ def build_parser() -> argparse.ArgumentParser:
     codex_plan.add_argument("--destination-close-b")
     codex_plan.add_argument("--output", required=True)
     codex_plan.set_defaults(handler=_codex_plan)
+
+    codex_private_capture = commands.add_parser(
+        "codex-private-capture",
+        help="capture opt-in Codex auth and SQLite through typed private readers",
+    )
+    codex_private_capture.add_argument("--codex-home", required=True)
+    codex_private_capture.add_argument(
+        "--sqlite-home",
+        help="required with --include-sqlite; pass the resolved effective authority",
+    )
+    codex_private_capture.add_argument("--output-directory", required=True)
+    codex_private_capture.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+    )
+    codex_private_capture.add_argument("--host-authority-id", required=True)
+    codex_private_capture.add_argument("--codex-version", required=True)
+    codex_private_capture.add_argument("--include-auth", action="store_true")
+    codex_private_capture.add_argument("--include-sqlite", action="store_true")
+    codex_private_capture.add_argument(
+        "--acknowledge-private-capture",
+        action="store_true",
+        help="acknowledge that the output contains private provider state",
+    )
+    codex_private_capture.add_argument(
+        "--max-sqlite-families",
+        type=int,
+        default=DEFAULT_MAX_SQLITE_FAMILIES,
+    )
+    codex_private_capture.add_argument(
+        "--max-total-sqlite-bytes",
+        type=int,
+        default=DEFAULT_MAX_TOTAL_SQLITE_BYTES,
+    )
+    codex_private_capture.add_argument(
+        "--backup-timeout-seconds",
+        type=int,
+        default=DEFAULT_BACKUP_TIMEOUT_SECONDS,
+    )
+    codex_private_capture.add_argument(
+        "--max-thread-entries",
+        type=int,
+        default=DEFAULT_MAX_THREAD_ENTRIES,
+    )
+    codex_private_capture.add_argument(
+        "--max-thread-index-bytes",
+        type=int,
+        default=DEFAULT_MAX_THREAD_INDEX_BYTES,
+    )
+    codex_private_capture.add_argument(
+        "--max-metadata-entries",
+        type=int,
+        default=DEFAULT_MAX_METADATA_ENTRIES,
+    )
+    codex_private_capture.add_argument(
+        "--max-metadata-bytes",
+        type=int,
+        default=DEFAULT_MAX_METADATA_BYTES,
+    )
+    codex_private_capture.set_defaults(handler=_codex_private_capture)
+
+    codex_private_plan = commands.add_parser(
+        "codex-private-plan",
+        help="compare private captures without installing live state",
+    )
+    codex_private_plan.add_argument("--source-bundle", required=True)
+    codex_private_plan.add_argument("--destination-bundle", required=True)
+    codex_private_plan.add_argument("--output", required=True)
+    codex_private_plan.set_defaults(handler=_codex_private_plan)
 
     doctor = commands.add_parser("doctor", help="report local runtime prerequisites")
     doctor.set_defaults(handler=_doctor)
