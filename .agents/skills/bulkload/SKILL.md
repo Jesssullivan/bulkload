@@ -283,8 +283,8 @@ not prove provider authentication. Require a fresh attended provider turn.
 Never infer SQLite authority, compose/install SQLite, or use a combined apply.
 The SQLite opening command consumes private and session A/B evidence, an exact
 registry and path map, and always leaves compose, publish, and apply false.
-V5 adds fresh cross-plane closes and an offline action plan; the composer,
-publisher, installer, and live cutover remain absent.
+V5 adds fresh cross-plane closes and an offline action plan whose command reopens every original v4 input before and after publication;
+the composer, publisher, installer, and live cutover remain absent.
 
 ## Compile and review the plan
 

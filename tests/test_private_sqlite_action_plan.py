@@ -19,6 +19,7 @@ from bulkload_lib.model import (
     sha256_bytes,
 )
 from bulkload_lib.cli import _codex_private_sqlite_compose_action_plan
+from bulkload_lib import cli as bulkload_cli
 from bulkload_lib import private_sqlite_action_plan
 from bulkload_lib import private_runtime
 from bulkload_lib.private_sqlite_action_plan import (
@@ -494,6 +495,73 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
                 runtime_authority=runtime,
             )
 
+    def _action_cli_fixture(
+        self,
+        *,
+        include_optional: bool = False,
+    ) -> tuple[SimpleNamespace, dict[str, dict], dict]:
+        required_documents = {
+            "opening_plan": self.opening_plan,
+            "close_request": self.close_request,
+            "opening_compatibility_plan": {"fixture": "compatibility"},
+            "opening_adapter_registry": {"fixture": "registry"},
+            "opening_path_map": {"fixture": "path-map"},
+            "opening_session_union_plan": {"fixture": "session-plan"},
+            "opening_session_source_a": {"fixture": "session-source-a"},
+            "opening_session_source_b": {"fixture": "session-source-b"},
+            "opening_session_destination_a": {"fixture": "session-destination-a"},
+            "opening_session_destination_b": {"fixture": "session-destination-b"},
+            "session_source_close_a": self.session_closes["source_a"],
+            "session_source_close_b": self.session_closes["source_b"],
+            "session_destination_close_a": self.session_closes["destination_a"],
+            "session_destination_close_b": self.session_closes["destination_b"],
+        }
+        arguments = {name: f"/private/{name}.json" for name in required_documents}
+        arguments.update(
+            {
+                "output": "/private/action-plan.json",
+                "opening_source_a_bundle": "/private/opening-source-a",
+                "opening_source_b_bundle": "/private/opening-source-b",
+                "opening_destination_a_bundle": "/private/opening-destination-a",
+                "opening_destination_b_bundle": "/private/opening-destination-b",
+                "source_close_a_bundle": "/private/close-source-a",
+                "source_close_b_bundle": "/private/close-source-b",
+                "destination_close_a_bundle": "/private/close-destination-a",
+                "destination_close_b_bundle": "/private/close-destination-b",
+                "accept_opening_plan": self.opening_plan["plan_sha256"],
+                "accept_close_request": self.close_request["close_request_sha256"],
+            }
+        )
+        documents = {
+            arguments[name]: value for name, value in required_documents.items()
+        }
+        for name in (
+            "opening_session_prefix_request",
+            "opening_session_source_prefix_a",
+            "opening_session_source_prefix_b",
+            "opening_session_destination_prefix_a",
+            "opening_session_destination_prefix_b",
+            "opening_session_close_request",
+            "opening_session_source_close_a",
+            "opening_session_source_close_b",
+            "opening_session_destination_close_a",
+            "opening_session_destination_close_b",
+        ):
+            if include_optional:
+                path = f"/private/{name}.json"
+                arguments[name] = path
+                documents[path] = {"fixture": name}
+            else:
+                arguments[name] = None
+        action_plan = {
+            "action_plan_sha256": _digest("cli-action-plan"),
+            "readiness": {
+                "descriptive_action_complete": True,
+                "ready_for_offline_compose": False,
+            },
+        }
+        return SimpleNamespace(**arguments), documents, action_plan
+
     def test_exact_close_emits_deterministic_create_only_union_contract(self) -> None:
         plan = self._compile()
         validate_codex_private_sqlite_action_plan(plan)
@@ -565,6 +633,152 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
             "owner-private output file",
         ):
             _codex_private_sqlite_compose_action_plan(SimpleNamespace(output="-"))
+
+    def test_action_plan_cli_recomputes_opening_chain_across_publication(
+        self,
+    ) -> None:
+        arguments, documents, action_plan = self._action_cli_fixture(
+            include_optional=True
+        )
+        events: list[str] = []
+        descriptors = iter(range(100, 200))
+
+        def read_document(path: str) -> tuple[dict, int, tuple[int, ...]]:
+            return documents[path], next(descriptors), ()
+
+        runtime = SimpleNamespace(
+            record=self.runtime_authority,
+            revalidate=mock.Mock(),
+        )
+        runtime_context = mock.MagicMock()
+        runtime_context.__enter__.return_value = runtime
+        runtime_context.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                bulkload_cli,
+                "_read_pinned_codex_json",
+                side_effect=read_document,
+            ),
+            mock.patch.object(
+                bulkload_cli.private_runtime,
+                "open_pinned_private_runtime_authority",
+                return_value=runtime_context,
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "validate_codex_private_sqlite_close_request_against_inputs",
+                side_effect=lambda *args, **kwargs: events.append("deep"),
+            ) as deep_validator,
+            mock.patch.object(
+                bulkload_cli,
+                "compile_codex_private_sqlite_action_plan",
+                side_effect=lambda *args, **kwargs: (
+                    events.append("compile") or action_plan
+                ),
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "validate_codex_private_sqlite_action_plan_against_close",
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "_revalidate_pinned_codex_input",
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "_write_pinned_codex_json",
+                side_effect=lambda *args, **kwargs: events.append("publish"),
+            ) as publish,
+            mock.patch.object(bulkload_cli.os, "close"),
+        ):
+            self.assertEqual(
+                _codex_private_sqlite_compose_action_plan(arguments),
+                4,
+            )
+
+        self.assertEqual(deep_validator.call_count, 3)
+        for call in deep_validator.call_args_list:
+            for name in (
+                "opening_session_prefix_request",
+                "opening_session_source_prefix_a",
+                "opening_session_source_prefix_b",
+                "opening_session_destination_prefix_a",
+                "opening_session_destination_prefix_b",
+                "opening_session_close_request",
+                "opening_session_source_close_a",
+                "opening_session_source_close_b",
+                "opening_session_destination_close_a",
+                "opening_session_destination_close_b",
+            ):
+                path = getattr(arguments, name)
+                self.assertEqual(call.kwargs[name], documents[path])
+        self.assertEqual(events[:2], ["deep", "compile"])
+        self.assertLess(events.index("publish"), len(events) - 1)
+        self.assertEqual(events[-1], "deep")
+        publish.assert_called_once()
+
+    def test_action_plan_cli_prepublication_recompute_blocks_output(self) -> None:
+        arguments, documents, action_plan = self._action_cli_fixture()
+        descriptors = iter(range(200, 300))
+
+        def read_document(path: str) -> tuple[dict, int, tuple[int, ...]]:
+            return documents[path], next(descriptors), ()
+
+        runtime = SimpleNamespace(
+            record=self.runtime_authority,
+            revalidate=mock.Mock(),
+        )
+        runtime_context = mock.MagicMock()
+        runtime_context.__enter__.return_value = runtime
+        runtime_context.__exit__.return_value = False
+
+        with (
+            mock.patch.object(
+                bulkload_cli,
+                "_read_pinned_codex_json",
+                side_effect=read_document,
+            ),
+            mock.patch.object(
+                bulkload_cli.private_runtime,
+                "open_pinned_private_runtime_authority",
+                return_value=runtime_context,
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "validate_codex_private_sqlite_close_request_against_inputs",
+                side_effect=[
+                    None,
+                    BulkloadError("opening input changed before publication"),
+                ],
+            ) as deep_validator,
+            mock.patch.object(
+                bulkload_cli,
+                "compile_codex_private_sqlite_action_plan",
+                return_value=action_plan,
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "validate_codex_private_sqlite_action_plan_against_close",
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "_revalidate_pinned_codex_input",
+            ),
+            mock.patch.object(
+                bulkload_cli,
+                "_write_pinned_codex_json",
+            ) as publish,
+            mock.patch.object(bulkload_cli.os, "close"),
+        ):
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "opening input changed before publication",
+            ):
+                _codex_private_sqlite_compose_action_plan(arguments)
+
+        self.assertEqual(deep_validator.call_count, 2)
+        publish.assert_not_called()
 
     def test_registered_prefix_remains_explicitly_blocked(self) -> None:
         opening = deepcopy(self.opening_plan)

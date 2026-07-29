@@ -57,6 +57,11 @@ No v4 digest may be reinterpreted as an action plan. Every v5 consumer must
 recompute v4 from all of its original private, session, registry, path-map, and
 runtime inputs.
 
+Accordingly, the action-plan command requires that complete original v4 input
+set. It reruns the full opening validation before compilation and again after
+create-only publication; the close request's
+`opening_inputs_revalidated=true` field is never accepted as proof by itself.
+
 ## Writer-stop close request
 
 The close request is immutable and contains no private values. It binds:
@@ -251,8 +256,9 @@ future files are `0600`. Symlinks, hardlinks, cross-device publication, parent
 swaps, an existing target, and insufficient free space remain future
 composition blockers, not claims made by this descriptive plan.
 
-The action plan is accepted only after complete against-input recomputation.
-Editing and re-digesting a persisted artifact cannot create authority.
+The action plan is accepted only after complete against-input recomputation
+before and after publication. Editing and re-digesting a persisted opening,
+close, or action artifact cannot create authority.
 
 ## Failure conditions
 

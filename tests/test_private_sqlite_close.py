@@ -21,11 +21,12 @@ from bulkload_lib.cli import (
     _codex_private_sqlite_session_reclose,
 )
 from bulkload_lib import cli as bulkload_cli
-from bulkload_lib import private_runtime, private_sqlite_close
+from bulkload_lib import private_runtime, private_sqlite_close, private_sqlite_plan
 from bulkload_lib.private_sqlite_close import (
     capture_codex_private_sqlite_session_reclose,
     compile_codex_private_sqlite_close_request,
     validate_codex_private_sqlite_close_request,
+    validate_codex_private_sqlite_close_request_against_inputs,
     validate_codex_private_sqlite_close_request_against_openings,
     validate_codex_private_sqlite_private_reclose_capture,
     validate_codex_private_sqlite_private_reclose_set,
@@ -33,7 +34,11 @@ from bulkload_lib.private_sqlite_close import (
     validate_codex_private_sqlite_session_reclose_capture,
     validate_codex_private_sqlite_session_reclose_set,
 )
-from bulkload_lib.private_sqlite_plan import PRIVATE_SQLITE_PLAN_SCHEMA
+from bulkload_lib.private_sqlite_plan import (
+    PRIVATE_SQLITE_PLAN_SCHEMA,
+    SQLITE_PATH_MAP_SCHEMA,
+    validate_sqlite_path_map,
+)
 from bulkload_lib.sessions import (
     capture_codex_sessions,
     compile_codex_session_union_plan,
@@ -389,6 +394,93 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                     self.destination_a,
                     self.destination_b,
                     active_runtime_authority(),
+                )
+
+    def test_full_chain_rejects_self_digested_changed_v4_input(self) -> None:
+        request = self.compile_request()
+        opening = deepcopy(self.opening_plan)
+        opening["runtime_authority"] = active_runtime_authority()
+        changed_path_map = {
+            "schema": SQLITE_PATH_MAP_SCHEMA,
+            "mapping_id": str(uuid.uuid4()),
+            "created_at": "2026-07-29T00:00:00Z",
+            "source_host_authority_id": SOURCE_AUTHORITY,
+            "destination_host_authority_id": DESTINATION_AUTHORITY,
+            "codex_version": {
+                "source": "0.145.0",
+                "destination": "0.145.0",
+            },
+            "session_union_plan_sha256": self.session_plan["plan_sha256"],
+            "source_session_catalog_sha256": self.source_a["catalog_sha256"],
+            "destination_session_catalog_sha256": self.destination_a["catalog_sha256"],
+            "source_session_root": self.source_a["resolved_root"],
+            "destination_session_root": self.destination_a["resolved_root"],
+            "rules": [
+                {
+                    "family_basename": "state_5.sqlite",
+                    "table": "threads",
+                    "session_id_column": "id",
+                    "column": "rollout_path",
+                    "kind": "session-rollout",
+                }
+            ],
+        }
+        changed_path_map["path_map_sha256"] = object_digest(
+            changed_path_map,
+            "path_map_sha256",
+        )
+        validate_sqlite_path_map(changed_path_map)
+        self.assertNotEqual(
+            changed_path_map["path_map_sha256"],
+            opening["accepted_inputs"]["path_map_sha256"],
+        )
+
+        with (
+            mock.patch.object(
+                private_sqlite_plan,
+                "validate_codex_private_sqlite_compose_plan",
+            ),
+            mock.patch.object(
+                private_sqlite_plan,
+                "validate_codex_private_state_plan",
+            ),
+            mock.patch.object(
+                private_sqlite_plan,
+                "validate_sqlite_adapter_registry",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "accepted SQLite path-map digest differs",
+            ):
+                validate_codex_private_sqlite_close_request_against_inputs(
+                    request,
+                    opening,
+                    self.session_plan,
+                    self.source_a,
+                    self.source_b,
+                    self.destination_a,
+                    self.destination_b,
+                    active_runtime_authority(),
+                    opening_compatibility_plan={
+                        "plan_sha256": opening["accepted_inputs"][
+                            "compatibility_plan_sha256"
+                        ]
+                    },
+                    opening_source_a_directory=self.root / "private-source-a",
+                    opening_source_b_directory=self.root / "private-source-b",
+                    opening_destination_a_directory=(
+                        self.root / "private-destination-a"
+                    ),
+                    opening_destination_b_directory=(
+                        self.root / "private-destination-b"
+                    ),
+                    opening_adapter_registry={
+                        "registry_sha256": opening["accepted_inputs"][
+                            "adapter_registry_sha256"
+                        ]
+                    },
+                    opening_path_map=changed_path_map,
                 )
 
     def test_request_rejects_digest_epoch_and_custody_mismatch(self) -> None:

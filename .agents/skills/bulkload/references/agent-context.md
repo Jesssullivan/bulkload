@@ -26,8 +26,9 @@ and SQLite only through the exact policy in
 typed auth install while preserving destination SQLite exactly. It accepts the
 complete legacy v4 four-pass, session-bound SQLite opening as immutable
 evidence, adds a fresh cross-plane close, and may compile a descriptive offline
-composition action plan. It does not implement the composer, publication,
-SQLite installation, combined apply, activation, or cutover.
+composition action plan only after reopening every original v4 input before
+and after publication. It does not implement the composer, publication, SQLite
+installation, combined apply, activation, or cutover.
 
 Before copying a rollout:
 

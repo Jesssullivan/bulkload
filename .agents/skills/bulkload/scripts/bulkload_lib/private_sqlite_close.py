@@ -801,6 +801,72 @@ def validate_codex_private_sqlite_close_request_against_openings(
         )
 
 
+def validate_codex_private_sqlite_close_request_against_inputs(
+    request: dict[str, Any],
+    opening_plan: dict[str, Any],
+    session_union_plan: dict[str, Any],
+    session_source_a: dict[str, Any],
+    session_source_b: dict[str, Any],
+    session_destination_a: dict[str, Any],
+    session_destination_b: dict[str, Any],
+    runtime_authority: dict[str, Any],
+    *,
+    opening_compatibility_plan: dict[str, Any],
+    opening_source_a_directory: Path,
+    opening_source_b_directory: Path,
+    opening_destination_a_directory: Path,
+    opening_destination_b_directory: Path,
+    opening_adapter_registry: dict[str, Any],
+    opening_path_map: dict[str, Any],
+    opening_session_prefix_request: dict[str, Any] | None = None,
+    opening_session_source_prefix_a: dict[str, Any] | None = None,
+    opening_session_source_prefix_b: dict[str, Any] | None = None,
+    opening_session_destination_prefix_a: dict[str, Any] | None = None,
+    opening_session_destination_prefix_b: dict[str, Any] | None = None,
+    opening_session_close_request: dict[str, Any] | None = None,
+    opening_session_source_close_a: dict[str, Any] | None = None,
+    opening_session_source_close_b: dict[str, Any] | None = None,
+    opening_session_destination_close_a: dict[str, Any] | None = None,
+    opening_session_destination_close_b: dict[str, Any] | None = None,
+) -> None:
+    """Recompute every v4 input, then bind the close to that exact opening."""
+    validate_codex_private_sqlite_compose_plan_against_inputs(
+        opening_plan,
+        opening_compatibility_plan,
+        opening_source_a_directory,
+        opening_source_b_directory,
+        opening_destination_a_directory,
+        opening_destination_b_directory,
+        adapter_registry=opening_adapter_registry,
+        path_map=opening_path_map,
+        session_union_plan=session_union_plan,
+        session_source_a=session_source_a,
+        session_source_b=session_source_b,
+        session_destination_a=session_destination_a,
+        session_destination_b=session_destination_b,
+        session_prefix_request=opening_session_prefix_request,
+        session_source_prefix_a=opening_session_source_prefix_a,
+        session_source_prefix_b=opening_session_source_prefix_b,
+        session_destination_prefix_a=opening_session_destination_prefix_a,
+        session_destination_prefix_b=opening_session_destination_prefix_b,
+        session_close_request=opening_session_close_request,
+        session_source_close_a=opening_session_source_close_a,
+        session_source_close_b=opening_session_source_close_b,
+        session_destination_close_a=opening_session_destination_close_a,
+        session_destination_close_b=opening_session_destination_close_b,
+    )
+    validate_codex_private_sqlite_close_request_against_openings(
+        request,
+        opening_plan,
+        session_union_plan,
+        session_source_a,
+        session_source_b,
+        session_destination_a,
+        session_destination_b,
+        runtime_authority,
+    )
+
+
 def validate_codex_private_sqlite_private_reclose_capture(
     capture: dict[str, Any],
     close_request: dict[str, Any],

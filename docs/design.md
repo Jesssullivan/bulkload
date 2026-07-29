@@ -551,9 +551,11 @@ enforceable SQLite deadlines, exact edge/collation/table-set blocker
 derivation, explicit column-collation and unknown-family blockers, and
 type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
 captures to one writer-stop epoch, recomputes closed classifications, and
-describes deterministic output and a create-only graph while keeping compose,
-publish, install, and apply false. It does not convert either the operator
-attestation or the lock into provider-writer proof.
+describes deterministic output and a create-only graph. The action-plan
+consumer reopens the complete original v4 input set before compilation and
+after publication instead of trusting a persisted revalidation flag. Compose,
+publish, install, and apply remain false. Neither the operator attestation nor
+the lock becomes provider-writer proof.
 Cross-filesystem atomicity, ACL/xattr
 fidelity, sparse files, hardlink identity, special files, case-insensitive
 collisions, submodule worktrees, live concurrent writers, and provider runtime

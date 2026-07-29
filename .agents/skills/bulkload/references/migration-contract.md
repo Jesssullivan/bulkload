@@ -68,7 +68,9 @@ session A/B closes must use globally distinct capture identities, share that
 epoch, remain stable within each role, and exactly equal their opening
 projections. The close compiler must recompute the v4 opening from its original
 inputs before and after publication. The offline action plan binds that proof
-and all close evidence, then records complete expected output counts and
+and all close evidence, but independently reopens the same complete v4 input
+set before compilation and after publication rather than trusting the close's
+revalidation claim. It then records complete expected output counts and
 semantic digests plus a descriptive create-only operation graph.
 Current readiness is limited to families whose schema and migration state are
 already exact. Registered-prefix skew emits

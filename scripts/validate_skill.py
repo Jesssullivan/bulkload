@@ -48,7 +48,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     },
     "source_digests": {
         "scripts/bulkload_lib/cli.py": (
-            "302796083f9f12c196333564552f7a431a6954db2066224ddca4b39b1e27b528"
+            "7de9c983348e718ec484eb8a5015fb771d2f69480433a99c3ebe8b5b728016f6"
         ),
         "scripts/bulkload_lib/private_apply.py": (
             "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
@@ -60,7 +60,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "7da422b4fd63b8c9fbf78797f9a27684648cdf165ac93c4dca26bb3ddf4ba2e3"
         ),
         "scripts/bulkload_lib/private_sqlite_close.py": (
-            "03134eef03ebddd16d0fdeed4ea06e5bade0d37c9a1e41fa9eebe6a27d4dc0c1"
+            "676f71c01fc1151a1019bbef2f7b42d4cf0e0b933ce3487f2529efe4e9a1d864"
         ),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             "e45dc732fe1a208bbbea1455d25435754d49397d9a0bea471d5bd5265321398c"
@@ -73,7 +73,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
         ),
     },
     "runtime_source_sha256": (
-        "ccc0bc2f63e7bcdf58093f065bd26fa0a44a06f6d58e14f15df19795df6d9b70"
+        "8193d692be87174c6618450fa84cd44a0755661f2cf50cab791e50725dabcad7"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
