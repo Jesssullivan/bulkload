@@ -19,13 +19,14 @@ operation is read-only.
   files, private keys, kubeconfigs, or decrypted secret material through the
   generic repository-file adapter. Codex `auth.json` and provider-owned SQLite
   families are copy-eligible only through an explicit typed, private,
-  provider-specific plan. Policy v4 implements an attended atomic `auth.json`
-  install plus a separate four-pass, session-bound SQLite classification
-  opening request. Prefer an auth-only source capture and an auth-plus-SQLite
-  destination capture for auth install; a full source capture is accepted but
-  its SQLite is never consumed by that installer. Destination SQLite must
-  remain byte-exact with zero auth-install mutations. SQLite composition,
-  publication, installation, and combined apply remain fail-held. Never log
+  provider-specific plan. Policy v5 retains the attended atomic `auth.json`
+  install and adds fresh cross-plane closure plus an offline action plan for a
+  four-pass, session-bound SQLite v4 opening. Prefer an auth-only source
+  capture and an auth-plus-SQLite destination capture for auth install; a full
+  source capture is accepted but its SQLite is never consumed by that
+  installer. Destination SQLite must remain byte-exact with zero auth-install
+  mutations. SQLite composition, publication, installation, and combined
+  apply remain fail-held. Never log
   credential values or raw database contents. Any live
   SQLite WAL, SHM, or rollback-journal sidecar hard-stops immutable capture.
 - A private-state quiescence attestation is an operator procedural fence with

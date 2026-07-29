@@ -17,6 +17,7 @@ from bulkload_lib.model import (
     canonical_bytes,
     object_digest,
     sha256_bytes,
+    utc_now,
 )
 from bulkload_lib import private_quiescence
 from bulkload_lib import private_runtime
@@ -31,6 +32,10 @@ from bulkload_lib.private_sqlite_plan import (
     validate_codex_private_sqlite_compose_plan_against_inputs,
     validate_sqlite_adapter_registry,
     validate_sqlite_path_map,
+)
+from bulkload_lib.private_sqlite_close import (
+    compile_codex_private_sqlite_close_request,
+    validate_codex_private_sqlite_close_request,
 )
 from bulkload_lib.sessions import (
     capture_codex_sessions,
@@ -575,6 +580,38 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             encoded = canonical_bytes(plan)
             self.assertNotIn(b"rollout-2026-07-29", encoded)
             self.assertNotIn(b"\\x00\\x00\\x00", encoded)
+
+    def test_v5_close_recomputes_the_complete_real_v4_opening(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, evidence = self.compile_fixture(Path(directory))
+            request = compile_codex_private_sqlite_close_request(
+                plan,
+                evidence["session_plan"],
+                evidence["session_source_a"],
+                evidence["session_source_b"],
+                evidence["session_destination_a"],
+                evidence["session_destination_b"],
+                evidence["runtime"],
+                accept_opening_plan=plan["plan_sha256"],
+                accept_session_union_plan=evidence["session_plan"]["plan_sha256"],
+                writer_stop_epoch_id=str(uuid.uuid4()),
+                writer_stop_epoch_at=utc_now(),
+                acknowledge_provider_writers_stopped=True,
+                opening_compatibility_plan=evidence["compatibility"],
+                opening_source_a_directory=evidence["source_a_path"],
+                opening_source_b_directory=evidence["source_b_path"],
+                opening_destination_a_directory=evidence["destination_a_path"],
+                opening_destination_b_directory=evidence["destination_b_path"],
+                opening_adapter_registry=evidence["registry"],
+                opening_path_map=evidence["path_map"],
+            )
+            validate_codex_private_sqlite_close_request(request)
+            self.assertTrue(request["opening_inputs_revalidated"])
+            self.assertEqual(
+                request["opening_plan"]["plan_sha256"],
+                plan["plan_sha256"],
+            )
+            self.assertEqual(request["runtime_authority"], evidence["runtime"])
 
     def test_tampered_registry_and_path_map_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

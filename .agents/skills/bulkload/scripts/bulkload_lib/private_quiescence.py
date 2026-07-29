@@ -21,6 +21,9 @@ from . import private_state
 from .model import BulkloadError, canonical_bytes, object_digest, sha256_bytes
 
 PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA = (
+    "dev.tinyland.bulkload.codex-private-quiescence-attestation.v2"
+)
+LEGACY_PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA = (
     "dev.tinyland.bulkload.codex-private-quiescence-attestation.v1"
 )
 QUIESCENCE_CLAIM = "operator-attested-procedural-fence"
@@ -31,7 +34,7 @@ MIN_PRIVATE_QUIESCENCE_TTL_SECONDS = 30
 DEFAULT_PRIVATE_QUIESCENCE_TTL_SECONDS = 300
 MAX_PRIVATE_QUIESCENCE_TTL_SECONDS = 900
 PRIVATE_QUIESCENCE_PURPOSES = frozenset(
-    {"capture", "apply", "verify", "rollback", "recover"}
+    {"capture", "close", "apply", "verify", "rollback", "recover"}
 )
 PRIVATE_STATE_CLASS_ORDER = ("auth", "sqlite")
 _ATTESTATION_KEYS = {
@@ -204,13 +207,19 @@ def _validate_purpose_inputs(
     plan = inputs["plan_sha256"]
     receipt = inputs["apply_receipt_sha256"]
     journal = inputs["journal_sha256"]
-    if purpose == "capture":
+    if purpose in {"capture", "close"}:
         if capture_role not in {"source", "destination"}:
             raise BulkloadError(
-                "capture quiescence requires a source or destination role"
+                f"{purpose} quiescence requires a source or destination role"
             )
-        if any(item is not None for item in inputs.values()):
+        if purpose == "capture" and any(item is not None for item in inputs.values()):
             raise BulkloadError("capture quiescence cannot accept operation inputs")
+        if purpose == "close" and (
+            plan is None or receipt is not None or journal is not None
+        ):
+            raise BulkloadError(
+                "close quiescence requires only the exact close-request digest"
+            )
     else:
         if capture_role is not None:
             raise BulkloadError("non-capture quiescence role must be null")
@@ -399,7 +408,10 @@ def validate_codex_private_quiescence_attestation(
         _ATTESTATION_KEYS,
         "private quiescence attestation",
     )
-    if value["schema"] != PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA:
+    if value["schema"] not in {
+        LEGACY_PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA,
+        PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA,
+    }:
         raise BulkloadError("private quiescence attestation schema is invalid")
     _require_uuid(value["attestation_id"], "private quiescence attestation ID")
     _require_sha256(
@@ -455,6 +467,11 @@ def validate_codex_private_quiescence_attestation(
         value["capture_role"],
         value["accepted_inputs"],
     )
+    if (
+        value["purpose"] == "close"
+        and value["schema"] != PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA
+    ):
+        raise BulkloadError("close quiescence requires the v2 attestation schema")
 
     codex = _validate_directory_record(
         value["codex_home"],

@@ -27,6 +27,10 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
         "scripts/bulkload_lib/cli.py": b"def main(): return 0\n",
         "scripts/bulkload_lib/private_apply.py": b"def apply(): return None\n",
         "scripts/bulkload_lib/private_quiescence.py": (b"def attest(): return None\n"),
+        "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+            b"def compile_action_plan(): return None\n"
+        ),
+        "scripts/bulkload_lib/private_sqlite_close.py": (b"def close(): return None\n"),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             b"def compile_plan(): return None\n"
         ),
@@ -49,6 +53,7 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
             "auth_install": True,
             "combined": False,
             "sqlite_compose": False,
+            "sqlite_compose_action_plan": True,
             "sqlite_compose_plan": True,
             "sqlite_publish": False,
         },
@@ -124,6 +129,31 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
                     expected
                 ) as reopened:
                     self.assertEqual(reopened.record, expected)
+
+    def test_only_the_exact_legacy_v4_authority_is_accepted(self) -> None:
+        legacy = json.loads(
+            json.dumps(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4)
+        )
+        self.assertEqual(
+            private_runtime.validate_private_runtime_authority(legacy),
+            legacy,
+        )
+        for field in (
+            "policy_sha256",
+            "runtime_source_sha256",
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(legacy))
+                changed[field] = "0" * 64
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "exact v4 closure",
+                ):
+                    private_runtime.validate_private_runtime_authority(changed)
+        changed = json.loads(json.dumps(legacy))
+        changed["source_digests"]["scripts/bulkload_lib/cli.py"] = "0" * 64
+        with self.assertRaisesRegex(BulkloadError, "exact v4 closure"):
+            private_runtime.validate_private_runtime_authority(changed)
 
     def test_path_replacement_and_inventory_drift_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

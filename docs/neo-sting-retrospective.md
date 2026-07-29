@@ -310,3 +310,53 @@ attended Codex turn on Sting is required before claiming working auth.
 
 No live Neo or Sting private state was mutated while developing or validating
 this source slice.
+
+### 2026-07-29 live parity re-audit
+
+A later read-only audit separated “ready to resume TCFS source work” from
+“complete agent-state parity.”
+
+The clean TIN-2864 lane is exact across Neo, Sting, and the live remote at
+`0a3a9ceceeab497af614e07e80e91780c7f3be47`. Sting can therefore carry
+source-only TCFS work without another repository copy. That claim does not
+extend to the full worktree registry: Neo registered eleven worktrees, one
+prunable/absent, while Sting registered thirty-three. Four matching paths
+currently exist on both hosts; only the clean root-plan lane was
+cleanliness-audited. The protected primary remains forbidden.
+
+Codex continuity is an asymmetric union. Neo's newest session and history are
+dated July 29; Sting's are dated July 22 and July 18. Sting also retains seeded
+session `019f8a9a-218a-7c91-8498-e17a794528a4`, which is absent on Neo.
+Replacing Sting's store with Neo's would therefore destroy target-only
+continuity. TIN-3268 must preserve destination-only sessions, add source-only
+sessions, prove shared-prefix relations, and finish with fresh picker, resume,
+dialog, and new-thread evidence.
+
+Authentication and SQLite differ on both hosts. That is not a prohibition on
+copying them: both are typed, copy-eligible state. It does prohibit raw file
+replacement while provider SQLite is live. Both state homes had WAL activity
+during the audit, so the safe path remains a consistent provider-aware backup
+or a proved-quiescent immutable capture, schema/path-aware composition,
+rollback custody, and attended provider acceptance.
+
+The global Codex skill projection is also incomplete. Neo has the current
+`~/.agents/skills` tree; Sting has no `~/.agents` directory and its legacy
+`~/.codex/skills` is a different projection. Claude's gstack revision matched.
+Skills must move as a typed, pinned projection with discovery/trigger tests,
+not as an undifferentiated plugin-cache copy.
+
+Two workstation surfaces remain separate attended lanes:
+
+- eGreg source is ahead of Sting generation 46. A managed daemon serves the
+  runtime-directory socket while an older unmanaged daemon still owns the
+  legacy `/tmp` socket selected by `et`. Do not kill either ad hoc; restack the
+  reviewed Lab source, switch under the runbook, and prove exactly one
+  PID/socket plus edit-detach-reconnect.
+- JetBrains remains intentionally on Honey. Sting has no backend unit or
+  `pycharm-sting` alias. TIN-3079 requires source, deployment, Gateway, and GUI
+  acceptance before Honey can be retired.
+
+Tailnet and the previously failing research MCP endpoints were healthy during
+this audit. Sting still lacked GitHub CLI authentication, so authenticated
+private development remained an operator-controlled follow-up rather than a
+network fault.

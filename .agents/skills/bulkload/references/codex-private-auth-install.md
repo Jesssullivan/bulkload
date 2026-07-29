@@ -1,14 +1,18 @@
 # Codex private auth install
 
-This runbook covers policy v4's only private-state mutation: an attended,
+This runbook covers policy v5's only private-state mutation: an attended,
 typed replacement of an existing destination `CODEX_HOME/auth.json`.
 
 It does not authorize SQLite union, composition, installation, combined
-auth-plus-SQLite apply, Codex activation, deployment, or TCFS runtime work.
+auth-plus-SQLite apply, Codex activation, deployment, or TCFS runtime work. A
+v5 SQLite close or offline action plan is separate evidence and grants none of
+those authorities.
 
 ## Exact boundary
 
-Read `codex-private-state-policy.v4.json` before proceeding.
+Read `codex-private-state-policy.v5.json` before proceeding. Retain any
+accepted v4 SQLite opening as immutable legacy evidence; do not reinterpret it
+as an install plan or consume it in this auth workflow.
 
 - Preferred inputs: source selects `auth`; destination selects `auth` and
   `sqlite`.
@@ -36,7 +40,7 @@ Read `codex-private-state-policy.v4.json` before proceeding.
   A fresh attended provider turn is required before claiming working auth.
 
 Use the reviewed `scripts/bulkload.py` entrypoint or its Bazel-built
-equivalent. The entrypoint pins policy v4 and the complete Python runtime
+equivalent. The entrypoint pins policy v5 and the complete Python runtime
 source inventory before importing command code. Compatibility and install
 plans bind that runtime authority; every later private operation revalidates
 it. Do not import and call the implementation modules directly.
@@ -490,7 +494,9 @@ Retain owner-private:
 - compatibility and install plans plus accepted digests;
 - apply/verify/rollback/recovery attestations;
 - journal, external rollback directory, captures, and receipts;
-- exact policy/runtime authority records; and
+- exact policy/runtime authority records;
+- any v4 SQLite opening and v5 cross-plane close/action-plan evidence as a
+  separate, non-authorizing chain when that workstream is also in scope; and
 - the attended provider-turn result without credential values.
 
 The strongest Bulkload-only claim is: accepted source auth bytes were installed

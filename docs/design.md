@@ -1,9 +1,10 @@
 # Bulkload v1 design
 
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension,
-private-state policy v4 narrow attended auth install, and the four-pass SQLite
-composition opening plan in review, 2026-07-29. SQLite composition,
-publication, installation, and combined private apply remain fail-held.
+private-state policy v5 narrow attended auth install, four-pass SQLite v4
+opening, and fresh cross-plane close/offline action-plan work in review,
+2026-07-29. SQLite composition, publication, installation, and combined
+private apply remain fail-held.
 
 ## 1. Decision
 
@@ -87,11 +88,12 @@ generic file adapter, but they may enter an explicit typed migration dossier.
 ### 4.1 Read-only first
 
 Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
-`apply` is separate and requires the exact `plan_sha256`. Private policy v4
-also exposes a separately attended, digest-accepted auth-only apply and a
-distinct non-actionable four-pass SQLite opening request; neither can compose,
-publish, or install SQLite. The CLI never invokes a terminal multiplexer, Home
-Manager, a deploy, or a product runtime.
+`apply` is separate and requires the exact `plan_sha256`. Private policy v5
+also exposes a separately attended, digest-accepted auth-only apply, a
+non-actionable four-pass SQLite v4 opening request, and fresh cross-plane
+closure into an offline action plan. None can compose, publish, install, or
+activate SQLite. The CLI never invokes a terminal multiplexer, Home Manager, a
+deploy, or a product runtime.
 
 ### 4.2 Repeated-catalog barrier
 
@@ -330,7 +332,7 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
   The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
   sidecar exists. It never copies a live database family as ordinary files.
-  Policy v4 does not compose or install SQLite; during auth install it
+  Policy v5 does not compose or install SQLite; during auth install it
   independently captures and preserves every destination family exactly with
   zero mutations.
 - Prefer an auth-only source capture and an auth-plus-SQLite destination
@@ -392,9 +394,9 @@ owner-private staging or fail-held final artifact; it is not authority and
 requires attended quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v4.json`.
+`.agents/skills/bulkload/references/codex-private-state-policy.v5.json`.
 It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
-but makes five separate readiness claims:
+but makes six separate readiness claims:
 
 - `auth_install=true`: an attended, journaled atomic replacement of an
   existing destination `auth.json` is implemented, with a complete rollback
@@ -402,6 +404,9 @@ but makes five separate readiness claims:
 - `sqlite_compose_plan=true`: a four-private-pass, recomputed-session-plan
   opening request can classify exact registry, schema, migration, path, and
   type-tagged row relations without emitting operations;
+- `sqlite_compose_action_plan=true`: fresh private and session A/B closes can
+  bind one operator writer-stop epoch and emit a descriptive, create-only
+  offline operation graph with deterministic expected-output claims;
 - `sqlite_compose=false`: no source SQLite family is merged or installed; and
 - `sqlite_publish=false`: no composed family or versioned directory can be
   published; and
@@ -530,7 +535,7 @@ sensitive-path blocks re-enforced during plan validation, no deletion,
 pre-copy source rehash, external backups, atomic replacement, durable
 journal/directory entries, fresh verification, Codex evidence inputs and output
 parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Private-state policy v4 adds
+adapter, and explicit incomplete/error states. Private-state policy v5 adds
 pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
 Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
 preservation, an external auth backup, a durable state-machine journal, and
@@ -544,9 +549,11 @@ exact stable-projection budget/count/latest-migration bindings, bidirectional
 rowset/digest claims, plan-wide row/byte charging with structural lower bounds,
 enforceable SQLite deadlines, exact edge/collation/table-set blocker
 derivation, explicit column-collation and unknown-family blockers, and
-type-tagged row digests while keeping compose, publish, install, and apply
-false. It does not convert either the operator attestation or the lock into
-provider-writer proof.
+type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
+captures to one writer-stop epoch, recomputes closed classifications, and
+describes deterministic output and a create-only graph while keeping compose,
+publish, install, and apply false. It does not convert either the operator
+attestation or the lock into provider-writer proof.
 Cross-filesystem atomicity, ACL/xattr
 fidelity, sparse files, hardlink identity, special files, case-insensitive
 collisions, submodule worktrees, live concurrent writers, and provider runtime

@@ -59,7 +59,7 @@ COUNTED_TABLES = frozenset(
 )
 PRIVATE_QUIESCENCE_CLAIM = "operator-attested-procedural-fence"
 PRIVATE_QUIESCENCE_PURPOSES = frozenset(
-    {"capture", "apply", "verify", "rollback", "recover"}
+    {"capture", "close", "apply", "verify", "rollback", "recover"}
 )
 PRIVATE_CAPTURE_QUIESCENCE_KEYS = {
     "attestation",
@@ -969,7 +969,7 @@ def _validate_private_capture_output_binding(
     capture: dict[str, Any],
 ) -> None:
     attestation = capture["quiescence"]["attestation"]
-    if attestation["purpose"] != "capture":
+    if attestation["purpose"] not in {"capture", "close"}:
         return
     if attestation["operation_output"] != capture["capture_output"]:
         raise BulkloadError(
@@ -1023,7 +1023,7 @@ def capture_codex_private_state(
         or quiescence_record["codex_version"] != codex_version
         or quiescence_record["selected_state_classes"] != selected_state_classes
         or (
-            quiescence_record["purpose"] == "capture"
+            quiescence_record["purpose"] in {"capture", "close"}
             and quiescence_record["capture_role"] != role
         )
     ):
@@ -1064,9 +1064,11 @@ def capture_codex_private_state(
     target = parent / requested.name
     if target.exists() or target.is_symlink():
         raise BulkloadError("private output already exists")
-    if quiescence_record["purpose"] == "capture" and quiescence_record["attestation"][
-        "operation_output"
-    ] != _private_capture_output_binding(target, parent, parent_info):
+    if quiescence_record["purpose"] in {"capture", "close"} and quiescence_record[
+        "attestation"
+    ]["operation_output"] != _private_capture_output_binding(
+        target, parent, parent_info
+    ):
         raise BulkloadError(
             "private capture output differs from quiescence attestation"
         )
@@ -1548,7 +1550,7 @@ def _validate_private_capture_quiescence(value: Any) -> dict[str, Any]:
         or record["provider_writer_proof"] is not False
     ):
         raise BulkloadError("private capture quiescence claim is invalid")
-    if record["purpose"] == "capture":
+    if record["purpose"] in {"capture", "close"}:
         if record["capture_role"] not in {"source", "destination"}:
             raise BulkloadError("private capture quiescence role is invalid")
     elif record["capture_role"] is not None:
@@ -1586,6 +1588,15 @@ def _validate_private_capture_quiescence(value: Any) -> dict[str, Any]:
     if record["purpose"] == "capture":
         if any(digest is not None for digest in accepted_inputs.values()):
             raise BulkloadError("capture quiescence cannot bind operation inputs")
+    elif record["purpose"] == "close":
+        if (
+            accepted_inputs["plan_sha256"] is None
+            or accepted_inputs["apply_receipt_sha256"] is not None
+            or accepted_inputs["journal_sha256"] is not None
+        ):
+            raise BulkloadError(
+                "close quiescence requires only the exact close-request digest"
+            )
     elif accepted_inputs["plan_sha256"] is None:
         raise BulkloadError("operation quiescence must bind an install plan")
     return record
@@ -1669,7 +1680,7 @@ def _validate_capture_quiescence_authority(
             "private capture state classes differ from quiescence attestation"
         )
     if (
-        attestation["purpose"] == "capture"
+        attestation["purpose"] in {"capture", "close"}
         and attestation["capture_role"] != capture["role"]
     ):
         raise BulkloadError("private capture role differs from quiescence attestation")
@@ -1691,11 +1702,14 @@ def _validate_capture_quiescence_authority(
         raise BulkloadError(
             "private capture SQLite root differs from quiescence attestation"
         )
-    if attestation["purpose"] != "capture" and capture["role"] != "destination":
+    if (
+        attestation["purpose"] not in {"capture", "close"}
+        and capture["role"] != "destination"
+    ):
         raise BulkloadError(
             "operation quiescence can authorize only a destination capture"
         )
-    if attestation["purpose"] not in {"capture", "verify"}:
+    if attestation["purpose"] not in {"capture", "close", "verify"}:
         return
     observed_auth = attestation["observed_auth"]
     captured_auth = capture["auth"]
@@ -1800,7 +1814,7 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
         or quiescence["codex_version"] != value["codex_version"]
         or quiescence["selected_state_classes"] != selected
         or (
-            quiescence["purpose"] == "capture"
+            quiescence["purpose"] in {"capture", "close"}
             and quiescence["capture_role"] != value["role"]
         )
     ):
