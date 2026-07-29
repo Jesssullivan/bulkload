@@ -1,8 +1,9 @@
 # Bulkload v1 design
 
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension
-and private auth/SQLite capture plus compatibility planning in review,
-2026-07-29
+and private-state policy v3 narrow attended auth install in review, 2026-07-29.
+SQLite union/composition/installation and combined private apply remain
+fail-held.
 
 ## 1. Decision
 
@@ -74,8 +75,8 @@ not byte equality over an arbitrary directory.
 | Working bytes | source worktree plus manifest | hash, additive copy, verify | modified tracked files, safe untracked files |
 | Agent continuity | append-only transcript authority | allowlisted copy, validate, resume proof | Codex JSONL, Claude project transcripts |
 | Generated state | destination runtime | regenerate | caches, `.direnv`, platform binaries |
-| Provider SQLite | provider runtime plus consistent snapshot | opt-in typed plan; snapshot/compose/verify | Codex state, log, goal, and memory databases |
-| Authentication | provider/operator | opt-in private atomic copy or attended re-authentication | Codex `auth.json` |
+| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; no composer/installer | Codex state, log, goal, and memory databases |
+| Authentication | provider/operator | opt-in private atomic replace with rollback, or attended re-authentication | Codex `auth.json` |
 
 Every plane has a separate contract. Generated caches are regenerated.
 Authentication and provider SQLite are never silently promoted through the
@@ -85,9 +86,11 @@ generic file adapter, but they may enter an explicit typed migration dossier.
 
 ### 4.1 Read-only first
 
-`capture`, `plan`, `verify`, and `files` are read-only. `apply` is separate and
-requires the exact `plan_sha256`. The CLI never invokes a terminal multiplexer,
-Home Manager, a deploy, or a product runtime.
+Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
+`apply` is separate and requires the exact `plan_sha256`. Private policy v3
+also exposes a separately attended, digest-accepted auth-only apply; it cannot
+compose or install SQLite. The CLI never invokes a terminal multiplexer, Home
+Manager, a deploy, or a product runtime.
 
 ### 4.2 Repeated-catalog barrier
 
@@ -324,10 +327,14 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   provider turn. Attended reauthentication remains a fallback.
 - Treat every provider-owned SQLite family under the effective
   `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
-  Use SQLite online backup or a quiesced backup API; never copy a live
-  database/WAL/SHM triplet as ordinary files. Validate version and schema
-  compatibility, `quick_check`, canonical destination rollout paths, index
-  parity, historical resume, and rollback.
+  The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
+  sidecar exists. It never copies a live database family as ordinary files.
+  Policy v3 does not compose or install SQLite; during auth install it
+  independently captures and preserves every destination family exactly with
+  zero mutations.
+- Prefer an auth-only source capture and an auth-plus-SQLite destination
+  capture for the narrow auth installer. A full source capture plus a full
+  destination capture is also accepted, but source SQLite is never consumed.
 - Browser profiles, cookies, private keys, and unrelated provider credential
   databases remain outside the Codex adapter.
 - Treat compaction as a semantic retention boundary. A transcript's presence
@@ -384,33 +391,66 @@ owner-private staging or fail-held final artifact; it is not authority and
 requires attended quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v2.json`.
-It classifies Codex auth and all provider-owned SQLite families as
-copy-eligible and opt-in, while setting
-`implementation=capture-and-compatibility-plan` and
-`ready_for_apply=false`. `codex-private-capture` pins and copies a bounded
-owner-only `auth.json`, enumerates every top-level `*.sqlite` family, creates a
-consistent snapshot through SQLite's online backup API, normalizes the
-snapshot journal to `DELETE`, runs `quick_check`, and publishes the private
-bundle with an OS no-replace rename. It never copies source WAL/SHM files.
-The operator must resolve configured `sqlite_home`/`CODEX_SQLITE_HOME`/
-`CODEX_HOME` authority and pass the effective path explicitly; the reader will
-not silently fall back. Selected state classes and count/byte/time budgets are
-digest-bound, discovery is repeated after backup, and published artifacts are
-fully revalidated. `codex-private-plan` rehashes every artifact and compares
-exact Codex version, family, schema, migration, SQLite header, and bounded
-thread/path evidence.
+`.agents/skills/bulkload/references/codex-private-state-policy.v3.json`.
+It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
+but makes three separate readiness claims:
 
-The validator parses the CLI and requires the exact command, alias, and handler
-topology for the entire surface, then checks the policy's exact Codex subset.
-The policy pins the SHA-256 of the CLI, the private-state module, and a
-canonical sorted digest manifest for the complete Python runtime dependency
-closure and entrypoint. This closes alternate syntax, imported side effects,
-and hidden handler construction outside the recognized parser shape. A
-composer or installer therefore cannot hide behind a non-prefixed command,
-alias, rebound handler, imported dependency, or obfuscated parser without an
-explicit reviewed contract change. The extension deliberately exposes no
-private auth or SQLite apply command.
+- `auth_install=true`: an attended, journaled atomic replacement of an
+  existing destination `auth.json` is implemented, with a complete rollback
+  copy, offline verification, manual rollback, and crash recovery;
+- `sqlite_compose=false`: no source SQLite family is merged or installed; and
+- `combined=false`: there is no combined auth-plus-SQLite apply.
+
+The supported installer input matrices are source `["auth"]` to destination
+`["auth","sqlite"]` (preferred), and source `["auth","sqlite"]` to the same
+destination selection. In both cases the install plan selects the destination
+state classes, consumes only source auth, emits
+`sqlite_union_ready=false`, records zero SQLite mutations, and binds every
+destination SQLite family as `preserve-destination-exact`. An auth-only
+destination is deliberately unsupported because a changing auth file must not
+bypass the destination SQLite preservation proof.
+
+`codex-private-capture` accepts only a short-lived, digest-accepted quiescence
+attestation bound to the exact role, roots, selected state classes, Codex
+version, host authority, and output. The attestation states
+`provider_writer_proof=false`: it records the operator's procedural fence.
+The accompanying nonblocking directory `flock` coordinates only cooperating
+Bulkload processes and cannot stop or detect a Codex writer.
+
+For SQLite selection, the operator must resolve configured
+`sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority and pass the effective
+path explicitly. Any observed `-wal`, `-shm`, or `-journal` companion rejects
+the immutable capture. With no sidecar present, the reader opens the source
+immutably, snapshots every top-level `*.sqlite` family through SQLite's backup
+API, normalizes the evidence copy to `DELETE` journal mode, runs
+`quick_check`, and binds schema, migration, header, thread/path, namespace,
+count, byte, and time evidence. It never copies source sidecars.
+
+`codex-private-plan` remains a non-actionable compatibility dossier.
+`codex-private-install-plan` consumes its exact accepted digest and compiles
+only the narrow auth-install plan. Apply revalidates source auth and the entire
+destination auth-plus-SQLite capture, backs up destination auth, journals each
+durable transition, replaces auth in the destination directory, then captures
+and compares destination auth and SQLite again. Verify uses a fresh
+attestation and capture. Rollback requires an exact apply receipt plus an
+operator assertion that no provider writes occurred after apply. Recovery
+classifies the durable journal before choosing a bounded forward or rollback
+path. Every receipt remains an offline byte-and-custody claim with
+`provider_runtime_acceptance_verified=false`; only a fresh attended provider
+turn can establish working authentication.
+
+The command entrypoint opens and pins the canonical policy and complete Python
+runtime source inventory before importing the command implementation. The
+runtime authority record—policy digest, closure digest, and exact core source
+digests—is carried by the compatibility and install plans and revalidated
+through publication and mutation boundaries. A changed or replaced runtime
+therefore fails closed rather than executing against a previously accepted
+plan. The validator also requires the exact command/handler topology and
+forbidden SQLite/combined command set.
+
+The operator sequence, exact arguments, evidence custody, and recovery rules
+are in the
+[private auth install runbook](../.agents/skills/bulkload/references/codex-private-auth-install.md).
 
 ## 8. Relationship to TCFS
 
@@ -447,9 +487,10 @@ helpers, case-folding collisions, stale remote refs, filename encoding,
 AppleDouble sidecars, unbounded ignored trees, secret-bearing untracked files,
 concurrent destination edits, partial transfer, and false confidence from a
 green transport exit code. Provider-state hazards additionally include token
-disclosure, refresh races, partial WAL capture, stale absolute rollout paths,
-schema skew, an incomplete SQLite-family inventory, and replacing a healthy
-destination index without rollback.
+disclosure, refresh races, a false quiescence claim, partial WAL capture,
+stale absolute rollout paths, schema skew, an incomplete SQLite-family
+inventory, changed runtime source after plan review, unintended SQLite
+mutation, and replacing healthy destination auth without rollback.
 
 V1 mitigations are canonical sorted catalogs, role-specific A/B barriers, no
 content in manifests, path normalization, a v1 block on symlink mutations,
@@ -457,10 +498,15 @@ sensitive-path blocks re-enforced during plan validation, no deletion,
 pre-copy source rehash, external backups, atomic replacement, durable
 journal/directory entries, fresh verification, Codex evidence inputs and output
 parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Cross-filesystem
-atomicity, ACL/xattr fidelity, sparse files, hardlink identity, special files,
-case-insensitive collisions, submodule worktrees, and live concurrent writers
-remain blockers or follow-up work.
+adapter, and explicit incomplete/error states. Private-state policy v3 adds
+pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
+Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
+preservation, an external auth backup, a durable state-machine journal, and
+fresh offline capture. It does not convert either the operator attestation or
+the lock into provider-writer proof. Cross-filesystem atomicity, ACL/xattr
+fidelity, sparse files, hardlink identity, special files, case-insensitive
+collisions, submodule worktrees, live concurrent writers, and provider runtime
+acceptance remain blockers or separate proof steps.
 
 ## 10. Implementation layout
 
@@ -493,12 +539,14 @@ Included:
 7. Independent verification.
 8. Portable Agent Skill and authenticated one-line private install.
 9. Bazel tests on the sanctioned GloriousFlywheel cache-first ARC path.
+10. Narrow attended Codex `auth.json` install with exact destination SQLite
+    preservation, offline verification, rollback, and recovery.
 
 Deferred:
 
-- the typed Codex auth installer and SQLite family composers/installers (the
-  private capture reader and compatibility planner are implemented, but the
-  exact policy remains `ready_for_apply=false`);
+- SQLite union, composition, or installation, including WAL-aware live-family
+  capture;
+- combined auth-plus-SQLite apply;
 - browser-state movement;
 - automatic remote command execution;
 - deletion/mirror mode;

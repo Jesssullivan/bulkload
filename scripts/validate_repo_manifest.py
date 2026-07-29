@@ -34,8 +34,8 @@ def validate(value: Any) -> None:
         },
         "root",
     )
-    if value["schema_version"] != 1:
-        raise ContractError("schema_version must be 1")
+    if value["schema_version"] != 2:
+        raise ContractError("schema_version must be 2")
     repo = value["repo"]
     require_keys(repo, {"name", "github", "description"}, "repo")
     if repo["name"] != "bulkload" or repo["github"] != "Jesssullivan/bulkload":
@@ -69,7 +69,16 @@ def validate(value: Any) -> None:
     required_boundaries = {
         "default_read_only": True,
         "deletes_destination_data": False,
-        "copies_credentials": False,
+        "copies_generic_credentials": False,
+        "copies_typed_codex_auth": True,
+        "installs_typed_codex_auth": True,
+        "credential_copy_policy": "typed-opt-in-attended",
+        "captures_typed_codex_sqlite": True,
+        "captures_live_wal_sqlite": False,
+        "preserves_destination_codex_sqlite_during_auth_install": True,
+        "composes_typed_codex_sqlite": False,
+        "installs_typed_codex_sqlite": False,
+        "private_runtime_acceptance_required": True,
         "invokes_terminal_multiplexers": False,
         "owns_tcfs_runtime": False,
         "owns_home_manager_activation": False,
@@ -80,7 +89,7 @@ def validate(value: Any) -> None:
 
 def self_test() -> None:
     valid = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repo": {
             "name": "bulkload",
             "github": "Jesssullivan/bulkload",
@@ -105,7 +114,16 @@ def self_test() -> None:
         "boundaries": {
             "default_read_only": True,
             "deletes_destination_data": False,
-            "copies_credentials": False,
+            "copies_generic_credentials": False,
+            "copies_typed_codex_auth": True,
+            "installs_typed_codex_auth": True,
+            "credential_copy_policy": "typed-opt-in-attended",
+            "captures_typed_codex_sqlite": True,
+            "captures_live_wal_sqlite": False,
+            "preserves_destination_codex_sqlite_during_auth_install": True,
+            "composes_typed_codex_sqlite": False,
+            "installs_typed_codex_sqlite": False,
+            "private_runtime_acceptance_required": True,
             "invokes_terminal_multiplexers": False,
             "owns_tcfs_runtime": False,
             "owns_home_manager_activation": False,
@@ -113,13 +131,29 @@ def self_test() -> None:
     }
     validate(valid)
     invalid = json.loads(json.dumps(valid))
-    invalid["boundaries"]["copies_credentials"] = True
+    invalid["boundaries"]["copies_generic_credentials"] = True
     try:
         validate(invalid)
     except ContractError:
         pass
     else:
         raise AssertionError("invalid boundary was accepted")
+    invalid = json.loads(json.dumps(valid))
+    invalid["boundaries"]["installs_typed_codex_auth"] = False
+    try:
+        validate(invalid)
+    except ContractError:
+        pass
+    else:
+        raise AssertionError("missing typed auth installer was accepted")
+    invalid = json.loads(json.dumps(valid))
+    invalid["boundaries"]["composes_typed_codex_sqlite"] = True
+    try:
+        validate(invalid)
+    except ContractError:
+        pass
+    else:
+        raise AssertionError("SQLite composer boundary drift was accepted")
     invalid = json.loads(json.dumps(valid))
     invalid["enrollment"]["executionPool"] = "ubuntu-latest"
     try:

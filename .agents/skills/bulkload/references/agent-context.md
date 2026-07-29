@@ -22,8 +22,9 @@ Portable candidates include closed rollout JSONL files, append-only
 SQLite families. Keep `config.toml`, rules directories, caches, installation
 IDs, shell snapshots, and active rollouts out of generic copying. Handle auth
 and SQLite only through the exact policy in
-`codex-private-state-policy.v2.json`; the current skill has a private capture
-reader and compatibility planner but no installer.
+`codex-private-state-policy.v3.json`. Policy v3 implements only a narrow,
+attended typed auth install while preserving destination SQLite exactly. It
+does not implement SQLite composition/installation or combined apply.
 
 Before copying a rollout:
 
@@ -98,54 +99,37 @@ the source file before and after.
 
 ## Codex private state
 
-Read `codex-private-state-policy.v2.json` before planning auth or SQLite.
+Read `codex-private-state-policy.v3.json` and
+[`codex-private-auth-install.md`](codex-private-auth-install.md) before
+capturing or installing auth.
 
-- Resolve SQLite authority in this order: configured `sqlite_home`,
-  `CODEX_SQLITE_HOME`, then `CODEX_HOME`. Pass that resolved absolute path
-  explicitly as `--sqlite-home`; private capture does not infer it.
-- Enumerate all provider-owned SQLite families. Do not chase one remembered
-  filename; state, logs, goals, and memories have all carried durable runtime
-  state.
-- Capture each family with SQLite online backup or while writers are
-  quiescent. Never raw-copy a live database/WAL/SHM triplet.
-- Require matching Codex versions, compatible migration/schema fingerprints,
-  source and destination backups, `quick_check`, canonical destination rollout
-  paths, atomic install, directory sync, rollback, picker parity, historical
-  resume, and a fresh persisted turn.
-- Copy `auth.json` only as an explicit password-equivalent artifact with
-  owner-only custody, no value logging, atomic replacement, rollback, and a
-  fresh authenticated turn.
+- Prefer source auth-only plus destination auth-and-SQLite evidence. Full
+  source and destination captures are accepted, but source SQLite is never
+  consumed.
+- Resolve destination SQLite authority in this order: configured
+  `sqlite_home`, `CODEX_SQLITE_HOME`, then `CODEX_HOME`, and pass the effective
+  absolute path explicitly. Never infer it during capture.
+- Any `-wal`, `-shm`, or `-journal` sidecar hard-stops immutable SQLite
+  capture. Do not raw-copy or bypass the sidecar fence.
+- Preserve every destination SQLite family exactly and require zero SQLite
+  mutations. SQLite union/composer/install and combined apply remain false.
+- Treat each quiescence attestation as an operator procedural fence with
+  `provider_writer_proof=false`. The directory `flock` coordinates Bulkload
+  only; independently stop provider writers for the complete operation.
+- Keep private bundles, plans, journals, backups, and receipts owner-only and
+  outside live roots. Never print credential values.
+- Require the pre-import pinned runtime authority carried by each plan. A
+  changed policy or runtime source fails closed.
+- Treat apply and verify receipts as offline byte/custody evidence only. Prove
+  working authentication with a fresh attended provider turn.
 
-Capture source and destination separately:
-
-```bash
-python3 scripts/bulkload.py codex-private-capture \
-  --codex-home /absolute/private/codex-home \
-  --sqlite-home /absolute/effective/sqlite-home \
-  --role source \
-  --host-authority-id 11111111-1111-4111-8111-111111111111 \
-  --codex-version 0.145.0 \
-  --include-auth --include-sqlite \
-  --acknowledge-private-capture \
-  --output-directory /secure/evidence/source-private
-```
-
-Repeat with role `destination` and a distinct authority ID, then run
-`codex-private-plan` against the two bundle directories. Capture requires an
-existing `0700` output parent, publishes the bundle with an atomic no-replace
-rename, stores artifacts and its manifest as `0600`, and retains any failed
-staging directory for attended quarantine. SQLite capture enumerates every
-top-level `*.sqlite` family, uses the online backup API, normalizes the snapshot
-to delete-journal mode, and never transfers source WAL/SHM files. The manifest
-binds the opt-in state classes, effective authorities, and count/byte/time
-budgets; family discovery is repeated after backup.
-
-The compatibility planner rehashes every private artifact and records
-version/family/schema/migration/header mismatches plus bounded thread/path set
-relations. It does not merge or install auth, state, logs, goals, or memories.
-The validator
-enforces `implementation=capture-and-compatibility-plan`,
-`ready_for_apply=false`, and the absence of `codex-private-apply`.
+The compatibility plan records version/family/schema/migration/header and
+bounded thread/path relations but remains non-actionable. The separately
+digest-accepted install plan can authorize only atomic `auth.json` replacement.
+Its apply path creates a complete destination-auth rollback artifact, writes a
+durable journal, preserves destination SQLite, supports bounded recovery, and
+publishes offline apply/verify/rollback receipts. It never activates Codex or
+claims provider acceptance.
 
 Quarantine AppleDouble `._*` files outside interpreted rules/skill/config
 directories. Record path, size, mode, type, and SHA-256; do not silently delete
@@ -157,7 +141,9 @@ Treat project transcript paths, plans/tasks, file history, and auto-memory as
 potentially portable only after exact path mapping. Project directory slugs may
 encode the physical cwd and may collide. Regenerate settings containing Nix
 store paths, plugins with platform binaries, caches, daemons, shell snapshots,
-and indexes. Re-authenticate; never copy keychain or credential files.
+and indexes. Move credentials only through a provider-specific typed policy.
+Policy v3 authorizes Codex `auth.json`, not Claude keychain or credential
+state, so use attended reauthentication for Claude.
 
 Do not blanket-rewrite binary or SQLite content. Use provider-supported
 re-indexing or a verified text/JSON transformation with a source backup.

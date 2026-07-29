@@ -1,6 +1,6 @@
 # Neo to Sting one-off sync retrospective
 
-Evidence cutoff: 2026-07-24. Classification: `DONE_WITH_CONCERNS`.
+Evidence cutoff: 2026-07-29. Classification: `DONE_WITH_CONCERNS`.
 
 ## Outcome
 
@@ -147,7 +147,8 @@ them as an automatic recovery source and never silently delete them.
 - Fresh Sting thread/resume proof passed.
 - Historical Sting rollout is a strict append/superset of the Neo version;
   retain Sting's longer file and never overwrite it.
-- Auth is per-host and fresh; no auth database was copied.
+- In this dated July 20–22 execution, auth was established freshly per host and
+  no auth file was copied. That is an execution fact, not a policy prohibition.
 - Rules sidecar is quarantined; no AppleDouble file remains in interpreted
   rules.
 
@@ -216,7 +217,8 @@ Git data must remain semantic: refs/objects through Git-safe mechanisms,
 working bytes through the sync layer, and linked-worktree administrative paths
 reconstructed locally. Agent state requires provider-aware allowlists and
 scheduled reconciliation. Generated state is denied/regenerated. Auth remains
-fresh and fail-closed.
+typed, private, and fail-closed; either an attended typed copy or
+reauthentication still requires a fresh destination acceptance proof.
 
 TIN-2864 establishes source-only held snapshots, held GitRaw topology,
 catalog/head completeness barriers, composed claims, and monotonic control
@@ -273,19 +275,38 @@ plans, consistent SQLite backups, path/schema reconciliation, rollback, and
 historical-resume acceptance. They must never enter the generic repo-file
 adapter or logs as values.
 
-### 2026-07-29 private reader boundary
+### 2026-07-29 private reader and typed-auth boundary
 
-The next source-only slice implements the copy-eligible half without claiming
-a cutover. `codex-private-capture` copies opted-in `auth.json` only into an
-owner-private, no-replace evidence bundle and snapshots every discovered
-top-level SQLite family through SQLite's online backup API. It normalizes
-snapshot journals to `DELETE`, runs `quick_check`, fingerprints schemas and
-migrations, binds explicit completeness budgets, and carries no raw WAL/SHM
-companions. The operator must pass the already-resolved effective SQLite
-authority; ambient fallback is fail-closed.
+The first July 29 source-only slice implemented the copy-eligible reader
+without claiming a cutover. `codex-private-capture` copied opted-in
+`auth.json` into an owner-private, no-replace evidence bundle and captured
+every selected top-level SQLite family through the immutable SQLite backup
+path. `codex-private-plan` emitted a non-actionable compatibility dossier.
+At that historical checkpoint no installer existed, and no live Neo or Sting
+Codex home was captured or modified.
 
-`codex-private-plan` verifies source/destination bundles and records the exact
-version, family, schema, migration, and state thread/path relationship. It
-remains deliberately blocked because auth installation and the state, logs,
-goals, and memories composers do not yet exist. No live Neo or Sting Codex
-home was captured or modified while developing this slice.
+The later TIN-3268 policy v3 slice supersedes only that “no installer” claim.
+It implements an attended, typed `auth.json` replacement with external backup,
+durable journal, offline verification, rollback, and interrupted-operation
+recovery. The preferred evidence shape is source auth-only plus destination
+auth-and-SQLite. Full source and destination captures are also accepted, but
+the source SQLite bytes are never consumed. Every destination SQLite family is
+captured and held exact before and after auth replacement with zero SQLite
+mutations and `sqlite_union_ready=false`.
+
+The SQLite boundary did not move: any live `-wal`, `-shm`, or `-journal`
+companion hard-stops immutable capture. There is still no WAL-aware capture,
+SQLite union/composer/installer, or combined private apply. The operator's
+short-lived quiescence attestation records a procedural fence with
+`provider_writer_proof=false`; the advisory `flock` coordinates cooperating
+Bulkload processes only.
+
+The private command entrypoint now pins the complete policy/runtime source
+closure before importing it and binds that authority through compatibility and
+install plans. Apply, verify, rollback, and recovery revalidate the accepted
+closure. Their receipts prove offline byte and preservation invariants only:
+`provider_runtime_acceptance_verified=false` remains deliberate, and a fresh
+attended Codex turn on Sting is required before claiming working auth.
+
+No live Neo or Sting private state was mutated while developing or validating
+this source slice.

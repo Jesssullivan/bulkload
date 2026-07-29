@@ -1,6 +1,6 @@
 ---
 name: bulkload
-description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed private Codex auth/SQLite capture and compatibility planning, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
+description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed private Codex capture, or a narrow attended Codex auth install, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, SQLite composition/installation, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
 ---
 
 # Bulkload
@@ -26,10 +26,11 @@ every boundary.
    - authentication or credentials.
 4. Keep credentials and databases outside the generic repository adapter.
    Codex `auth.json` and provider-owned SQLite families are copy-eligible only
-   through an explicit typed opt-in plan. The current private-state reader
-   produces owner-private captures and a compatibility plan, but has no install
-   executor. Never log credential values or copy a live database/WAL/SHM
-   triplet as ordinary files.
+   through an explicit typed opt-in plan. Policy v3 implements only attended
+   atomic auth replacement while preserving destination SQLite exact with zero
+   mutations. SQLite union/composition/installation and combined apply remain
+   false. Never log credential values. Any live SQLite WAL, SHM, or rollback
+   journal hard-stops immutable capture.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
@@ -38,8 +39,10 @@ Read [references/migration-contract.md](references/migration-contract.md) for
 the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
-[references/codex-private-state-policy.v2.json](references/codex-private-state-policy.v2.json)
-before classifying Codex auth or SQLite.
+[references/codex-private-state-policy.v3.json](references/codex-private-state-policy.v3.json)
+before classifying Codex auth or SQLite, and use
+[references/codex-private-auth-install.md](references/codex-private-auth-install.md)
+for the attended private workflow.
 
 ## Capture two stable source passes
 
@@ -256,32 +259,26 @@ command. Any future attended copier must recheck the exact source and
 `destination_before` hashes and sizes immediately before replacement. Never
 run it against active writers or treat path/size equality as content proof.
 
-## Capture private Codex state
+## Handle private Codex auth
 
-Read [references/agent-context.md](references/agent-context.md), then run
-`codex-private-capture` separately on source and destination with explicit
-`--include-auth` and/or `--include-sqlite`,
-`--acknowledge-private-capture`, role, host-authority UUID, Codex version, and
-an owner-private output directory. When SQLite is selected, resolve its
-effective authority first and pass it explicitly with `--sqlite-home`; the
-reader never guesses from ambient configuration. Keep outputs outside both
-Codex homes.
+Follow
+[references/codex-private-auth-install.md](references/codex-private-auth-install.md)
+exactly. Prefer source auth-only and destination auth-plus-SQLite captures.
+Full/full inputs are accepted, but source SQLite is never consumed. Every
+destination family is preserved exact with zero mutations, while
+`sqlite_union_ready=false`.
 
-The reader pins and privately copies `auth.json`; it enumerates every top-level
-`*.sqlite` family and uses SQLite's online backup API. It normalizes capture
-journals to `DELETE`, runs `quick_check`, fingerprints schema, migrations,
-header values, and bounded thread/path indexes, emits no credential values,
-and never copies WAL/SHM companions. The capture digest binds the selected
-state classes and all completeness budgets.
+Create and digest-accept a fresh, purpose-bound quiescence attestation for each
+capture or operation. It is an operator procedural fence with
+`provider_writer_proof=false`; the advisory `flock` coordinates only
+cooperating Bulkload processes. Any SQLite WAL, SHM, or rollback journal blocks
+immutable capture.
 
-Run `codex-private-plan --source-bundle ... --destination-bundle ... --output
-...` only against complete bundles. It verifies every artifact digest,
-compares versions, family sets, schemas, migrations, SQLite header values, and
-state thread/path relations, and records the required auth and family-specific
-composers. Planning revalidates every input before and after atomic publication
-and refuses to write into either bundle or any recorded live root.
-Private planning intentionally exits `4` and emits
-`ready_for_apply=false`: there is no `codex-private-apply` command.
+The private entrypoint pins policy v3 and the full Python runtime closure before
+import, and the compatibility/install plans bind that authority. Review and
+accept both exact plan digests before attended auth apply. Offline receipts do
+not prove provider authentication. Require a fresh attended provider turn.
+Never infer SQLite authority, compose/install SQLite, or use a combined apply.
 
 ## Compile and review the plan
 

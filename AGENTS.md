@@ -19,10 +19,20 @@ operation is read-only.
   files, private keys, kubeconfigs, or decrypted secret material through the
   generic repository-file adapter. Codex `auth.json` and provider-owned SQLite
   families are copy-eligible only through an explicit typed, private,
-  provider-specific plan. The current implementation has an owner-private auth
-  reader, SQLite online-backup reader, and compatibility planner, but no
-  composer or installer. Never log credential values or raw database contents,
-  and never copy a live SQLite database/WAL/SHM triplet as ordinary files.
+  provider-specific plan. Policy v3 implements only an attended atomic
+  `auth.json` install. Prefer an auth-only source capture and an auth-plus-SQLite
+  destination capture; a full source capture is accepted but its SQLite is
+  never consumed. Destination SQLite must remain byte-exact with zero
+  mutations. SQLite composition/installation and combined apply remain
+  fail-held. Never log credential values or raw database contents. Any live
+  SQLite WAL, SHM, or rollback-journal sidecar hard-stops immutable capture.
+- A private-state quiescence attestation is an operator procedural fence with
+  `provider_writer_proof=false`. Its advisory `flock` coordinates cooperating
+  Bulkload processes only; it does not stop or prove the absence of provider
+  writers.
+- Private-state operations must use the pre-import pinned runtime closure bound
+  into their plans. Offline apply/verify receipts do not prove working provider
+  authentication; require a fresh attended provider turn before claiming it.
 - Never delete source data. Never delete destination data in v1.
 - Never apply a plan without an exact plan digest supplied by the operator.
 - Require two byte-stable source catalogs before creating an actionable plan.

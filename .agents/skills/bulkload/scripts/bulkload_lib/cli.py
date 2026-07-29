@@ -18,6 +18,7 @@ import sys
 from typing import Any, Sequence
 
 from . import __version__
+from . import private_runtime
 from .executor import apply_plan, export_copy_paths, verify_plan
 from .model import (
     BulkloadError,
@@ -27,6 +28,19 @@ from .model import (
     read_json,
 )
 from .planner import compile_plan
+from .private_apply import (
+    apply_codex_private_install,
+    compile_codex_private_install_plan,
+    recover_codex_private_mutation,
+    rollback_codex_private_install,
+    verify_codex_private_install,
+)
+from .private_quiescence import (
+    DEFAULT_PRIVATE_QUIESCENCE_TTL_SECONDS,
+    acquire_codex_private_bulkload_lock,
+    create_codex_private_quiescence_attestation,
+    open_codex_private_quiescence_attestation,
+)
 from .private_state import (
     DEFAULT_BACKUP_TIMEOUT_SECONDS,
     DEFAULT_MAX_METADATA_BYTES,
@@ -37,6 +51,8 @@ from .private_state import (
     DEFAULT_MAX_TOTAL_SQLITE_BYTES,
     capture_codex_private_state,
     compile_codex_private_state_plan,
+    private_quiescence_capture_record,
+    read_codex_private_state_plan,
     revalidate_codex_private_bundles,
     write_private_json_noreplace,
 )
@@ -1003,26 +1019,53 @@ def _codex_plan(arguments: argparse.Namespace) -> int:
 
 
 def _codex_private_capture(arguments: argparse.Namespace) -> int:
-    capture = capture_codex_private_state(
-        Path(arguments.codex_home),
-        Path(arguments.output_directory),
-        role=arguments.role,
-        host_authority_id=arguments.host_authority_id,
-        codex_version=arguments.codex_version,
-        sqlite_home=(
-            Path(arguments.sqlite_home) if arguments.sqlite_home is not None else None
-        ),
-        include_auth=arguments.include_auth,
-        include_sqlite=arguments.include_sqlite,
-        acknowledge_private_capture=arguments.acknowledge_private_capture,
-        max_sqlite_families=arguments.max_sqlite_families,
-        max_total_sqlite_bytes=arguments.max_total_sqlite_bytes,
-        backup_timeout_seconds=arguments.backup_timeout_seconds,
-        max_thread_entries=arguments.max_thread_entries,
-        max_thread_index_bytes=arguments.max_thread_index_bytes,
-        max_metadata_entries=arguments.max_metadata_entries,
-        max_metadata_bytes=arguments.max_metadata_bytes,
+    codex_home = Path(arguments.codex_home)
+    sqlite_home = (
+        Path(arguments.sqlite_home) if arguments.sqlite_home is not None else None
     )
+    selected_state_classes = [
+        state_class
+        for state_class, selected in (
+            ("auth", arguments.include_auth),
+            ("sqlite", arguments.include_sqlite),
+        )
+        if selected
+    ]
+    with acquire_codex_private_bulkload_lock(codex_home, sqlite_home) as lock:
+        with open_codex_private_quiescence_attestation(
+            Path(arguments.quiescence_attestation),
+            accept_attestation=arguments.accept_quiescence_attestation,
+            expected_purpose="capture",
+            expected_host_authority_id=arguments.host_authority_id,
+            expected_codex_version=arguments.codex_version,
+            expected_selected_state_classes=selected_state_classes,
+            expected_codex_home=codex_home,
+            expected_sqlite_home=sqlite_home,
+            expected_operation_output=Path(arguments.output_directory),
+            expected_capture_role=arguments.role,
+        ) as quiescence:
+            quiescence.assert_bulkload_lock(lock)
+            capture = capture_codex_private_state(
+                codex_home,
+                Path(arguments.output_directory),
+                role=arguments.role,
+                host_authority_id=arguments.host_authority_id,
+                codex_version=arguments.codex_version,
+                sqlite_home=sqlite_home,
+                include_auth=arguments.include_auth,
+                include_sqlite=arguments.include_sqlite,
+                acknowledge_private_capture=arguments.acknowledge_private_capture,
+                quiescence=private_quiescence_capture_record(quiescence.value),
+                max_sqlite_families=arguments.max_sqlite_families,
+                max_total_sqlite_bytes=arguments.max_total_sqlite_bytes,
+                backup_timeout_seconds=arguments.backup_timeout_seconds,
+                max_thread_entries=arguments.max_thread_entries,
+                max_thread_index_bytes=arguments.max_thread_index_bytes,
+                max_metadata_entries=arguments.max_metadata_entries,
+                max_metadata_bytes=arguments.max_metadata_bytes,
+            )
+            lock.revalidate()
+            quiescence.revalidate()
     print(
         f"capture={capture['capture_sha256']} "
         f"auth={str(capture['auth'] is not None).lower()} "
@@ -1032,43 +1075,277 @@ def _codex_private_capture(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _codex_private_quiescence_attest(arguments: argparse.Namespace) -> int:
+    selected_state_classes = [
+        state_class
+        for state_class, selected in (
+            ("auth", arguments.include_auth),
+            ("sqlite", arguments.include_sqlite),
+        )
+        if selected
+    ]
+    attestation = create_codex_private_quiescence_attestation(
+        Path(arguments.codex_home),
+        Path(arguments.output),
+        purpose=arguments.purpose,
+        host_authority_id=arguments.host_authority_id,
+        codex_version=arguments.codex_version,
+        selected_state_classes=selected_state_classes,
+        sqlite_home=(
+            Path(arguments.sqlite_home) if arguments.sqlite_home is not None else None
+        ),
+        create_only_output=Path(arguments.operation_output),
+        acknowledge_writers_quiesced=arguments.acknowledge_writers_quiesced,
+        capture_role=arguments.capture_role,
+        accepted_plan_sha256=arguments.accept_plan,
+        accepted_apply_receipt_sha256=arguments.accept_apply_receipt,
+        accepted_journal_sha256=arguments.accept_journal,
+        ttl_seconds=arguments.ttl_seconds,
+    )
+    print(
+        f"attestation={attestation['attestation_sha256']} "
+        f"id={attestation['attestation_id']} "
+        f"expires_at={attestation['expires_at']} "
+        "provider_writer_proof=false"
+    )
+    return 0
+
+
 def _codex_private_plan(arguments: argparse.Namespace) -> int:
     source = Path(arguments.source_bundle)
     destination = Path(arguments.destination_bundle)
-    plan = compile_codex_private_state_plan(source, destination)
-    live_roots = (
-        *plan["protected_live_roots"]["source"],
-        *plan["protected_live_roots"]["destination"],
-    )
-    revalidate_codex_private_bundles(
-        source,
-        destination,
-        expected_source_capture_sha256=plan["source_capture_sha256"],
-        expected_destination_capture_sha256=plan["destination_capture_sha256"],
-    )
-    write_private_json_noreplace(
-        Path(arguments.output),
-        plan,
-        protected_directories=(source, destination),
-        recorded_protected_directories=tuple(Path(root) for root in live_roots),
-    )
-    try:
+    with private_runtime.open_pinned_private_runtime_authority() as runtime:
+        plan = compile_codex_private_state_plan(
+            source,
+            destination,
+            runtime_authority=runtime.record,
+        )
+        live_roots = (
+            *plan["protected_live_roots"]["source"],
+            *plan["protected_live_roots"]["destination"],
+        )
         revalidate_codex_private_bundles(
             source,
             destination,
             expected_source_capture_sha256=plan["source_capture_sha256"],
             expected_destination_capture_sha256=plan["destination_capture_sha256"],
         )
-    except BulkloadError as error:
-        raise BulkloadError(
-            "private plan inputs changed after publication; "
-            f"fail-held evidence: {arguments.output}"
-        ) from error
+        runtime.revalidate()
+        write_private_json_noreplace(
+            Path(arguments.output),
+            plan,
+            protected_directories=(source, destination),
+            recorded_protected_directories=tuple(Path(root) for root in live_roots),
+        )
+        try:
+            revalidate_codex_private_bundles(
+                source,
+                destination,
+                expected_source_capture_sha256=plan["source_capture_sha256"],
+                expected_destination_capture_sha256=plan["destination_capture_sha256"],
+            )
+            runtime.revalidate()
+        except BulkloadError as error:
+            raise BulkloadError(
+                "private plan inputs or runtime changed after publication; "
+                f"fail-held evidence: {arguments.output}"
+            ) from error
     print(
         f"plan={plan['plan_sha256']} "
         f"blockers={len(plan['blockers'])} ready_for_apply=false"
     )
     return 4
+
+
+def _codex_private_install_plan(arguments: argparse.Namespace) -> int:
+    source = Path(arguments.source_bundle)
+    destination = Path(arguments.destination_bundle)
+    compatibility = read_codex_private_state_plan(Path(arguments.compatibility_plan))
+    with private_runtime.open_pinned_private_runtime_authority() as runtime:
+        plan = compile_codex_private_install_plan(
+            compatibility,
+            source,
+            destination,
+            accept_compatibility_plan=arguments.accept_compatibility_plan,
+            runtime_authority=runtime.record,
+        )
+        live_roots = (
+            *compatibility["protected_live_roots"]["source"],
+            *compatibility["protected_live_roots"]["destination"],
+        )
+        revalidate_codex_private_bundles(
+            source,
+            destination,
+            expected_source_capture_sha256=plan["source_capture_sha256"],
+            expected_destination_capture_sha256=plan[
+                "destination_before_capture_sha256"
+            ],
+        )
+        runtime.revalidate()
+        write_private_json_noreplace(
+            Path(arguments.output),
+            plan,
+            protected_directories=(source, destination),
+            recorded_protected_directories=tuple(Path(root) for root in live_roots),
+        )
+        try:
+            revalidate_codex_private_bundles(
+                source,
+                destination,
+                expected_source_capture_sha256=plan["source_capture_sha256"],
+                expected_destination_capture_sha256=plan[
+                    "destination_before_capture_sha256"
+                ],
+            )
+            runtime.revalidate()
+        except BulkloadError as error:
+            raise BulkloadError(
+                "private install-plan inputs or runtime changed after publication; "
+                f"fail-held evidence: {arguments.output}"
+            ) from error
+    print(
+        f"plan={plan['plan_sha256']} "
+        f"blockers={len(plan['blockers'])} "
+        f"ready_for_apply={str(plan['ready_for_apply']).lower()}"
+    )
+    return 0 if plan["ready_for_apply"] else 4
+
+
+def _codex_private_apply(arguments: argparse.Namespace) -> int:
+    receipt = apply_codex_private_install(
+        Path(arguments.install_plan),
+        Path(arguments.compatibility_plan),
+        Path(arguments.source_bundle),
+        Path(arguments.destination_before_bundle),
+        destination_codex_home=Path(arguments.destination_codex_home),
+        destination_sqlite_home=(
+            Path(arguments.destination_sqlite_home)
+            if arguments.destination_sqlite_home is not None
+            else None
+        ),
+        rollback_directory=Path(arguments.rollback_directory),
+        post_capture_directory=Path(arguments.post_capture_directory),
+        recovery_capture_directory=Path(arguments.recovery_capture_directory),
+        journal_path=Path(arguments.journal),
+        receipt_path=Path(arguments.receipt),
+        accept_plan=arguments.accept_plan,
+        destination_host_authority_id=arguments.destination_host_authority_id,
+        codex_version=arguments.codex_version,
+        quiescence_attestation_path=Path(arguments.quiescence_attestation),
+        accept_quiescence_attestation=(arguments.accept_quiescence_attestation),
+        acknowledge_private_apply=arguments.acknowledge_private_apply,
+    )
+    print(
+        f"receipt={receipt['receipt_sha256']} "
+        f"offline_verified={str(receipt['offline_verified']).lower()} "
+        "provider_runtime_acceptance_verified=false"
+    )
+    return 0
+
+
+def _codex_private_verify(arguments: argparse.Namespace) -> int:
+    receipt = verify_codex_private_install(
+        Path(arguments.install_plan),
+        Path(arguments.compatibility_plan),
+        Path(arguments.source_bundle),
+        Path(arguments.destination_before_bundle),
+        Path(arguments.apply_receipt),
+        destination_codex_home=Path(arguments.destination_codex_home),
+        destination_sqlite_home=(
+            Path(arguments.destination_sqlite_home)
+            if arguments.destination_sqlite_home is not None
+            else None
+        ),
+        capture_directory=Path(arguments.capture_directory),
+        receipt_path=Path(arguments.receipt),
+        accept_plan=arguments.accept_plan,
+        accept_apply_receipt=arguments.accept_apply_receipt,
+        destination_host_authority_id=arguments.destination_host_authority_id,
+        codex_version=arguments.codex_version,
+        quiescence_attestation_path=Path(arguments.quiescence_attestation),
+        accept_quiescence_attestation=(arguments.accept_quiescence_attestation),
+        acknowledge_private_verify=arguments.acknowledge_private_verify,
+    )
+    print(
+        f"receipt={receipt['receipt_sha256']} "
+        f"offline_verified={str(receipt['offline_verified']).lower()} "
+        "provider_runtime_acceptance_verified=false"
+    )
+    return 0
+
+
+def _codex_private_rollback(arguments: argparse.Namespace) -> int:
+    receipt = rollback_codex_private_install(
+        Path(arguments.install_plan),
+        Path(arguments.compatibility_plan),
+        Path(arguments.source_bundle),
+        Path(arguments.destination_before_bundle),
+        Path(arguments.apply_receipt),
+        Path(arguments.rollback_directory),
+        destination_codex_home=Path(arguments.destination_codex_home),
+        destination_sqlite_home=(
+            Path(arguments.destination_sqlite_home)
+            if arguments.destination_sqlite_home is not None
+            else None
+        ),
+        preflight_capture_directory=Path(arguments.preflight_capture_directory),
+        post_capture_directory=Path(arguments.post_capture_directory),
+        recovery_capture_directory=Path(arguments.recovery_capture_directory),
+        journal_path=Path(arguments.journal),
+        receipt_path=Path(arguments.receipt),
+        accept_plan=arguments.accept_plan,
+        accept_apply_receipt=arguments.accept_apply_receipt,
+        destination_host_authority_id=arguments.destination_host_authority_id,
+        codex_version=arguments.codex_version,
+        quiescence_attestation_path=Path(arguments.quiescence_attestation),
+        accept_quiescence_attestation=(arguments.accept_quiescence_attestation),
+        acknowledge_private_rollback=arguments.acknowledge_private_rollback,
+        acknowledge_no_post_apply_writes=(arguments.acknowledge_no_post_apply_writes),
+    )
+    print(
+        f"receipt={receipt['receipt_sha256']} "
+        f"offline_restored={str(receipt['offline_restored']).lower()} "
+        "provider_runtime_acceptance_verified=false"
+    )
+    return 0
+
+
+def _codex_private_recover(arguments: argparse.Namespace) -> int:
+    receipt = recover_codex_private_mutation(
+        Path(arguments.install_plan),
+        Path(arguments.compatibility_plan),
+        Path(arguments.source_bundle),
+        Path(arguments.destination_before_bundle),
+        Path(arguments.journal),
+        apply_receipt_path=(
+            Path(arguments.apply_receipt)
+            if arguments.apply_receipt is not None
+            else None
+        ),
+        destination_codex_home=Path(arguments.destination_codex_home),
+        destination_sqlite_home=(
+            Path(arguments.destination_sqlite_home)
+            if arguments.destination_sqlite_home is not None
+            else None
+        ),
+        preflight_capture_directory=Path(arguments.preflight_capture_directory),
+        post_capture_directory=Path(arguments.post_capture_directory),
+        receipt_path=Path(arguments.receipt),
+        accept_plan=arguments.accept_plan,
+        accept_journal=arguments.accept_journal,
+        accept_apply_receipt=arguments.accept_apply_receipt,
+        destination_host_authority_id=arguments.destination_host_authority_id,
+        codex_version=arguments.codex_version,
+        quiescence_attestation_path=Path(arguments.quiescence_attestation),
+        accept_quiescence_attestation=(arguments.accept_quiescence_attestation),
+        acknowledge_private_recovery=arguments.acknowledge_private_recovery,
+    )
+    print(
+        f"receipt={receipt['receipt_sha256']} "
+        f"decision={receipt['decision']} "
+        "provider_runtime_acceptance_verified=false"
+    )
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1299,7 +1576,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     codex_private_capture = commands.add_parser(
         "codex-private-capture",
-        help="capture opt-in Codex auth and SQLite through typed private readers",
+        help=(
+            "capture typed private state; SQLite requires quiescence and "
+            "no live WAL/SHM/journal sidecars"
+        ),
     )
     codex_private_capture.add_argument("--codex-home", required=True)
     codex_private_capture.add_argument(
@@ -1320,6 +1600,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--acknowledge-private-capture",
         action="store_true",
         help="acknowledge that the output contains private provider state",
+    )
+    codex_private_capture.add_argument(
+        "--quiescence-attestation",
+        required=True,
+        help="short-lived owner-private operator attestation",
+    )
+    codex_private_capture.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+        help="exact SHA-256 of the accepted quiescence attestation",
     )
     codex_private_capture.add_argument(
         "--max-sqlite-families",
@@ -1358,6 +1648,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     codex_private_capture.set_defaults(handler=_codex_private_capture)
 
+    codex_private_quiescence = commands.add_parser(
+        "codex-private-quiescence-attest",
+        help=(
+            "record an operator-attested procedural writer fence; "
+            "this is not provider-writer proof"
+        ),
+    )
+    codex_private_quiescence.add_argument("--codex-home", required=True)
+    codex_private_quiescence.add_argument("--sqlite-home")
+    codex_private_quiescence.add_argument("--output", required=True)
+    codex_private_quiescence.add_argument("--operation-output", required=True)
+    codex_private_quiescence.add_argument(
+        "--purpose",
+        choices=("capture", "apply", "verify", "rollback", "recover"),
+        required=True,
+    )
+    codex_private_quiescence.add_argument(
+        "--capture-role",
+        choices=("source", "destination"),
+    )
+    codex_private_quiescence.add_argument("--host-authority-id", required=True)
+    codex_private_quiescence.add_argument("--codex-version", required=True)
+    codex_private_quiescence.add_argument("--include-auth", action="store_true")
+    codex_private_quiescence.add_argument("--include-sqlite", action="store_true")
+    codex_private_quiescence.add_argument("--accept-plan")
+    codex_private_quiescence.add_argument("--accept-apply-receipt")
+    codex_private_quiescence.add_argument("--accept-journal")
+    codex_private_quiescence.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=DEFAULT_PRIVATE_QUIESCENCE_TTL_SECONDS,
+    )
+    codex_private_quiescence.add_argument(
+        "--acknowledge-writers-quiesced",
+        action="store_true",
+        help=(
+            "attest that provider writers are procedurally quiesced; "
+            "Bulkload cannot independently prove this"
+        ),
+    )
+    codex_private_quiescence.set_defaults(handler=_codex_private_quiescence_attest)
+
     codex_private_plan = commands.add_parser(
         "codex-private-plan",
         help="compare private captures without installing live state",
@@ -1367,14 +1699,246 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_plan.add_argument("--output", required=True)
     codex_private_plan.set_defaults(handler=_codex_private_plan)
 
+    codex_private_install_plan = commands.add_parser(
+        "codex-private-install-plan",
+        help=(
+            "compile auth-only source to auth+SQLite destination install; "
+            "destination SQLite remains exact and is never composed"
+        ),
+    )
+    codex_private_install_plan.add_argument(
+        "--compatibility-plan",
+        required=True,
+    )
+    codex_private_install_plan.add_argument("--source-bundle", required=True)
+    codex_private_install_plan.add_argument(
+        "--destination-bundle",
+        required=True,
+    )
+    codex_private_install_plan.add_argument(
+        "--accept-compatibility-plan",
+        required=True,
+    )
+    codex_private_install_plan.add_argument("--output", required=True)
+    codex_private_install_plan.set_defaults(handler=_codex_private_install_plan)
+
+    codex_private_apply = commands.add_parser(
+        "codex-private-apply",
+        help=(
+            "attended atomic auth install with exact SQLite preservation; "
+            "offline receipt is not provider authentication proof"
+        ),
+    )
+    codex_private_apply.add_argument("--install-plan", required=True)
+    codex_private_apply.add_argument("--compatibility-plan", required=True)
+    codex_private_apply.add_argument("--source-bundle", required=True)
+    codex_private_apply.add_argument(
+        "--destination-before-bundle",
+        required=True,
+    )
+    codex_private_apply.add_argument("--destination-codex-home", required=True)
+    codex_private_apply.add_argument("--destination-sqlite-home")
+    codex_private_apply.add_argument("--rollback-directory", required=True)
+    codex_private_apply.add_argument(
+        "--post-capture-directory",
+        required=True,
+    )
+    codex_private_apply.add_argument(
+        "--recovery-capture-directory",
+        required=True,
+    )
+    codex_private_apply.add_argument("--journal", required=True)
+    codex_private_apply.add_argument("--receipt", required=True)
+    codex_private_apply.add_argument("--accept-plan", required=True)
+    codex_private_apply.add_argument(
+        "--destination-host-authority-id",
+        required=True,
+    )
+    codex_private_apply.add_argument("--codex-version", required=True)
+    codex_private_apply.add_argument(
+        "--quiescence-attestation",
+        required=True,
+    )
+    codex_private_apply.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+    )
+    codex_private_apply.add_argument(
+        "--acknowledge-private-apply",
+        action="store_true",
+    )
+    codex_private_apply.set_defaults(handler=_codex_private_apply)
+
+    codex_private_verify = commands.add_parser(
+        "codex-private-verify",
+        help=(
+            "independently verify installed bytes offline; fresh provider "
+            "authentication remains an attended external acceptance step"
+        ),
+    )
+    codex_private_verify.add_argument("--install-plan", required=True)
+    codex_private_verify.add_argument("--compatibility-plan", required=True)
+    codex_private_verify.add_argument("--source-bundle", required=True)
+    codex_private_verify.add_argument(
+        "--destination-before-bundle",
+        required=True,
+    )
+    codex_private_verify.add_argument("--apply-receipt", required=True)
+    codex_private_verify.add_argument("--destination-codex-home", required=True)
+    codex_private_verify.add_argument("--destination-sqlite-home")
+    codex_private_verify.add_argument("--capture-directory", required=True)
+    codex_private_verify.add_argument("--receipt", required=True)
+    codex_private_verify.add_argument("--accept-plan", required=True)
+    codex_private_verify.add_argument("--accept-apply-receipt", required=True)
+    codex_private_verify.add_argument(
+        "--destination-host-authority-id",
+        required=True,
+    )
+    codex_private_verify.add_argument("--codex-version", required=True)
+    codex_private_verify.add_argument(
+        "--quiescence-attestation",
+        required=True,
+    )
+    codex_private_verify.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+    )
+    codex_private_verify.add_argument(
+        "--acknowledge-private-verify",
+        action="store_true",
+    )
+    codex_private_verify.set_defaults(handler=_codex_private_verify)
+
+    codex_private_rollback = commands.add_parser(
+        "codex-private-rollback",
+        help="attended exact rollback after a no-post-apply-write assertion",
+    )
+    codex_private_rollback.add_argument("--install-plan", required=True)
+    codex_private_rollback.add_argument("--compatibility-plan", required=True)
+    codex_private_rollback.add_argument("--source-bundle", required=True)
+    codex_private_rollback.add_argument(
+        "--destination-before-bundle",
+        required=True,
+    )
+    codex_private_rollback.add_argument("--apply-receipt", required=True)
+    codex_private_rollback.add_argument("--rollback-directory", required=True)
+    codex_private_rollback.add_argument(
+        "--destination-codex-home",
+        required=True,
+    )
+    codex_private_rollback.add_argument("--destination-sqlite-home")
+    codex_private_rollback.add_argument(
+        "--preflight-capture-directory",
+        required=True,
+    )
+    codex_private_rollback.add_argument(
+        "--post-capture-directory",
+        required=True,
+    )
+    codex_private_rollback.add_argument(
+        "--recovery-capture-directory",
+        required=True,
+    )
+    codex_private_rollback.add_argument("--journal", required=True)
+    codex_private_rollback.add_argument("--receipt", required=True)
+    codex_private_rollback.add_argument("--accept-plan", required=True)
+    codex_private_rollback.add_argument(
+        "--accept-apply-receipt",
+        required=True,
+    )
+    codex_private_rollback.add_argument(
+        "--destination-host-authority-id",
+        required=True,
+    )
+    codex_private_rollback.add_argument("--codex-version", required=True)
+    codex_private_rollback.add_argument(
+        "--quiescence-attestation",
+        required=True,
+    )
+    codex_private_rollback.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+    )
+    codex_private_rollback.add_argument(
+        "--acknowledge-private-rollback",
+        action="store_true",
+    )
+    codex_private_rollback.add_argument(
+        "--acknowledge-no-post-apply-writes",
+        action="store_true",
+    )
+    codex_private_rollback.set_defaults(handler=_codex_private_rollback)
+
+    codex_private_recover = commands.add_parser(
+        "codex-private-recover",
+        help="recover an interrupted typed private auth mutation",
+    )
+    codex_private_recover.add_argument("--install-plan", required=True)
+    codex_private_recover.add_argument("--compatibility-plan", required=True)
+    codex_private_recover.add_argument("--source-bundle", required=True)
+    codex_private_recover.add_argument(
+        "--destination-before-bundle",
+        required=True,
+    )
+    codex_private_recover.add_argument("--journal", required=True)
+    codex_private_recover.add_argument("--apply-receipt")
+    codex_private_recover.add_argument(
+        "--destination-codex-home",
+        required=True,
+    )
+    codex_private_recover.add_argument("--destination-sqlite-home")
+    codex_private_recover.add_argument(
+        "--preflight-capture-directory",
+        required=True,
+    )
+    codex_private_recover.add_argument(
+        "--post-capture-directory",
+        required=True,
+    )
+    codex_private_recover.add_argument("--receipt", required=True)
+    codex_private_recover.add_argument("--accept-plan", required=True)
+    codex_private_recover.add_argument("--accept-journal", required=True)
+    codex_private_recover.add_argument("--accept-apply-receipt")
+    codex_private_recover.add_argument(
+        "--destination-host-authority-id",
+        required=True,
+    )
+    codex_private_recover.add_argument("--codex-version", required=True)
+    codex_private_recover.add_argument(
+        "--quiescence-attestation",
+        required=True,
+    )
+    codex_private_recover.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+    )
+    codex_private_recover.add_argument(
+        "--acknowledge-private-recovery",
+        action="store_true",
+    )
+    codex_private_recover.set_defaults(handler=_codex_private_recover)
+
     doctor = commands.add_parser("doctor", help="report local runtime prerequisites")
     doctor.set_defaults(handler=_doctor)
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    process_runtime_authority: Any | None = None,
+) -> int:
     try:
+        if process_runtime_authority is not None:
+            private_runtime.bind_process_private_runtime_authority(
+                process_runtime_authority
+            )
         arguments = build_parser().parse_args(argv)
+        if arguments.command.startswith("codex-private-"):
+            with private_runtime.open_pinned_private_runtime_authority() as runtime:
+                result = int(arguments.handler(arguments))
+                runtime.revalidate()
+                return result
         return int(arguments.handler(arguments))
     except (BulkloadError, OSError) as error:
         print(f"bulkload: error: {error}", file=sys.stderr)
