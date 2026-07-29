@@ -22,13 +22,13 @@ Portable candidates include closed rollout JSONL files, append-only
 SQLite families. Keep `config.toml`, rules directories, caches, installation
 IDs, shell snapshots, and active rollouts out of generic copying. Handle auth
 and SQLite only through the exact policy in
-`codex-private-state-policy.v5.json`. Policy v5 retains the narrow, attended
-typed auth install while preserving destination SQLite exactly. It accepts the
-complete legacy v4 four-pass, session-bound SQLite opening as immutable
-evidence, adds a fresh cross-plane close, and may compile a descriptive offline
-composition action plan only after reopening every original v4 input before
-and after publication. It does not implement the composer, publication, SQLite
-installation, combined apply, activation, or cutover.
+`codex-private-state-policy.v6.json`. Policy v6 retains the narrow, attended
+typed auth install while preserving destination SQLite exactly. It consumes
+only the exact repaired v5 action-plan producer authority and may compile a
+host-bound, non-actionable compose request plus a separate short-lived
+caller-capacity observation after reopening the complete v4-to-v5 chain before
+and after publication. It does not implement a composer, reservation,
+publication, SQLite installation, combined apply, activation, or cutover.
 
 Before copying a rollout:
 
@@ -103,9 +103,10 @@ the source file before and after.
 
 ## Codex private state
 
-Read `codex-private-state-policy.v5.json`,
+Read `codex-private-state-policy.v6.json`,
 [`codex-private-sqlite-compose-plan.md`](codex-private-sqlite-compose-plan.md),
 [`codex-private-sqlite-compose-action-plan.md`](codex-private-sqlite-compose-action-plan.md),
+[`codex-private-sqlite-compose-request.md`](codex-private-sqlite-compose-request.md),
 and
 [`codex-private-auth-install.md`](codex-private-auth-install.md) before
 capturing or installing auth.
@@ -125,9 +126,11 @@ capturing or installing auth.
   counts, semantic digests, and a descriptive operation graph for families
   whose schema and migration state are already exact. Registered-prefix skew
   remains blocked because no pinned migration adapter executes in this slice.
-  SQLite
-  compose/publish/install, combined apply, provider acceptance, and cutover
-  remain false.
+  V6 accepts only the exact repaired v5 producer closure, pins an absent
+  owner-private workspace, derives a conservative capacity requirement, and
+  records caller-available capacity separately. SQLite compose/reservation/
+  publish/install, combined apply, provider acceptance, and cutover remain
+  false.
 - Treat each quiescence attestation as an operator procedural fence with
   `provider_writer_proof=false`. The directory `flock` coordinates Bulkload
   only; independently stop provider writers for the complete operation.
@@ -146,10 +149,13 @@ durable journal, preserves destination SQLite, supports bounded recovery, and
 publishes offline apply/verify/rollback receipts. It never activates Codex or
 claims provider acceptance. A v5 SQLite action plan is separate evidence for a
 future internal offline composer. `descriptive_action_complete=true` can record
-an exact-schema semantic closure, but `ready_for_offline_compose=false` remains
-invariant because output and scratch authority are absent. No composition
-command exists, and the plan authorizes no live-root mutation, publication,
-installation, session execution, or provider-readiness claim.
+an exact-schema semantic closure. V6 may bind its intended absent output
+namespace and a volatile capacity observation, but both
+`ready_for_internal_offline_compose=false` and
+`ready_for_offline_compose=false` remain invariant because no composer runtime,
+reservation, or write authority exists. No composition command exists, and
+the request authorizes no live-root mutation, publication, installation,
+session execution, or provider-readiness claim.
 
 Quarantine AppleDouble `._*` files outside interpreted rules/skill/config
 directories. Record path, size, mode, type, and SHA-256; do not silently delete
@@ -162,7 +168,7 @@ potentially portable only after exact path mapping. Project directory slugs may
 encode the physical cwd and may collide. Regenerate settings containing Nix
 store paths, plugins with platform binaries, caches, daemons, shell snapshots,
 and indexes. Move credentials only through a provider-specific typed policy.
-Policy v5 authorizes Codex `auth.json`, not Claude keychain or credential
+Policy v6 authorizes Codex `auth.json`, not Claude keychain or credential
 state, so use attended reauthentication for Claude.
 
 Do not blanket-rewrite binary or SQLite content. Use provider-supported

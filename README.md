@@ -15,17 +15,19 @@ required proof digest, and only then accepts fresh source and destination A/B
 captures wrapped against that request.
 
 Codex auth and SQLite families are explicitly copy-eligible, opt-in state
-classes. Policy v5 retains the narrow attended `auth.json` install, the
-four-pass SQLite v4 opening request, and fresh cross-plane closure into an
-offline action plan.
+classes. Policy v6 retains the narrow attended `auth.json` install and consumes
+the exact repaired v5 four-pass SQLite close/action authority. It may emit a
+non-actionable compose request and a separate short-lived observation of
+caller-available workspace capacity.
 The preferred inputs are an auth-only source capture and an auth-plus-SQLite
 destination capture. A full source capture is accepted, but source SQLite is
 never consumed; destination SQLite is preserved exactly with zero mutation.
 The workflow provides digest-accepted planning, atomic auth replacement,
 journaling, offline verification, rollback, and interrupted-operation recovery.
-SQLite composition, publication, installation, combined apply, and any claim
-that the session union was executed remain false and fail-held. Any live WAL,
-SHM, or rollback-journal sidecar blocks immutable SQLite capture.
+SQLite composition, capacity reservation, publication, installation, combined
+apply, and any claim that the session union was executed remain false and
+fail-held. Any live WAL, SHM, or rollback-journal sidecar blocks immutable
+SQLite capture.
 
 Quiescence evidence is an operator procedural assertion with
 `provider_writer_proof=false`; its advisory lock coordinates Bulkload only.
@@ -37,6 +39,8 @@ acceptance proof. See the
 The plan-only database contracts are in the
 [SQLite opening-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md)
 and [v5 close/action-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-action-plan.md).
+The v6 request and volatile capacity contract is in the
+[compose-request reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-request.md).
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:

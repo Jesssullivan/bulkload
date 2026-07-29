@@ -51,15 +51,7 @@ SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def active_runtime_authority() -> dict:
-    return {
-        "schema": private_runtime.PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
-        "policy_schema": private_runtime.PRIVATE_STATE_POLICY_SCHEMA,
-        "policy_sha256": "4" * 64,
-        "runtime_source_sha256": "5" * 64,
-        "source_digests": {
-            path: "6" * 64 for path in private_runtime.PRIVATE_RUNTIME_SOURCE_KEYS
-        },
-    }
+    return deepcopy(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED)
 
 
 def write_rollout(root: Path) -> Path:

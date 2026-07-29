@@ -1,10 +1,11 @@
 # Bulkload v1 design
 
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension,
-private-state policy v5 narrow attended auth install, four-pass SQLite v4
-opening, and fresh cross-plane close/offline action-plan work in review,
-2026-07-29. SQLite composition, publication, installation, and combined
-private apply remain fail-held.
+private-state policy v6 narrow attended auth install and request-only consumer
+of the exact repaired v5 SQLite action authority in review, 2026-07-29. The v6
+slice adds a protected output/workspace request and a separate volatile
+caller-capacity observation. SQLite composition, reservation, publication,
+installation, and combined private apply remain fail-held.
 
 ## 1. Decision
 
@@ -88,12 +89,12 @@ generic file adapter, but they may enter an explicit typed migration dossier.
 ### 4.1 Read-only first
 
 Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
-`apply` is separate and requires the exact `plan_sha256`. Private policy v5
-also exposes a separately attended, digest-accepted auth-only apply, a
-non-actionable four-pass SQLite v4 opening request, and fresh cross-plane
-closure into an offline action plan. None can compose, publish, install, or
-activate SQLite. The CLI never invokes a terminal multiplexer, Home Manager, a
-deploy, or a product runtime.
+`apply` is separate and requires the exact `plan_sha256`. Private policy v6
+also exposes a separately attended, digest-accepted auth-only apply and
+consumes the exact repaired v5 four-pass SQLite close/action chain into a
+non-actionable request plus capacity observation. Neither can compose, reserve,
+publish, install, or activate SQLite. The CLI never invokes a terminal
+multiplexer, Home Manager, a deploy, or a product runtime.
 
 ### 4.2 Repeated-catalog barrier
 
@@ -332,9 +333,9 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
   The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
   sidecar exists. It never copies a live database family as ordinary files.
-  Policy v5 does not compose or install SQLite; during auth install it
+  Policy v6 does not compose or install SQLite; during auth install it
   independently captures and preserves every destination family exactly with
-  zero mutations.
+  zero mutations. Its request/capacity surfaces do not touch live roots.
 - Prefer an auth-only source capture and an auth-plus-SQLite destination
   capture for the narrow auth installer. A full source capture plus a full
   destination capture is also accepted, but source SQLite is never consumed.
@@ -394,19 +395,22 @@ owner-private staging or fail-held final artifact; it is not authority and
 requires attended quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v5.json`.
+`.agents/skills/bulkload/references/codex-private-state-policy.v6.json`.
 It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
-but makes six separate readiness claims:
+but makes eight separate readiness claims:
 
 - `auth_install=true`: an attended, journaled atomic replacement of an
   existing destination `auth.json` is implemented, with a complete rollback
   copy, offline verification, manual rollback, and crash recovery;
-- `sqlite_compose_plan=true`: a four-private-pass, recomputed-session-plan
-  opening request can classify exact registry, schema, migration, path, and
-  type-tagged row relations without emitting operations;
-- `sqlite_compose_action_plan=true`: fresh private and session A/B closes can
-  bind one operator writer-stop epoch and emit a descriptive, create-only
-  offline operation graph with deterministic expected-output claims;
+- `sqlite_compose_plan=false`: v6 retains the v4 validator but exposes no
+  current opening producer command;
+- `sqlite_compose_action_plan=false`: v6 retains exact v5 close/action
+  validators but exposes no current close, reclose, or action-plan producer;
+- `sqlite_compose_request=true`: a v6 request binds the exact v5 producer,
+  current v6 consumer runtime, protected absent output namespace, and checked
+  capacity requirement without granting write authority;
+- `sqlite_capacity_observation=true`: a separate 300-second artifact records
+  caller-available bytes/inodes without reservation or future guarantee;
 - `sqlite_compose=false`: no source SQLite family is merged or installed; and
 - `sqlite_publish=false`: no composed family or versioned directory can be
   published; and
@@ -437,15 +441,18 @@ API, normalizes the evidence copy to `DELETE` journal mode, runs
 `quick_check`, and binds schema, migration, header, thread/path, namespace,
 count, byte, and time evidence. It never copies source sidecars.
 
-`codex-private-plan` remains a non-actionable compatibility dossier.
-`codex-private-sqlite-compose-plan` consumes source A/B and destination A/B
+`codex-private-plan` remains a non-actionable compatibility dossier. In exact
+reviewed v4/v5 historical checkouts only,
+`codex-private-sqlite-compose-plan` consumed source A/B and destination A/B
 private bundles plus the recomputed session-union closure, exact adapter
-registry, and exact path map. It embeds and revalidates the complete registry
-and path-map bodies while binding their digests to the accepted inputs. It is
-an immutable opening request and always records that fresh post-plan close
-captures remain required. It does not claim that the session union was
-executed or verified. Its eight private capture and attestation IDs are
-globally distinct and disjoint from session evidence. Classification binds
+registry, and exact path map. The active v6 CLI retires that producer command
+and retains only its immutable output validator. The historical output embeds
+and revalidates the complete registry and path-map bodies while binding their
+digests to the accepted inputs. It is an immutable opening request and always
+records that fresh post-plan close captures remain required. It does not claim
+that the session union was executed or verified. Its eight private capture and
+attestation IDs are globally distinct and disjoint from session evidence.
+Classification binds
 observed foreign-key topology and actions exactly, fail-holds every
 trigger/view and unsafe or secondary UNIQUE claim, requires an exact
 UUID-to-session-path binding, reapplies captured family/count/byte budgets, and
@@ -535,7 +542,7 @@ sensitive-path blocks re-enforced during plan validation, no deletion,
 pre-copy source rehash, external backups, atomic replacement, durable
 journal/directory entries, fresh verification, Codex evidence inputs and output
 parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Private-state policy v5 adds
+adapter, and explicit incomplete/error states. Private-state policy v6 retains
 pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
 Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
 preservation, an external auth backup, a durable state-machine journal, and
@@ -553,9 +560,12 @@ type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
 captures to one writer-stop epoch, recomputes closed classifications, and
 describes deterministic output and a create-only graph. The action-plan
 consumer reopens the complete original v4 input set before compilation and
-after publication instead of trusting a persisted revalidation flag. Compose,
-publish, install, and apply remain false. Neither the operator attestation nor
-the lock becomes provider-writer proof.
+after publication instead of trusting a persisted revalidation flag. V6
+separately pins an exact `0700` workspace, action-derived absent output and
+staging namespace, protected-root lineages, checked capacity requirement, and
+caller-available `fstatvfs` observation. It reserves nothing and binds no
+composer runtime. Compose, publish, install, and apply remain false. Neither the
+operator attestation nor the lock becomes provider-writer proof.
 Cross-filesystem atomicity, ACL/xattr
 fidelity, sparse files, hardlink identity, special files, case-insensitive
 collisions, submodule worktrees, live concurrent writers, and provider runtime

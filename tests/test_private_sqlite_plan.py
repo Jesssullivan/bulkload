@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
-import io
+from copy import deepcopy
 import json
 from pathlib import Path
 import sqlite3
@@ -325,6 +325,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
         payload_bytes: int = 1024,
         database_mutator: Callable[[Path], None] | None = None,
         home_mutator: Callable[[Path], None] | None = None,
+        runtime_authority: dict[str, object] | None = None,
     ) -> tuple[dict, dict[str, object]]:
         source_home = root / "source-home"
         destination_home = root / "destination-home"
@@ -379,7 +380,11 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             authority=DESTINATION_AUTHORITY,
             pass_name="b",
         )
-        runtime = private_runtime.current_private_runtime_authority()
+        runtime = (
+            private_runtime.current_private_runtime_authority()
+            if runtime_authority is None
+            else deepcopy(runtime_authority)
+        )
         compatibility = private_state.compile_codex_private_state_plan(
             source_a_path,
             destination_a_path,
@@ -583,7 +588,13 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
 
     def test_v5_close_recomputes_the_complete_real_v4_opening(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            plan, evidence = self.compile_fixture(Path(directory))
+            legacy_runtime = deepcopy(
+                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+            )
+            plan, evidence = self.compile_fixture(
+                Path(directory),
+                runtime_authority=legacy_runtime,
+            )
             request = compile_codex_private_sqlite_close_request(
                 plan,
                 evidence["session_plan"],
@@ -2027,115 +2038,21 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             ):
                 self.validate_against_inputs(drifted, evidence)
 
-    def test_cli_recomputes_before_and_after_fail_held_publication(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plan, evidence = self.compile_fixture(root)
-            documents = {
-                "compatibility-plan.json": evidence["compatibility"],
-                "adapter-registry.json": evidence["registry"],
-                "path-map.json": evidence["path_map"],
-                "session-union-plan.json": evidence["session_plan"],
-                "session-source-a.json": evidence["session_source_a"],
-                "session-source-b.json": evidence["session_source_b"],
-                "session-destination-a.json": evidence["session_destination_a"],
-                "session-destination-b.json": evidence["session_destination_b"],
-            }
-            document_paths: dict[str, Path] = {}
-            for name, value in documents.items():
-                path = root / name
-                path.write_bytes(canonical_bytes(value) + b"\n")
-                path.chmod(0o600)
-                document_paths[name] = path
-
-            def arguments(output: Path) -> list[str]:
-                return [
-                    "codex-private-sqlite-compose-plan",
-                    "--compatibility-plan",
-                    str(document_paths["compatibility-plan.json"]),
-                    "--accept-compatibility-plan",
-                    evidence["compatibility"]["plan_sha256"],
-                    "--source-a-bundle",
-                    str(evidence["source_a_path"]),
-                    "--source-b-bundle",
-                    str(evidence["source_b_path"]),
-                    "--destination-a-bundle",
-                    str(evidence["destination_a_path"]),
-                    "--destination-b-bundle",
-                    str(evidence["destination_b_path"]),
-                    "--adapter-registry",
-                    str(document_paths["adapter-registry.json"]),
-                    "--accept-adapter-registry",
-                    evidence["registry"]["registry_sha256"],
-                    "--path-map",
-                    str(document_paths["path-map.json"]),
-                    "--accept-path-map",
-                    evidence["path_map"]["path_map_sha256"],
-                    "--session-union-plan",
-                    str(document_paths["session-union-plan.json"]),
-                    "--accept-session-union-plan",
-                    evidence["session_plan"]["plan_sha256"],
-                    "--session-source-a",
-                    str(document_paths["session-source-a.json"]),
-                    "--session-source-b",
-                    str(document_paths["session-source-b.json"]),
-                    "--session-destination-a",
-                    str(document_paths["session-destination-a.json"]),
-                    "--session-destination-b",
-                    str(document_paths["session-destination-b.json"]),
-                    "--output",
-                    str(output),
-                ]
-
-            output = root / "sqlite-plan.json"
-            standard_output = io.StringIO()
-            with redirect_stdout(standard_output):
-                result = bulkload_cli.main(arguments(output))
-            self.assertEqual(result, 4)
-            self.assertTrue(output.is_file())
-            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
-            self.assertIn("sqlite_compose=false", standard_output.getvalue())
-            self.assertIn("sqlite_publish=false", standard_output.getvalue())
-            self.assertIn("ready_for_apply=false", standard_output.getvalue())
-            published_plan = json.loads(output.read_text(encoding="utf-8"))
-            validate_codex_private_sqlite_compose_plan(published_plan)
-            self.assertEqual(
-                published_plan["accepted_inputs"],
-                plan["accepted_inputs"],
-            )
-
-            actual_revalidate = (
-                bulkload_cli.validate_codex_private_sqlite_compose_plan_against_inputs
-            )
-            calls = 0
-
-            def drift_after_publish(*args: object, **kwargs: object) -> None:
-                nonlocal calls
-                calls += 1
-                actual_revalidate(*args, **kwargs)
-                if calls == 2:
-                    raise BulkloadError("simulated post-publication drift")
-
-            held_output = root / "sqlite-plan-held.json"
-            standard_error = io.StringIO()
-            with mock.patch.object(
-                bulkload_cli,
-                "validate_codex_private_sqlite_compose_plan_against_inputs",
-                side_effect=drift_after_publish,
-            ):
-                with redirect_stderr(standard_error):
-                    result = bulkload_cli.main(arguments(held_output))
-            self.assertEqual(result, 2)
-            self.assertEqual(calls, 2)
-            self.assertTrue(held_output.is_file())
-            self.assertIn(
-                "private SQLite plan inputs changed after publication",
-                standard_error.getvalue(),
-            )
-            self.assertIn(
-                f"fail-held evidence: {held_output}",
-                standard_error.getvalue(),
-            )
+    def test_legacy_sqlite_producer_commands_are_retired_in_v6(self) -> None:
+        parser = bulkload_cli.build_parser()
+        command_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        for command in (
+            "codex-private-sqlite-compose-plan",
+            "codex-private-sqlite-close-request",
+            "codex-private-sqlite-session-reclose",
+            "codex-private-sqlite-private-reclose",
+            "codex-private-sqlite-compose-action-plan",
+        ):
+            self.assertNotIn(command, command_action.choices)
 
     def test_value_and_publication_budgets_are_aligned(self) -> None:
         self.assertEqual(

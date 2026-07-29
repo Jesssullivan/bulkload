@@ -58,6 +58,15 @@ from .private_sqlite_close import (
     validate_codex_private_sqlite_session_reclose_against_live,
     validate_codex_private_sqlite_session_reclose_capture,
 )
+from .private_sqlite_request import (
+    PinnedComposeWorkspace,
+    compile_codex_private_sqlite_capacity_observation,
+    compile_codex_private_sqlite_compose_request,
+    derived_compose_output_leaf,
+    validate_codex_private_sqlite_capacity_observation_against_request,
+    validate_codex_private_sqlite_compose_request,
+    validate_codex_private_sqlite_compose_request_against_action,
+)
 from .private_state import (
     DEFAULT_BACKUP_TIMEOUT_SECONDS,
     DEFAULT_MAX_METADATA_BYTES,
@@ -369,11 +378,15 @@ def _write_pinned_codex_json(
     pinned_inputs: Sequence[tuple[str, int, tuple[int, ...]]],
     *,
     protected_roots: Sequence[Path] = (),
+    pinned_output_parent: (tuple[Path, int, tuple[int, int, int, int]] | None) = None,
 ) -> None:
     if output == "-":
         sys.stdout.buffer.write(canonical_bytes(value) + b"\n")
         return
-    requested = Path(output).expanduser()
+    requested_input = Path(output).expanduser()
+    if ".." in requested_input.parts:
+        raise BulkloadError("Codex evidence output contains parent traversal")
+    requested = Path(os.path.abspath(os.fspath(requested_input)))
     roots = [
         *protected_roots,
         *[
@@ -386,11 +399,18 @@ def _write_pinned_codex_json(
         _reject_output_overlap(str(requested), roots)
     except (OSError, RuntimeError, ValueError) as error:
         raise BulkloadError("cannot validate Codex evidence output path") from error
-    try:
-        parent = requested.parent.resolve()
-    except (OSError, RuntimeError, ValueError) as error:
-        raise BulkloadError("cannot resolve Codex evidence output parent") from error
-    durable_makedirs(parent)
+    if pinned_output_parent is None:
+        try:
+            parent = requested.parent.resolve()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise BulkloadError(
+                "cannot resolve Codex evidence output parent"
+            ) from error
+        durable_makedirs(parent)
+    else:
+        parent, _, _ = pinned_output_parent
+        if requested.parent != parent:
+            raise BulkloadError("Codex evidence output differs from its pinned parent")
     target = parent / requested.name
     try:
         _reject_output_overlap(str(target), roots)
@@ -403,7 +423,12 @@ def _write_pinned_codex_json(
         | getattr(os, "O_CLOEXEC", 0)
     )
     try:
-        parent_descriptor = os.open(parent, flags)
+        if pinned_output_parent is None:
+            parent_descriptor = os.open(parent, flags)
+            supplied_parent_expected = None
+        else:
+            _, supplied_descriptor, supplied_parent_expected = pinned_output_parent
+            parent_descriptor = os.dup(supplied_descriptor)
     except (OSError, ValueError) as error:
         raise BulkloadError(
             f"cannot pin Codex evidence output parent: {parent}"
@@ -419,12 +444,30 @@ def _write_pinned_codex_json(
             stat.S_IMODE(parent_info.st_mode),
         )
         if (
+            supplied_parent_expected is not None
+            and parent_expected != supplied_parent_expected
+        ):
+            raise BulkloadError("Codex evidence pinned output parent changed")
+        if (
             parent_info.st_uid != os.getuid()
             or stat.S_IMODE(parent_info.st_mode) & 0o077
         ):
             raise BulkloadError(
                 f"Codex evidence output parent is not owner-private: {parent}"
             )
+        try:
+            current_parent = os.stat(parent, follow_symlinks=False)
+        except OSError as error:
+            raise BulkloadError(
+                "Codex evidence pinned output parent path changed"
+            ) from error
+        if (
+            current_parent.st_dev,
+            current_parent.st_ino,
+            current_parent.st_uid,
+            stat.S_IMODE(current_parent.st_mode),
+        ) != parent_expected:
+            raise BulkloadError("Codex evidence pinned output parent path changed")
         protected_identities = {
             (snapshot["root_identity"]["device"], snapshot["root_identity"]["inode"])
             for snapshot in snapshots
@@ -1931,6 +1974,533 @@ def _codex_private_sqlite_compose_action_plan(
     return 4
 
 
+def _sqlite_action_chain_paths(
+    arguments: argparse.Namespace,
+) -> tuple[
+    dict[str, Path],
+    dict[str, Path],
+    dict[str, str],
+    dict[str, str | None],
+]:
+    bundles = {
+        "source_a": Path(arguments.source_close_a_bundle),
+        "source_b": Path(arguments.source_close_b_bundle),
+        "destination_a": Path(arguments.destination_close_a_bundle),
+        "destination_b": Path(arguments.destination_close_b_bundle),
+    }
+    opening_bundles = {
+        "source_a": Path(arguments.opening_source_a_bundle),
+        "source_b": Path(arguments.opening_source_b_bundle),
+        "destination_a": Path(arguments.opening_destination_a_bundle),
+        "destination_b": Path(arguments.opening_destination_b_bundle),
+    }
+    input_paths = {
+        "action_plan": arguments.action_plan,
+        "opening_plan": arguments.opening_plan,
+        "close_request": arguments.close_request,
+        "opening_compatibility_plan": arguments.opening_compatibility_plan,
+        "opening_adapter_registry": arguments.opening_adapter_registry,
+        "opening_path_map": arguments.opening_path_map,
+        "opening_session_union_plan": arguments.opening_session_union_plan,
+        "opening_session_source_a": arguments.opening_session_source_a,
+        "opening_session_source_b": arguments.opening_session_source_b,
+        "opening_session_destination_a": arguments.opening_session_destination_a,
+        "opening_session_destination_b": arguments.opening_session_destination_b,
+        "session_source_a": arguments.session_source_close_a,
+        "session_source_b": arguments.session_source_close_b,
+        "session_destination_a": arguments.session_destination_close_a,
+        "session_destination_b": arguments.session_destination_close_b,
+    }
+    optional_input_paths = {
+        "opening_session_prefix_request": arguments.opening_session_prefix_request,
+        "opening_session_source_prefix_a": (arguments.opening_session_source_prefix_a),
+        "opening_session_source_prefix_b": (arguments.opening_session_source_prefix_b),
+        "opening_session_destination_prefix_a": (
+            arguments.opening_session_destination_prefix_a
+        ),
+        "opening_session_destination_prefix_b": (
+            arguments.opening_session_destination_prefix_b
+        ),
+        "opening_session_close_request": arguments.opening_session_close_request,
+        "opening_session_source_close_a": (arguments.opening_session_source_close_a),
+        "opening_session_source_close_b": (arguments.opening_session_source_close_b),
+        "opening_session_destination_close_a": (
+            arguments.opening_session_destination_close_a
+        ),
+        "opening_session_destination_close_b": (
+            arguments.opening_session_destination_close_b
+        ),
+    }
+    return bundles, opening_bundles, input_paths, optional_input_paths
+
+
+def _read_sqlite_action_chain(
+    arguments: argparse.Namespace,
+) -> tuple[
+    dict[str, Path],
+    dict[str, Path],
+    dict[str, str],
+    dict[str, str | None],
+    dict[str, dict[str, Any] | None],
+    list[tuple[str, int, tuple[int, ...]]],
+]:
+    (
+        bundles,
+        opening_bundles,
+        input_paths,
+        optional_input_paths,
+    ) = _sqlite_action_chain_paths(arguments)
+    documents: dict[str, dict[str, Any] | None] = {}
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    try:
+        for name, path in input_paths.items():
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            documents[name] = document
+            pinned.append((path, descriptor, expected))
+        for name, path in optional_input_paths.items():
+            if path is None:
+                documents[name] = None
+                continue
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            documents[name] = document
+            pinned.append((path, descriptor, expected))
+    except BaseException:
+        for _, descriptor, _ in pinned:
+            os.close(descriptor)
+        raise
+    return (
+        bundles,
+        opening_bundles,
+        input_paths,
+        optional_input_paths,
+        documents,
+        pinned,
+    )
+
+
+def _revalidate_sqlite_action_chain(
+    documents: dict[str, dict[str, Any] | None],
+    bundles: dict[str, Path],
+    opening_bundles: dict[str, Path],
+) -> None:
+    action_plan = documents["action_plan"]
+    assert action_plan is not None
+    opening_plan = documents["opening_plan"]
+    assert opening_plan is not None
+    producer_runtime = action_plan["runtime_authority"]
+    opening_runtime = opening_plan["runtime_authority"]
+    if opening_runtime not in (
+        private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+        private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED,
+    ):
+        raise BulkloadError(
+            "private SQLite opening requires an exact reviewed legacy "
+            "v4/v5 producer authority"
+        )
+    if producer_runtime != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED:
+        raise BulkloadError(
+            "private SQLite action chain requires the exact repaired v5 "
+            "producer authority"
+        )
+    validate_codex_private_sqlite_close_request_against_inputs(
+        documents["close_request"],
+        opening_plan,
+        documents["opening_session_union_plan"],
+        documents["opening_session_source_a"],
+        documents["opening_session_source_b"],
+        documents["opening_session_destination_a"],
+        documents["opening_session_destination_b"],
+        producer_runtime,
+        opening_compatibility_plan=documents["opening_compatibility_plan"],
+        opening_source_a_directory=opening_bundles["source_a"],
+        opening_source_b_directory=opening_bundles["source_b"],
+        opening_destination_a_directory=opening_bundles["destination_a"],
+        opening_destination_b_directory=opening_bundles["destination_b"],
+        opening_adapter_registry=documents["opening_adapter_registry"],
+        opening_path_map=documents["opening_path_map"],
+        opening_session_prefix_request=documents["opening_session_prefix_request"],
+        opening_session_source_prefix_a=documents["opening_session_source_prefix_a"],
+        opening_session_source_prefix_b=documents["opening_session_source_prefix_b"],
+        opening_session_destination_prefix_a=documents[
+            "opening_session_destination_prefix_a"
+        ],
+        opening_session_destination_prefix_b=documents[
+            "opening_session_destination_prefix_b"
+        ],
+        opening_session_close_request=documents["opening_session_close_request"],
+        opening_session_source_close_a=documents["opening_session_source_close_a"],
+        opening_session_source_close_b=documents["opening_session_source_close_b"],
+        opening_session_destination_close_a=documents[
+            "opening_session_destination_close_a"
+        ],
+        opening_session_destination_close_b=documents[
+            "opening_session_destination_close_b"
+        ],
+    )
+    validate_codex_private_sqlite_action_plan_against_close(
+        action_plan,
+        opening_plan,
+        documents["close_request"],
+        bundles["source_a"],
+        bundles["source_b"],
+        bundles["destination_a"],
+        bundles["destination_b"],
+        documents["session_source_a"],
+        documents["session_source_b"],
+        documents["session_destination_a"],
+        documents["session_destination_b"],
+    )
+
+
+def _sqlite_recorded_roots(
+    documents: dict[str, dict[str, Any] | None],
+) -> list[tuple[str, str, Path]]:
+    roots: list[tuple[str, str, Path]] = []
+    close_request = documents["close_request"]
+    assert close_request is not None
+    for role in ("source", "destination"):
+        stable = close_request["private_opening"][role]["binding"]["stable_projection"]
+        for authority in ("codex_home", "sqlite_home"):
+            roots.append(
+                (
+                    "live-private-root",
+                    f"{role}:{authority}",
+                    Path(stable[authority]["resolved_path"]),
+                )
+            )
+    for name in (
+        "opening_session_source_a",
+        "opening_session_source_b",
+        "opening_session_destination_a",
+        "opening_session_destination_b",
+        "session_source_a",
+        "session_source_b",
+        "session_destination_a",
+        "session_destination_b",
+    ):
+        document = documents[name]
+        assert document is not None
+        snapshot = document.get("snapshot", document)
+        resolved_root = snapshot.get("resolved_root")
+        if isinstance(resolved_root, str):
+            roots.append(("live-session-root", name, Path(resolved_root)))
+    return roots
+
+
+def _sqlite_workspace_roots(
+    *,
+    bundles: dict[str, Path],
+    opening_bundles: dict[str, Path],
+    input_paths: dict[str, str],
+    optional_input_paths: dict[str, str | None],
+    evidence_output: str,
+) -> list[tuple[str, str, Path, bool]]:
+    roots: list[tuple[str, str, Path, bool]] = [
+        *[
+            ("closing-private-bundle", name, path, True)
+            for name, path in bundles.items()
+        ],
+        *[
+            ("opening-private-bundle", name, path, True)
+            for name, path in opening_bundles.items()
+        ],
+        ("request-runtime-root", "consumer", private_runtime._skill_root(), False),
+    ]
+    evidence_paths = [
+        *input_paths.values(),
+        *[path for path in optional_input_paths.values() if path is not None],
+    ]
+    roots.extend(
+        (
+            "protocol-evidence-parent",
+            "private-json",
+            Path(path).expanduser().parent,
+            True,
+        )
+        for path in evidence_paths
+    )
+    roots.append(
+        (
+            "request-output-parent",
+            "private-json",
+            Path(evidence_output).expanduser().parent,
+            True,
+        )
+    )
+    return roots
+
+
+def _sqlite_write_protected_roots(
+    documents: dict[str, dict[str, Any] | None],
+    bundles: dict[str, Path],
+    opening_bundles: dict[str, Path],
+    workspace: PinnedComposeWorkspace,
+) -> list[Path]:
+    return [
+        workspace.parent,
+        private_runtime._skill_root(),
+        *bundles.values(),
+        *opening_bundles.values(),
+        *[path for _, _, path in _sqlite_recorded_roots(documents)],
+    ]
+
+
+def _closing_session_snapshots(
+    documents: dict[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for name in (
+        "session_source_a",
+        "session_source_b",
+        "session_destination_a",
+        "session_destination_b",
+    ):
+        document = documents[name]
+        assert document is not None
+        snapshots.append(document["snapshot"])
+    return snapshots
+
+
+def _codex_private_sqlite_compose_request(
+    arguments: argparse.Namespace,
+) -> int:
+    if arguments.output == "-":
+        raise BulkloadError(
+            "private SQLite compose request requires an owner-private output file"
+        )
+    (
+        bundles,
+        opening_bundles,
+        input_paths,
+        optional_input_paths,
+        documents,
+        pinned,
+    ) = _read_sqlite_action_chain(arguments)
+    action_plan = documents["action_plan"]
+    assert action_plan is not None
+    workspace: PinnedComposeWorkspace | None = None
+    try:
+        workspace = PinnedComposeWorkspace(
+            Path(arguments.workspace_parent),
+            derived_compose_output_leaf(action_plan["action_plan_sha256"]),
+            existing_roots=_sqlite_workspace_roots(
+                bundles=bundles,
+                opening_bundles=opening_bundles,
+                input_paths=input_paths,
+                optional_input_paths=optional_input_paths,
+                evidence_output=arguments.output,
+            ),
+            recorded_roots=_sqlite_recorded_roots(documents),
+        )
+        with private_runtime.open_pinned_private_runtime_authority() as runtime:
+
+            def revalidate_inputs() -> None:
+                for path, descriptor, expected in pinned:
+                    _revalidate_pinned_codex_input(path, descriptor, expected)
+                runtime.revalidate()
+                _revalidate_sqlite_action_chain(
+                    documents,
+                    bundles,
+                    opening_bundles,
+                )
+                workspace.revalidate()
+
+            revalidate_inputs()
+            request = compile_codex_private_sqlite_compose_request(
+                action_plan,
+                workspace.record(),
+                accept_action_plan=arguments.accept_action_plan,
+                request_runtime_authority=runtime.record,
+            )
+            validate_codex_private_sqlite_compose_request_against_action(
+                request,
+                action_plan,
+                workspace.record(),
+                runtime.record,
+            )
+            revalidate_inputs()
+            _write_pinned_codex_json(
+                arguments.output,
+                request,
+                _closing_session_snapshots(documents),
+                pinned,
+                protected_roots=_sqlite_write_protected_roots(
+                    documents,
+                    bundles,
+                    opening_bundles,
+                    workspace,
+                ),
+                pinned_output_parent=workspace.output_parent_binding(),
+            )
+            try:
+                revalidate_inputs()
+                validate_codex_private_sqlite_compose_request_against_action(
+                    request,
+                    action_plan,
+                    workspace.record(),
+                    runtime.record,
+                )
+            except BulkloadError as error:
+                raise BulkloadError(
+                    "private SQLite compose-request inputs, workspace, or runtime "
+                    f"changed after publication; fail-held evidence: {arguments.output}"
+                ) from error
+    finally:
+        if workspace is not None:
+            workspace.close()
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    print(
+        f"compose_request={request['request_sha256']} request_complete=true "
+        "capacity_observation_required=true capacity_reserved=false "
+        "composer_implemented=false ready_for_internal_offline_compose=false"
+    )
+    return 4
+
+
+def _capacity_is_sufficient(
+    request: dict[str, Any],
+    capacity: dict[str, int],
+) -> bool:
+    requirement = request["capacity_requirement"]
+    return bool(
+        capacity["available_bytes"] >= requirement["required_bytes"]
+        and capacity["available_inodes"] >= requirement["required_inodes"]
+    )
+
+
+def _codex_private_sqlite_capacity_observe(
+    arguments: argparse.Namespace,
+) -> int:
+    if arguments.output == "-":
+        raise BulkloadError(
+            "private SQLite capacity observation requires an owner-private output file"
+        )
+    request_parent = Path(arguments.request).expanduser().parent.resolve()
+    output_parent = Path(arguments.output).expanduser().parent.resolve()
+    if request_parent != output_parent:
+        raise BulkloadError(
+            "capacity observation must share the request evidence parent"
+        )
+    (
+        bundles,
+        opening_bundles,
+        input_paths,
+        optional_input_paths,
+        documents,
+        pinned,
+    ) = _read_sqlite_action_chain(arguments)
+    request, request_descriptor, request_expected = _read_pinned_codex_json(
+        arguments.request
+    )
+    pinned.append((arguments.request, request_descriptor, request_expected))
+    action_plan = documents["action_plan"]
+    assert action_plan is not None
+    workspace: PinnedComposeWorkspace | None = None
+    try:
+        if arguments.accept_action_plan != action_plan["action_plan_sha256"]:
+            raise BulkloadError("accepted private SQLite action-plan digest differs")
+        validate_codex_private_sqlite_compose_request(request)
+        workspace = PinnedComposeWorkspace(
+            Path(arguments.workspace_parent),
+            request["output_intent"]["workspace"]["final_leaf"],
+            existing_roots=_sqlite_workspace_roots(
+                bundles=bundles,
+                opening_bundles=opening_bundles,
+                input_paths=input_paths,
+                optional_input_paths=optional_input_paths,
+                evidence_output=arguments.output,
+            ),
+            recorded_roots=_sqlite_recorded_roots(documents),
+        )
+        with private_runtime.open_pinned_private_runtime_authority() as runtime:
+
+            def revalidate_inputs() -> dict[str, int]:
+                for path, descriptor, expected in pinned:
+                    _revalidate_pinned_codex_input(path, descriptor, expected)
+                runtime.revalidate()
+                _revalidate_sqlite_action_chain(
+                    documents,
+                    bundles,
+                    opening_bundles,
+                )
+                workspace.revalidate()
+                validate_codex_private_sqlite_compose_request_against_action(
+                    request,
+                    action_plan,
+                    workspace.record(),
+                    runtime.record,
+                )
+                observed = workspace.observe_capacity()
+                if not _capacity_is_sufficient(request, observed):
+                    raise BulkloadError(
+                        "caller-available workspace capacity is insufficient"
+                    )
+                return observed
+
+            capacity = revalidate_inputs()
+            observation = compile_codex_private_sqlite_capacity_observation(
+                request,
+                workspace.record(),
+                capacity,
+                accept_request=arguments.accept_request,
+                observation_runtime_authority=runtime.record,
+                host_authority_id=arguments.host_authority_id,
+            )
+            validate_codex_private_sqlite_capacity_observation_against_request(
+                observation,
+                request,
+                workspace.record(),
+                runtime.record,
+            )
+            revalidate_inputs()
+            _write_pinned_codex_json(
+                arguments.output,
+                observation,
+                _closing_session_snapshots(documents),
+                pinned,
+                protected_roots=_sqlite_write_protected_roots(
+                    documents,
+                    bundles,
+                    opening_bundles,
+                    workspace,
+                ),
+                pinned_output_parent=workspace.output_parent_binding(),
+            )
+            try:
+                revalidate_inputs()
+                validate_codex_private_sqlite_capacity_observation_against_request(
+                    observation,
+                    request,
+                    workspace.record(),
+                    runtime.record,
+                )
+            except BulkloadError as error:
+                raise BulkloadError(
+                    "private SQLite capacity-observation inputs, workspace, "
+                    "capacity, or runtime changed after publication; fail-held "
+                    f"evidence: {arguments.output}"
+                ) from error
+    finally:
+        if workspace is not None:
+            workspace.close()
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    print(
+        f"capacity_observation={observation['observation_sha256']} "
+        "capacity_sufficient_observed=true capacity_reserved=false "
+        "future_write_guaranteed=false "
+        "ready_for_internal_offline_compose=false"
+    )
+    return 4
+
+
 def _codex_private_install_plan(arguments: argparse.Namespace) -> int:
     source = Path(arguments.source_bundle)
     destination = Path(arguments.destination_bundle)
@@ -2120,6 +2690,55 @@ def _codex_private_recover(arguments: argparse.Namespace) -> int:
         "provider_runtime_acceptance_verified=false"
     )
     return 0
+
+
+def _add_sqlite_action_chain_cli_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument("--action-plan", required=True)
+    parser.add_argument("--accept-action-plan", required=True)
+    parser.add_argument("--opening-plan", required=True)
+    parser.add_argument("--close-request", required=True)
+    parser.add_argument("--opening-compatibility-plan", required=True)
+    parser.add_argument("--opening-source-a-bundle", required=True)
+    parser.add_argument("--opening-source-b-bundle", required=True)
+    parser.add_argument("--opening-destination-a-bundle", required=True)
+    parser.add_argument("--opening-destination-b-bundle", required=True)
+    parser.add_argument("--opening-adapter-registry", required=True)
+    parser.add_argument("--opening-path-map", required=True)
+    parser.add_argument("--opening-session-union-plan", required=True)
+    parser.add_argument("--opening-session-source-a", required=True)
+    parser.add_argument("--opening-session-source-b", required=True)
+    parser.add_argument("--opening-session-destination-a", required=True)
+    parser.add_argument("--opening-session-destination-b", required=True)
+    parser.add_argument("--opening-session-prefix-request")
+    parser.add_argument("--opening-session-source-prefix-a")
+    parser.add_argument("--opening-session-source-prefix-b")
+    parser.add_argument("--opening-session-destination-prefix-a")
+    parser.add_argument("--opening-session-destination-prefix-b")
+    parser.add_argument("--opening-session-close-request")
+    parser.add_argument("--opening-session-source-close-a")
+    parser.add_argument("--opening-session-source-close-b")
+    parser.add_argument("--opening-session-destination-close-a")
+    parser.add_argument("--opening-session-destination-close-b")
+    parser.add_argument("--source-close-a-bundle", required=True)
+    parser.add_argument("--source-close-b-bundle", required=True)
+    parser.add_argument("--destination-close-a-bundle", required=True)
+    parser.add_argument("--destination-close-b-bundle", required=True)
+    parser.add_argument("--session-source-close-a", required=True)
+    parser.add_argument("--session-source-close-b", required=True)
+    parser.add_argument("--session-destination-close-a", required=True)
+    parser.add_argument("--session-destination-close-b", required=True)
+
+
+def _retired_sqlite_producer_parser() -> argparse.ArgumentParser:
+    """Hold legacy argument documentation without registering a v6 command."""
+    return argparse.ArgumentParser(add_help=False)
+
+
+def _retire_sqlite_producer_handler(parser: argparse.ArgumentParser) -> None:
+    """Make the legacy v4/v5 producer parser unreachable from active v6."""
+    del parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2473,13 +3092,7 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_plan.add_argument("--output", required=True)
     codex_private_plan.set_defaults(handler=_codex_private_plan)
 
-    codex_private_sqlite_close_request = commands.add_parser(
-        "codex-private-sqlite-close-request",
-        help=(
-            "bind one operator-attested writer-stop epoch to the exact private "
-            "SQLite opening and session-union bodies"
-        ),
-    )
+    codex_private_sqlite_close_request = _retired_sqlite_producer_parser()
     codex_private_sqlite_close_request.add_argument(
         "--opening-plan",
         required=True,
@@ -2568,17 +3181,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     codex_private_sqlite_close_request.add_argument("--output", required=True)
-    codex_private_sqlite_close_request.set_defaults(
-        handler=_codex_private_sqlite_close_request
-    )
+    _retire_sqlite_producer_handler(codex_private_sqlite_close_request)
 
-    codex_private_sqlite_session_reclose = commands.add_parser(
-        "codex-private-sqlite-session-reclose",
-        help=(
-            "capture one fresh live session root against a private SQLite "
-            "writer-stop close request"
-        ),
-    )
+    codex_private_sqlite_session_reclose = _retired_sqlite_producer_parser()
     codex_private_sqlite_session_reclose.add_argument(
         "--close-request",
         required=True,
@@ -2603,17 +3208,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="assert that every writer to this live session root is stopped",
     )
     codex_private_sqlite_session_reclose.add_argument("--output", required=True)
-    codex_private_sqlite_session_reclose.set_defaults(
-        handler=_codex_private_sqlite_session_reclose
-    )
+    _retire_sqlite_producer_handler(codex_private_sqlite_session_reclose)
 
-    codex_private_sqlite_private_reclose = commands.add_parser(
-        "codex-private-sqlite-private-reclose",
-        help=(
-            "capture one fresh private Codex/SQLite bundle bound to the exact "
-            "writer-stop close request"
-        ),
-    )
+    codex_private_sqlite_private_reclose = _retired_sqlite_producer_parser()
     codex_private_sqlite_private_reclose.add_argument(
         "--close-request",
         required=True,
@@ -2664,17 +3261,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--accept-quiescence-attestation",
         required=True,
     )
-    codex_private_sqlite_private_reclose.set_defaults(
-        handler=_codex_private_sqlite_private_reclose
-    )
+    _retire_sqlite_producer_handler(codex_private_sqlite_private_reclose)
 
-    codex_private_sqlite_plan = commands.add_parser(
-        "codex-private-sqlite-compose-plan",
-        help=(
-            "compile a four-pass, session-bound SQLite classification request; "
-            "no composer, publisher, installer, or apply is exposed"
-        ),
-    )
+    codex_private_sqlite_plan = _retired_sqlite_producer_parser()
     codex_private_sqlite_plan.add_argument(
         "--compatibility-plan",
         required=True,
@@ -2729,15 +3318,9 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_sqlite_plan.add_argument("--session-destination-close-a")
     codex_private_sqlite_plan.add_argument("--session-destination-close-b")
     codex_private_sqlite_plan.add_argument("--output", required=True)
-    codex_private_sqlite_plan.set_defaults(handler=_codex_private_sqlite_compose_plan)
+    _retire_sqlite_producer_handler(codex_private_sqlite_plan)
 
-    codex_private_sqlite_action_plan = commands.add_parser(
-        "codex-private-sqlite-compose-action-plan",
-        help=(
-            "compile a closed descriptive offline SQLite action plan; no "
-            "composer, publisher, installer, or apply is exposed"
-        ),
-    )
+    codex_private_sqlite_action_plan = _retired_sqlite_producer_parser()
     codex_private_sqlite_action_plan.add_argument(
         "--opening-plan",
         required=True,
@@ -2866,8 +3449,49 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     codex_private_sqlite_action_plan.add_argument("--output", required=True)
-    codex_private_sqlite_action_plan.set_defaults(
-        handler=_codex_private_sqlite_compose_action_plan
+    _retire_sqlite_producer_handler(codex_private_sqlite_action_plan)
+
+    codex_private_sqlite_request = commands.add_parser(
+        "codex-private-sqlite-compose-request",
+        help=(
+            "compile a host-bound, non-actionable SQLite compose request; "
+            "no composer, reservation, publisher, installer, or apply is exposed"
+        ),
+    )
+    _add_sqlite_action_chain_cli_arguments(codex_private_sqlite_request)
+    codex_private_sqlite_request.add_argument(
+        "--workspace-parent",
+        required=True,
+    )
+    codex_private_sqlite_request.add_argument("--output", required=True)
+    codex_private_sqlite_request.set_defaults(
+        handler=_codex_private_sqlite_compose_request
+    )
+
+    codex_private_sqlite_capacity = commands.add_parser(
+        "codex-private-sqlite-capacity-observe",
+        help=(
+            "record one short-lived caller-available capacity observation; "
+            "no reservation, compose, publisher, installer, or apply is exposed"
+        ),
+    )
+    _add_sqlite_action_chain_cli_arguments(codex_private_sqlite_capacity)
+    codex_private_sqlite_capacity.add_argument("--request", required=True)
+    codex_private_sqlite_capacity.add_argument(
+        "--accept-request",
+        required=True,
+    )
+    codex_private_sqlite_capacity.add_argument(
+        "--workspace-parent",
+        required=True,
+    )
+    codex_private_sqlite_capacity.add_argument(
+        "--host-authority-id",
+        required=True,
+    )
+    codex_private_sqlite_capacity.add_argument("--output", required=True)
+    codex_private_sqlite_capacity.set_defaults(
+        handler=_codex_private_sqlite_capacity_observe
     )
 
     codex_private_install_plan = commands.add_parser(
