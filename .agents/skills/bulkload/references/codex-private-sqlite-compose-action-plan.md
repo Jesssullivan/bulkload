@@ -1,5 +1,10 @@
 # Codex private SQLite close and action plan v5
 
+> Historical exact producer contract. Active policy v7 retains v5 artifacts
+> only as validator-bound legacy evidence and registers no close, reclose, or
+> action-plan producer command. Production requires the exact reviewed v5
+> checkout.
+
 ## Contents
 
 1. [Status and non-authority](#status-and-non-authority)
@@ -298,15 +303,20 @@ against-input recomputation.
 1. **V5 close/action plan:** this reference; immutable producer authority.
 2. **V6 request/capacity observation:** protected absent output intent and a
    volatile preflight only; no composer command or reservation.
-3. **Internal offline composer:** stream into a complete sealed bundle and
-   independently verify it; no public command or readiness flip.
-4. **Production adapters and command enablement:** review every observed
+3. **V7 protocol and read-only oracle:** independently observe hand-built
+   bundle fixtures; no writer, final receipt, public command, or readiness
+   flip.
+4. **Internal offline composer:** stream into a complete pre-seal bundle; no
+   public command or independent-verification claim.
+5. **Independent final receipt integration:** run the separately reviewed
+   verifier against the complete original chain.
+6. **Production adapters and command enablement:** review every observed
    family/table adapter, then expose digest-accepted offline composition and
    set only `sqlite_compose=true`.
-5. **Publisher and recovery:** no-replace same-filesystem publication with
+7. **Publisher and recovery:** no-replace same-filesystem publication with
    crash recovery; keep activation separate.
-6. **Session execution and independent verification:** produce a bound session
+8. **Session execution and independent verification:** produce a bound session
    receipt before `sqlite_union_ready` may become true.
-7. **Attended provider acceptance and cutover:** picker, resume, dialog, new
+9. **Attended provider acceptance and cutover:** picker, resume, dialog, new
    thread, authentication, rollback, and an independently authorized live
    transition.

@@ -4,11 +4,30 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 py_library(
     name = "bulkload_lib",
-    srcs = glob([".agents/skills/bulkload/scripts/bulkload_lib/**/*.py"]),
+    srcs = [
+        ".agents/skills/bulkload/scripts/bulkload_lib/__init__.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/cli.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/executor.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/model.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/planner.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_apply.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_quiescence.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_runtime.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_action_plan.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_close.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_plan.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_protocol.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_request.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_verifier.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/private_state.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/scanner.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/sessions.py",
+    ],
     data = [
         ".agents/skills/bulkload/references/codex-private-state-policy.v4.json",
         ".agents/skills/bulkload/references/codex-private-state-policy.v5.json",
         ".agents/skills/bulkload/references/codex-private-state-policy.v6.json",
+        ".agents/skills/bulkload/references/codex-private-state-policy.v7.json",
         ".agents/skills/bulkload/scripts/bulkload.py",
     ],
     imports = [".agents/skills/bulkload/scripts"],
@@ -17,6 +36,10 @@ py_library(
 
 py_binary(
     name = "bulkload",
+    interpreter_args = [
+        "-I",
+        "-S",
+    ],
     legacy_create_init = 0,
     srcs = [".agents/skills/bulkload/scripts/bulkload.py"],
     deps = [":bulkload_lib"],
@@ -73,6 +96,9 @@ py_test(
     main = "tests/test_private_runtime.py",
     size = "small",
     srcs = ["tests/test_private_runtime.py"],
+    data = [
+        ".agents/skills/bulkload/references/codex-private-runtime-inventory.v6.json",
+    ],
     deps = [":bulkload_lib"],
 )
 
@@ -82,7 +108,10 @@ py_test(
     main = "tests/test_private_sqlite_plan.py",
     size = "large",
     srcs = ["tests/test_private_sqlite_plan.py"],
-    deps = [":bulkload_lib"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_legacy_test_fixtures",
+    ],
 )
 
 py_test(
@@ -91,7 +120,10 @@ py_test(
     main = "tests/test_private_sqlite_close.py",
     size = "medium",
     srcs = ["tests/test_private_sqlite_close.py"],
-    deps = [":bulkload_lib"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_legacy_test_fixtures",
+    ],
 )
 
 py_test(
@@ -100,7 +132,10 @@ py_test(
     main = "tests/test_private_sqlite_action_plan.py",
     size = "large",
     srcs = ["tests/test_private_sqlite_action_plan.py"],
-    deps = [":bulkload_lib"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_legacy_test_fixtures",
+    ],
 )
 
 py_test(
@@ -110,6 +145,67 @@ py_test(
     size = "small",
     srcs = ["tests/test_private_sqlite_expected_output.py"],
     deps = [":bulkload_lib"],
+)
+
+py_library(
+    name = "private_sqlite_legacy_test_fixtures",
+    testonly = True,
+    srcs = ["tests/private_sqlite_legacy_fixtures.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_library(
+    name = "private_sqlite_v7_test_fixtures",
+    testonly = True,
+    srcs = ["tests/private_sqlite_v7_fixtures.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_library(
+    name = "private_sqlite_public_oracle_test_fixtures",
+    testonly = True,
+    srcs = ["tests/private_sqlite_public_oracle_fixtures.py"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_legacy_test_fixtures",
+        ":private_sqlite_v7_test_fixtures",
+    ],
+)
+
+py_test(
+    name = "private_sqlite_protocol_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_protocol.py",
+    size = "small",
+    srcs = ["tests/test_private_sqlite_protocol.py"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_v7_test_fixtures",
+    ],
+)
+
+py_test(
+    name = "private_sqlite_verifier_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_verifier.py",
+    size = "large",
+    srcs = ["tests/test_private_sqlite_verifier.py"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_v7_test_fixtures",
+    ],
+)
+
+py_test(
+    name = "private_sqlite_public_oracle_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_public_oracle.py",
+    size = "large",
+    srcs = ["tests/test_private_sqlite_public_oracle.py"],
+    deps = [
+        ":bulkload_lib",
+        ":private_sqlite_public_oracle_test_fixtures",
+    ],
 )
 
 py_test(
@@ -149,7 +245,7 @@ py_test(
     name = "installer_test",
     legacy_create_init = 0,
     main = "tests/test_installer.py",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_installer.py"],
     data = [
         "scripts/install_lock.py",
@@ -196,6 +292,9 @@ test_suite(
         ":private_sqlite_close_tests",
         ":private_sqlite_expected_output_tests",
         ":private_sqlite_plan_tests",
+        ":private_sqlite_protocol_tests",
+        ":private_sqlite_public_oracle_tests",
+        ":private_sqlite_verifier_tests",
         ":private_state_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",

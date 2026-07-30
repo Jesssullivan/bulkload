@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from types import ModuleType
 import unittest
@@ -38,8 +38,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
         ):
             bootstrap._open_runtime_authority(BOOTSTRAP_PATH.parent)
 
-    def test_direct_launcher_isolates_stdlib_from_scripts_shadowing(self) -> None:
-        bootstrap = _load_bootstrap()
+    def test_direct_launcher_rejects_stdlib_shadowing_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             skill_root = Path(directory) / "bulkload"
             shutil.copytree(BOOTSTRAP_PATH.parents[1], skill_root)
@@ -47,20 +46,8 @@ class RuntimeBootstrapTest(unittest.TestCase):
             (skill_root / "scripts/hashlib.py").write_text(
                 f"print({sentinel!r})\nraise RuntimeError('shadow imported')\n"
             )
-            runtime_payloads = {
-                path.relative_to(skill_root).as_posix(): path.read_bytes()
-                for path in sorted((skill_root / "scripts").rglob("*.py"))
-            }
-            policy_path = skill_root / "references" / bootstrap.POLICY_NAME
-            policy = json.loads(policy_path.read_text())
-            policy["runtime_source_sha256"] = bootstrap._runtime_digest(
-                runtime_payloads
-            )
-            policy_path.write_bytes(bootstrap._canonical_bytes(policy) + b"\n")
-
             result = subprocess.run(
                 [
-                    sys.executable,
                     str(skill_root / "scripts/bulkload.py"),
                     "--help",
                 ],
@@ -68,9 +55,39 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(
+                "private-state policy source inventory differs",
+                result.stderr,
+            )
             self.assertNotIn(sentinel, result.stdout)
             self.assertNotIn(sentinel, result.stderr)
+
+    def test_direct_launcher_blocks_python_startup_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill_root = root / "bulkload"
+            hook_root = root / "hostile-python-path"
+            marker = root / "startup-hook-ran"
+            shutil.copytree(BOOTSTRAP_PATH.parents[1], skill_root)
+            hook_root.mkdir()
+            (hook_root / "sitecustomize.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({os.fspath(marker)!r}).write_text('executed')\n"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.fspath(hook_root)
+
+            result = subprocess.run(
+                [str(skill_root / "scripts/bulkload.py"), "--help"],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
 
     def test_symlink_launcher_promotes_one_pinned_real_closure(self) -> None:
         bootstrap = _load_bootstrap()
@@ -92,7 +109,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             launcher.symlink_to(skill_root / "scripts/bulkload.py")
 
             result = subprocess.run(
-                [sys.executable, str(launcher), "--help"],
+                [str(launcher), "--help"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -125,7 +142,6 @@ class RuntimeBootstrapTest(unittest.TestCase):
 
             result = subprocess.run(
                 [
-                    sys.executable,
                     str(runfiles / launcher_relative),
                     "--help",
                 ],
@@ -225,7 +241,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             policy_path.write_bytes(bootstrap._canonical_bytes(policy) + b"\n")
 
             result = subprocess.run(
-                [sys.executable, str(launcher), "--help"],
+                [str(launcher), "--help"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -307,7 +323,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 "policy_sha256": "0" * 64,
                 "runtime_source_sha256": "1" * 64,
                 "source_digests": {
-                    path: "2" * 64 for path in bootstrap.CORE_SOURCE_KEYS
+                    path: "2" * 64 for path in bootstrap.RUNTIME_SOURCE_KEYS
                 },
             }
 

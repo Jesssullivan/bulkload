@@ -1,11 +1,11 @@
 # Bulkload v1 design
 
-Status: repository v1 complete; Codex session-union v3 prefix-proof extension,
-private-state policy v6 narrow attended auth install and request-only consumer
-of the exact repaired v5 SQLite action authority in review, 2026-07-29. The v6
-slice adds a protected output/workspace request and a separate volatile
-caller-capacity observation. SQLite composition, reservation, publication,
-installation, and combined private apply remain fail-held.
+Status: repository v1 complete; Codex session-union v3 prefix-proof extension;
+private-state policy v7 narrow attended auth install, exact-v6 compatibility
+freeze, and internal read-only SQLite verifier oracle in review, 2026-07-29.
+The oracle observes fixtures built separately without invoking the oracle and
+cannot write bundles or mint final receipts. SQLite composition, reservation, publication,
+installation, final verification, and combined private apply remain fail-held.
 
 ## 1. Decision
 
@@ -77,7 +77,7 @@ not byte equality over an arbitrary directory.
 | Working bytes | source worktree plus manifest | hash, additive copy, verify | modified tracked files, safe untracked files |
 | Agent continuity | append-only transcript authority | allowlisted copy, validate, resume proof | Codex JSONL, Claude project transcripts |
 | Generated state | destination runtime | regenerate | caches, `.direnv`, platform binaries |
-| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; no composer/installer | Codex state, log, goal, and memory databases |
+| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; internal fixture-only read oracle; no composer/installer | Codex state, log, goal, and memory databases |
 | Authentication | provider/operator | opt-in private atomic replace with rollback, or attended re-authentication | Codex `auth.json` |
 
 Every plane has a separate contract. Generated caches are regenerated.
@@ -89,11 +89,11 @@ generic file adapter, but they may enter an explicit typed migration dossier.
 ### 4.1 Read-only first
 
 Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
-`apply` is separate and requires the exact `plan_sha256`. Private policy v6
-also exposes a separately attended, digest-accepted auth-only apply and
-consumes the exact repaired v5 four-pass SQLite close/action chain into a
-non-actionable request plus capacity observation. Neither can compose, reserve,
-publish, install, or activate SQLite. The CLI never invokes a terminal
+`apply` is separate and requires the exact `plan_sha256`. Private policy v7
+also exposes a separately attended, digest-accepted auth-only apply, freezes
+the exact v6 request/capacity producer closure as validator-only legacy
+authority, and adds a CLI-inaccessible read-only SQLite oracle. None can
+compose, reserve, publish, install, finally verify, or activate SQLite. The CLI never invokes a terminal
 multiplexer, Home Manager, a deploy, or a product runtime.
 
 ### 4.2 Repeated-catalog barrier
@@ -333,9 +333,11 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
   The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
   sidecar exists. It never copies a live database family as ordinary files.
-  Policy v6 does not compose or install SQLite; during auth install it
+  Policy v7 does not compose or install SQLite; during auth install it
   independently captures and preserves every destination family exactly with
-  zero mutations. Its request/capacity surfaces do not touch live roots.
+  zero mutations. Its frozen v6 validators and internal read-only oracle do
+  not expose SQLite request, capacity, composition, or final-verification
+  commands and do not touch live roots.
 - Prefer an auth-only source capture and an auth-plus-SQLite destination
   capture for the narrow auth installer. A full source capture plus a full
   destination capture is also accepted, but source SQLite is never consumed.
@@ -395,22 +397,26 @@ owner-private staging or fail-held final artifact; it is not authority and
 requires attended quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v6.json`.
+`.agents/skills/bulkload/references/codex-private-state-policy.v7.json`.
 It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
-but makes eight separate readiness claims:
+but makes ten separate readiness claims:
 
 - `auth_install=true`: an attended, journaled atomic replacement of an
   existing destination `auth.json` is implemented, with a complete rollback
   copy, offline verification, manual rollback, and crash recovery;
-- `sqlite_compose_plan=false`: v6 retains the v4 validator but exposes no
+- `sqlite_compose_plan=false`: v7 retains the v4 validator but exposes no
   current opening producer command;
-- `sqlite_compose_action_plan=false`: v6 retains exact v5 close/action
+- `sqlite_compose_action_plan=false`: v7 retains exact v5 close/action
   validators but exposes no current close, reclose, or action-plan producer;
-- `sqlite_compose_request=true`: a v6 request binds the exact v5 producer,
-  current v6 consumer runtime, protected absent output namespace, and checked
-  capacity requirement without granting write authority;
-- `sqlite_capacity_observation=true`: a separate 300-second artifact records
-  caller-available bytes/inodes without reservation or future guarantee;
+- `sqlite_compose_request=false`: exact v6 request artifacts remain
+  validator-only legacy evidence and their producer command is retired;
+- `sqlite_capacity_observation=false`: exact v6 observations remain
+  validator-only legacy evidence and their producer command is retired;
+- `sqlite_verifier_oracle_internal_only=true`: an internal, CLI-inaccessible read-only
+  oracle observes bundle fixtures built separately without invoking it and
+  emits only a diagnostic report with every final/public claim false;
+- `sqlite_independent_verification=false`: the later final verifier receipt
+  and complete original-input recomputation are not implemented;
 - `sqlite_compose=false`: no source SQLite family is merged or installed; and
 - `sqlite_publish=false`: no composed family or versioned directory can be
   published; and
@@ -445,8 +451,9 @@ count, byte, and time evidence. It never copies source sidecars.
 reviewed v4/v5 historical checkouts only,
 `codex-private-sqlite-compose-plan` consumed source A/B and destination A/B
 private bundles plus the recomputed session-union closure, exact adapter
-registry, and exact path map. The active v6 CLI retires that producer command
-and retains only its immutable output validator. The historical output embeds
+registry, and exact path map. The active v7 CLI retires that producer command,
+the v5 close/action producers, and the v6 request/capacity producers while
+retaining their immutable validators. The historical output embeds
 and revalidates the complete registry and path-map bodies while binding their
 digests to the accepted inputs. It is an immutable opening request and always
 records that fresh post-plan close captures remain required. It does not claim
@@ -467,8 +474,10 @@ blockers. Source/destination migration counts and latest versions are
 cross-bound to the opening projections. Safely named unknown families are also
 retained as fail-held evidence. A single aggregate ledger covers all
 source/destination rows and typed bytes across every table and family, while
-SQLite progress handlers enforce the shared deadline. The CLI recomputes the
-complete plan against pinned inputs before and after create-only publication.
+SQLite progress handlers provide cooperative checks against the shared
+deadline. The historical producer
+CLI recomputed the complete plan against pinned inputs before and after
+create-only publication.
 Its full contract is in the
 [SQLite opening-plan reference](../.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md).
 `codex-private-install-plan` consumes its exact accepted digest and compiles
@@ -483,14 +492,32 @@ path. Every receipt remains an offline byte-and-custody claim with
 `provider_runtime_acceptance_verified=false`; only a fresh attended provider
 turn can establish working authentication.
 
-The command entrypoint opens and pins the canonical policy and complete Python
-runtime source inventory before importing the command implementation. The
-runtime authority record—policy digest, closure digest, and exact core source
-digests—is carried by the compatibility and install plans and revalidated
+The supported direct and Bazel launchers enter Python with `-I -S` before
+Python startup hooks. The command entrypoint then opens and pins the canonical
+policy and complete Bulkload application-source inventory before importing the
+command implementation. This is not a claim that Bulkload binds the Python
+interpreter or standard-library closure. The application authority
+record—policy digest, closure digest, and exact full source
+inventory with per-file digests—is carried by the compatibility and install plans and revalidated
 through publication and mutation boundaries. A changed or replaced runtime
 therefore fails closed rather than executing against a previously accepted
 plan. The validator also requires the exact command/handler topology and
 forbidden SQLite/combined command set.
+
+V7's first SQLite-composition slice is deliberately verifier-first. The
+protocol module defines strict manifest, writer-receipt, future final-receipt,
+and diagnostic-oracle schemas, but the only executable addition is an internal
+read-only oracle in a source file distinct from every historical producer.
+It opens a supplied owner-private fixture bundle without mutation, binds the
+active pinned verifier source, separately scans schema, migrations, foreign
+keys, and type-tagged rows, and compares those observations with the supplied v5/v6 evidence and
+protocol artifacts. The oracle does not import a writer or
+final verifier implementation, has no registered CLI command, and cannot
+upgrade `failures=[]` into sealed-bundle, complete-input-recomputation,
+independent-final-verification, provider-acceptance, or cutover authority. The
+public wrapper creates its diagnostic observation UUID and timestamp itself;
+neither is caller-supplied. The writer, final receipt integration, publisher,
+and any command enablement are separate reviewed slices.
 
 The operator sequence, exact arguments, evidence custody, and recovery rules
 are in the
@@ -542,7 +569,7 @@ sensitive-path blocks re-enforced during plan validation, no deletion,
 pre-copy source rehash, external backups, atomic replacement, durable
 journal/directory entries, fresh verification, Codex evidence inputs and output
 parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Private-state policy v6 retains
+adapter, and explicit incomplete/error states. Private-state policy v7 retains
 pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
 Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
 preservation, an external auth backup, a durable state-machine journal, and
@@ -554,18 +581,28 @@ preflight, complete embedded registry/path-map bodies, a canonical raw-schema
 record catalog, typed schema omissions, registry-bound producer blockers,
 exact stable-projection budget/count/latest-migration bindings, bidirectional
 rowset/digest claims, plan-wide row/byte charging with structural lower bounds,
-enforceable SQLite deadlines, exact edge/collation/table-set blocker
+cooperative SQLite progress deadlines, exact edge/collation/table-set blocker
 derivation, explicit column-collation and unknown-family blockers, and
 type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
 captures to one writer-stop epoch, recomputes closed classifications, and
 describes deterministic output and a create-only graph. The action-plan
 consumer reopens the complete original v4 input set before compilation and
-after publication instead of trusting a persisted revalidation flag. V6
-separately pins an exact `0700` workspace, action-derived absent output and
-staging namespace, protected-root lineages, checked capacity requirement, and
-caller-available `fstatvfs` observation. It reserves nothing and binds no
-composer runtime. Compose, publish, install, and apply remain false. Neither the
-operator attestation nor the lock becomes provider-writer proof.
+after publication instead of trusting a persisted revalidation flag. Frozen
+v6 evidence separately pins an exact `0700` workspace, action-derived absent
+output and staging namespace, protected-root lineages, checked capacity
+requirement, and caller-available `fstatvfs` observation. V7 registers neither
+legacy producer command. Its separately implemented read-only oracle adds
+strict artifact custody, manifest/receipt binding, SQLite engine consistency,
+schema/migration/edge/semantic comparisons, exact active verifier-source
+binding, bounded in-process identity ordering without SQLite-side sorting or
+temporary files, including database-encoding-compatible TEXT keys, and an
+all-false final/public claim surface. Its progress
+handler and monotonic checks are cooperative; they do not preempt blocked
+filesystem I/O, and callers must add an external process timeout before using
+the oracle against an unresponsive or adversarial volume. It reserves nothing,
+binds no writer runtime, and publishes no final receipt. Compose, publish,
+install, final verification, and apply remain false. Neither the operator
+attestation nor the lock becomes provider-writer proof.
 Cross-filesystem atomicity, ACL/xattr
 fidelity, sparse files, hardlink identity, special files, case-insensitive
 collisions, submodule worktrees, live concurrent writers, and provider runtime

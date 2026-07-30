@@ -1,8 +1,8 @@
 """Immutable cross-plane close evidence for private Codex SQLite planning.
 
-This module is intentionally limited to a close request and fresh Codex
-session re-close evidence.  It has no composer, publisher, installer, apply,
-activation, or provider-runtime entrypoint.
+This module validates persisted close requests and session re-close evidence
+against exact opening inputs and fresh live captures. It has no composer,
+publisher, installer, apply, activation, or provider-runtime entrypoint.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from .model import (
     object_digest,
     require_digest,
     sha256_bytes,
-    utc_now,
 )
 from . import private_runtime
 from .private_sqlite_plan import (
@@ -270,7 +269,8 @@ def _writer_stop_epoch(
     }
 
 
-def compile_codex_private_sqlite_close_request(
+def validate_codex_private_sqlite_close_request_against_inputs(
+    request: dict[str, Any],
     opening_plan: dict[str, Any],
     session_union_plan: dict[str, Any],
     session_source_a: dict[str, Any],
@@ -279,11 +279,6 @@ def compile_codex_private_sqlite_close_request(
     session_destination_b: dict[str, Any],
     runtime_authority: dict[str, Any],
     *,
-    accept_opening_plan: str,
-    accept_session_union_plan: str,
-    writer_stop_epoch_id: str,
-    writer_stop_epoch_at: str,
-    acknowledge_provider_writers_stopped: bool,
     opening_compatibility_plan: dict[str, Any],
     opening_source_a_directory: Path,
     opening_source_b_directory: Path,
@@ -301,8 +296,12 @@ def compile_codex_private_sqlite_close_request(
     opening_session_source_close_b: dict[str, Any] | None = None,
     opening_session_destination_close_a: dict[str, Any] | None = None,
     opening_session_destination_close_b: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Bind the immutable v4 opening and both live-plane opening catalogs."""
+) -> None:
+    """Recompute every v5 close claim from the exact opening inputs."""
+    validate_codex_private_sqlite_close_request(request)
+    writer_stop_epoch_id = request["writer_stop_epoch"]["epoch_id"]
+    writer_stop_epoch_at = request["writer_stop_epoch"]["stopped_at"]
+    created_at = request["created_at"]
     private_runtime.validate_private_runtime_authority(runtime_authority)
     if (
         runtime_authority["policy_schema"]
@@ -313,8 +312,6 @@ def compile_codex_private_sqlite_close_request(
             "producer authority"
         )
     validate_codex_private_sqlite_compose_plan(opening_plan)
-    if accept_opening_plan != opening_plan["plan_sha256"]:
-        raise BulkloadError("accepted private SQLite opening-plan digest differs")
     validate_codex_private_sqlite_compose_plan_against_inputs(
         opening_plan,
         opening_compatibility_plan,
@@ -341,8 +338,6 @@ def compile_codex_private_sqlite_close_request(
         session_destination_close_b=opening_session_destination_close_b,
     )
     validate_codex_session_union_plan(session_union_plan)
-    if accept_session_union_plan != session_union_plan["plan_sha256"]:
-        raise BulkloadError("accepted Codex session union-plan digest differs")
     expected_session_binding = {
         "plan_sha256": session_union_plan["plan_sha256"],
         "source": session_union_plan["source"],
@@ -376,14 +371,13 @@ def compile_codex_private_sqlite_close_request(
             session_plan_custody=session_union_plan["destination"],
         ),
     }
-    created_at = utc_now()
     epoch = _writer_stop_epoch(
         writer_stop_epoch_id,
         writer_stop_epoch_at,
-        operator_acknowledged_writers_stopped=(acknowledge_provider_writers_stopped),
+        operator_acknowledged_writers_stopped=True,
         created_at=created_at,
     )
-    request: dict[str, Any] = {
+    expected_request: dict[str, Any] = {
         "schema": PRIVATE_SQLITE_CLOSE_REQUEST_SCHEMA,
         "created_at": created_at,
         "runtime_authority": deepcopy(runtime_authority),
@@ -402,13 +396,13 @@ def compile_codex_private_sqlite_close_request(
             "passes_per_role": 2,
         },
     }
-    request["close_request_sha256"] = object_digest(
-        request,
+    expected_request["close_request_sha256"] = object_digest(
+        expected_request,
         "close_request_sha256",
     )
-    validate_codex_private_sqlite_close_request(request)
+    validate_codex_private_sqlite_close_request(expected_request)
     validate_codex_private_sqlite_close_request_against_openings(
-        request,
+        expected_request,
         opening_plan,
         session_union_plan,
         session_source_a,
@@ -417,7 +411,10 @@ def compile_codex_private_sqlite_close_request(
         session_destination_b,
         runtime_authority,
     )
-    return request
+    if request != expected_request:
+        raise BulkloadError(
+            "private SQLite close request differs from its exact inputs"
+        )
 
 
 def _validate_private_opening_binding(
@@ -803,72 +800,6 @@ def validate_codex_private_sqlite_close_request_against_openings(
         )
 
 
-def validate_codex_private_sqlite_close_request_against_inputs(
-    request: dict[str, Any],
-    opening_plan: dict[str, Any],
-    session_union_plan: dict[str, Any],
-    session_source_a: dict[str, Any],
-    session_source_b: dict[str, Any],
-    session_destination_a: dict[str, Any],
-    session_destination_b: dict[str, Any],
-    runtime_authority: dict[str, Any],
-    *,
-    opening_compatibility_plan: dict[str, Any],
-    opening_source_a_directory: Path,
-    opening_source_b_directory: Path,
-    opening_destination_a_directory: Path,
-    opening_destination_b_directory: Path,
-    opening_adapter_registry: dict[str, Any],
-    opening_path_map: dict[str, Any],
-    opening_session_prefix_request: dict[str, Any] | None = None,
-    opening_session_source_prefix_a: dict[str, Any] | None = None,
-    opening_session_source_prefix_b: dict[str, Any] | None = None,
-    opening_session_destination_prefix_a: dict[str, Any] | None = None,
-    opening_session_destination_prefix_b: dict[str, Any] | None = None,
-    opening_session_close_request: dict[str, Any] | None = None,
-    opening_session_source_close_a: dict[str, Any] | None = None,
-    opening_session_source_close_b: dict[str, Any] | None = None,
-    opening_session_destination_close_a: dict[str, Any] | None = None,
-    opening_session_destination_close_b: dict[str, Any] | None = None,
-) -> None:
-    """Recompute every v4 input, then bind the close to that exact opening."""
-    validate_codex_private_sqlite_compose_plan_against_inputs(
-        opening_plan,
-        opening_compatibility_plan,
-        opening_source_a_directory,
-        opening_source_b_directory,
-        opening_destination_a_directory,
-        opening_destination_b_directory,
-        adapter_registry=opening_adapter_registry,
-        path_map=opening_path_map,
-        session_union_plan=session_union_plan,
-        session_source_a=session_source_a,
-        session_source_b=session_source_b,
-        session_destination_a=session_destination_a,
-        session_destination_b=session_destination_b,
-        session_prefix_request=opening_session_prefix_request,
-        session_source_prefix_a=opening_session_source_prefix_a,
-        session_source_prefix_b=opening_session_source_prefix_b,
-        session_destination_prefix_a=opening_session_destination_prefix_a,
-        session_destination_prefix_b=opening_session_destination_prefix_b,
-        session_close_request=opening_session_close_request,
-        session_source_close_a=opening_session_source_close_a,
-        session_source_close_b=opening_session_source_close_b,
-        session_destination_close_a=opening_session_destination_close_a,
-        session_destination_close_b=opening_session_destination_close_b,
-    )
-    validate_codex_private_sqlite_close_request_against_openings(
-        request,
-        opening_plan,
-        session_union_plan,
-        session_source_a,
-        session_source_b,
-        session_destination_a,
-        session_destination_b,
-        runtime_authority,
-    )
-
-
 def validate_codex_private_sqlite_private_reclose_capture(
     capture: dict[str, Any],
     close_request: dict[str, Any],
@@ -1050,23 +981,20 @@ def _snapshot_matches_session_opening(
         )
 
 
-def capture_codex_private_sqlite_session_reclose(
+def validate_codex_private_sqlite_session_reclose_against_live(
+    capture: dict[str, Any],
     root: Path,
+    close_request: dict[str, Any],
     *,
     role: str,
-    close_request: dict[str, Any],
-    accept_close_request: str,
-    writer_stop_epoch_id: str,
     acknowledge_writers_quiesced: bool,
-) -> dict[str, Any]:
-    """Capture a live session root directly; no snapshot wrapper input exists."""
-    validate_codex_private_sqlite_close_request(close_request)
-    if accept_close_request != close_request["close_request_sha256"]:
-        raise BulkloadError("accepted private SQLite close-request digest differs")
-    if role not in {"source", "destination"}:
-        raise BulkloadError("private SQLite session re-close role is invalid")
-    if writer_stop_epoch_id != close_request["writer_stop_epoch"]["epoch_id"]:
-        raise BulkloadError("private SQLite writer-stop epoch acceptance differs")
+) -> None:
+    """Recapture after publication and require the same stable live catalog."""
+    validate_codex_private_sqlite_session_reclose_capture_against_request(
+        capture,
+        close_request,
+        role=role,
+    )
     opening = close_request["session_opening"][role]["stable_projection"]
     root = root.expanduser()
     root_text = os.fspath(root)
@@ -1098,55 +1026,7 @@ def capture_codex_private_sqlite_session_reclose(
         max_output_bytes=budgets["max_output_bytes"],
     )
     _snapshot_matches_session_opening(snapshot, close_request, role=role)
-    value: dict[str, Any] = {
-        "schema": PRIVATE_SQLITE_SESSION_RECLOSE_SCHEMA,
-        "created_at": utc_now(),
-        "close_request_sha256": close_request["close_request_sha256"],
-        "writer_stop_epoch": deepcopy(close_request["writer_stop_epoch"]),
-        "role": role,
-        "opening_stable_projection_sha256": close_request["session_opening"][role][
-            "stable_projection_sha256"
-        ],
-        "snapshot": snapshot,
-    }
-    value["reclose_capture_sha256"] = object_digest(
-        value,
-        "reclose_capture_sha256",
-    )
-    validate_codex_private_sqlite_session_reclose_capture(value)
-    validate_codex_private_sqlite_session_reclose_capture_against_request(
-        value,
-        close_request,
-        role=role,
-    )
-    return value
-
-
-def validate_codex_private_sqlite_session_reclose_against_live(
-    capture: dict[str, Any],
-    root: Path,
-    close_request: dict[str, Any],
-    *,
-    role: str,
-    accept_close_request: str,
-    writer_stop_epoch_id: str,
-    acknowledge_writers_quiesced: bool,
-) -> None:
-    """Recapture after publication and require the same stable live catalog."""
-    validate_codex_private_sqlite_session_reclose_capture_against_request(
-        capture,
-        close_request,
-        role=role,
-    )
-    observed = capture_codex_private_sqlite_session_reclose(
-        root,
-        role=role,
-        close_request=close_request,
-        accept_close_request=accept_close_request,
-        writer_stop_epoch_id=writer_stop_epoch_id,
-        acknowledge_writers_quiesced=acknowledge_writers_quiesced,
-    )
-    if _session_stable_projection(observed["snapshot"]) != _session_stable_projection(
+    if _session_stable_projection(snapshot) != _session_stable_projection(
         capture["snapshot"]
     ):
         raise BulkloadError(

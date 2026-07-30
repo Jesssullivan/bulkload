@@ -15,6 +15,27 @@ from bulkload_lib.model import BulkloadError, canonical_bytes
 from bulkload_lib import private_runtime
 
 
+def _find_workspace() -> Path:
+    candidates = [Path.cwd(), Path(__file__)]
+    runfiles = os.environ.get("RUNFILES_DIR")
+    if runfiles:
+        candidates.extend(
+            [
+                Path(runfiles) / "_main",
+                Path(runfiles) / "bulkload",
+            ]
+        )
+    for candidate in candidates:
+        for parent in [candidate, *candidate.parents]:
+            if (
+                parent
+                / ".agents/skills/bulkload/references"
+                / "codex-private-runtime-inventory.v6.json"
+            ).is_file():
+                return parent
+    raise AssertionError("cannot locate immutable v6 runtime inventory")
+
+
 def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
     scripts = root / "scripts"
     library = scripts / "bulkload_lib"
@@ -25,8 +46,14 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
         "scripts/bulkload.py": b"print('fixture')\n",
         "scripts/bulkload_lib/__init__.py": b'"""fixture"""\n',
         "scripts/bulkload_lib/cli.py": b"def main(): return 0\n",
+        "scripts/bulkload_lib/executor.py": b"def execute(): return None\n",
+        "scripts/bulkload_lib/model.py": b"VALUE = 1\n",
+        "scripts/bulkload_lib/planner.py": b"def plan(): return None\n",
         "scripts/bulkload_lib/private_apply.py": b"def apply(): return None\n",
         "scripts/bulkload_lib/private_quiescence.py": (b"def attest(): return None\n"),
+        "scripts/bulkload_lib/private_runtime.py": (
+            b"def validate_runtime(): return None\n"
+        ),
         "scripts/bulkload_lib/private_sqlite_action_plan.py": (
             b"def compile_action_plan(): return None\n"
         ),
@@ -34,12 +61,18 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             b"def compile_plan(): return None\n"
         ),
+        "scripts/bulkload_lib/private_sqlite_protocol.py": (
+            b"def validate_protocol(): return None\n"
+        ),
         "scripts/bulkload_lib/private_sqlite_request.py": (
             b"def compile_request(): return None\n"
         ),
+        "scripts/bulkload_lib/private_sqlite_verifier.py": (
+            b"def observe_bundle(): return None\n"
+        ),
         "scripts/bulkload_lib/private_state.py": b"def capture(): return None\n",
+        "scripts/bulkload_lib/scanner.py": b"def scan(): return None\n",
         "scripts/bulkload_lib/sessions.py": b"def sessions(): return None\n",
-        "scripts/bulkload_lib/other.py": b"VALUE = 1\n",
     }
     for relative, payload in payloads.items():
         path = root / relative
@@ -57,9 +90,11 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
             "combined": False,
             "sqlite_compose": False,
             "sqlite_compose_action_plan": False,
-            "sqlite_compose_request": True,
-            "sqlite_capacity_observation": True,
+            "sqlite_compose_request": False,
+            "sqlite_capacity_observation": False,
             "sqlite_compose_plan": False,
+            "sqlite_verifier_oracle_internal_only": True,
+            "sqlite_independent_verification": False,
             "sqlite_publish": False,
         },
         "source_digests": source_digests,
@@ -187,6 +222,92 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
         with self.assertRaisesRegex(BulkloadError, "exact repaired v5 closure"):
             private_runtime.validate_private_runtime_authority(changed)
 
+    def test_only_the_exact_legacy_v6_authority_is_accepted(self) -> None:
+        legacy = json.loads(
+            json.dumps(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6)
+        )
+        self.assertEqual(
+            private_runtime.validate_private_runtime_authority(legacy),
+            legacy,
+        )
+        for field in ("policy_sha256", "runtime_source_sha256"):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(legacy))
+                changed[field] = "0" * 64
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "exact v6 closure",
+                ):
+                    private_runtime.validate_private_runtime_authority(changed)
+        changed = json.loads(json.dumps(legacy))
+        changed["source_digests"]["scripts/bulkload_lib/cli.py"] = "0" * 64
+        with self.assertRaisesRegex(BulkloadError, "exact v6 closure"):
+            private_runtime.validate_private_runtime_authority(changed)
+
+    def test_checked_in_v6_policy_and_full_runtime_inventory_are_immutable(
+        self,
+    ) -> None:
+        root = _find_workspace()
+        references = root / ".agents/skills/bulkload/references"
+        policy_payload = (
+            references / "codex-private-state-policy.v6.json"
+        ).read_bytes()
+        inventory_payload = (
+            references / "codex-private-runtime-inventory.v6.json"
+        ).read_bytes()
+        policy = json.loads(policy_payload)
+        inventory = json.loads(inventory_payload)
+        authority = private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+
+        self.assertEqual(policy_payload, canonical_bytes(policy) + b"\n")
+        self.assertEqual(inventory_payload, canonical_bytes(inventory) + b"\n")
+        self.assertEqual(
+            set(inventory),
+            {
+                "schema",
+                "policy_schema",
+                "policy_sha256",
+                "runtime_source_sha256",
+                "source_commit",
+                "source_digests",
+            },
+        )
+        self.assertEqual(
+            inventory["schema"],
+            "dev.tinyland.bulkload.codex-private-runtime-inventory.v6",
+        )
+        self.assertEqual(
+            inventory["source_commit"],
+            "96db5c46eda9774c3bf6983eb04281cb249675fb",
+        )
+        self.assertEqual(inventory["policy_schema"], authority["policy_schema"])
+        self.assertEqual(inventory["policy_sha256"], authority["policy_sha256"])
+        self.assertEqual(
+            inventory["runtime_source_sha256"],
+            authority["runtime_source_sha256"],
+        )
+        self.assertEqual(
+            hashlib.sha256(policy_payload).hexdigest(),
+            authority["policy_sha256"],
+        )
+        self.assertEqual(policy["schema"], authority["policy_schema"])
+        self.assertEqual(
+            policy["runtime_source_sha256"],
+            authority["runtime_source_sha256"],
+        )
+        self.assertEqual(policy["source_digests"], authority["source_digests"])
+
+        full_sources = inventory["source_digests"]
+        self.assertEqual(len(full_sources), 16)
+        self.assertEqual(
+            {path: full_sources[path] for path in authority["source_digests"]},
+            authority["source_digests"],
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical_bytes(full_sources)).hexdigest(),
+            authority["runtime_source_sha256"],
+        )
+
     def test_path_replacement_and_inventory_drift_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,6 +330,35 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
                 finally:
                     pinned.close()
 
+    def test_extra_writer_source_is_rejected_even_after_aggregate_repin(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payloads = _write_runtime_fixture(root)
+            extra_relative = "scripts/bulkload_lib/private_sqlite_composer.py"
+            extra_payload = b"def compose(): return None\n"
+            extra_path = root / extra_relative
+            extra_path.write_bytes(extra_payload)
+            payloads[extra_relative] = extra_payload
+            policy_path = (
+                root / "references" / private_runtime.PRIVATE_STATE_POLICY_NAME
+            )
+            policy = json.loads(policy_path.read_text())
+            policy["runtime_source_sha256"] = private_runtime._runtime_digest(payloads)
+            policy_path.write_bytes(canonical_bytes(policy) + b"\n")
+            with mock.patch.object(
+                private_runtime,
+                "_skill_root",
+                return_value=root,
+            ):
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "source inventory differs",
+                ):
+                    private_runtime._open_disk_private_runtime_authority_for_tests()
+
+            extra_path.unlink()
             _write_runtime_fixture(root)
             with mock.patch.object(
                 private_runtime,
@@ -276,10 +426,7 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
                         changed
                     )
 
-                for relative in (
-                    "scripts/bulkload_lib/private_apply.py",
-                    "scripts/bulkload_lib/other.py",
-                ):
+                for relative in sorted(private_runtime.PRIVATE_RUNTIME_SOURCE_KEYS):
                     with self.subTest(relative=relative):
                         path = root / relative
                         original = path.read_bytes()

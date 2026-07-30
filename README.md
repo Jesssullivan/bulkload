@@ -15,15 +15,16 @@ required proof digest, and only then accepts fresh source and destination A/B
 captures wrapped against that request.
 
 Codex auth and SQLite families are explicitly copy-eligible, opt-in state
-classes. Policy v6 retains the narrow attended `auth.json` install and consumes
-the exact repaired v5 four-pass SQLite close/action authority. It may emit a
-non-actionable compose request and a separate short-lived observation of
-caller-available workspace capacity.
+classes. Policy v7 retains the narrow attended `auth.json` install, freezes
+the exact v6 compose-request and capacity artifacts as validator-only legacy
+evidence, and adds a CLI-inaccessible read-only oracle for independently
+hand-built SQLite bundle fixtures.
 The preferred inputs are an auth-only source capture and an auth-plus-SQLite
 destination capture. A full source capture is accepted, but source SQLite is
 never consumed; destination SQLite is preserved exactly with zero mutation.
 The workflow provides digest-accepted planning, atomic auth replacement,
 journaling, offline verification, rollback, and interrupted-operation recovery.
+The oracle cannot write a bundle or mint final verification authority.
 SQLite composition, capacity reservation, publication, installation, combined
 apply, and any claim that the session union was executed remain false and
 fail-held. Any live WAL, SHM, or rollback-journal sidecar blocks immutable
@@ -39,8 +40,10 @@ acceptance proof. See the
 The plan-only database contracts are in the
 [SQLite opening-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md)
 and [v5 close/action-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-action-plan.md).
-The v6 request and volatile capacity contract is in the
+The frozen v6 request and volatile capacity contract is in the
 [compose-request reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-request.md).
+The staged writer, receipt, and first v7 read-only-oracle boundary is in the
+[offline composition contract](.agents/skills/bulkload/references/codex-private-sqlite-offline-composer.md).
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:
@@ -58,7 +61,8 @@ Claude receives a symlink at `~/.claude/skills/bulkload` to that same copy.
 The installer validates the canonical, private-backup, and Claude destinations
 before mutation, refuses symlinked directory authority, and preserves a forced
 replacement under `~/.agents/backups/bulkload` before installing it.
-Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
+Runtime support requires Python 3.11 or newer linked with SQLite 3.37.0 or
+newer, Git, and a Unix-like host with file locking, `pread`, and dirfd support.
 Codex evidence file publication requires macOS or Linux for an OS-backed atomic
 no-replace rename.
 

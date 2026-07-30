@@ -1,8 +1,8 @@
 """Closed, source-only action planning for private Codex SQLite composition.
 
-This module emits only a descriptive input to a later offline composer.  It
-does not create an output database, publish a bundle, install provider state,
-or expose an apply surface.
+This module validates a persisted descriptive input to a later offline
+composer. It does not create an output database, publish a bundle, install
+provider state, or expose an apply surface.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from .model import (
     canonical_bytes,
     object_digest,
     sha256_bytes,
-    utc_now,
 )
 from .private_sqlite_close import (
     PRIVATE_SQLITE_CLOSE_REQUEST_SCHEMA,
@@ -55,6 +54,7 @@ PRIVATE_SQLITE_ACTION_PLAN_IMPLEMENTATION = (
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_HEX_128 = re.compile(r"[0-9a-f]{32}")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ROLES = ("source", "destination")
 _V4_TERMINAL_BLOCKERS = {
@@ -109,6 +109,18 @@ def _require_uuid(value: Any, label: str) -> str:
 
 def _uuid_hex(value: str, label: str) -> str:
     return uuid.UUID(_require_uuid(value, label)).hex
+
+
+def _session_capture_id_hex(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _HEX_128.fullmatch(value) is None:
+        raise BulkloadError(f"{label} must be lowercase 128-bit hex")
+    return value
+
+
+def _cross_plane_identity_hex(value: Any, label: str) -> str:
+    if isinstance(value, str) and _HEX_128.fullmatch(value) is not None:
+        return value
+    return _uuid_hex(value, label)
 
 
 def _require_identifier(value: Any, label: str) -> str:
@@ -267,7 +279,10 @@ def _validate_close_identity_set(
     )
     identities.append(close_request["writer_stop_epoch"]["epoch_id"])
     normalized = [
-        _uuid_hex(item, "private SQLite closing evidence identity")
+        _cross_plane_identity_hex(
+            item,
+            "private SQLite closing evidence identity",
+        )
         for item in identities
     ]
     if len(normalized) != 13 or len(set(normalized)) != 13:
@@ -635,7 +650,8 @@ def _operation_graph(
     }
 
 
-def compile_codex_private_sqlite_action_plan(
+def validate_codex_private_sqlite_action_plan_against_close(
+    action_plan: dict[str, Any],
     opening_plan: dict[str, Any],
     close_request: dict[str, Any],
     source_close_a_directory: Path,
@@ -646,12 +662,11 @@ def compile_codex_private_sqlite_action_plan(
     session_source_close_b: dict[str, Any],
     session_destination_close_a: dict[str, Any],
     session_destination_close_b: dict[str, Any],
-    *,
-    accept_opening_plan: str,
-    accept_close_request: str,
-    runtime_authority: dict[str, Any],
-) -> dict[str, Any]:
-    """Compile a closed, descriptive plan for a later offline composer."""
+) -> None:
+    """Recompute every v5 action claim from the exact closing evidence."""
+    validate_codex_private_sqlite_action_plan(action_plan)
+    runtime_authority = action_plan["runtime_authority"]
+    created_at = action_plan["created_at"]
     deadline = time.monotonic() + MAX_SQLITE_PLAN_SECONDS
     private_runtime.validate_private_runtime_authority(runtime_authority)
     if (
@@ -664,11 +679,7 @@ def compile_codex_private_sqlite_action_plan(
             "private SQLite close and action-plan runtime authorities differ"
         )
     validate_codex_private_sqlite_compose_plan(opening_plan)
-    if accept_opening_plan != opening_plan["plan_sha256"]:
-        raise BulkloadError("accepted private SQLite opening-plan digest differs")
     validate_codex_private_sqlite_close_request(close_request)
-    if accept_close_request != close_request["close_request_sha256"]:
-        raise BulkloadError("accepted private SQLite close-request digest differs")
     _validate_close_binds_opening(opening_plan, close_request)
 
     private_bindings, captures, roots = _private_close_context(
@@ -738,9 +749,9 @@ def compile_codex_private_sqlite_action_plan(
         not blockers
         and all(family["descriptive_action_complete"] for family in families)
     )
-    action_plan: dict[str, Any] = {
+    expected_action_plan: dict[str, Any] = {
         "schema": PRIVATE_SQLITE_ACTION_PLAN_SCHEMA,
-        "created_at": utc_now(),
+        "created_at": created_at,
         "runtime_authority": deepcopy(runtime_authority),
         "accepted_inputs": {
             "opening_plan": _opening_binding(opening_plan),
@@ -770,14 +781,17 @@ def compile_codex_private_sqlite_action_plan(
         },
         "implementation": PRIVATE_SQLITE_ACTION_PLAN_IMPLEMENTATION,
     }
-    action_plan["action_plan_sha256"] = object_digest(
-        action_plan,
+    expected_action_plan["action_plan_sha256"] = object_digest(
+        expected_action_plan,
         "action_plan_sha256",
     )
-    validate_codex_private_sqlite_action_plan(action_plan)
+    validate_codex_private_sqlite_action_plan(expected_action_plan)
     if time.monotonic() > deadline:
         raise BulkloadError("private SQLite action planning exceeded its deadline")
-    return action_plan
+    if action_plan != expected_action_plan:
+        raise BulkloadError(
+            "private SQLite action plan differs from its closing evidence"
+        )
 
 
 def _validate_artifact(value: Any, label: str) -> None:
@@ -1175,9 +1189,11 @@ def _validate_close_bindings(
                 identity_keys = ("capture_id",)
                 digest_keys = ("snapshot_sha256", "reclose_capture_sha256")
             for key in identity_keys:
-                normalized = _uuid_hex(
-                    binding[key],
-                    f"private SQLite {name} close identity",
+                label = f"private SQLite {name} close identity"
+                normalized = (
+                    _uuid_hex(binding[key], label)
+                    if private
+                    else _session_capture_id_hex(binding[key], label)
                 )
                 if normalized in identities:
                     raise BulkloadError(
@@ -1455,46 +1471,3 @@ def validate_codex_private_sqlite_action_plan(
     )
     if object_digest(plan, "action_plan_sha256") != plan["action_plan_sha256"]:
         raise BulkloadError("private SQLite action-plan digest mismatch")
-
-
-def validate_codex_private_sqlite_action_plan_against_close(
-    action_plan: dict[str, Any],
-    opening_plan: dict[str, Any],
-    close_request: dict[str, Any],
-    source_close_a_directory: Path,
-    source_close_b_directory: Path,
-    destination_close_a_directory: Path,
-    destination_close_b_directory: Path,
-    session_source_close_a: dict[str, Any],
-    session_source_close_b: dict[str, Any],
-    session_destination_close_a: dict[str, Any],
-    session_destination_close_b: dict[str, Any],
-) -> None:
-    """Recompute every v5 claim from the exact closing evidence."""
-    validate_codex_private_sqlite_action_plan(action_plan)
-    recomputed = compile_codex_private_sqlite_action_plan(
-        opening_plan,
-        close_request,
-        source_close_a_directory,
-        source_close_b_directory,
-        destination_close_a_directory,
-        destination_close_b_directory,
-        session_source_close_a,
-        session_source_close_b,
-        session_destination_close_a,
-        session_destination_close_b,
-        accept_opening_plan=action_plan["accepted_inputs"]["opening_plan"][
-            "plan_sha256"
-        ],
-        accept_close_request=action_plan["accepted_inputs"]["close_request"][
-            "close_request_sha256"
-        ],
-        runtime_authority=action_plan["runtime_authority"],
-    )
-    ignored = {"created_at", "action_plan_sha256"}
-    observed = {key: value for key, value in action_plan.items() if key not in ignored}
-    expected = {key: value for key, value in recomputed.items() if key not in ignored}
-    if observed != expected:
-        raise BulkloadError(
-            "private SQLite action plan differs from its closing evidence"
-        )

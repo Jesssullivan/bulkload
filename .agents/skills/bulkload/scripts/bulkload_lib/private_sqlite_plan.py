@@ -1,9 +1,8 @@
 """Plan-only cross-plane classification for private Codex SQLite state.
 
 This module deliberately has no composer, publisher, installer, or mutation
-entrypoint.  It turns four immutable v3 private captures plus a recomputed
-Codex session-union closure into a digest-bound opening request for a later,
-separately reviewed offline composer.
+entrypoint. It validates a persisted digest-bound opening request against four
+immutable v3 private captures and a recomputed Codex session-union closure.
 """
 
 from __future__ import annotations
@@ -27,7 +26,6 @@ from .model import (
     canonical_bytes,
     object_digest,
     sha256_bytes,
-    utc_now,
 )
 from .private_state import (
     AUTH_BASENAME,
@@ -2220,20 +2218,17 @@ def _classify_family(
     )
 
 
-def compile_codex_private_sqlite_compose_plan(
+def validate_codex_private_sqlite_compose_plan_against_inputs(
+    plan: dict[str, Any],
     compatibility_plan: dict[str, Any],
     source_a_directory: Path,
     source_b_directory: Path,
     destination_a_directory: Path,
     destination_b_directory: Path,
     *,
-    accept_compatibility_plan: str,
     adapter_registry: dict[str, Any],
-    accept_adapter_registry: str,
     path_map: dict[str, Any],
-    accept_path_map: str,
     session_union_plan: dict[str, Any],
-    accept_session_union_plan: str,
     session_source_a: dict[str, Any],
     session_source_b: dict[str, Any],
     session_destination_a: dict[str, Any],
@@ -2248,23 +2243,17 @@ def compile_codex_private_sqlite_compose_plan(
     session_source_close_b: dict[str, Any] | None = None,
     session_destination_close_a: dict[str, Any] | None = None,
     session_destination_close_b: dict[str, Any] | None = None,
-    runtime_authority: dict[str, Any],
-) -> dict[str, Any]:
-    """Compile a non-actionable SQLite classification/opening request."""
+) -> None:
+    """Recompute every v4 claim from its accepted opening inputs."""
+    validate_codex_private_sqlite_compose_plan(plan)
+    runtime_authority = plan["runtime_authority"]
+    created_at = plan["created_at"]
     deadline = time.monotonic() + MAX_SQLITE_PLAN_SECONDS
     private_runtime.validate_private_runtime_authority(runtime_authority)
     validate_codex_private_state_plan(compatibility_plan)
-    if accept_compatibility_plan != compatibility_plan["plan_sha256"]:
-        raise BulkloadError("accepted compatibility plan digest differs")
     validate_sqlite_adapter_registry(adapter_registry)
-    if accept_adapter_registry != adapter_registry["registry_sha256"]:
-        raise BulkloadError("accepted SQLite adapter registry digest differs")
     validate_sqlite_path_map(path_map)
-    if accept_path_map != path_map["path_map_sha256"]:
-        raise BulkloadError("accepted SQLite path-map digest differs")
     validate_codex_session_union_plan(session_union_plan)
-    if accept_session_union_plan != session_union_plan["plan_sha256"]:
-        raise BulkloadError("accepted Codex session union plan digest differs")
     validate_codex_session_union_plan_against_inputs(
         session_union_plan,
         session_source_a,
@@ -2418,9 +2407,9 @@ def compile_codex_private_sqlite_compose_plan(
         ]
     )
     _require_sqlite_deadline(deadline, "SQLite plan classification")
-    plan: dict[str, Any] = {
+    expected_plan: dict[str, Any] = {
         "schema": PRIVATE_SQLITE_PLAN_SCHEMA,
-        "created_at": utc_now(),
+        "created_at": created_at,
         "runtime_authority": runtime_authority,
         "accepted_inputs": {
             "compatibility_plan_sha256": compatibility_plan["plan_sha256"],
@@ -2459,10 +2448,13 @@ def compile_codex_private_sqlite_compose_plan(
         },
         "implementation": "sqlite-compose-opening-plan-only-v4",
     }
-    plan["plan_sha256"] = object_digest(plan, "plan_sha256")
-    validate_codex_private_sqlite_compose_plan(plan)
+    expected_plan["plan_sha256"] = object_digest(expected_plan, "plan_sha256")
+    validate_codex_private_sqlite_compose_plan(expected_plan)
     _require_sqlite_deadline(deadline, "SQLite plan classification")
-    return plan
+    if plan != expected_plan:
+        raise BulkloadError(
+            "private SQLite compose plan differs from its opening inputs"
+        )
 
 
 _ROLE_BLOCKER_FIELDS = {
@@ -4541,69 +4533,3 @@ def validate_codex_private_sqlite_compose_plan(value: dict[str, Any]) -> None:
     _require_sha256(plan["plan_sha256"], "private SQLite plan digest")
     if object_digest(plan, "plan_sha256") != plan["plan_sha256"]:
         raise BulkloadError("private SQLite plan digest mismatch")
-
-
-def validate_codex_private_sqlite_compose_plan_against_inputs(
-    plan: dict[str, Any],
-    compatibility_plan: dict[str, Any],
-    source_a_directory: Path,
-    source_b_directory: Path,
-    destination_a_directory: Path,
-    destination_b_directory: Path,
-    *,
-    adapter_registry: dict[str, Any],
-    path_map: dict[str, Any],
-    session_union_plan: dict[str, Any],
-    session_source_a: dict[str, Any],
-    session_source_b: dict[str, Any],
-    session_destination_a: dict[str, Any],
-    session_destination_b: dict[str, Any],
-    session_prefix_request: dict[str, Any] | None = None,
-    session_source_prefix_a: dict[str, Any] | None = None,
-    session_source_prefix_b: dict[str, Any] | None = None,
-    session_destination_prefix_a: dict[str, Any] | None = None,
-    session_destination_prefix_b: dict[str, Any] | None = None,
-    session_close_request: dict[str, Any] | None = None,
-    session_source_close_a: dict[str, Any] | None = None,
-    session_source_close_b: dict[str, Any] | None = None,
-    session_destination_close_a: dict[str, Any] | None = None,
-    session_destination_close_b: dict[str, Any] | None = None,
-) -> None:
-    """Recompute a persisted v4 plan from every accepted opening input."""
-    validate_codex_private_sqlite_compose_plan(plan)
-    recomputed = compile_codex_private_sqlite_compose_plan(
-        compatibility_plan,
-        source_a_directory,
-        source_b_directory,
-        destination_a_directory,
-        destination_b_directory,
-        accept_compatibility_plan=plan["accepted_inputs"]["compatibility_plan_sha256"],
-        adapter_registry=adapter_registry,
-        accept_adapter_registry=plan["accepted_inputs"]["adapter_registry_sha256"],
-        path_map=path_map,
-        accept_path_map=plan["accepted_inputs"]["path_map_sha256"],
-        session_union_plan=session_union_plan,
-        accept_session_union_plan=plan["accepted_inputs"]["session_union_plan_sha256"],
-        session_source_a=session_source_a,
-        session_source_b=session_source_b,
-        session_destination_a=session_destination_a,
-        session_destination_b=session_destination_b,
-        session_prefix_request=session_prefix_request,
-        session_source_prefix_a=session_source_prefix_a,
-        session_source_prefix_b=session_source_prefix_b,
-        session_destination_prefix_a=session_destination_prefix_a,
-        session_destination_prefix_b=session_destination_prefix_b,
-        session_close_request=session_close_request,
-        session_source_close_a=session_source_close_a,
-        session_source_close_b=session_source_close_b,
-        session_destination_close_a=session_destination_close_a,
-        session_destination_close_b=session_destination_close_b,
-        runtime_authority=plan["runtime_authority"],
-    )
-    ignored = {"created_at", "plan_sha256"}
-    expected = {key: item for key, item in recomputed.items() if key not in ignored}
-    observed = {key: item for key, item in plan.items() if key not in ignored}
-    if observed != expected:
-        raise BulkloadError(
-            "private SQLite compose plan differs from its opening inputs"
-        )
