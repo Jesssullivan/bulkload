@@ -20,8 +20,8 @@ LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
-ACTION_SHA256 = "2883a1296e2195a4a9485325d3974dc601feddb0df99a2f016fdff0c29a7e068"
-GUARD_SHA256 = "118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033"
+ACTION_SHA256 = "86f7106b1a955a59235c13bab482311b2817a03e6faad516def596a903f9d35d"
+GUARD_SHA256 = "f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71"
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
     "15aa8306cc530bbc4d143dd7a6a2f0cfd3efbed19c01503d35bbec0c5e7cd357"
@@ -280,6 +280,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "id-token:",
         "flywheel-executor",
         "executor-backed",
+        "runner.labels",
     ):
         if forbidden in action:
             raise ContractError(
@@ -330,6 +331,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "BULKLOAD_GUARD_PATH",
         ["${{ steps.guard-snapshot.outputs.guard_path }}"] * 4,
     )
+    require_yaml_lines("BULKLOAD_RUNNER_NAME", ["${{ runner.name }}"] * 4)
 
     if action.count("      shell: /bin/bash --noprofile --norc {0}") != 5:
         raise ContractError("every guard boundary must use absolute non-profile Bash")
@@ -461,7 +463,7 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         "readonly public_site=bulkload-ci",
         "readonly cache_name=main",
         'require_equal "runner environment" "${BULKLOAD_RUNNER_ENVIRONMENT:-}" self-hosted',
-        "*,tinyland-nix,*)",
+        "^bulkload-nix-[a-z0-9]+-runner-[a-z0-9]+$",
         'require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"',
         'require_equal "ref" "${BULKLOAD_REF:-}" "${GITHUB_REF:-}"',
         '"pull-request head repository"',
@@ -821,6 +823,7 @@ class CiContractTest(unittest.TestCase):
                 '        ATTIC_TOKEN: ""',
                 '        ATTIC_TOKEN: ""\n        BAZEL_REMOTE_HEADER: secret',
             ),
+            self.action + "\n# ${{ join(runner.labels, ',') }}\n",
             self.action + "\n# type=gha\n",
             self.action + "\n# https://cache.invalid\n",
         ]
@@ -910,7 +913,7 @@ class CiContractTest(unittest.TestCase):
                 "BULKLOAD_HEAD_REPOSITORY": "Jesssullivan/bulkload",
                 "BULKLOAD_UPLOAD_BAZEL_RESULTS": "false",
                 "BULKLOAD_RUNNER_ENVIRONMENT": "self-hosted",
-                "BULKLOAD_RUNNER_LABELS": "self-hosted,Linux,X64,tinyland-nix",
+                "BULKLOAD_RUNNER_NAME": "bulkload-nix-g5qc5-runner-n4jx8",
                 "BULKLOAD_ATTIC_REACHABLE": "true",
                 "BULKLOAD_BAZEL_CACHE_REACHABLE": "true",
                 "ATTIC_TOKEN": "",
@@ -1050,7 +1053,7 @@ class CiContractTest(unittest.TestCase):
             for key, value in (
                 ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
                 ("BULKLOAD_UPLOAD_BAZEL_RESULTS", "true"),
-                ("BULKLOAD_RUNNER_LABELS", "self-hosted,Linux,X64"),
+                ("BULKLOAD_RUNNER_NAME", "other-pool-runner-12345"),
                 ("BAZEL_REMOTE_EXECUTOR", "grpc://executor.invalid"),
                 ("BAZEL_REMOTE_EXEC_HEADER", "x-auth:secret"),
                 ("BAZEL_CREDENTIAL_HELPER", "/tmp/helper"),

@@ -32,7 +32,7 @@ runs:
         ENV: /dev/null
       run: |
         set -euo pipefail
-        expected=118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033
+        expected=f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
         source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
         test "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" = "$expected"
         guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
@@ -55,7 +55,7 @@ runs:
         BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
         BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
         BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        BULKLOAD_RUNNER_LABELS: ${{ join(runner.labels, ',') }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
         ATTIC_TOKEN: ""
         NIX_ACCESS_TOKENS: ""
         NIX_USER_CONF_FILES: /dev/null
@@ -72,7 +72,7 @@ runs:
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = 118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
         /bin/bash "$BULKLOAD_GUARD_PATH" preflight
 
     - name: Discover sanctioned runner endpoint authority
@@ -95,7 +95,7 @@ runs:
         BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
         BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
         BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        BULKLOAD_RUNNER_LABELS: ${{ join(runner.labels, ',') }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
         BULKLOAD_ATTIC_REACHABLE: ${{ steps.endpoints.outputs.attic_reachable }}
         BULKLOAD_BAZEL_CACHE_REACHABLE: ${{ steps.endpoints.outputs.bazel_cache_reachable }}
         ATTIC_TOKEN: ""
@@ -114,7 +114,7 @@ runs:
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = 118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
         /bin/bash "$BULKLOAD_GUARD_PATH" enforce
 
     - name: Run repository-owned source gates
@@ -161,7 +161,7 @@ runs:
         BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
         BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
         BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        BULKLOAD_RUNNER_LABELS: ${{ join(runner.labels, ',') }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
         BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
         BULKLOAD_CAPTURED_BAZEL_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
         BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
@@ -191,7 +191,7 @@ runs:
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = 118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
         /bin/bash "$BULKLOAD_GUARD_PATH" bazel
 
     - name: Build the Bulkload binary through the public Flywheel action
@@ -246,7 +246,7 @@ runs:
         BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
         BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
         BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        BULKLOAD_RUNNER_LABELS: ${{ join(runner.labels, ',') }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
         BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
         BULKLOAD_CAPTURED_BAZEL_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
         BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
@@ -276,7 +276,7 @@ runs:
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = 118eb631fb54617111df54980502bd1fbbf4f26ac98d98b0ba22afabe30d2033
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
         /bin/bash "$BULKLOAD_GUARD_PATH" bazel
 
     - name: Test the complete Bulkload Bazel graph through the public Flywheel action

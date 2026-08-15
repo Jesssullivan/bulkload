@@ -104,15 +104,8 @@ case "$mode" in
 esac
 
 require_equal "runner environment" "${BULKLOAD_RUNNER_ENVIRONMENT:-}" self-hosted
-case ",${BULKLOAD_RUNNER_LABELS:-}," in
-  *,tinyland-nix,*) ;;
-  *) die "runner labels do not contain literal tinyland-nix" ;;
-esac
-case "${BULKLOAD_RUNNER_LABELS:-}" in
-  *ubuntu-* | *macos-* | *windows-*)
-    die "runner labels contain a forbidden hosted fallback"
-    ;;
-esac
+[[ "${BULKLOAD_RUNNER_NAME:-}" =~ ^bulkload-nix-[a-z0-9]+-runner-[a-z0-9]+$ ]] ||
+  die "runner name is outside the bulkload-nix ARC scale set"
 
 require_equal "repository" "${BULKLOAD_REPOSITORY:-}" "${GITHUB_REPOSITORY:-}"
 require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"
