@@ -277,6 +277,12 @@ single-link, non-symlink, on the bound mount, and reachable beneath the pinned
 final directory. No WAL, SHM, journal, temporary, lock, cache, or
 unlisted entry is allowed inside the bundle.
 
+Mount records keep an in-range `f_fsid` when the platform supplies one. Linux
+may expose that opaque value outside the protocol's checked signed range; in
+that case it is recorded as `null` and the required `/proc` mount ID remains
+the mount authority. A platform with neither a checked filesystem ID nor a
+Linux mount ID fails closed.
+
 The canonical manifest schema is
 `dev.tinyland.bulkload.codex-private-sqlite-composed-bundle-manifest.v7`.
 Its exact top-level keys are:

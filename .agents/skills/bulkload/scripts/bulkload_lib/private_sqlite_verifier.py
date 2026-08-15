@@ -47,6 +47,7 @@ from .private_sqlite_plan import (
 from .private_sqlite_protocol import (
     COMPOSED_BUNDLE_MANIFEST_SCHEMA,
     COMPOSITION_RECEIPT_SCHEMA,
+    MAX_CHECKED_INTEGER,
     MAX_FAILURES,
     MAX_PROTOCOL_BYTES,
     MAX_TABLES,
@@ -149,6 +150,8 @@ def _mount(descriptor: int) -> dict[str, int | None]:
     filesystem_id = getattr(filesystem, "f_fsid", None)
     if filesystem_id is not None:
         filesystem_id = int(filesystem_id)
+        if filesystem_id < 0 or filesystem_id > MAX_CHECKED_INTEGER:
+            filesystem_id = None
     linux_mount_id: int | None = None
     if os.path.exists("/proc/self/fdinfo"):
         try:

@@ -104,7 +104,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "1f4f30ce3b648b8cb0bcaa3ae76b43fa0ff50d26471c3a24c7d3c347621c67c3"
         ),
         "scripts/bulkload_lib/private_sqlite_verifier.py": (
-            "18e5e82d66b9252804bd41e5688994be37f0ded6d2d68a1c7e7305b0e7f96bbf"
+            "4545a78e157a5ed7e440309938d053640b8536dfc74a60dd902a1b2d9a02f7b0"
         ),
         "scripts/bulkload_lib/private_state.py": (
             "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
@@ -117,7 +117,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
         ),
     },
     "runtime_source_sha256": (
-        "4cb514730f08371cffc00e69d1607bb6b73f464b6fd0c5d0ca894ffdca31be4f"
+        "7d2c68f8965b28f276bb0f2ba93004c2e5a3593305a18ad6b53052a685e99bb9"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
@@ -886,6 +886,7 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
         (1, "private_sqlite_protocol"): {
             "COMPOSED_BUNDLE_MANIFEST_SCHEMA",
             "COMPOSITION_RECEIPT_SCHEMA",
+            "MAX_CHECKED_INTEGER",
             "MAX_FAILURES",
             "MAX_PROTOCOL_BYTES",
             "MAX_TABLES",

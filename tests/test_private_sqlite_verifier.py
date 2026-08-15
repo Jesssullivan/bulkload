@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,6 +23,7 @@ from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
 from bulkload_lib.private_sqlite_plan import MAX_SQLITE_VALUE_BYTES
 from bulkload_lib.private_sqlite_protocol import (
     MAX_FAILURES,
+    MAX_CHECKED_INTEGER,
     MAX_PROTOCOL_BYTES,
     MAX_TREE_ENTRIES,
     VERIFIER_ORACLE_REPORT_SCHEMA,
@@ -29,6 +31,7 @@ from bulkload_lib.private_sqlite_protocol import (
     validate_composition_receipt,
     validate_verifier_oracle_report,
 )
+from tests import private_sqlite_v7_fixtures as v7_fixtures
 from tests.private_sqlite_v7_fixtures import (
     BASENAME,
     COMPLETED_AT,
@@ -141,6 +144,54 @@ class _ScriptedSchemaConnection:
 
 
 class PrivateSqliteV7VerifierTest(unittest.TestCase):
+    def test_mount_uses_checked_linux_id_when_fsid_is_unrepresentable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            self.addCleanup(os.close, descriptor)
+            statvfs = SimpleNamespace(f_fsid=MAX_CHECKED_INTEGER + 1)
+            with (
+                mock.patch.object(verifier.os, "fstatvfs", return_value=statvfs),
+                mock.patch.object(verifier.os.path, "exists", return_value=True),
+                mock.patch.object(
+                    verifier.Path,
+                    "read_text",
+                    return_value="mnt_id:\t41\n",
+                ),
+            ):
+                observed = verifier._mount(descriptor)
+            with (
+                mock.patch.object(
+                    v7_fixtures.os,
+                    "fstatvfs",
+                    return_value=statvfs,
+                ),
+                mock.patch.object(v7_fixtures.Path, "exists", return_value=True),
+                mock.patch.object(
+                    v7_fixtures.Path,
+                    "read_text",
+                    return_value="mnt_id:\t41\n",
+                ),
+            ):
+                fixture_observed = v7_fixtures._filesystem_mount(descriptor)
+            self.assertEqual(observed, fixture_observed)
+            self.assertIsNone(observed["filesystem_id"])
+            self.assertEqual(observed["linux_mount_id"], 41)
+
+            with (
+                mock.patch.object(verifier.os, "fstatvfs", return_value=statvfs),
+                mock.patch.object(verifier.os.path, "exists", return_value=False),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "verifier mount identity is unavailable",
+                ),
+            ):
+                verifier._mount(descriptor)
+
     def test_verifier_uses_protocol_limits_without_local_drift(self) -> None:
         self.assertEqual(verifier.MAX_PROTOCOL_BYTES, MAX_PROTOCOL_BYTES)
         self.assertEqual(verifier.MAX_TREE_ENTRIES, MAX_TREE_ENTRIES)

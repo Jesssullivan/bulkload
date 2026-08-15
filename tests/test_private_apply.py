@@ -20,6 +20,7 @@ from bulkload_lib import (
     private_runtime,
     private_state,
 )
+from tests.unprivileged_test_main import run_unittest_main
 
 
 SOURCE_AUTHORITY = "11111111-1111-4111-8111-111111111111"
@@ -564,6 +565,37 @@ class CodexPrivateApplyTest(unittest.TestCase):
         self.assertEqual(waited, pid)
         self.assertTrue(os.WIFEXITED(status))
         self.assertEqual(os.WEXITSTATUS(status), expected)
+
+    def test_private_apply_refuses_root_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = PrivateApplyFixture(Path(directory))
+            auth_before = (
+                fixture.destination_home / private_state.AUTH_BASENAME
+            ).read_bytes()
+            with (
+                mock.patch.object(private_apply.os, "geteuid", return_value=0),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "private Codex apply refuses root",
+                ),
+            ):
+                fixture.apply(prefix="root-refusal")
+            self.assertEqual(
+                (fixture.destination_home / private_state.AUTH_BASENAME).read_bytes(),
+                auth_before,
+            )
+            self.assertEqual(
+                _sqlite_truth(fixture.destination_home),
+                fixture.sqlite_before,
+            )
+            for suffix in (
+                "rollback",
+                "post",
+                "automatic-recovery",
+                "journal.jsonl",
+                "receipt.json",
+            ):
+                self.assertFalse((fixture.root / f"root-refusal-{suffix}").exists())
 
     def test_compiler_round_trip_and_full_apply_verify_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2266,4 +2298,4 @@ class CodexPrivateApplyTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_unittest_main()

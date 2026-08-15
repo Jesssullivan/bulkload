@@ -60,6 +60,7 @@ from bulkload_lib.sessions import (  # noqa: E402
     validate_codex_session_union_plan,
     validate_codex_session_union_plan_against_inputs,
 )
+from tests.unprivileged_test_main import run_unittest_main  # noqa: E402
 
 TEST_HOST_AUTHORITY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 OTHER_HOST_AUTHORITY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -255,6 +256,54 @@ def capture_codex_closes(
 
 
 class BulkloadProtocolTest(unittest.TestCase):
+    def test_mutation_suite_runs_as_an_unprivileged_user(self) -> None:
+        if hasattr(os, "geteuid"):
+            self.assertNotEqual(os.geteuid(), 0)
+        if os.environ.get("BULKLOAD_TEST_PRIVILEGE_DROP") == "1":
+            for variable in (
+                "HOME",
+                "TMPDIR",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_RUNTIME_DIR",
+                "XDG_STATE_HOME",
+            ):
+                path = Path(os.environ[variable])
+                self.assertEqual(path.stat().st_uid, os.getuid())
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_apply_refuses_root_before_creating_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = make_pair(root)
+            (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+            plan = compile_plan(
+                capture_snapshot(source, "repo"),
+                capture_snapshot(source, "repo"),
+                capture_snapshot(destination, "repo"),
+            )
+            state_root = root / "state"
+            receipt_path = root / "receipt.json"
+            with (
+                mock.patch("bulkload_lib.executor.os.geteuid", return_value=0),
+                self.assertRaisesRegex(BulkloadError, "apply refuses to run as root"),
+            ):
+                apply_plan(
+                    plan,
+                    source_root=source,
+                    destination_root=destination,
+                    accepted_digest=plan["plan_sha256"],
+                    state_root=state_root,
+                    receipt_path=receipt_path,
+                )
+            self.assertEqual(
+                (destination / "tracked.txt").read_text(encoding="utf-8"),
+                "base\n",
+            )
+            self.assertFalse(state_root.exists())
+            self.assertFalse(receipt_path.exists())
+
     def test_codex_session_union_is_stable_absent_only_and_preserving(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5140,4 +5189,4 @@ class BulkloadProtocolTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_unittest_main()

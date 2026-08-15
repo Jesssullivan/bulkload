@@ -50,7 +50,10 @@ py_test(
     legacy_create_init = 0,
     main = "tests/test_bulkload.py",
     size = "medium",
-    srcs = ["tests/test_bulkload.py"],
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/unprivileged_test_main.py",
+    ],
     deps = [":bulkload_lib"],
 )
 
@@ -77,7 +80,10 @@ py_test(
     legacy_create_init = 0,
     main = "tests/test_private_apply.py",
     size = "medium",
-    srcs = ["tests/test_private_apply.py"],
+    srcs = [
+        "tests/test_private_apply.py",
+        "tests/unprivileged_test_main.py",
+    ],
     deps = [":bulkload_lib"],
 )
 

@@ -19,6 +19,7 @@ from bulkload_lib.private_sqlite_protocol import (
     COMPOSE_REQUEST_SCHEMA,
     COMPOSITION_RECEIPT_IMPLEMENTATION,
     COMPOSITION_RECEIPT_SCHEMA,
+    MAX_CHECKED_INTEGER,
     MANIFEST_FALSE_CLAIMS,
     MANIFEST_POSITIVE_CLAIMS,
     ORACLE_FALSE_CLAIMS,
@@ -722,6 +723,8 @@ def _filesystem_mount(descriptor: int) -> dict[str, int | None]:
     filesystem_id = getattr(filesystem, "f_fsid", None)
     if filesystem_id is not None:
         filesystem_id = int(filesystem_id)
+        if filesystem_id < 0 or filesystem_id > MAX_CHECKED_INTEGER:
+            filesystem_id = None
     linux_mount_id: int | None = None
     fdinfo = Path(f"/proc/self/fdinfo/{descriptor}")
     if fdinfo.parent.exists():
