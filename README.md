@@ -27,7 +27,7 @@ Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
 For development:
 
 ```bash
-nix develop github:tinyland-inc/GloriousFlywheel/693574567f9b879486782f1fb7f432c54a2fe294#ci
+nix develop
 just flywheel-doctor
 just flywheel-verify
 just check
@@ -36,11 +36,28 @@ just demo
 
 The normal build/test path is attached to GloriousFlywheel and fails closed if
 the fleet profile is missing or contradictory. CI uses only the on-prem
-`tinyland-nix` capability-class ARC pool, the endpoint-free front-door kit, and
-the canonical `gloriousflywheel-bazel` wrapper. Pull requests cannot upload
-Bazel or Attic results. Nix reads use the token-free public Attic contract;
-trusted `main` pushes may warm only the shared Bazel cache. A cache hit is cache
-evidence, not proof of REAPI remote execution.
+`tinyland-nix` capability-class ARC pool and the repository-local public-read
+front door. That front door calls only the public, immutable
+`tinyland-inc/ci-templates` v2.13.0 actions at commit
+`139bd4c7deabbe07c918dc764a3b9f054066431d`; it never resolves a private
+GloriousFlywheel action, source tree, or flake. Cache endpoints remain
+runner-injected authority. A repository-owned, no-value preflight validates
+those raw authority-only endpoints and clears inherited credential channels
+before the pinned setup action may inspect or export them; a second pass binds
+the discovered reachability evidence before any Nix or Bazel command. The
+exact guard is snapshotted before repository-owned source gates, then its
+digest and the captured authority are rechecked immediately before each Bazel
+call. Each call receives a new private Bazelisk home and an empty user home, so
+workspace wrappers, ambient rc files, and netrc credentials cannot enter the
+public-read route. The Nix client process is configured for token-free
+`bulkload-ci` public reads: access tokens, user configuration, netrc,
+flake-provided configuration, post-build hooks, secret signing keys, and
+plugins are all cleared. This source contract does not attest the independent
+multi-user Nix daemon's own HTTP authentication or post-build policy. Pull
+requests cannot request Bazel or Attic uploads through this client; only a
+trusted push to `main` may warm the shared Bazel cache. The front door never
+selects a remote executor. A cache hit is cache evidence, not proof of REAPI
+remote execution.
 
 For a source-only check on an intentionally unattached machine, run
 `nix develop --command just check-local`. That fallback is not CI or enrollment

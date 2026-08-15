@@ -16,14 +16,12 @@ concurrency:
 jobs:
   test:
     name: Bazel contract and fixture tests
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: tinyland-nix
     timeout-minutes: 15
     env:
-      # GF #ci exposes its pinned Bazelisk shim under the compatibility name.
-      BAZEL_BIN: bazel
-      # Pull requests are cache-read-only. Only the trusted main push may
-      # publish Bazel action results; tag verification remains read-only.
-      GF_BAZEL_REMOTE_UPLOAD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
+      ATTIC_TOKEN: ""
+      NIX_ACCESS_TOKENS: ""
     steps:
       - name: Check out exact revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,16 +35,12 @@ jobs:
           EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
-      - name: GloriousFlywheel cache-first validation
-        uses: tinyland-inc/GloriousFlywheel/.github/actions/nix-job@693574567f9b879486782f1fb7f432c54a2fe294
+      - name: Bulkload public-read cache-first validation
+        uses: ./.github/actions/bulkload-public-read-ci
         with:
-          attic-enabled: "true"
-          attic-public-key: "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
-          attic-public-read-only: "true"
-          attic-public-read-site: "bulkload-ci"
-          push-cache: "false"
-          require-cache-push: "false"
-          command: |
-            test -n "${BAZEL_REMOTE_CACHE:-}"
-            test "${GF_BAZEL_SUBSTRATE_MODE:-}" = shared-cache-backed
-            nix develop github:tinyland-inc/GloriousFlywheel/693574567f9b879486782f1fb7f432c54a2fe294#ci -c just ci
+          event-name: ${{ github.event_name }}
+          expected-sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.ref }}
+          repository: ${{ github.repository }}
+          head-repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          upload-bazel-results: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}

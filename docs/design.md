@@ -2,6 +2,28 @@
 
 Status: implementation complete; landing held on GF listener proof, 2026-07-24
 
+The public-read CI boundary is separately closed by a repository-local
+front door. It runs only on the literal `tinyland-nix` capability, rejects fork
+pull requests before scheduling, and consumes the public immutable
+`tinyland-inc/ci-templates` v2.13.0 actions at commit
+`139bd4c7deabbe07c918dc764a3b9f054066431d`. It does not import private
+GloriousFlywheel action or flake source. The Nix client process is configured
+for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
+locations remain injected by the runner. A no-value repository preflight
+validates authority-only raw endpoints and clears inherited shell, Nix, and
+Bazel credential channels before the pinned discovery action; post-discovery
+enforcement revalidates the boundary and requires both cache reachability
+claims before any Nix or Bazel command. The exact guard is snapshotted before
+repository-owned source gates. Both Bazel calls are preceded by a fresh digest
+and captured-authority check and receive distinct, newly allocated Bazelisk
+homes plus empty user homes; workspace wrappers, system/user rc drift, and
+netrc credentials fail closed. Client access tokens, user Nix
+configuration, netrc, flake-config acceptance, post-build hooks, secret signing
+keys, and plugins are cleared. This source boundary does not attest the
+independent multi-user Nix daemon's own HTTP authentication or post-build
+policy. Bazel cache publication is false for every pull request and tag and
+true only for a trusted push to `main`; remote execution is never selected.
+
 ## 1. Decision
 
 Build `bulkload` as a manifest-first controller and portable Agent Skill for

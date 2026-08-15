@@ -70,12 +70,18 @@ py_test(
     size = "small",
     srcs = ["tests/test_ci_contract.py"],
     data = [
+        "BUILD.bazel",
         ".bazelrc",
         ".bazelrc.flywheel",
+        ".bazelversion",
         ".github/actionlint.yaml",
+        ".github/actions/bulkload-public-read-ci/action.yml",
         ".github/workflows/ci.yml",
+        "flake.lock",
+        "flake.nix",
         "justfile",
         "justfile.flywheel",
+        "scripts/ci-public-read-guard.sh",
         "tinyland.repo.json",
     ],
 )
