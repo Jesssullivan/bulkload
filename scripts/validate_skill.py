@@ -30,8 +30,34 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     "implementation": "plan-only",
     "ready_for_apply": False,
     "cli_source_sha256": (
-        "950a0ea71d9b3544c7e8d67f3c18354bf9481b7b5b3b9562d0d9fdd62c72ce24"
+        "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb"
     ),
+    "runtime_source_sha256_by_path": {
+        "scripts/bulkload.py": (
+            "a9df2769cfb2b7c4770950bf0d40ad1b8403835762475bf61dd0e77f7e46544a"
+        ),
+        "scripts/bulkload_lib/__init__.py": (
+            "de2a7f4d6ec3468db41cb3b643469ec445cbbaf386f97230e4f72b7ebc3dd89f"
+        ),
+        "scripts/bulkload_lib/cli.py": (
+            "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb"
+        ),
+        "scripts/bulkload_lib/executor.py": (
+            "f4c48bc4e02ec8eb8efe164bd2523855ff82a71819e155b93803542da0364201"
+        ),
+        "scripts/bulkload_lib/model.py": (
+            "6099e031801ac56038d0e1d9a76baefab057551f885840a5b7c3eee0abb6ac92"
+        ),
+        "scripts/bulkload_lib/planner.py": (
+            "24ea53940dce472521460734bf31236380ea632fbfd4afc948c105b5a2473eb3"
+        ),
+        "scripts/bulkload_lib/scanner.py": (
+            "813c49326f1ba3dfee82ef37de6671fe9fb46d771a8f19c45a604c55a4d4b9b5"
+        ),
+        "scripts/bulkload_lib/sessions.py": (
+            "e03957286f916fc30c1c628a2883d468bbf36d2c419b54e8b2d65c403a2c36f4"
+        ),
+    },
     "allowed_codex_cli_commands": [
         "codex-capture",
         "codex-close-capture",
@@ -263,7 +289,9 @@ def validate_private_state_policy(
     policy: object,
     *,
     cli_text: str,
+    runtime_sources: dict[str, str],
     expected_cli_sha256: str | None = None,
+    expected_runtime_sha256_by_path: dict[str, str] | None = None,
 ) -> None:
     if policy != EXPECTED_PRIVATE_STATE_POLICY:
         raise SkillContractError(
@@ -279,6 +307,26 @@ def validate_private_state_policy(
         raise SkillContractError(
             "bulkload CLI source differs from the exact plan-only policy digest: "
             f"expected={required_cli_sha256} observed={observed_cli_sha256}"
+        )
+    required_runtime_sha256_by_path = (
+        EXPECTED_PRIVATE_STATE_POLICY["runtime_source_sha256_by_path"]
+        if expected_runtime_sha256_by_path is None
+        else expected_runtime_sha256_by_path
+    )
+    observed_runtime_sha256_by_path = {
+        path: hashlib.sha256(source.encode("utf-8")).hexdigest()
+        for path, source in sorted(runtime_sources.items())
+    }
+    if observed_runtime_sha256_by_path != required_runtime_sha256_by_path:
+        raise SkillContractError(
+            "bulkload runtime sources differ from the exact plan-only policy digest map"
+        )
+    if (
+        observed_runtime_sha256_by_path.get("scripts/bulkload_lib/cli.py")
+        != observed_cli_sha256
+    ):
+        raise SkillContractError(
+            "bulkload CLI source is not the CLI member of the runtime digest map"
         )
     observed_handlers = cli_command_handlers(cli_text)
     if observed_handlers != EXPECTED_CLI_COMMAND_HANDLERS:
@@ -386,11 +434,27 @@ def validate(skill_root: Path, *, allow_runfiles_symlinks: bool = False) -> None
             f"cannot read exact Codex private-state policy: {error}"
         ) from error
     cli_file = skill_root / "scripts" / "bulkload_lib" / "cli.py"
+    runtime_files = sorted(
+        {
+            skill_root / "scripts" / "bulkload.py",
+            *(skill_root / "scripts" / "bulkload_lib").rglob("*.py"),
+        }
+    )
     try:
         cli_text = cli_file.read_text(encoding="utf-8")
+        runtime_sources = {
+            path.relative_to(skill_root).as_posix(): path.read_text(encoding="utf-8")
+            for path in runtime_files
+        }
     except OSError as error:
-        raise SkillContractError(f"cannot read {cli_file}: {error}") from error
-    validate_private_state_policy(policy, cli_text=cli_text)
+        raise SkillContractError(
+            f"cannot read exact Bulkload runtime sources: {error}"
+        ) from error
+    validate_private_state_policy(
+        policy,
+        cli_text=cli_text,
+        runtime_sources=runtime_sources,
+    )
 
     metadata_file = skill_root / "agents" / "openai.yaml"
     try:
@@ -463,10 +527,21 @@ def build_parser():
     doctor = commands.add_parser("doctor")
     doctor.set_defaults(handler=_doctor)
 """
+    valid_runtime_sources = {
+        path: f"# synthetic runtime source: {path}\n"
+        for path in EXPECTED_PRIVATE_STATE_POLICY["runtime_source_sha256_by_path"]
+    }
+    valid_runtime_sources["scripts/bulkload_lib/cli.py"] = valid_cli_text
+    valid_runtime_sha256_by_path = {
+        path: hashlib.sha256(source.encode("utf-8")).hexdigest()
+        for path, source in sorted(valid_runtime_sources.items())
+    }
     validate_private_state_policy(
         copy.deepcopy(EXPECTED_PRIVATE_STATE_POLICY),
         cli_text=valid_cli_text,
+        runtime_sources=valid_runtime_sources,
         expected_cli_sha256=hashlib.sha256(valid_cli_text.encode("utf-8")).hexdigest(),
+        expected_runtime_sha256_by_path=valid_runtime_sha256_by_path,
     )
     invalid_policy = copy.deepcopy(EXPECTED_PRIVATE_STATE_POLICY)
     invalid_policy["ready_for_apply"] = True
@@ -474,9 +549,11 @@ def build_parser():
         validate_private_state_policy(
             invalid_policy,
             cli_text=valid_cli_text,
+            runtime_sources=valid_runtime_sources,
             expected_cli_sha256=hashlib.sha256(
                 valid_cli_text.encode("utf-8")
             ).hexdigest(),
+            expected_runtime_sha256_by_path=valid_runtime_sha256_by_path,
         )
     except SkillContractError:
         pass
@@ -529,15 +606,35 @@ def build_parser():
             validate_private_state_policy(
                 copy.deepcopy(EXPECTED_PRIVATE_STATE_POLICY),
                 cli_text=forbidden_cli_text,
+                runtime_sources=valid_runtime_sources,
                 expected_cli_sha256=hashlib.sha256(
                     valid_cli_text.encode("utf-8")
                 ).hexdigest(),
+                expected_runtime_sha256_by_path=valid_runtime_sha256_by_path,
             )
         except SkillContractError:
             continue
         raise AssertionError(
             "private-state CLI command/alias/handler topology was accepted"
         )
+    mutated_runtime_sources = dict(valid_runtime_sources)
+    mutated_runtime_sources["scripts/bulkload_lib/sessions.py"] += (
+        "\ndef read_private_state():\n    return True\n"
+    )
+    try:
+        validate_private_state_policy(
+            copy.deepcopy(EXPECTED_PRIVATE_STATE_POLICY),
+            cli_text=valid_cli_text,
+            runtime_sources=mutated_runtime_sources,
+            expected_cli_sha256=hashlib.sha256(
+                valid_cli_text.encode("utf-8")
+            ).hexdigest(),
+            expected_runtime_sha256_by_path=valid_runtime_sha256_by_path,
+        )
+    except SkillContractError:
+        pass
+    else:
+        raise AssertionError("private-state runtime source drift was accepted")
     for invalid_json in (
         '{"schema":"first","schema":"second"}',
         '{"value":NaN}',

@@ -261,7 +261,12 @@ def _rename_codex_output_noreplace(
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     if sys.platform == "darwin":
-        rename = libc.renameatx_np
+        try:
+            rename = libc.renameatx_np
+        except AttributeError as error:
+            raise BulkloadError(
+                "atomic no-replace evidence publication is unavailable"
+            ) from error
         rename.argtypes = (
             ctypes.c_int,
             ctypes.c_char_p,
@@ -324,8 +329,10 @@ def _write_pinned_codex_json(
     protected_roots: Sequence[Path] = (),
 ) -> None:
     if output == "-":
-        sys.stdout.buffer.write(canonical_bytes(value) + b"\n")
-        return
+        raise BulkloadError(
+            "Codex evidence output must be an owner-private file; "
+            "stdout publication is forbidden"
+        )
     requested = Path(output).expanduser()
     roots = [
         *protected_roots,
@@ -681,6 +688,7 @@ def _codex_capture(arguments: argparse.Namespace) -> int:
         max_errors=arguments.max_errors,
         max_output_bytes=arguments.max_output_bytes,
     )
+    validate_codex_session_snapshot(snapshot)
     _write_pinned_codex_json(
         arguments.output,
         snapshot,

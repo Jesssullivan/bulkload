@@ -21,7 +21,10 @@ py_test(
     legacy_create_init = 0,
     main = "tests/test_bulkload.py",
     size = "medium",
-    srcs = ["tests/test_bulkload.py"],
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/unprivileged_test_main.py",
+    ],
     deps = [":bulkload_lib"],
 )
 
@@ -70,12 +73,18 @@ py_test(
     size = "small",
     srcs = ["tests/test_ci_contract.py"],
     data = [
+        "BUILD.bazel",
         ".bazelrc",
         ".bazelrc.flywheel",
+        ".bazelversion",
         ".github/actionlint.yaml",
+        ".github/actions/bulkload-public-read-ci/action.yml",
         ".github/workflows/ci.yml",
+        "flake.lock",
+        "flake.nix",
         "justfile",
         "justfile.flywheel",
+        "scripts/ci-public-read-guard.sh",
         "tinyland.repo.json",
     ],
 )

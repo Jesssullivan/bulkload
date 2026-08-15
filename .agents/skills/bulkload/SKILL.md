@@ -245,8 +245,9 @@ and close artifact by distinct capture ID or body digest as appropriate. Any
 blocker suppresses the complete copy candidate list.
 Codex evidence inputs must be owner-only, single-link regular files; the CLI
 pins them through a create-only atomic publish in an owner-private output
-directory. It verifies exact temporary bytes and single-link custody, uses an
-OS no-replace rename, revalidates every input and the requested
+directory. Stdout is never an evidence destination. It verifies exact
+temporary bytes and single-link custody, uses an OS no-replace rename,
+revalidates every input and the requested
 directory/target immediately after publication, and refuses an existing
 target. It never pathname-deletes on a failure: a nonzero result may leave an
 owner-private staging or fail-held final artifact for attended quarantine. It

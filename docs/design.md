@@ -3,6 +3,28 @@
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension
 and plan-only private-state policy in review, 2026-07-28
 
+The public-read CI boundary is separately closed by a repository-local
+front door. It runs only on the literal `tinyland-nix` capability, rejects fork
+pull requests before scheduling, and consumes the public immutable
+`tinyland-inc/ci-templates` v2.13.0 actions at commit
+`139bd4c7deabbe07c918dc764a3b9f054066431d`. It does not import private
+GloriousFlywheel action or flake source. The Nix client process is configured
+for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
+locations remain injected by the runner. A no-value repository preflight
+validates authority-only raw endpoints and clears inherited shell, Nix, and
+Bazel credential channels before the pinned discovery action; post-discovery
+enforcement revalidates the boundary and requires both cache reachability
+claims before any Nix or Bazel command. The exact guard is snapshotted before
+repository-owned source gates. Both Bazel calls are preceded by a fresh digest
+and captured-authority check and receive distinct, newly allocated Bazelisk
+homes plus empty user homes; workspace wrappers, system/user rc drift, and
+netrc credentials fail closed. Client access tokens, user Nix
+configuration, netrc, flake-config acceptance, post-build hooks, secret signing
+keys, and plugins are cleared. This source boundary does not attest the
+independent multi-user Nix daemon's own HTTP authentication or post-build
+policy. Bazel cache publication is false for every pull request and tag and
+true only for a trusted push to `main`; remote execution is never selected.
+
 ## 1. Decision
 
 Build `bulkload` as a manifest-first controller and portable Agent Skill for
@@ -347,7 +369,10 @@ respectively. Each snapshot binds a non-secret, operator-assigned
 host-authority UUID to the resolved root, its device/inode lineage, and typed
 directory records. One authority ID names one physical filesystem namespace
 even when a hostname changes or storage is shared; an independent namespace
-receives a different ID.
+receives a different ID. The serialized non-private-directory count covers
+only those portable descendant directory records. The capture validates the
+root separately as namespace authority; it is not itself a catalog member or
+part of that descendant count.
 
 The scanner holds descriptor authority while traversing, rejects duplicate
 JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
@@ -378,9 +403,10 @@ planning reads bounded exact-`0600` single-link evidence through pinned
 descriptors and publishes into a pinned owner-private directory with an OS
 no-replace rename. It verifies exact staging bytes and single-link custody,
 revalidates inputs plus the requested directory/target after publication, and
-never pathname-deletes on failure. A nonzero result can therefore retain an
-owner-private staging or fail-held final artifact; it is not authority and
-requires attended quarantine.
+never permits stdout as an evidence destination or pathname-deletes on
+failure. A nonzero result can therefore retain an owner-private staging or
+fail-held final artifact; it is not authority and requires attended
+quarantine.
 
 The exact private-state policy lives in
 `.agents/skills/bulkload/references/codex-private-state-policy.v1.json`.
@@ -388,12 +414,15 @@ It classifies Codex auth and all provider-owned SQLite families as
 copy-eligible and opt-in, while explicitly setting `implementation=plan-only`
 and `ready_for_apply=false`. The validator parses the CLI and requires the
 exact command, alias, and handler topology for the entire surface, then checks
-the policy's exact Codex subset. The policy also pins the SHA-256 of the entire
-CLI source, closing alternate Python syntax and hidden handler construction
-outside the recognized parser shape. A private-state reader or executor
-therefore cannot hide behind a non-prefixed command, alias, rebound handler, or
-obfuscated parser without an explicit reviewed contract change. The extension
-deliberately exposes no session, auth, or SQLite apply command.
+the policy's exact Codex subset. The policy pins a complete path-to-SHA-256 map
+for the executable Python runtime, including the entrypoint and every
+`bulkload_lib` module, and separately binds the CLI member to that same map.
+This closes alternate Python syntax, imported helper drift, and hidden handler
+construction outside the recognized parser shape. A private-state reader or
+executor therefore cannot hide behind a non-prefixed command, alias, rebound
+handler, imported runtime change, or obfuscated parser without an explicit
+reviewed contract change. The extension deliberately exposes no session,
+auth, or SQLite apply command.
 
 ## 8. Relationship to TCFS
 
