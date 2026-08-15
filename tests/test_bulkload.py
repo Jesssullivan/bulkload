@@ -43,6 +43,7 @@ from bulkload_lib.scanner import (  # noqa: E402
     capture_git_runtime,
     capture_snapshot,
 )
+from tests.unprivileged_test_main import run_unittest_main  # noqa: E402
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -112,6 +113,10 @@ def make_pair(root: Path) -> tuple[Path, Path]:
 
 
 class BulkloadProtocolTest(unittest.TestCase):
+    def test_mutation_suite_runs_as_an_unprivileged_user(self) -> None:
+        if hasattr(os, "geteuid"):
+            self.assertNotEqual(os.geteuid(), 0)
+
     def test_stable_plan_apply_and_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2300,4 +2305,4 @@ class BulkloadProtocolTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_unittest_main()
