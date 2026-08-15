@@ -1200,6 +1200,7 @@ class CiContractTest(unittest.TestCase):
     def test_frontdoor_files_are_bazel_data_and_profile_is_endpoint_free(self) -> None:
         build = (self.root / "BUILD.bazel").read_text(encoding="utf-8")
         for path in (
+            "BUILD.bazel",
             LOCAL_ACTION_PATH,
             GUARD_PATH,
             ".bazelrc",

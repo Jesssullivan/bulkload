@@ -16,6 +16,7 @@ from unittest import mock
 sys.dont_write_bytecode = True
 
 import bulkload_lib.cli as bulkload_cli  # noqa: E402
+from bulkload_lib import private_runtime  # noqa: E402
 from bulkload_lib.cli import main as cli_main  # noqa: E402
 from bulkload_lib.executor import (  # noqa: E402
     apply_plan,
@@ -60,7 +61,11 @@ from bulkload_lib.sessions import (  # noqa: E402
     validate_codex_session_union_plan,
     validate_codex_session_union_plan_against_inputs,
 )
-from tests.unprivileged_test_main import run_unittest_main  # noqa: E402
+from tests.unprivileged_test_main import (  # noqa: E402
+    _assert_regular_source,
+    _remove_readonly_tree,
+    run_unittest_main,
+)
 
 TEST_HOST_AUTHORITY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 OTHER_HOST_AUTHORITY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -272,6 +277,42 @@ class BulkloadProtocolTest(unittest.TestCase):
                 path = Path(os.environ[variable])
                 self.assertEqual(path.stat().st_uid, os.getuid())
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            runtime_stage = Path(os.environ["BULKLOAD_TEST_RUNTIME_STAGE"])
+            self.assertEqual(runtime_stage.stat().st_uid, 0)
+            self.assertEqual(stat.S_IMODE(runtime_stage.stat().st_mode), 0o555)
+            self.assertTrue(
+                Path(private_runtime.__file__).resolve().is_relative_to(runtime_stage)
+            )
+            self.assertFalse(
+                any(path.is_symlink() for path in runtime_stage.rglob("*"))
+            )
+            for path in runtime_stage.rglob("*"):
+                expected_mode = 0o555 if path.is_dir() else 0o444
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
+            with self.assertRaises(PermissionError):
+                (runtime_stage / "unprivileged-write-probe").write_text("forbidden")
+
+    def test_readonly_runtime_stage_cleanup_reopens_owned_tree(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="bulkload-cleanup-contract-"))
+        nested = root / "scripts" / "runtime.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("pass\n", encoding="utf-8")
+        nested.chmod(0o444)
+        nested.parent.chmod(0o555)
+        root.chmod(0o555)
+        _remove_readonly_tree(root)
+        self.assertFalse(root.exists())
+
+    def test_runtime_stage_rejects_symlinked_source_components(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scripts" / "runtime.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("pass\n", encoding="utf-8")
+            alias = root / "scripts-alias"
+            alias.symlink_to(source.parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "contains a symlink"):
+                _assert_regular_source(root, alias / source.name)
 
     def test_apply_refuses_root_before_creating_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
