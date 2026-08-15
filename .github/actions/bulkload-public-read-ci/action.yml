@@ -143,7 +143,7 @@ runs:
         test -z "$(nix config show plugin-files)"
         nix config show substituters | tr ' ' '\n' | grep -Fx -- "${ATTIC_SERVER%/}/${ATTIC_CACHE}"
         nix config show trusted-public-keys | tr ' ' '\n' | grep -Fx -- "$ATTIC_PUBLIC_KEY"
-        just flake-check
+        nix flake check --no-build --no-write-lock-file
         nix develop --no-write-lock-file .#default --command just ci-source
 
     - name: Revalidate immutable Bazel build authority

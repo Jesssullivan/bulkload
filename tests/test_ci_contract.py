@@ -20,8 +20,11 @@ LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
-ACTION_SHA256 = "86f7106b1a955a59235c13bab482311b2817a03e6faad516def596a903f9d35d"
+ACTION_SHA256 = "1645f336958e224b631383bd92c65d4dfe6c31e5340d1ccfd44d3a856c95c34a"
 GUARD_SHA256 = "f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71"
+SOURCE_GATE_STEP_SHA256 = (
+    "3ff25eb59372d709639c3ab2bbda958af8a2c02278d84dab7a3aea98b4ff75a6"
+)
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
     "15aa8306cc530bbc4d143dd7a6a2f0cfd3efbed19c01503d35bbec0c5e7cd357"
@@ -175,6 +178,16 @@ def extract_uses(source: str) -> list[str]:
     return canonical
 
 
+def extract_action_step(action: str, name: str) -> str:
+    marker = f"    - name: {name}\n"
+    if action.count(marker) != 1:
+        raise ContractError(f"composite step inventory drifted: {name}")
+    start = action.index(marker)
+    next_step = action.find("    - name: ", start + len(marker))
+    end = len(action) if next_step == -1 else next_step
+    return action[start:end]
+
+
 def validate_workflow(workflow: str) -> None:
     validate_job_routing(workflow)
     validate_permissions(workflow)
@@ -261,6 +274,10 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     }:
         raise ContractError("local public-read action input inventory drifted")
 
+    source_gate_step = extract_action_step(action, "Run repository-owned source gates")
+    if sha256(source_gate_step) != SOURCE_GATE_STEP_SHA256:
+        raise ContractError("repository source-gate step mapping drifted")
+
     nix_setup = (
         "tinyland-inc/ci-templates/.github/actions/nix-setup@" + CI_TEMPLATES_REV
     )
@@ -286,6 +303,11 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             raise ContractError(
                 f"local action contains forbidden authority: {forbidden}"
             )
+    if re.search(
+        r"""(?m)^ {6}(?:if|continue-on-error|"if"|"continue-on-error"|'if'|'continue-on-error')\s*:""",
+        action,
+    ):
+        raise ContractError("step-level conditions and error suppression are forbidden")
     if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", action):
         raise ContractError("local action must not bake a deployment endpoint")
     if re.search(r"type\s*=\s*gha", action, re.IGNORECASE):
@@ -305,7 +327,6 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         '        test -z "$(nix config show post-build-hook)"',
         '        test -z "$(nix config show secret-key-files)"',
         '        test -z "$(nix config show plugin-files)"',
-        "        just flake-check",
         "        nix develop --no-write-lock-file .#default --command just ci-source",
         "        command: build",
         "        targets: //:bulkload",
@@ -415,7 +436,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     preflight = action.index('/bin/bash "$BULKLOAD_GUARD_PATH" preflight')
     setup = action.index(f"uses: {nix_setup}")
     enforce = action.index('/bin/bash "$BULKLOAD_GUARD_PATH" enforce')
-    source = action.index("just flake-check")
+    source = action.index("\n    - name: Run repository-owned source gates\n")
     bazel_guards = [
         match.start()
         for match in re.finditer(
@@ -789,7 +810,57 @@ class CiContractTest(unittest.TestCase):
             ),
             self.action.replace("config: flywheel", "config: flywheel-executor", 1),
             self.action.replace("targets: //:tests", "targets: //..."),
-            self.action.replace("        just flake-check\n", ""),
+            self.action.replace(
+                "        nix flake check --no-build --no-write-lock-file\n", ""
+            ),
+            self.action.replace(
+                "        nix flake check --no-build --no-write-lock-file",
+                "        nix flake check --no-build --no-write-lock-file || true",
+            ),
+            self.action.replace(
+                "        nix flake check --no-build --no-write-lock-file",
+                "        nix flake check --no-build --no-write-lock-file &",
+            ),
+            self.action.replace(
+                "        nix flake check --no-build --no-write-lock-file",
+                "        exit 0\n"
+                "        nix flake check --no-build --no-write-lock-file",
+            ),
+            self.action.replace(
+                '        set -euo pipefail\n        test -z "${NIX_ACCESS_TOKENS:-}"\n',
+                '        set +e\n        test -z "${NIX_ACCESS_TOKENS:-}"\n',
+            ),
+            self.action.replace(
+                "        nix flake check --no-build --no-write-lock-file",
+                "        nix() { return 0; }\n"
+                "        nix flake check --no-build --no-write-lock-file",
+            ),
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n",
+                "    - name: Run repository-owned source gates\n"
+                "      continue-on-error: true\n",
+            ),
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n",
+                "    - name: Run repository-owned source gates\n"
+                '      "continue-on-error": true\n',
+            ),
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n",
+                "    - name: Run repository-owned source gates\n"
+                "      if: ${{ false }}\n",
+            ),
+            self.action.replace("      shell: bash\n", "      shell: /bin/true {0}\n"),
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n      shell: bash\n",
+                "    - name: Run repository-owned source gates\n"
+                "      shell: /bin/true {0}\n",
+            ).replace(
+                "    - name: Revalidate immutable Bazel build authority\n",
+                "    - name: Revalidate immutable Bazel build authority\n"
+                "      shell: bash\n",
+                1,
+            ),
             self.action.replace(
                 '/bin/bash "$BULKLOAD_GUARD_PATH" preflight',
                 '/bin/bash "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
