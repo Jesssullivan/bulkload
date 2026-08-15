@@ -2151,7 +2151,11 @@ class CodexPrivateApplyTest(unittest.TestCase):
             self.assertTrue(prior_preflight.is_dir())
             with self.assertRaisesRegex(
                 BulkloadError,
-                "overlaps .*original evidence",
+                # Linux catches the lexical ancestor first. macOS canonicalizes
+                # /var through /private/var and catches the same directory in
+                # the descriptor-backed protected-artifact pass instead.
+                "^recovery preflight capture overlaps "
+                "(?:original recovery evidence|protected original evidence 3)$",
             ):
                 fixture.recover(
                     paths["journal"],
