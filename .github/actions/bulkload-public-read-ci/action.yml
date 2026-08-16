@@ -69,7 +69,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -126,7 +125,7 @@ runs:
         USE_BAZEL_VERSION: ""
       run: |
         set -euo pipefail
-        expected=14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820
+        expected=327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336
         source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
         [[ "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" == "$expected" ]]
         guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
@@ -169,7 +168,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -238,7 +236,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- preflight
 
     - name: Discover sanctioned runner endpoint authority
@@ -270,7 +268,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -357,7 +354,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -428,7 +424,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- enforce
 
     - name: Verify effective Nix client authority
@@ -459,7 +455,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -558,7 +553,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -621,7 +615,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
     - name: Build the Bulkload binary through the public Flywheel action
@@ -653,7 +647,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -734,7 +727,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -797,7 +789,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
     - name: Test the complete Bulkload Bazel graph through the public Flywheel action
@@ -829,7 +821,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""
@@ -909,7 +900,6 @@ runs:
         NIX_SSL_CERT_FILE: ""
         NIX_CURL_FLAGS: ""
         NIX_HASHED_MIRRORS: ""
-        GRPC_PROXY_EXP: ""
         JAVA_TOOL_OPTIONS: ""
         JDK_JAVA_OPTIONS: ""
         _JAVA_OPTIONS: ""

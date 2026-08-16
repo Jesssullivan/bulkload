@@ -26,6 +26,7 @@ require_forbidden_environment_names_absent() {
     case "$name" in
       BASH_FUNC_*%%) die "exported Bash functions are forbidden" ;;
       GIT_*) die "Git environment overrides are forbidden" ;;
+      GRPC_PROXY_EXP) die "gRPC proxy override must be absent" ;;
       JUST_*) die "Just environment overrides are forbidden" ;;
       NIX_MIRRORS_*) die "dynamic Nix mirror overrides are forbidden" ;;
       SHELLCHECK_OPTS) die "ShellCheck environment overrides are forbidden" ;;
@@ -194,7 +195,6 @@ require_empty "uppercase HTTPS proxy" "${HTTPS_PROXY:-}"
 require_empty "uppercase FTP proxy" "${FTP_PROXY:-}"
 require_empty "uppercase all-protocol proxy" "${ALL_PROXY:-}"
 require_empty "uppercase proxy bypass" "${NO_PROXY:-}"
-require_empty "gRPC proxy override" "${GRPC_PROXY_EXP:-}"
 require_empty "Java tool options" "${JAVA_TOOL_OPTIONS:-}"
 require_empty "JDK Java options" "${JDK_JAVA_OPTIONS:-}"
 require_empty "legacy Java options" "${_JAVA_OPTIONS:-}"
@@ -348,7 +348,6 @@ emit_common_environment() {
   printf 'FTP_PROXY=\n'
   printf 'ALL_PROXY=\n'
   printf 'NO_PROXY=\n'
-  printf 'GRPC_PROXY_EXP=\n'
   printf 'SHELLOPTS=\n'
   printf 'BASHOPTS=\n'
   printf 'PS4=\n'

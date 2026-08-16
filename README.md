@@ -91,6 +91,14 @@ path; after the pinned setup action contributes that profile through
 `GITHUB_PATH`, each step supplies only the reviewed system suffix. The guard
 refuses any other effective path.
 
+`GRPC_PROXY_EXP` is an absence-only fence, not an empty-value fence: grpc-java
+treats a present-empty value as an active proxy request and resolves it to
+localhost port 80. The guard scans the NUL-framed process environment and
+rejects both present-empty and nonempty forms before Nix setup and again before
+the Java/gRPC/Bazel consumers. Successful runner command files never create
+the variable. The fixed-Git fetch remains governed by its separate minimal
+transport environment.
+
 The exact guard is snapshotted before the selected repository consumer, then
 its captured bytes, digest, and authority are rechecked immediately before the
 selected Bazel call. Each Bazel leg receives a new private Bazelisk home, empty
@@ -104,8 +112,9 @@ route. This is same-UID authority hygiene, not a filesystem sandbox.
 The Nix client uses the canonical direct `/nix/store` with `store = local` and
 `allow-symlinked-store = false`. Its only substituters and public keys are the
 runner-injected `bulkload-ci` `main` cache plus `cache.nixos.org`; signatures
-remain required. Store, daemon-socket, mirror, proxy, certificate, curl, JVM,
-Bazel shell, and Bazelisk command selectors are empty. Trusted substituters,
+remain required. Store, daemon-socket, mirror, HTTP-family proxy, certificate,
+curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
+`GRPC_PROXY_EXP` is absent. Trusted substituters,
 remote builders, build and diff hooks, access tokens, user configuration,
 netrc, flake-provided configuration, secret signing keys, and plugins are also
 cleared and checked from effective Nix settings. Ambient `GIT_*`, `JUST_*`,

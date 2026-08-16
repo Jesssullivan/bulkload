@@ -24,13 +24,13 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "a3e64f622c8d045af2036ec8a5cda5e4569924353c2fc5ede6d91521cbf5eebc"
-GUARD_SHA256 = "14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820"
+ACTION_SHA256 = "fcfd0fd05eb41074e4a6c186939cfb156036ed6b1c2b06cdbe8717a2200129ce"
+GUARD_SHA256 = "327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336"
 SOURCE_GATE_STEP_SHA256 = (
-    "dc9d6a05dc5b168ac009a6e91655d316e9392d7f04aee157fafd90b1a3288569"
+    "96893435532ebb5d5e4b53e813e2069a28c8c23303a70c1bb9b1a9fb4071bdf2"
 )
 EFFECTIVE_NIX_STEP_SHA256 = (
-    "7cbbfea8b64796ffa0e0abe3704e502a9b2bda1e4e9864c2bae7fa803916c344"
+    "70c1bd9b875355d76e8649d2904f1aa82f4b6004041bb2c4300980ef79be4a4c"
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
@@ -433,6 +433,8 @@ def parse_job_env(workflow: str) -> list[tuple[str, str]]:
 def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
     if exact_digest and sha256(workflow) != WORKFLOW_SHA256:
         raise ContractError("CI workflow digest drifted")
+    if re.search(r"(?i)(?<![A-Za-z0-9_])GRPC_PROXY_EXP(?![A-Za-z0-9_])", workflow):
+        raise ContractError("CI workflow must not declare the gRPC proxy override")
     validate_job_routing(workflow)
     validate_permissions(workflow)
     if HOSTED_RUNNER_PATTERN.search(workflow):
@@ -847,6 +849,8 @@ def parse_action_inputs(action: str) -> set[str]:
 def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     if exact_digest and sha256(action) != ACTION_SHA256:
         raise ContractError("local public-read action digest drifted")
+    if re.search(r"(?i)(?<![A-Za-z0-9_])GRPC_PROXY_EXP(?![A-Za-z0-9_])", action):
+        raise ContractError("local public-read action must keep GRPC_PROXY_EXP absent")
     if parse_action_inputs(action) != {
         "gate",
         "event-name",
@@ -1111,7 +1115,6 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "NIX_SSL_CERT_FILE",
         "NIX_CURL_FLAGS",
         "NIX_HASHED_MIRRORS",
-        "GRPC_PROXY_EXP",
         "JAVA_TOOL_OPTIONS",
         "JDK_JAVA_OPTIONS",
         "_JAVA_OPTIONS",
@@ -1543,7 +1546,7 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'require_empty "Nix TLS certificate override" "${NIX_SSL_CERT_FILE:-}"',
         'require_empty "Nix curl flags" "${NIX_CURL_FLAGS:-}"',
         'require_empty "Nix hashed mirrors" "${NIX_HASHED_MIRRORS:-}"',
-        'require_empty "gRPC proxy override" "${GRPC_PROXY_EXP:-}"',
+        'GRPC_PROXY_EXP) die "gRPC proxy override must be absent" ;;',
         'require_empty "Java tool options" "${JAVA_TOOL_OPTIONS:-}"',
         'require_empty "Bazel shell override" "${BAZEL_SH:-}"',
         'require_empty "Bazelisk no-JDK selector" "${BAZELISK_NOJDK:-}"',
@@ -1645,6 +1648,8 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
     for declaration in required:
         if declaration not in guard:
             raise ContractError(f"guard contract drifted: {declaration}")
+    if guard.count("GRPC_PROXY_EXP") != 1:
+        raise ContractError("gRPC proxy exact-absence fence drifted")
 
     preflight_nix_config_match = re.search(
         r'readonly preflight_nix_config="([^\"]*)"', guard
@@ -1883,10 +1888,10 @@ class CiContractTest(unittest.TestCase):
             1,
         )
         action_collision = self.action.replace(
-            '        GRPC_PROXY_EXP: ""\n',
+            '        JAVA_TOOL_OPTIONS: ""\n',
             '        ftp_proxy: ""\n'
             '        FTP_PROXY: ""\n'
-            '        GRPC_PROXY_EXP: ""\n',
+            '        JAVA_TOOL_OPTIONS: ""\n',
             1,
         )
         for source, validator in (
@@ -1898,6 +1903,60 @@ class CiContractTest(unittest.TestCase):
                     ContractError, "environment key is case-insensitively duplicated"
                 ):
                     validator(source, exact_digest=False)
+
+    def test_grpc_proxy_requires_exact_absence(self) -> None:
+        grpc_name = "GRPC_PROXY_EXP"
+        grpc_pattern = re.compile(
+            r"(?i)(?<![A-Za-z0-9_])GRPC_PROXY_EXP(?![A-Za-z0-9_])"
+        )
+        self.assertIsNone(grpc_pattern.search(self.workflow))
+        self.assertIsNone(grpc_pattern.search(self.action))
+
+        def add_consumer_environment(
+            action: str, step_name: str, key: str, value: str
+        ) -> str:
+            step = extract_action_step(action, step_name)
+            mutated_step = step.replace(
+                "      env:\n", f"      env:\n        {key}: {value}\n", 1
+            )
+            self.assertNotEqual(mutated_step, step)
+            return action.replace(step, mutated_step, 1)
+
+        action_variants = [
+            add_consumer_environment(self.action, step_name, grpc_name, value)
+            for step_name in (
+                TERMINAL_CONSUMERS["build"],
+                TERMINAL_CONSUMERS["test"],
+            )
+            for value in ('""', "dns:///proxy.invalid")
+        ]
+        action_variants.extend(
+            (
+                add_consumer_environment(
+                    self.action,
+                    "Preflight raw runner endpoint authority",
+                    grpc_name.lower(),
+                    '""',
+                ),
+                self.action.replace(
+                    "        set -euo pipefail\n",
+                    "        set -euo pipefail\n        export GRPC_PROXY_EXP=\n",
+                    1,
+                ),
+            )
+        )
+        for index, unsafe in enumerate(action_variants):
+            with self.subTest(action_variant=index):
+                with self.assertRaisesRegex(ContractError, "GRPC_PROXY_EXP absent"):
+                    validate_local_action(unsafe, exact_digest=False)
+
+        workflow_variant = self.workflow.replace(
+            '      ATTIC_TOKEN: ""\n',
+            '      GRPC_PROXY_EXP: ""\n      ATTIC_TOKEN: ""\n',
+            1,
+        )
+        with self.assertRaisesRegex(ContractError, "gRPC proxy override"):
+            validate_workflow(workflow_variant, exact_digest=False)
 
     def test_each_gate_has_one_semantically_terminal_repository_consumer(self) -> None:
         expected = {
@@ -2489,11 +2548,6 @@ class CiContractTest(unittest.TestCase):
                 "        NIX_REMOTE: local", "        NIX_REMOTE: daemon", 1
             ),
             self.action.replace(
-                '        GRPC_PROXY_EXP: ""',
-                "        GRPC_PROXY_EXP: dns:///proxy.invalid",
-                1,
-            ),
-            self.action.replace(
                 '        BAZEL_SH: ""', "        BAZEL_SH: /tmp/unaudited-sh", 1
             ),
             self.action.replace(
@@ -2580,8 +2634,8 @@ class CiContractTest(unittest.TestCase):
             self.guard.replace('NIX_REMOTE:-}" local', 'NIX_REMOTE:-}" daemon'),
             self.guard.replace(REVIEWED_PATH, "/tmp/unaudited:/usr/bin:/bin"),
             self.guard.replace(
-                'require_empty "gRPC proxy override" "${GRPC_PROXY_EXP:-}"',
-                'printf "%s\\n" "${GRPC_PROXY_EXP:-}"',
+                '      GRPC_PROXY_EXP) die "gRPC proxy override must be absent" ;;\n',
+                "",
             ),
             self.guard.replace(
                 'require_empty "Bazel shell override" "${BAZEL_SH:-}"',
@@ -2756,7 +2810,6 @@ class CiContractTest(unittest.TestCase):
                 "BAZELISK_SHUTDOWN": "",
                 "USE_BAZEL_FALLBACK_VERSION": "",
                 "BAZEL_SH": "",
-                "GRPC_PROXY_EXP": "",
                 "TEST_TMPDIR": "",
             }
 
@@ -2796,7 +2849,6 @@ class CiContractTest(unittest.TestCase):
             self.assertIn("require-sigs = true\n", preflight_emitted)
             self.assertIn("BAZEL_CREDENTIAL_HELPER=\n", preflight_emitted)
             for key in (
-                "GRPC_PROXY_EXP",
                 "JAVA_TOOL_OPTIONS",
                 "BAZEL_SH",
                 "BAZELISK_NOJDK",
@@ -2806,6 +2858,7 @@ class CiContractTest(unittest.TestCase):
                 "TEST_TMPDIR",
             ):
                 self.assertIn(f"{key}=\n", preflight_emitted)
+            self.assertNotIn("GRPC_PROXY_EXP", preflight_emitted)
             for key in (
                 "NIX_CACHE_HOME",
                 "NIX_CONFIG_HOME",
@@ -2836,6 +2889,7 @@ class CiContractTest(unittest.TestCase):
             self.assertIn("post-build-hook =\n", emitted)
             self.assertIn("secret-key-files =\n", emitted)
             self.assertIn("plugin-files =\n", emitted)
+            self.assertNotIn("GRPC_PROXY_EXP", emitted)
             authority_outputs = github_output.read_text()
             self.assertIn(
                 "attic_server=https://cache.example.invalid\n", authority_outputs
@@ -2847,6 +2901,7 @@ class CiContractTest(unittest.TestCase):
             self.assertIn("bazel_remote_upload=false\n", authority_outputs)
             self.assertIn("trusted_path=", authority_outputs)
             self.assertIn("nix_config<<BULKLOAD_NIX_OUTPUT_", authority_outputs)
+            self.assertNotIn("GRPC_PROXY_EXP", authority_outputs)
 
             bazel_env = dict(base_env)
             bazel_env.update(
@@ -2894,6 +2949,29 @@ class CiContractTest(unittest.TestCase):
                 )
             )
             self.assertNotEqual(build_home, test_home)
+            self.assertNotIn("GRPC_PROXY_EXP", github_env.read_text())
+            self.assertNotIn("GRPC_PROXY_EXP", github_output.read_text())
+
+            absence_cases = (
+                ("preflight", "preflight", base_env),
+                ("enforce", "enforce", base_env),
+                ("bazel-build", "bazel", bazel_env),
+                ("bazel-test", "bazel", test_bazel_env),
+            )
+            for label, mode, clean_env in absence_cases:
+                for value in ("", "dns:///private-proxy.invalid"):
+                    unsafe_env = dict(clean_env)
+                    unsafe_env["GRPC_PROXY_EXP"] = value
+                    before_env = github_env.read_text()
+                    before_output = github_output.read_text()
+                    with self.subTest(mode=label, grpc_proxy=value or "present-empty"):
+                        result = run_guard(mode, unsafe_env, check=False)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(github_env.read_text(), before_env)
+                        self.assertEqual(github_output.read_text(), before_output)
+                        if value:
+                            self.assertNotIn(value, result.stdout)
+                            self.assertNotIn(value, result.stderr)
 
             main_env = dict(base_env)
             main_env.update(
@@ -2928,7 +3006,6 @@ class CiContractTest(unittest.TestCase):
                 ("PATH", "/usr/bin:/bin"),
                 ("HOME", "/tmp"),
                 ("NIX_CACHE_HOME", "/tmp/cache"),
-                ("GRPC_PROXY_EXP", "dns:///proxy.invalid"),
                 ("BAZEL_SH", "/tmp/unaudited-sh"),
                 ("BAZELISK_NOJDK", "true"),
                 ("BAZELISK_CLEAN", "expunge"),

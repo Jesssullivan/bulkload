@@ -74,6 +74,16 @@ reviewed Nix profile plus the fixed system path; after discovery contributes
 that profile through `GITHUB_PATH`, step mappings carry only the reviewed
 system suffix. The guard rejects any other effective path.
 
+`GRPC_PROXY_EXP` is different from the empty-valued transport fences:
+grpc-java treats even a present-empty value as an active proxy request and
+resolves it to localhost port 80. It must therefore be exactly absent. The
+guard inspects the NUL-framed process environment and rejects both
+present-empty and nonempty forms before Nix setup, after discovery, and at each
+immediate Bazel boundary. The local composite never declares or persists the
+name, so Nix and the Java/gRPC/Bazel consumers receive absence rather than an
+empty record. Fixed-Git source fetching remains inside its separate minimal
+transport fence.
+
 The exact guard is snapshotted before the selected repository consumer. Each
 Bazel leg performs a fresh captured-byte, digest, and authority check
 immediately before its terminal call and receives a new private Bazelisk home,
@@ -88,8 +98,9 @@ sandbox; exact source review remains part of the trust boundary.
 The Nix client binds the canonical direct `/nix/store` with `store = local` and
 `allow-symlinked-store = false`. Its exact substituter/key inventory is the
 runner-injected public `main` Attic cache plus `cache.nixos.org`, with
-signatures required. Store, daemon-socket, mirror, proxy, certificate, curl,
-JVM, Bazel shell, and Bazelisk command selectors are empty. Trusted
+signatures required. Store, daemon-socket, mirror, HTTP-family proxy,
+certificate, curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
+`GRPC_PROXY_EXP` is absent. Trusted
 substituters, remote builders, build and diff hooks, access tokens, user Nix
 configuration, netrc, flake-config acceptance, secret signing keys, and
 plugins are cleared and verified from effective settings. Ambient `GIT_*`,
