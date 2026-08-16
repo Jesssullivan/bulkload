@@ -15,15 +15,15 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-CHECKOUT_REV = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+WORKFLOW_SHA256 = "eb33c848448423ca3afdca6b2626acb4f989a6a57bde52c501d69b76e41f4333"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
-ACTION_SHA256 = "fb038c7d8ddefd0a2a189adfb7c492305fec2ce685fba51c8ae6db412d751a4f"
-GUARD_SHA256 = "4b0e814836085de71a4fbd70aded6aead05c79c5996c0598f321b536eb222201"
+ACTION_SHA256 = "13b9db516dc91c1d0081ed785c074d4a15328c6bcedd9415fe14287c3dccc49e"
+GUARD_SHA256 = "ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d"
 SOURCE_GATE_STEP_SHA256 = (
-    "8591f4da8535259191d5747c214e809c60af35ef19a9dbf2f1332f3119edd2d5"
+    "9b930d781e10acbb1beaf64255d65ec82e7e24ab570c6d5fb71052627aa18ac0"
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
@@ -50,6 +50,37 @@ UPLOAD_EXPRESSION = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
     "&& 'true' || 'false' }}"
 )
+MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
+TERMINAL_GATES = ("source", "build", "test")
+TERMINAL_CONSUMERS = {
+    "source": "Run repository-owned source gates",
+    "build": "Build the Bulkload binary through the public Flywheel action",
+    "test": "Test the complete Bulkload Bazel graph through the public Flywheel action",
+}
+ACTION_STEP_GATES = {
+    "Revalidate immutable Bazel build authority": "build",
+    TERMINAL_CONSUMERS["build"]: "build",
+    "Revalidate immutable Bazel test authority": "test",
+    TERMINAL_CONSUMERS["test"]: "test",
+    TERMINAL_CONSUMERS["source"]: "source",
+}
+JOB_FENCED_ACTION_ENV = {
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "BASH_XTRACEFD",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SSLKEYLOGFILE",
+}
 AUDITED_JOB_RUNNERS = {"test": "tinyland-nix"}
 HOSTED_RUNNER_PATTERN = re.compile(
     r"(?:ubuntu|macos|windows)-(?:latest|[0-9][A-Za-z0-9.-]*)", re.IGNORECASE
@@ -137,6 +168,17 @@ def validate_job_routing(workflow: str) -> None:
         if properties.get("if") != [SAME_REPOSITORY_GUARD]:
             raise ContractError(f"job {job} must reject fork pull requests")
 
+    matrix = (
+        "    strategy:\n"
+        "      fail-fast: false\n"
+        "      matrix:\n"
+        "        gate: [source, build, test]\n"
+    )
+    if workflow.count(matrix) != 1:
+        raise ContractError("terminal gate matrix must be one exact literal inventory")
+    if workflow.count("matrix:") != 1 or workflow.count(MATRIX_GATE_EXPRESSION) != 2:
+        raise ContractError("terminal gate matrix authority escaped its audited scope")
+
     declarations = [
         line
         for line in workflow.splitlines()
@@ -188,7 +230,167 @@ def extract_action_step(action: str, name: str) -> str:
     return action[start:end]
 
 
-def validate_workflow(workflow: str) -> None:
+def parse_action_step_env(step: str) -> list[tuple[str, str]]:
+    lines = step.splitlines()
+    markers: list[int] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("      ") or line.startswith("       "):
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        field = re.fullmatch(r"      ([a-z][a-z0-9-]*):(.*)", line)
+        if field is None:
+            raise ContractError(
+                "composite step fields must use canonical block mapping syntax"
+            )
+        if field.group(1) == "env":
+            if field.group(2):
+                raise ContractError(
+                    "composite step env must use canonical block mapping syntax"
+                )
+            markers.append(index)
+    if len(markers) > 1:
+        raise ContractError("composite step declares more than one env mapping")
+    if not markers:
+        return []
+    parsed: list[tuple[str, str]] = []
+    for line in lines[markers[0] + 1 :]:
+        if not line.startswith("        ") or line.startswith("          "):
+            break
+        match = re.fullmatch(r"        ([^:#][^:]*): (.+)", line)
+        if match is None:
+            raise ContractError("composite step env must use canonical scalar entries")
+        key = match.group(1).strip()
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+            key = key[1:-1]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_%]*", key) is None:
+            raise ContractError("composite step env key is not auditable")
+        parsed.append((key, match.group(2)))
+    return parsed
+
+
+def validate_action_step_environment_fences(action: str) -> None:
+    for name in re.findall(r"(?m)^    - name: (.+)$", action):
+        for key, value in parse_action_step_env(extract_action_step(action, name)):
+            canonical = key.upper()
+            if canonical in {"BASH_ENV", "ENV"}:
+                if value != "/dev/null":
+                    raise ContractError(f"step overrides the {canonical} shell fence")
+                continue
+            if canonical in JOB_FENCED_ACTION_ENV or canonical.startswith("BASH_FUNC_"):
+                raise ContractError(f"step overrides job-fenced environment: {key}")
+
+
+def action_step_condition(step: str) -> str | None:
+    conditions = re.findall(r"(?m)^      if: (.+)$", step)
+    if len(conditions) > 1:
+        raise ContractError("composite step declares more than one condition")
+    return conditions[0] if conditions else None
+
+
+def selected_action_path(action: str, gate: str) -> list[str]:
+    if gate not in TERMINAL_GATES:
+        raise ContractError(f"unknown terminal gate: {gate}")
+    names = re.findall(r"(?m)^    - name: (.+)$", action)
+    selected: list[str] = []
+    for name in names:
+        condition = action_step_condition(extract_action_step(action, name))
+        expected_gate = ACTION_STEP_GATES.get(name)
+        if expected_gate is None:
+            if condition is not None:
+                raise ContractError(f"common step is conditional: {name}")
+            selected.append(name)
+            continue
+        expected_condition = f"${{{{ inputs.gate == '{expected_gate}' }}}}"
+        if condition != expected_condition:
+            raise ContractError(f"terminal gate condition drifted: {name}")
+        if gate == expected_gate:
+            selected.append(name)
+    return selected
+
+
+def validate_terminal_consumer_paths(action: str) -> None:
+    common = [
+        "Validate the terminal gate selection",
+        "Snapshot the exact public-read guard",
+        "Preflight raw runner endpoint authority",
+        "Discover sanctioned runner endpoint authority",
+        "Enforce the discovered public-read boundary",
+    ]
+    expected_paths = {
+        "source": [*common, TERMINAL_CONSUMERS["source"]],
+        "build": [
+            *common,
+            "Revalidate immutable Bazel build authority",
+            TERMINAL_CONSUMERS["build"],
+        ],
+        "test": [
+            *common,
+            "Revalidate immutable Bazel test authority",
+            TERMINAL_CONSUMERS["test"],
+        ],
+    }
+    consumer_names = set(TERMINAL_CONSUMERS.values())
+    for gate in TERMINAL_GATES:
+        selected = selected_action_path(action, gate)
+        if selected != expected_paths[gate]:
+            raise ContractError(f"selected {gate} action path drifted")
+        consumers = [name for name in selected if name in consumer_names]
+        if consumers != [TERMINAL_CONSUMERS[gate]]:
+            raise ContractError(f"{gate} must select exactly one repository consumer")
+        if selected[-1] != TERMINAL_CONSUMERS[gate]:
+            raise ContractError(f"{gate} repository consumer is not terminal")
+
+
+def extract_workflow_step(workflow: str, name: str) -> str:
+    marker = f"      - name: {name}\n"
+    if workflow.count(marker) != 1:
+        raise ContractError(f"workflow step inventory drifted: {name}")
+    start = workflow.index(marker)
+    next_step = workflow.find("      - name: ", start + len(marker))
+    end = len(workflow) if next_step == -1 else next_step
+    return workflow[start:end]
+
+
+def parse_workflow_step_env(step: str) -> list[tuple[str, str]]:
+    lines = step.splitlines()
+    try:
+        start = lines.index("        env:") + 1
+        end = lines.index("        run: |")
+    except ValueError as exc:
+        raise ContractError("workflow step must use an explicit env mapping") from exc
+    parsed: list[tuple[str, str]] = []
+    for line in lines[start:end]:
+        match = re.fullmatch(r"          ([A-Za-z_][A-Za-z0-9_]*): (.+)", line)
+        if match is None:
+            raise ContractError("materialization env must use canonical scalar entries")
+        parsed.append((match.group(1), match.group(2)))
+    return parsed
+
+
+def parse_job_env(workflow: str) -> list[tuple[str, str]]:
+    lines = workflow.splitlines()
+    markers = [index for index, line in enumerate(lines) if line == "    env:"]
+    if len(markers) != 1:
+        raise ContractError("workflow must declare one audited job environment")
+    start = markers[0] + 1
+    ends = [
+        index for index, line in enumerate(lines[start:], start) if line == "    steps:"
+    ]
+    if len(ends) != 1:
+        raise ContractError("workflow job environment must precede steps")
+    parsed: list[tuple[str, str]] = []
+    for line in lines[start : ends[0]]:
+        match = re.fullmatch(r"      ([A-Za-z_][A-Za-z0-9_]*): (.+)", line)
+        if match is None:
+            raise ContractError("job environment must use canonical scalar entries")
+        parsed.append((match.group(1), match.group(2)))
+    return parsed
+
+
+def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
+    if exact_digest and sha256(workflow) != WORKFLOW_SHA256:
+        raise ContractError("CI workflow digest drifted")
     validate_job_routing(workflow)
     validate_permissions(workflow)
     if HOSTED_RUNNER_PATTERN.search(workflow):
@@ -211,28 +413,356 @@ def validate_workflow(workflow: str) -> None:
     ):
         if forbidden in workflow:
             raise ContractError(f"workflow contains forbidden authority: {forbidden}")
-    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", workflow):
+    if (
+        workflow.count('"https://github.com"') != 1
+        or workflow.count("http.https://github.com/.extraheader") != 1
+    ):
+        raise ContractError("checkout origin authority must be exactly GitHub")
+    endpoint_scan = workflow.replace('"https://github.com"', "").replace(
+        "http.https://github.com/.extraheader", ""
+    )
+    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", endpoint_scan):
         raise ContractError("workflow must not bake a deployment endpoint")
     if re.search(r"type\s*=\s*gha", workflow, re.IGNORECASE):
         raise ContractError("GitHub Actions cache authority is forbidden")
 
-    expected_uses = [f"actions/checkout@{CHECKOUT_REV}", LOCAL_ACTION]
-    if extract_uses(workflow) != expected_uses:
+    expected_job_env = [
+        ("BASH_ENV", "/dev/null"),
+        ("ENV", "/dev/null"),
+        ("SHELLOPTS", '""'),
+        ("BASHOPTS", '""'),
+        ("PS4", '""'),
+        ("BASH_XTRACEFD", '""'),
+        ("LD_PRELOAD", '""'),
+        ("LD_LIBRARY_PATH", '""'),
+        ("LD_AUDIT", '""'),
+        ("http_proxy", '""'),
+        ("https_proxy", '""'),
+        ("all_proxy", '""'),
+        ("no_proxy", '""'),
+        ("CURL_CA_BUNDLE", '""'),
+        ("SSL_CERT_FILE", '""'),
+        ("SSL_CERT_DIR", '""'),
+        ("SSLKEYLOGFILE", '""'),
+        ("ATTIC_TOKEN", '""'),
+        ("NIX_ACCESS_TOKENS", '""'),
+    ]
+    if parse_job_env(workflow) != expected_job_env:
+        raise ContractError(
+            "job-wide loader, function, proxy, CA, or token fence drifted"
+        )
+
+    if extract_uses(workflow) != [LOCAL_ACTION]:
         raise ContractError("workflow action inventory drifted")
-    if workflow.count(f"ref: {EXPECTED_SHA_EXPRESSION}") != 1:
-        raise ContractError("checkout must select the exact PR head or push SHA")
-    if workflow.count("persist-credentials: false") != 1:
-        raise ContractError("checkout credentials must not persist")
-    if workflow.count(f"EXPECTED_SHA: {EXPECTED_SHA_EXPRESSION}") != 1:
-        raise ContractError("checkout verification must bind the event SHA")
-    if 'run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"' not in workflow:
-        raise ContractError("CI must verify the checked-out commit")
+    if "actions/checkout" in workflow or re.search(
+        r"(?mi)^\s+(?:post|post-if)\s*:", workflow
+    ):
+        raise ContractError("workflow must not register an action post")
+
+    step_names = re.findall(r"(?m)^      - name: (.+)$", workflow)
+    if step_names != [
+        "Materialize exact revision with fixed Git",
+        "Bulkload public-read cache-first validation",
+    ]:
+        raise ContractError("workflow step order or inventory drifted")
+    if len(re.findall(r"(?m)^      - \S", workflow)) != 2:
+        raise ContractError("workflow steps must use the audited named inventory")
+    materialize = extract_workflow_step(
+        workflow, "Materialize exact revision with fixed Git"
+    )
+    local_action = extract_workflow_step(
+        workflow, "Bulkload public-read cache-first validation"
+    )
+    if f"        uses: {LOCAL_ACTION}\n" not in local_action:
+        raise ContractError("local public-read action must remain the final step")
+    if not workflow.endswith(local_action):
+        raise ContractError("no workflow step may follow the local action")
+
+    token_declaration = "          BULKLOAD_CHECKOUT_TOKEN: ${{ github.token }}"
+    expected_declaration = f"          BULKLOAD_EXPECTED_SHA: {EXPECTED_SHA_EXPRESSION}"
+    if workflow.count(token_declaration) != 1 or workflow.count("github.token") != 1:
+        raise ContractError(
+            "checkout token must exist only in the materialization step"
+        )
+    if token_declaration not in materialize or "github.token" in local_action:
+        raise ContractError("checkout token escaped its materialization scope")
+    if workflow.count(expected_declaration) != 1:
+        raise ContractError("materialization must bind the exact event SHA once")
+    if workflow.count("GITHUB_ENV") != 1:
+        raise ContractError("runner environment command file escaped materialization")
+
+    expected_materializer_env = [
+        ("BASH_ENV", "/dev/null"),
+        ("ENV", "/dev/null"),
+        ("SHELLOPTS", '""'),
+        ("BASHOPTS", '""'),
+        ("PS4", '""'),
+        ("BASH_XTRACEFD", '""'),
+        ("LD_PRELOAD", '""'),
+        ("LD_LIBRARY_PATH", '""'),
+        ("LD_AUDIT", '""'),
+        ("HTTP_PROXY", '""'),
+        ("HTTPS_PROXY", '""'),
+        ("ALL_PROXY", '""'),
+        ("NO_PROXY", '""'),
+        ("CURL_CA_BUNDLE", '""'),
+        ("SSL_CERT_FILE", '""'),
+        ("SSL_CERT_DIR", '""'),
+        ("SSLKEYLOGFILE", '""'),
+        ("BULKLOAD_CHECKOUT_TOKEN", "${{ github.token }}"),
+        ("BULKLOAD_EXPECTED_SHA", EXPECTED_SHA_EXPRESSION),
+        ("BULKLOAD_REPOSITORY", "${{ github.repository }}"),
+        ("BULKLOAD_SERVER_URL", "${{ github.server_url }}"),
+    ]
+    if parse_workflow_step_env(materialize) != expected_materializer_env:
+        raise ContractError("materialization bootstrap environment drifted")
+
+    required_materialization = (
+        "        shell: /bin/bash --noprofile --norc -p {0}",
+        "          set +x",
+        "          set +v",
+        "          set -euo pipefail",
+        "          umask 077",
+        "          [[ $- == *p* ]]",
+        "          [[ $- != *a* ]]",
+        '          [[ -n "${BULKLOAD_CHECKOUT_TOKEN:-}" ]]',
+        "          builtin printf '::add-mask::%s\\n' \"$BULKLOAD_CHECKOUT_TOKEN\"",
+        "          checkout_token=$BULKLOAD_CHECKOUT_TOKEN",
+        "          export -n checkout_token SHELLOPTS BASHOPTS",
+        "          unset BULKLOAD_CHECKOUT_TOKEN",
+        '          [[ -z "${BULKLOAD_CHECKOUT_TOKEN:-}" ]]',
+        "          trap 'unset BULKLOAD_CHECKOUT_TOKEN checkout_token encoded_token git_http_header BULKLOAD_GIT_HTTP_HEADER' EXIT",
+        "          unset BASH_ENV ENV CDPATH PS4 BASH_XTRACEFD",
+        "          unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT",
+        "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY",
+        "          unset http_proxy https_proxy all_proxy no_proxy",
+        "          unset CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE",
+        "          unset GH_TOKEN GITHUB_TOKEN GITLAB_TOKEN SSH_AUTH_SOCK SSH_ASKPASS",
+        '          for variable in "${!GIT_@}"; do',
+        "          encoded_token=$(",
+        "              /usr/bin/base64 -w0",
+        "          export -n encoded_token",
+        "          builtin printf '::add-mask::%s\\n' \"$encoded_token\"",
+        '          git_http_header="AUTHORIZATION: basic $encoded_token"',
+        "          export -n git_http_header",
+        "          builtin printf '::add-mask::%s\\n' \"$git_http_header\"",
+        "          unset checkout_token encoded_token",
+        '          [[ -z "${checkout_token:-}" ]]',
+        '          [[ -z "${encoded_token:-}" ]]',
+        '          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]',
+        '          [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]',
+        '          test "$server_url" = "https://github.com"',
+        "          runner_commands=$runner_temp/_runner_file_commands",
+        "          github_env=$GITHUB_ENV",
+        '          test ! -L "$workspace"',
+        '          test -O "$workspace"',
+        '          test "$(/usr/bin/readlink -f -- "$workspace")" = "$workspace"',
+        '          test ! -L "$runner_temp"',
+        '          test -O "$runner_temp"',
+        '          test "$(/usr/bin/readlink -f -- "$runner_temp")" = "$runner_temp"',
+        '          test -d "$runner_commands"',
+        '          test ! -L "$runner_commands"',
+        '          test -O "$runner_commands"',
+        '          test "$(/usr/bin/readlink -f -- "$runner_commands")" = "$runner_commands"',
+        '          test -f "$github_env"',
+        '          test ! -L "$github_env"',
+        '          test -O "$github_env"',
+        '          test "$(/usr/bin/readlink -f -- "$github_env")" = "$github_env"',
+        '          test "$(/usr/bin/dirname -- "$github_env")" = "$runner_commands"',
+        '          test -z "$(/usr/bin/find "$workspace" -xdev -mindepth 1 -maxdepth 1 -print -quit)"',
+        '          checkout_state=$(/usr/bin/mktemp -d "$runner_temp/bulkload-checkout.XXXXXXXX")',
+        '            "$checkout_state/home" \\',
+        '            "$checkout_state/xdg" \\',
+        '            "$checkout_state/template" \\',
+        '            "$checkout_state/tmp"',
+        '          : >"$checkout_state/home/.gitconfig"',
+        '          /bin/chmod 600 "$checkout_state/home/.gitconfig"',
+        "          export HOME=$checkout_state/home",
+        "          export XDG_CONFIG_HOME=$checkout_state/xdg",
+        "          export GIT_CONFIG_GLOBAL=$checkout_state/home/.gitconfig",
+        "          export GIT_CONFIG_NOSYSTEM=1",
+        "          export GIT_TERMINAL_PROMPT=0",
+        "          export GCM_INTERACTIVE=never",
+        '          /usr/bin/git init --template="$checkout_state/template" "$workspace"',
+        '          /usr/bin/git -C "$workspace" remote add origin "$origin_url"',
+        "            fetch_env_unsets=()",
+        "            done < <(compgen -e)",
+        "            export PATH=/usr/bin:/bin",
+        "            export HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM",
+        "            export GIT_TERMINAL_PROMPT GCM_INTERACTIVE",
+        '            export TMPDIR="$checkout_state/tmp"',
+        "            export LANG=C LC_ALL=C",
+        '            export BULKLOAD_GIT_HTTP_HEADER="$git_http_header"',
+        '            exec /usr/bin/env "${fetch_env_unsets[@]}" \\',
+        "                --config-env=http.https://github.com/.extraheader=BULKLOAD_GIT_HTTP_HEADER \\",
+        "                fetch --force --prune --no-recurse-submodules --no-tags \\",
+        "                --no-auto-maintenance --no-write-commit-graph origin \\",
+        '                "$expected_sha" \\',
+        "                '+refs/heads/*:refs/remotes/origin/*' \\",
+        "                '+refs/tags/*:refs/tags/*'",
+        "          unset BULKLOAD_GIT_HTTP_HEADER git_http_header",
+        '          [[ -z "${BULKLOAD_GIT_HTTP_HEADER:-}" ]]',
+        '          [[ -z "${git_http_header:-}" ]]',
+        "          trap - EXIT",
+        '            checkout --detach --force "$expected_sha"',
+        '          test "$(/usr/bin/git -C "$workspace" rev-parse --verify HEAD)" = "$expected_sha"',
+        '          test "$(/usr/bin/git -C "$workspace" rev-parse --is-shallow-repository)" = false',
+        '          test "$(/usr/bin/git -C "$workspace" rev-parse --show-toplevel)" = "$workspace"',
+        '          test -z "$(/usr/bin/git -C "$workspace" status --porcelain=v1 --untracked-files=all)"',
+        '          test ! -e "$workspace/.git/objects/info/alternates"',
+        '          test -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"',
+        '          test "$(/usr/bin/git -C "$workspace" remote get-url --all origin)" = "$origin_url"',
+        '          test "$(/usr/bin/git -C "$workspace" remote get-url --push --all origin)" = "$origin_url"',
+        "            '^(credential\\.|http\\.|include\\.|includeif\\.|core\\.askpass$|core\\.sshcommand$|ssh\\.|remote\\..*\\.uploadpack$|url\\..*\\.insteadof$)' \\",
+        "          for variable in GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS SSH_ASKPASS SSH_AUTH_SOCK; do",
+        '            test -z "${!variable:-}"',
+        '          /bin/rm -rf --one-file-system -- "$checkout_state"',
+        "          builtin printf '%s\\n' \\",
+        "            'HTTP_PROXY=' \\",
+        "            'HTTPS_PROXY=' \\",
+        "            'ALL_PROXY=' \\",
+        "            'NO_PROXY=' \\",
+        '            >> "$github_env"',
+    )
+    for declaration in required_materialization:
+        if materialize.count(declaration) != 1:
+            raise ContractError(
+                f"Git materialization contract drifted: {declaration.strip()}"
+            )
+
+    if materialize.count("/usr/bin/git") != 11:
+        raise ContractError("materialization must use the audited fixed Git binary")
+    if materialize.count("/usr/bin/base64") != 1:
+        raise ContractError("raw checkout token must have one fixed encoder")
+    if materialize.count("/usr/bin/env") != 1:
+        raise ContractError("fetch must have one fixed minimal-environment launcher")
+    if materialize.count("/usr/bin/dirname") != 1:
+        raise ContractError("runner command-file containment must use fixed dirname")
+    if materialize.count("/bin/rm") != 1:
+        raise ContractError("materialization must never delete workspace contents")
+    if re.search(r"(?<![/A-Za-z0-9_.-])git(?:\s|$)", materialize):
+        raise ContractError("materialization must not resolve Git through PATH")
+    if materialize.count("--config-env=") != 1:
+        raise ContractError("HTTP authorization must use one transient config-env")
+    for variable in (
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "BASH_XTRACEFD",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "SSLKEYLOGFILE",
+    ):
+        expected_mentions = (
+            3
+            if variable in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+            else 2
+        )
+        if (
+            len(re.findall(rf"\b{re.escape(variable)}\b", materialize))
+            != expected_mentions
+        ):
+            raise ContractError(
+                f"bootstrap or transport environment reintroduced: {variable}"
+            )
+    for variable in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        if len(re.findall(rf"\b{variable}\b", materialize)) != 1:
+            raise ContractError(f"lower-case proxy reintroduced: {variable}")
+
+    raw_mask = materialize.index(
+        "builtin printf '::add-mask::%s\\n' \"$BULKLOAD_CHECKOUT_TOKEN\""
+    )
+    raw_copy = materialize.index("checkout_token=$BULKLOAD_CHECKOUT_TOKEN")
+    raw_deexport = materialize.index("export -n checkout_token SHELLOPTS BASHOPTS")
+    raw_unset = materialize.index("\n          unset BULKLOAD_CHECKOUT_TOKEN\n")
+    encode = materialize.index("encoded_token=$(")
+    encoder = materialize.index("/usr/bin/base64 -w0")
+    encoded_mask = materialize.index(
+        "builtin printf '::add-mask::%s\\n' \"$encoded_token\""
+    )
+    header = materialize.index('git_http_header="AUTHORIZATION: basic $encoded_token"')
+    header_mask = materialize.index(
+        "builtin printf '::add-mask::%s\\n' \"$git_http_header\""
+    )
+    raw_encoded_clear = materialize.index("unset checkout_token encoded_token")
+    first_workspace_child = materialize.index("/usr/bin/readlink")
+    fetch_boundary = materialize.index("fetch_env_unsets=()")
+    header_export = materialize.index(
+        'export BULKLOAD_GIT_HTTP_HEADER="$git_http_header"'
+    )
+    env_exec = materialize.index('exec /usr/bin/env "${fetch_env_unsets[@]}"')
+    fetch = materialize.index("fetch --force --prune --no-recurse-submodules --no-tags")
+    clear = materialize.index("unset BULKLOAD_GIT_HTTP_HEADER git_http_header")
+    trap_clear = materialize.index("trap - EXIT")
+    checkout = materialize.index('checkout --detach --force "$expected_sha"')
+    verify = materialize.index("rev-parse --verify HEAD")
+    cleanup = materialize.index('/bin/rm -rf --one-file-system -- "$checkout_state"')
+    persist_proxies = materialize.index("builtin printf '%s\\n'")
+    if not (
+        raw_mask
+        < raw_copy
+        < raw_deexport
+        < raw_unset
+        < encode
+        < encoder
+        < encoded_mask
+        < header
+        < header_mask
+        < raw_encoded_clear
+        < first_workspace_child
+        < fetch_boundary
+        < header_export
+        < env_exec
+        < fetch
+        < clear
+        < trap_clear
+        < checkout
+        < verify
+        < cleanup
+        < persist_proxies
+    ):
+        raise ContractError(
+            "bootstrap, credential, fetch, checkout, or verification order drifted"
+        )
+    if not materialize.rstrip().endswith('>> "$github_env"'):
+        raise ContractError(
+            "upper-case proxy persistence must terminate materialization"
+        )
+    if materialize.count("export BULKLOAD_GIT_HTTP_HEADER=") != 1:
+        raise ContractError("fetch header must be exported only inside its closure")
+    if materialize.count("--no-auto-maintenance") != 1:
+        raise ContractError("fetch must suppress automatic maintenance")
+    if materialize.count("--no-write-commit-graph") != 1:
+        raise ContractError("fetch must suppress commit-graph writers")
+    if any(
+        credential in materialize[checkout:]
+        for credential in (
+            "BULKLOAD_CHECKOUT_TOKEN",
+            "BULKLOAD_GIT_HTTP_HEADER",
+            "checkout_token",
+            "encoded_token",
+            "git_http_header",
+        )
+    ):
+        raise ContractError("checkout or verification retained credential material")
+
     if workflow.count('      ATTIC_TOKEN: ""') != 1:
         raise ContractError("workflow must empty ATTIC_TOKEN exactly once")
     if workflow.count('      NIX_ACCESS_TOKENS: ""') != 1:
         raise ContractError("workflow must empty NIX_ACCESS_TOKENS exactly once")
 
     required_inputs = (
+        f"          gate: {MATRIX_GATE_EXPRESSION}",
         "          event-name: ${{ github.event_name }}",
         f"          expected-sha: {EXPECTED_SHA_EXPRESSION}",
         "          ref: ${{ github.ref }}",
@@ -265,6 +795,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     if exact_digest and sha256(action) != ACTION_SHA256:
         raise ContractError("local public-read action digest drifted")
     if parse_action_inputs(action) != {
+        "gate",
         "event-name",
         "expected-sha",
         "head-repository",
@@ -274,9 +805,66 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     }:
         raise ContractError("local public-read action input inventory drifted")
 
+    step_names = re.findall(r"(?m)^    - name: (.+)$", action)
+    expected_step_names = [
+        "Validate the terminal gate selection",
+        "Snapshot the exact public-read guard",
+        "Preflight raw runner endpoint authority",
+        "Discover sanctioned runner endpoint authority",
+        "Enforce the discovered public-read boundary",
+        "Revalidate immutable Bazel build authority",
+        "Build the Bulkload binary through the public Flywheel action",
+        "Revalidate immutable Bazel test authority",
+        "Test the complete Bulkload Bazel graph through the public Flywheel action",
+        "Run repository-owned source gates",
+    ]
+    if step_names != expected_step_names:
+        raise ContractError("local action step order or inventory drifted")
+    if len(re.findall(r"(?m)^    - \S", action)) != len(expected_step_names):
+        raise ContractError("local action steps must use the audited named inventory")
+    for name in expected_step_names:
+        step = extract_action_step(action, name)
+        shells = re.findall(r"(?m)^      shell: ", step)
+        uses = re.findall(r"(?m)^      uses: ", step)
+        runs = re.findall(r"(?m)^      run: \|$", step)
+        if len(shells) + len(uses) != 1:
+            raise ContractError(f"step must select one execution mechanism: {name}")
+        if (shells and len(runs) != 1) or (uses and runs):
+            raise ContractError(f"step run mapping drifted: {name}")
+    if re.search(r"(?mi)^ {4,}(?:post|post-if)\s*:", action):
+        raise ContractError("local action closure must not register a post")
+    if re.search(
+        r"(?mi)^ {6}(?:continue-on-error|\"continue-on-error\"|'continue-on-error')\s*:",
+        action,
+    ):
+        raise ContractError("local action closure must not suppress an error")
+    validate_action_step_environment_fences(action)
+    validate_terminal_consumer_paths(action)
+
     source_gate_step = extract_action_step(action, "Run repository-owned source gates")
-    if sha256(source_gate_step) != SOURCE_GATE_STEP_SHA256:
+    if exact_digest and sha256(source_gate_step) != SOURCE_GATE_STEP_SHA256:
         raise ContractError("repository source-gate step mapping drifted")
+    if not action.endswith(source_gate_step):
+        raise ContractError("repository source gates must be the recursive action tail")
+    source_exec = (
+        "        exec nix develop --no-write-lock-file .#default "
+        "--command just ci-source"
+    )
+    source_flake = "        nix flake check --no-build --no-write-lock-file"
+    if (
+        "      shell: /bin/bash --noprofile --norc -p {0}\n" not in source_gate_step
+        or "      run: |\n        set -euo pipefail\n" not in source_gate_step
+        or source_gate_step.count(source_flake) != 1
+        or source_gate_step.count(source_exec) != 1
+        or source_gate_step.index(source_flake) >= source_gate_step.index(source_exec)
+        or not source_gate_step.rstrip().endswith(source_exec)
+    ):
+        raise ContractError("source gate must end by execing the audited source suite")
+    if re.search(
+        r"(?m)^\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*\{|\|\|\s*true\s*$|&\s*$|^\s*exit\s+0\s*$",
+        source_gate_step,
+    ):
+        raise ContractError("source gate must not define wrappers or detach failures")
 
     nix_setup = (
         "tinyland-inc/ci-templates/.github/actions/nix-setup@" + CI_TEMPLATES_REV
@@ -303,31 +891,31 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             raise ContractError(
                 f"local action contains forbidden authority: {forbidden}"
             )
-    if re.search(
-        r"""(?m)^ {6}(?:if|continue-on-error|"if"|"continue-on-error"|'if'|'continue-on-error')\s*:""",
-        action,
-    ):
-        raise ContractError("step-level conditions and error suppression are forbidden")
+    if re.search(r"(?m)^ {6}(?:\"if\"|'if')\s*:", action):
+        raise ContractError("terminal conditions must use canonical unquoted keys")
     if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", action):
         raise ContractError("local action must not bake a deployment endpoint")
     if re.search(r"type\s*=\s*gha", action, re.IGNORECASE):
         raise ContractError("GitHub Actions cache authority is forbidden")
 
     required = (
+        "        BULKLOAD_GATE: ${{ inputs.gate }}",
+        '        case "$BULKLOAD_GATE" in',
+        "          source | build | test) ;;",
         "        attic-cache: main",
         "      id: guard-snapshot",
         "      id: authority",
         "      id: bazel-build-authority",
         "      id: bazel-test-authority",
-        '        /bin/bash "$BULKLOAD_GUARD_PATH" preflight',
-        '        /bin/bash "$BULKLOAD_GUARD_PATH" enforce',
+        '        /bin/bash -p "$BULKLOAD_GUARD_PATH" preflight',
+        '        /bin/bash -p "$BULKLOAD_GUARD_PATH" enforce',
         '        test "$(nix config show accept-flake-config)" = false',
         '        test "$(nix config show netrc-file)" = /dev/null',
         '        test -z "$(nix config show access-tokens)"',
         '        test -z "$(nix config show post-build-hook)"',
         '        test -z "$(nix config show secret-key-files)"',
         '        test -z "$(nix config show plugin-files)"',
-        "        nix develop --no-write-lock-file .#default --command just ci-source",
+        "        exec nix develop --no-write-lock-file .#default --command just ci-source",
         "        command: build",
         "        targets: //:bulkload",
         "        command: test",
@@ -354,26 +942,23 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     )
     require_yaml_lines("BULKLOAD_RUNNER_NAME", ["${{ runner.name }}"] * 4)
 
-    if action.count("      shell: /bin/bash --noprofile --norc {0}") != 5:
-        raise ContractError("every guard boundary must use absolute non-profile Bash")
+    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 7:
+        raise ContractError(
+            "every direct shell boundary must use absolute privileged non-profile Bash"
+        )
     require_yaml_lines("PATH", ["${{ steps.authority.outputs.trusted_path }}"] * 5)
     require_yaml_lines(
         "HOME",
         [
-            "/var/empty",
             "${{ steps.bazel-build-authority.outputs.bazel_home }}",
             "${{ steps.bazel-test-authority.outputs.bazel_home }}",
         ],
     )
     for key in ("ATTIC_TOKEN", "NIX_ACCESS_TOKENS"):
-        require_yaml_lines(key, ['""'] * 8)
-    require_yaml_lines("NIX_USER_CONF_FILES", ["/dev/null"] * 8)
-    require_yaml_lines("NETRC", ["/dev/null"] * 8)
-    require_yaml_lines("NIX_REMOTE", ["daemon"] * 8)
-    require_yaml_lines(
-        "NIX_CONFIG",
-        ["|-", "|-", "|-", *(["${{ steps.authority.outputs.nix_config }}"] * 5)],
-    )
+        require_yaml_lines(key, ['""'] * 7)
+    require_yaml_lines("NIX_USER_CONF_FILES", ["/dev/null"] * 7)
+    require_yaml_lines("NETRC", ["/dev/null"] * 7)
+    require_yaml_lines("NIX_CONFIG", ["${{ steps.authority.outputs.nix_config }}"] * 5)
     require_yaml_lines(
         "BAZEL_REMOTE_CACHE",
         ["${{ steps.authority.outputs.bazel_remote_cache }}"] * 4,
@@ -425,7 +1010,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         != 4
     ):
         raise ContractError("every guard execution must have an external digest check")
-    if action.count('        /bin/bash "$BULKLOAD_GUARD_PATH" bazel') != 2:
+    if action.count('        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel') != 2:
         raise ContractError("each Bazel invocation needs an immediate authority guard")
     if (
         action.count(
@@ -438,14 +1023,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("Bazel executor input must remain empty")
 
     snapshot = action.index("- name: Snapshot the exact public-read guard")
-    preflight = action.index('/bin/bash "$BULKLOAD_GUARD_PATH" preflight')
+    preflight = action.index('/bin/bash -p "$BULKLOAD_GUARD_PATH" preflight')
     setup = action.index(f"uses: {nix_setup}")
-    enforce = action.index('/bin/bash "$BULKLOAD_GUARD_PATH" enforce')
+    enforce = action.index('/bin/bash -p "$BULKLOAD_GUARD_PATH" enforce')
     source = action.index("\n    - name: Run repository-owned source gates\n")
     bazel_guards = [
         match.start()
         for match in re.finditer(
-            re.escape('/bin/bash "$BULKLOAD_GUARD_PATH" bazel'), action
+            re.escape('/bin/bash -p "$BULKLOAD_GUARD_PATH" bazel'), action
         )
     ]
     bazel_actions = [
@@ -457,14 +1042,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         < preflight
         < setup
         < enforce
-        < source
         < bazel_guards[0]
         < bazel_actions[0]
         < bazel_guards[1]
         < bazel_actions[1]
+        < source
     ):
         raise ContractError(
-            "guard snapshot, discovery, source, and per-Bazel boundaries are misordered"
+            "guard snapshot, discovery, per-Bazel boundaries, or source tail are misordered"
         )
     if action.count("        config: flywheel") != 2:
         raise ContractError("both Bazel invocations must be cache-only Flywheel calls")
@@ -754,6 +1339,221 @@ class CiContractTest(unittest.TestCase):
         mode = (self.root / GUARD_PATH).stat().st_mode
         self.assertNotEqual(mode & stat.S_IXUSR, 0)
 
+    def test_each_gate_has_one_semantically_terminal_repository_consumer(self) -> None:
+        expected = {
+            "source": [
+                "Validate the terminal gate selection",
+                "Snapshot the exact public-read guard",
+                "Preflight raw runner endpoint authority",
+                "Discover sanctioned runner endpoint authority",
+                "Enforce the discovered public-read boundary",
+                TERMINAL_CONSUMERS["source"],
+            ],
+            "build": [
+                "Validate the terminal gate selection",
+                "Snapshot the exact public-read guard",
+                "Preflight raw runner endpoint authority",
+                "Discover sanctioned runner endpoint authority",
+                "Enforce the discovered public-read boundary",
+                "Revalidate immutable Bazel build authority",
+                TERMINAL_CONSUMERS["build"],
+            ],
+            "test": [
+                "Validate the terminal gate selection",
+                "Snapshot the exact public-read guard",
+                "Preflight raw runner endpoint authority",
+                "Discover sanctioned runner endpoint authority",
+                "Enforce the discovered public-read boundary",
+                "Revalidate immutable Bazel test authority",
+                TERMINAL_CONSUMERS["test"],
+            ],
+        }
+        all_consumers = set(TERMINAL_CONSUMERS.values())
+        for gate in TERMINAL_GATES:
+            with self.subTest(gate=gate):
+                selected = selected_action_path(self.action, gate)
+                self.assertEqual(selected, expected[gate])
+                self.assertEqual(
+                    [name for name in selected if name in all_consumers],
+                    [TERMINAL_CONSUMERS[gate]],
+                )
+                self.assertEqual(selected[-1], TERMINAL_CONSUMERS[gate])
+
+    def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
+        workflow_variants = [
+            self.workflow.replace(
+                "        gate: [source, build, test]",
+                "        gate: [source, build]",
+                1,
+            ),
+            self.workflow.replace(
+                "        gate: [source, build, test]",
+                "        gate: [build, source, test]",
+                1,
+            ),
+            self.workflow.replace("      fail-fast: false", "      fail-fast: true", 1),
+            self.workflow.replace(
+                f"          gate: {MATRIX_GATE_EXPRESSION}",
+                "          gate: source",
+                1,
+            ),
+            self.workflow.replace(
+                "      BASH_ENV: /dev/null", "      BASH_ENV: /tmp/evil", 1
+            ),
+            self.workflow.replace(
+                '      LD_PRELOAD: ""', "      LD_PRELOAD: /tmp/evil.so", 1
+            ),
+            self.workflow.replace(
+                '      http_proxy: ""',
+                "      http_proxy: http://proxy.invalid",
+                1,
+            ),
+            self.workflow.replace(
+                '      https_proxy: ""',
+                "      https_proxy: http://proxy.invalid",
+                1,
+            ),
+            self.workflow.replace(
+                '      all_proxy: ""',
+                "      all_proxy: socks5://proxy.invalid",
+                1,
+            ),
+            self.workflow.replace(
+                '      no_proxy: ""', "      no_proxy: metadata.internal", 1
+            ),
+            self.workflow.replace(
+                '      CURL_CA_BUNDLE: ""',
+                "      CURL_CA_BUNDLE: /tmp/ca.pem",
+                1,
+            ),
+            self.workflow.replace(
+                '      SSLKEYLOGFILE: ""',
+                "      SSLKEYLOGFILE: /tmp/keylog",
+                1,
+            ),
+            self.workflow.replace(
+                "      BASH_ENV: /dev/null\n",
+                "      BASH_ENV: /dev/null\n"
+                "      BASH_FUNC_nix%%: '() { /bin/true; }'\n",
+                1,
+            ),
+        ]
+        self.assert_workflow_mutations_fail_closed(workflow_variants)
+
+        build_condition = "      if: ${{ inputs.gate == 'build' }}\n"
+        test_condition = "      if: ${{ inputs.gate == 'test' }}\n"
+        source_condition = "      if: ${{ inputs.gate == 'source' }}\n"
+
+        def action_env_override(key: str, value: str) -> str:
+            marker = "        BASH_ENV: /dev/null\n"
+            return self.action.replace(marker, marker + f"        {key}: {value}\n", 1)
+
+        def action_step_env_override(declaration: str) -> str:
+            marker = "        BULKLOAD_GATE: ${{ inputs.gate }}\n      run: |\n"
+            return self.action.replace(
+                marker,
+                "        BULKLOAD_GATE: ${{ inputs.gate }}\n"
+                f"{declaration}"
+                "      run: |\n",
+                1,
+            )
+
+        alias_prelude = (
+            "x-poison-env: &poison-env\n  LD_PRELOAD: /tmp/poison.so\nruns:\n"
+        )
+        action_with_alias = self.action.replace("runs:\n", alias_prelude, 1)
+        alias_marker = "        BULKLOAD_GATE: ${{ inputs.gate }}\n      run: |\n"
+        action_with_env_alias = action_with_alias.replace(
+            alias_marker,
+            "        BULKLOAD_GATE: ${{ inputs.gate }}\n"
+            "      env: *poison-env\n"
+            "      run: |\n",
+            1,
+        )
+        action_with_env_merge = action_with_alias.replace(
+            "      env:\n        BASH_ENV: /dev/null\n",
+            "      env:\n        <<: *poison-env\n        BASH_ENV: /dev/null\n",
+            1,
+        )
+        alternate_env_syntax_variants = [
+            action_step_env_override("      env: {LD_PRELOAD: /tmp/flow-poison.so}\n"),
+            action_step_env_override(
+                '      "env":\n        http_proxy: http://proxy.invalid\n'
+            ),
+            action_step_env_override(
+                "      'env':\n        SSL_CERT_FILE: /tmp/poison-ca.pem\n"
+            ),
+            action_step_env_override(
+                '      "e\\u006ev":\n        SSLKEYLOGFILE: /tmp/keylog\n'
+            ),
+            action_with_env_alias,
+            action_with_env_merge,
+        ]
+        for index, unsafe in enumerate(alternate_env_syntax_variants):
+            with self.subTest(alternate_env_syntax_variant=index):
+                self.assertNotEqual(unsafe, self.action)
+                with self.assertRaisesRegex(
+                    ContractError,
+                    r"(?:canonical block mapping syntax|env key is not auditable)",
+                ):
+                    validate_local_action(unsafe, exact_digest=False)
+
+        action_variants = [
+            self.action.replace(build_condition, "", 1),
+            self.action.replace(test_condition, build_condition, 1),
+            self.action.replace(source_condition, "      if: ${{ always() }}\n", 1),
+            self.action.replace(
+                "        BASH_ENV: /dev/null", "        BASH_ENV: /tmp/evil", 1
+            ),
+            action_env_override("LD_PRELOAD", "/tmp/evil.so"),
+            action_env_override('"LD_PRELOAD"', "/tmp/quoted-evil.so"),
+            action_env_override('"LD_AUDIT"', "/tmp/audit.so"),
+            action_env_override("BASH_FUNC_nix%%", "'() { /bin/true; }'"),
+            action_env_override('"BASH_FUNC_nix%%"', "'() { /bin/true; }'"),
+            action_env_override("SHELLOPTS", "xtrace"),
+            action_env_override("PS4", "secret"),
+            action_env_override("http_proxy", "http://proxy.invalid"),
+            action_env_override("HTTPS_PROXY", '""'),
+            action_env_override("CURL_CA_BUNDLE", "/tmp/ca.pem"),
+            action_env_override("SSL_CERT_DIR", "/tmp/certs"),
+            action_env_override("SSLKEYLOGFILE", "/tmp/keylog"),
+            self.action.replace(
+                "        exec nix develop --no-write-lock-file .#default --command just ci-source",
+                "        nix develop --no-write-lock-file .#default --command just ci-source",
+                1,
+            ),
+            self.action.replace(
+                "        exec nix develop --no-write-lock-file .#default --command just ci-source",
+                "        exec nix develop --no-write-lock-file .#default --command just ci-source\n"
+                "        /bin/true",
+                1,
+            ),
+            self.action + "\n    - name: Consume poisoned environment\n"
+            "      shell: /bin/bash --noprofile --norc -p {0}\n"
+            "      run: /bin/true\n",
+            self.action.replace(
+                "    - name: Revalidate immutable Bazel test authority\n",
+                "    - name: Consume build output after its consumer\n"
+                "      if: ${{ inputs.gate == 'build' }}\n"
+                "      shell: /bin/bash --noprofile --norc -p {0}\n"
+                "      run: /bin/true\n\n"
+                "    - name: Revalidate immutable Bazel test authority\n",
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(action_variants):
+            with self.subTest(action_variant=index):
+                self.assertNotEqual(unsafe, self.action)
+                with self.assertRaises(ContractError):
+                    validate_local_action(unsafe, exact_digest=False)
+
+    def assert_workflow_mutations_fail_closed(self, unsafe_variants: list[str]) -> None:
+        for index, unsafe in enumerate(unsafe_variants):
+            with self.subTest(index=index, unsafe=unsafe[-160:]):
+                self.assertNotEqual(unsafe, self.workflow)
+                with self.assertRaises(ContractError):
+                    validate_workflow(unsafe, exact_digest=False)
+
     def test_hosted_dynamic_and_fork_regressions_fail_closed(self) -> None:
         unsafe_variants = [
             self.workflow.replace("runs-on: tinyland-nix", "runs-on: ubuntu-latest"),
@@ -767,20 +1567,220 @@ class CiContractTest(unittest.TestCase):
             self.workflow
             + "\n  unaudited:\n    runs-on: tinyland-nix\n    steps: []\n",
         ]
-        for unsafe in unsafe_variants:
-            with self.subTest(unsafe=unsafe[-120:]):
-                with self.assertRaises(ContractError):
-                    validate_workflow(unsafe)
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
 
-    def test_checkout_permission_and_upload_regressions_fail_closed(self) -> None:
+    def test_materialization_token_scope_and_no_post_fail_closed(self) -> None:
+        clear = "          unset BULKLOAD_GIT_HTTP_HEADER git_http_header\n"
+        checkout = '            checkout --detach --force "$expected_sha"\n'
+        clear_after_checkout = self.workflow.replace(clear, "", 1).replace(
+            checkout, checkout + clear, 1
+        )
         unsafe_variants = [
             self.workflow.replace(
-                f"actions/checkout@{CHECKOUT_REV}", "actions/checkout@main"
+                "${{ github.token }}", "${{ secrets.GITHUB_TOKEN }}", 1
             ),
-            self.workflow.replace("contents: read", "contents: write"),
             self.workflow.replace(
-                "persist-credentials: false", "persist-credentials: true"
+                f"        uses: {LOCAL_ACTION}\n",
+                f"        uses: {LOCAL_ACTION}\n"
+                "        env:\n"
+                "          BULKLOAD_CHECKOUT_TOKEN: ${{ github.token }}\n",
+                1,
             ),
+            self.workflow.replace(clear, "", 1),
+            clear_after_checkout,
+            self.workflow.replace(
+                "                --config-env=http.https://github.com/.extraheader=BULKLOAD_GIT_HTTP_HEADER \\\n",
+                "                -c http.https://github.com/.extraheader=$BULKLOAD_GIT_HTTP_HEADER \\\n",
+                1,
+            ),
+            self.workflow.replace(
+                "        run: |\n", "        post: /tmp/post.sh\n        run: |\n", 1
+            ),
+            self.workflow.replace(
+                f"        uses: {LOCAL_ACTION}", "        uses: actions/checkout@main"
+            ),
+            self.workflow.replace(
+                "          builtin printf '::add-mask::%s\\n' \"$BULKLOAD_CHECKOUT_TOKEN\"\n",
+                "",
+                1,
+            ),
+            self.workflow.replace(
+                "          builtin printf '::add-mask::%s\\n' \"$encoded_token\"\n",
+                "",
+                1,
+            ),
+            self.workflow.replace(
+                "          builtin printf '::add-mask::%s\\n' \"$git_http_header\"\n",
+                "",
+                1,
+            ),
+            self.workflow.replace(
+                "          export -n checkout_token SHELLOPTS BASHOPTS\n",
+                "          export checkout_token\n",
+                1,
+            ),
+            self.workflow.replace(
+                '            export BULKLOAD_GIT_HTTP_HEADER="$git_http_header"\n',
+                '          export BULKLOAD_GIT_HTTP_HEADER="$git_http_header"\n',
+                1,
+            ),
+            self.workflow.replace("            fetch_env_unsets=()\n", "", 1),
+        ]
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
+
+    def test_materialization_bootstrap_and_transport_fences_fail_closed(self) -> None:
+        proxy_persistence = (
+            "          builtin printf '%s\\n' \\\n"
+            "            'HTTP_PROXY=' \\\n"
+            "            'HTTPS_PROXY=' \\\n"
+            "            'ALL_PROXY=' \\\n"
+            "            'NO_PROXY=' \\\n"
+            '            >> "$github_env"\n'
+        )
+        checkout = '            checkout --detach --force "$expected_sha"\n'
+        persistence_before_checkout = self.workflow.replace(
+            proxy_persistence, "", 1
+        ).replace(checkout, proxy_persistence + checkout, 1)
+        unsafe_variants = [
+            self.workflow.replace(
+                "        shell: /bin/bash --noprofile --norc -p {0}",
+                "        shell: /bin/bash --noprofile --norc {0}",
+                1,
+            ),
+            self.workflow.replace(
+                "          BASH_ENV: /dev/null", "          BASH_ENV: /tmp/evil", 1
+            ),
+            self.workflow.replace(
+                '          SHELLOPTS: ""', "          SHELLOPTS: xtrace", 1
+            ),
+            self.workflow.replace('          PS4: ""', "          PS4: leaked", 1),
+            self.workflow.replace(
+                '          LD_AUDIT: ""', "          LD_AUDIT: /tmp/audit.so", 1
+            ),
+            self.workflow.replace(
+                '          HTTPS_PROXY: ""', "          HTTPS_PROXY: inherited", 1
+            ),
+            self.workflow.replace(
+                '          HTTP_PROXY: ""\n',
+                '          HTTP_PROXY: ""\n          http_proxy: inherited\n',
+                1,
+            ),
+            self.workflow.replace(
+                '          CURL_CA_BUNDLE: ""',
+                "          CURL_CA_BUNDLE: /tmp/ca.pem",
+                1,
+            ),
+            self.workflow.replace(
+                '          SSLKEYLOGFILE: ""', "          SSLKEYLOGFILE: /tmp/keys", 1
+            ),
+            self.workflow.replace(
+                "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY\n",
+                "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY\n"
+                "          export HTTPS_PROXY=inherited\n",
+                1,
+            ),
+            self.workflow.replace(
+                "github_env=$GITHUB_ENV", "github_env=$GITHUB_PATH", 1
+            ),
+            self.workflow.replace(
+                '          test "$(/usr/bin/dirname -- "$github_env")" = "$runner_commands"\n',
+                "",
+                1,
+            ),
+            self.workflow.replace("            'HTTP_PROXY=' \\\n", "", 1),
+            self.workflow.replace(
+                "            'HTTPS_PROXY=' \\\n",
+                "            'HTTPS_PROXY=http://proxy.invalid' \\\n",
+                1,
+            ),
+            self.workflow.replace(
+                "            'ALL_PROXY=' \\\n",
+                "            'ALL_PROXY=$BULKLOAD_CHECKOUT_TOKEN' \\\n",
+                1,
+            ),
+            persistence_before_checkout,
+        ]
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
+
+    def test_materialization_history_sha_and_order_fail_closed(self) -> None:
+        unsafe_variants = [
+            self.workflow.replace(
+                "                fetch --force --prune --no-recurse-submodules --no-tags \\\n",
+                "                fetch --depth=1 \\\n",
+                1,
+            ),
+            self.workflow.replace(
+                "                --no-auto-maintenance ", "                ", 1
+            ),
+            self.workflow.replace("--no-write-commit-graph ", "", 1),
+            self.workflow.replace(
+                "                '+refs/heads/*:refs/remotes/origin/*' \\\n", "", 1
+            ),
+            self.workflow.replace(
+                "                '+refs/tags/*:refs/tags/*'\n", "", 1
+            ),
+            self.workflow.replace(
+                '            checkout --detach --force "$expected_sha"',
+                "            checkout --detach --force origin/main",
+                1,
+            ),
+            self.workflow.replace(
+                '          test "$(/usr/bin/git -C "$workspace" rev-parse --verify HEAD)" = "$expected_sha"\n',
+                "",
+                1,
+            ),
+            self.workflow.replace(
+                '          test "$(/usr/bin/git -C "$workspace" rev-parse --is-shallow-repository)" = false\n',
+                "",
+                1,
+            ),
+            self.workflow.replace(EXPECTED_SHA_EXPRESSION, "${{ github.sha }}", 1),
+            self.workflow
+            + "\n      - run: /bin/true\n        shell: /bin/bash --noprofile --norc -p {0}\n",
+        ]
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
+
+    def test_materialization_workspace_config_and_auth_guards_fail_closed(self) -> None:
+        required_lines = (
+            '          test ! -L "$workspace"\n',
+            '          test -O "$workspace"\n',
+            '          test "$(/usr/bin/readlink -f -- "$workspace")" = "$workspace"\n',
+            '          test -z "$(/usr/bin/find "$workspace" -xdev -mindepth 1 -maxdepth 1 -print -quit)"\n',
+            "          export GIT_CONFIG_GLOBAL=$checkout_state/home/.gitconfig\n",
+            "          export GIT_CONFIG_NOSYSTEM=1\n",
+            '          /usr/bin/git init --template="$checkout_state/template" "$workspace"\n',
+            '          test ! -e "$workspace/.git/objects/info/alternates"\n',
+            '          test -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"\n',
+            '          test "$(/usr/bin/git -C "$workspace" remote get-url --all origin)" = "$origin_url"\n',
+            "          for variable in GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS SSH_ASKPASS SSH_AUTH_SOCK; do\n",
+        )
+        unsafe_variants = [
+            self.workflow.replace(line, "", 1) for line in required_lines
+        ]
+        unsafe_variants.extend(
+            [
+                self.workflow.replace(
+                    '          test -z "$(/usr/bin/find "$workspace" -xdev -mindepth 1 -maxdepth 1 -print -quit)"\n',
+                    '          /bin/rm -rf --one-file-system -- "$workspace"/*\n',
+                    1,
+                ),
+                self.workflow.replace(
+                    "credential\\.|http\\.|include\\.|includeif\\.|core\\.askpass$|core\\.sshcommand$|ssh\\.|remote\\..*\\.uploadpack$|url\\..*\\.insteadof$",
+                    "credential\\.|http\\.",
+                    1,
+                ),
+                self.workflow.replace(
+                    "          origin_url=$server_url/$repository.git",
+                    "          origin_url=https://x-access-token:$BULKLOAD_CHECKOUT_TOKEN@github.com/$repository.git",
+                    1,
+                ),
+            ]
+        )
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
+
+    def test_permission_upload_and_endpoint_regressions_fail_closed(self) -> None:
+        unsafe_variants = [
+            self.workflow.replace("contents: read", "contents: write"),
             self.workflow.replace(EXPECTED_SHA_EXPRESSION, "${{ github.sha }}"),
             self.workflow.replace(UPLOAD_EXPRESSION, "true"),
             self.workflow.replace('ATTIC_TOKEN: ""', "ATTIC_TOKEN: inherited"),
@@ -794,9 +1794,7 @@ class CiContractTest(unittest.TestCase):
             self.workflow + "\n# type=gha\n",
             self.workflow + "\n# https://cache.invalid\n",
         ]
-        for unsafe in unsafe_variants:
-            with self.assertRaises(ContractError):
-                validate_workflow(unsafe)
+        self.assert_workflow_mutations_fail_closed(unsafe_variants)
 
     def test_recursive_action_pin_and_capability_regressions_fail_closed(self) -> None:
         preflight_start = self.action.index("    - name: Preflight raw runner")
@@ -807,6 +1805,17 @@ class CiContractTest(unittest.TestCase):
             + self.action[setup_start:enforce_start]
             + self.action[preflight_start:setup_start]
             + self.action[enforce_start:]
+        )
+        source_start = self.action.index(
+            "    - name: Run repository-owned source gates\n"
+        )
+        source_block = self.action[source_start:]
+        without_source = self.action[:source_start]
+        test_start = without_source.index(
+            "    - name: Test the complete Bulkload Bazel graph"
+        )
+        source_before_test = (
+            without_source[:test_start] + source_block + without_source[test_start:]
         )
         unsafe_variants = [
             self.action.replace("@" + CI_TEMPLATES_REV, "@v2.13.0", 1),
@@ -855,24 +1864,28 @@ class CiContractTest(unittest.TestCase):
                 "    - name: Run repository-owned source gates\n"
                 "      if: ${{ false }}\n",
             ),
-            self.action.replace("      shell: bash\n", "      shell: /bin/true {0}\n"),
             self.action.replace(
-                "    - name: Run repository-owned source gates\n      shell: bash\n",
                 "    - name: Run repository-owned source gates\n"
+                "      if: ${{ inputs.gate == 'source' }}\n"
+                "      shell: /bin/bash --noprofile --norc -p {0}\n",
+                "    - name: Run repository-owned source gates\n"
+                "      if: ${{ inputs.gate == 'source' }}\n"
                 "      shell: /bin/true {0}\n",
-            ).replace(
+                1,
+            ),
+            self.action.replace(
                 "    - name: Revalidate immutable Bazel build authority\n",
                 "    - name: Revalidate immutable Bazel build authority\n"
                 "      shell: bash\n",
                 1,
             ),
             self.action.replace(
-                '/bin/bash "$BULKLOAD_GUARD_PATH" preflight',
-                '/bin/bash "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
+                '/bin/bash -p "$BULKLOAD_GUARD_PATH" preflight',
+                '/bin/bash -p "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
                 1,
             ),
             self.action.replace(
-                '        /bin/bash "$BULKLOAD_GUARD_PATH" bazel\n', "", 1
+                '        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel\n', "", 1
             ),
             self.action.replace(GUARD_SHA256, "0" * 64, 1),
             self.action.replace(
@@ -899,13 +1912,31 @@ class CiContractTest(unittest.TestCase):
                 '        ATTIC_TOKEN: ""',
                 '        ATTIC_TOKEN: ""\n        BAZEL_REMOTE_HEADER: secret',
             ),
+            source_before_test,
+            self.action + "\n    - name: Consume poisoned environment\n"
+            "      shell: bash\n"
+            "      run: /bin/true\n",
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n",
+                "    - name: Run repository-owned source gates\n"
+                "      post: /tmp/post.sh\n",
+                1,
+            ),
+            self.action.replace(
+                "    - name: Run repository-owned source gates\n",
+                "    - name: Run repository-owned source gates\n"
+                "      post-if: always()\n",
+                1,
+            ),
             self.action + "\n# ${{ join(runner.labels, ',') }}\n",
             self.action + "\n# type=gha\n",
             self.action + "\n# https://cache.invalid\n",
         ]
-        for unsafe in unsafe_variants:
-            with self.assertRaises(ContractError):
-                validate_local_action(unsafe, exact_digest=False)
+        for index, unsafe in enumerate(unsafe_variants):
+            with self.subTest(index=index, unsafe=unsafe[-160:]):
+                self.assertNotEqual(unsafe, self.action)
+                with self.assertRaises(ContractError):
+                    validate_local_action(unsafe, exact_digest=False)
 
     def test_guard_authority_regressions_fail_closed(self) -> None:
         unsafe_variants = [
@@ -972,16 +2003,6 @@ class CiContractTest(unittest.TestCase):
                     "plugin-files =",
                 )
             )
-            preflight_nix_config = "\n".join(
-                (
-                    "access-tokens =",
-                    "netrc-file = /dev/null",
-                    "accept-flake-config = false",
-                    "post-build-hook =",
-                    "secret-key-files =",
-                    "plugin-files =",
-                )
-            )
             base_env = {
                 "PATH": f"{mock_bin}:/usr/bin:/bin:/sbin",
                 "MOCK_HEAD": head,
@@ -1006,8 +2027,6 @@ class CiContractTest(unittest.TestCase):
                 "NIX_ACCESS_TOKENS": "",
                 "NIX_USER_CONF_FILES": "/dev/null",
                 "NETRC": "/dev/null",
-                "NIX_CONFIG": preflight_nix_config,
-                "NIX_REMOTE": "daemon",
                 "ATTIC_SERVER": "https://cache.example.invalid",
                 "ATTIC_CACHE": "main",
                 "BAZEL_REMOTE_CACHE": "https://bazel.example.invalid",
@@ -1046,11 +2065,6 @@ class CiContractTest(unittest.TestCase):
             self.assertIn("ENV=/dev/null\n", preflight_emitted)
             self.assertIn("ATTIC_TOKEN=\n", preflight_emitted)
             self.assertIn("NIX_ACCESS_TOKENS=\n", preflight_emitted)
-            self.assertIn("NIX_USER_CONF_FILES=/dev/null\n", preflight_emitted)
-            self.assertIn("NETRC=/dev/null\n", preflight_emitted)
-            self.assertIn("NIX_REMOTE=daemon\n", preflight_emitted)
-            self.assertIn("access-tokens =\n", preflight_emitted)
-            self.assertIn("plugin-files =\n", preflight_emitted)
             self.assertIn("BAZEL_CREDENTIAL_HELPER=\n", preflight_emitted)
 
             run_guard("enforce", base_env)
@@ -1155,8 +2169,6 @@ class CiContractTest(unittest.TestCase):
                 ("NIX_ACCESS_TOKENS", "github.com=secret"),
                 ("NIX_USER_CONF_FILES", "/tmp/nix.conf"),
                 ("NETRC", "/tmp/netrc"),
-                ("NIX_CONFIG", "access-tokens = github.com=secret"),
-                ("NIX_REMOTE", "ssh://builder.invalid"),
                 ("BAZELISK_GITHUB_TOKEN", "secret"),
                 ("BAZELISK_BASE_URL", "https://binary.invalid"),
                 ("BAZELISK_SKIP_WRAPPER", "false"),

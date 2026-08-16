@@ -91,12 +91,6 @@ readonly ci_templates_rev=139bd4c7deabbe07c918dc764a3b9f054066431d
 readonly public_key='main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA='
 readonly public_site=bulkload-ci
 readonly cache_name=main
-readonly preflight_nix_config="access-tokens =
-netrc-file = /dev/null
-accept-flake-config = false
-post-build-hook =
-secret-key-files =
-plugin-files ="
 readonly workspace_bazelrc_sha256=ade9e1559ddff673288f3a5029874b0daebf7927a56a26e7b956ff1804a90697
 readonly flywheel_bazelrc_sha256=f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592
 readonly bazel_version_sha256=4fa9948d0ae7007cbd1cc05768bc3e7cc6ec46ad0ea84c87df79e7a0c48d76b4
@@ -153,7 +147,6 @@ require_empty "Attic token" "${ATTIC_TOKEN:-}"
 require_empty "Nix access tokens" "${NIX_ACCESS_TOKENS:-}"
 require_equal "Nix user configuration" "${NIX_USER_CONF_FILES:-}" /dev/null
 require_equal "netrc environment" "${NETRC:-}" /dev/null
-require_equal "Nix remote store" "${NIX_REMOTE:-}" daemon
 require_empty "remote executor" "${BAZEL_REMOTE_EXECUTOR:-}"
 require_empty "remote execution header" "${BAZEL_REMOTE_EXEC_HEADER:-}"
 require_empty "Bazel credential helper" "${BAZEL_CREDENTIAL_HELPER:-}"
@@ -172,10 +165,6 @@ require_equal "Bazelisk wrapper skip" "${BAZELISK_SKIP_WRAPPER:-}" true
 require_empty "Bazelisk home" "${BAZELISK_HOME:-}"
 require_github_env
 
-if [[ "$mode" != bazel ]]; then
-  require_equal "pre-discovery Nix client configuration" "${NIX_CONFIG:-}" "$preflight_nix_config"
-fi
-
 if [[ "$mode" == preflight ]]; then
   # This pass runs before public nix-setup, so raw runner endpoint authority is
   # rejected before that action can log it or append it to GITHUB_ENV. Clear
@@ -185,12 +174,6 @@ if [[ "$mode" == preflight ]]; then
     printf 'ENV=/dev/null\n'
     printf 'ATTIC_TOKEN=\n'
     printf 'NIX_ACCESS_TOKENS=\n'
-    printf 'NIX_USER_CONF_FILES=/dev/null\n'
-    printf 'NETRC=/dev/null\n'
-    printf 'NIX_REMOTE=daemon\n'
-    printf 'NIX_CONFIG<<BULKLOAD_PREFLIGHT_NIX_CONFIG_%s\n' "$ci_templates_rev"
-    printf '%s\n' "$preflight_nix_config"
-    printf 'BULKLOAD_PREFLIGHT_NIX_CONFIG_%s\n' "$ci_templates_rev"
     printf 'BAZEL_CREDENTIAL_HELPER=\n'
     printf 'BAZEL_REMOTE_CACHE_HEADER=\n'
     printf 'BAZEL_REMOTE_EXECUTOR=\n'
@@ -311,7 +294,6 @@ plugin-files ="
   printf 'NIX_ACCESS_TOKENS=\n'
   printf 'NIX_USER_CONF_FILES=/dev/null\n'
   printf 'NETRC=/dev/null\n'
-  printf 'NIX_REMOTE=daemon\n'
   printf 'NIX_CONFIG<<BULKLOAD_NIX_CONFIG_%s\n' "$ci_templates_rev"
   printf '%s\n' "$nix_config"
   printf 'BULKLOAD_NIX_CONFIG_%s\n' "$ci_templates_rev"
