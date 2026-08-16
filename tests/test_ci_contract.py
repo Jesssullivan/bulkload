@@ -20,10 +20,17 @@ LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
-ACTION_SHA256 = "13b9db516dc91c1d0081ed785c074d4a15328c6bcedd9415fe14287c3dccc49e"
-GUARD_SHA256 = "ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d"
+NIXOS_CACHE = "https://cache.nixos.org/"
+NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+ACTION_SHA256 = "8ce0d081779003d4c4e4ee4996ff64d21653322ec0f3428d7907fcfff6639cfb"
+GUARD_SHA256 = "14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820"
 SOURCE_GATE_STEP_SHA256 = (
-    "9b930d781e10acbb1beaf64255d65ec82e7e24ab570c6d5fb71052627aa18ac0"
+    "c8e7f978424e8a21a1bf9296363f7723f92a6a6754d9af988ea8377eda041b95"
+)
+EFFECTIVE_NIX_STEP_SHA256 = (
+    "3c4e52f897ed912d097493c6dd7b79d7dd2c06325effd7de00d6202b6538fb23"
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
@@ -230,6 +237,54 @@ def extract_action_step(action: str, name: str) -> str:
     return action[start:end]
 
 
+def parse_canonical_env_entries(
+    lines: list[str], *, start: int, entry_indent: int
+) -> list[tuple[str, str]]:
+    entry_prefix = " " * entry_indent
+    literal_prefix = " " * (entry_indent + 2)
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if not line.startswith(entry_prefix) or line.startswith(entry_prefix + " "):
+            break
+        match = re.fullmatch(rf" {{{entry_indent}}}([^:#][^:]*): (.+)", line)
+        if match is None:
+            raise ContractError("environment must use canonical scalar entries")
+        key = match.group(1).strip()
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+            key = key[1:-1]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_%]*", key) is None:
+            raise ContractError("environment key is not auditable")
+        if key in seen:
+            raise ContractError(f"environment key is duplicated: {key}")
+        seen.add(key)
+
+        value = match.group(2)
+        if value == "|-":
+            literal: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].startswith(literal_prefix):
+                literal_line = lines[index]
+                if literal_line.startswith(literal_prefix + " "):
+                    raise ContractError(
+                        "environment literal must use canonical indentation"
+                    )
+                literal.append(literal_line[len(literal_prefix) :])
+                index += 1
+            if not literal:
+                raise ContractError("environment literal must not be empty")
+            value = "|-\n" + "\n".join(literal)
+            parsed.append((key, value))
+            continue
+        if value.startswith(("|", ">", "&", "*", "{")):
+            raise ContractError("environment value uses unaudited YAML syntax")
+        parsed.append((key, value))
+        index += 1
+    return parsed
+
+
 def parse_action_step_env(step: str) -> list[tuple[str, str]]:
     lines = step.splitlines()
     markers: list[int] = []
@@ -253,20 +308,7 @@ def parse_action_step_env(step: str) -> list[tuple[str, str]]:
         raise ContractError("composite step declares more than one env mapping")
     if not markers:
         return []
-    parsed: list[tuple[str, str]] = []
-    for line in lines[markers[0] + 1 :]:
-        if not line.startswith("        ") or line.startswith("          "):
-            break
-        match = re.fullmatch(r"        ([^:#][^:]*): (.+)", line)
-        if match is None:
-            raise ContractError("composite step env must use canonical scalar entries")
-        key = match.group(1).strip()
-        if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
-            key = key[1:-1]
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_%]*", key) is None:
-            raise ContractError("composite step env key is not auditable")
-        parsed.append((key, match.group(2)))
-    return parsed
+    return parse_canonical_env_entries(lines, start=markers[0] + 1, entry_indent=8)
 
 
 def validate_action_step_environment_fences(action: str) -> None:
@@ -316,6 +358,7 @@ def validate_terminal_consumer_paths(action: str) -> None:
         "Preflight raw runner endpoint authority",
         "Discover sanctioned runner endpoint authority",
         "Enforce the discovered public-read boundary",
+        "Verify effective Nix client authority",
     ]
     expected_paths = {
         "source": [*common, TERMINAL_CONSUMERS["source"]],
@@ -359,12 +402,9 @@ def parse_workflow_step_env(step: str) -> list[tuple[str, str]]:
         end = lines.index("        run: |")
     except ValueError as exc:
         raise ContractError("workflow step must use an explicit env mapping") from exc
-    parsed: list[tuple[str, str]] = []
-    for line in lines[start:end]:
-        match = re.fullmatch(r"          ([A-Za-z_][A-Za-z0-9_]*): (.+)", line)
-        if match is None:
-            raise ContractError("materialization env must use canonical scalar entries")
-        parsed.append((match.group(1), match.group(2)))
+    parsed = parse_canonical_env_entries(lines, start=start, entry_indent=10)
+    if start + len(parsed) != end:
+        raise ContractError("materialization env must use canonical scalar entries")
     return parsed
 
 
@@ -379,12 +419,9 @@ def parse_job_env(workflow: str) -> list[tuple[str, str]]:
     ]
     if len(ends) != 1:
         raise ContractError("workflow job environment must precede steps")
-    parsed: list[tuple[str, str]] = []
-    for line in lines[start : ends[0]]:
-        match = re.fullmatch(r"      ([A-Za-z_][A-Za-z0-9_]*): (.+)", line)
-        if match is None:
-            raise ContractError("job environment must use canonical scalar entries")
-        parsed.append((match.group(1), match.group(2)))
+    parsed = parse_canonical_env_entries(lines, start=start, entry_indent=6)
+    if start + len(parsed) != ends[0]:
+        raise ContractError("job environment must use canonical scalar entries")
     return parsed
 
 
@@ -812,6 +849,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "Preflight raw runner endpoint authority",
         "Discover sanctioned runner endpoint authority",
         "Enforce the discovered public-read boundary",
+        "Verify effective Nix client authority",
         "Revalidate immutable Bazel build authority",
         "Build the Bulkload binary through the public Flywheel action",
         "Revalidate immutable Bazel test authority",
@@ -822,8 +860,61 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("local action step order or inventory drifted")
     if len(re.findall(r"(?m)^    - \S", action)) != len(expected_step_names):
         raise ContractError("local action steps must use the audited named inventory")
+    expected_step_fields = {
+        "Validate the terminal gate selection": ("shell", "env", "run"),
+        "Snapshot the exact public-read guard": ("id", "shell", "env", "run"),
+        "Preflight raw runner endpoint authority": ("shell", "env", "run"),
+        "Discover sanctioned runner endpoint authority": (
+            "id",
+            "uses",
+            "env",
+            "with",
+        ),
+        "Enforce the discovered public-read boundary": (
+            "id",
+            "shell",
+            "env",
+            "run",
+        ),
+        "Verify effective Nix client authority": ("shell", "env", "run"),
+        "Revalidate immutable Bazel build authority": (
+            "if",
+            "id",
+            "shell",
+            "env",
+            "run",
+        ),
+        "Build the Bulkload binary through the public Flywheel action": (
+            "if",
+            "uses",
+            "env",
+            "with",
+        ),
+        "Revalidate immutable Bazel test authority": (
+            "if",
+            "id",
+            "shell",
+            "env",
+            "run",
+        ),
+        "Test the complete Bulkload Bazel graph through the public Flywheel action": (
+            "if",
+            "uses",
+            "env",
+            "with",
+        ),
+        "Run repository-owned source gates": ("if", "shell", "env", "run"),
+    }
     for name in expected_step_names:
         step = extract_action_step(action, name)
+        fields = tuple(
+            match.group(1)
+            for line in step.splitlines()
+            if (match := re.fullmatch(r"      ([a-z][a-z0-9-]*):(.*)", line))
+            is not None
+        )
+        if fields != expected_step_fields[name]:
+            raise ContractError(f"composite step field inventory drifted: {name}")
         shells = re.findall(r"(?m)^      shell: ", step)
         uses = re.findall(r"(?m)^      uses: ", step)
         runs = re.findall(r"(?m)^      run: \|$", step)
@@ -841,21 +932,53 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     validate_action_step_environment_fences(action)
     validate_terminal_consumer_paths(action)
 
+    effective_nix_step = extract_action_step(
+        action, "Verify effective Nix client authority"
+    )
+    if exact_digest and sha256(effective_nix_step) != EFFECTIVE_NIX_STEP_SHA256:
+        raise ContractError("effective Nix authority step mapping drifted")
+    if "sort -u" in effective_nix_step:
+        raise ContractError(
+            "effective Nix inventories must preserve duplicate evidence"
+        )
+    if (
+        f"      run: |\n        set -euo pipefail\n        nixos_cache={NIXOS_CACHE}\n"
+    ) not in effective_nix_step:
+        raise ContractError("effective Nix authority must fail fast")
+
     source_gate_step = extract_action_step(action, "Run repository-owned source gates")
     if exact_digest and sha256(source_gate_step) != SOURCE_GATE_STEP_SHA256:
         raise ContractError("repository source-gate step mapping drifted")
     if not action.endswith(source_gate_step):
         raise ContractError("repository source gates must be the recursive action tail")
-    source_exec = (
-        "        exec nix develop --no-write-lock-file .#default "
-        "--command just ci-source"
-    )
+    source_exec = "          .#default --command just ci-source"
     source_flake = "        nix flake check --no-build --no-write-lock-file"
+    source_keep_names = tuple(
+        line.removeprefix("          --keep ").removesuffix(" \\")
+        for line in source_gate_step.splitlines()
+        if line.startswith("          --keep ") and line.endswith(" \\")
+    )
     if (
         "      shell: /bin/bash --noprofile --norc -p {0}\n" not in source_gate_step
         or "      run: |\n        set -euo pipefail\n" not in source_gate_step
         or source_gate_step.count(source_flake) != 1
         or source_gate_step.count(source_exec) != 1
+        or source_gate_step.count(
+            "        exec nix develop --no-write-lock-file --ignore-environment \\\n"
+        )
+        != 1
+        or source_keep_names
+        != (
+            "HOME",
+            "NIX_CACHE_HOME",
+            "NIX_CONFIG_HOME",
+            "NIX_DATA_HOME",
+            "NIX_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        )
         or source_gate_step.index(source_flake) >= source_gate_step.index(source_exec)
         or not source_gate_step.rstrip().endswith(source_exec)
     ):
@@ -893,7 +1016,8 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             )
     if re.search(r"(?m)^ {6}(?:\"if\"|'if')\s*:", action):
         raise ContractError("terminal conditions must use canonical unquoted keys")
-    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", action):
+    action_without_reviewed_cache = action.replace(NIXOS_CACHE, "")
+    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", action_without_reviewed_cache):
         raise ContractError("local action must not bake a deployment endpoint")
     if re.search(r"type\s*=\s*gha", action, re.IGNORECASE):
         raise ContractError("GitHub Actions cache authority is forbidden")
@@ -907,15 +1031,34 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "      id: authority",
         "      id: bazel-build-authority",
         "      id: bazel-test-authority",
-        '        /bin/bash -p "$BULKLOAD_GUARD_PATH" preflight',
-        '        /bin/bash -p "$BULKLOAD_GUARD_PATH" enforce',
-        '        test "$(nix config show accept-flake-config)" = false',
-        '        test "$(nix config show netrc-file)" = /dev/null',
-        '        test -z "$(nix config show access-tokens)"',
-        '        test -z "$(nix config show post-build-hook)"',
-        '        test -z "$(nix config show secret-key-files)"',
-        '        test -z "$(nix config show plugin-files)"',
-        "        exec nix develop --no-write-lock-file .#default --command just ci-source",
+        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- preflight",
+        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- enforce",
+        '        [[ "$(nix config show store)" == local ]]',
+        '        [[ "$(nix config show allow-symlinked-store)" == false ]]',
+        '        [[ "$(nix eval --raw --expr builtins.storeDir)" == /nix/store ]]',
+        '        [[ "$(nix config show accept-flake-config)" == false ]]',
+        '        [[ "$(nix config show netrc-file)" == /dev/null ]]',
+        '        [[ -z "$(nix config show access-tokens)" ]]',
+        '        [[ -z "$(nix config show trusted-substituters)" ]]',
+        '        [[ -z "$(nix config show builders)" ]]',
+        '        [[ "$(nix config show builders-use-substitutes)" == false ]]',
+        '        [[ -z "$(nix config show build-hook)" ]]',
+        '        [[ -z "$(nix config show pre-build-hook)" ]]',
+        '        [[ -z "$(nix config show post-build-hook)" ]]',
+        '        [[ -z "$(nix config show diff-hook)" ]]',
+        '        [[ "$(nix config show run-diff-hook)" == false ]]',
+        '        [[ "$(nix config show require-sigs)" == true ]]',
+        '        [[ -z "$(nix config show secret-key-files)" ]]',
+        '        [[ -z "$(nix config show plugin-files)" ]]',
+        f"        nixos_cache={NIXOS_CACHE}",
+        f"        nixos_public_key={NIXOS_PUBLIC_KEY}",
+        "        actual_substituters=$(nix config show substituters | tr ' ' '\\n' | sed '/^$/d' | LC_ALL=C sort)",
+        '        expected_substituters=$(printf \'%s\\n\' "${ATTIC_SERVER%/}/${ATTIC_CACHE}" "$nixos_cache" | LC_ALL=C sort)',
+        '        [[ "$actual_substituters" == "$expected_substituters" ]]',
+        "        actual_public_keys=$(nix config show trusted-public-keys | tr ' ' '\\n' | sed '/^$/d' | LC_ALL=C sort)",
+        '        expected_public_keys=$(printf \'%s\\n\' "$ATTIC_PUBLIC_KEY" "$nixos_public_key" | LC_ALL=C sort)',
+        '        [[ "$actual_public_keys" == "$expected_public_keys" ]]',
+        "        exec nix develop --no-write-lock-file --ignore-environment \\",
         "        command: build",
         "        targets: //:bulkload",
         "        command: test",
@@ -925,92 +1068,372 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         if action.count(declaration) != 1:
             raise ContractError(f"local action contract drifted: {declaration.strip()}")
 
-    def require_yaml_lines(key: str, expected_values: list[str]) -> None:
-        actual = [
-            line.strip().removeprefix(f"{key}:").strip()
-            for line in action.splitlines()
-            if line.strip().startswith(f"{key}:")
-        ]
-        if actual != expected_values:
-            raise ContractError(f"local action {key} environment inventory drifted")
-
-    require_yaml_lines("BASH_ENV", ["/dev/null"] * 9)
-    require_yaml_lines("ENV", ["/dev/null"] * 9)
-    require_yaml_lines(
-        "BULKLOAD_GUARD_PATH",
-        ["${{ steps.guard-snapshot.outputs.guard_path }}"] * 4,
+    reviewed_env_steps = expected_step_names[1:]
+    environment = {
+        name: dict(parse_action_step_env(extract_action_step(action, name)))
+        for name in reviewed_env_steps
+    }
+    action_owned_empty = (
+        "USER",
+        "USERNAME",
+        "LOGNAME",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "NIX_STORE_DIR",
+        "NIX_STORE",
+        "NIX_STATE_DIR",
+        "NIX_DATA_DIR",
+        "NIX_LOG_DIR",
+        "NIX_CONF_DIR",
+        "NIX_DAEMON_SOCKET_PATH",
+        "NIX_IGNORE_SYMLINK_STORE",
+        "NIX_LIBEXEC_DIR",
+        "NIX_BIN_DIR",
+        "NIX_REMOTE_SYSTEMS",
+        "NIX_SSL_CERT_FILE",
+        "NIX_CURL_FLAGS",
+        "NIX_HASHED_MIRRORS",
+        "ftp_proxy",
+        "FTP_PROXY",
+        "GRPC_PROXY_EXP",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JAVA_HOME",
+        "JAVACMD",
+        "BAZEL_SH",
+        "BAZELISK_NOJDK",
+        "BAZELISK_CLEAN",
+        "BAZELISK_SHUTDOWN",
+        "USE_BAZEL_FALLBACK_VERSION",
     )
-    require_yaml_lines("BULKLOAD_RUNNER_NAME", ["${{ runner.name }}"] * 4)
-
-    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 7:
-        raise ContractError(
-            "every direct shell boundary must use absolute privileged non-profile Bash"
-        )
-    require_yaml_lines("PATH", ["${{ steps.authority.outputs.trusted_path }}"] * 5)
-    require_yaml_lines(
+    common_keys = set(action_owned_empty) | {
+        "PATH",
         "HOME",
-        [
-            "${{ steps.bazel-build-authority.outputs.bazel_home }}",
-            "${{ steps.bazel-test-authority.outputs.bazel_home }}",
-        ],
-    )
-    for key in ("ATTIC_TOKEN", "NIX_ACCESS_TOKENS"):
-        require_yaml_lines(key, ['""'] * 7)
-    require_yaml_lines("NIX_USER_CONF_FILES", ["/dev/null"] * 7)
-    require_yaml_lines("NETRC", ["/dev/null"] * 7)
-    require_yaml_lines("NIX_CONFIG", ["${{ steps.authority.outputs.nix_config }}"] * 5)
-    require_yaml_lines(
-        "BAZEL_REMOTE_CACHE",
-        ["${{ steps.authority.outputs.bazel_remote_cache }}"] * 4,
-    )
-    for key in (
-        "BAZEL_REMOTE_EXECUTOR",
-        "BAZEL_REMOTE_EXEC_HEADER",
-        "BAZEL_CREDENTIAL_HELPER",
-        "BAZEL_REMOTE_HEADER",
-        "BAZEL_REMOTE_CACHE_HEADER",
-    ):
-        require_yaml_lines(key, ['""'] * 4)
-    require_yaml_lines(
-        "GF_BAZEL_REMOTE_UPLOAD",
-        ["${{ steps.authority.outputs.bazel_remote_upload }}"] * 4,
-    )
-    for key in (
+        "BASH_ENV",
+        "ENV",
+        "TEST_TMPDIR",
+        "NIX_CACHE_HOME",
+        "NIX_CONFIG_HOME",
+        "NIX_DATA_HOME",
+        "NIX_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "ATTIC_TOKEN",
+        "NIX_ACCESS_TOKENS",
+        "NIX_USER_CONF_FILES",
+        "NETRC",
+        "NIX_CONFIG",
+        "NIX_REMOTE",
         "BAZELISK_BASE_URL",
         "BAZELISK_FORMAT_URL",
         "BAZELISK_GITHUB_TOKEN",
+        "BAZELISK_HOME",
         "BAZELISK_HOME_DARWIN",
         "BAZELISK_HOME_LINUX",
         "BAZELISK_INCOMPATIBLE_FLAGS",
         "BAZELISK_VERIFY_SHA256",
+        "BAZELISK_SKIP_WRAPPER",
         "BAZELISK_WRAPPER_DIRECTORY",
         "USE_BAZEL_VERSION",
-    ):
-        require_yaml_lines(key, ['""'] * 6)
-    require_yaml_lines("BAZELISK_SKIP_WRAPPER", ['"true"'] * 6)
-    require_yaml_lines(
-        "BAZELISK_HOME",
-        [
-            '""',
-            '""',
-            '""',
-            "${{ steps.bazel-build-authority.outputs.bazelisk_home }}",
-            '""',
-            "${{ steps.bazel-test-authority.outputs.bazelisk_home }}",
-        ],
+    }
+    guard_context = {
+        "BULKLOAD_GUARD_PATH": "${{ steps.guard-snapshot.outputs.guard_path }}",
+        "BULKLOAD_RUNTIME_HOME": "${{ steps.guard-snapshot.outputs.runtime_home }}",
+        "BULKLOAD_EVENT_NAME": "${{ inputs.event-name }}",
+        "BULKLOAD_EXPECTED_SHA": "${{ inputs.expected-sha }}",
+        "BULKLOAD_REF": "${{ inputs.ref }}",
+        "BULKLOAD_REPOSITORY": "${{ inputs.repository }}",
+        "BULKLOAD_HEAD_REPOSITORY": "${{ inputs.head-repository }}",
+        "BULKLOAD_UPLOAD_BAZEL_RESULTS": "${{ inputs.upload-bazel-results }}",
+        "BULKLOAD_RUNNER_ENVIRONMENT": "${{ runner.environment }}",
+        "BULKLOAD_RUNNER_NAME": "${{ runner.name }}",
+    }
+    discovered_context = {
+        "BULKLOAD_ATTIC_REACHABLE": "${{ steps.endpoints.outputs.attic_reachable }}",
+        "BULKLOAD_BAZEL_CACHE_REACHABLE": "${{ steps.endpoints.outputs.bazel_cache_reachable }}",
+    }
+    captured_bazel_context = {
+        "BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE": "${{ steps.authority.outputs.bazel_remote_cache }}",
+        "BULKLOAD_CAPTURED_BAZEL_UPLOAD": "${{ steps.authority.outputs.bazel_remote_upload }}",
+        "BULKLOAD_CAPTURED_NIX_CONFIG": "${{ steps.authority.outputs.nix_config }}",
+        "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
+        "BAZEL_REMOTE_CACHE": "${{ steps.authority.outputs.bazel_remote_cache }}",
+        "BAZEL_REMOTE_EXECUTOR": '""',
+        "BAZEL_REMOTE_EXEC_HEADER": '""',
+        "BAZEL_CREDENTIAL_HELPER": '""',
+        "BAZEL_REMOTE_HEADER": '""',
+        "BAZEL_REMOTE_CACHE_HEADER": '""',
+        "GF_BAZEL_REMOTE_UPLOAD": "${{ steps.authority.outputs.bazel_remote_upload }}",
+    }
+    bazel_consumer_context = {
+        key: value
+        for key, value in captured_bazel_context.items()
+        if not key.startswith("BULKLOAD_CAPTURED_") and key != "ATTIC_SERVER"
+    }
+    exact_extras = {
+        reviewed_env_steps[0]: {},
+        reviewed_env_steps[1]: guard_context,
+        reviewed_env_steps[2]: {},
+        reviewed_env_steps[3]: {**guard_context, **discovered_context},
+        reviewed_env_steps[4]: {
+            "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
+            "ATTIC_CACHE": "main",
+            "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
+        },
+        reviewed_env_steps[5]: {
+            **guard_context,
+            **captured_bazel_context,
+            "BULKLOAD_BAZEL_PHASE": "build",
+        },
+        reviewed_env_steps[6]: bazel_consumer_context,
+        reviewed_env_steps[7]: {
+            **guard_context,
+            **captured_bazel_context,
+            "BULKLOAD_BAZEL_PHASE": "test",
+        },
+        reviewed_env_steps[8]: bazel_consumer_context,
+        reviewed_env_steps[9]: {
+            "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
+            "ATTIC_CACHE": "main",
+            "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
+            "ATTIC_PUBLIC_READ_SITE": "bulkload-ci",
+        },
+    }
+    for name, env in environment.items():
+        extras = exact_extras[name]
+        if set(env) != common_keys | set(extras):
+            raise ContractError(f"local action {name} environment key set drifted")
+        if any(env[key] != value for key, value in extras.items()):
+            raise ContractError(f"local action {name} authority inputs drifted")
+
+    for name, env in environment.items():
+        for key in action_owned_empty:
+            if env.get(key) != '""':
+                raise ContractError(f"local action {name} must empty {key}")
+        for key in ("BASH_ENV", "ENV"):
+            if env.get(key) != "/dev/null":
+                raise ContractError(f"local action {name} lost its {key} fence")
+        for key in ("ATTIC_TOKEN", "NIX_ACCESS_TOKENS"):
+            if env.get(key) != '""':
+                raise ContractError(f"local action {name} must empty {key}")
+        if env.get("NIX_USER_CONF_FILES") != "/dev/null":
+            raise ContractError(f"local action {name} lost its Nix config fence")
+        if env.get("NETRC") != "/dev/null":
+            raise ContractError(f"local action {name} lost its netrc fence")
+        if env.get("NIX_REMOTE") != "local":
+            raise ContractError(f"local action {name} escaped the local Nix store")
+        for key in (
+            "BAZELISK_BASE_URL",
+            "BAZELISK_FORMAT_URL",
+            "BAZELISK_GITHUB_TOKEN",
+            "BAZELISK_HOME_DARWIN",
+            "BAZELISK_HOME_LINUX",
+            "BAZELISK_INCOMPATIBLE_FLAGS",
+            "BAZELISK_VERIFY_SHA256",
+            "BAZELISK_WRAPPER_DIRECTORY",
+            "USE_BAZEL_VERSION",
+        ):
+            if env.get(key) != '""':
+                raise ContractError(f"local action {name} must empty {key}")
+        if env.get("BAZELISK_SKIP_WRAPPER") != '"true"':
+            raise ContractError(f"local action {name} lost its Bazelisk fence")
+
+    gate_env = dict(
+        parse_action_step_env(
+            extract_action_step(action, "Validate the terminal gate selection")
+        )
     )
+    if gate_env != {
+        "BASH_ENV": "/dev/null",
+        "ENV": "/dev/null",
+        "BULKLOAD_GATE": "${{ inputs.gate }}",
+    }:
+        raise ContractError("terminal gate validation environment drifted")
+
+    preflight_nix_config = "|-\n" + "\n".join(
+        (
+            f"substituters = {NIXOS_CACHE}",
+            "store = local",
+            "allow-symlinked-store = false",
+            f"trusted-public-keys = {NIXOS_PUBLIC_KEY}",
+            "trusted-substituters =",
+            "builders =",
+            "builders-use-substitutes = false",
+            "build-hook =",
+            "pre-build-hook =",
+            "post-build-hook =",
+            "diff-hook =",
+            "run-diff-hook = false",
+            "require-sigs = true",
+            "access-tokens =",
+            "netrc-file = /dev/null",
+            "accept-flake-config = false",
+            "secret-key-files =",
+            "plugin-files =",
+        )
+    )
+    for name in reviewed_env_steps[:4]:
+        if environment[name].get("NIX_CONFIG") != preflight_nix_config:
+            raise ContractError(f"local action {name} preflight Nix config drifted")
+    for name in reviewed_env_steps[4:]:
+        if environment[name].get("NIX_CONFIG") != (
+            "${{ steps.authority.outputs.nix_config }}"
+        ):
+            raise ContractError(f"local action {name} captured Nix config drifted")
+
+    expected_paths = {
+        reviewed_env_steps[0]: REVIEWED_PATH,
+        reviewed_env_steps[1]: REVIEWED_PATH,
+        reviewed_env_steps[2]: REVIEWED_PATH,
+        reviewed_env_steps[3]: REVIEWED_STEP_PATH,
+        **{
+            name: "${{ steps.authority.outputs.trusted_path }}"
+            for name in reviewed_env_steps[4:]
+        },
+    }
+    common_home = "${{ steps.guard-snapshot.outputs.runtime_home }}"
+    source_home = "${{ steps.guard-snapshot.outputs.source_runtime_home }}"
+    expected_homes = {
+        reviewed_env_steps[0]: "/var/empty",
+        reviewed_env_steps[1]: common_home,
+        reviewed_env_steps[2]: common_home,
+        reviewed_env_steps[3]: common_home,
+        reviewed_env_steps[4]: common_home,
+        reviewed_env_steps[5]: common_home,
+        reviewed_env_steps[6]: "${{ steps.bazel-build-authority.outputs.bazel_home }}",
+        reviewed_env_steps[7]: common_home,
+        reviewed_env_steps[8]: "${{ steps.bazel-test-authority.outputs.bazel_home }}",
+        reviewed_env_steps[9]: source_home,
+    }
+    for name in reviewed_env_steps:
+        env = environment[name]
+        if (
+            env.get("PATH") != expected_paths[name]
+            or env.get("HOME") != expected_homes[name]
+        ):
+            raise ContractError(f"local action {name} path or home authority drifted")
+
+    private_home_keys = (
+        "NIX_CACHE_HOME",
+        "NIX_CONFIG_HOME",
+        "NIX_DATA_HOME",
+        "NIX_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    )
+    expected_runtime_homes = {
+        reviewed_env_steps[0]: '""',
+        reviewed_env_steps[1]: common_home,
+        reviewed_env_steps[2]: common_home,
+        reviewed_env_steps[3]: common_home,
+        reviewed_env_steps[4]: common_home,
+        reviewed_env_steps[5]: common_home,
+        reviewed_env_steps[
+            6
+        ]: "${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}",
+        reviewed_env_steps[7]: common_home,
+        reviewed_env_steps[
+            8
+        ]: "${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}",
+        reviewed_env_steps[9]: source_home,
+    }
+    expected_test_tmpdirs = {name: '""' for name in reviewed_env_steps}
+    expected_test_tmpdirs[reviewed_env_steps[6]] = (
+        "${{ steps.bazel-build-authority.outputs.bazel_test_tmpdir }}"
+    )
+    expected_test_tmpdirs[reviewed_env_steps[8]] = (
+        "${{ steps.bazel-test-authority.outputs.bazel_test_tmpdir }}"
+    )
+    expected_bazelisk_homes = {name: '""' for name in reviewed_env_steps}
+    expected_bazelisk_homes[reviewed_env_steps[6]] = (
+        "${{ steps.bazel-build-authority.outputs.bazelisk_home }}"
+    )
+    expected_bazelisk_homes[reviewed_env_steps[8]] = (
+        "${{ steps.bazel-test-authority.outputs.bazelisk_home }}"
+    )
+    for name, env in environment.items():
+        if any(
+            env.get(key) != expected_runtime_homes[name] for key in private_home_keys
+        ):
+            raise ContractError(f"local action {name} private home inventory drifted")
+        if env.get("TEST_TMPDIR") != expected_test_tmpdirs[name]:
+            raise ContractError(f"local action {name} test tmpdir drifted")
+        if env.get("BAZELISK_HOME") != expected_bazelisk_homes[name]:
+            raise ContractError(f"local action {name} Bazelisk home drifted")
+
+    bazel_steps = reviewed_env_steps[5:9]
+    for name in bazel_steps:
+        env = environment[name]
+        if env.get("BAZEL_REMOTE_CACHE") != (
+            "${{ steps.authority.outputs.bazel_remote_cache }}"
+        ):
+            raise ContractError(f"local action {name} Bazel cache authority drifted")
+        if env.get("GF_BAZEL_REMOTE_UPLOAD") != (
+            "${{ steps.authority.outputs.bazel_remote_upload }}"
+        ):
+            raise ContractError(f"local action {name} Bazel upload authority drifted")
+        for key in (
+            "BAZEL_REMOTE_EXECUTOR",
+            "BAZEL_REMOTE_EXEC_HEADER",
+            "BAZEL_CREDENTIAL_HELPER",
+            "BAZEL_REMOTE_HEADER",
+            "BAZEL_REMOTE_CACHE_HEADER",
+        ):
+            if env.get(key) != '""':
+                raise ContractError(f"local action {name} must empty {key}")
+    for name, phase in (
+        (reviewed_env_steps[5], "build"),
+        (reviewed_env_steps[7], "test"),
+    ):
+        env = environment[name]
+        if env.get("BULKLOAD_BAZEL_PHASE") != phase:
+            raise ContractError(f"local action {name} Bazel phase drifted")
+        if env.get("BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE") != (
+            "${{ steps.authority.outputs.bazel_remote_cache }}"
+        ):
+            raise ContractError(f"local action {name} captured cache drifted")
+        if env.get("BULKLOAD_CAPTURED_BAZEL_UPLOAD") != (
+            "${{ steps.authority.outputs.bazel_remote_upload }}"
+        ):
+            raise ContractError(f"local action {name} captured upload drifted")
+        if env.get("BULKLOAD_CAPTURED_NIX_CONFIG") != (
+            "${{ steps.authority.outputs.nix_config }}"
+        ):
+            raise ContractError(f"local action {name} captured Nix config drifted")
+
+    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 8:
+        raise ContractError(
+            "every direct shell boundary must use absolute privileged non-profile Bash"
+        )
 
     if action.count(GUARD_SHA256) != 5:
         raise ContractError("snapshot guard digest inventory drifted")
     if (
-        action.count(
-            'test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk \'{print $1}\')" = '
-            + GUARD_SHA256
-        )
+        action.count('guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)')
         != 4
     ):
-        raise ContractError("every guard execution must have an external digest check")
-    if action.count('        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel') != 2:
+        raise ContractError("every guard wrapper must capture immutable bytes")
+    if action.count("        guard_source=${guard_source%x}") != 4:
+        raise ContractError("every guard wrapper must preserve trailing newlines")
+    digest_check = (
+        '[[ "$(printf \'%s\' "$guard_source" | /usr/bin/sha256sum | '
+        "/usr/bin/awk '{print $1}')\" == " + GUARD_SHA256 + " ]]"
+    )
+    if action.count(digest_check) != 4:
+        raise ContractError("every captured guard must have an external digest check")
+    if (
+        action.count(
+            "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel"
+        )
+        != 2
+    ):
         raise ContractError("each Bazel invocation needs an immediate authority guard")
     if (
         action.count(
@@ -1023,14 +1446,17 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("Bazel executor input must remain empty")
 
     snapshot = action.index("- name: Snapshot the exact public-read guard")
-    preflight = action.index('/bin/bash -p "$BULKLOAD_GUARD_PATH" preflight')
+    preflight = action.index("/bin/bash --noprofile --norc -p -s -- preflight")
     setup = action.index(f"uses: {nix_setup}")
-    enforce = action.index('/bin/bash -p "$BULKLOAD_GUARD_PATH" enforce')
+    enforce = action.index("/bin/bash --noprofile --norc -p -s -- enforce")
+    effective_nix = action.index(
+        "\n    - name: Verify effective Nix client authority\n"
+    )
     source = action.index("\n    - name: Run repository-owned source gates\n")
     bazel_guards = [
         match.start()
         for match in re.finditer(
-            re.escape('/bin/bash -p "$BULKLOAD_GUARD_PATH" bazel'), action
+            re.escape("/bin/bash --noprofile --norc -p -s -- bazel"), action
         )
     ]
     bazel_actions = [
@@ -1042,6 +1468,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         < preflight
         < setup
         < enforce
+        < effective_nix
         < bazel_guards[0]
         < bazel_actions[0]
         < bazel_guards[1]
@@ -1058,7 +1485,8 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
 def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
     if exact_digest and sha256(guard) != GUARD_SHA256:
         raise ContractError("public-read guard digest drifted")
-    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", guard):
+    guard_without_reviewed_cache = guard.replace(NIXOS_CACHE, "")
+    if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", guard_without_reviewed_cache):
         raise ContractError("guard must not bake a deployment endpoint")
     for forbidden in (
         "accept-flake-config = true",
@@ -1071,8 +1499,20 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
     required = (
         f"readonly ci_templates_rev={CI_TEMPLATES_REV}",
         f"readonly public_key='{PUBLIC_KEY}'",
+        f"readonly nixos_cache='{NIXOS_CACHE}'",
+        f"readonly nixos_public_key='{NIXOS_PUBLIC_KEY}'",
         "readonly public_site=bulkload-ci",
         "readonly cache_name=main",
+        f"readonly reviewed_path={REVIEWED_PATH}",
+        f"readonly reviewed_step_path={REVIEWED_STEP_PATH}",
+        "require_forbidden_environment_names_absent",
+        'GIT_*) die "Git environment overrides are forbidden" ;;',
+        'JUST_*) die "Just environment overrides are forbidden" ;;',
+        'NIX_MIRRORS_*) die "dynamic Nix mirror overrides are forbidden" ;;',
+        'SHELLCHECK_OPTS) die "ShellCheck environment overrides are forbidden" ;;',
+        'require_equal "command search path" "${PATH:-}" "$reviewed_path"',
+        'require_equal "private runtime home" "${HOME:-}" "${BULKLOAD_RUNTIME_HOME:-}"',
+        'require_private_directory "Nix/XDG runtime home" "${BULKLOAD_RUNTIME_HOME:-}"',
         'require_equal "runner environment" "${BULKLOAD_RUNNER_ENVIRONMENT:-}" self-hosted',
         "^bulkload-nix-[a-z0-9]+-runner-[a-z0-9]+$",
         'require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"',
@@ -1082,10 +1522,34 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'if [[ "$BULKLOAD_EVENT_NAME" == push && "$BULKLOAD_REF" == refs/heads/main ]]; then',
         'case "$mode" in',
         "preflight | enforce | bazel) ;;",
+        'require_empty "user-name override" "${USER:-}"',
+        'require_empty "Nix store directory override" "${NIX_STORE_DIR:-}"',
+        'require_empty "Nix daemon socket override" "${NIX_DAEMON_SOCKET_PATH:-}"',
+        'require_empty "Nix remote systems override" "${NIX_REMOTE_SYSTEMS:-}"',
+        'require_empty "Nix TLS certificate override" "${NIX_SSL_CERT_FILE:-}"',
+        'require_empty "Nix curl flags" "${NIX_CURL_FLAGS:-}"',
+        'require_empty "Nix hashed mirrors" "${NIX_HASHED_MIRRORS:-}"',
+        'require_empty "gRPC proxy override" "${GRPC_PROXY_EXP:-}"',
+        'require_empty "Java tool options" "${JAVA_TOOL_OPTIONS:-}"',
+        'require_empty "Bazel shell override" "${BAZEL_SH:-}"',
+        'require_empty "Bazelisk no-JDK selector" "${BAZELISK_NOJDK:-}"',
+        'require_empty "Bazelisk clean command" "${BAZELISK_CLEAN:-}"',
+        'require_empty "Bazelisk shutdown command" "${BAZELISK_SHUTDOWN:-}"',
+        'require_empty "Bazelisk fallback version" "${USE_BAZEL_FALLBACK_VERSION:-}"',
+        'require_empty "Bazel test temporary root" "${TEST_TMPDIR:-}"',
+        "  NIX_CACHE_HOME \\",
+        "  NIX_CONFIG_HOME \\",
+        "  NIX_DATA_HOME \\",
+        "  NIX_STATE_HOME \\",
+        "  XDG_CACHE_HOME \\",
+        "  XDG_CONFIG_HOME \\",
+        "  XDG_DATA_HOME \\",
+        "  XDG_STATE_HOME; do",
         'require_empty "Attic token" "${ATTIC_TOKEN:-}"',
         'require_empty "Nix access tokens" "${NIX_ACCESS_TOKENS:-}"',
         'require_equal "Nix user configuration" "${NIX_USER_CONF_FILES:-}" /dev/null',
         'require_equal "netrc environment" "${NETRC:-}" /dev/null',
+        'require_equal "Nix remote store" "${NIX_REMOTE:-}" local',
         'require_endpoint ATTIC_SERVER "${ATTIC_SERVER:-}"',
         'require_endpoint BAZEL_REMOTE_CACHE "${BAZEL_REMOTE_CACHE:-}"',
         'require_empty "remote executor" "${BAZEL_REMOTE_EXECUTOR:-}"',
@@ -1099,6 +1563,9 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'require_empty "Bazelisk wrapper directory" "${BAZELISK_WRAPPER_DIRECTORY:-}"',
         'require_empty "Bazelisk incompatible flags" "${BAZELISK_INCOMPATIBLE_FLAGS:-}"',
         'require_empty "Bazelisk verification override" "${BAZELISK_VERIFY_SHA256:-}"',
+        'require_empty "Bazelisk version override" "${USE_BAZEL_VERSION:-}"',
+        'require_empty "Bazelisk Linux home override" "${BAZELISK_HOME_LINUX:-}"',
+        'require_empty "Bazelisk Darwin home override" "${BAZELISK_HOME_DARWIN:-}"',
         'require_equal "Bazelisk wrapper skip" "${BAZELISK_SKIP_WRAPPER:-}" true',
         'require_empty "Bazelisk home" "${BAZELISK_HOME:-}"',
         'if [[ "$mode" == preflight ]]; then',
@@ -1108,9 +1575,11 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         "set_env_*) ;;",
         "set_output_*) ;;",
         'if [[ "$mode" == bazel ]]; then',
+        "build | test) ;;",
         '"captured Bazel endpoint"',
         '"active Bazel upload gate"',
         '"captured Nix client configuration"',
+        '"reviewed Nix client configuration"',
         'require_absent_or_empty_file "system Bazel rc" /etc/bazel.bazelrc',
         'die "workspace Bazelisk rc is forbidden"',
         'die "workspace Bazelisk wrapper is forbidden"',
@@ -1123,17 +1592,30 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'require_absent_or_empty_file "isolated home netrc" "$bazel_home/.netrc"',
         "printf 'bazelisk_home=%s\\n' \"$bazelisk_home\"",
         "printf 'bazel_home=%s\\n' \"$bazel_home\"",
-        "extra-substituters = ${ATTIC_SERVER%/}/${cache_name}",
-        "extra-trusted-public-keys = ${public_key}",
+        "printf 'bazel_test_tmpdir=%s\\n' \"$bazel_test_tmpdir\"",
+        "printf 'bazel_runtime_home=%s\\n' \"$bazel_runtime_home\"",
+        "substituters = ${ATTIC_SERVER%/}/${cache_name} ${nixos_cache}",
+        "store = local",
+        "allow-symlinked-store = false",
+        "trusted-public-keys = ${public_key} ${nixos_public_key}",
+        "trusted-substituters =",
+        "builders =",
+        "builders-use-substitutes = false",
+        "build-hook =",
+        "pre-build-hook =",
         "access-tokens =",
         "netrc-file = /dev/null",
         "accept-flake-config = false",
         "post-build-hook =",
+        "diff-hook =",
+        "run-diff-hook = false",
+        "require-sigs = true",
         "secret-key-files =",
         "plugin-files =",
         "printf 'NIX_ACCESS_TOKENS=\\n'",
         "printf 'NIX_USER_CONF_FILES=/dev/null\\n'",
         "printf 'NETRC=/dev/null\\n'",
+        "printf 'NIX_REMOTE=local\\n'",
         "printf 'BAZEL_CREDENTIAL_HELPER=\\n'",
         "printf 'BAZEL_REMOTE_CACHE_HEADER=\\n'",
         "printf 'BAZEL_REMOTE_EXECUTOR=\\n'",
@@ -1143,22 +1625,63 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         "printf 'BAZELISK_HOME=\\n'",
         "printf 'BAZELISK_SKIP_WRAPPER=true\\n'",
         "printf 'BAZELISK_VERIFY_SHA256=\\n'",
-        "printf 'trusted_path=%s\\n' \"$PATH\"",
+        "printf 'trusted_path=%s\\n' \"$reviewed_step_path\"",
         "printf 'nix_config<<BULKLOAD_NIX_OUTPUT_%s\\n' \"$ci_templates_rev\"",
     )
     for declaration in required:
         if declaration not in guard:
             raise ContractError(f"guard contract drifted: {declaration}")
 
-    nix_config_match = re.search(r'readonly nix_config="([^\"]*)"', guard)
-    expected_nix_config = "\n".join(
+    preflight_nix_config_match = re.search(
+        r'readonly preflight_nix_config="([^\"]*)"', guard
+    )
+    expected_preflight_nix_config = "\n".join(
         (
-            "extra-substituters = ${ATTIC_SERVER%/}/${cache_name}",
-            "extra-trusted-public-keys = ${public_key}",
+            "substituters = ${nixos_cache}",
+            "store = local",
+            "allow-symlinked-store = false",
+            "trusted-public-keys = ${nixos_public_key}",
+            "trusted-substituters =",
+            "builders =",
+            "builders-use-substitutes = false",
+            "build-hook =",
+            "pre-build-hook =",
+            "post-build-hook =",
+            "diff-hook =",
+            "run-diff-hook = false",
+            "require-sigs = true",
             "access-tokens =",
             "netrc-file = /dev/null",
             "accept-flake-config = false",
+            "secret-key-files =",
+            "plugin-files =",
+        )
+    )
+    if (
+        preflight_nix_config_match is None
+        or preflight_nix_config_match.group(1) != expected_preflight_nix_config
+    ):
+        raise ContractError("pre-discovery Nix client configuration drifted")
+
+    nix_config_match = re.search(r'readonly nix_config="([^\"]*)"', guard)
+    expected_nix_config = "\n".join(
+        (
+            "substituters = ${ATTIC_SERVER%/}/${cache_name} ${nixos_cache}",
+            "store = local",
+            "allow-symlinked-store = false",
+            "trusted-public-keys = ${public_key} ${nixos_public_key}",
+            "trusted-substituters =",
+            "builders =",
+            "builders-use-substitutes = false",
+            "build-hook =",
+            "pre-build-hook =",
             "post-build-hook =",
+            "diff-hook =",
+            "run-diff-hook = false",
+            "require-sigs = true",
+            "access-tokens =",
+            "netrc-file = /dev/null",
+            "accept-flake-config = false",
             "secret-key-files =",
             "plugin-files =",
         )
@@ -1347,6 +1870,7 @@ class CiContractTest(unittest.TestCase):
                 "Preflight raw runner endpoint authority",
                 "Discover sanctioned runner endpoint authority",
                 "Enforce the discovered public-read boundary",
+                "Verify effective Nix client authority",
                 TERMINAL_CONSUMERS["source"],
             ],
             "build": [
@@ -1355,6 +1879,7 @@ class CiContractTest(unittest.TestCase):
                 "Preflight raw runner endpoint authority",
                 "Discover sanctioned runner endpoint authority",
                 "Enforce the discovered public-read boundary",
+                "Verify effective Nix client authority",
                 "Revalidate immutable Bazel build authority",
                 TERMINAL_CONSUMERS["build"],
             ],
@@ -1364,6 +1889,7 @@ class CiContractTest(unittest.TestCase):
                 "Preflight raw runner endpoint authority",
                 "Discover sanctioned runner endpoint authority",
                 "Enforce the discovered public-read boundary",
+                "Verify effective Nix client authority",
                 "Revalidate immutable Bazel test authority",
                 TERMINAL_CONSUMERS["test"],
             ],
@@ -1494,7 +2020,7 @@ class CiContractTest(unittest.TestCase):
                 self.assertNotEqual(unsafe, self.action)
                 with self.assertRaisesRegex(
                     ContractError,
-                    r"(?:canonical block mapping syntax|env key is not auditable)",
+                    r"(?:canonical block mapping syntax|environment key is not auditable|composite step field inventory drifted)",
                 ):
                     validate_local_action(unsafe, exact_digest=False)
 
@@ -1518,14 +2044,21 @@ class CiContractTest(unittest.TestCase):
             action_env_override("SSL_CERT_DIR", "/tmp/certs"),
             action_env_override("SSLKEYLOGFILE", "/tmp/keylog"),
             self.action.replace(
-                "        exec nix develop --no-write-lock-file .#default --command just ci-source",
-                "        nix develop --no-write-lock-file .#default --command just ci-source",
+                "        exec nix develop --no-write-lock-file --ignore-environment \\",
+                "        nix develop --no-write-lock-file --ignore-environment \\",
                 1,
             ),
             self.action.replace(
-                "        exec nix develop --no-write-lock-file .#default --command just ci-source",
-                "        exec nix develop --no-write-lock-file .#default --command just ci-source\n"
-                "        /bin/true",
+                "    - name: Run repository-owned source gates\n"
+                "      if: ${{ inputs.gate == 'source' }}\n",
+                "    - name: Run repository-owned source gates\n"
+                "      if: ${{ inputs.gate == 'source' }}\n"
+                "      working-directory: ${{ github.workspace }}/attacker\n",
+                1,
+            ),
+            self.action.replace(
+                "          .#default --command just ci-source",
+                "          .#default --command just ci-source\n        /bin/true",
                 1,
             ),
             self.action + "\n    - name: Consume poisoned environment\n"
@@ -1841,8 +2374,8 @@ class CiContractTest(unittest.TestCase):
                 "        nix flake check --no-build --no-write-lock-file",
             ),
             self.action.replace(
-                '        set -euo pipefail\n        test -z "${NIX_ACCESS_TOKENS:-}"\n',
-                '        set +e\n        test -z "${NIX_ACCESS_TOKENS:-}"\n',
+                "        set -euo pipefail\n        nixos_cache=https://cache.nixos.org/\n",
+                "        set +e\n        nixos_cache=https://cache.nixos.org/\n",
             ),
             self.action.replace(
                 "        nix flake check --no-build --no-write-lock-file",
@@ -1880,12 +2413,14 @@ class CiContractTest(unittest.TestCase):
                 1,
             ),
             self.action.replace(
-                '/bin/bash -p "$BULKLOAD_GUARD_PATH" preflight',
-                '/bin/bash -p "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
+                "/bin/bash --noprofile --norc -p -s -- preflight",
+                '/bin/bash --noprofile --norc -p "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
                 1,
             ),
             self.action.replace(
-                '        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel\n', "", 1
+                "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel\n",
+                "",
+                1,
             ),
             self.action.replace(GUARD_SHA256, "0" * 64, 1),
             self.action.replace(
@@ -1901,12 +2436,44 @@ class CiContractTest(unittest.TestCase):
                 "BAZELISK_HOME: ${{ runner.temp }}/predictable",
                 1,
             ),
-            setup_before_preflight,
             self.action.replace(
-                'accept-flake-config)" = false', 'accept-flake-config)" = true'
+                "        NIX_REMOTE: local", "        NIX_REMOTE: daemon", 1
             ),
             self.action.replace(
-                '        test -z "$(nix config show post-build-hook)"\n', ""
+                '        GRPC_PROXY_EXP: ""',
+                "        GRPC_PROXY_EXP: dns:///proxy.invalid",
+                1,
+            ),
+            self.action.replace(
+                '        BAZEL_SH: ""', "        BAZEL_SH: /tmp/unaudited-sh", 1
+            ),
+            self.action.replace(
+                '        BAZELISK_CLEAN: ""', "        BAZELISK_CLEAN: expunge", 1
+            ),
+            self.action.replace(" --ignore-environment \\", " \\", 1),
+            self.action.replace(
+                "          --keep HOME \\",
+                "          --keep HOME \\\n          --keep ATTIC_TOKEN \\",
+                1,
+            ),
+            self.action.replace("LC_ALL=C sort)", "LC_ALL=C sort -u)", 1),
+            self.action.replace(
+                "        NIX_REMOTE: local\n",
+                "        NIX_REMOTE: local\n        NIX_REMOTE: local\n",
+                1,
+            ),
+            self.action.replace(
+                "        NIX_REMOTE: local\n",
+                "        NIX_REMOTE: local\n        UNREVIEWED_SELECTOR: value\n",
+                1,
+            ),
+            self.action.replace("        NIX_CONFIG: |-", "        NIX_CONFIG: >-", 1),
+            setup_before_preflight,
+            self.action.replace(
+                'accept-flake-config)" == false', 'accept-flake-config)" == true'
+            ),
+            self.action.replace(
+                '        [[ -z "$(nix config show post-build-hook)" ]]\n', ""
             ),
             self.action.replace(
                 '        ATTIC_TOKEN: ""',
@@ -1961,6 +2528,28 @@ class CiContractTest(unittest.TestCase):
                 'printf "%s\\n" "${ATTIC_SERVER:-}"',
             ),
             self.guard.replace("refs/heads/main", "refs/heads/*"),
+            self.guard.replace('NIX_REMOTE:-}" local', 'NIX_REMOTE:-}" daemon'),
+            self.guard.replace(REVIEWED_PATH, "/tmp/unaudited:/usr/bin:/bin"),
+            self.guard.replace(
+                'require_empty "gRPC proxy override" "${GRPC_PROXY_EXP:-}"',
+                'printf "%s\\n" "${GRPC_PROXY_EXP:-}"',
+            ),
+            self.guard.replace(
+                'require_empty "Bazel shell override" "${BAZEL_SH:-}"',
+                'printf "%s\\n" "${BAZEL_SH:-}"',
+            ),
+            self.guard.replace(
+                'require_empty "Bazelisk clean command" "${BAZELISK_CLEAN:-}"',
+                'printf "%s\\n" "${BAZELISK_CLEAN:-}"',
+            ),
+            self.guard.replace("store = local", "store = daemon"),
+            self.guard.replace(
+                "allow-symlinked-store = false", "allow-symlinked-store = true"
+            ),
+            self.guard.replace("require-sigs = true", "require-sigs = false"),
+            self.guard.replace(
+                'GIT_*) die "Git environment overrides are forbidden" ;;', ""
+            ),
         ]
         for unsafe in unsafe_variants:
             with self.assertRaises(ContractError):
@@ -1969,11 +2558,6 @@ class CiContractTest(unittest.TestCase):
     def test_guard_executes_pr_and_main_upload_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
-            mock_bin = temporary_path / "mock-bin"
-            mock_bin.mkdir()
-            git = mock_bin / "git"
-            git.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$MOCK_HEAD"\n')
-            git.chmod(0o755)
             workspace = temporary_path / "workspace"
             workspace.mkdir()
             for path in (
@@ -1984,28 +2568,89 @@ class CiContractTest(unittest.TestCase):
                 "flake.lock",
             ):
                 shutil.copy2(self.root / path, workspace / path)
+            subprocess.run(["/usr/bin/git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["/usr/bin/git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-c",
+                    "user.name=Bulkload CI contract",
+                    "-c",
+                    "user.email=bulkload-ci@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                cwd=workspace,
+                check=True,
+            )
             command_files = temporary_path / "_runner_file_commands"
             command_files.mkdir()
             github_env = command_files / "set_env_bulkload"
             github_env.touch()
             github_output = command_files / "set_output_bulkload"
             github_output.touch()
-            head = "a" * 40
+            head = subprocess.check_output(
+                ["/usr/bin/git", "rev-parse", "HEAD"],
+                cwd=workspace,
+                text=True,
+            ).strip()
+            runtime_home = temporary_path / "runtime-home"
+            runtime_home.mkdir(mode=0o700)
             nix_config = "\n".join(
                 (
-                    "extra-substituters = https://cache.example.invalid/main",
-                    f"extra-trusted-public-keys = {PUBLIC_KEY}",
+                    f"substituters = https://cache.example.invalid/main {NIXOS_CACHE}",
+                    "store = local",
+                    "allow-symlinked-store = false",
+                    f"trusted-public-keys = {PUBLIC_KEY} {NIXOS_PUBLIC_KEY}",
+                    "trusted-substituters =",
+                    "builders =",
+                    "builders-use-substitutes = false",
+                    "build-hook =",
+                    "pre-build-hook =",
+                    "post-build-hook =",
+                    "diff-hook =",
+                    "run-diff-hook = false",
+                    "require-sigs = true",
                     "access-tokens =",
                     "netrc-file = /dev/null",
                     "accept-flake-config = false",
+                    "secret-key-files =",
+                    "plugin-files =",
+                )
+            )
+            preflight_nix_config = "\n".join(
+                (
+                    f"substituters = {NIXOS_CACHE}",
+                    "store = local",
+                    "allow-symlinked-store = false",
+                    f"trusted-public-keys = {NIXOS_PUBLIC_KEY}",
+                    "trusted-substituters =",
+                    "builders =",
+                    "builders-use-substitutes = false",
+                    "build-hook =",
+                    "pre-build-hook =",
                     "post-build-hook =",
+                    "diff-hook =",
+                    "run-diff-hook = false",
+                    "require-sigs = true",
+                    "access-tokens =",
+                    "netrc-file = /dev/null",
+                    "accept-flake-config = false",
                     "secret-key-files =",
                     "plugin-files =",
                 )
             )
             base_env = {
-                "PATH": f"{mock_bin}:/usr/bin:/bin:/sbin",
-                "MOCK_HEAD": head,
+                "PATH": REVIEWED_PATH,
+                "HOME": str(runtime_home),
+                "USER": "",
+                "USERNAME": "",
+                "LOGNAME": "",
                 "GITHUB_ENV": str(github_env),
                 "GITHUB_OUTPUT": str(github_output),
                 "RUNNER_TEMP": temporary,
@@ -2013,6 +2658,7 @@ class CiContractTest(unittest.TestCase):
                 "GITHUB_REF": "refs/pull/9/merge",
                 "GITHUB_WORKSPACE": str(workspace),
                 "GITHUB_REPOSITORY": "Jesssullivan/bulkload",
+                "BULKLOAD_RUNTIME_HOME": str(runtime_home),
                 "BULKLOAD_EVENT_NAME": "pull_request",
                 "BULKLOAD_EXPECTED_SHA": head,
                 "BULKLOAD_REF": "refs/pull/9/merge",
@@ -2027,6 +2673,16 @@ class CiContractTest(unittest.TestCase):
                 "NIX_ACCESS_TOKENS": "",
                 "NIX_USER_CONF_FILES": "/dev/null",
                 "NETRC": "/dev/null",
+                "NIX_CONFIG": preflight_nix_config,
+                "NIX_REMOTE": "local",
+                "NIX_CACHE_HOME": str(runtime_home),
+                "NIX_CONFIG_HOME": str(runtime_home),
+                "NIX_DATA_HOME": str(runtime_home),
+                "NIX_STATE_HOME": str(runtime_home),
+                "XDG_CACHE_HOME": str(runtime_home),
+                "XDG_CONFIG_HOME": str(runtime_home),
+                "XDG_DATA_HOME": str(runtime_home),
+                "XDG_STATE_HOME": str(runtime_home),
                 "ATTIC_SERVER": "https://cache.example.invalid",
                 "ATTIC_CACHE": "main",
                 "BAZEL_REMOTE_CACHE": "https://bazel.example.invalid",
@@ -2046,18 +2702,35 @@ class CiContractTest(unittest.TestCase):
                 "BAZELISK_SKIP_WRAPPER": "true",
                 "BAZELISK_WRAPPER_DIRECTORY": "",
                 "USE_BAZEL_VERSION": "",
+                "BAZELISK_NOJDK": "",
+                "BAZELISK_CLEAN": "",
+                "BAZELISK_SHUTDOWN": "",
+                "USE_BAZEL_FALLBACK_VERSION": "",
+                "BAZEL_SH": "",
+                "GRPC_PROXY_EXP": "",
+                "TEST_TMPDIR": "",
             }
 
             def run_guard(
                 mode: str, env: dict[str, str], *, check: bool = True
             ) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    ["bash", str(self.root / GUARD_PATH), mode],
-                    check=check,
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "--noprofile",
+                        "--norc",
+                        "-p",
+                        str(self.root / GUARD_PATH),
+                        mode,
+                    ],
+                    check=False,
                     env=env,
                     capture_output=True,
                     text=True,
                 )
+                if check:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                return result
 
             run_guard("preflight", base_env)
             preflight_emitted = github_env.read_text()
@@ -2065,7 +2738,36 @@ class CiContractTest(unittest.TestCase):
             self.assertIn("ENV=/dev/null\n", preflight_emitted)
             self.assertIn("ATTIC_TOKEN=\n", preflight_emitted)
             self.assertIn("NIX_ACCESS_TOKENS=\n", preflight_emitted)
+            self.assertIn("NIX_REMOTE=local\n", preflight_emitted)
+            self.assertIn(f"HOME={runtime_home}\n", preflight_emitted)
+            self.assertIn(f"substituters = {NIXOS_CACHE}\n", preflight_emitted)
+            self.assertIn("store = local\n", preflight_emitted)
+            self.assertIn("allow-symlinked-store = false\n", preflight_emitted)
+            self.assertIn("builders =\n", preflight_emitted)
+            self.assertIn("require-sigs = true\n", preflight_emitted)
             self.assertIn("BAZEL_CREDENTIAL_HELPER=\n", preflight_emitted)
+            for key in (
+                "GRPC_PROXY_EXP",
+                "JAVA_TOOL_OPTIONS",
+                "BAZEL_SH",
+                "BAZELISK_NOJDK",
+                "BAZELISK_CLEAN",
+                "BAZELISK_SHUTDOWN",
+                "USE_BAZEL_FALLBACK_VERSION",
+                "TEST_TMPDIR",
+            ):
+                self.assertIn(f"{key}=\n", preflight_emitted)
+            for key in (
+                "NIX_CACHE_HOME",
+                "NIX_CONFIG_HOME",
+                "NIX_DATA_HOME",
+                "NIX_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+            ):
+                self.assertIn(f"{key}={runtime_home}\n", preflight_emitted)
 
             run_guard("enforce", base_env)
             emitted = github_env.read_text()
@@ -2173,6 +2875,21 @@ class CiContractTest(unittest.TestCase):
                 ("BAZELISK_BASE_URL", "https://binary.invalid"),
                 ("BAZELISK_SKIP_WRAPPER", "false"),
                 ("BAZELISK_HOME", "/tmp/predictable"),
+                ("NIX_REMOTE", "daemon"),
+                ("PATH", "/usr/bin:/bin"),
+                ("HOME", "/tmp"),
+                ("NIX_CACHE_HOME", "/tmp/cache"),
+                ("GRPC_PROXY_EXP", "dns:///proxy.invalid"),
+                ("BAZEL_SH", "/tmp/unaudited-sh"),
+                ("BAZELISK_NOJDK", "true"),
+                ("BAZELISK_CLEAN", "expunge"),
+                ("BAZELISK_SHUTDOWN", "true"),
+                ("USE_BAZEL_FALLBACK_VERSION", "7.0.0"),
+                ("TEST_TMPDIR", "/tmp/reused"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("JUST_UNSTABLE", "1"),
+                ("NIX_MIRRORS_TEST", "https://mirror.invalid"),
+                ("SHELLCHECK_OPTS", "--exclude=all"),
             ):
                 unsafe_env = dict(base_env)
                 unsafe_env[key] = value

@@ -63,19 +63,37 @@ proxy, CA, or keylog channel, including `LD_PRELOAD` and `BASH_FUNC_*`.
 
 The Nix client process is configured
 for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
-locations remain injected by the runner. A no-value repository preflight
-validates authority-only raw endpoints and clears inherited shell, Nix, and
-Bazel credential channels before the pinned discovery action; post-discovery
+locations for Attic and Bazel remain injected by the runner. A no-value
+repository preflight validates authority-only raw endpoints and clears
+inherited shell, Nix, and Bazel credential channels before the pinned discovery
+action; post-discovery
 enforcement revalidates the boundary and requires both cache reachability
-claims before any Nix or Bazel command. The exact guard is snapshotted before
-the selected repository consumer. Each Bazel leg performs a fresh digest and
-captured-authority check immediately before its terminal call and receives a
-new Bazelisk home plus an empty user home; workspace wrappers, system/user rc
-drift, and netrc credentials fail closed. Client access tokens, user Nix
-configuration, netrc, flake-config acceptance, post-build hooks, secret signing
-keys, and plugins are cleared. This source boundary does not attest the
-independent multi-user Nix daemon's own HTTP authentication or post-build
-policy. Bazel cache publication is false for every pull request and tag and
+claims before any Nix or Bazel command. Pre-discovery command lookup is the
+reviewed Nix profile plus the fixed system path; after discovery contributes
+that profile through `GITHUB_PATH`, step mappings carry only the reviewed
+system suffix. The guard rejects any other effective path.
+
+The exact guard is snapshotted before the selected repository consumer. Each
+Bazel leg performs a fresh captured-byte, digest, and authority check
+immediately before its terminal call and receives a new private Bazelisk home,
+empty user home, test temporary root, and Nix/XDG runtime home. The source leg
+uses a distinct private runtime home and enters its development shell with the
+inherited environment cleared, retaining only `HOME` and its eight Nix/XDG
+home selectors. Workspace wrappers, persistent caches and Bazel servers,
+inherited username path components, system/user rc drift, and netrc
+credentials fail closed. This is same-UID authority hygiene, not a filesystem
+sandbox; exact source review remains part of the trust boundary.
+
+The Nix client binds the canonical direct `/nix/store` with `store = local` and
+`allow-symlinked-store = false`. Its exact substituter/key inventory is the
+runner-injected public `main` Attic cache plus `cache.nixos.org`, with
+signatures required. Store, daemon-socket, mirror, proxy, certificate, curl,
+JVM, Bazel shell, and Bazelisk command selectors are empty. Trusted
+substituters, remote builders, build and diff hooks, access tokens, user Nix
+configuration, netrc, flake-config acceptance, secret signing keys, and
+plugins are cleared and verified from effective settings. Ambient `GIT_*`,
+`JUST_*`, `NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` are
+rejected. Bazel cache publication is false for every pull request and tag and
 true only for a trusted push to `main`; remote execution is never selected.
 
 ## 1. Decision
