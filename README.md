@@ -60,9 +60,11 @@ environment, masking channel, fixed system Bash/base64/env/Git binaries, and
 system DNS/TLS/CA. Each matrix leg blanks shell loaders and options, dynamic
 loaders, proxy override channels, CA overrides, and TLS key logging before any
 step. Lower-case proxy blanks live at job scope and therefore reach the local
-composite and its pinned actions. After token and header destruction and exact
-checkout verification, the trusted materializer persists the four upper-case
-empty records through its owned, canonical GitHub environment command file.
+composite and its pinned actions. FTP follows that split explicitly:
+`ftp_proxy` is job-scoped, while `FTP_PROXY` is materializer-scoped. After token
+and header destruction and exact checkout verification, the trusted
+materializer persists the five upper-case empty proxy records through its
+owned, canonical GitHub environment command file.
 Privileged non-profile Bash ignores imported functions and option state, and
 the materializer removes both proxy cases and every other transport channel
 again before its first child. The raw read-only GitHub token is masked, copied

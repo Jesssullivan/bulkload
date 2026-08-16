@@ -35,6 +35,7 @@ jobs:
       LD_AUDIT: ""
       http_proxy: ""
       https_proxy: ""
+      ftp_proxy: ""
       all_proxy: ""
       no_proxy: ""
       CURL_CA_BUNDLE: ""
@@ -58,6 +59,7 @@ jobs:
           LD_AUDIT: ""
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
+          FTP_PROXY: ""
           ALL_PROXY: ""
           NO_PROXY: ""
           CURL_CA_BUNDLE: ""
@@ -86,8 +88,8 @@ jobs:
 
           unset BASH_ENV ENV CDPATH PS4 BASH_XTRACEFD
           unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
-          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
-          unset http_proxy https_proxy all_proxy no_proxy
+          unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+          unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
           unset CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE
           unset GH_TOKEN GITHUB_TOKEN GITLAB_TOKEN SSH_AUTH_SOCK SSH_ASKPASS
           for variable in "${!GIT_@}"; do
@@ -220,6 +222,7 @@ jobs:
           builtin printf '%s\n' \
             'HTTP_PROXY=' \
             'HTTPS_PROXY=' \
+            'FTP_PROXY=' \
             'ALL_PROXY=' \
             'NO_PROXY=' \
             >> "$github_env"

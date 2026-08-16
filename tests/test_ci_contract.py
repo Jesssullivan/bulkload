@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "eb33c848448423ca3afdca6b2626acb4f989a6a57bde52c501d69b76e41f4333"
+WORKFLOW_SHA256 = "2c6bc4b88c4a777c957980f26fa19efb833bb20f29ab75bba6c1d64b06d16ffe"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -24,13 +24,13 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "8ce0d081779003d4c4e4ee4996ff64d21653322ec0f3428d7907fcfff6639cfb"
+ACTION_SHA256 = "a3e64f622c8d045af2036ec8a5cda5e4569924353c2fc5ede6d91521cbf5eebc"
 GUARD_SHA256 = "14d1a93c3539bc7706d3cbece04c4c1bf44d8ecafea1beab99df2d537a30d820"
 SOURCE_GATE_STEP_SHA256 = (
-    "c8e7f978424e8a21a1bf9296363f7723f92a6a6754d9af988ea8377eda041b95"
+    "dc9d6a05dc5b168ac009a6e91655d316e9392d7f04aee157fafd90b1a3288569"
 )
 EFFECTIVE_NIX_STEP_SHA256 = (
-    "3c4e52f897ed912d097493c6dd7b79d7dd2c06325effd7de00d6202b6538fb23"
+    "7cbbfea8b64796ffa0e0abe3704e502a9b2bda1e4e9864c2bae7fa803916c344"
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
@@ -81,6 +81,7 @@ JOB_FENCED_ACTION_ENV = {
     "LD_AUDIT",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "FTP_PROXY",
     "ALL_PROXY",
     "NO_PROXY",
     "CURL_CA_BUNDLE",
@@ -243,7 +244,7 @@ def parse_canonical_env_entries(
     entry_prefix = " " * entry_indent
     literal_prefix = " " * (entry_indent + 2)
     parsed: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     index = start
     while index < len(lines):
         line = lines[index]
@@ -257,9 +258,13 @@ def parse_canonical_env_entries(
             key = key[1:-1]
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_%]*", key) is None:
             raise ContractError("environment key is not auditable")
-        if key in seen:
-            raise ContractError(f"environment key is duplicated: {key}")
-        seen.add(key)
+        folded_key = key.casefold()
+        if folded_key in seen:
+            raise ContractError(
+                "environment key is case-insensitively duplicated: "
+                f"{seen[folded_key]} / {key}"
+            )
+        seen[folded_key] = key
 
         value = match.group(2)
         if value == "|-":
@@ -475,6 +480,7 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
         ("LD_AUDIT", '""'),
         ("http_proxy", '""'),
         ("https_proxy", '""'),
+        ("ftp_proxy", '""'),
         ("all_proxy", '""'),
         ("no_proxy", '""'),
         ("CURL_CA_BUNDLE", '""'),
@@ -540,6 +546,7 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
         ("LD_AUDIT", '""'),
         ("HTTP_PROXY", '""'),
         ("HTTPS_PROXY", '""'),
+        ("FTP_PROXY", '""'),
         ("ALL_PROXY", '""'),
         ("NO_PROXY", '""'),
         ("CURL_CA_BUNDLE", '""'),
@@ -571,8 +578,8 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
         "          trap 'unset BULKLOAD_CHECKOUT_TOKEN checkout_token encoded_token git_http_header BULKLOAD_GIT_HTTP_HEADER' EXIT",
         "          unset BASH_ENV ENV CDPATH PS4 BASH_XTRACEFD",
         "          unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT",
-        "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY",
-        "          unset http_proxy https_proxy all_proxy no_proxy",
+        "          unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY",
+        "          unset http_proxy https_proxy ftp_proxy all_proxy no_proxy",
         "          unset CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE",
         "          unset GH_TOKEN GITHUB_TOKEN GITLAB_TOKEN SSH_AUTH_SOCK SSH_ASKPASS",
         '          for variable in "${!GIT_@}"; do',
@@ -657,6 +664,7 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
         "          builtin printf '%s\\n' \\",
         "            'HTTP_PROXY=' \\",
         "            'HTTPS_PROXY=' \\",
+        "            'FTP_PROXY=' \\",
         "            'ALL_PROXY=' \\",
         "            'NO_PROXY=' \\",
         '            >> "$github_env"',
@@ -693,6 +701,7 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
         "LD_AUDIT",
         "HTTP_PROXY",
         "HTTPS_PROXY",
+        "FTP_PROXY",
         "ALL_PROXY",
         "NO_PROXY",
         "CURL_CA_BUNDLE",
@@ -702,7 +711,8 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
     ):
         expected_mentions = (
             3
-            if variable in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+            if variable
+            in {"HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY"}
             else 2
         )
         if (
@@ -712,7 +722,13 @@ def validate_workflow(workflow: str, *, exact_digest: bool = True) -> None:
             raise ContractError(
                 f"bootstrap or transport environment reintroduced: {variable}"
             )
-    for variable in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+    for variable in (
+        "http_proxy",
+        "https_proxy",
+        "ftp_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
         if len(re.findall(rf"\b{variable}\b", materialize)) != 1:
             raise ContractError(f"lower-case proxy reintroduced: {variable}")
 
@@ -1095,8 +1111,6 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "NIX_SSL_CERT_FILE",
         "NIX_CURL_FLAGS",
         "NIX_HASHED_MIRRORS",
-        "ftp_proxy",
-        "FTP_PROXY",
         "GRPC_PROXY_EXP",
         "JAVA_TOOL_OPTIONS",
         "JDK_JAVA_OPTIONS",
@@ -1862,6 +1876,29 @@ class CiContractTest(unittest.TestCase):
         mode = (self.root / GUARD_PATH).stat().st_mode
         self.assertNotEqual(mode & stat.S_IXUSR, 0)
 
+    def test_yaml_environment_keys_are_casefold_unique(self) -> None:
+        workflow_collision = self.workflow.replace(
+            '      ftp_proxy: ""\n',
+            '      ftp_proxy: ""\n      FTP_PROXY: ""\n',
+            1,
+        )
+        action_collision = self.action.replace(
+            '        GRPC_PROXY_EXP: ""\n',
+            '        ftp_proxy: ""\n'
+            '        FTP_PROXY: ""\n'
+            '        GRPC_PROXY_EXP: ""\n',
+            1,
+        )
+        for source, validator in (
+            (workflow_collision, validate_workflow),
+            (action_collision, validate_local_action),
+        ):
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaisesRegex(
+                    ContractError, "environment key is case-insensitively duplicated"
+                ):
+                    validator(source, exact_digest=False)
+
     def test_each_gate_has_one_semantically_terminal_repository_consumer(self) -> None:
         expected = {
             "source": [
@@ -1937,6 +1974,11 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(
                 '      https_proxy: ""',
                 "      https_proxy: http://proxy.invalid",
+                1,
+            ),
+            self.workflow.replace(
+                '      ftp_proxy: ""',
+                "      ftp_proxy: http://proxy.invalid",
                 1,
             ),
             self.workflow.replace(
@@ -2040,6 +2082,8 @@ class CiContractTest(unittest.TestCase):
             action_env_override("PS4", "secret"),
             action_env_override("http_proxy", "http://proxy.invalid"),
             action_env_override("HTTPS_PROXY", '""'),
+            action_env_override("ftp_proxy", '""'),
+            action_env_override("FTP_PROXY", '""'),
             action_env_override("CURL_CA_BUNDLE", "/tmp/ca.pem"),
             action_env_override("SSL_CERT_DIR", "/tmp/certs"),
             action_env_override("SSLKEYLOGFILE", "/tmp/keylog"),
@@ -2166,6 +2210,7 @@ class CiContractTest(unittest.TestCase):
             "          builtin printf '%s\\n' \\\n"
             "            'HTTP_PROXY=' \\\n"
             "            'HTTPS_PROXY=' \\\n"
+            "            'FTP_PROXY=' \\\n"
             "            'ALL_PROXY=' \\\n"
             "            'NO_PROXY=' \\\n"
             '            >> "$github_env"\n'
@@ -2194,6 +2239,9 @@ class CiContractTest(unittest.TestCase):
                 '          HTTPS_PROXY: ""', "          HTTPS_PROXY: inherited", 1
             ),
             self.workflow.replace(
+                '          FTP_PROXY: ""', "          FTP_PROXY: inherited", 1
+            ),
+            self.workflow.replace(
                 '          HTTP_PROXY: ""\n',
                 '          HTTP_PROXY: ""\n          http_proxy: inherited\n',
                 1,
@@ -2207,8 +2255,8 @@ class CiContractTest(unittest.TestCase):
                 '          SSLKEYLOGFILE: ""', "          SSLKEYLOGFILE: /tmp/keys", 1
             ),
             self.workflow.replace(
-                "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY\n",
-                "          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY\n"
+                "          unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY\n",
+                "          unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY\n"
                 "          export HTTPS_PROXY=inherited\n",
                 1,
             ),
@@ -2226,6 +2274,7 @@ class CiContractTest(unittest.TestCase):
                 "            'HTTPS_PROXY=http://proxy.invalid' \\\n",
                 1,
             ),
+            self.workflow.replace("            'FTP_PROXY=' \\\n", "", 1),
             self.workflow.replace(
                 "            'ALL_PROXY=' \\\n",
                 "            'ALL_PROXY=$BULKLOAD_CHECKOUT_TOKEN' \\\n",

@@ -18,10 +18,11 @@ that root.
 
 Before any leg starts, the job environment blanks `BASH_ENV`, imported shell
 option and trace channels, loader injection, proxy override channels, CA
-overrides, and TLS key logging. Lower-case proxy blanks remain job-scoped for
-the local composite and pinned actions. After token and header destruction,
-exact checkout verification, and private checkout-state cleanup, the trusted
-materializer appends exactly four upper-case empty proxy records to an owned,
+overrides, and TLS key logging. Lower-case proxy blanks, including `ftp_proxy`,
+remain job-scoped for the local composite and pinned actions. The materializer
+step separately blanks `FTP_PROXY`. After token and header destruction, exact
+checkout verification, and private checkout-state cleanup, the trusted
+materializer appends exactly five upper-case empty proxy records to an owned,
 canonical regular `$GITHUB_ENV` file contained by
 `$RUNNER_TEMP/_runner_file_commands`. Bash runs privileged without profile or
 rc files, so imported functions and option state are ignored. The
