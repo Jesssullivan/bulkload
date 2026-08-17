@@ -369,7 +369,7 @@ def _build_legacy_chain(root: Path) -> tuple[dict[str, Any], dict[str, Any], Pat
             )
             opening_paths[f"{role}_{pass_name}"] = path
 
-    runtime = deepcopy(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED)
+    runtime = deepcopy(private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5)
     compatibility = private_state.compile_codex_private_state_plan(
         opening_paths["source_a"],
         opening_paths["destination_a"],
@@ -658,7 +658,7 @@ def _frozen_v6_request(
             action_plan["runtime_authority"]
         ),
         "request_runtime_authority": deepcopy(
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+            private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6
         ),
         "required_composer_runtime_authority": None,
         "output_intent": {

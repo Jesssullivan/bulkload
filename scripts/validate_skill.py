@@ -68,7 +68,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "de2a7f4d6ec3468db41cb3b643469ec445cbbaf386f97230e4f72b7ebc3dd89f"
         ),
         "scripts/bulkload_lib/cli.py": (
-            "d408d9c57ae05fcea01b6a9378559bacf9d1c0906a686629fabc1c54b31b6299"
+            "1fb208b5ef833915f0bbe8722efd0d45064a3a76172a27636033a0e929fce7ed"
         ),
         "scripts/bulkload_lib/executor.py": (
             "f4c48bc4e02ec8eb8efe164bd2523855ff82a71819e155b93803542da0364201"
@@ -86,25 +86,25 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "7b7e3e110f030a536f2b74bfc0079d59681b5af740f68859e96596f22d3d0423"
         ),
         "scripts/bulkload_lib/private_runtime.py": (
-            "0ae2926aaa4a3383875c2e7822feeae796a0c7b77ed4cf01ee1bff7b7f44b0ba"
+            "1ef878b3906c77a95656667bf49d8a1c4ad984cd1d46f06cf157cfae493240ac"
         ),
         "scripts/bulkload_lib/private_sqlite_action_plan.py": (
             "7262972ec15668c9de3d0a6fb188a1e13c60a9e482fb83ac07fe96df7f35a8d6"
         ),
         "scripts/bulkload_lib/private_sqlite_close.py": (
-            "e7619be6349cb3d47cc71a93cb175d290a5b1b42ff28380163cd07f8435cf642"
+            "cdd6125dce3b5a8be34b5aceb0ff0838fd00337d9ee66f3dec489f144200b1fb"
         ),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             "465e24b4d28bf2c296a292080d3c92a59ae622180921cc63fbce6e5c576e8f18"
         ),
         "scripts/bulkload_lib/private_sqlite_protocol.py": (
-            "70cdc2d86138124aa33499567f8fd4e9456b1d6fbbb5bc2fea61fa16f9a448ea"
+            "ae6678f026917fb07af388fdcccb83ad02943a5d993fe891df7a9f8c27dc070c"
         ),
         "scripts/bulkload_lib/private_sqlite_request.py": (
-            "1f4f30ce3b648b8cb0bcaa3ae76b43fa0ff50d26471c3a24c7d3c347621c67c3"
+            "8a0c50d7dbfb8f61d6046ddf831133693c4aae6ff097e0c95a7c0643d0b2dc0e"
         ),
         "scripts/bulkload_lib/private_sqlite_verifier.py": (
-            "4545a78e157a5ed7e440309938d053640b8536dfc74a60dd902a1b2d9a02f7b0"
+            "31c00038d231be194e5694a54b14f8a29646b632b763e9076ff06da98f1a4e7f"
         ),
         "scripts/bulkload_lib/private_state.py": (
             "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
@@ -113,11 +113,11 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "813c49326f1ba3dfee82ef37de6671fe9fb46d771a8f19c45a604c55a4d4b9b5"
         ),
         "scripts/bulkload_lib/sessions.py": (
-            "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
+            "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
         ),
     },
     "runtime_source_sha256": (
-        "7d2c68f8965b28f276bb0f2ba93004c2e5a3593305a18ad6b53052a685e99bb9"
+        "37d326488a0ef121850c4816149899ef0e51dfd5c60f1582d676d059c963cd5a"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
@@ -985,8 +985,8 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
         "os.scandir",
         "os.stat",
         "os.stat_result",
-        "private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED",
-        "private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6",
+        "private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5",
+        "private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6",
         "private_runtime.open_pinned_private_runtime_authority",
         "private_runtime.validate_private_runtime_authority",
         "re.compile",
@@ -1508,6 +1508,37 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             or public.decorator_list
         ):
             return False
+        if (
+            worker.args.posonlyargs
+            or [argument.arg for argument in worker.args.args]
+            != [
+                "bundle_path",
+                "action_plan",
+                "opening_plan",
+                "compose_request",
+                "capacity_observation",
+            ]
+            or worker.args.vararg is not None
+            or [argument.arg for argument in worker.args.kwonlyargs]
+            != [
+                "verifier_runtime_binding",
+                "observation_id",
+                "observed_at",
+                "runtime_lease",
+                "input_values",
+                "input_snapshots",
+                "input_bodies",
+                "deadline",
+            ]
+            or worker.args.kw_defaults[:-1] != [None] * 7
+            or len(worker.args.kw_defaults) != 8
+            or not isinstance(worker.args.kw_defaults[-1], ast.Constant)
+            or worker.args.kw_defaults[-1].value is not None
+            or worker.args.kwarg is not None
+            or worker.args.defaults
+            or worker.decorator_list
+        ):
+            return False
 
         worker_loads = [
             node
@@ -1556,6 +1587,10 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             "observation_id",
             "observed_at",
             "deadline",
+            "runtime_lease",
+            "input_values",
+            "input_snapshots",
+            "input_bodies",
         }:
             return False
 
@@ -1580,6 +1615,16 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             or worker_keywords["observation_id"].id != "identifier"
             or not isinstance(worker_keywords["observed_at"], ast.Name)
             or worker_keywords["observed_at"].id != "timestamp"
+            or not isinstance(worker_keywords["deadline"], ast.Name)
+            or worker_keywords["deadline"].id != "deadline"
+            or not isinstance(worker_keywords["runtime_lease"], ast.Name)
+            or worker_keywords["runtime_lease"].id != "pinned_runtime"
+            or not isinstance(worker_keywords["input_values"], ast.Name)
+            or worker_keywords["input_values"].id != "input_values"
+            or not isinstance(worker_keywords["input_snapshots"], ast.Name)
+            or worker_keywords["input_snapshots"].id != "snapshots"
+            or not isinstance(worker_keywords["input_bodies"], ast.Name)
+            or worker_keywords["input_bodies"].id != "snapshot_bodies"
         ):
             return False
         identifier_loads = [
@@ -1654,6 +1699,14 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             len(public_returns) != 1
             or not isinstance(public_returns[0].value, ast.Name)
             or public_returns[0].value.id != "report"
+        ):
+            return False
+        public_success_parent = parent_by_id.get(id(public_assignment))
+        if (
+            public_success_parent is None
+            or parent_by_id.get(id(public_returns[0])) is not public_success_parent
+            or not hasattr(public_success_parent, "body")
+            or public_success_parent.body[-2:] != [public_assignment, public_returns[0]]
         ):
             return False
         public_report_loads = {
@@ -1806,6 +1859,124 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             or validator_calls[0].args[0].id != "report"
         ):
             return False
+        runtime_revalidate_calls = [
+            node
+            for node in ast.walk(worker)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "revalidate"
+            and enclosing_function(node) is worker
+        ]
+        if (
+            len(runtime_revalidate_calls) != 1
+            or not isinstance(runtime_revalidate_calls[0].func.value, ast.Name)
+            or runtime_revalidate_calls[0].func.value.id != "runtime_lease"
+            or runtime_revalidate_calls[0].args
+            or runtime_revalidate_calls[0].keywords
+        ):
+            return False
+        input_revalidate_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_revalidate_input_documents"
+        ]
+        if (
+            len(input_revalidate_calls) != 1
+            or enclosing_function(input_revalidate_calls[0]) is not worker
+            or [
+                argument.id if isinstance(argument, ast.Name) else None
+                for argument in input_revalidate_calls[0].args
+            ]
+            != ["input_values", "input_snapshots", "input_bodies"]
+            or len(input_revalidate_calls[0].keywords) != 1
+            or input_revalidate_calls[0].keywords[0].arg != "deadline"
+            or not isinstance(input_revalidate_calls[0].keywords[0].value, ast.Name)
+            or input_revalidate_calls[0].keywords[0].value.id != "deadline"
+        ):
+            return False
+        custody_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_revalidate_bundle_lease"
+        ]
+        custody_loads = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == "_revalidate_bundle_lease"
+        ]
+        expected_custody_keywords = {
+            "parent_descriptor",
+            "parent_identity",
+            "parent_mount",
+            "parent_lineage",
+            "bundle_descriptor",
+            "bundle_info",
+            "bundle_mount",
+            "bundle_lineage",
+            "sqlite_descriptor",
+            "sqlite_info",
+            "sqlite_lineage",
+            "manifest_descriptor",
+            "manifest_info",
+            "manifest_payload",
+            "receipt_descriptor",
+            "receipt_info",
+            "receipt_payload",
+            "database_descriptors",
+            "family_results",
+            "expected_basenames",
+            "maximum_database_bytes",
+            "deadline",
+        }
+        custody_keywords = (
+            {keyword.arg: keyword.value for keyword in custody_calls[0].keywords}
+            if len(custody_calls) == 1
+            else {}
+        )
+        capacity_value = custody_keywords.get("maximum_database_bytes")
+        capacity_parent = (
+            capacity_value.value if isinstance(capacity_value, ast.Subscript) else None
+        )
+        if (
+            len(custody_calls) != 1
+            or len(custody_loads) != 1
+            or custody_calls[0].func is not custody_loads[0]
+            or enclosing_function(custody_calls[0]) is not worker
+            or len(custody_calls[0].args) != 1
+            or not isinstance(custody_calls[0].args[0], ast.Name)
+            or custody_calls[0].args[0].id != "normalized"
+            or any(keyword.arg is None for keyword in custody_calls[0].keywords)
+            or {keyword.arg for keyword in custody_calls[0].keywords}
+            != expected_custody_keywords
+            or any(
+                keyword.arg != "maximum_database_bytes"
+                and (
+                    not isinstance(keyword.value, ast.Name)
+                    or keyword.value.id != keyword.arg
+                )
+                for keyword in custody_calls[0].keywords
+            )
+            or not isinstance(capacity_value, ast.Subscript)
+            or not isinstance(capacity_value.slice, ast.Constant)
+            or capacity_value.slice.value != "required_bytes"
+            or not isinstance(capacity_parent, ast.Subscript)
+            or not isinstance(capacity_parent.slice, ast.Constant)
+            or capacity_parent.slice.value != "capacity_requirement"
+            or not isinstance(capacity_parent.value, ast.Name)
+            or capacity_parent.value.id != "compose_request"
+            or any(
+                isinstance(node, ast.Constant)
+                and node.value == "_revalidate_bundle_lease"
+                for node in ast.walk(tree)
+            )
+        ):
+            return False
         worker_returns = [
             node
             for node in ast.walk(worker)
@@ -1831,12 +2002,41 @@ def validate_verifier_oracle_source(verifier_text: str) -> None:
             id(validator_calls[0].args[0]),
             id(worker_returns[0].value),
         }
+        validator_statement = parent_by_id.get(id(validator_calls[0]))
+        runtime_statement = parent_by_id.get(id(runtime_revalidate_calls[0]))
+        input_statement = parent_by_id.get(id(input_revalidate_calls[0]))
+        custody_statement = parent_by_id.get(id(custody_calls[0]))
+        success_parent = parent_by_id.get(id(validator_statement))
+        if (
+            not isinstance(validator_statement, ast.Expr)
+            or not isinstance(runtime_statement, ast.Expr)
+            or not isinstance(input_statement, ast.Expr)
+            or not isinstance(custody_statement, ast.Expr)
+            or success_parent is None
+            or parent_by_id.get(id(runtime_statement)) is not success_parent
+            or parent_by_id.get(id(input_statement)) is not success_parent
+            or parent_by_id.get(id(custody_statement)) is not success_parent
+            or parent_by_id.get(id(worker_returns[0])) is not success_parent
+            or not hasattr(success_parent, "body")
+            or success_parent.body[-5:]
+            != [
+                validator_statement,
+                runtime_statement,
+                input_statement,
+                custody_statement,
+                worker_returns[0],
+            ]
+        ):
+            return False
         return bool(
             report_loads == expected_report_loads
             and claims_assignment.lineno < report_assignment.lineno
             and report_assignment.lineno < digest_assignment.lineno
             and digest_assignment.lineno < validator_calls[0].lineno
-            and validator_calls[0].lineno < worker_returns[0].lineno
+            and validator_calls[0].lineno < runtime_revalidate_calls[0].lineno
+            and runtime_revalidate_calls[0].lineno < input_revalidate_calls[0].lineno
+            and input_revalidate_calls[0].lineno < custody_calls[0].lineno
+            and custody_calls[0].lineno < worker_returns[0].lineno
             and public_assignment.lineno < public_returns[0].lineno
         )
 
@@ -2291,9 +2491,35 @@ def self_test() -> None:
     claims_fixture = ",".join(
         f"{name!r}: False" for name in sorted(EXPECTED_ORACLE_FALSE_CLAIMS)
     )
+    valid_custody_call = (
+        "    _revalidate_bundle_lease(normalized, "
+        "parent_descriptor=parent_descriptor, parent_identity=parent_identity, "
+        "parent_mount=parent_mount, parent_lineage=parent_lineage, "
+        "bundle_descriptor=bundle_descriptor, bundle_info=bundle_info, "
+        "bundle_mount=bundle_mount, bundle_lineage=bundle_lineage, "
+        "sqlite_descriptor=sqlite_descriptor, sqlite_info=sqlite_info, "
+        "sqlite_lineage=sqlite_lineage, manifest_descriptor=manifest_descriptor, "
+        "manifest_info=manifest_info, manifest_payload=manifest_payload, "
+        "receipt_descriptor=receipt_descriptor, receipt_info=receipt_info, "
+        "receipt_payload=receipt_payload, database_descriptors=database_descriptors, "
+        "family_results=family_results, expected_basenames=expected_basenames, "
+        "maximum_database_bytes=compose_request['capacity_requirement']"
+        "['required_bytes'], deadline=deadline)\n"
+    )
+    validated_worker_tail = (
+        "    validate_verifier_oracle_report(report)\n"
+        "    runtime_lease.revalidate()\n"
+        "    _revalidate_input_documents(input_values, input_snapshots, "
+        "input_bodies, deadline=deadline)\n"
+        + valid_custody_call
+        + "    return report\n"
+    )
     valid_verifier_text = (
         "def _require_uuid(value, label): return value\n"
         "def _parse_utc(value, label): return value\n"
+        "def _revalidate_input_documents(values, snapshots, bodies, *, "
+        "deadline): return None\n"
+        "def _revalidate_bundle_lease(normalized, **kwargs): return None\n"
         "def observe_codex_private_sqlite_bundle("
         "bundle_path, action_plan, opening_plan, compose_request, "
         "capacity_observation, *, verifier_runtime_authority):\n"
@@ -2301,6 +2527,11 @@ def self_test() -> None:
         "    opening_snapshot = opening_plan\n"
         "    request_snapshot = compose_request\n"
         "    capacity_snapshot = capacity_observation\n"
+        "    input_values = ()\n"
+        "    snapshots = ()\n"
+        "    snapshot_bodies = ()\n"
+        "    pinned_runtime = verifier_runtime_authority\n"
+        "    deadline = None\n"
         "    identifier = str(uuid.uuid4())\n"
         "    _require_uuid(identifier, 'oracle observation ID')\n"
         "    timestamp = utc_now()\n"
@@ -2309,18 +2540,21 @@ def self_test() -> None:
         "bundle_path, action_snapshot, opening_snapshot, request_snapshot, "
         "capacity_snapshot, "
         "verifier_runtime_binding=verifier_runtime_authority, "
-        "observation_id=identifier, observed_at=timestamp, deadline=None)\n"
+        "observation_id=identifier, observed_at=timestamp, "
+        "runtime_lease=pinned_runtime, input_values=input_values, "
+        "input_snapshots=snapshots, input_bodies=snapshot_bodies, "
+        "deadline=deadline)\n"
         "    return report\n"
         "def _observe_codex_private_sqlite_bundle("
         "bundle_path, action_plan, opening_plan, compose_request, "
         "capacity_observation, *, verifier_runtime_binding, observation_id, "
-        "observed_at, deadline):\n"
+        "observed_at, runtime_lease, input_values, input_snapshots, "
+        "input_bodies, deadline=None):\n"
+        "    normalized = bundle_path\n"
         f"    claims = {{{claims_fixture}}}\n"
         "    report = {'claims': claims}\n"
         "    report['oracle_report_sha256'] = object_digest("
-        "report, 'oracle_report_sha256')\n"
-        "    validate_verifier_oracle_report(report)\n"
-        "    return report\n"
+        "report, 'oracle_report_sha256')\n" + validated_worker_tail
     )
     source_texts["scripts/bulkload_lib/private_sqlite_verifier.py"] = (
         valid_verifier_text
@@ -2575,8 +2809,9 @@ def self_test() -> None:
             return
         raise AssertionError(f"verifier adversarial probe was accepted: {label}")
 
-    validated_worker_return = (
-        "    validate_verifier_oracle_report(report)\n    return report\n"
+    validated_worker_return = validated_worker_tail
+    validated_epilogue = validated_worker_tail.removeprefix(
+        "    validate_verifier_oracle_report(report)\n"
     )
     verifier_adversarial_probes = {
         "os-creat": (
@@ -2657,21 +2892,73 @@ def self_test() -> None:
         "claims-post-validation-augassign": valid_verifier_text.replace(
             validated_worker_return,
             "    validate_verifier_oracle_report(report)\n"
-            "    claims |= {'apply_authorized': True}\n"
-            "    return report\n",
+            "    claims |= {'apply_authorized': True}\n" + validated_epilogue,
         ),
         "claims-post-validation-alias": valid_verifier_text.replace(
             validated_worker_return,
             "    validate_verifier_oracle_report(report)\n"
             "    claims_alias = claims\n"
-            "    claims_alias['apply_authorized'] = True\n"
-            "    return report\n",
+            "    claims_alias['apply_authorized'] = True\n" + validated_epilogue,
         ),
         "report-post-validation-mutation": valid_verifier_text.replace(
             validated_worker_return,
             "    validate_verifier_oracle_report(report)\n"
-            "    report['claims'] = {'apply_authorized': True}\n"
-            "    return report\n",
+            "    report['claims'] = {'apply_authorized': True}\n" + validated_epilogue,
+        ),
+        "missing-runtime-revalidation": valid_verifier_text.replace(
+            "    runtime_lease.revalidate()\n",
+            "",
+        ),
+        "reordered-runtime-input-revalidation": valid_verifier_text.replace(
+            "    runtime_lease.revalidate()\n"
+            "    _revalidate_input_documents(input_values, input_snapshots, "
+            "input_bodies, deadline=deadline)\n",
+            "    _revalidate_input_documents(input_values, input_snapshots, "
+            "input_bodies, deadline=deadline)\n"
+            "    runtime_lease.revalidate()\n",
+        ),
+        "custody-stub": valid_verifier_text.replace(
+            valid_custody_call,
+            "    _custody_stub()\n",
+        ),
+        "custody-alias": valid_verifier_text.replace(
+            valid_custody_call,
+            "    custody = _revalidate_bundle_lease\n"
+            + valid_custody_call.replace("_revalidate_bundle_lease", "custody", 1),
+        ),
+        "wrong-runtime-receiver": valid_verifier_text.replace(
+            "    runtime_lease.revalidate()\n",
+            "    verifier_runtime_binding.revalidate()\n",
+        ),
+        "wrong-input-tuple": valid_verifier_text.replace(
+            "_revalidate_input_documents(input_values, input_snapshots, "
+            "input_bodies, deadline=deadline)",
+            "_revalidate_input_documents(input_values, input_values, "
+            "input_bodies, deadline=deadline)",
+        ),
+        "wrong-custody-tuple": valid_verifier_text.replace(
+            "family_results=family_results",
+            "family_results=expected_basenames",
+        ),
+        "post-custody-call": valid_verifier_text.replace(
+            valid_custody_call,
+            valid_custody_call + "    _custody_stub()\n",
+        ),
+        "conditional-custody": valid_verifier_text.replace(
+            valid_custody_call,
+            "    if True:\n" + valid_custody_call.replace("    ", "        ", 1),
+        ),
+        "swallowed-custody": valid_verifier_text.replace(
+            valid_custody_call,
+            "    try:\n"
+            + valid_custody_call.replace("    ", "        ", 1)
+            + "    except BulkloadError:\n"
+            "        pass\n",
+        ),
+        "public-post-worker-call": valid_verifier_text.replace(
+            "deadline=deadline)\n    return report\n",
+            "deadline=deadline)\n    _custody_stub()\n    return report\n",
+            1,
         ),
         "public-observation-id-parameter": valid_verifier_text.replace(
             "capacity_observation, *, verifier_runtime_authority):",

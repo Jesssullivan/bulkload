@@ -348,6 +348,39 @@ def _read_private_json_at(
         raise
 
 
+def _open_private_regular_at(
+    parent_descriptor: int,
+    leaf: str,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> tuple[int, os.stat_result]:
+    if not isinstance(leaf, str) or not leaf or "/" in leaf or leaf in {".", ".."}:
+        raise BulkloadError(f"{label} leaf is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise BulkloadError(f"cannot open {label}") from error
+    try:
+        info = os.fstat(descriptor)
+        entry = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size < 1
+            or info.st_size > maximum_bytes
+            or _stable(info) != _stable(entry)
+        ):
+            raise BulkloadError(f"{label} custody or size is invalid")
+        return descriptor, info
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _require_before_deadline(deadline: float, label: str) -> None:
     if time.monotonic() > deadline:
         raise BulkloadError(f"{label} exceeded its deadline")
@@ -1647,19 +1680,21 @@ def _verify_input_bindings(
     if (
         action_plan["schema"] != PRIVATE_SQLITE_ACTION_PLAN_SCHEMA
         or action_plan["runtime_authority"]
-        != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+        != private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
     ):
-        raise BulkloadError("verifier requires the exact repaired v5 action")
-    expected_v6 = private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+        raise BulkloadError("verifier requires the exact accepted-H6 v5 action")
+    expected_v6 = private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6
     if (
         compose_request["schema"] != PRIVATE_SQLITE_COMPOSE_REQUEST_SCHEMA
         or compose_request["request_runtime_authority"] != expected_v6
         or compose_request["action_plan_producer_runtime_authority"]
-        != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+        != private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
         or capacity_observation["schema"] != PRIVATE_SQLITE_CAPACITY_OBSERVATION_SCHEMA
         or capacity_observation["observation_runtime_authority"] != expected_v6
     ):
-        raise BulkloadError("verifier requires the exact v6 request authority")
+        raise BulkloadError(
+            "verifier requires the exact accepted-H7 v6 request authority"
+        )
     workspace = compose_request["output_intent"]["workspace"]
     validate_codex_private_sqlite_compose_request_against_action(
         compose_request,
@@ -1774,6 +1809,372 @@ def _revalidate_input_documents(
     _require_before_deadline(deadline, "verifier input revalidation")
 
 
+def _revalidate_current_bundle_path(
+    normalized: Path,
+    *,
+    parent_identity: dict[str, int],
+    parent_mount: dict[str, int | None],
+    parent_lineage: list[dict[str, Any]],
+    bundle_info: os.stat_result,
+    bundle_mount: dict[str, int | None],
+    bundle_lineage: list[dict[str, Any]],
+    sqlite_info: os.stat_result,
+    sqlite_lineage: list[dict[str, Any]],
+    manifest_info: os.stat_result,
+    manifest_payload: bytes,
+    receipt_info: os.stat_result,
+    receipt_payload: bytes,
+    database_descriptors: list[tuple[int, os.stat_result, str]],
+    family_results: list[dict[str, Any]],
+    expected_basenames: list[str],
+    maximum_database_bytes: int,
+    deadline: float,
+) -> None:
+    """Reopen and hold the current path tree through the final custody check."""
+    current_parent = current_bundle = current_sqlite = -1
+    current_manifest = current_receipt = -1
+    current_databases: list[tuple[int, os.stat_result, str]] = []
+    try:
+        current_normalized, current_parent, current_parent_info = _open_absolute_parent(
+            normalized
+        )
+        current_bundle, current_bundle_info = _open_private_directory_at(
+            current_parent,
+            normalized.name,
+            label="current offline bundle candidate",
+        )
+        (
+            _,
+            current_manifest_payload,
+            current_manifest_info,
+            current_manifest,
+        ) = _read_private_json_at(
+            current_bundle,
+            "manifest.json",
+            label="current composed bundle manifest",
+        )
+        (
+            _,
+            current_receipt_payload,
+            current_receipt_info,
+            current_receipt,
+        ) = _read_private_json_at(
+            current_bundle,
+            "composition-receipt.json",
+            label="current composition receipt",
+        )
+        current_sqlite, current_sqlite_info = _open_private_directory_at(
+            current_bundle,
+            "sqlite",
+            label="current offline SQLite candidate directory",
+        )
+        expected_databases = {
+            basename: expected for _, expected, basename in database_descriptors
+        }
+        expected_payloads = {
+            family["observed"]["basename"]: family["observed"]
+            for family in family_results
+        }
+        if (
+            sorted(expected_databases) != expected_basenames
+            or sorted(expected_payloads) != expected_basenames
+        ):
+            raise BulkloadError("current offline bundle family inventory differs")
+        for basename in expected_basenames:
+            descriptor, info = _open_private_regular_at(
+                current_sqlite,
+                basename,
+                label=f"current offline SQLite candidate family {basename}",
+                maximum_bytes=maximum_database_bytes,
+            )
+            current_databases.append((descriptor, info, basename))
+
+        if (
+            current_normalized != normalized
+            or _identity(current_parent_info) != parent_identity
+            or _mount(current_parent) != parent_mount
+            or _lineage(current_parent) != parent_lineage
+            or _stable(current_bundle_info) != _stable(bundle_info)
+            or _mount(current_bundle) != bundle_mount
+            or _lineage(current_bundle) != bundle_lineage
+            or _stable(current_sqlite_info) != _stable(sqlite_info)
+            or _mount(current_sqlite) != parent_mount
+            or _lineage(current_sqlite) != sqlite_lineage
+            or _stable(current_manifest_info) != _stable(manifest_info)
+            or current_manifest_payload != manifest_payload
+            or _mount(current_manifest) != parent_mount
+            or _stable(current_receipt_info) != _stable(receipt_info)
+            or current_receipt_payload != receipt_payload
+            or _mount(current_receipt) != parent_mount
+            or _bounded_directory_entries(
+                current_bundle,
+                label="current offline bundle candidate",
+                deadline=deadline,
+            )
+            != ["composition-receipt.json", "manifest.json", "sqlite"]
+            or _bounded_directory_entries(
+                current_sqlite,
+                label="current offline SQLite candidate directory",
+                deadline=deadline,
+            )
+            != expected_basenames
+        ):
+            raise BulkloadError(
+                "offline bundle candidate changed during final custody revalidation"
+            )
+
+        for descriptor, info, basename in current_databases:
+            expected_info = expected_databases[basename]
+            expected_payload = expected_payloads[basename]
+            observed_sha256, observed_size = _hash_descriptor(
+                descriptor,
+                maximum_database_bytes,
+                deadline=deadline,
+            )
+            if (
+                _stable(info) != _stable(expected_info)
+                or _stable(os.fstat(descriptor)) != _stable(info)
+                or _stable(
+                    os.stat(
+                        basename,
+                        dir_fd=current_sqlite,
+                        follow_symlinks=False,
+                    )
+                )
+                != _stable(info)
+                or _mount(descriptor) != parent_mount
+                or observed_sha256 != expected_payload["sha256"]
+                or observed_size != expected_payload["size"]
+            ):
+                raise BulkloadError(
+                    "offline SQLite candidate family changed during final custody "
+                    f"revalidation: {basename}"
+                )
+
+        if (
+            _stable(os.fstat(current_manifest)) != _stable(current_manifest_info)
+            or _mount(current_manifest) != parent_mount
+            or _stable(
+                os.stat(
+                    "manifest.json",
+                    dir_fd=current_bundle,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(current_manifest_info)
+            or _stable(os.fstat(current_receipt)) != _stable(current_receipt_info)
+            or _mount(current_receipt) != parent_mount
+            or _stable(
+                os.stat(
+                    "composition-receipt.json",
+                    dir_fd=current_bundle,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(current_receipt_info)
+            or any(
+                _stable(os.fstat(descriptor)) != _stable(info)
+                or _stable(
+                    os.stat(
+                        basename,
+                        dir_fd=current_sqlite,
+                        follow_symlinks=False,
+                    )
+                )
+                != _stable(info)
+                or _mount(descriptor) != parent_mount
+                for descriptor, info, basename in current_databases
+            )
+            or _stable(os.fstat(current_sqlite)) != _stable(current_sqlite_info)
+            or _stable(os.stat("sqlite", dir_fd=current_bundle, follow_symlinks=False))
+            != _stable(current_sqlite_info)
+            or _mount(current_sqlite) != parent_mount
+            or _lineage(current_sqlite) != sqlite_lineage
+            or _stable(os.fstat(current_bundle)) != _stable(current_bundle_info)
+            or _stable(
+                os.stat(
+                    normalized.name,
+                    dir_fd=current_parent,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(current_bundle_info)
+            or _mount(current_bundle) != bundle_mount
+            or _lineage(current_bundle) != bundle_lineage
+            or _identity(os.fstat(current_parent)) != parent_identity
+            or _mount(current_parent) != parent_mount
+            or _lineage(current_parent) != parent_lineage
+            or _bounded_directory_entries(
+                current_bundle,
+                label="current offline bundle candidate",
+                deadline=deadline,
+            )
+            != ["composition-receipt.json", "manifest.json", "sqlite"]
+            or _bounded_directory_entries(
+                current_sqlite,
+                label="current offline SQLite candidate directory",
+                deadline=deadline,
+            )
+            != expected_basenames
+        ):
+            raise BulkloadError(
+                "offline bundle candidate changed during final custody revalidation"
+            )
+        _require_before_deadline(deadline, "final bundle custody revalidation")
+    except OSError as error:
+        raise BulkloadError(
+            "offline bundle candidate changed during final custody revalidation"
+        ) from error
+    finally:
+        for descriptor, _, _ in current_databases:
+            os.close(descriptor)
+        for descriptor in (
+            current_receipt,
+            current_manifest,
+            current_sqlite,
+            current_bundle,
+            current_parent,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _revalidate_bundle_lease(
+    normalized: Path,
+    *,
+    parent_descriptor: int,
+    parent_identity: dict[str, int],
+    parent_mount: dict[str, int | None],
+    parent_lineage: list[dict[str, Any]],
+    bundle_descriptor: int,
+    bundle_info: os.stat_result,
+    bundle_mount: dict[str, int | None],
+    bundle_lineage: list[dict[str, Any]],
+    sqlite_descriptor: int,
+    sqlite_info: os.stat_result,
+    sqlite_lineage: list[dict[str, Any]],
+    manifest_descriptor: int,
+    manifest_info: os.stat_result,
+    manifest_payload: bytes,
+    receipt_descriptor: int,
+    receipt_info: os.stat_result,
+    receipt_payload: bytes,
+    database_descriptors: list[tuple[int, os.stat_result, str]],
+    family_results: list[dict[str, Any]],
+    expected_basenames: list[str],
+    maximum_database_bytes: int,
+    deadline: float,
+) -> None:
+    """Revalidate original leases and then the complete current path tree."""
+    try:
+        if (
+            _bounded_directory_entries(
+                bundle_descriptor,
+                label="offline bundle candidate",
+                deadline=deadline,
+            )
+            != ["composition-receipt.json", "manifest.json", "sqlite"]
+            or _bounded_directory_entries(
+                sqlite_descriptor,
+                label="offline SQLite candidate directory",
+                deadline=deadline,
+            )
+            != expected_basenames
+            or _stable(os.fstat(sqlite_descriptor)) != _stable(sqlite_info)
+            or _stable(
+                os.stat(
+                    "sqlite",
+                    dir_fd=bundle_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(sqlite_info)
+            or _mount(sqlite_descriptor) != parent_mount
+            or _lineage(sqlite_descriptor) != sqlite_lineage
+        ):
+            raise BulkloadError(
+                "offline SQLite candidate directory changed during observation"
+            )
+        for descriptor, expected, basename in database_descriptors:
+            if (
+                _stable(os.fstat(descriptor)) != _stable(expected)
+                or _stable(
+                    os.stat(
+                        basename,
+                        dir_fd=sqlite_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                != _stable(expected)
+                or _mount(descriptor) != parent_mount
+            ):
+                raise BulkloadError(
+                    "offline SQLite candidate family changed during observation: "
+                    f"{basename}"
+                )
+        if (
+            _stable(os.fstat(manifest_descriptor)) != _stable(manifest_info)
+            or _mount(manifest_descriptor) != parent_mount
+            or _stable(os.fstat(receipt_descriptor)) != _stable(receipt_info)
+            or _mount(receipt_descriptor) != parent_mount
+            or _stable(
+                os.stat(
+                    "manifest.json",
+                    dir_fd=bundle_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(manifest_info)
+            or _stable(
+                os.stat(
+                    "composition-receipt.json",
+                    dir_fd=bundle_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(receipt_info)
+            or _stable(os.fstat(bundle_descriptor)) != _stable(bundle_info)
+            or _stable(
+                os.stat(
+                    normalized.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            != _stable(bundle_info)
+            or _mount(bundle_descriptor) != bundle_mount
+            or _lineage(bundle_descriptor) != bundle_lineage
+            or _identity(os.fstat(parent_descriptor)) != parent_identity
+            or _mount(parent_descriptor) != parent_mount
+            or _lineage(parent_descriptor) != parent_lineage
+        ):
+            raise BulkloadError("offline bundle candidate changed during observation")
+    except OSError as error:
+        raise BulkloadError(
+            "offline bundle candidate changed during observation"
+        ) from error
+    _revalidate_current_bundle_path(
+        normalized,
+        parent_identity=parent_identity,
+        parent_mount=parent_mount,
+        parent_lineage=parent_lineage,
+        bundle_info=bundle_info,
+        bundle_mount=bundle_mount,
+        bundle_lineage=bundle_lineage,
+        sqlite_info=sqlite_info,
+        sqlite_lineage=sqlite_lineage,
+        manifest_info=manifest_info,
+        manifest_payload=manifest_payload,
+        receipt_info=receipt_info,
+        receipt_payload=receipt_payload,
+        database_descriptors=database_descriptors,
+        family_results=family_results,
+        expected_basenames=expected_basenames,
+        maximum_database_bytes=maximum_database_bytes,
+        deadline=deadline,
+    )
+
+
 def observe_codex_private_sqlite_bundle(
     bundle_path: Path,
     action_plan: dict[str, Any],
@@ -1826,6 +2227,7 @@ def observe_codex_private_sqlite_bundle(
             raise BulkloadError(
                 "active runtime does not bind the verifier oracle source"
             )
+
         report = _observe_codex_private_sqlite_bundle(
             bundle_path,
             action_snapshot,
@@ -1840,13 +2242,10 @@ def observe_codex_private_sqlite_bundle(
             observation_id=identifier,
             observed_at=timestamp,
             deadline=deadline,
-        )
-        pinned_runtime.revalidate()
-        _revalidate_input_documents(
-            input_values,
-            snapshots,
-            snapshot_bodies,
-            deadline=deadline,
+            runtime_lease=pinned_runtime,
+            input_values=input_values,
+            input_snapshots=snapshots,
+            input_bodies=snapshot_bodies,
         )
         return report
 
@@ -1861,6 +2260,10 @@ def _observe_codex_private_sqlite_bundle(
     verifier_runtime_binding: dict[str, Any],
     observation_id: str,
     observed_at: str,
+    runtime_lease: Any,
+    input_values: tuple[tuple[str, dict[str, Any]], ...],
+    input_snapshots: tuple[dict[str, Any], ...],
+    input_bodies: tuple[bytes, ...],
     deadline: float | None = None,
 ) -> dict[str, Any]:
     deadline = (
@@ -2586,112 +2989,40 @@ def _observe_codex_private_sqlite_bundle(
             "oracle_report_sha256",
         )
         validate_verifier_oracle_report(report)
-        if (
-            _bounded_directory_entries(
-                bundle_descriptor,
-                label="offline bundle candidate",
-                deadline=deadline,
-            )
-            != ["composition-receipt.json", "manifest.json", "sqlite"]
-            or _bounded_directory_entries(
-                sqlite_descriptor,
-                label="offline SQLite candidate directory",
-                deadline=deadline,
-            )
-            != expected_basenames
-            or _stable(os.fstat(sqlite_descriptor)) != _stable(sqlite_info)
-            or _stable(
-                os.stat(
-                    "sqlite",
-                    dir_fd=bundle_descriptor,
-                    follow_symlinks=False,
-                )
-            )
-            != _stable(sqlite_info)
-            or _mount(sqlite_descriptor) != parent_mount
-            or _lineage(sqlite_descriptor) != sqlite_lineage
-        ):
-            raise BulkloadError(
-                "offline SQLite candidate directory changed during observation"
-            )
-        for descriptor, expected, basename in database_descriptors:
-            if (
-                _stable(os.fstat(descriptor)) != _stable(expected)
-                or _stable(
-                    os.stat(
-                        basename,
-                        dir_fd=sqlite_descriptor,
-                        follow_symlinks=False,
-                    )
-                )
-                != _stable(expected)
-                or _mount(descriptor) != parent_mount
-            ):
-                raise BulkloadError(
-                    "offline SQLite candidate family changed during observation: "
-                    f"{basename}"
-                )
-        if (
-            _stable(os.fstat(manifest_descriptor)) != _stable(manifest_info)
-            or _stable(os.fstat(receipt_descriptor)) != _stable(receipt_info)
-            or _stable(
-                os.stat(
-                    "manifest.json",
-                    dir_fd=bundle_descriptor,
-                    follow_symlinks=False,
-                )
-            )
-            != _stable(manifest_info)
-            or _stable(
-                os.stat(
-                    "composition-receipt.json",
-                    dir_fd=bundle_descriptor,
-                    follow_symlinks=False,
-                )
-            )
-            != _stable(receipt_info)
-            or _stable(os.fstat(bundle_descriptor)) != _stable(bundle_info)
-            or _stable(
-                os.stat(
-                    normalized.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            )
-            != _stable(bundle_info)
-            or _mount(bundle_descriptor) != bundle_mount
-            or _lineage(bundle_descriptor) != bundle_lineage
-            or _identity(os.fstat(parent_descriptor)) != parent_identity
-            or _mount(parent_descriptor) != parent_mount
-            or _lineage(parent_descriptor) != parent_lineage
-        ):
-            raise BulkloadError("offline bundle candidate changed during observation")
-        reopened_normalized, reopened_parent, reopened_parent_info = (
-            _open_absolute_parent(normalized)
+        runtime_lease.revalidate()
+        _revalidate_input_documents(
+            input_values,
+            input_snapshots,
+            input_bodies,
+            deadline=deadline,
         )
-        try:
-            if (
-                reopened_normalized != normalized
-                or _identity(reopened_parent_info) != parent_identity
-                or _mount(reopened_parent) != parent_mount
-                or _lineage(reopened_parent) != parent_lineage
-                or _stable(
-                    os.stat(
-                        normalized.name,
-                        dir_fd=reopened_parent,
-                        follow_symlinks=False,
-                    )
-                )
-                != _stable(bundle_info)
-            ):
-                raise BulkloadError(
-                    "offline bundle candidate parent changed during observation"
-                )
-        finally:
-            os.close(reopened_parent)
-        for descriptor, _, _ in database_descriptors:
-            os.close(descriptor)
-        database_descriptors.clear()
+        _revalidate_bundle_lease(
+            normalized,
+            parent_descriptor=parent_descriptor,
+            parent_identity=parent_identity,
+            parent_mount=parent_mount,
+            parent_lineage=parent_lineage,
+            bundle_descriptor=bundle_descriptor,
+            bundle_info=bundle_info,
+            bundle_mount=bundle_mount,
+            bundle_lineage=bundle_lineage,
+            sqlite_descriptor=sqlite_descriptor,
+            sqlite_info=sqlite_info,
+            sqlite_lineage=sqlite_lineage,
+            manifest_descriptor=manifest_descriptor,
+            manifest_info=manifest_info,
+            manifest_payload=manifest_payload,
+            receipt_descriptor=receipt_descriptor,
+            receipt_info=receipt_info,
+            receipt_payload=receipt_payload,
+            database_descriptors=database_descriptors,
+            family_results=family_results,
+            expected_basenames=expected_basenames,
+            maximum_database_bytes=compose_request["capacity_requirement"][
+                "required_bytes"
+            ],
+            deadline=deadline,
+        )
         return report
     finally:
         for descriptor, _, _ in database_descriptors:

@@ -308,7 +308,7 @@ def validate_codex_private_sqlite_close_request_against_inputs(
         != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError(
-            "private SQLite close request requires the exact repaired v5 "
+            "private SQLite close request requires the exact accepted-H6 v5 "
             "producer authority"
         )
     validate_codex_private_sqlite_compose_plan(opening_plan)
@@ -556,7 +556,7 @@ def validate_codex_private_sqlite_close_request(
         != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError(
-            "private SQLite close request requires the exact repaired v5 "
+            "private SQLite close request requires the exact accepted-H6 v5 "
             "producer authority"
         )
     if value["opening_inputs_revalidated"] is not True:

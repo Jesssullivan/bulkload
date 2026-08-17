@@ -226,8 +226,10 @@ def _validate_v6_request_runtime_authority(
     label: str,
 ) -> dict[str, Any]:
     authority = _validate_runtime_authority(value, label)
-    if authority != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6:
-        raise BulkloadError(f"{label} must use the exact frozen v6 consumer policy")
+    if authority != private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6:
+        raise BulkloadError(
+            f"{label} must use the exact accepted-H7 v6 consumer policy"
+        )
     return authority
 
 
@@ -235,10 +237,10 @@ def _validate_exact_action_producer(action_plan: dict[str, Any]) -> None:
     validate_codex_private_sqlite_action_plan(action_plan)
     if (
         action_plan["runtime_authority"]
-        != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+        != private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
     ):
         raise BulkloadError(
-            "compose request requires the exact repaired v5 producer closure"
+            "compose request requires the exact accepted-H6 v5 producer closure"
         )
 
 
@@ -909,7 +911,7 @@ def validate_codex_private_sqlite_compose_request(value: dict[str, Any]) -> None
     )
     if (
         request["action_plan_producer_runtime_authority"]
-        != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+        != private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
     ):
         raise BulkloadError("compose request action producer differs")
     _validate_v6_request_runtime_authority(

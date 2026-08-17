@@ -47,20 +47,20 @@ A future writer may consume only this exact chain:
 
 1. the exact repaired v5 action-plan producer:
    - source commit
-     `3daf764660f45c0d1e71383f1269237a0cfe991b`;
+     `4d949a846690b265b0bf775ec81ff4b9e5a52ddc`;
    - policy SHA-256
-     `13fa05eecb0eefb2f697735a4ad7351834695e26a7dd0a910be2e87b035ca82d`;
+     `78318633ef06ca12d6dc7e72199c07dc6f5cfdf0e9cf13bc5bd3f3e7c2ddbcf0`;
    - runtime closure SHA-256
-     `8193d692be87174c6618450fa84cd44a0755661f2cf50cab791e50725dabcad7`;
+     `cc9f96adb8189e0a41133244231edf51dd837fa75459728355b93eeb981c7392`;
 2. one exact v5 action plan whose complete v4 opening and v5 close inputs
    recompute from their original evidence;
 3. the exact v6 request/observation producer:
    - source commit
-     `96db5c46eda9774c3bf6983eb04281cb249675fb`;
+     `7bd06a05f7a4710e42fac6be08b477b801493c95`;
    - policy SHA-256
-     `b0fb835934a1caac48fb72190f072b5ec35737c52ce42c7bf6a30088d5bf8548`;
+     `6d8c1e01c7ea244adb5e3d09279c8ac640a8a5a3c9a4966b30eeff5cc56e289e`;
    - runtime closure SHA-256
-     `b221bb77ebd23e58ba2ea0788b35bfe52f7f1c6073b9e5e6fd2a4498daeb3650`;
+     `5adfc213cf657d24d3bd8de3ab6b5f9e3d1bf14627045c8526d0b32241f460f5`;
 4. one exact v6 compose request and one unexpired, sufficient v6 capacity
    observation bound to that request, host authority, runtime, and workspace;
    and

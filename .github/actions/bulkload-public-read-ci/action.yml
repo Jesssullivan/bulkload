@@ -1,7 +1,10 @@
 name: Bulkload public-read CI
-description: Run Bulkload source and Bazel gates through the sanctioned public-read Flywheel front door
+description: Run one terminal Bulkload gate through the sanctioned public-read Flywheel front door
 
 inputs:
+  gate:
+    description: "Exact terminal repository consumer: source, build, or test"
+    required: true
   event-name:
     description: Exact triggering event name
     required: true
@@ -24,42 +27,91 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Snapshot the exact public-read guard
-      id: guard-snapshot
-      shell: /bin/bash --noprofile --norc {0}
+    - name: Validate the terminal gate selection
+      shell: /bin/bash --noprofile --norc -p {0}
       env:
         BASH_ENV: /dev/null
         ENV: /dev/null
+        BULKLOAD_GATE: ${{ inputs.gate }}
       run: |
         set -euo pipefail
-        expected=f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
-        source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
-        test "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" = "$expected"
-        guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
-        /bin/chmod 0700 "$guard_dir"
-        guard="$guard_dir/ci-public-read-guard.sh"
-        /usr/bin/install -m 0500 "$source_guard" "$guard"
-        test "$(/usr/bin/sha256sum "$guard" | /usr/bin/awk '{print $1}')" = "$expected"
-        printf 'guard_path=%s\n' "$guard" >> "$GITHUB_OUTPUT"
+        case "$BULKLOAD_GATE" in
+          source | build | test) ;;
+          *) exit 1 ;;
+        esac
 
-    - name: Preflight raw runner endpoint authority
-      shell: /bin/bash --noprofile --norc {0}
+    - name: Snapshot the exact public-read guard
+      id: guard-snapshot
+      shell: /bin/bash --noprofile --norc -p {0}
       env:
+        PATH: /nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        HOME: /var/empty
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
-        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
-        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
-        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
-        BULKLOAD_REF: ${{ inputs.ref }}
-        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
-        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
-        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
-        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ""
+        NIX_CONFIG_HOME: ""
+        NIX_DATA_HOME: ""
+        NIX_STATE_HOME: ""
+        XDG_CACHE_HOME: ""
+        XDG_CONFIG_HOME: ""
+        XDG_DATA_HOME: ""
+        XDG_STATE_HOME: ""
         ATTIC_TOKEN: ""
         NIX_ACCESS_TOKENS: ""
         NIX_USER_CONF_FILES: /dev/null
         NETRC: /dev/null
+        NIX_CONFIG: |-
+          substituters = https://cache.nixos.org/
+          store = local
+          allow-symlinked-store = false
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+          trusted-substituters =
+          builders =
+          builders-use-substitutes = false
+          build-hook =
+          pre-build-hook =
+          post-build-hook =
+          diff-hook =
+          run-diff-hook = false
+          require-sigs = true
+          access-tokens =
+          netrc-file = /dev/null
+          accept-flake-config = false
+          secret-key-files =
+          plugin-files =
+        NIX_REMOTE: local
         BAZELISK_BASE_URL: ""
         BAZELISK_FORMAT_URL: ""
         BAZELISK_GITHUB_TOKEN: ""
@@ -72,22 +124,292 @@ runs:
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
-        /bin/bash "$BULKLOAD_GUARD_PATH" preflight
+        set -euo pipefail
+        expected=50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11
+        source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
+        [[ "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" == "$expected" ]]
+        guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
+        /bin/chmod 0700 "$guard_dir"
+        guard="$guard_dir/ci-public-read-guard.sh"
+        /usr/bin/install -m 0500 "$source_guard" "$guard"
+        [[ "$(/usr/bin/sha256sum "$guard" | /usr/bin/awk '{print $1}')" == "$expected" ]]
+        runtime_home="$guard_dir/runtime-home"
+        source_runtime_home="$guard_dir/source-runtime-home"
+        /bin/mkdir -m 0700 "$runtime_home" "$source_runtime_home"
+        printf 'guard_path=%s\n' "$guard" >> "$GITHUB_OUTPUT"
+        printf 'runtime_home=%s\n' "$runtime_home" >> "$GITHUB_OUTPUT"
+        printf 'source_runtime_home=%s\n' "$source_runtime_home" >> "$GITHUB_OUTPUT"
+
+    - name: Preflight raw runner endpoint authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: /nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: |-
+          substituters = https://cache.nixos.org/
+          store = local
+          allow-symlinked-store = false
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+          trusted-substituters =
+          builders =
+          builders-use-substitutes = false
+          build-hook =
+          pre-build-hook =
+          post-build-hook =
+          diff-hook =
+          run-diff-hook = false
+          require-sigs = true
+          access-tokens =
+          netrc-file = /dev/null
+          accept-flake-config = false
+          secret-key-files =
+          plugin-files =
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_RUNTIME_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
+        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BULKLOAD_REF: ${{ inputs.ref }}
+        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
+        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
+        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
+        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+      run: |
+        set -euo pipefail
+        guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
+        guard_source=${guard_source%x}
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- preflight
 
     - name: Discover sanctioned runner endpoint authority
       id: endpoints
       uses: tinyland-inc/ci-templates/.github/actions/nix-setup@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
+      env:
+        PATH: /nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: |-
+          substituters = https://cache.nixos.org/
+          store = local
+          allow-symlinked-store = false
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+          trusted-substituters =
+          builders =
+          builders-use-substitutes = false
+          build-hook =
+          pre-build-hook =
+          post-build-hook =
+          diff-hook =
+          run-diff-hook = false
+          require-sigs = true
+          access-tokens =
+          netrc-file = /dev/null
+          accept-flake-config = false
+          secret-key-files =
+          plugin-files =
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
       with:
         attic-cache: main
 
     - name: Enforce the discovered public-read boundary
       id: authority
-      shell: /bin/bash --noprofile --norc {0}
+      shell: /bin/bash --noprofile --norc -p {0}
       env:
+        PATH: /usr/bin:/bin:/usr/sbin:/sbin
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: |-
+          substituters = https://cache.nixos.org/
+          store = local
+          allow-symlinked-store = false
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+          trusted-substituters =
+          builders =
+          builders-use-substitutes = false
+          build-hook =
+          pre-build-hook =
+          post-build-hook =
+          diff-hook =
+          run-diff-hook = false
+          require-sigs = true
+          access-tokens =
+          netrc-file = /dev/null
+          accept-flake-config = false
+          secret-key-files =
+          plugin-files =
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
         BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_RUNTIME_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
         BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
         BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
         BULKLOAD_REF: ${{ inputs.ref }}
@@ -98,10 +420,66 @@ runs:
         BULKLOAD_RUNNER_NAME: ${{ runner.name }}
         BULKLOAD_ATTIC_REACHABLE: ${{ steps.endpoints.outputs.attic_reachable }}
         BULKLOAD_BAZEL_CACHE_REACHABLE: ${{ steps.endpoints.outputs.bazel_cache_reachable }}
+      run: |
+        set -euo pipefail
+        guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
+        guard_source=${guard_source%x}
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- enforce
+
+    - name: Verify effective Nix client authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
         ATTIC_TOKEN: ""
         NIX_ACCESS_TOKENS: ""
         NIX_USER_CONF_FILES: /dev/null
         NETRC: /dev/null
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
         BAZELISK_BASE_URL: ""
         BAZELISK_FORMAT_URL: ""
         BAZELISK_GITHUB_TOKEN: ""
@@ -113,47 +491,106 @@ runs:
         BAZELISK_SKIP_WRAPPER: "true"
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
-      run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
-        /bin/bash "$BULKLOAD_GUARD_PATH" enforce
-
-    - name: Run repository-owned source gates
-      shell: bash
-      env:
-        PATH: ${{ steps.authority.outputs.trusted_path }}
-        BASH_ENV: /dev/null
-        ENV: /dev/null
         ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
         ATTIC_CACHE: main
         ATTIC_PUBLIC_KEY: main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
-        ATTIC_PUBLIC_READ_SITE: bulkload-ci
-        ATTIC_TOKEN: ""
-        NIX_ACCESS_TOKENS: ""
-        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
-        NIX_USER_CONF_FILES: /dev/null
-        NETRC: /dev/null
       run: |
         set -euo pipefail
-        test -z "${NIX_ACCESS_TOKENS:-}"
-        test "$(nix config show accept-flake-config)" = false
-        test "$(nix config show netrc-file)" = /dev/null
-        test -z "$(nix config show access-tokens)"
-        test -z "$(nix config show post-build-hook)"
-        test -z "$(nix config show secret-key-files)"
-        test -z "$(nix config show plugin-files)"
-        nix config show substituters | tr ' ' '\n' | grep -Fx -- "${ATTIC_SERVER%/}/${ATTIC_CACHE}"
-        nix config show trusted-public-keys | tr ' ' '\n' | grep -Fx -- "$ATTIC_PUBLIC_KEY"
-        nix flake check --no-build --no-write-lock-file
-        nix develop --no-write-lock-file .#default --command just ci-source
+        nixos_cache=https://cache.nixos.org/
+        nixos_public_key=cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+        [[ -z "${NIX_ACCESS_TOKENS:-}" ]]
+        [[ "$(nix config show store)" == local ]]
+        [[ "$(nix config show allow-symlinked-store)" == false ]]
+        [[ "$(nix eval --raw --expr builtins.storeDir)" == /nix/store ]]
+        [[ "$(nix config show accept-flake-config)" == false ]]
+        [[ "$(nix config show netrc-file)" == /dev/null ]]
+        [[ -z "$(nix config show access-tokens)" ]]
+        [[ -z "$(nix config show trusted-substituters)" ]]
+        [[ -z "$(nix config show builders)" ]]
+        [[ "$(nix config show builders-use-substitutes)" == false ]]
+        [[ -z "$(nix config show build-hook)" ]]
+        [[ -z "$(nix config show pre-build-hook)" ]]
+        [[ -z "$(nix config show post-build-hook)" ]]
+        [[ -z "$(nix config show diff-hook)" ]]
+        [[ "$(nix config show run-diff-hook)" == false ]]
+        [[ "$(nix config show require-sigs)" == true ]]
+        [[ -z "$(nix config show secret-key-files)" ]]
+        [[ -z "$(nix config show plugin-files)" ]]
+        actual_substituters=$(nix config show substituters | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort)
+        expected_substituters=$(printf '%s\n' "${ATTIC_SERVER%/}/${ATTIC_CACHE}" "$nixos_cache" | LC_ALL=C sort)
+        [[ "$actual_substituters" == "$expected_substituters" ]]
+        actual_public_keys=$(nix config show trusted-public-keys | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort)
+        expected_public_keys=$(printf '%s\n' "$ATTIC_PUBLIC_KEY" "$nixos_public_key" | LC_ALL=C sort)
+        [[ "$actual_public_keys" == "$expected_public_keys" ]]
 
     - name: Revalidate immutable Bazel build authority
+      if: ${{ inputs.gate == 'build' }}
       id: bazel-build-authority
-      shell: /bin/bash --noprofile --norc {0}
+      shell: /bin/bash --noprofile --norc -p {0}
       env:
         PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
         BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_RUNTIME_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
         BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
         BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
         BULKLOAD_REF: ${{ inputs.ref }}
@@ -167,11 +604,6 @@ runs:
         BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
         BULKLOAD_BAZEL_PHASE: build
         ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
-        ATTIC_TOKEN: ""
-        NIX_ACCESS_TOKENS: ""
-        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
-        NIX_USER_CONF_FILES: /dev/null
-        NETRC: /dev/null
         BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
         BAZEL_REMOTE_EXECUTOR: ""
         BAZEL_REMOTE_EXEC_HEADER: ""
@@ -179,40 +611,67 @@ runs:
         BAZEL_REMOTE_HEADER: ""
         BAZEL_REMOTE_CACHE_HEADER: ""
         GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
-        BAZELISK_BASE_URL: ""
-        BAZELISK_FORMAT_URL: ""
-        BAZELISK_GITHUB_TOKEN: ""
-        BAZELISK_HOME: ""
-        BAZELISK_HOME_DARWIN: ""
-        BAZELISK_HOME_LINUX: ""
-        BAZELISK_INCOMPATIBLE_FLAGS: ""
-        BAZELISK_VERIFY_SHA256: ""
-        BAZELISK_SKIP_WRAPPER: "true"
-        BAZELISK_WRAPPER_DIRECTORY: ""
-        USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
-        /bin/bash "$BULKLOAD_GUARD_PATH" bazel
+        set -euo pipefail
+        guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
+        guard_source=${guard_source%x}
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
     - name: Build the Bulkload binary through the public Flywheel action
+      if: ${{ inputs.gate == 'build' }}
       uses: tinyland-inc/ci-templates/.github/actions/flywheel-bazel@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
       env:
         PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.bazel-build-authority.outputs.bazel_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
-        HOME: ${{ steps.bazel-build-authority.outputs.bazel_home }}
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ${{ steps.bazel-build-authority.outputs.bazel_test_tmpdir }}
+        NIX_CACHE_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        NIX_DATA_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        NIX_STATE_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        XDG_DATA_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
+        XDG_STATE_HOME: ${{ steps.bazel-build-authority.outputs.bazel_runtime_home }}
         ATTIC_TOKEN: ""
         NIX_ACCESS_TOKENS: ""
-        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
         NIX_USER_CONF_FILES: /dev/null
         NETRC: /dev/null
-        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
-        BAZEL_REMOTE_EXECUTOR: ""
-        BAZEL_REMOTE_EXEC_HEADER: ""
-        BAZEL_CREDENTIAL_HELPER: ""
-        BAZEL_REMOTE_HEADER: ""
-        BAZEL_REMOTE_CACHE_HEADER: ""
-        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
         BAZELISK_BASE_URL: ""
         BAZELISK_FORMAT_URL: ""
         BAZELISK_GITHUB_TOKEN: ""
@@ -224,6 +683,13 @@ runs:
         BAZELISK_SKIP_WRAPPER: "true"
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
       with:
         bazel_remote_cache: ${{ steps.authority.outputs.bazel_remote_cache }}
         bazel_remote_executor: ""
@@ -232,13 +698,73 @@ runs:
         targets: //:bulkload
 
     - name: Revalidate immutable Bazel test authority
+      if: ${{ inputs.gate == 'test' }}
       id: bazel-test-authority
-      shell: /bin/bash --noprofile --norc {0}
+      shell: /bin/bash --noprofile --norc -p {0}
       env:
         PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
         BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_RUNTIME_HOME: ${{ steps.guard-snapshot.outputs.runtime_home }}
         BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
         BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
         BULKLOAD_REF: ${{ inputs.ref }}
@@ -252,11 +778,6 @@ runs:
         BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
         BULKLOAD_BAZEL_PHASE: test
         ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
-        ATTIC_TOKEN: ""
-        NIX_ACCESS_TOKENS: ""
-        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
-        NIX_USER_CONF_FILES: /dev/null
-        NETRC: /dev/null
         BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
         BAZEL_REMOTE_EXECUTOR: ""
         BAZEL_REMOTE_EXEC_HEADER: ""
@@ -264,40 +785,67 @@ runs:
         BAZEL_REMOTE_HEADER: ""
         BAZEL_REMOTE_CACHE_HEADER: ""
         GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
-        BAZELISK_BASE_URL: ""
-        BAZELISK_FORMAT_URL: ""
-        BAZELISK_GITHUB_TOKEN: ""
-        BAZELISK_HOME: ""
-        BAZELISK_HOME_DARWIN: ""
-        BAZELISK_HOME_LINUX: ""
-        BAZELISK_INCOMPATIBLE_FLAGS: ""
-        BAZELISK_VERIFY_SHA256: ""
-        BAZELISK_SKIP_WRAPPER: "true"
-        BAZELISK_WRAPPER_DIRECTORY: ""
-        USE_BAZEL_VERSION: ""
       run: |
-        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = f3d2d1e6b90440ba327a4b81d2e26b6516cadac383d8c66f40028e7d2294bb71
-        /bin/bash "$BULKLOAD_GUARD_PATH" bazel
+        set -euo pipefail
+        guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
+        guard_source=${guard_source%x}
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
     - name: Test the complete Bulkload Bazel graph through the public Flywheel action
+      if: ${{ inputs.gate == 'test' }}
       uses: tinyland-inc/ci-templates/.github/actions/flywheel-bazel@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
       env:
         PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.bazel-test-authority.outputs.bazel_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
         BASH_ENV: /dev/null
         ENV: /dev/null
-        HOME: ${{ steps.bazel-test-authority.outputs.bazel_home }}
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ${{ steps.bazel-test-authority.outputs.bazel_test_tmpdir }}
+        NIX_CACHE_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        NIX_DATA_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        NIX_STATE_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        XDG_DATA_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
+        XDG_STATE_HOME: ${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}
         ATTIC_TOKEN: ""
         NIX_ACCESS_TOKENS: ""
-        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
         NIX_USER_CONF_FILES: /dev/null
         NETRC: /dev/null
-        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
-        BAZEL_REMOTE_EXECUTOR: ""
-        BAZEL_REMOTE_EXEC_HEADER: ""
-        BAZEL_CREDENTIAL_HELPER: ""
-        BAZEL_REMOTE_HEADER: ""
-        BAZEL_REMOTE_CACHE_HEADER: ""
-        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
         BAZELISK_BASE_URL: ""
         BAZELISK_FORMAT_URL: ""
         BAZELISK_GITHUB_TOKEN: ""
@@ -309,9 +857,100 @@ runs:
         BAZELISK_SKIP_WRAPPER: "true"
         BAZELISK_WRAPPER_DIRECTORY: ""
         USE_BAZEL_VERSION: ""
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
       with:
         bazel_remote_cache: ${{ steps.authority.outputs.bazel_remote_cache }}
         bazel_remote_executor: ""
         command: test
         config: flywheel
         targets: //:tests
+
+    - name: Run repository-owned source gates
+      if: ${{ inputs.gate == 'source' }}
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+        ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
+        ATTIC_CACHE: main
+        ATTIC_PUBLIC_KEY: main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+        ATTIC_PUBLIC_READ_SITE: bulkload-ci
+      run: |
+        set -euo pipefail
+        nix flake check --no-build --no-write-lock-file
+        exec nix develop --no-write-lock-file --ignore-environment \
+          --keep HOME \
+          --keep NIX_CACHE_HOME \
+          --keep NIX_CONFIG_HOME \
+          --keep NIX_DATA_HOME \
+          --keep NIX_STATE_HOME \
+          --keep XDG_CACHE_HOME \
+          --keep XDG_CONFIG_HOME \
+          --keep XDG_DATA_HOME \
+          --keep XDG_STATE_HOME \
+          .#default --command just ci-source

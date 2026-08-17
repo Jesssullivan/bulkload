@@ -98,8 +98,8 @@ provider-writer proof, and readiness false.
 The immutable
 [v6 full application-source inventory](codex-private-runtime-inventory.v6.json)
 binds all 16 Bulkload Python source paths and digests from signed source commit
-`96db5c46eda9774c3bf6983eb04281cb249675fb`. Its canonical aggregate must remain
-`b221bb77ebd23e58ba2ea0788b35bfe52f7f1c6073b9e5e6fd2a4498daeb3650`;
+`7bd06a05f7a4710e42fac6be08b477b801493c95`. Its canonical aggregate must remain
+`5adfc213cf657d24d3bd8de3ab6b5f9e3d1bf14627045c8526d0b32241f460f5`;
 the v6 policy remains byte-frozen.
 
 Policy v7 retains the exact v6 policy/application/request validators but registers

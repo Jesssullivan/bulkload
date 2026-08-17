@@ -74,6 +74,156 @@ def _rewrite_canonical_json(path: Path, value: dict[str, object]) -> None:
     path.chmod(0o600)
 
 
+class _NoOpRuntimeLease:
+    def revalidate(self) -> None:
+        return None
+
+
+_NO_OP_PRIVATE_EPILOGUE = {
+    "runtime_lease": _NoOpRuntimeLease(),
+    "input_values": (),
+    "input_snapshots": (),
+    "input_bodies": (),
+}
+
+
+def _active_runtime_authority() -> dict[str, object]:
+    verifier_path = Path(inspect.getsourcefile(verifier)).resolve()
+    skill_root = verifier_path.parents[2]
+    policy_payload = (
+        skill_root / "references" / private_runtime.PRIVATE_STATE_POLICY_NAME
+    ).read_bytes()
+    policy = json.loads(policy_payload)
+    return {
+        "schema": private_runtime.PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+        "policy_schema": policy["schema"],
+        "policy_sha256": hashlib.sha256(policy_payload).hexdigest(),
+        "runtime_source_sha256": policy["runtime_source_sha256"],
+        "source_digests": deepcopy(policy["source_digests"]),
+    }
+
+
+class _CurrentPathOpenRecorder:
+    """Record only the final current-path descriptor set."""
+
+    def __init__(self, *, fail_after: int | None = None) -> None:
+        self.fail_after = fail_after
+        self.absolute_parent_calls = 0
+        self.opened: dict[str, int] = {}
+        self.order: list[str] = []
+        self.failure_injected = False
+        self.real_open_absolute_parent = verifier._open_absolute_parent
+        self.real_open_private_directory_at = verifier._open_private_directory_at
+        self.real_read_private_json_at = verifier._read_private_json_at
+        self.real_open_private_regular_at = verifier._open_private_regular_at
+        self.real_bounded_directory_entries = verifier._bounded_directory_entries
+
+    def _before_open(self) -> None:
+        if self.fail_after == len(self.order):
+            self.failure_injected = True
+            raise OSError("injected current-path open failure")
+
+    def _record(self, kind: str, descriptor: int) -> None:
+        self.opened[kind] = descriptor
+        self.order.append(kind)
+
+    def open_absolute_parent(
+        self,
+        path: Path,
+    ) -> tuple[Path, int, os.stat_result]:
+        self.absolute_parent_calls += 1
+        if self.absolute_parent_calls != 2:
+            return self.real_open_absolute_parent(path)
+        self._before_open()
+        result = self.real_open_absolute_parent(path)
+        self._record("parent", result[1])
+        return result
+
+    def open_private_directory_at(
+        self,
+        parent_descriptor: int,
+        leaf: str,
+        *,
+        label: str,
+    ) -> tuple[int, os.stat_result]:
+        if not label.startswith("current "):
+            return self.real_open_private_directory_at(
+                parent_descriptor,
+                leaf,
+                label=label,
+            )
+        self._before_open()
+        result = self.real_open_private_directory_at(
+            parent_descriptor,
+            leaf,
+            label=label,
+        )
+        kind = "sqlite" if "SQLite" in label else "bundle"
+        self._record(kind, result[0])
+        return result
+
+    def read_private_json_at(
+        self,
+        parent_descriptor: int,
+        leaf: str,
+        *,
+        label: str,
+    ) -> tuple[dict[str, object], bytes, os.stat_result, int]:
+        if not label.startswith("current "):
+            return self.real_read_private_json_at(
+                parent_descriptor,
+                leaf,
+                label=label,
+            )
+        self._before_open()
+        result = self.real_read_private_json_at(
+            parent_descriptor,
+            leaf,
+            label=label,
+        )
+        kind = "manifest" if leaf == "manifest.json" else "receipt"
+        self._record(kind, result[3])
+        return result
+
+    def open_private_regular_at(
+        self,
+        parent_descriptor: int,
+        leaf: str,
+        *,
+        label: str,
+        maximum_bytes: int,
+    ) -> tuple[int, os.stat_result]:
+        self._before_open()
+        result = self.real_open_private_regular_at(
+            parent_descriptor,
+            leaf,
+            label=label,
+            maximum_bytes=maximum_bytes,
+        )
+        self._record("database", result[0])
+        return result
+
+    def bounded_directory_entries(
+        self,
+        descriptor: int,
+        *,
+        label: str,
+        deadline: float,
+    ) -> list[str]:
+        if (
+            label.startswith("current ")
+            and self.fail_after == len(self.order)
+            and not self.failure_injected
+        ):
+            self.failure_injected = True
+            raise OSError("injected post-open custody failure")
+        return self.real_bounded_directory_entries(
+            descriptor,
+            label=label,
+            deadline=deadline,
+        )
+
+
 def _schema_limits(**counts: int) -> dict[str, int]:
     result = {key: 0 for key in verifier._SCHEMA_COUNT_LABELS}
     result.update(counts)
@@ -321,7 +471,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
             observed_opening: dict[str, object],
             observed_request: dict[str, object],
             observed_capacity: dict[str, object],
-            **__: object,
+            **arguments: object,
         ) -> dict[str, object]:
             self.assertIsNot(observed_action, action_plan)
             self.assertIsNot(observed_opening, opening_plan)
@@ -329,6 +479,14 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
             self.assertIsNot(observed_capacity, capacity_observation)
             self.assertEqual(observed_action, {"marker": "original"})
             action_plan["marker"] = "mutated"
+            runtime_lease = arguments["runtime_lease"]
+            runtime_lease.revalidate()  # type: ignore[attr-defined]
+            verifier._revalidate_input_documents(
+                arguments["input_values"],  # type: ignore[arg-type]
+                arguments["input_snapshots"],  # type: ignore[arg-type]
+                arguments["input_bodies"],  # type: ignore[arg-type]
+                deadline=arguments["deadline"],  # type: ignore[arg-type]
+            )
             return {"snapshot": "report"}
 
         with (
@@ -1119,7 +1277,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
         )
         self.assertNotIn(
             verifier.PRIVATE_SQLITE_VERIFIER_SOURCE_PATH,
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6["source_digests"],
+            private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6["source_digests"],
         )
         self.assertIn(
             verifier.PRIVATE_SQLITE_VERIFIER_SOURCE_PATH,
@@ -1159,7 +1317,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                     {},
                     {},
                     verifier_runtime_authority=deepcopy(
-                        private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+                        private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6
                     ),
                 )
 
@@ -1203,27 +1361,370 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
         self.assertTrue(all(value is False for value in report["claims"].values()))
         lease.revalidate.assert_called_once_with()
 
+    def test_public_oracle_holds_bundle_lease_through_runtime_revalidation(
+        self,
+    ) -> None:
+        authority = _active_runtime_authority()
+        lease = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_handbuilt_bundle(
+                Path(directory).resolve(),
+                actual_rows=[(1, b"one")],
+            )
+            moved_bundle = fixture.bundle_path.with_name(
+                f"{fixture.bundle_path.name}-replaced"
+            )
+
+            def replace_bundle_path() -> None:
+                fixture.bundle_path.rename(moved_bundle)
+                fixture.bundle_path.mkdir(mode=0o700)
+
+            lease.revalidate.side_effect = replace_bundle_path
+            with (
+                mock.patch.object(verifier, "_verify_input_bindings"),
+                mock.patch.object(
+                    private_runtime,
+                    "open_pinned_private_runtime_authority",
+                    return_value=nullcontext(lease),
+                ),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "offline bundle candidate changed during observation",
+                ),
+            ):
+                verifier.observe_codex_private_sqlite_bundle(
+                    fixture.bundle_path,
+                    fixture.action_plan,
+                    fixture.opening_plan,
+                    fixture.compose_request,
+                    fixture.capacity_observation,
+                    verifier_runtime_authority=authority,
+                )
+        lease.revalidate.assert_called_once_with()
+
+    def test_public_oracle_rejects_every_current_descriptor_mount_change(
+        self,
+    ) -> None:
+        real_mount = verifier._mount
+        expected_kinds = {
+            "parent",
+            "bundle",
+            "manifest",
+            "receipt",
+            "sqlite",
+            "database",
+        }
+        for target in sorted(expected_kinds):
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                recorder = _CurrentPathOpenRecorder()
+                lease = mock.Mock()
+                fixture = build_handbuilt_bundle(
+                    Path(directory).resolve(),
+                    actual_rows=[(1, b"one")],
+                )
+
+                def change_current_mount(
+                    descriptor: int,
+                ) -> dict[str, int | None]:
+                    observed = real_mount(descriptor)
+                    if recorder.opened.get(target) == descriptor:
+                        observed = deepcopy(observed)
+                        key = (
+                            "linux_mount_id"
+                            if observed["linux_mount_id"] is not None
+                            else "filesystem_id"
+                        )
+                        self.assertIsNotNone(observed[key])
+                        observed[key] = int(observed[key]) + 1  # type: ignore[arg-type]
+                    return observed
+
+                with (
+                    mock.patch.object(verifier, "_verify_input_bindings"),
+                    mock.patch.object(
+                        private_runtime,
+                        "open_pinned_private_runtime_authority",
+                        return_value=nullcontext(lease),
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_absolute_parent",
+                        side_effect=recorder.open_absolute_parent,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_private_directory_at",
+                        side_effect=recorder.open_private_directory_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_read_private_json_at",
+                        side_effect=recorder.read_private_json_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_private_regular_at",
+                        side_effect=recorder.open_private_regular_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_mount",
+                        side_effect=change_current_mount,
+                    ),
+                    self.assertRaisesRegex(
+                        BulkloadError,
+                        "final custody revalidation",
+                    ),
+                ):
+                    verifier.observe_codex_private_sqlite_bundle(
+                        fixture.bundle_path,
+                        fixture.action_plan,
+                        fixture.opening_plan,
+                        fixture.compose_request,
+                        fixture.capacity_observation,
+                        verifier_runtime_authority=_active_runtime_authority(),
+                    )
+                lease.revalidate.assert_called_once_with()
+                self.assertEqual(set(recorder.opened), expected_kinds)
+                for descriptor in recorder.opened.values():
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+
+    def test_current_path_reopen_closes_every_prior_descriptor_on_failure(
+        self,
+    ) -> None:
+        expected_order = [
+            "parent",
+            "bundle",
+            "manifest",
+            "receipt",
+            "sqlite",
+            "database",
+        ]
+        for fail_after in range(1, len(expected_order) + 1):
+            with (
+                self.subTest(fail_after=fail_after),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                recorder = _CurrentPathOpenRecorder(fail_after=fail_after)
+                lease = mock.Mock()
+                fixture = build_handbuilt_bundle(
+                    Path(directory).resolve(),
+                    actual_rows=[(1, b"one")],
+                )
+                with (
+                    mock.patch.object(verifier, "_verify_input_bindings"),
+                    mock.patch.object(
+                        private_runtime,
+                        "open_pinned_private_runtime_authority",
+                        return_value=nullcontext(lease),
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_absolute_parent",
+                        side_effect=recorder.open_absolute_parent,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_private_directory_at",
+                        side_effect=recorder.open_private_directory_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_read_private_json_at",
+                        side_effect=recorder.read_private_json_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_open_private_regular_at",
+                        side_effect=recorder.open_private_regular_at,
+                    ),
+                    mock.patch.object(
+                        verifier,
+                        "_bounded_directory_entries",
+                        side_effect=recorder.bounded_directory_entries,
+                    ),
+                    self.assertRaisesRegex(
+                        BulkloadError,
+                        "final custody revalidation",
+                    ),
+                ):
+                    verifier.observe_codex_private_sqlite_bundle(
+                        fixture.bundle_path,
+                        fixture.action_plan,
+                        fixture.opening_plan,
+                        fixture.compose_request,
+                        fixture.capacity_observation,
+                        verifier_runtime_authority=_active_runtime_authority(),
+                    )
+                lease.revalidate.assert_called_once_with()
+                self.assertTrue(recorder.failure_injected)
+                self.assertEqual(recorder.order, expected_order[:fail_after])
+                for descriptor in recorder.opened.values():
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+
+    def test_current_path_rechecks_earlier_child_after_last_child_hash(self) -> None:
+        recorder = _CurrentPathOpenRecorder()
+        real_hash_descriptor = verifier._hash_descriptor
+        lease = mock.Mock()
+        mutated = False
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_handbuilt_bundle(
+                Path(directory).resolve(),
+                actual_rows=[(1, b"one")],
+            )
+            manifest_path = fixture.bundle_path / "manifest.json"
+
+            def mutate_manifest_after_database_hash(
+                descriptor: int,
+                maximum_bytes: int,
+                *,
+                deadline: float,
+            ) -> tuple[str, int]:
+                nonlocal mutated
+                result = real_hash_descriptor(
+                    descriptor,
+                    maximum_bytes,
+                    deadline=deadline,
+                )
+                if recorder.opened.get("database") == descriptor and not mutated:
+                    manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+                    manifest_path.chmod(0o600)
+                    mutated = True
+                return result
+
+            with (
+                mock.patch.object(verifier, "_verify_input_bindings"),
+                mock.patch.object(
+                    private_runtime,
+                    "open_pinned_private_runtime_authority",
+                    return_value=nullcontext(lease),
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_open_absolute_parent",
+                    side_effect=recorder.open_absolute_parent,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_open_private_directory_at",
+                    side_effect=recorder.open_private_directory_at,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_read_private_json_at",
+                    side_effect=recorder.read_private_json_at,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_open_private_regular_at",
+                    side_effect=recorder.open_private_regular_at,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_hash_descriptor",
+                    side_effect=mutate_manifest_after_database_hash,
+                ),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "final custody revalidation",
+                ),
+            ):
+                verifier.observe_codex_private_sqlite_bundle(
+                    fixture.bundle_path,
+                    fixture.action_plan,
+                    fixture.opening_plan,
+                    fixture.compose_request,
+                    fixture.capacity_observation,
+                    verifier_runtime_authority=_active_runtime_authority(),
+                )
+        self.assertTrue(mutated)
+        lease.revalidate.assert_called_once_with()
+        for descriptor in recorder.opened.values():
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_public_oracle_rejects_bundle_symlink_swap_during_input_revalidation(
+        self,
+    ) -> None:
+        real_revalidate_inputs = verifier._revalidate_input_documents
+        lease = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_handbuilt_bundle(
+                Path(directory).resolve(),
+                actual_rows=[(1, b"one")],
+            )
+            moved_bundle = fixture.bundle_path.with_name(
+                f"{fixture.bundle_path.name}-moved"
+            )
+
+            def swap_bundle_for_symlink(
+                values: tuple[tuple[str, dict[str, object]], ...],
+                snapshots: tuple[dict[str, object], ...],
+                bodies: tuple[bytes, ...],
+                *,
+                deadline: float,
+            ) -> None:
+                real_revalidate_inputs(
+                    values,
+                    snapshots,
+                    bodies,
+                    deadline=deadline,
+                )
+                fixture.bundle_path.rename(moved_bundle)
+                fixture.bundle_path.symlink_to(moved_bundle, target_is_directory=True)
+
+            with (
+                mock.patch.object(verifier, "_verify_input_bindings"),
+                mock.patch.object(
+                    private_runtime,
+                    "open_pinned_private_runtime_authority",
+                    return_value=nullcontext(lease),
+                ),
+                mock.patch.object(
+                    verifier,
+                    "_revalidate_input_documents",
+                    side_effect=swap_bundle_for_symlink,
+                ),
+                self.assertRaisesRegex(
+                    BulkloadError,
+                    "offline bundle candidate changed during observation",
+                ),
+            ):
+                verifier.observe_codex_private_sqlite_bundle(
+                    fixture.bundle_path,
+                    fixture.action_plan,
+                    fixture.opening_plan,
+                    fixture.compose_request,
+                    fixture.capacity_observation,
+                    verifier_runtime_authority=_active_runtime_authority(),
+                )
+        lease.revalidate.assert_called_once_with()
+
     def test_input_binding_recomputes_v6_request_against_action(self) -> None:
         action_plan = {
             "schema": verifier.PRIVATE_SQLITE_ACTION_PLAN_SCHEMA,
             "runtime_authority": deepcopy(
-                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+                private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
             ),
         }
         compose_request = {
             "schema": verifier.PRIVATE_SQLITE_COMPOSE_REQUEST_SCHEMA,
             "request_runtime_authority": deepcopy(
-                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+                private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6
             ),
             "action_plan_producer_runtime_authority": deepcopy(
-                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+                private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
             ),
             "output_intent": {"workspace": {"marker": "exact-workspace"}},
         }
         capacity_observation = {
             "schema": verifier.PRIVATE_SQLITE_CAPACITY_OBSERVATION_SCHEMA,
             "observation_runtime_authority": deepcopy(
-                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6
+                private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6
             ),
         }
         with (
@@ -1263,7 +1764,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
             compose_request,
             action_plan,
             compose_request["output_intent"]["workspace"],
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6,
+            private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6,
         )
 
     def test_typed_blob_bound_accepts_over_8mib_and_exact_64mib(self) -> None:
@@ -1306,6 +1807,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                     verifier_runtime_binding=fixture.verifier_runtime_binding,
                     observation_id=OBSERVATION_ID,
                     observed_at=COMPLETED_AT,
+                    **_NO_OP_PRIVATE_EPILOGUE,
                 )
             self.assertEqual(report["failures"], [])
             self.assertTrue(report["observed_checks"]["semantic_comparisons_observed"])
@@ -1351,6 +1853,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                 verifier_runtime_binding=fixture.verifier_runtime_binding,
                 observation_id=OBSERVATION_ID,
                 observed_at=COMPLETED_AT,
+                **_NO_OP_PRIVATE_EPILOGUE,
             )
             after = _tree_snapshot(root)
             self.assertEqual(after, before)
@@ -1402,6 +1905,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                 verifier_runtime_binding=fixture.verifier_runtime_binding,
                 observation_id=OBSERVATION_ID,
                 observed_at=COMPLETED_AT,
+                **_NO_OP_PRIVATE_EPILOGUE,
             )
         self.assertNotIn(
             "operation-graph-binding-differs",
@@ -1432,6 +1936,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                 verifier_runtime_binding=fixture.verifier_runtime_binding,
                 observation_id=OBSERVATION_ID,
                 observed_at=COMPLETED_AT,
+                **_NO_OP_PRIVATE_EPILOGUE,
             )
         self.assertIn(
             "capacity-admission-differs",
@@ -1485,6 +1990,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                     verifier_runtime_binding=fixture.verifier_runtime_binding,
                     observation_id=OBSERVATION_ID,
                     observed_at=COMPLETED_AT,
+                    **_NO_OP_PRIVATE_EPILOGUE,
                 )
             self.assertIn(
                 "composition-chronology-differs",
@@ -1516,6 +2022,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                     verifier_runtime_binding=fixture.verifier_runtime_binding,
                     observation_id=OBSERVATION_ID,
                     observed_at=COMPLETED_AT,
+                    **_NO_OP_PRIVATE_EPILOGUE,
                 )
             self.assertIn(
                 "claimed-sqlite-engine-differs",
@@ -1555,6 +2062,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                         verifier_runtime_binding=fixture.verifier_runtime_binding,
                         observation_id=OBSERVATION_ID,
                         observed_at=COMPLETED_AT,
+                        **_NO_OP_PRIVATE_EPILOGUE,
                     )
 
     def test_self_redigested_wrong_semantic_output_is_observed_as_failure(
@@ -1591,6 +2099,7 @@ class PrivateSqliteV7VerifierTest(unittest.TestCase):
                 verifier_runtime_binding=fixture.verifier_runtime_binding,
                 observation_id=OBSERVATION_ID,
                 observed_at=COMPLETED_AT,
+                **_NO_OP_PRIVATE_EPILOGUE,
             )
             self.assertIn(
                 "semantic-union-differs",

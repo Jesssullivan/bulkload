@@ -47,7 +47,7 @@ SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def active_runtime_authority() -> dict:
-    return deepcopy(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED)
+    return deepcopy(private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5)
 
 
 def write_rollout(root: Path) -> Path:

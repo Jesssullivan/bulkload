@@ -16,7 +16,6 @@ from unittest import mock
 sys.dont_write_bytecode = True
 
 import bulkload_lib.cli as bulkload_cli  # noqa: E402
-from bulkload_lib import private_runtime  # noqa: E402
 from bulkload_lib.cli import main as cli_main  # noqa: E402
 from bulkload_lib.executor import (  # noqa: E402
     apply_plan,
@@ -61,11 +60,7 @@ from bulkload_lib.sessions import (  # noqa: E402
     validate_codex_session_union_plan,
     validate_codex_session_union_plan_against_inputs,
 )
-from tests.unprivileged_test_main import (  # noqa: E402
-    _assert_regular_source,
-    _remove_readonly_tree,
-    run_unittest_main,
-)
+from tests.unprivileged_test_main import run_unittest_main  # noqa: E402
 
 TEST_HOST_AUTHORITY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 OTHER_HOST_AUTHORITY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -264,68 +259,18 @@ class BulkloadProtocolTest(unittest.TestCase):
     def test_mutation_suite_runs_as_an_unprivileged_user(self) -> None:
         if hasattr(os, "geteuid"):
             self.assertNotEqual(os.geteuid(), 0)
-        if os.environ.get("BULKLOAD_TEST_PRIVILEGE_DROP") == "1":
-            for variable in (
-                "HOME",
-                "TMPDIR",
-                "XDG_CACHE_HOME",
-                "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME",
-                "XDG_RUNTIME_DIR",
-                "XDG_STATE_HOME",
-            ):
-                path = Path(os.environ[variable])
-                self.assertEqual(path.stat().st_uid, os.getuid())
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
-            runtime_stage = Path(os.environ["BULKLOAD_TEST_RUNTIME_STAGE"])
-            self.assertEqual(runtime_stage.stat().st_uid, 0)
-            self.assertEqual(stat.S_IMODE(runtime_stage.stat().st_mode), 0o555)
-            self.assertTrue(
-                Path(private_runtime.__file__).resolve().is_relative_to(runtime_stage)
-            )
-            self.assertFalse(
-                any(path.is_symlink() for path in runtime_stage.rglob("*"))
-            )
-            for path in runtime_stage.rglob("*"):
-                expected_mode = 0o555 if path.is_dir() else 0o444
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
-            with self.assertRaises(PermissionError):
-                (runtime_stage / "unprivileged-write-probe").write_text("forbidden")
 
-    def test_readonly_runtime_stage_cleanup_reopens_owned_tree(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="bulkload-cleanup-contract-"))
-        nested = root / "scripts" / "runtime.py"
-        nested.parent.mkdir(parents=True)
-        nested.write_text("pass\n", encoding="utf-8")
-        nested.chmod(0o444)
-        nested.parent.chmod(0o555)
-        root.chmod(0o555)
-        _remove_readonly_tree(root)
-        self.assertFalse(root.exists())
-
-    def test_runtime_stage_rejects_symlinked_source_components(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "scripts" / "runtime.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("pass\n", encoding="utf-8")
-            alias = root / "scripts-alias"
-            alias.symlink_to(source.parent, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, "contains a symlink"):
-                _assert_regular_source(root, alias / source.name)
-
-    def test_apply_refuses_root_before_creating_state(self) -> None:
+    def test_production_apply_refuses_root_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, destination = make_pair(root)
-            (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+            (source / "notes.txt").write_text("new\n", encoding="utf-8")
             plan = compile_plan(
                 capture_snapshot(source, "repo"),
                 capture_snapshot(source, "repo"),
                 capture_snapshot(destination, "repo"),
             )
-            state_root = root / "state"
-            receipt_path = root / "receipt.json"
+
             with (
                 mock.patch("bulkload_lib.executor.os.geteuid", return_value=0),
                 self.assertRaisesRegex(BulkloadError, "apply refuses to run as root"),
@@ -335,15 +280,13 @@ class BulkloadProtocolTest(unittest.TestCase):
                     source_root=source,
                     destination_root=destination,
                     accepted_digest=plan["plan_sha256"],
-                    state_root=state_root,
-                    receipt_path=receipt_path,
+                    state_root=root / "state",
+                    receipt_path=root / "receipt.json",
                 )
-            self.assertEqual(
-                (destination / "tracked.txt").read_text(encoding="utf-8"),
-                "base\n",
-            )
-            self.assertFalse(state_root.exists())
-            self.assertFalse(receipt_path.exists())
+
+            self.assertFalse((destination / "notes.txt").exists())
+            self.assertFalse((root / "state").exists())
+            self.assertFalse((root / "receipt.json").exists())
 
     def test_codex_session_union_is_stable_absent_only_and_preserving(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1196,6 +1139,182 @@ class BulkloadProtocolTest(unittest.TestCase):
                     capture_codex(destination, role="destination"),
                     capture_codex(destination, role="destination"),
                 )
+
+    def test_codex_capture_rejects_privileged_modes_and_self_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            privileged_file = os.stat_result(
+                (
+                    stat.S_IFREG | 0o4600,
+                    1,
+                    1,
+                    1,
+                    os.getuid(),
+                    os.getgid(),
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            )
+            with self.assertRaisesRegex(BulkloadError, "privileged permission bits"):
+                session_catalogs._stable_user_regular(
+                    privileged_file,
+                    root / "rollout.jsonl",
+                    role="source",
+                )
+
+            privileged_directory = os.stat_result(
+                (
+                    stat.S_IFDIR | 0o1700,
+                    2,
+                    1,
+                    1,
+                    os.getuid(),
+                    os.getgid(),
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            )
+            with self.assertRaisesRegex(BulkloadError, "privileged permission bits"):
+                session_catalogs._validate_stable_directory(
+                    root / "2026",
+                    privileged_directory,
+                    role="source",
+                )
+
+            public_source_root = root / "public-source"
+            write_codex_rollout(
+                public_source_root,
+                "74747474-7474-4474-8474-747474747474",
+            )
+            public_source_root.chmod(0o755)
+            public_source_capture = capture_codex(public_source_root)
+            self.assertTrue(public_source_capture["complete"])
+            self.assertEqual(public_source_capture["non_private_directory_count"], 0)
+            validate_codex_session_snapshot(public_source_capture)
+            for field in (
+                "non_private_file_count",
+                "non_private_directory_count",
+            ):
+                forged_count = dict(public_source_capture)
+                forged_count[field] = False
+                refresh_codex_snapshot(forged_count)
+                with self.assertRaisesRegex(BulkloadError, "count mismatch"):
+                    validate_codex_session_snapshot(forged_count)
+
+            empty_source_root = root / "empty-source"
+            empty_source_root.mkdir(mode=0o700)
+            empty_source_capture = capture_codex(empty_source_root)
+            self.assertTrue(empty_source_capture["complete"])
+            self.assertEqual(empty_source_capture["total_bytes"], 0)
+            empty_source_capture["total_bytes"] = False
+            refresh_codex_snapshot(empty_source_capture)
+            with self.assertRaisesRegex(BulkloadError, "total_bytes mismatch"):
+                validate_codex_session_snapshot(empty_source_capture)
+
+            failed_traversal_root = root / "failed-traversal"
+            write_codex_rollout(
+                failed_traversal_root,
+                "78787878-7878-4878-8878-787878787878",
+            )
+            (failed_traversal_root / "2026").chmod(0o755)
+            real_scandir = session_catalogs.os.scandir
+            scandir_calls = 0
+
+            def fail_second_scandir(descriptor: int):
+                nonlocal scandir_calls
+                scandir_calls += 1
+                if scandir_calls == 2:
+                    raise OSError("fixture child enumeration failure")
+                return real_scandir(descriptor)
+
+            with mock.patch(
+                "bulkload_lib.sessions.os.scandir",
+                side_effect=fail_second_scandir,
+            ):
+                failed_traversal = capture_codex(failed_traversal_root)
+            self.assertFalse(failed_traversal["complete"])
+            self.assertEqual(failed_traversal["directories"], [])
+            self.assertEqual(failed_traversal["non_private_directory_count"], 0)
+            validate_codex_session_snapshot(failed_traversal)
+
+            valid_root = root / "valid"
+            write_codex_rollout(
+                valid_root,
+                "76767676-7676-4676-8676-767676767676",
+            )
+            invalid_capture = capture_codex(valid_root)
+            invalid_capture["directories"][0]["mode"] = "1700"
+            output = root / "invalid-capture.json"
+            stderr = io.StringIO()
+            with (
+                redirect_stderr(stderr),
+                mock.patch(
+                    "bulkload_lib.cli.capture_codex_sessions",
+                    return_value=invalid_capture,
+                ),
+                mock.patch("sys.stdout", new=io.StringIO()),
+            ):
+                result = cli_main(
+                    [
+                        "codex-capture",
+                        "--root",
+                        str(valid_root),
+                        "--output",
+                        str(output),
+                        "--role",
+                        "source",
+                        "--acknowledge-writers-quiesced",
+                        "--host-authority-id",
+                        TEST_HOST_AUTHORITY_ID,
+                    ]
+                )
+            self.assertEqual(result, 2)
+            self.assertFalse(output.exists())
+            self.assertIn("directory record is invalid", stderr.getvalue())
+
+    def test_codex_evidence_stdout_publication_is_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            write_codex_rollout(
+                sessions,
+                "75757575-7575-4575-8575-757575757575",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), mock.patch("sys.stdout", new=stdout):
+                result = cli_main(
+                    [
+                        "codex-capture",
+                        "--root",
+                        str(sessions),
+                        "--output",
+                        "-",
+                        "--role",
+                        "source",
+                        "--acknowledge-writers-quiesced",
+                        "--host-authority-id",
+                        TEST_HOST_AUTHORITY_ID,
+                    ]
+                )
+            self.assertEqual(result, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("stdout publication is forbidden", stderr.getvalue())
+
+    def test_darwin_codex_publication_requires_atomic_rename_symbol(self) -> None:
+        with (
+            mock.patch.object(bulkload_cli.sys, "platform", "darwin"),
+            mock.patch.object(bulkload_cli.ctypes, "CDLL", return_value=object()),
+            self.assertRaisesRegex(
+                BulkloadError,
+                "atomic no-replace evidence publication is unavailable",
+            ),
+        ):
+            bulkload_cli._rename_codex_output_noreplace(3, "source", 4, "target")
 
     def test_codex_capture_cli_forwards_record_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

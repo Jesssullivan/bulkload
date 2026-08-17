@@ -15,29 +15,222 @@ concurrency:
 
 jobs:
   test:
-    name: Bazel contract and fixture tests
+    name: ${{ matrix.gate }} terminal gate
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: tinyland-nix
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [source, build, test]
     env:
+      BASH_ENV: /dev/null
+      ENV: /dev/null
+      SHELLOPTS: ""
+      BASHOPTS: ""
+      PS4: ""
+      BASH_XTRACEFD: ""
+      LD_PRELOAD: ""
+      LD_LIBRARY_PATH: ""
+      LD_AUDIT: ""
+      http_proxy: ""
+      https_proxy: ""
+      ftp_proxy: ""
+      all_proxy: ""
+      no_proxy: ""
+      CURL_CA_BUNDLE: ""
+      SSL_CERT_FILE: ""
+      SSL_CERT_DIR: ""
+      SSLKEYLOGFILE: ""
       ATTIC_TOKEN: ""
       NIX_ACCESS_TOKENS: ""
     steps:
-      - name: Check out exact revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
-      - name: Verify exact checked out revision
+      - name: Materialize exact revision with fixed Git
+        shell: /bin/bash --noprofile --norc -p {0}
         env:
-          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          BASH_ENV: /dev/null
+          ENV: /dev/null
+          SHELLOPTS: ""
+          BASHOPTS: ""
+          PS4: ""
+          BASH_XTRACEFD: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          LD_AUDIT: ""
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          FTP_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: ""
+          CURL_CA_BUNDLE: ""
+          SSL_CERT_FILE: ""
+          SSL_CERT_DIR: ""
+          SSLKEYLOGFILE: ""
+          BULKLOAD_CHECKOUT_TOKEN: ${{ github.token }}
+          BULKLOAD_EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BULKLOAD_REPOSITORY: ${{ github.repository }}
+          BULKLOAD_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set +x
+          set +v
+          set -euo pipefail
+          umask 077
+
+          [[ $- == *p* ]]
+          [[ $- != *a* ]]
+          [[ -n "${BULKLOAD_CHECKOUT_TOKEN:-}" ]]
+          builtin printf '::add-mask::%s\n' "$BULKLOAD_CHECKOUT_TOKEN"
+          checkout_token=$BULKLOAD_CHECKOUT_TOKEN
+          export -n checkout_token SHELLOPTS BASHOPTS
+          unset BULKLOAD_CHECKOUT_TOKEN
+          [[ -z "${BULKLOAD_CHECKOUT_TOKEN:-}" ]]
+          trap 'unset BULKLOAD_CHECKOUT_TOKEN checkout_token encoded_token git_http_header BULKLOAD_GIT_HTTP_HEADER' EXIT
+
+          unset BASH_ENV ENV CDPATH PS4 BASH_XTRACEFD
+          unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
+          unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+          unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
+          unset CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE
+          unset GH_TOKEN GITHUB_TOKEN GITLAB_TOKEN SSH_AUTH_SOCK SSH_ASKPASS
+          for variable in "${!GIT_@}"; do
+            unset "$variable"
+          done
+
+          encoded_token=$(
+            builtin printf 'x-access-token:%s' "$checkout_token" |
+              /usr/bin/base64 -w0
+          )
+          export -n encoded_token
+          builtin printf '::add-mask::%s\n' "$encoded_token"
+          git_http_header="AUTHORIZATION: basic $encoded_token"
+          export -n git_http_header
+          builtin printf '::add-mask::%s\n' "$git_http_header"
+          unset checkout_token encoded_token
+          [[ -z "${checkout_token:-}" ]]
+          [[ -z "${encoded_token:-}" ]]
+
+          expected_sha=$BULKLOAD_EXPECTED_SHA
+          repository=$BULKLOAD_REPOSITORY
+          server_url=$BULKLOAD_SERVER_URL
+          workspace=$GITHUB_WORKSPACE
+          runner_temp=$RUNNER_TEMP
+          runner_commands=$runner_temp/_runner_file_commands
+          github_env=$GITHUB_ENV
+
+          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          test "$server_url" = "https://github.com"
+          test -d "$workspace"
+          test ! -L "$workspace"
+          test -O "$workspace"
+          test "$(/usr/bin/readlink -f -- "$workspace")" = "$workspace"
+          test -d "$runner_temp"
+          test ! -L "$runner_temp"
+          test -O "$runner_temp"
+          test "$(/usr/bin/readlink -f -- "$runner_temp")" = "$runner_temp"
+          test -d "$runner_commands"
+          test ! -L "$runner_commands"
+          test -O "$runner_commands"
+          test "$(/usr/bin/readlink -f -- "$runner_commands")" = "$runner_commands"
+          test -f "$github_env"
+          test ! -L "$github_env"
+          test -O "$github_env"
+          test "$(/usr/bin/readlink -f -- "$github_env")" = "$github_env"
+          test "$(/usr/bin/dirname -- "$github_env")" = "$runner_commands"
+
+          test -z "$(/usr/bin/find "$workspace" -xdev -mindepth 1 -maxdepth 1 -print -quit)"
+
+          checkout_state=$(/usr/bin/mktemp -d "$runner_temp/bulkload-checkout.XXXXXXXX")
+          test -d "$checkout_state"
+          test ! -L "$checkout_state"
+          test -O "$checkout_state"
+          /bin/chmod 700 "$checkout_state"
+          /bin/mkdir -m 700 \
+            "$checkout_state/home" \
+            "$checkout_state/xdg" \
+            "$checkout_state/template" \
+            "$checkout_state/tmp"
+          : >"$checkout_state/home/.gitconfig"
+          /bin/chmod 600 "$checkout_state/home/.gitconfig"
+
+          export HOME=$checkout_state/home
+          export XDG_CONFIG_HOME=$checkout_state/xdg
+          export GIT_CONFIG_GLOBAL=$checkout_state/home/.gitconfig
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_TERMINAL_PROMPT=0
+          export GCM_INTERACTIVE=never
+
+          origin_url=$server_url/$repository.git
+          /usr/bin/git init --template="$checkout_state/template" "$workspace"
+          /usr/bin/git -C "$workspace" remote add origin "$origin_url"
+
+          (
+            fetch_env_unsets=()
+            while IFS= read -r variable; do
+              if [[ "$variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                export -n "$variable"
+              else
+                fetch_env_unsets+=(-u "$variable")
+              fi
+            done < <(compgen -e)
+
+            export PATH=/usr/bin:/bin
+            export HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+            export GIT_TERMINAL_PROMPT GCM_INTERACTIVE
+            export TMPDIR="$checkout_state/tmp"
+            export LANG=C LC_ALL=C
+            export BULKLOAD_GIT_HTTP_HEADER="$git_http_header"
+            exec /usr/bin/env "${fetch_env_unsets[@]}" \
+              /usr/bin/git -C "$workspace" \
+                -c core.hooksPath=/dev/null \
+                -c credential.helper= \
+                --config-env=http.https://github.com/.extraheader=BULKLOAD_GIT_HTTP_HEADER \
+                fetch --force --prune --no-recurse-submodules --no-tags \
+                --no-auto-maintenance --no-write-commit-graph origin \
+                "$expected_sha" \
+                '+refs/heads/*:refs/remotes/origin/*' \
+                '+refs/tags/*:refs/tags/*'
+          )
+
+          unset BULKLOAD_GIT_HTTP_HEADER git_http_header
+          [[ -z "${BULKLOAD_GIT_HTTP_HEADER:-}" ]]
+          [[ -z "${git_http_header:-}" ]]
+          trap - EXIT
+          /usr/bin/git -C "$workspace" \
+            -c core.hooksPath=/dev/null \
+            checkout --detach --force "$expected_sha"
+
+          test "$(/usr/bin/git -C "$workspace" rev-parse --verify HEAD)" = "$expected_sha"
+          test "$(/usr/bin/git -C "$workspace" rev-parse --is-shallow-repository)" = false
+          test "$(/usr/bin/git -C "$workspace" rev-parse --show-toplevel)" = "$workspace"
+          test -z "$(/usr/bin/git -C "$workspace" status --porcelain=v1 --untracked-files=all)"
+          test ! -e "$workspace/.git/objects/info/alternates"
+          test -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"
+          test "$(/usr/bin/git -C "$workspace" remote get-url --all origin)" = "$origin_url"
+          test "$(/usr/bin/git -C "$workspace" remote get-url --push --all origin)" = "$origin_url"
+          if /usr/bin/git -C "$workspace" config --show-origin --name-only --get-regexp \
+            '^(credential\.|http\.|include\.|includeif\.|core\.askpass$|core\.sshcommand$|ssh\.|remote\..*\.uploadpack$|url\..*\.insteadof$)' \
+            >/dev/null; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          for variable in GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS SSH_ASKPASS SSH_AUTH_SOCK; do
+            test -z "${!variable:-}"
+          done
+          /bin/rm -rf --one-file-system -- "$checkout_state"
+          builtin printf '%s\n' \
+            'HTTP_PROXY=' \
+            'HTTPS_PROXY=' \
+            'FTP_PROXY=' \
+            'ALL_PROXY=' \
+            'NO_PROXY=' \
+            >> "$github_env"
 
       - name: Bulkload public-read cache-first validation
         uses: ./.github/actions/bulkload-public-read-ci
         with:
+          gate: ${{ matrix.gate }}
           event-name: ${{ github.event_name }}
           expected-sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           ref: ${{ github.ref }}

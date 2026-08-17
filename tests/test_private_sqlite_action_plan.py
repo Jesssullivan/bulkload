@@ -121,7 +121,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         self.opening_relation = self._classify(include_expected_output=False)
         self.captures = self._captures()
         self.runtime_authority = deepcopy(
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+            private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
         )
         self.opening_plan = self._opening_plan()
         self.close_request = self._close_request(self.opening_plan)
@@ -689,7 +689,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
                 )
 
     def _request_runtime_authority(self) -> dict:
-        return deepcopy(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V6)
+        return deepcopy(private_runtime.ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6)
 
     def _workspace_record(self, action_plan: dict) -> dict:
         protected: list[dict] = []
