@@ -41,7 +41,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     },
     "source_digests": {
         "scripts/bulkload_lib/cli.py": (
-            "94023890797fe351aaf0de0502d35901dc9d11220d6200f31961753ff27ab452"
+            "159312753a2a576e04b2ad77a5463ed6fa866709fb9e080eca80047a62aee7d2"
         ),
         "scripts/bulkload_lib/private_apply.py": (
             "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
@@ -54,7 +54,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
         ),
     },
     "runtime_source_sha256": (
-        "6a8011455ff9f003aa88022a3282f4144309a105c9fe7b328e096af885ba2b5d"
+        "7865ddfe8db0ba28769fadd57d560db8ab48c73cf56f2e71682fe35bf273dabd"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",

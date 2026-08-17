@@ -2119,7 +2119,7 @@ class CodexPrivateApplyTest(unittest.TestCase):
             self.assertTrue(prior_preflight.is_dir())
             with self.assertRaisesRegex(
                 BulkloadError,
-                "overlaps .*original evidence",
+                "overlaps original recovery evidence",
             ):
                 fixture.recover(
                     paths["journal"],

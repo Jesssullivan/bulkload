@@ -28,7 +28,7 @@ python-lint:
     cd {{ root }} && ruff format --check .agents/skills/bulkload/scripts scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/install-skill.sh scripts/demo.sh
+    cd {{ root }} && shellcheck scripts/install-skill.sh scripts/demo.sh scripts/ci-public-read-guard.sh
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml

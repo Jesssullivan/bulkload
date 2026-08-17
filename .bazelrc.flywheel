@@ -1,34 +1,38 @@
-# GloriousFlywheel consumer Bazel cache/RBE contract.
+# .bazelrc.flywheel - endpoint-free GloriousFlywheel behavior for Tinyland consumers.
 #
-# This file is endpoint-free on purpose. Set BAZEL_REMOTE_CACHE,
-# BAZEL_REMOTE_EXECUTOR, GF_BAZEL_SUBSTRATE_MODE, and runtime auth through the
-# fleet-managed profile, CI runtime, or .env.flywheel.local fallback. The
-# gloriousflywheel-bazel wrapper passes concrete endpoint flags after validating
-# the profile shape.
+# Vendored by tinyland-inc/ci-templates. Cache and executor endpoints are
+# runtime authority and must be supplied through environment variables or action
+# inputs, then passed as Bazel flags by the flywheel-bazel composite action.
+#
+# Do not put deployment-specific endpoints, credentials, auth headers, or cache
+# upload authority in this file.
+#
+# Hard invariants:
+#   - Cache hits are not RBE.
+#   - Current RustFS is not trusted CAS/action-cache/publication authority
+#     until TIN-1147 proves repair or replacement.
+#   - OpenTofu, developer-server, and image-push targets are not executor
+#     eligible through this fragment.
 
-build:ci-cached --remote_upload_local_results=false
-build:ci-cached --remote_download_minimal
-build:ci-cached --remote_timeout=60
-build:ci-cached --experimental_remote_cache_ttl=3h
+# Remote cache behavior. The wrapper/action supplies --remote_cache and upload
+# policy after validating BAZEL_REMOTE_CACHE and GF_BAZEL_REMOTE_UPLOAD.
+common:flywheel --remote_upload_local_results=false
+common:flywheel --remote_local_fallback
+common:flywheel --remote_timeout=60
 
-test:ci-cached --remote_upload_local_results=false
-test:ci-cached --remote_download_minimal
-test:ci-cached --remote_timeout=60
-test:ci-cached --experimental_remote_cache_ttl=3h
+# Remote executor behavior. The wrapper/action supplies --remote_executor only
+# when executor mode is selected and BAZEL_REMOTE_EXECUTOR is present.
+common:flywheel-executor --config=flywheel
+common:flywheel-executor --remote_download_minimal
+common:flywheel-executor --remote_local_fallback=false
+common:flywheel-executor --spawn_strategy=remote
+common:flywheel-executor --jobs=200
 
-# Opt-in executor-backed contract. The executor endpoint is intentionally not
-# set here; gloriousflywheel-bazel passes --remote_executor from
-# BAZEL_REMOTE_EXECUTOR only after it validates executor-backed mode.
-build:executor-backed --config=ci-cached
-build:executor-backed --remote_local_fallback=false
-build:executor-backed --spawn_strategy=remote
-build:executor-backed --remote_download_minimal
-build:executor-backed --noremote_cache_compression
-build:executor-backed --jobs=4
-build:executor-backed --host_platform=//tools/bazel/platforms:linux_x86_64
-build:executor-backed --extra_execution_platforms=//tools/bazel/platforms:linux_x86_64
-# NOTE: no `test:executor-backed --config=executor-backed` here — that is a
-# self-referential rc cycle (Bazel: "Config expansion has a cycle"); `test`
-# already inherits every `build:executor-backed` line above.
-test:executor-backed --noremote_cache_compression
-test:executor-backed --jobs=4
+# Worker platform identity is supplied by the repo-managed wrapper/action via
+# --remote_default_exec_properties=gf.platform=<class>. Fresh spokes must not
+# need a consumer-visible @gloriousflywheel Bzlmod repo just to attach.
+
+# Proved-class gating: consumers add tags = ["flywheel-eligible"] only for
+# target classes present in the GloriousFlywheel eligibility manifest.
+common:flywheel-executor --build_tag_filters=flywheel-eligible
+common:flywheel-executor --test_tag_filters=flywheel-eligible

@@ -1,9 +1,114 @@
 # Bulkload v1 design
 
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension
-and private-state policy v3 narrow attended auth install in review, 2026-07-29.
+and private-state policy v3 narrow attended auth install in review; public-read
+CI repair naturally green on its source carrier, 2026-08-16.
 SQLite union/composition/installation and combined private apply remain
 fail-held.
+
+The public-read CI boundary is separately closed by a repository-local
+front door. It runs only on the literal `tinyland-nix` capability, rejects fork
+pull requests before scheduling, and consumes the public immutable
+`tinyland-inc/ci-templates` v2.13.0 actions at commit
+`139bd4c7deabbe07c918dc764a3b9f054066431d`. It does not import private
+GloriousFlywheel action or flake source. The workflow does not use a checkout
+action. Its bootstrap trust root is the GitHub runtime and sanctioned ARC
+runner image and kernel: the runner constructs the step environment and command
+files and supplies system Bash, base64, env, Git/libcurl, DNS, TLS, and CA
+authority. The contract does not claim resistance to a compromised member of
+that root.
+
+Before any leg starts, the job environment blanks `BASH_ENV`, imported shell
+option and trace channels, loader injection, proxy override channels, CA
+overrides, and TLS key logging. Lower-case proxy blanks, including `ftp_proxy`,
+remain job-scoped for the local composite and pinned actions. The materializer
+step separately blanks `FTP_PROXY`. After token and header destruction, exact
+checkout verification, and private checkout-state cleanup, the trusted
+materializer appends exactly five upper-case empty proxy records to an owned,
+canonical regular `$GITHUB_ENV` file contained by
+`$RUNNER_TEMP/_runner_file_commands`. Bash runs privileged without profile or
+rc files, so imported functions and option state are ignored. The
+materialization step removes both proxy cases and every other transport channel
+again before its first child. It then requires
+the pre-existing workspace and runner temporary root to be owned, canonical
+nonsymlink directories and requires the workspace to be empty without deleting
+stale contents. It uses fixed system binaries, a new private home and global
+config, an empty template, a private temporary root, and no system Git config.
+
+The read-only GitHub token is masked, copied to an explicitly non-exported shell
+variable, and removed from the process environment before the fixed base64
+encoder receives the raw value over stdin. The raw and encoded forms are
+cleared before any Git fetch. A fetch-only subshell de-exports the inherited
+environment and exports only the private Git configuration, fixed system path,
+locale, temporary root, prompt fences, and masked Basic header; malformed
+environment names such as imported function records are removed by fixed
+`/usr/bin/env`. `--config-env` binds that header to GitHub, while
+`--no-auto-maintenance` and `--no-write-commit-graph` prevent ancillary writers.
+The fetch requests the exact event object and complete head and tag namespaces.
+The header is cleared on success and by shell exit on failure before an exact
+detached checkout. The step then proves full history, exact HEAD and worktree
+root, a clean tree, a tokenless origin, no object alternates, and no credential,
+HTTP, include, or SSH config.
+
+The workflow is one literal, fail-fast-disabled matrix whose `source`, `build`,
+and `test` legs are independently scheduled on `tinyland-nix`. Each leg has
+exactly two workflow steps: the fixed-Git materializer and the local composite.
+The composite fail-closes any gate outside that enum, establishes the common
+public-read boundary, and selects one mutually exclusive tail. The source tail
+executes the source suite; the build tail revalidates Bazel authority and ends
+in `build //:bulkload`; the test tail revalidates independently and ends in
+`test //:tests`. Thus each selected execution path has exactly one repository
+consumer and no process or action after it. The materializer registers no
+checkout post. The exact nested action pins contain no post, nested use, or
+step after their Bazel invocation. Semantic contract validation rejects any
+composite step that redeclares a job-fenced shell, imported-function, loader,
+proxy, CA, or keylog channel, including `LD_PRELOAD` and `BASH_FUNC_*`.
+
+The Nix client process is configured
+for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
+locations for Attic and Bazel remain injected by the runner. A no-value
+repository preflight validates authority-only raw endpoints and clears
+inherited shell, Nix, and Bazel credential channels before the pinned discovery
+action; post-discovery
+enforcement revalidates the boundary and requires both cache reachability
+claims before any Nix or Bazel command. Pre-discovery command lookup is the
+reviewed Nix profile plus the fixed system path; after discovery contributes
+that profile through `GITHUB_PATH`, step mappings carry only the reviewed
+system suffix. The guard rejects any other effective path.
+
+`GRPC_PROXY_EXP` is different from the empty-valued transport fences:
+grpc-java treats even a present-empty value as an active proxy request and
+resolves it to localhost port 80. It must therefore be exactly absent. The
+guard inspects the NUL-framed process environment and rejects both
+present-empty and nonempty forms before Nix setup, after discovery, and at each
+immediate Bazel boundary. The local composite never declares or persists the
+name, so Nix and the Java/gRPC/Bazel consumers receive absence rather than an
+empty record. Fixed-Git source fetching remains inside its separate minimal
+transport fence.
+
+The exact guard is snapshotted before the selected repository consumer. Each
+Bazel leg performs a fresh captured-byte, digest, and authority check
+immediately before its terminal call and receives a new private Bazelisk home,
+empty user home, test temporary root, and Nix/XDG runtime home. The source leg
+uses a distinct private runtime home and enters its development shell with the
+inherited environment cleared, retaining only `HOME` and its eight Nix/XDG
+home selectors. Workspace wrappers, persistent caches and Bazel servers,
+inherited username path components, system/user rc drift, and netrc
+credentials fail closed. This is same-UID authority hygiene, not a filesystem
+sandbox; exact source review remains part of the trust boundary.
+
+The Nix client binds the canonical direct `/nix/store` with `store = local` and
+`allow-symlinked-store = false`. Its exact substituter/key inventory is the
+runner-injected public `main` Attic cache plus `cache.nixos.org`, with
+signatures required. Store, daemon-socket, mirror, HTTP-family proxy,
+certificate, curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
+`GRPC_PROXY_EXP` is absent. Trusted
+substituters, remote builders, build and diff hooks, access tokens, user Nix
+configuration, netrc, flake-config acceptance, secret signing keys, and
+plugins are cleared and verified from effective settings. Ambient `GIT_*`,
+`JUST_*`, `NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` are
+rejected. Bazel cache publication is false for every pull request and tag and
+true only for a trusted push to `main`; remote execution is never selected.
 
 ## 1. Decision
 
@@ -355,7 +460,10 @@ respectively. Each snapshot binds a non-secret, operator-assigned
 host-authority UUID to the resolved root, its device/inode lineage, and typed
 directory records. One authority ID names one physical filesystem namespace
 even when a hostname changes or storage is shared; an independent namespace
-receives a different ID.
+receives a different ID. The serialized non-private-directory count covers
+only those portable descendant directory records. The capture validates the
+root separately as namespace authority; it is not itself a catalog member or
+part of that descendant count.
 
 The scanner holds descriptor authority while traversing, rejects duplicate
 JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
@@ -386,9 +494,10 @@ planning reads bounded exact-`0600` single-link evidence through pinned
 descriptors and publishes into a pinned owner-private directory with an OS
 no-replace rename. It verifies exact staging bytes and single-link custody,
 revalidates inputs plus the requested directory/target after publication, and
-never pathname-deletes on failure. A nonzero result can therefore retain an
-owner-private staging or fail-held final artifact; it is not authority and
-requires attended quarantine.
+never permits stdout as an evidence destination or pathname-deletes on
+failure. A nonzero result can therefore retain an owner-private staging or
+fail-held final artifact; it is not authority and requires attended
+quarantine.
 
 The exact private-state policy lives in
 `.agents/skills/bulkload/references/codex-private-state-policy.v3.json`.
@@ -516,8 +625,11 @@ acceptance remain blockers or separate proof steps.
   GloriousFlywheel wrapper.
 - `justfile.flywheel` and `.bazelrc.flywheel`: generated, endpoint-free
   GloriousFlywheel front-door kit pinned by CI to an immutable core revision.
-- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation; no
-  hosted or dynamic runner fallback.
+- `.github/actions/bulkload-public-read-ci/action.yml`: immutable public action
+  closure with audited, mutually exclusive source/build/test terminal paths.
+- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation with
+  a literal three-gate matrix and exact minimal-environment, no-post Git
+  materialization; no hosted or dynamic runner fallback.
 - `scripts/install-skill.sh`: locked user-scope installation with fail-before-
   mutation destination preflight and no-follow private backup containment.
 - `tests/`: deterministic fixture tests for catalogs, barriers, plans, apply,
