@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
+import inspect
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from bulkload_lib import (
     private_runtime,
     private_state,
 )
+from tests.unprivileged_test_main import run_unittest_main
 
 
 SOURCE_AUTHORITY = "11111111-1111-4111-8111-111111111111"
@@ -564,6 +566,51 @@ class CodexPrivateApplyTest(unittest.TestCase):
         self.assertEqual(waited, pid)
         self.assertTrue(os.WIFEXITED(status))
         self.assertEqual(os.WEXITSTATUS(status), expected)
+
+    def test_mutation_suite_runs_as_an_unprivileged_user(self) -> None:
+        if hasattr(os, "geteuid"):
+            self.assertNotEqual(os.geteuid(), 0)
+
+    def test_production_mutations_refuse_root_before_read_or_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("apply", private_apply.apply_codex_private_install),
+                ("verify", private_apply.verify_codex_private_install),
+                ("rollback", private_apply.rollback_codex_private_install),
+                ("recovery", private_apply.recover_codex_private_mutation),
+            )
+            for operation, function in cases:
+                arguments: list[Path] = []
+                keywords: dict[str, Path] = {}
+                for parameter in inspect.signature(function).parameters.values():
+                    if parameter.default is not inspect.Parameter.empty:
+                        continue
+                    value = root / parameter.name
+                    if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                        arguments.append(value)
+                    elif parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                        keywords[parameter.name] = value
+                    else:
+                        self.fail(
+                            f"unsupported private mutation parameter: {parameter.name}"
+                        )
+                with (
+                    self.subTest(operation=operation),
+                    mock.patch.object(private_apply.os, "geteuid", return_value=0),
+                    mock.patch.object(
+                        private_apply,
+                        "read_codex_private_install_plan",
+                    ) as read_plan,
+                    self.assertRaises(BulkloadError) as raised,
+                ):
+                    function(*arguments, **keywords)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"private Codex {operation} refuses root",
+                )
+                read_plan.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_compiler_round_trip_and_full_apply_verify_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2266,4 +2313,4 @@ class CodexPrivateApplyTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_unittest_main()
