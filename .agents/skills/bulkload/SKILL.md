@@ -27,7 +27,7 @@ every boundary.
 4. Keep credentials and databases outside the generic repository adapter.
    Codex `auth.json` and provider-owned SQLite families are copy-eligible only
    through an explicit typed opt-in plan. Policy v6 retains attended atomic auth
-   replacement and consumes only the exact repaired v5 SQLite action authority.
+   replacement and consumes only the exact accepted-H6 v5 SQLite action authority.
    It may emit a protected non-actionable compose request and a separate volatile caller-capacity observation. Destination SQLite remains exact during auth.
    SQLite composition, reservation, publication, installation, and combined apply remain false. Never log credential values. Any live SQLite WAL, SHM, or
    rollback journal hard-stops immutable capture.
@@ -40,7 +40,7 @@ the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
 [references/codex-private-state-policy.v6.json](references/codex-private-state-policy.v6.json)
-before classifying Codex auth or SQLite. Retain [v5](references/codex-private-state-policy.v5.json) and [v4](references/codex-private-state-policy.v4.json) only as exact legacy producer authority. Use
+before classifying Codex auth or SQLite. Retain [v5](references/codex-private-state-policy.v5.json) only as the exact accepted-H6 producer authority and [v4](references/codex-private-state-policy.v4.json) only as the two exact opening authorities. Use
 [references/codex-private-auth-install.md](references/codex-private-auth-install.md)
 for the attended auth workflow. Read the [v4 SQLite opening contract](references/codex-private-sqlite-compose-plan.md)
 and [v5 close/action-plan contract](references/codex-private-sqlite-compose-action-plan.md) for immutable producer evidence, then the [v6 request/capacity contract](references/codex-private-sqlite-compose-request.md).
@@ -250,10 +250,10 @@ and close artifact by distinct capture ID or body digest as appropriate. Any
 blocker suppresses the complete copy candidate list.
 Codex evidence inputs must be owner-only, single-link regular files; the CLI
 pins them through a create-only atomic publish in an owner-private output
-directory. It verifies exact temporary bytes and single-link custody, uses an
-OS no-replace rename, revalidates every input and the requested
-directory/target immediately after publication, and refuses an existing
-target. It never pathname-deletes on a failure: a nonzero result may leave an
+directory. Stdout is never an evidence destination. It verifies exact temporary
+bytes and single-link custody, uses an OS no-replace rename, revalidates every
+input and the requested directory/target immediately after publication, and
+refuses an existing target. It never pathname-deletes on a failure: a nonzero result may leave an
 owner-private staging or fail-held final artifact for attended quarantine. It
 is a dry-run report: the protocol intentionally has no Codex-session apply
 command. Any future attended copier must recheck the exact source and
@@ -281,7 +281,7 @@ not prove provider authentication. Require a fresh attended provider turn.
 Never infer SQLite authority, compose/install SQLite, or use a combined apply.
 The immutable v4/v5 chain binds private and session A/B evidence, an exact
 registry/path map, fresh cross-plane closes, and a descriptive action plan.
-V6 accepts only the exact repaired v5 producer, reopens the complete chain
+V6 accepts only the exact accepted-H6 v5 producer, reopens the complete chain
 before, during, and after publication, and binds an absent protected workspace.
 Its separate 300-second observation uses caller-available bytes and inodes but reserves nothing. The composer runtime, composer, publisher, installer, and live
 cutover remain absent; both commands return blocked-plan exit `4`.

@@ -51,7 +51,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     },
     "source_digests": {
         "scripts/bulkload_lib/cli.py": (
-            "bc7e73c80d0210f50303bad1df1a9389f9c9e71c47ff390304f8cf48053a0531"
+            "0fd41ba9cf57d53f21e66045c08ff2878d9805332707f69a82943b5ac7c570c7"
         ),
         "scripts/bulkload_lib/private_apply.py": (
             "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
@@ -63,23 +63,23 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "d6d74b8ff4338effd1c30571aa11aa079df1450be43b142187119b700189f080"
         ),
         "scripts/bulkload_lib/private_sqlite_close.py": (
-            "bbfb386deac6658408ee7a799abb0e30321662631ab7c4411d0245d14c6b2956"
+            "8886c3b443747a827e977a784df60c75218d3586d27c9976aa6e77e765565763"
         ),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             "e45dc732fe1a208bbbea1455d25435754d49397d9a0bea471d5bd5265321398c"
         ),
         "scripts/bulkload_lib/private_sqlite_request.py": (
-            "5a8ea96b6b6429ca97224cb75c710b8a2fe57d9752d5e6c11f6dbe0e08f9505e"
+            "01b739dea9e5a45c90e71905a8f430d634247495c268143847501d074fcd85e9"
         ),
         "scripts/bulkload_lib/private_state.py": (
             "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
         ),
         "scripts/bulkload_lib/sessions.py": (
-            "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
+            "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
         ),
     },
     "runtime_source_sha256": (
-        "b221bb77ebd23e58ba2ea0788b35bfe52f7f1c6073b9e5e6fd2a4498daeb3650"
+        "5adfc213cf657d24d3bd8de3ab6b5f9e3d1bf14627045c8526d0b32241f460f5"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
@@ -148,7 +148,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "capacity_observation_implemented": True,
             "workspace_reservation_implemented": False,
             "sqlite_compose_plan_implemented": False,
-            "sqlite_compose_request_scope": "exact-repaired-v5-input-only",
+            "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
             "post_plan_close_implemented": True,
             "wal_aware_capture": False,
         },

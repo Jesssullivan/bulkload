@@ -269,7 +269,7 @@ STATE_CLASSES = {
         "capacity_observation_implemented": True,
         "workspace_reservation_implemented": False,
         "sqlite_compose_plan_implemented": False,
-        "sqlite_compose_request_scope": "exact-repaired-v5-input-only",
+        "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
         "post_plan_close_implemented": True,
         "wal_aware_capture": False,
     },

@@ -589,7 +589,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
     def test_v5_close_recomputes_the_complete_real_v4_opening(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             legacy_runtime = deepcopy(
-                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+                private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
             )
             plan, evidence = self.compile_fixture(
                 Path(directory),
@@ -623,6 +623,24 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                 plan["plan_sha256"],
             )
             self.assertEqual(request["runtime_authority"], evidence["runtime"])
+
+    def test_both_exact_v4_runtime_origins_validate_as_opening_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan, _ = self.compile_fixture(Path(directory))
+            for authority in (
+                private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+                private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+            ):
+                with self.subTest(policy_sha256=authority["policy_sha256"]):
+                    opening = json.loads(json.dumps(plan))
+                    opening["runtime_authority"] = json.loads(json.dumps(authority))
+                    opening["plan_sha256"] = object_digest(
+                        opening,
+                        "plan_sha256",
+                    )
+                    validate_codex_private_sqlite_compose_plan(opening)
 
     def test_tampered_registry_and_path_map_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -24,7 +24,7 @@ IDs, shell snapshots, and active rollouts out of generic copying. Handle auth
 and SQLite only through the exact policy in
 `codex-private-state-policy.v6.json`. Policy v6 retains the narrow, attended
 typed auth install while preserving destination SQLite exactly. It consumes
-only the exact repaired v5 action-plan producer authority and may compile a
+only the exact accepted-H6 v5 action-plan producer authority and may compile a
 host-bound, non-actionable compose request plus a separate short-lived
 caller-capacity observation after reopening the complete v4-to-v5 chain before
 and after publication. It does not implement a composer, reservation,
@@ -126,7 +126,7 @@ capturing or installing auth.
   counts, semantic digests, and a descriptive operation graph for families
   whose schema and migration state are already exact. Registered-prefix skew
   remains blocked because no pinned migration adapter executes in this slice.
-  V6 accepts only the exact repaired v5 producer closure, pins an absent
+  V6 accepts only the exact accepted-H6 v5 producer closure, pins an absent
   owner-private workspace, derives a conservative capacity requirement, and
   records caller-available capacity separately. SQLite compose/reservation/
   publish/install, combined apply, provider acceptance, and cutover remain

@@ -13,7 +13,7 @@
 | Agent transcripts | path, mode, size, prefix/hash, open/closed | destination-absent or proof-bound superset plan | JSONL validity, mode, exact hash or record-boundary prefix | opt in |
 | Agent indexes/caches | metadata only | regenerate | destination application rebuild | exclude |
 | Codex auth | existence, owner/mode, exact digest/size/identity; never values | policy v6 attended atomic replace with external backup and journal | fresh offline capture, rollback evidence, then a fresh attended provider turn | opt in; typed auth install |
-| Codex SQLite families | effective authority, complete family inventory, structured schema/migration/table/path facts, absent WAL/SHM/journal sidecars | retain immutable v4/v5 opening/close/action evidence; under v6, bind an absent protected workspace and separate volatile caller-capacity observation; preserve destination exact during auth; no composer/reservation/publish/install | exact repaired-v5 producer binding; complete chain recomputation; descriptor/mount/lineage proof; later independent composition, picker, and resume acceptance | opt in; request/observation only |
+| Codex SQLite families | effective authority, complete family inventory, structured schema/migration/table/path facts, absent WAL/SHM/journal sidecars | retain immutable v4/v5 opening/close/action evidence; under v6, bind an absent protected workspace and separate volatile caller-capacity observation; preserve destination exact during auth; no composer/reservation/publish/install | exact accepted-H6 v5 producer binding; complete chain recomputation; descriptor/mount/lineage proof; later independent composition, picker, and resume acceptance | opt in; request/observation only |
 
 ## Required proofs
 
@@ -80,7 +80,7 @@ already exact. Registered-prefix skew emits
 values, output/workspace authority, capacity proof, composer runtime, or
 receipt contract and authorizes no composer or live-root mutation.
 
-The v6 compose request accepts only the exact repaired v5 producer policy and
+The v6 compose request accepts only the exact accepted-H6 v5 producer policy and
 runtime closure. It separately binds the active v6 consumer runtime, an
 existing descriptor-pinned `0700` workspace parent, an absent
 action-digest-derived final leaf, an empty randomized-staging namespace, every
@@ -116,7 +116,7 @@ Stop before application when any of these is true:
   adapter or other schema-skew execution, lacks exact expected output
   counts/digests, or is presented as composer, publisher, installer, session,
   or cutover authority;
-- a v6 request is not backed by the exact repaired v5 producer closure, uses a
+- a v6 request is not backed by the exact accepted-H6 v5 producer closure, uses a
   non-v6 consumer runtime, omits any v4-to-v5 recomputation input, proposes a
   workspace that is not an existing exact-`0700` owner directory, overlaps a
   protected namespace, finds an occupied final/staging name, overflows its
@@ -163,8 +163,8 @@ Bulkload v1 proves integrity and scoped parity, not authenticity, global
 filesystem atomicity, credential correctness, or a live TCFS promotion. The
 Codex private-state adapter produces owner-private auth and immutable SQLite
 evidence plus a compatibility plan. Policy v6 retains typed auth replacement
-while preserving destination SQLite exact and consumes the immutable repaired
-v5 close/action chain for a protected request plus volatile capacity
+while preserving destination SQLite exact and consumes the immutable
+accepted-H6 v5 close/action chain for a protected request plus volatile capacity
 observation. It has no SQLite composer, reservation, publisher, installer,
 combined apply, activation, or cutover. Offline receipts deliberately record
 `provider_runtime_acceptance_verified=false`; working auth requires a fresh

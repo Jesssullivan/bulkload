@@ -31,17 +31,17 @@ establish its own write/reservation authority immediately before work.
 
 ## Immutable producer and current consumer
 
-The request accepts only an action plan produced by the exact repaired v5
+The request accepts only an action plan produced by the exact accepted-H6 v5
 closure:
 
 - source commit:
-  `3daf764660f45c0d1e71383f1269237a0cfe991b`;
+  `4d949a846690b265b0bf775ec81ff4b9e5a52ddc`;
 - policy schema:
   `dev.tinyland.bulkload.codex-private-state-policy.v5`;
 - policy SHA-256:
-  `13fa05eecb0eefb2f697735a4ad7351834695e26a7dd0a910be2e87b035ca82d`;
+  `78318633ef06ca12d6dc7e72199c07dc6f5cfdf0e9cf13bc5bd3f3e7c2ddbcf0`;
 - runtime closure SHA-256:
-  `8193d692be87174c6618450fa84cd44a0755661f2cf50cab791e50725dabcad7`;
+  `cc9f96adb8189e0a41133244231edf51dd837fa75459728355b93eeb981c7392`;
   and
 - the exact eight-file v5 source-digest inventory embedded in that policy.
 

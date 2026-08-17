@@ -130,7 +130,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         self.opening_relation = self._classify(include_expected_output=False)
         self.captures = self._captures()
         self.runtime_authority = deepcopy(
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+            private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
         )
         self.opening_plan = self._opening_plan()
         self.close_request = self._close_request(self.opening_plan)
@@ -829,11 +829,14 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(BulkloadError, "operation is unsafe"):
             validate_codex_private_sqlite_action_plan(tampered)
 
-    def test_action_plan_rejects_legacy_v4_runtime_authority(self) -> None:
-        with self.assertRaisesRegex(BulkloadError, "requires policy v5"):
-            self._compile(
-                runtime_authority=private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4
-            )
+    def test_action_plan_rejects_both_legacy_v4_runtime_authorities(self) -> None:
+        for authority in (
+            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+        ):
+            with self.subTest(policy_sha256=authority["policy_sha256"]):
+                with self.assertRaisesRegex(BulkloadError, "requires policy v5"):
+                    self._compile(runtime_authority=authority)
 
     def test_against_close_recomputes_exact_table_semantics(self) -> None:
         plan = self._compile()
@@ -1141,7 +1144,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         documents = {
             "action_plan": {
                 "runtime_authority": deepcopy(
-                    private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED
+                    private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5
                 )
             },
             "opening_plan": {
@@ -1150,7 +1153,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(
             BulkloadError,
-            "exact reviewed legacy v4/v5 producer authority",
+            "exact reviewed v4 or accepted-H6 v5 producer authority",
         ):
             _revalidate_sqlite_action_chain(documents, {}, {})
 
@@ -1344,7 +1347,7 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             request["action_plan_producer_runtime_authority"],
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED,
+            private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5,
         )
         self.assertNotEqual(
             request["action_plan_producer_runtime_authority"],
@@ -1421,7 +1424,8 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         action = self._compile()
         for authority in (
             private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED,
+            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+            private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5,
         ):
             with self.subTest(policy_schema=authority["policy_schema"]):
                 with self.assertRaisesRegex(

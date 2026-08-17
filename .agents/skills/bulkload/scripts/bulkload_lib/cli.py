@@ -317,7 +317,12 @@ def _rename_codex_output_noreplace(
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     if sys.platform == "darwin":
-        rename = libc.renameatx_np
+        try:
+            rename = libc.renameatx_np
+        except AttributeError as error:
+            raise BulkloadError(
+                "atomic no-replace evidence publication is unavailable"
+            ) from error
         rename.argtypes = (
             ctypes.c_int,
             ctypes.c_char_p,
@@ -381,8 +386,10 @@ def _write_pinned_codex_json(
     pinned_output_parent: (tuple[Path, int, tuple[int, int, int, int]] | None) = None,
 ) -> None:
     if output == "-":
-        sys.stdout.buffer.write(canonical_bytes(value) + b"\n")
-        return
+        raise BulkloadError(
+            "Codex evidence output must be an owner-private file; "
+            "stdout publication is forbidden"
+        )
     requested_input = Path(output).expanduser()
     if ".." in requested_input.parts:
         raise BulkloadError("Codex evidence output contains parent traversal")
@@ -771,6 +778,7 @@ def _codex_capture(arguments: argparse.Namespace) -> int:
         max_errors=arguments.max_errors,
         max_output_bytes=arguments.max_output_bytes,
     )
+    validate_codex_session_snapshot(snapshot)
     _write_pinned_codex_json(
         arguments.output,
         snapshot,
@@ -2091,15 +2099,16 @@ def _revalidate_sqlite_action_chain(
     opening_runtime = opening_plan["runtime_authority"]
     if opening_runtime not in (
         private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
-        private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED,
+        private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+        private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5,
     ):
         raise BulkloadError(
-            "private SQLite opening requires an exact reviewed legacy "
-            "v4/v5 producer authority"
+            "private SQLite opening requires one exact reviewed v4 or "
+            "accepted-H6 v5 producer authority"
         )
-    if producer_runtime != private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V5_REPAIRED:
+    if producer_runtime != private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5:
         raise BulkloadError(
-            "private SQLite action chain requires the exact repaired v5 "
+            "private SQLite action chain requires the exact accepted-H6 v5 "
             "producer authority"
         )
     validate_codex_private_sqlite_close_request_against_inputs(
