@@ -1,5 +1,10 @@
 # Codex private SQLite compose request and capacity observation v6
 
+> Historical exact producer contract. Active policy v7 retains these artifacts
+> only as validator-bound legacy evidence and registers neither producer
+> command. The command examples below require the exact reviewed v6 checkout;
+> they are not available from the active v7 CLI.
+
 ## Status and authority boundary
 
 Policy v6 consumes one exact, complete v5 SQLite action plan and emits two
@@ -63,9 +68,11 @@ production; never make a v6-bound opening that no exact-v5 close can consume.
 
 ## Required evidence chain
 
-Keep every input `0600`, current-user, single-link, and non-symlink in an exact
-`0700` evidence directory outside live state and the proposed workspace. Pass
-the complete original chain:
+Keep every input `0600`, same-UID, single-link, and non-symlink in an exact
+`0700` evidence directory outside live state and the proposed workspace. The
+frozen v6 validator compares every private owner UID to the process UID, so
+cross-UID validation is unsupported even when filesystem ACLs would permit the
+read. Pass the complete original chain:
 
 - v5 action plan and exact accepted digest;
 - v4 opening plan;
@@ -87,8 +94,8 @@ before create-only publication, and after publication. A persisted
 ## Workspace contract
 
 Create the workspace parent before the request. It must be an existing,
-current-user directory with exact mode `0700`. The request command does not
-create it.
+same-UID directory with exact mode `0700`. The request command does not create
+it.
 
 The command opens every absolute path component with no-follow directory
 descriptors, binds the parent identity, mount identity, and full directory
@@ -133,79 +140,20 @@ Overflow, a missing expected-output record, an incomplete action plan, any
 action-plan blocker, or zero families fails closed. This is a conservative
 preflight bound, not an allocation.
 
-## Compile the request
+## Historical producer provenance
 
-Use `umask 077`. Review the exact v5 action-plan digest and substitute only
-reviewed absolute paths:
+The request and capacity producers exist only at reviewed v6 commit
+`7bd06a05f7a4710e42fac6be08b477b801493c95`. Active v7 deliberately removes
+their CLI handlers, writer helpers, workspace mutator, and public constructor
+functions. This document records the frozen artifact semantics for validation;
+it is not an operator recipe for minting new v6 evidence.
 
-```bash
-python3 scripts/bulkload.py codex-private-sqlite-compose-request \
-  --action-plan /secure/evidence/sqlite-action-v5.json \
-  --accept-action-plan ACTION_PLAN_SHA256 \
-  --opening-plan /secure/evidence/sqlite-opening-v4.json \
-  --close-request /secure/evidence/sqlite-close-request-v5.json \
-  --opening-compatibility-plan /secure/evidence/private-opening-plan.json \
-  --opening-source-a-bundle /secure/evidence/opening-source-a \
-  --opening-source-b-bundle /secure/evidence/opening-source-b \
-  --opening-destination-a-bundle /secure/evidence/opening-destination-a \
-  --opening-destination-b-bundle /secure/evidence/opening-destination-b \
-  --opening-adapter-registry /secure/evidence/sqlite-adapters.json \
-  --opening-path-map /secure/evidence/sqlite-path-map.json \
-  --opening-session-union-plan /secure/evidence/session-union.json \
-  --opening-session-source-a /secure/evidence/session-opening-source-a.json \
-  --opening-session-source-b /secure/evidence/session-opening-source-b.json \
-  --opening-session-destination-a /secure/evidence/session-opening-destination-a.json \
-  --opening-session-destination-b /secure/evidence/session-opening-destination-b.json \
-  --source-close-a-bundle /secure/evidence/closing-source-a \
-  --source-close-b-bundle /secure/evidence/closing-source-b \
-  --destination-close-a-bundle /secure/evidence/closing-destination-a \
-  --destination-close-b-bundle /secure/evidence/closing-destination-b \
-  --session-source-close-a /secure/evidence/session-closing-source-a.json \
-  --session-source-close-b /secure/evidence/session-closing-source-b.json \
-  --session-destination-close-a /secure/evidence/session-closing-destination-a.json \
-  --session-destination-close-b /secure/evidence/session-closing-destination-b.json \
-  --workspace-parent /secure/sqlite-compose-workspace \
-  --output /secure/evidence/sqlite-compose-request-v6.json
-```
-
-When the accepted session-union plan contains prefix or close evidence, pass
-the matching optional `--opening-session-*-prefix-*` and
-`--opening-session-*-close-*` arguments too. Omitting required evidence blocks
-the complete-chain recomputation.
-
-Exit `4` is expected. Review the exact request digest, both runtime
-authorities, action binding, workspace identity and protected namespaces,
-capacity derivation, and every false authority/readiness claim. Do not treat
-the artifact as permission to create the proposed leaf.
-
-## Observe caller-available capacity
-
-The observation command takes the same complete action chain and workspace.
-Its output must share the request's evidence parent. Supply a stable,
-non-secret canonical UUID for the physical host/filesystem authority:
-
-```bash
-python3 scripts/bulkload.py codex-private-sqlite-capacity-observe \
-  [THE SAME COMPLETE ACTION-CHAIN ARGUMENTS] \
-  --request /secure/evidence/sqlite-compose-request-v6.json \
-  --accept-request REQUEST_SHA256 \
-  --workspace-parent /secure/sqlite-compose-workspace \
-  --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --output /secure/evidence/sqlite-capacity-v6.json
-```
-
-The command uses descriptor-relative `fstatvfs` on the pinned workspace and
-records `f_bavail * f_frsize` plus `f_favail`. It deliberately does not use
-privileged `f_bfree`. Checked overflow, insufficient caller-available bytes or
-inodes, target/staging occupation, path or mount drift, runtime drift, or any
-input-chain drift blocks publication. It repeats the complete chain,
-workspace, and sufficiency checks before and after create-only publication.
-
-Exit `4` is expected for a successfully written observation. Review
-`created_at`, `expires_at`, request/body digests, host authority, runtime,
-workspace, requirement, filesystem values, and the invariant false claims.
-After expiry, capacity change, workspace change, or any input/runtime change,
-discard the observation and create a fresh one.
+V7 accepts an existing artifact only after structural validation and exact
+relational binding to its v5 action plan, v6 runtime authority, workspace,
+capacity requirement, and request digest. Self-redigested drift remains
+invalid. A new producer requires a later policy version and a separately
+reviewed transaction; do not recover the historical commands by copying them
+from Git history into the active runtime.
 
 ## Fail-held outputs
 

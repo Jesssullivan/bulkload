@@ -6,9 +6,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.dont_write_bytecode = True
+
+CONCURRENT_INSTALL_TIMEOUT_SECONDS = 180
 
 
 def find_workspace() -> Path:
@@ -82,10 +85,17 @@ class InstallerTest(unittest.TestCase):
             canonical = home / ".agents/skills/bulkload"
             claude = home / ".claude/skills/bulkload"
             self.assertTrue((canonical / "SKILL.md").is_file())
+            for relative in (
+                "references/codex-private-state-policy.v7.json",
+                "references/codex-private-sqlite-offline-composer.md",
+                "scripts/bulkload_lib/private_sqlite_protocol.py",
+                "scripts/bulkload_lib/private_sqlite_verifier.py",
+            ):
+                self.assertTrue((canonical / relative).is_file(), relative)
             self.assertTrue(claude.is_symlink())
             self.assertEqual(claude.resolve(), canonical.resolve())
             runtime = subprocess.run(
-                [sys.executable, str(canonical / "scripts/bulkload.py"), "--version"],
+                [str(canonical / "scripts/bulkload.py"), "--version"],
                 env=environment,
                 check=False,
                 text=True,
@@ -137,7 +147,27 @@ class InstallerTest(unittest.TestCase):
                 )
                 for _ in range(8)
             ]
-            results = [process.communicate(timeout=30) for process in processes]
+            deadline = time.monotonic() + CONCURRENT_INSTALL_TIMEOUT_SECONDS
+            results = []
+            try:
+                for process in processes:
+                    results.append(
+                        process.communicate(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                    )
+            finally:
+                unfinished = [
+                    process for process in processes if process.poll() is None
+                ]
+                for process in unfinished:
+                    process.terminate()
+                for process in unfinished:
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
             self.assertEqual(
                 [process.returncode for process in processes], [0] * 8, results
             )

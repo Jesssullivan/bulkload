@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Self-contained bulkload command entrypoint with pre-import runtime pinning."""
 
 # ruff: noqa: E402
@@ -14,6 +14,20 @@ import sys as _bootstrap_sys
 
 _BULKLOAD_PINNED_BOOTSTRAP = globals().get("_BULKLOAD_PINNED_BOOTSTRAP")
 if __name__ == "__main__" and _BULKLOAD_PINNED_BOOTSTRAP is None:
+    if not all(
+        (
+            _bootstrap_sys.flags.isolated,
+            _bootstrap_sys.flags.no_site,
+            _bootstrap_sys.flags.no_user_site,
+            _bootstrap_sys.flags.ignore_environment,
+            _bootstrap_sys.flags.safe_path,
+        )
+    ):
+        _bootstrap_sys.stderr.write(
+            "error: execute scripts/bulkload.py directly; the supported launcher "
+            "requires Python -I -S before startup hooks\n"
+        )
+        raise SystemExit(78)
     _bootstrap_maximum = 16 * 1024 * 1024
     _bootstrap_entry_before = _bootstrap_posix.lstat(__file__)
 
@@ -154,6 +168,7 @@ if __name__ == "__main__" and _BULKLOAD_PINNED_BOOTSTRAP is None:
             [
                 _bootstrap_sys.executable,
                 "-I",
+                "-S",
                 "-c",
                 _bootstrap_stub,
                 str(_bootstrap_descriptor),
@@ -180,21 +195,30 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-POLICY_NAME = "codex-private-state-policy.v6.json"
-POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v6"
+POLICY_NAME = "codex-private-state-policy.v7.json"
+POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v7"
 RUNTIME_SCHEMA = "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
-IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-request-v6"
+IMPLEMENTATION = "auth-atomic-replace-sqlite-verifier-oracle-v7"
 MAX_POLICY_BYTES = 1024 * 1024
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
-CORE_SOURCE_KEYS = {
+RUNTIME_SOURCE_KEYS = {
+    "scripts/bulkload.py",
+    "scripts/bulkload_lib/__init__.py",
     "scripts/bulkload_lib/cli.py",
+    "scripts/bulkload_lib/executor.py",
+    "scripts/bulkload_lib/model.py",
+    "scripts/bulkload_lib/planner.py",
     "scripts/bulkload_lib/private_apply.py",
     "scripts/bulkload_lib/private_quiescence.py",
+    "scripts/bulkload_lib/private_runtime.py",
     "scripts/bulkload_lib/private_sqlite_action_plan.py",
     "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
+    "scripts/bulkload_lib/private_sqlite_protocol.py",
     "scripts/bulkload_lib/private_sqlite_request.py",
+    "scripts/bulkload_lib/private_sqlite_verifier.py",
     "scripts/bulkload_lib/private_state.py",
+    "scripts/bulkload_lib/scanner.py",
     "scripts/bulkload_lib/sessions.py",
 }
 ALLOWED_CODEX_COMMANDS = [
@@ -212,13 +236,18 @@ ALLOWED_CODEX_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
-    "codex-private-sqlite-capacity-observe",
-    "codex-private-sqlite-compose-request",
     "codex-private-verify",
 ]
 FORBIDDEN_COMMANDS = [
     "codex-private-combined-apply",
+    "codex-private-sqlite-capacity-observe",
     "codex-private-sqlite-compose",
+    "codex-private-sqlite-compose-request",
+    "codex-private-sqlite-install",
+    "codex-private-sqlite-oracle",
+    "codex-private-sqlite-publish",
+    "codex-private-sqlite-verifier-oracle",
+    "codex-private-sqlite-verify",
     "codex-state-apply",
 ]
 STATE_CLASSES = {
@@ -265,12 +294,15 @@ STATE_CLASSES = {
         "legacy_sqlite_opening_validator_implemented": True,
         "legacy_sqlite_close_action_validator_implemented": True,
         "sqlite_compose_action_plan_implemented": False,
-        "sqlite_compose_request_implemented": True,
-        "capacity_observation_implemented": True,
+        "sqlite_compose_request_implemented": False,
+        "capacity_observation_implemented": False,
+        "sqlite_verifier_oracle_internal_only": True,
+        "independent_verification_receipt_implemented": False,
+        "offline_bundle_writer_implemented": False,
         "workspace_reservation_implemented": False,
         "sqlite_compose_plan_implemented": False,
-        "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
-        "post_plan_close_implemented": True,
+        "sqlite_compose_request_scope": "frozen-v6-validator-only",
+        "post_plan_close_implemented": False,
         "wal_aware_capture": False,
     },
 }
@@ -590,9 +622,11 @@ def _validate_policy(
         != {
             "auth_install": True,
             "sqlite_compose_action_plan": False,
-            "sqlite_compose_request": True,
-            "sqlite_capacity_observation": True,
+            "sqlite_compose_request": False,
+            "sqlite_capacity_observation": False,
             "sqlite_compose_plan": False,
+            "sqlite_verifier_oracle_internal_only": True,
+            "sqlite_independent_verification": False,
             "sqlite_compose": False,
             "sqlite_publish": False,
             "combined": False,
@@ -603,7 +637,11 @@ def _validate_policy(
     ):
         raise BootstrapError("private-state policy semantics differ")
     source_digests = policy["source_digests"]
-    if not isinstance(source_digests, dict) or set(source_digests) != CORE_SOURCE_KEYS:
+    if (
+        not isinstance(source_digests, dict)
+        or set(source_digests) != RUNTIME_SOURCE_KEYS
+        or set(runtime_payloads) != RUNTIME_SOURCE_KEYS
+    ):
         raise BootstrapError("private-state policy source inventory differs")
     for relative, expected in source_digests.items():
         if (

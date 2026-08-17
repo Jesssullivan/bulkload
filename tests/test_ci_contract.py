@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -24,8 +25,8 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "fcfd0fd05eb41074e4a6c186939cfb156036ed6b1c2b06cdbe8717a2200129ce"
-GUARD_SHA256 = "327efcc005bd009f22177479e0ceaaf8158c163a00d6cf168bb412dcb3755336"
+ACTION_SHA256 = "fa92c9535479ab91f7184bddc14e74d6d0e60ea013a140ffd1cf5e65c3c65a5f"
+GUARD_SHA256 = "50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11"
 SOURCE_GATE_STEP_SHA256 = (
     "96893435532ebb5d5e4b53e813e2069a28c8c23303a70c1bb9b1a9fb4071bdf2"
 )
@@ -34,7 +35,10 @@ EFFECTIVE_NIX_STEP_SHA256 = (
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
-    "ade9e1559ddff673288f3a5029874b0daebf7927a56a26e7b956ff1804a90697"
+    "15aa8306cc530bbc4d143dd7a6a2f0cfd3efbed19c01503d35bbec0c5e7cd357"
+)
+BOOTSTRAP_IMPL_LINE = (
+    "common --@rules_python//python/config_settings:bootstrap_impl=script"
 )
 BAZEL_VERSION_SHA256 = (
     "4fa9948d0ae7007cbd1cc05768bc3e7cc6ec46ad0ea84c87df79e7a0c48d76b4"
@@ -1724,6 +1728,21 @@ def validate_bazelrc(
         raise ContractError("workspace bazelrc bytes drifted")
     if exact_digest and sha256(flywheel_bazelrc) != BAZELRC_SHA256:
         raise ContractError("vendored ci-templates bazelrc bytes drifted")
+    workspace_bootstrap = [
+        line
+        for line in workspace_bazelrc.splitlines()
+        if "bootstrap_impl" in line.casefold()
+    ]
+    if workspace_bootstrap != [BOOTSTRAP_IMPL_LINE]:
+        raise ContractError(
+            "workspace bazelrc must select the exact rules_python script bootstrap"
+        )
+    if any(
+        "bootstrap_impl" in line.casefold() for line in flywheel_bazelrc.splitlines()
+    ):
+        raise ContractError(
+            "vendored bazelrc must not override the workspace Python bootstrap"
+        )
     if workspace_bazelrc.count("try-import %workspace%/.bazelrc.flywheel") != 1:
         raise ContractError(
             "workspace bazelrc must import one reviewed Flywheel profile"
@@ -1774,6 +1793,60 @@ def validate_bazelrc(
             )
     if "common:flywheel --remote_upload_local_results=false" not in flywheel_bazelrc:
         raise ContractError("vendored bazelrc lost the read-only default")
+
+
+def validate_bulkload_bootstrap_build(build: str) -> None:
+    try:
+        tree = ast.parse(build)
+    except SyntaxError as error:
+        raise ContractError("BUILD source is not statically parseable") from error
+    candidates: list[ast.Call] = []
+    for statement in tree.body:
+        if (
+            not isinstance(statement, ast.Expr)
+            or not isinstance(statement.value, ast.Call)
+            or not isinstance(statement.value.func, ast.Name)
+            or statement.value.func.id != "py_binary"
+        ):
+            continue
+        if any(
+            keyword.arg == "name"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "bulkload"
+            for keyword in statement.value.keywords
+        ):
+            candidates.append(statement.value)
+    if len(candidates) != 1:
+        raise ContractError("BUILD must contain one direct bulkload py_binary")
+    candidate = candidates[0]
+    if candidate.args or any(keyword.arg is None for keyword in candidate.keywords):
+        raise ContractError("bulkload py_binary arguments must be explicit keywords")
+    keywords = [keyword.arg for keyword in candidate.keywords]
+    if len(keywords) != len(set(keywords)):
+        raise ContractError("bulkload py_binary keywords must be unique")
+    name_values = [
+        keyword.value for keyword in candidate.keywords if keyword.arg == "name"
+    ]
+    interpreter_values = [
+        keyword.value
+        for keyword in candidate.keywords
+        if keyword.arg == "interpreter_args"
+    ]
+    if (
+        len(name_values) != 1
+        or not isinstance(name_values[0], ast.Constant)
+        or name_values[0].value != "bulkload"
+        or len(interpreter_values) != 1
+        or not isinstance(interpreter_values[0], (ast.List, ast.Tuple))
+        or [
+            item.value if isinstance(item, ast.Constant) else None
+            for item in interpreter_values[0].elts
+        ]
+        != ["-I", "-S"]
+    ):
+        raise ContractError(
+            "bulkload py_binary must use literal interpreter_args [-I, -S]"
+        )
 
 
 def validate_flake_topology(
@@ -1867,6 +1940,7 @@ class CiContractTest(unittest.TestCase):
         cls.guard = (cls.root / GUARD_PATH).read_text(encoding="utf-8")
         cls.workspace_bazelrc = (cls.root / ".bazelrc").read_text(encoding="utf-8")
         cls.bazelrc = (cls.root / ".bazelrc.flywheel").read_text(encoding="utf-8")
+        cls.build = (cls.root / "BUILD.bazel").read_text(encoding="utf-8")
         cls.flake = (cls.root / "flake.nix").read_text(encoding="utf-8")
         cls.flake_lock = (cls.root / "flake.lock").read_text(encoding="utf-8")
         cls.bazel_version = (cls.root / ".bazelversion").read_text(encoding="utf-8")
@@ -1876,6 +1950,7 @@ class CiContractTest(unittest.TestCase):
         validate_local_action(self.action)
         validate_guard(self.guard)
         validate_bazelrc(self.workspace_bazelrc, self.bazelrc)
+        validate_bulkload_bootstrap_build(self.build)
         validate_flake_topology(self.flake, self.flake_lock)
         self.assertEqual(sha256(self.bazel_version), BAZEL_VERSION_SHA256)
         mode = (self.root / GUARD_PATH).stat().st_mode
@@ -3096,6 +3171,20 @@ class CiContractTest(unittest.TestCase):
 
     def test_bazelrc_authority_mutations_fail_closed(self) -> None:
         workspace_variants = (
+            self.workspace_bazelrc.replace(f"{BOOTSTRAP_IMPL_LINE}\n", "", 1),
+            self.workspace_bazelrc.replace(
+                BOOTSTRAP_IMPL_LINE,
+                BOOTSTRAP_IMPL_LINE.replace("script", "system_python"),
+                1,
+            ),
+            self.workspace_bazelrc.replace(
+                BOOTSTRAP_IMPL_LINE,
+                BOOTSTRAP_IMPL_LINE.replace("common ", "build ", 1),
+                1,
+            ),
+            self.workspace_bazelrc + f"\n{BOOTSTRAP_IMPL_LINE}\n",
+            self.workspace_bazelrc + "\ncommon --@rules_python//python/config_settings:"
+            "bootstrap_impl=system_python\n",
             self.workspace_bazelrc + "\ncommon --remote_executor=grpc://exec.invalid\n",
             self.workspace_bazelrc + "\ncommon --remote_header=x-auth=secret\n",
             self.workspace_bazelrc + "\ncommon --credential_helper=/tmp/helper\n",
@@ -3108,6 +3197,8 @@ class CiContractTest(unittest.TestCase):
                 validate_bazelrc(workspace, self.bazelrc, exact_digest=False)
 
         flywheel_variants = (
+            self.bazelrc + "\ncommon:flywheel --@rules_python//python/config_settings:"
+            "bootstrap_impl=system_python\n",
             self.bazelrc + "\ncommon:flywheel --remote_cache=https://cache.invalid\n",
             self.bazelrc + "\ncommon:flywheel --remote_cache_header=x-auth=secret\n",
             self.bazelrc + "\ncommon:flywheel --credential_helper=/tmp/helper\n",
@@ -3116,6 +3207,36 @@ class CiContractTest(unittest.TestCase):
         for flywheel in flywheel_variants:
             with self.assertRaises(ContractError):
                 validate_bazelrc(self.workspace_bazelrc, flywheel, exact_digest=False)
+
+    def test_bulkload_bootstrap_build_mutations_fail_closed(self) -> None:
+        literal_block = '    interpreter_args = [\n        "-I",\n        "-S",\n    ],'
+        build_variants = (
+            self.build.replace('        "-I",\n', "", 1),
+            self.build.replace('        "-S",\n', "", 1),
+            self.build.replace(
+                literal_block,
+                '    interpreter_args = [\n        "-S",\n        "-I",\n    ],',
+                1,
+            ),
+            self.build.replace(
+                literal_block,
+                "    interpreter_args = [\n"
+                '        "-I",\n'
+                '        "-S",\n'
+                '        "-E",\n'
+                "    ],",
+                1,
+            ),
+            self.build.replace(
+                literal_block,
+                "    interpreter_args = BOOTSTRAP_ARGS,",
+                1,
+            ),
+        )
+        for build in build_variants:
+            self.assertNotEqual(build, self.build)
+            with self.assertRaises(ContractError):
+                validate_bulkload_bootstrap_build(build)
 
     def test_flake_private_source_mutations_fail_closed(self) -> None:
         flake_variants = (

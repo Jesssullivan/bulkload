@@ -1,18 +1,19 @@
 # Codex private auth install
 
-This runbook covers policy v6's only private-state mutation: an attended,
+This runbook covers policy v7's only private-state mutation: an attended,
 typed replacement of an existing destination `CODEX_HOME/auth.json`.
 
 It does not authorize SQLite union, composition, installation, combined
 auth-plus-SQLite apply, Codex activation, deployment, or TCFS runtime work. A
-v5 SQLite close/action evidence and a v6 compose request or capacity
-observation are separate evidence and grant none of those authorities.
+v5 SQLite close/action evidence, frozen v6 request/capacity evidence, and a v7
+oracle report are separate evidence and grant none of those authorities.
 
 ## Exact boundary
 
-Read `codex-private-state-policy.v6.json` before proceeding. Retain any
-accepted v4 SQLite opening as immutable legacy evidence; do not reinterpret it
-as an install plan or consume it in this auth workflow.
+Read `codex-private-state-policy.v7.json` before proceeding. Retain accepted
+v4/v5/v6 SQLite artifacts as immutable legacy evidence; do not reinterpret
+them or a v7 diagnostic oracle report as an install plan or consume them in
+this auth workflow.
 
 - Preferred inputs: source selects `auth`; destination selects `auth` and
   `sqlite`.
@@ -39,11 +40,14 @@ as an install plan or consume it in this auth workflow.
   They deliberately record `provider_runtime_acceptance_verified=false`.
   A fresh attended provider turn is required before claiming working auth.
 
-Use the reviewed `scripts/bulkload.py` entrypoint or its Bazel-built
-equivalent. The entrypoint pins policy v6 and the complete Python runtime
-source inventory before importing command code. Compatibility and install
-plans bind that runtime authority; every later private operation revalidates
-it. Do not import and call the implementation modules directly.
+Execute the reviewed `scripts/bulkload.py` entrypoint directly or use its
+Bazel-built equivalent. Both supported launchers enter Python with `-I -S`
+before Python startup hooks. The entrypoint then pins policy v7 and the
+complete Bulkload application-source inventory before importing command code.
+Compatibility and install plans bind that application authority; every later
+private operation revalidates it. This does not bind the Python interpreter or
+standard-library closure. Do not import and call the implementation modules
+directly.
 
 ## Custody and path setup
 
@@ -75,7 +79,7 @@ only after reviewing the corresponding immutable artifact.
 Create the procedural capture attestation:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/source/codex-home \
   --output /secure/evidence/source-capture-quiescence.json \
   --operation-output /secure/evidence/source-private \
@@ -90,7 +94,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 Then capture with the reviewed attestation digest:
 
 ```bash
-python3 scripts/bulkload.py codex-private-capture \
+scripts/bulkload.py codex-private-capture \
   --codex-home /absolute/source/codex-home \
   --output-directory /secure/evidence/source-private \
   --role source \
@@ -117,7 +121,7 @@ the check.
 Create a destination capture attestation:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/destination-capture-quiescence.json \
@@ -134,7 +138,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 Capture the complete destination state set:
 
 ```bash
-python3 scripts/bulkload.py codex-private-capture \
+scripts/bulkload.py codex-private-capture \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output-directory /secure/evidence/destination-private \
@@ -158,7 +162,7 @@ complete live namespace. It never copies WAL/SHM/journal companions.
 Create the compatibility dossier:
 
 ```bash
-python3 scripts/bulkload.py codex-private-plan \
+scripts/bulkload.py codex-private-plan \
   --source-bundle /secure/evidence/source-private \
   --destination-bundle /secure/evidence/destination-private \
   --output /secure/evidence/private-compatibility.json
@@ -171,7 +175,7 @@ versions, selected classes, blockers, and SQLite findings.
 Compile the separately accepted narrow install plan:
 
 ```bash
-python3 scripts/bulkload.py codex-private-install-plan \
+scripts/bulkload.py codex-private-install-plan \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \
   --destination-bundle /secure/evidence/destination-private \
@@ -201,7 +205,7 @@ Keep the destination writer stopped. Create a fresh apply attestation bound to
 the final apply receipt path and accepted install plan:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/apply-quiescence.json \
@@ -218,7 +222,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 Apply:
 
 ```bash
-python3 scripts/bulkload.py codex-private-apply \
+scripts/bulkload.py codex-private-apply \
   --install-plan /secure/evidence/private-install-plan.json \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \
@@ -254,7 +258,7 @@ Keep the writer stopped and create a new verify attestation. It must use a
 different attestation ID and bind both the plan and apply receipt:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/verify-quiescence.json \
@@ -270,7 +274,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 ```
 
 ```bash
-python3 scripts/bulkload.py codex-private-verify \
+scripts/bulkload.py codex-private-verify \
   --install-plan /secure/evidence/private-install-plan.json \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \
@@ -305,7 +309,7 @@ stopped and create a fresh rollback attestation bound to the plan, apply
 receipt, and rollback receipt path:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/rollback-quiescence.json \
@@ -324,7 +328,7 @@ Run rollback with absent preflight, post-capture, recovery-capture, journal,
 and receipt outputs:
 
 ```bash
-python3 scripts/bulkload.py codex-private-rollback \
+scripts/bulkload.py codex-private-rollback \
   --install-plan /secure/evidence/private-install-plan.json \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \
@@ -385,7 +389,7 @@ not safely published. Do not edit or truncate the journal manually.
 The apply-journal form never accepts apply-receipt arguments:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/recovery-quiescence.json \
@@ -401,7 +405,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 ```
 
 ```bash
-python3 scripts/bulkload.py codex-private-recover \
+scripts/bulkload.py codex-private-recover \
   --install-plan /secure/evidence/private-install-plan.json \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \
@@ -431,7 +435,7 @@ The rollback-journal form requires the original apply receipt. Bind its digest
 in the fresh attestation:
 
 ```bash
-python3 scripts/bulkload.py codex-private-quiescence-attest \
+scripts/bulkload.py codex-private-quiescence-attest \
   --codex-home /absolute/destination/codex-home \
   --sqlite-home /absolute/destination/sqlite-home \
   --output /secure/evidence/rollback-recovery-quiescence.json \
@@ -450,7 +454,7 @@ python3 scripts/bulkload.py codex-private-quiescence-attest \
 Then pass the same accepted digest with the exact original apply-receipt path:
 
 ```bash
-python3 scripts/bulkload.py codex-private-recover \
+scripts/bulkload.py codex-private-recover \
   --install-plan /secure/evidence/private-install-plan.json \
   --compatibility-plan /secure/evidence/private-compatibility.json \
   --source-bundle /secure/evidence/source-private \

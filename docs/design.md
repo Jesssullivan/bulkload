@@ -1,115 +1,32 @@
 # Bulkload v1 design
 
-Status: repository v1 complete; Codex session-union v3 prefix-proof extension,
-private-state policy v6 narrow attended auth install and request-only consumer
-of the exact accepted-H6 SQLite action authority in review, with public-read CI
-repair naturally green on its source carrier, 2026-08-16. The v6 slice adds a
-protected output/workspace request and a separate volatile caller-capacity
-observation. SQLite composition, reservation, publication, installation, and
-combined private apply remain fail-held.
+Status: repository v1 complete; Codex session-union v3 prefix-proof extension;
+private-state policy v7 narrow attended auth install, exact-v6 compatibility
+freeze, and internal read-only SQLite verifier oracle in review, 2026-07-29.
+The oracle observes fixtures built separately without invoking the oracle and
+cannot write bundles or mint final receipts. SQLite composition, reservation, publication,
+installation, final verification, and combined private apply remain fail-held.
 
 The public-read CI boundary is separately closed by a repository-local
 front door. It runs only on the literal `tinyland-nix` capability, rejects fork
 pull requests before scheduling, and consumes the public immutable
 `tinyland-inc/ci-templates` v2.13.0 actions at commit
 `139bd4c7deabbe07c918dc764a3b9f054066431d`. It does not import private
-GloriousFlywheel action or flake source. The workflow does not use a checkout
-action. Its bootstrap trust root is the GitHub runtime and sanctioned ARC
-runner image and kernel: the runner constructs the step environment and command
-files and supplies system Bash, base64, env, Git/libcurl, DNS, TLS, and CA
-authority. The contract does not claim resistance to a compromised member of
-that root.
-
-Before any leg starts, the job environment blanks `BASH_ENV`, imported shell
-option and trace channels, loader injection, proxy override channels, CA
-overrides, and TLS key logging. Lower-case proxy blanks, including `ftp_proxy`,
-remain job-scoped for the local composite and pinned actions. The materializer
-step separately blanks `FTP_PROXY`. After token and header destruction, exact
-checkout verification, and private checkout-state cleanup, the trusted
-materializer appends exactly five upper-case empty proxy records to an owned,
-canonical regular `$GITHUB_ENV` file contained by
-`$RUNNER_TEMP/_runner_file_commands`. Bash runs privileged without profile or
-rc files, so imported functions and option state are ignored. The
-materialization step removes both proxy cases and every other transport channel
-again before its first child. It then requires
-the pre-existing workspace and runner temporary root to be owned, canonical
-nonsymlink directories and requires the workspace to be empty without deleting
-stale contents. It uses fixed system binaries, a new private home and global
-config, an empty template, a private temporary root, and no system Git config.
-
-The read-only GitHub token is masked, copied to an explicitly non-exported shell
-variable, and removed from the process environment before the fixed base64
-encoder receives the raw value over stdin. The raw and encoded forms are
-cleared before any Git fetch. A fetch-only subshell de-exports the inherited
-environment and exports only the private Git configuration, fixed system path,
-locale, temporary root, prompt fences, and masked Basic header; malformed
-environment names such as imported function records are removed by fixed
-`/usr/bin/env`. `--config-env` binds that header to GitHub, while
-`--no-auto-maintenance` and `--no-write-commit-graph` prevent ancillary writers.
-The fetch requests the exact event object and complete head and tag namespaces.
-The header is cleared on success and by shell exit on failure before an exact
-detached checkout. The step then proves full history, exact HEAD and worktree
-root, a clean tree, a tokenless origin, no object alternates, and no credential,
-HTTP, include, or SSH config.
-
-The workflow is one literal, fail-fast-disabled matrix whose `source`, `build`,
-and `test` legs are independently scheduled on `tinyland-nix`. Each leg has
-exactly two workflow steps: the fixed-Git materializer and the local composite.
-The composite fail-closes any gate outside that enum, establishes the common
-public-read boundary, and selects one mutually exclusive tail. The source tail
-executes the source suite; the build tail revalidates Bazel authority and ends
-in `build //:bulkload`; the test tail revalidates independently and ends in
-`test //:tests`. Thus each selected execution path has exactly one repository
-consumer and no process or action after it. The materializer registers no
-checkout post. The exact nested action pins contain no post, nested use, or
-step after their Bazel invocation. Semantic contract validation rejects any
-composite step that redeclares a job-fenced shell, imported-function, loader,
-proxy, CA, or keylog channel, including `LD_PRELOAD` and `BASH_FUNC_*`.
-
-The Nix client process is configured
+GloriousFlywheel action or flake source. The Nix client process is configured
 for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
-locations for Attic and Bazel remain injected by the runner. A no-value
-repository preflight validates authority-only raw endpoints and clears
-inherited shell, Nix, and Bazel credential channels before the pinned discovery
-action; post-discovery
+locations remain injected by the runner. A no-value repository preflight
+validates authority-only raw endpoints and clears inherited shell, Nix, and
+Bazel credential channels before the pinned discovery action; post-discovery
 enforcement revalidates the boundary and requires both cache reachability
-claims before any Nix or Bazel command. Pre-discovery command lookup is the
-reviewed Nix profile plus the fixed system path; after discovery contributes
-that profile through `GITHUB_PATH`, step mappings carry only the reviewed
-system suffix. The guard rejects any other effective path.
-
-`GRPC_PROXY_EXP` is different from the empty-valued transport fences:
-grpc-java treats even a present-empty value as an active proxy request and
-resolves it to localhost port 80. It must therefore be exactly absent. The
-guard inspects the NUL-framed process environment and rejects both
-present-empty and nonempty forms before Nix setup, after discovery, and at each
-immediate Bazel boundary. The local composite never declares or persists the
-name, so Nix and the Java/gRPC/Bazel consumers receive absence rather than an
-empty record. Fixed-Git source fetching remains inside its separate minimal
-transport fence.
-
-The exact guard is snapshotted before the selected repository consumer. Each
-Bazel leg performs a fresh captured-byte, digest, and authority check
-immediately before its terminal call and receives a new private Bazelisk home,
-empty user home, test temporary root, and Nix/XDG runtime home. The source leg
-uses a distinct private runtime home and enters its development shell with the
-inherited environment cleared, retaining only `HOME` and its eight Nix/XDG
-home selectors. Workspace wrappers, persistent caches and Bazel servers,
-inherited username path components, system/user rc drift, and netrc
-credentials fail closed. This is same-UID authority hygiene, not a filesystem
-sandbox; exact source review remains part of the trust boundary.
-
-The Nix client binds the canonical direct `/nix/store` with `store = local` and
-`allow-symlinked-store = false`. Its exact substituter/key inventory is the
-runner-injected public `main` Attic cache plus `cache.nixos.org`, with
-signatures required. Store, daemon-socket, mirror, HTTP-family proxy,
-certificate, curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
-`GRPC_PROXY_EXP` is absent. Trusted
-substituters, remote builders, build and diff hooks, access tokens, user Nix
-configuration, netrc, flake-config acceptance, secret signing keys, and
-plugins are cleared and verified from effective settings. Ambient `GIT_*`,
-`JUST_*`, `NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` are
-rejected. Bazel cache publication is false for every pull request and tag and
+claims before any Nix or Bazel command. The exact guard is snapshotted before
+repository-owned source gates. Both Bazel calls are preceded by a fresh digest
+and captured-authority check and receive distinct, newly allocated Bazelisk
+homes plus empty user homes; workspace wrappers, system/user rc drift, and
+netrc credentials fail closed. Client access tokens, user Nix
+configuration, netrc, flake-config acceptance, post-build hooks, secret signing
+keys, and plugins are cleared. This source boundary does not attest the
+independent multi-user Nix daemon's own HTTP authentication or post-build
+policy. Bazel cache publication is false for every pull request and tag and
 true only for a trusted push to `main`; remote execution is never selected.
 
 ## 1. Decision
@@ -182,7 +99,7 @@ not byte equality over an arbitrary directory.
 | Working bytes | source worktree plus manifest | hash, additive copy, verify | modified tracked files, safe untracked files |
 | Agent continuity | append-only transcript authority | allowlisted copy, validate, resume proof | Codex JSONL, Claude project transcripts |
 | Generated state | destination runtime | regenerate | caches, `.direnv`, platform binaries |
-| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; no composer/installer | Codex state, log, goal, and memory databases |
+| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; internal fixture-only read oracle; no composer/installer | Codex state, log, goal, and memory databases |
 | Authentication | provider/operator | opt-in private atomic replace with rollback, or attended re-authentication | Codex `auth.json` |
 
 Every plane has a separate contract. Generated caches are regenerated.
@@ -194,11 +111,11 @@ generic file adapter, but they may enter an explicit typed migration dossier.
 ### 4.1 Read-only first
 
 Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
-`apply` is separate and requires the exact `plan_sha256`. Private policy v6
-also exposes a separately attended, digest-accepted auth-only apply and
-consumes the exact accepted-H6 v5 four-pass SQLite close/action chain into a
-non-actionable request plus capacity observation. Neither can compose, reserve,
-publish, install, or activate SQLite. The CLI never invokes a terminal
+`apply` is separate and requires the exact `plan_sha256`. Private policy v7
+also exposes a separately attended, digest-accepted auth-only apply, freezes
+the exact v6 request/capacity producer closure as validator-only legacy
+authority, and adds a CLI-inaccessible read-only SQLite oracle. None can
+compose, reserve, publish, install, finally verify, or activate SQLite. The CLI never invokes a terminal
 multiplexer, Home Manager, a deploy, or a product runtime.
 
 ### 4.2 Repeated-catalog barrier
@@ -438,9 +355,11 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
   The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
   sidecar exists. It never copies a live database family as ordinary files.
-  Policy v6 does not compose or install SQLite; during auth install it
+  Policy v7 does not compose or install SQLite; during auth install it
   independently captures and preserves every destination family exactly with
-  zero mutations. Its request/capacity surfaces do not touch live roots.
+  zero mutations. Its frozen v6 validators and internal read-only oracle do
+  not expose SQLite request, capacity, composition, or final-verification
+  commands and do not touch live roots.
 - Prefer an auth-only source capture and an auth-plus-SQLite destination
   capture for the narrow auth installer. A full source capture plus a full
   destination capture is also accepted, but source SQLite is never consumed.
@@ -464,10 +383,7 @@ respectively. Each snapshot binds a non-secret, operator-assigned
 host-authority UUID to the resolved root, its device/inode lineage, and typed
 directory records. One authority ID names one physical filesystem namespace
 even when a hostname changes or storage is shared; an independent namespace
-receives a different ID. The serialized non-private-directory count covers
-only those portable descendant directory records. The capture validates the
-root separately as namespace authority; it is not itself a catalog member or
-part of that descendant count.
+receives a different ID.
 
 The scanner holds descriptor authority while traversing, rejects duplicate
 JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
@@ -498,28 +414,31 @@ planning reads bounded exact-`0600` single-link evidence through pinned
 descriptors and publishes into a pinned owner-private directory with an OS
 no-replace rename. It verifies exact staging bytes and single-link custody,
 revalidates inputs plus the requested directory/target after publication, and
-never permits stdout as an evidence destination or pathname-deletes on
-failure. A nonzero result can therefore retain an owner-private staging or
-fail-held final artifact; it is not authority and requires attended
-quarantine.
+never pathname-deletes on failure. A nonzero result can therefore retain an
+owner-private staging or fail-held final artifact; it is not authority and
+requires attended quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v6.json`.
+`.agents/skills/bulkload/references/codex-private-state-policy.v7.json`.
 It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
-but makes eight separate readiness claims:
+but makes ten separate readiness claims:
 
 - `auth_install=true`: an attended, journaled atomic replacement of an
   existing destination `auth.json` is implemented, with a complete rollback
   copy, offline verification, manual rollback, and crash recovery;
-- `sqlite_compose_plan=false`: v6 retains the v4 validator but exposes no
+- `sqlite_compose_plan=false`: v7 retains the v4 validator but exposes no
   current opening producer command;
-- `sqlite_compose_action_plan=false`: v6 retains exact v5 close/action
+- `sqlite_compose_action_plan=false`: v7 retains exact v5 close/action
   validators but exposes no current close, reclose, or action-plan producer;
-- `sqlite_compose_request=true`: a v6 request binds the exact v5 producer,
-  current v6 consumer runtime, protected absent output namespace, and checked
-  capacity requirement without granting write authority;
-- `sqlite_capacity_observation=true`: a separate 300-second artifact records
-  caller-available bytes/inodes without reservation or future guarantee;
+- `sqlite_compose_request=false`: exact v6 request artifacts remain
+  validator-only legacy evidence and their producer command is retired;
+- `sqlite_capacity_observation=false`: exact v6 observations remain
+  validator-only legacy evidence and their producer command is retired;
+- `sqlite_verifier_oracle_internal_only=true`: an internal, CLI-inaccessible read-only
+  oracle observes bundle fixtures built separately without invoking it and
+  emits only a diagnostic report with every final/public claim false;
+- `sqlite_independent_verification=false`: the later final verifier receipt
+  and complete original-input recomputation are not implemented;
 - `sqlite_compose=false`: no source SQLite family is merged or installed; and
 - `sqlite_publish=false`: no composed family or versioned directory can be
   published; and
@@ -554,8 +473,9 @@ count, byte, and time evidence. It never copies source sidecars.
 reviewed v4/v5 historical checkouts only,
 `codex-private-sqlite-compose-plan` consumed source A/B and destination A/B
 private bundles plus the recomputed session-union closure, exact adapter
-registry, and exact path map. The active v6 CLI retires that producer command
-and retains only its immutable output validator. The historical output embeds
+registry, and exact path map. The active v7 CLI retires that producer command,
+the v5 close/action producers, and the v6 request/capacity producers while
+retaining their immutable validators. The historical output embeds
 and revalidates the complete registry and path-map bodies while binding their
 digests to the accepted inputs. It is an immutable opening request and always
 records that fresh post-plan close captures remain required. It does not claim
@@ -576,8 +496,10 @@ blockers. Source/destination migration counts and latest versions are
 cross-bound to the opening projections. Safely named unknown families are also
 retained as fail-held evidence. A single aggregate ledger covers all
 source/destination rows and typed bytes across every table and family, while
-SQLite progress handlers enforce the shared deadline. The CLI recomputes the
-complete plan against pinned inputs before and after create-only publication.
+SQLite progress handlers provide cooperative checks against the shared
+deadline. The historical producer
+CLI recomputed the complete plan against pinned inputs before and after
+create-only publication.
 Its full contract is in the
 [SQLite opening-plan reference](../.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md).
 `codex-private-install-plan` consumes its exact accepted digest and compiles
@@ -592,17 +514,32 @@ path. Every receipt remains an offline byte-and-custody claim with
 `provider_runtime_acceptance_verified=false`; only a fresh attended provider
 turn can establish working authentication.
 
-The command entrypoint opens and pins the canonical policy and complete Python
-runtime source inventory before importing the command implementation. The
-runtime authority record—policy digest, closure digest, and exact core source
-digests—is carried by the compatibility and install plans and revalidated
+The supported direct and Bazel launchers enter Python with `-I -S` before
+Python startup hooks. The command entrypoint then opens and pins the canonical
+policy and complete Bulkload application-source inventory before importing the
+command implementation. This is not a claim that Bulkload binds the Python
+interpreter or standard-library closure. The application authority
+record—policy digest, closure digest, and exact full source
+inventory with per-file digests—is carried by the compatibility and install plans and revalidated
 through publication and mutation boundaries. A changed or replaced runtime
 therefore fails closed rather than executing against a previously accepted
-plan. Policy v6 recognizes exactly two complete v4 opening authorities—the
-original H6-ratified closure and the recomposed, accepted H5 closure—and the
-exact accepted-H6 v5 close/action producer. It rejects unknown or cross-mixed
-policy, runtime, and source digests. The validator also requires the exact
-command/handler topology and forbidden SQLite/combined command set.
+plan. The validator also requires the exact command/handler topology and
+forbidden SQLite/combined command set.
+
+V7's first SQLite-composition slice is deliberately verifier-first. The
+protocol module defines strict manifest, writer-receipt, future final-receipt,
+and diagnostic-oracle schemas, but the only executable addition is an internal
+read-only oracle in a source file distinct from every historical producer.
+It opens a supplied owner-private fixture bundle without mutation, binds the
+active pinned verifier source, separately scans schema, migrations, foreign
+keys, and type-tagged rows, and compares those observations with the supplied v5/v6 evidence and
+protocol artifacts. The oracle does not import a writer or
+final verifier implementation, has no registered CLI command, and cannot
+upgrade `failures=[]` into sealed-bundle, complete-input-recomputation,
+independent-final-verification, provider-acceptance, or cutover authority. The
+public wrapper creates its diagnostic observation UUID and timestamp itself;
+neither is caller-supplied. The writer, final receipt integration, publisher,
+and any command enablement are separate reviewed slices.
 
 The operator sequence, exact arguments, evidence custody, and recovery rules
 are in the
@@ -654,7 +591,7 @@ sensitive-path blocks re-enforced during plan validation, no deletion,
 pre-copy source rehash, external backups, atomic replacement, durable
 journal/directory entries, fresh verification, Codex evidence inputs and output
 parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Private-state policy v6 retains
+adapter, and explicit incomplete/error states. Private-state policy v7 retains
 pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
 Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
 preservation, an external auth backup, a durable state-machine journal, and
@@ -666,18 +603,28 @@ preflight, complete embedded registry/path-map bodies, a canonical raw-schema
 record catalog, typed schema omissions, registry-bound producer blockers,
 exact stable-projection budget/count/latest-migration bindings, bidirectional
 rowset/digest claims, plan-wide row/byte charging with structural lower bounds,
-enforceable SQLite deadlines, exact edge/collation/table-set blocker
+cooperative SQLite progress deadlines, exact edge/collation/table-set blocker
 derivation, explicit column-collation and unknown-family blockers, and
 type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
 captures to one writer-stop epoch, recomputes closed classifications, and
 describes deterministic output and a create-only graph. The action-plan
 consumer reopens the complete original v4 input set before compilation and
-after publication instead of trusting a persisted revalidation flag. V6
-separately pins an exact `0700` workspace, action-derived absent output and
-staging namespace, protected-root lineages, checked capacity requirement, and
-caller-available `fstatvfs` observation. It reserves nothing and binds no
-composer runtime. Compose, publish, install, and apply remain false. Neither the
-operator attestation nor the lock becomes provider-writer proof.
+after publication instead of trusting a persisted revalidation flag. Frozen
+v6 evidence separately pins an exact `0700` workspace, action-derived absent
+output and staging namespace, protected-root lineages, checked capacity
+requirement, and caller-available `fstatvfs` observation. V7 registers neither
+legacy producer command. Its separately implemented read-only oracle adds
+strict artifact custody, manifest/receipt binding, SQLite engine consistency,
+schema/migration/edge/semantic comparisons, exact active verifier-source
+binding, bounded in-process identity ordering without SQLite-side sorting or
+temporary files, including database-encoding-compatible TEXT keys, and an
+all-false final/public claim surface. Its progress
+handler and monotonic checks are cooperative; they do not preempt blocked
+filesystem I/O, and callers must add an external process timeout before using
+the oracle against an unresponsive or adversarial volume. It reserves nothing,
+binds no writer runtime, and publishes no final receipt. Compose, publish,
+install, final verification, and apply remain false. Neither the operator
+attestation nor the lock becomes provider-writer proof.
 Cross-filesystem atomicity, ACL/xattr
 fidelity, sparse files, hardlink identity, special files, case-insensitive
 collisions, submodule worktrees, live concurrent writers, and provider runtime
@@ -691,11 +638,8 @@ acceptance remain blockers or separate proof steps.
   GloriousFlywheel wrapper.
 - `justfile.flywheel` and `.bazelrc.flywheel`: generated, endpoint-free
   GloriousFlywheel front-door kit pinned by CI to an immutable core revision.
-- `.github/actions/bulkload-public-read-ci/action.yml`: immutable public action
-  closure with audited, mutually exclusive source/build/test terminal paths.
-- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation with
-  a literal three-gate matrix and exact minimal-environment, no-post Git
-  materialization; no hosted or dynamic runner fallback.
+- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation; no
+  hosted or dynamic runner fallback.
 - `scripts/install-skill.sh`: locked user-scope installation with fail-before-
   mutation destination preflight and no-follow private backup containment.
 - `tests/`: deterministic fixture tests for catalogs, barriers, plans, apply,

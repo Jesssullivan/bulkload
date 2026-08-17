@@ -1,5 +1,9 @@
 # Codex private SQLite composition opening plan v4
 
+> Historical exact producer contract. Active policy v7 retains v4 artifacts
+> only as validator-bound legacy evidence and registers no opening producer
+> command. Production requires the exact reviewed v4 checkout.
+
 ## Status and boundary
 
 Policy v4 implements a source-only, non-actionable classification request. It
@@ -385,11 +389,16 @@ Stale pre-plan bundles may not be wrapped as closing evidence.
 The intended sequence is:
 
 1. v4 opening/classification request — this slice;
-2. offline composer into a complete versioned bundle;
-3. no-replace versioned-directory publisher and crash recovery;
-4. independent provider acceptance across picker, resume, dialog, new thread,
+2. v5 fresh close and descriptive action plan;
+3. v6 protected workspace request and volatile capacity observation;
+4. v7 strict protocol plus internal read-only oracle over independently
+   hand-built fixtures;
+5. internal writer into a complete pre-seal versioned bundle;
+6. separately integrated final verifier receipt;
+7. no-replace versioned-directory publisher and crash recovery;
+8. independent provider acceptance across picker, resume, dialog, new thread,
    rollback, and auth; and
-5. a separately attended cutover.
+9. a separately attended cutover.
 
 WAL-aware provider backup remains a separate future reader. Raw live DB/WAL/
 SHM copying is never an acceptable substitute.

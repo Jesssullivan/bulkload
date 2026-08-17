@@ -5,12 +5,10 @@ description: Inventory, plan, transfer, and independently verify a one-way migra
 
 # Bulkload
 
-Runtime requirement: Python 3.11 or newer, Git, and a Unix-like host with file
-locking and dirfd support. Codex evidence file publication requires macOS or
-Linux for an OS-backed atomic no-replace rename.
-
-Turn an ad hoc copy into a typed, digest-bound migration with a fresh proof at
-every boundary.
+Runtime requirement: Python 3.11 or newer linked with SQLite 3.37.0 or newer,
+Git, and a Unix-like host with file locking, `pread`, and dirfd support. Codex evidence
+publication requires macOS or Linux for an OS-backed atomic no-replace rename. Turn an ad hoc copy into a typed,
+digest-bound migration with a fresh proof at every boundary.
 
 ## Establish the boundary
 
@@ -25,25 +23,23 @@ every boundary.
    - provider-owned SQLite families; and
    - authentication or credentials.
 4. Keep credentials and databases outside the generic repository adapter.
-   Codex `auth.json` and provider-owned SQLite families are copy-eligible only
-   through an explicit typed opt-in plan. Policy v6 retains attended atomic auth
-   replacement and consumes only the exact accepted-H6 v5 SQLite action authority.
-   It may emit a protected non-actionable compose request and a separate volatile caller-capacity observation. Destination SQLite remains exact during auth.
-   SQLite composition, reservation, publication, installation, and combined apply remain false. Never log credential values. Any live SQLite WAL, SHM, or
-   rollback journal hard-stops immutable capture.
+   Codex `auth.json` and provider-owned SQLite families are copy-eligible only through an explicit typed opt-in plan.
+   Policy v7 retains attended atomic auth replacement and freezes v6 request/capacity artifacts as validator-only evidence.
+   Its internal read-only SQLite oracle has no CLI and cannot claim sealing, full recomputation, final verification,
+   composition, publication, installation, or apply.
+   Destination SQLite remains exact during auth. Never log credential values.
+   Any live SQLite WAL, SHM, or rollback journal hard-stops immutable capture.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
 
-Read [references/migration-contract.md](references/migration-contract.md) for
-the state matrix and stop conditions. Read
-[references/agent-context.md](references/agent-context.md) before handling
-Codex, Claude, or Pi state. Read
-[references/codex-private-state-policy.v6.json](references/codex-private-state-policy.v6.json)
-before classifying Codex auth or SQLite. Retain [v5](references/codex-private-state-policy.v5.json) only as the exact accepted-H6 producer authority and [v4](references/codex-private-state-policy.v4.json) only as the two exact opening authorities. Use
-[references/codex-private-auth-install.md](references/codex-private-auth-install.md)
-for the attended auth workflow. Read the [v4 SQLite opening contract](references/codex-private-sqlite-compose-plan.md)
-and [v5 close/action-plan contract](references/codex-private-sqlite-compose-action-plan.md) for immutable producer evidence, then the [v6 request/capacity contract](references/codex-private-sqlite-compose-request.md).
+Read the [migration contract](references/migration-contract.md) and [agent-context guide](references/agent-context.md).
+Before classifying Codex state, read policy [v7](references/codex-private-state-policy.v7.json); retain
+[v6](references/codex-private-state-policy.v6.json), its [full runtime inventory](references/codex-private-runtime-inventory.v6.json),
+[v5](references/codex-private-state-policy.v5.json), and [v4](references/codex-private-state-policy.v4.json) only as exact
+legacy producer authority. Use the [auth runbook](references/codex-private-auth-install.md), [v4 opening contract](references/codex-private-sqlite-compose-plan.md),
+[v5 close/action contract](references/codex-private-sqlite-compose-action-plan.md), [v6 request/capacity contract](references/codex-private-sqlite-compose-request.md),
+and [v7 offline-composer boundary](references/codex-private-sqlite-offline-composer.md).
 
 ## Capture two stable source passes
 
@@ -51,12 +47,12 @@ Run from the installed skill directory or use the Bazel-built `bulkload`
 binary:
 
 ```bash
-python3 scripts/bulkload.py capture \
+scripts/bulkload.py capture \
   --mode repo \
   --root /absolute/source/repo \
   --output /secure/evidence/source-a.json
 
-python3 scripts/bulkload.py capture \
+scripts/bulkload.py capture \
   --mode repo \
   --root /absolute/source/repo \
   --output /secure/evidence/source-b.json
@@ -92,7 +88,7 @@ umask 077
 destination_tmp="$(mktemp /secure/evidence/.destination.XXXXXX)"
 trap 'rm -f "$destination_tmp"' EXIT
 ssh destination-host \
-  'python3 ~/.agents/skills/bulkload/scripts/bulkload.py capture --mode repo --root /absolute/destination/repo --output -' \
+  '~/.agents/skills/bulkload/scripts/bulkload.py capture --mode repo --root /absolute/destination/repo --output -' \
   > "$destination_tmp"
 mv -f "$destination_tmp" /secure/evidence/destination.json
 trap - EXIT
@@ -107,31 +103,31 @@ Read [references/agent-context.md](references/agent-context.md), quiesce both
 Codex writers, and capture two distinct observations of each role:
 
 ```bash
-python3 scripts/bulkload.py codex-capture \
+scripts/bulkload.py codex-capture \
   --root /absolute/source/.codex/sessions \
   --role source \
   --host-authority-id 11111111-1111-4111-8111-111111111111 \
   --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-source-a.json
-python3 scripts/bulkload.py codex-capture \
+scripts/bulkload.py codex-capture \
   --root /absolute/source/.codex/sessions \
   --role source \
   --host-authority-id 11111111-1111-4111-8111-111111111111 \
   --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-source-b.json
-python3 scripts/bulkload.py codex-capture \
+scripts/bulkload.py codex-capture \
   --root /absolute/destination/.codex/sessions \
   --role destination \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
   --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-destination-a.json
-python3 scripts/bulkload.py codex-capture \
+scripts/bulkload.py codex-capture \
   --root /absolute/destination/.codex/sessions \
   --role destination \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
   --acknowledge-writers-quiesced \
   --output /secure/evidence/codex-destination-b.json
-python3 scripts/bulkload.py codex-plan \
+scripts/bulkload.py codex-plan \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
   --destination-a /secure/evidence/codex-destination-a.json \
@@ -144,14 +140,14 @@ immutable request, then capture two more quiescent passes for every role named
 as `longer_role` in the request:
 
 ```bash
-python3 scripts/bulkload.py codex-prefix-request \
+scripts/bulkload.py codex-prefix-request \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
   --destination-a /secure/evidence/codex-destination-a.json \
   --destination-b /secure/evidence/codex-destination-b.json \
   --output /secure/evidence/codex-prefix-request.json
 
-python3 scripts/bulkload.py codex-prefix-proof \
+scripts/bulkload.py codex-prefix-proof \
   --prefix-request /secure/evidence/codex-prefix-request.json \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
@@ -173,7 +169,7 @@ compile one immutable close request that binds the exact request, opening
 custody, proof capture IDs, and proof body digests:
 
 ```bash
-python3 scripts/bulkload.py codex-close-request \
+scripts/bulkload.py codex-close-request \
   --prefix-request /secure/evidence/codex-prefix-request.json \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
@@ -183,7 +179,7 @@ python3 scripts/bulkload.py codex-close-request \
   --source-prefix-b /secure/evidence/codex-source-prefix-b.json \
   --output /secure/evidence/codex-close-request.json
 
-python3 scripts/bulkload.py codex-close-capture \
+scripts/bulkload.py codex-close-capture \
   --close-request /secure/evidence/codex-close-request.json \
   --root /absolute/source/.codex/sessions \
   --role source \
@@ -200,7 +196,7 @@ snapshot; it does not accept a pre-existing snapshot to wrap. Then compile the
 final plan:
 
 ```bash
-python3 scripts/bulkload.py codex-plan \
+scripts/bulkload.py codex-plan \
   --source-a /secure/evidence/codex-source-a.json \
   --source-b /secure/evidence/codex-source-b.json \
   --destination-a /secure/evidence/codex-destination-a.json \
@@ -250,10 +246,10 @@ and close artifact by distinct capture ID or body digest as appropriate. Any
 blocker suppresses the complete copy candidate list.
 Codex evidence inputs must be owner-only, single-link regular files; the CLI
 pins them through a create-only atomic publish in an owner-private output
-directory. Stdout is never an evidence destination. It verifies exact temporary
-bytes and single-link custody, uses an OS no-replace rename, revalidates every
-input and the requested directory/target immediately after publication, and
-refuses an existing target. It never pathname-deletes on a failure: a nonzero result may leave an
+directory. It verifies exact temporary bytes and single-link custody, uses an
+OS no-replace rename, revalidates every input and the requested
+directory/target immediately after publication, and refuses an existing
+target. It never pathname-deletes on a failure: a nonzero result may leave an
 owner-private staging or fail-held final artifact for attended quarantine. It
 is a dry-run report: the protocol intentionally has no Codex-session apply
 command. Any future attended copier must recheck the exact source and
@@ -275,21 +271,24 @@ capture or operation. It is an operator procedural fence with
 cooperating Bulkload processes. Any SQLite WAL, SHM, or rollback journal blocks
 immutable capture.
 
-The private entrypoint pins policy v6 and the full Python runtime closure before import, and the compatibility/install plans bind that authority. Review and
-accept both exact plan digests before attended auth apply. Offline receipts do
-not prove provider authentication. Require a fresh attended provider turn.
-Never infer SQLite authority, compose/install SQLite, or use a combined apply.
-The immutable v4/v5 chain binds private and session A/B evidence, an exact
-registry/path map, fresh cross-plane closes, and a descriptive action plan.
-V6 accepts only the exact accepted-H6 v5 producer, reopens the complete chain
-before, during, and after publication, and binds an absent protected workspace.
-Its separate 300-second observation uses caller-available bytes and inodes but reserves nothing. The composer runtime, composer, publisher, installer, and live
-cutover remain absent; both commands return blocked-plan exit `4`.
+Execute `scripts/bulkload.py` directly, or use the Bazel-built binary. Both
+supported launchers enter Python with `-I -S` before Python startup hooks. The
+private entrypoint then pins policy v7 and the complete Bulkload
+application-source closure before importing the command implementation;
+it does not claim to bind the Python interpreter or standard-library closure.
+Compatibility/install plans bind that application authority. Review and
+accept both plan digests before attended auth apply. Offline receipts do not prove
+provider authentication, so require a fresh attended provider turn. Never infer SQLite authority, compose/install
+SQLite, or use a combined apply. The immutable v4/v5 chain binds private and session A/B evidence, an exact
+registry/path map, fresh cross-plane closes, and a descriptive action plan. V6 request/capacity bodies remain accepted
+only under their exact frozen producer closure; their active commands are retired. V7 adds only an internal read-only
+oracle over separately hand-built or already present offline bundles. Its in-memory diagnostic keeps every final/public
+claim false. Writer, final-receipt, publisher, installer, and live-cutover integration remain later slices.
 
 ## Compile and review the plan
 
 ```bash
-python3 scripts/bulkload.py plan \
+scripts/bulkload.py plan \
   --source-a /secure/evidence/source-a.json \
   --source-b /secure/evidence/source-b.json \
   --destination /secure/evidence/destination.json \
@@ -389,7 +388,7 @@ instead of raw list equality.
 Prefer local application when source and destination roots are both visible:
 
 ```bash
-python3 scripts/bulkload.py apply \
+scripts/bulkload.py apply \
   --plan /secure/evidence/plan.json \
   --accept-plan FULL_PLAN_SHA256 \
   --source-root /absolute/source/root \
@@ -424,7 +423,7 @@ umask 077
 allowlist=$(mktemp /secure/evidence/.bulkload-files.XXXXXX)
 cleanup() { rm -f -- "$allowlist"; }
 trap cleanup EXIT
-python3 scripts/bulkload.py files --null \
+scripts/bulkload.py files --null \
   --plan /secure/evidence/plan.json \
   --accept-plan FULL_PLAN_SHA256 >"$allowlist"
 rsync -a --from0 --files-from="$allowlist" --checksum --delay-updates \
@@ -445,25 +444,19 @@ staging transport.
 Capture the destination again after application, then verify:
 
 ```bash
-python3 scripts/bulkload.py verify \
+scripts/bulkload.py verify \
   --plan /secure/evidence/plan.json \
   --accept-plan FULL_PLAN_SHA256 \
   --destination /secure/evidence/destination-after.json \
   --output /secure/evidence/verification.json
 ```
 
-Require `verified: true`, zero failures, exact branch/HEAD/status evidence,
-unchanged destination non-remote ref catalog, exact capture mode, and the
-expected file identities. Reuse of the exact pre-plan destination snapshot is
-a verification failure, including for a no-op plan. Any newly active alternate,
-graft, submodule, content filter, LFS attribute, or external attribute authority
-also fails verification. Keep the source captures, plan, application receipt,
-destination capture, verification receipt, exclusions, tool revision, and
-operator decision together.
-
-`verified: true` proves only the accepted content plan. It does not by itself
-prove a live remote head, upstream agreement, commit signature, or historical
-session continuity. Collect those separate proofs before claiming
+Require `verified: true`, zero failures, exact branch/HEAD/status evidence, an unchanged destination non-remote ref
+catalog, exact capture mode, and expected file identities. Reusing the pre-plan destination snapshot fails, including
+for a no-op plan. A newly active alternate, graft, submodule, content filter, LFS attribute, or external attribute
+authority also fails. Retain all captures, plan, application and verification receipts, exclusions, tool revision, and
+operator decision together. `verified: true` proves only the accepted content plan—not a live remote head, upstream
+agreement, commit signature, or historical session continuity. Collect those proofs separately before claiming
 `EXACT_ACTIVE_LANE` or `SESSION_NATIVE`.
 
 ## Report accurately

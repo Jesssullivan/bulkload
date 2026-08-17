@@ -17,7 +17,6 @@ from bulkload_lib.model import (
     canonical_bytes,
     object_digest,
     sha256_bytes,
-    utc_now,
 )
 from bulkload_lib import private_quiescence
 from bulkload_lib import private_runtime
@@ -27,19 +26,21 @@ import bulkload_lib.cli as bulkload_cli
 from bulkload_lib.private_sqlite_plan import (
     SQLITE_ADAPTER_REGISTRY_SCHEMA,
     SQLITE_PATH_MAP_SCHEMA,
-    compile_codex_private_sqlite_compose_plan,
     validate_codex_private_sqlite_compose_plan,
     validate_codex_private_sqlite_compose_plan_against_inputs,
     validate_sqlite_adapter_registry,
     validate_sqlite_path_map,
 )
 from bulkload_lib.private_sqlite_close import (
-    compile_codex_private_sqlite_close_request,
     validate_codex_private_sqlite_close_request,
 )
 from bulkload_lib.sessions import (
     capture_codex_sessions,
     compile_codex_session_union_plan,
+)
+from tests.private_sqlite_legacy_fixtures import (
+    build_v4_compose_plan_fixture,
+    build_v5_close_request_fixture,
 )
 
 
@@ -427,24 +428,21 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             session_destination_a,
             session_plan,
         )
-        plan = compile_codex_private_sqlite_compose_plan(
+        plan = build_v4_compose_plan_fixture(
             compatibility,
             source_a_path,
             source_b_path,
             destination_a_path,
             destination_b_path,
-            accept_compatibility_plan=compatibility["plan_sha256"],
             adapter_registry=registry,
-            accept_adapter_registry=registry["registry_sha256"],
             path_map=path_map,
-            accept_path_map=path_map["path_map_sha256"],
             session_union_plan=session_plan,
-            accept_session_union_plan=session_plan["plan_sha256"],
             session_source_a=session_source_a,
             session_source_b=session_source_b,
             session_destination_a=session_destination_a,
             session_destination_b=session_destination_b,
             runtime_authority=runtime,
+            created_at="2026-07-29T00:00:00Z",
         )
         return plan, {
             "compatibility": compatibility,
@@ -471,20 +469,22 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
         plan: dict,
         evidence: dict[str, object],
     ) -> None:
-        validate_codex_private_sqlite_compose_plan_against_inputs(
-            plan,
-            evidence["compatibility"],
-            evidence["source_a_path"],
-            evidence["source_b_path"],
-            evidence["destination_a_path"],
-            evidence["destination_b_path"],
-            adapter_registry=evidence["registry"],
-            path_map=evidence["path_map"],
-            session_union_plan=evidence["session_plan"],
-            session_source_a=evidence["session_source_a"],
-            session_source_b=evidence["session_source_b"],
-            session_destination_a=evidence["session_destination_a"],
-            session_destination_b=evidence["session_destination_b"],
+        self.assertIsNone(
+            validate_codex_private_sqlite_compose_plan_against_inputs(
+                plan,
+                evidence["compatibility"],
+                evidence["source_a_path"],
+                evidence["source_b_path"],
+                evidence["destination_a_path"],
+                evidence["destination_b_path"],
+                adapter_registry=evidence["registry"],
+                path_map=evidence["path_map"],
+                session_union_plan=evidence["session_plan"],
+                session_source_a=evidence["session_source_a"],
+                session_source_b=evidence["session_source_b"],
+                session_destination_a=evidence["session_destination_a"],
+                session_destination_b=evidence["session_destination_b"],
+            )
         )
 
     def classify_records(
@@ -595,7 +595,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                 Path(directory),
                 runtime_authority=legacy_runtime,
             )
-            request = compile_codex_private_sqlite_close_request(
+            request = build_v5_close_request_fixture(
                 plan,
                 evidence["session_plan"],
                 evidence["session_source_a"],
@@ -603,18 +603,9 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                 evidence["session_destination_a"],
                 evidence["session_destination_b"],
                 evidence["runtime"],
-                accept_opening_plan=plan["plan_sha256"],
-                accept_session_union_plan=evidence["session_plan"]["plan_sha256"],
                 writer_stop_epoch_id=str(uuid.uuid4()),
-                writer_stop_epoch_at=utc_now(),
-                acknowledge_provider_writers_stopped=True,
-                opening_compatibility_plan=evidence["compatibility"],
-                opening_source_a_directory=evidence["source_a_path"],
-                opening_source_b_directory=evidence["source_b_path"],
-                opening_destination_a_directory=evidence["destination_a_path"],
-                opening_destination_b_directory=evidence["destination_b_path"],
-                opening_adapter_registry=evidence["registry"],
-                opening_path_map=evidence["path_map"],
+                writer_stop_epoch_at="2026-07-29T00:00:00Z",
+                created_at="2026-07-29T00:00:00Z",
             )
             validate_codex_private_sqlite_close_request(request)
             self.assertTrue(request["opening_inputs_revalidated"])
@@ -644,7 +635,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
 
     def test_tampered_registry_and_path_map_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            _, evidence = self.compile_fixture(Path(directory))
+            plan, evidence = self.compile_fixture(Path(directory))
             registry = json.loads(json.dumps(evidence["registry"]))
             registry["families"][0]["tables"][0]["merge_class"] = "keyed-union"
             with self.assertRaisesRegex(BulkloadError, "digest mismatch"):
@@ -673,24 +664,20 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                 BulkloadError,
                 "does not bind the session closure",
             ):
-                compile_codex_private_sqlite_compose_plan(
+                validate_codex_private_sqlite_compose_plan_against_inputs(
+                    plan,
                     evidence["compatibility"],
                     evidence["source_a_path"],
                     evidence["source_b_path"],
                     evidence["destination_a_path"],
                     evidence["destination_b_path"],
-                    accept_compatibility_plan=evidence["compatibility"]["plan_sha256"],
                     adapter_registry=evidence["registry"],
-                    accept_adapter_registry=evidence["registry"]["registry_sha256"],
                     path_map=path_map,
-                    accept_path_map=path_map["path_map_sha256"],
                     session_union_plan=evidence["session_plan"],
-                    accept_session_union_plan=evidence["session_plan"]["plan_sha256"],
                     session_source_a=evidence["session_source_a"],
                     session_source_b=evidence["session_source_b"],
                     session_destination_a=evidence["session_destination_a"],
                     session_destination_b=evidence["session_destination_b"],
-                    runtime_authority=evidence["runtime"],
                 )
 
             missing_mapped_path = json.loads(json.dumps(evidence["path_map"]))
@@ -711,28 +698,28 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                 unregistered,
                 "registry_sha256",
             )
-            plan = compile_codex_private_sqlite_compose_plan(
+            unregistered_plan = build_v4_compose_plan_fixture(
                 evidence["compatibility"],
                 evidence["source_a_path"],
                 evidence["source_b_path"],
                 evidence["destination_a_path"],
                 evidence["destination_b_path"],
-                accept_compatibility_plan=evidence["compatibility"]["plan_sha256"],
                 adapter_registry=unregistered,
-                accept_adapter_registry=unregistered["registry_sha256"],
                 path_map=evidence["path_map"],
-                accept_path_map=evidence["path_map"]["path_map_sha256"],
                 session_union_plan=evidence["session_plan"],
-                accept_session_union_plan=evidence["session_plan"]["plan_sha256"],
                 session_source_a=evidence["session_source_a"],
                 session_source_b=evidence["session_source_b"],
                 session_destination_a=evidence["session_destination_a"],
                 session_destination_b=evidence["session_destination_b"],
                 runtime_authority=evidence["runtime"],
+                created_at="2026-07-29T00:00:00Z",
             )
             self.assertIn(
                 "sqlite-adapter-not-registered",
-                {blocker["code"] for blocker in plan["sqlite_families"][0]["blockers"]},
+                {
+                    blocker["code"]
+                    for blocker in unregistered_plan["sqlite_families"][0]["blockers"]
+                },
             )
 
     def test_stable_pair_and_typed_digest_collisions_are_rejected(self) -> None:
@@ -1940,7 +1927,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            _, evidence = self.compile_fixture(Path(directory))
+            plan, evidence = self.compile_fixture(Path(directory))
             actual_relation = private_sqlite_plan._migration_relation
             clock = [1000.0]
 
@@ -1966,30 +1953,20 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
                         BulkloadError,
                         "migration classification exceeded its deadline",
                     ):
-                        compile_codex_private_sqlite_compose_plan(
+                        validate_codex_private_sqlite_compose_plan_against_inputs(
+                            plan,
                             evidence["compatibility"],
                             evidence["source_a_path"],
                             evidence["source_b_path"],
                             evidence["destination_a_path"],
                             evidence["destination_b_path"],
-                            accept_compatibility_plan=evidence["compatibility"][
-                                "plan_sha256"
-                            ],
                             adapter_registry=evidence["registry"],
-                            accept_adapter_registry=evidence["registry"][
-                                "registry_sha256"
-                            ],
                             path_map=evidence["path_map"],
-                            accept_path_map=evidence["path_map"]["path_map_sha256"],
                             session_union_plan=evidence["session_plan"],
-                            accept_session_union_plan=evidence["session_plan"][
-                                "plan_sha256"
-                            ],
                             session_source_a=evidence["session_source_a"],
                             session_source_b=evidence["session_source_b"],
                             session_destination_a=evidence["session_destination_a"],
                             session_destination_b=evidence["session_destination_b"],
-                            runtime_authority=evidence["runtime"],
                         )
 
     def test_structural_and_against_input_validation_reject_tamper(self) -> None:
@@ -2056,7 +2033,7 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             ):
                 self.validate_against_inputs(drifted, evidence)
 
-    def test_legacy_sqlite_producer_commands_are_retired_in_v6(self) -> None:
+    def test_sqlite_producer_and_oracle_commands_are_retired_in_v7(self) -> None:
         parser = bulkload_cli.build_parser()
         command_action = next(
             action
@@ -2069,6 +2046,14 @@ class CodexPrivateSqlitePlanTest(unittest.TestCase):
             "codex-private-sqlite-session-reclose",
             "codex-private-sqlite-private-reclose",
             "codex-private-sqlite-compose-action-plan",
+            "codex-private-sqlite-compose-request",
+            "codex-private-sqlite-capacity-observe",
+            "codex-private-sqlite-compose",
+            "codex-private-sqlite-verify",
+            "codex-private-sqlite-oracle",
+            "codex-private-sqlite-verifier-oracle",
+            "codex-private-sqlite-publish",
+            "codex-private-sqlite-install",
         ):
             self.assertNotIn(command, command_action.choices)
 

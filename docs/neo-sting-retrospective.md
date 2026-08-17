@@ -301,9 +301,12 @@ short-lived quiescence attestation records a procedural fence with
 `provider_writer_proof=false`; the advisory `flock` coordinates cooperating
 Bulkload processes only.
 
-The private command entrypoint now pins the complete policy/runtime source
-closure before importing it and binds that authority through compatibility and
-install plans. Apply, verify, rollback, and recovery revalidate the accepted
+The supported direct and Bazel launchers enter Python with `-I -S` before
+Python startup hooks. The private command entrypoint then pins the complete
+Bulkload policy/application-source closure before importing the command
+implementation and binds that authority through compatibility and install
+plans. This does not claim interpreter or standard-library closure authority.
+Apply, verify, rollback, and recovery revalidate the accepted application
 closure. Their receipts prove offline byte and preservation invariants only:
 `provider_runtime_acceptance_verified=false` remains deliberate, and a fresh
 attended Codex turn on Sting is required before claiming working auth.

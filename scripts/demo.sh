@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-bulkload=(python3 "$root/.agents/skills/bulkload/scripts/bulkload.py")
+bulkload=("$root/.agents/skills/bulkload/scripts/bulkload.py")
 git_safe=(git -c core.hooksPath=/dev/null -c commit.gpgsign=false \
   -c user.name=Bulkload -c user.email=bulkload@example.invalid)
 scratch="$(mktemp -d)"

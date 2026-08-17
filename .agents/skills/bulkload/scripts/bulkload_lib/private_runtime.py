@@ -11,27 +11,39 @@ from typing import Any
 from .model import BulkloadError, canonical_bytes, sha256_bytes
 
 
-PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v6.json"
-PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v6"
+PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v7.json"
+PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v7"
 LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4 = (
     "dev.tinyland.bulkload.codex-private-state-policy.v4"
 )
 LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5 = (
     "dev.tinyland.bulkload.codex-private-state-policy.v5"
 )
+LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V6 = (
+    "dev.tinyland.bulkload.codex-private-state-policy.v6"
+)
 PRIVATE_RUNTIME_AUTHORITY_SCHEMA = (
     "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
 )
-PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-request-v6"
+PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-verifier-oracle-v7"
 PRIVATE_RUNTIME_SOURCE_KEYS = {
+    "scripts/bulkload.py",
+    "scripts/bulkload_lib/__init__.py",
     "scripts/bulkload_lib/cli.py",
+    "scripts/bulkload_lib/executor.py",
+    "scripts/bulkload_lib/model.py",
+    "scripts/bulkload_lib/planner.py",
     "scripts/bulkload_lib/private_apply.py",
     "scripts/bulkload_lib/private_quiescence.py",
+    "scripts/bulkload_lib/private_runtime.py",
     "scripts/bulkload_lib/private_sqlite_action_plan.py",
     "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
+    "scripts/bulkload_lib/private_sqlite_protocol.py",
     "scripts/bulkload_lib/private_sqlite_request.py",
+    "scripts/bulkload_lib/private_sqlite_verifier.py",
     "scripts/bulkload_lib/private_state.py",
+    "scripts/bulkload_lib/scanner.py",
     "scripts/bulkload_lib/sessions.py",
 }
 LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
@@ -54,6 +66,17 @@ LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
         "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
     ),
 }
+LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
+    "policy_sha256": (
+        "6167a5a60ec621400c564f689be8c6617caa06ea9b2b80197664e48e111f22fc"
+    ),
+    "runtime_source_sha256": (
+        "14ecf2c208cefb06978a1073cc023400d6b0d498327e4d858b6c8aa978ea0c2b"
+    ),
+    "source_digests": LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
+}
 ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
     "scripts/bulkload_lib/cli.py": (
         "90a534ebfec72ea7492990447a148f14049aa6ee80d10e20cf8d11b00773d193"
@@ -73,17 +96,6 @@ ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
     "scripts/bulkload_lib/sessions.py": (
         "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
     ),
-}
-LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4 = {
-    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
-    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
-    "policy_sha256": (
-        "6167a5a60ec621400c564f689be8c6617caa06ea9b2b80197664e48e111f22fc"
-    ),
-    "runtime_source_sha256": (
-        "14ecf2c208cefb06978a1073cc023400d6b0d498327e4d858b6c8aa978ea0c2b"
-    ),
-    "source_digests": LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
 }
 ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4 = {
     "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
@@ -143,6 +155,46 @@ ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5 = {
 _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V5 = frozenset(
     (canonical_bytes(ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5),)
 )
+ACCEPTED_H7_PRIVATE_RUNTIME_SOURCE_DIGESTS_V6 = {
+    "scripts/bulkload_lib/cli.py": (
+        "0fd41ba9cf57d53f21e66045c08ff2878d9805332707f69a82943b5ac7c570c7"
+    ),
+    "scripts/bulkload_lib/private_apply.py": (
+        "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
+    ),
+    "scripts/bulkload_lib/private_quiescence.py": (
+        "7b7e3e110f030a536f2b74bfc0079d59681b5af740f68859e96596f22d3d0423"
+    ),
+    "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+        "d6d74b8ff4338effd1c30571aa11aa079df1450be43b142187119b700189f080"
+    ),
+    "scripts/bulkload_lib/private_sqlite_close.py": (
+        "8886c3b443747a827e977a784df60c75218d3586d27c9976aa6e77e765565763"
+    ),
+    "scripts/bulkload_lib/private_sqlite_plan.py": (
+        "e45dc732fe1a208bbbea1455d25435754d49397d9a0bea471d5bd5265321398c"
+    ),
+    "scripts/bulkload_lib/private_sqlite_request.py": (
+        "01b739dea9e5a45c90e71905a8f430d634247495c268143847501d074fcd85e9"
+    ),
+    "scripts/bulkload_lib/private_state.py": (
+        "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
+    ),
+    "scripts/bulkload_lib/sessions.py": (
+        "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
+    ),
+}
+ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V6,
+    "policy_sha256": (
+        "6d8c1e01c7ea244adb5e3d09279c8ac640a8a5a3c9a4966b30eeff5cc56e289e"
+    ),
+    "runtime_source_sha256": (
+        "5adfc213cf657d24d3bd8de3ab6b5f9e3d1bf14627045c8526d0b32241f460f5"
+    ),
+    "source_digests": ACCEPTED_H7_PRIVATE_RUNTIME_SOURCE_DIGESTS_V6,
+}
 PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-capture",
     "codex-close-capture",
@@ -158,13 +210,18 @@ PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
-    "codex-private-sqlite-capacity-observe",
-    "codex-private-sqlite-compose-request",
     "codex-private-verify",
 ]
 PRIVATE_FORBIDDEN_COMMANDS = [
     "codex-private-combined-apply",
+    "codex-private-sqlite-capacity-observe",
     "codex-private-sqlite-compose",
+    "codex-private-sqlite-compose-request",
+    "codex-private-sqlite-install",
+    "codex-private-sqlite-oracle",
+    "codex-private-sqlite-publish",
+    "codex-private-sqlite-verifier-oracle",
+    "codex-private-sqlite-verify",
     "codex-state-apply",
 ]
 PRIVATE_STATE_CLASSES = {
@@ -212,11 +269,14 @@ PRIVATE_STATE_CLASSES = {
         "legacy_sqlite_close_action_validator_implemented": True,
         "sqlite_compose_plan_implemented": False,
         "sqlite_compose_action_plan_implemented": False,
-        "sqlite_compose_request_implemented": True,
-        "capacity_observation_implemented": True,
+        "sqlite_compose_request_implemented": False,
+        "capacity_observation_implemented": False,
+        "sqlite_verifier_oracle_internal_only": True,
+        "independent_verification_receipt_implemented": False,
+        "offline_bundle_writer_implemented": False,
         "workspace_reservation_implemented": False,
-        "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
-        "post_plan_close_implemented": True,
+        "sqlite_compose_request_scope": "frozen-v6-validator-only",
+        "post_plan_close_implemented": False,
         "wal_aware_capture": False,
     },
 }
@@ -389,9 +449,11 @@ def _validate_policy(
         != {
             "auth_install": True,
             "sqlite_compose_action_plan": False,
-            "sqlite_compose_request": True,
-            "sqlite_capacity_observation": True,
+            "sqlite_compose_request": False,
+            "sqlite_capacity_observation": False,
             "sqlite_compose_plan": False,
+            "sqlite_verifier_oracle_internal_only": True,
+            "sqlite_independent_verification": False,
             "sqlite_compose": False,
             "sqlite_publish": False,
             "combined": False,
@@ -402,6 +464,7 @@ def _validate_policy(
     if (
         not isinstance(source_digests, dict)
         or set(source_digests) != PRIVATE_RUNTIME_SOURCE_KEYS
+        or set(payloads) != PRIVATE_RUNTIME_SOURCE_KEYS
     ):
         raise BulkloadError("private-state policy source inventory differs")
     for path, expected in source_digests.items():
@@ -459,6 +522,13 @@ def validate_private_runtime_authority(value: Any) -> dict[str, Any]:
             raise BulkloadError(
                 "legacy private runtime authority differs from exact accepted-H6 "
                 "v5 closure"
+            )
+        return value
+    if value["policy_schema"] == LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V6:
+        if value != ACCEPTED_H7_PRIVATE_RUNTIME_AUTHORITY_V6:
+            raise BulkloadError(
+                "legacy private runtime authority differs from exact accepted-H7 "
+                "v6 closure"
             )
         return value
     if (

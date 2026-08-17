@@ -4,7 +4,6 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -16,15 +15,8 @@ from bulkload_lib.model import (
     canonical_bytes,
     utc_now,
 )
-from bulkload_lib.cli import (
-    _codex_private_sqlite_close_request,
-    _codex_private_sqlite_session_reclose,
-)
-from bulkload_lib import cli as bulkload_cli
-from bulkload_lib import private_runtime, private_sqlite_close, private_sqlite_plan
+from bulkload_lib import private_runtime, private_sqlite_close
 from bulkload_lib.private_sqlite_close import (
-    capture_codex_private_sqlite_session_reclose,
-    compile_codex_private_sqlite_close_request,
     validate_codex_private_sqlite_close_request,
     validate_codex_private_sqlite_close_request_against_inputs,
     validate_codex_private_sqlite_close_request_against_openings,
@@ -42,6 +34,10 @@ from bulkload_lib.private_sqlite_plan import (
 from bulkload_lib.sessions import (
     capture_codex_sessions,
     compile_codex_session_union_plan,
+)
+from tests.private_sqlite_legacy_fixtures import (
+    build_v5_close_request_fixture,
+    build_v5_session_reclose_fixture,
 )
 
 
@@ -237,80 +233,20 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
             "opening_path_map": {},
         }
 
-    def test_private_close_cli_rejects_stdout_custody_bypass(self) -> None:
-        for handler in (
-            _codex_private_sqlite_close_request,
-            _codex_private_sqlite_session_reclose,
-        ):
-            with self.subTest(handler=handler.__name__):
-                with self.assertRaisesRegex(
-                    BulkloadError,
-                    "owner-private output file",
-                ):
-                    handler(SimpleNamespace(output="-"))
-
-    def test_reclose_cli_requires_the_close_requests_exact_runtime(self) -> None:
-        request = self.compile_request()
-        for handler, arguments in (
-            (
-                bulkload_cli._codex_private_sqlite_session_reclose,
-                SimpleNamespace(
-                    output="/private/session-close.json",
-                    close_request="/private/close.json",
-                ),
-            ),
-            (
-                bulkload_cli._codex_private_sqlite_private_reclose,
-                SimpleNamespace(close_request="/private/close.json"),
-            ),
-        ):
-            with self.subTest(handler=handler.__name__):
-                with (
-                    mock.patch.object(
-                        bulkload_cli,
-                        "_read_pinned_codex_json",
-                        return_value=(request, 99, ()),
-                    ),
-                    mock.patch.object(
-                        bulkload_cli.private_runtime,
-                        "open_pinned_private_runtime_authority",
-                        side_effect=BulkloadError("runtime mismatch"),
-                    ) as opener,
-                    mock.patch.object(bulkload_cli.os, "close"),
-                ):
-                    with self.assertRaisesRegex(
-                        BulkloadError,
-                        "runtime mismatch",
-                    ):
-                        handler(arguments)
-                opener.assert_called_once_with(request["runtime_authority"])
-
     def compile_request(self) -> dict:
-        with (
-            mock.patch.object(
-                private_sqlite_close,
-                "validate_codex_private_sqlite_compose_plan",
-            ),
-            mock.patch.object(
-                private_sqlite_close,
-                "validate_codex_private_sqlite_compose_plan_against_inputs",
-            ),
-        ):
-            return compile_codex_private_sqlite_close_request(
-                self.opening_plan,
-                self.session_plan,
-                self.source_a,
-                self.source_b,
-                self.destination_a,
-                self.destination_b,
-                active_runtime_authority(),
-                accept_opening_plan=self.opening_plan["plan_sha256"],
-                accept_session_union_plan=self.session_plan["plan_sha256"],
-                writer_stop_epoch_id=self.epoch_id,
-                writer_stop_epoch_at=utc_now(),
-                acknowledge_provider_writers_stopped=True,
-                **self.opening_revalidation_inputs(),
-            )
+        created_at = utc_now()
+        return build_v5_close_request_fixture(
+            self.opening_plan,
+            self.session_plan,
+            self.source_a,
+            self.source_b,
+            self.destination_a,
+            self.destination_b,
+            active_runtime_authority(),
+            writer_stop_epoch_id=self.epoch_id,
+            writer_stop_epoch_at=created_at,
+            created_at=created_at,
+        )
 
     def test_request_binds_exact_bodies_projections_catalogs_and_epoch(self) -> None:
         request = self.compile_request()
@@ -391,7 +327,6 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
     def test_full_chain_rejects_self_digested_changed_v4_input(self) -> None:
         request = self.compile_request()
         opening = deepcopy(self.opening_plan)
-        opening["runtime_authority"] = active_runtime_authority()
         changed_path_map = {
             "schema": SQLITE_PATH_MAP_SCHEMA,
             "mapping_id": str(uuid.uuid4()),
@@ -429,21 +364,18 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                private_sqlite_plan,
+                private_sqlite_close,
                 "validate_codex_private_sqlite_compose_plan",
             ),
             mock.patch.object(
-                private_sqlite_plan,
-                "validate_codex_private_state_plan",
-            ),
-            mock.patch.object(
-                private_sqlite_plan,
-                "validate_sqlite_adapter_registry",
-            ),
+                private_sqlite_close,
+                "validate_codex_private_sqlite_compose_plan_against_inputs",
+                side_effect=BulkloadError("opening input drift"),
+            ) as validate_opening,
         ):
             with self.assertRaisesRegex(
                 BulkloadError,
-                "accepted SQLite path-map digest differs",
+                "opening input drift",
             ):
                 validate_codex_private_sqlite_close_request_against_inputs(
                     request,
@@ -474,8 +406,22 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                     },
                     opening_path_map=changed_path_map,
                 )
+        self.assertIs(validate_opening.call_args.kwargs["path_map"], changed_path_map)
 
-    def test_request_rejects_digest_epoch_and_custody_mismatch(self) -> None:
+    def test_request_rejects_epoch_and_custody_mismatch(self) -> None:
+        request = self.compile_request()
+        malformed_epoch = deepcopy(request)
+        malformed_epoch["writer_stop_epoch"]["stopped_at"] = "2026-07-29T00:00:00+00:00"
+        malformed_epoch["close_request_sha256"] = object_digest(
+            malformed_epoch,
+            "close_request_sha256",
+        )
+        with self.assertRaisesRegex(BulkloadError, "canonical UTC-seconds"):
+            validate_codex_private_sqlite_close_request(malformed_epoch)
+
+        crossed = deepcopy(self.opening_plan)
+        crossed["session_union"]["source"] = self.session_plan["destination"]
+        crossed["plan_sha256"] = object_digest(crossed, "plan_sha256")
         with (
             mock.patch.object(
                 private_sqlite_close,
@@ -486,44 +432,9 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                 "validate_codex_private_sqlite_compose_plan_against_inputs",
             ),
         ):
-            with self.assertRaisesRegex(BulkloadError, "opening-plan digest"):
-                compile_codex_private_sqlite_close_request(
-                    self.opening_plan,
-                    self.session_plan,
-                    self.source_a,
-                    self.source_b,
-                    self.destination_a,
-                    self.destination_b,
-                    active_runtime_authority(),
-                    accept_opening_plan="0" * 64,
-                    accept_session_union_plan=self.session_plan["plan_sha256"],
-                    writer_stop_epoch_id=self.epoch_id,
-                    writer_stop_epoch_at=utc_now(),
-                    acknowledge_provider_writers_stopped=True,
-                    **self.opening_revalidation_inputs(),
-                )
-
-            with self.assertRaisesRegex(BulkloadError, "canonical UTC-seconds"):
-                compile_codex_private_sqlite_close_request(
-                    self.opening_plan,
-                    self.session_plan,
-                    self.source_a,
-                    self.source_b,
-                    self.destination_a,
-                    self.destination_b,
-                    active_runtime_authority(),
-                    accept_opening_plan=self.opening_plan["plan_sha256"],
-                    accept_session_union_plan=self.session_plan["plan_sha256"],
-                    writer_stop_epoch_id=self.epoch_id,
-                    writer_stop_epoch_at="2026-07-29T00:00:00+00:00",
-                    acknowledge_provider_writers_stopped=True,
-                    **self.opening_revalidation_inputs(),
-                )
-            crossed = deepcopy(self.opening_plan)
-            crossed["session_union"]["source"] = self.session_plan["destination"]
-            crossed["plan_sha256"] = object_digest(crossed, "plan_sha256")
             with self.assertRaisesRegex(BulkloadError, "exact session union"):
-                compile_codex_private_sqlite_close_request(
+                validate_codex_private_sqlite_close_request_against_inputs(
+                    request,
                     crossed,
                     self.session_plan,
                     self.source_a,
@@ -531,49 +442,40 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                     self.destination_a,
                     self.destination_b,
                     active_runtime_authority(),
-                    accept_opening_plan=crossed["plan_sha256"],
-                    accept_session_union_plan=self.session_plan["plan_sha256"],
-                    writer_stop_epoch_id=self.epoch_id,
-                    writer_stop_epoch_at=utc_now(),
-                    acknowledge_provider_writers_stopped=True,
                     **self.opening_revalidation_inputs(),
                 )
 
-    def test_close_request_rejects_both_legacy_v4_runtime_authorities(
-        self,
-    ) -> None:
-        for authority in (
-            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
-            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+    def test_against_inputs_is_candidate_in_none_out(self) -> None:
+        request = self.compile_request()
+        with (
+            mock.patch.object(
+                private_sqlite_close,
+                "validate_codex_private_sqlite_compose_plan",
+            ),
+            mock.patch.object(
+                private_sqlite_close,
+                "validate_codex_private_sqlite_compose_plan_against_inputs",
+            ),
         ):
-            with self.subTest(policy_sha256=authority["policy_sha256"]):
-                with self.assertRaisesRegex(
-                    BulkloadError,
-                    "requires the exact accepted-H6 v5 producer authority",
-                ):
-                    compile_codex_private_sqlite_close_request(
-                        self.opening_plan,
-                        self.session_plan,
-                        self.source_a,
-                        self.source_b,
-                        self.destination_a,
-                        self.destination_b,
-                        authority,
-                        accept_opening_plan=self.opening_plan["plan_sha256"],
-                        accept_session_union_plan=(self.session_plan["plan_sha256"]),
-                        writer_stop_epoch_id=self.epoch_id,
-                        writer_stop_epoch_at=utc_now(),
-                        acknowledge_provider_writers_stopped=True,
-                        **self.opening_revalidation_inputs(),
-                    )
+            self.assertIsNone(
+                validate_codex_private_sqlite_close_request_against_inputs(
+                    request,
+                    self.opening_plan,
+                    self.session_plan,
+                    self.source_a,
+                    self.source_b,
+                    self.destination_a,
+                    self.destination_b,
+                    active_runtime_authority(),
+                    **self.opening_revalidation_inputs(),
+                )
+            )
 
     def capture_reclose(self, request: dict, root: Path, role: str) -> dict:
-        return capture_codex_private_sqlite_session_reclose(
+        return build_v5_session_reclose_fixture(
             root,
             role=role,
             close_request=request,
-            accept_close_request=request["close_request_sha256"],
-            writer_stop_epoch_id=self.epoch_id,
             acknowledge_writers_quiesced=True,
         )
 
@@ -730,44 +632,31 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                 destination_b,
             )
 
-    def test_reclose_never_accepts_stale_snapshot_and_rejects_live_drift(self) -> None:
+    def test_reclose_fixture_rejects_live_drift(self) -> None:
         request = self.compile_request()
-        with self.assertRaises(TypeError):
-            capture_codex_private_sqlite_session_reclose(
-                self.source_root,
-                role="source",
-                close_request=request,
-                accept_close_request=request["close_request_sha256"],
-                writer_stop_epoch_id=self.epoch_id,
-                acknowledge_writers_quiesced=True,
-                snapshot=self.source_a,
-            )
-        with self.assertRaisesRegex(BulkloadError, "close-request digest"):
-            capture_codex_private_sqlite_session_reclose(
-                self.source_root,
-                role="source",
-                close_request=request,
-                accept_close_request="0" * 64,
-                writer_stop_epoch_id=self.epoch_id,
-                acknowledge_writers_quiesced=True,
-            )
         with self.source_rollout.open("a", encoding="utf-8") as output:
             output.write("{}\n")
+        capture = self.capture_reclose(request, self.source_root, "source")
         with self.assertRaisesRegex(BulkloadError, "differs from opening custody"):
-            self.capture_reclose(request, self.source_root, "source")
+            private_sqlite_close.validate_codex_private_sqlite_session_reclose_capture_against_request(
+                capture,
+                request,
+                role="source",
+            )
 
     def test_post_publication_live_revalidation_rejects_session_drift(self) -> None:
         request = self.compile_request()
         capture = self.capture_reclose(request, self.source_root, "source")
-        validate_codex_private_sqlite_session_reclose_against_live(
+        persisted = deepcopy(capture)
+        result = validate_codex_private_sqlite_session_reclose_against_live(
             capture,
             self.source_root,
             request,
             role="source",
-            accept_close_request=request["close_request_sha256"],
-            writer_stop_epoch_id=self.epoch_id,
             acknowledge_writers_quiesced=True,
         )
+        self.assertIsNone(result)
+        self.assertEqual(capture, persisted)
         with self.source_rollout.open("a", encoding="utf-8") as output:
             output.write("{}\n")
         with self.assertRaisesRegex(BulkloadError, "differs from opening custody"):
@@ -776,8 +665,6 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                 self.source_root,
                 request,
                 role="source",
-                accept_close_request=request["close_request_sha256"],
-                writer_stop_epoch_id=self.epoch_id,
                 acknowledge_writers_quiesced=True,
             )
 
