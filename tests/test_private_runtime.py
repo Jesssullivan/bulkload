@@ -34,6 +34,9 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             b"def compile_plan(): return None\n"
         ),
+        "scripts/bulkload_lib/private_sqlite_request.py": (
+            b"def compile_request(): return None\n"
+        ),
         "scripts/bulkload_lib/private_state.py": b"def capture(): return None\n",
         "scripts/bulkload_lib/sessions.py": b"def sessions(): return None\n",
         "scripts/bulkload_lib/other.py": b"VALUE = 1\n",
@@ -53,8 +56,10 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
             "auth_install": True,
             "combined": False,
             "sqlite_compose": False,
-            "sqlite_compose_action_plan": True,
-            "sqlite_compose_plan": True,
+            "sqlite_compose_action_plan": False,
+            "sqlite_compose_request": True,
+            "sqlite_capacity_observation": True,
+            "sqlite_compose_plan": False,
             "sqlite_publish": False,
         },
         "source_digests": source_digests,
@@ -204,6 +209,33 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
             with self.subTest(malformed=label):
                 with self.assertRaises(BulkloadError):
                     private_runtime.validate_private_runtime_authority(malformed)
+
+    def test_only_the_exact_accepted_h6_v5_authority_is_accepted(
+        self,
+    ) -> None:
+        legacy = json.loads(
+            json.dumps(private_runtime.ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5)
+        )
+        self.assertEqual(
+            private_runtime.validate_private_runtime_authority(legacy),
+            legacy,
+        )
+        for field in (
+            "policy_sha256",
+            "runtime_source_sha256",
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(legacy))
+                changed[field] = "0" * 64
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "exact accepted-H6 v5 closure",
+                ):
+                    private_runtime.validate_private_runtime_authority(changed)
+        changed = json.loads(json.dumps(legacy))
+        changed["source_digests"]["scripts/bulkload_lib/cli.py"] = "0" * 64
+        with self.assertRaisesRegex(BulkloadError, "exact accepted-H6 v5 closure"):
+            private_runtime.validate_private_runtime_authority(changed)
 
     def test_path_replacement_and_inventory_drift_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

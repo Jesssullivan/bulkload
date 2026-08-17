@@ -216,9 +216,10 @@ A complete v5 descriptive action plan binds:
 It deliberately does not bind a concrete compose output, scratch directory,
 free-space proof, publication parent, or manifest/receipt schema. Therefore
 `descriptive_action_complete` may become true, but
-`ready_for_offline_compose=false` remains invariant in v5. A later internal
-composer request must add those authorities without changing this plan's
-semantic union.
+`ready_for_offline_compose=false` remains invariant in v5. Policy v6 may add a
+protected output/workspace intent and conservative capacity requirement
+without changing this plan's semantic union; it still binds no composer
+runtime, reservation, manifest/receipt implementation, or write authority.
 
 The operation graph is descriptive. It may name only these future internal
 steps:
@@ -243,7 +244,8 @@ Every JSON input is opened no-follow, owner-only, single-link, bounded, and
 pinned through plan publication. Every bundle manifest, SQLite snapshot, and
 session close artifact is revalidated before and after publication.
 
-A future composer request must prove that its scratch and proposed output are
+The [v6 compose-request contract](codex-private-sqlite-compose-request.md)
+proves that its proposed workspace and output are
 outside:
 
 - every live Codex, SQLite, and session root;
@@ -251,10 +253,11 @@ outside:
 - the runtime and policy roots; and
 - each other.
 
-That later proposed output must be create-only beneath an exact `0700` parent;
-future files are `0600`. Symlinks, hardlinks, cross-device publication, parent
-swaps, an existing target, and insufficient free space remain future
-composition blockers, not claims made by this descriptive plan.
+The proposed output is absent and create-only beneath an exact `0700` parent;
+future files are `0600`. V6 separately records caller-available capacity but
+reserves nothing. Symlinks, hardlinks, cross-device publication, parent swaps,
+an existing target, and insufficient space remain composition blockers, not
+write authority granted by this descriptive plan or its v6 request.
 
 The action plan is accepted only after complete against-input recomputation
 before and after publication. Editing and re-digesting a persisted opening,
@@ -292,16 +295,18 @@ against-input recomputation.
 
 ## Later slices
 
-1. **V5 close/action plan:** this reference; no composer command.
-2. **Internal offline composer:** stream into a complete sealed bundle and
+1. **V5 close/action plan:** this reference; immutable producer authority.
+2. **V6 request/capacity observation:** protected absent output intent and a
+   volatile preflight only; no composer command or reservation.
+3. **Internal offline composer:** stream into a complete sealed bundle and
    independently verify it; no public command or readiness flip.
-3. **Production adapters and command enablement:** review every observed
+4. **Production adapters and command enablement:** review every observed
    family/table adapter, then expose digest-accepted offline composition and
    set only `sqlite_compose=true`.
-4. **Publisher and recovery:** no-replace same-filesystem publication with
+5. **Publisher and recovery:** no-replace same-filesystem publication with
    crash recovery; keep activation separate.
-5. **Session execution and independent verification:** produce a bound session
+6. **Session execution and independent verification:** produce a bound session
    receipt before `sqlite_union_ready` may become true.
-6. **Attended provider acceptance and cutover:** picker, resume, dialog, new
+7. **Attended provider acceptance and cutover:** picker, resume, dialog, new
    thread, authentication, rollback, and an independently authorized live
    transition.

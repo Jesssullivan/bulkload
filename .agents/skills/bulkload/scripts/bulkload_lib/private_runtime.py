@@ -11,15 +11,18 @@ from typing import Any
 from .model import BulkloadError, canonical_bytes, sha256_bytes
 
 
-PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v5.json"
-PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v5"
+PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v6.json"
+PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v6"
 LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4 = (
     "dev.tinyland.bulkload.codex-private-state-policy.v4"
+)
+LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5 = (
+    "dev.tinyland.bulkload.codex-private-state-policy.v5"
 )
 PRIVATE_RUNTIME_AUTHORITY_SCHEMA = (
     "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
 )
-PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-action-plan-v5"
+PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-request-v6"
 PRIVATE_RUNTIME_SOURCE_KEYS = {
     "scripts/bulkload_lib/cli.py",
     "scripts/bulkload_lib/private_apply.py",
@@ -27,6 +30,7 @@ PRIVATE_RUNTIME_SOURCE_KEYS = {
     "scripts/bulkload_lib/private_sqlite_action_plan.py",
     "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
+    "scripts/bulkload_lib/private_sqlite_request.py",
     "scripts/bulkload_lib/private_state.py",
     "scripts/bulkload_lib/sessions.py",
 }
@@ -99,6 +103,46 @@ _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4 = frozenset(
         ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
     )
 )
+ACCEPTED_H6_PRIVATE_RUNTIME_SOURCE_DIGESTS_V5 = {
+    "scripts/bulkload_lib/cli.py": (
+        "5d5aa2b9d9a8f04413a49dff92a8c4eb545d54a2970d9b5371b7b52bac9e4238"
+    ),
+    "scripts/bulkload_lib/private_apply.py": (
+        "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
+    ),
+    "scripts/bulkload_lib/private_quiescence.py": (
+        "7b7e3e110f030a536f2b74bfc0079d59681b5af740f68859e96596f22d3d0423"
+    ),
+    "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+        "7da422b4fd63b8c9fbf78797f9a27684648cdf165ac93c4dca26bb3ddf4ba2e3"
+    ),
+    "scripts/bulkload_lib/private_sqlite_close.py": (
+        "676f71c01fc1151a1019bbef2f7b42d4cf0e0b933ce3487f2529efe4e9a1d864"
+    ),
+    "scripts/bulkload_lib/private_sqlite_plan.py": (
+        "e45dc732fe1a208bbbea1455d25435754d49397d9a0bea471d5bd5265321398c"
+    ),
+    "scripts/bulkload_lib/private_state.py": (
+        "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
+    ),
+    "scripts/bulkload_lib/sessions.py": (
+        "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
+    ),
+}
+ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5,
+    "policy_sha256": (
+        "78318633ef06ca12d6dc7e72199c07dc6f5cfdf0e9cf13bc5bd3f3e7c2ddbcf0"
+    ),
+    "runtime_source_sha256": (
+        "cc9f96adb8189e0a41133244231edf51dd837fa75459728355b93eeb981c7392"
+    ),
+    "source_digests": ACCEPTED_H6_PRIVATE_RUNTIME_SOURCE_DIGESTS_V5,
+}
+_ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V5 = frozenset(
+    (canonical_bytes(ACCEPTED_H6_PRIVATE_RUNTIME_AUTHORITY_V5),)
+)
 PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-capture",
     "codex-close-capture",
@@ -114,11 +158,8 @@ PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
-    "codex-private-sqlite-close-request",
-    "codex-private-sqlite-compose-action-plan",
-    "codex-private-sqlite-compose-plan",
-    "codex-private-sqlite-private-reclose",
-    "codex-private-sqlite-session-reclose",
+    "codex-private-sqlite-capacity-observe",
+    "codex-private-sqlite-compose-request",
     "codex-private-verify",
 ]
 PRIVATE_FORBIDDEN_COMMANDS = [
@@ -167,9 +208,14 @@ PRIVATE_STATE_CLASSES = {
         "runtime_acceptance_required": True,
         "session_union_execution_verified": False,
         "source_sqlite_required_for_auth_install": False,
-        "sqlite_compose_plan_implemented": True,
-        "sqlite_compose_action_plan_implemented": True,
-        "sqlite_compose_plan_scope": "opening-v4-close-action-plan-v5",
+        "legacy_sqlite_opening_validator_implemented": True,
+        "legacy_sqlite_close_action_validator_implemented": True,
+        "sqlite_compose_plan_implemented": False,
+        "sqlite_compose_action_plan_implemented": False,
+        "sqlite_compose_request_implemented": True,
+        "capacity_observation_implemented": True,
+        "workspace_reservation_implemented": False,
+        "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
         "post_plan_close_implemented": True,
         "wal_aware_capture": False,
     },
@@ -342,8 +388,10 @@ def _validate_policy(
         or policy["readiness"]
         != {
             "auth_install": True,
-            "sqlite_compose_action_plan": True,
-            "sqlite_compose_plan": True,
+            "sqlite_compose_action_plan": False,
+            "sqlite_compose_request": True,
+            "sqlite_capacity_observation": True,
+            "sqlite_compose_plan": False,
             "sqlite_compose": False,
             "sqlite_publish": False,
             "combined": False,
@@ -404,6 +452,13 @@ def validate_private_runtime_authority(value: Any) -> dict[str, Any]:
         if canonical_bytes(value) not in _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4:
             raise BulkloadError(
                 "legacy private runtime authority differs from exact v4 closures"
+            )
+        return value
+    if value["policy_schema"] == LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5:
+        if canonical_bytes(value) not in _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V5:
+            raise BulkloadError(
+                "legacy private runtime authority differs from exact accepted-H6 "
+                "v5 closure"
             )
         return value
     if (

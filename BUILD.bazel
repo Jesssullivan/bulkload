@@ -8,6 +8,7 @@ py_library(
     data = [
         ".agents/skills/bulkload/references/codex-private-state-policy.v4.json",
         ".agents/skills/bulkload/references/codex-private-state-policy.v5.json",
+        ".agents/skills/bulkload/references/codex-private-state-policy.v6.json",
         ".agents/skills/bulkload/scripts/bulkload.py",
     ],
     imports = [".agents/skills/bulkload/scripts"],

@@ -306,10 +306,11 @@ def compile_codex_private_sqlite_close_request(
     private_runtime.validate_private_runtime_authority(runtime_authority)
     if (
         runtime_authority["policy_schema"]
-        != private_runtime.PRIVATE_STATE_POLICY_SCHEMA
+        != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError(
-            "private SQLite close request requires the active runtime authority"
+            "private SQLite close request requires the exact accepted-H6 v5 "
+            "producer authority"
         )
     validate_codex_private_sqlite_compose_plan(opening_plan)
     if accept_opening_plan != opening_plan["plan_sha256"]:
@@ -555,10 +556,11 @@ def validate_codex_private_sqlite_close_request(
     private_runtime.validate_private_runtime_authority(value["runtime_authority"])
     if (
         value["runtime_authority"]["policy_schema"]
-        != private_runtime.PRIVATE_STATE_POLICY_SCHEMA
+        != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError(
-            "private SQLite close request requires the active runtime authority"
+            "private SQLite close request requires the exact accepted-H6 v5 "
+            "producer authority"
         )
     if value["opening_inputs_revalidated"] is not True:
         raise BulkloadError(

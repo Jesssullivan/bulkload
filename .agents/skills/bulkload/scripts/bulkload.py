@@ -180,10 +180,10 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-POLICY_NAME = "codex-private-state-policy.v5.json"
-POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v5"
+POLICY_NAME = "codex-private-state-policy.v6.json"
+POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v6"
 RUNTIME_SCHEMA = "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
-IMPLEMENTATION = "auth-atomic-replace-sqlite-action-plan-v5"
+IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-request-v6"
 MAX_POLICY_BYTES = 1024 * 1024
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
 CORE_SOURCE_KEYS = {
@@ -193,6 +193,7 @@ CORE_SOURCE_KEYS = {
     "scripts/bulkload_lib/private_sqlite_action_plan.py",
     "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
+    "scripts/bulkload_lib/private_sqlite_request.py",
     "scripts/bulkload_lib/private_state.py",
     "scripts/bulkload_lib/sessions.py",
 }
@@ -211,11 +212,8 @@ ALLOWED_CODEX_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
-    "codex-private-sqlite-close-request",
-    "codex-private-sqlite-compose-action-plan",
-    "codex-private-sqlite-compose-plan",
-    "codex-private-sqlite-private-reclose",
-    "codex-private-sqlite-session-reclose",
+    "codex-private-sqlite-capacity-observe",
+    "codex-private-sqlite-compose-request",
     "codex-private-verify",
 ]
 FORBIDDEN_COMMANDS = [
@@ -264,9 +262,14 @@ STATE_CLASSES = {
         "runtime_acceptance_required": True,
         "session_union_execution_verified": False,
         "source_sqlite_required_for_auth_install": False,
-        "sqlite_compose_action_plan_implemented": True,
-        "sqlite_compose_plan_implemented": True,
-        "sqlite_compose_plan_scope": "opening-v4-close-action-plan-v5",
+        "legacy_sqlite_opening_validator_implemented": True,
+        "legacy_sqlite_close_action_validator_implemented": True,
+        "sqlite_compose_action_plan_implemented": False,
+        "sqlite_compose_request_implemented": True,
+        "capacity_observation_implemented": True,
+        "workspace_reservation_implemented": False,
+        "sqlite_compose_plan_implemented": False,
+        "sqlite_compose_request_scope": "exact-accepted-h6-v5-input-only",
         "post_plan_close_implemented": True,
         "wal_aware_capture": False,
     },
@@ -586,8 +589,10 @@ def _validate_policy(
         or policy["readiness"]
         != {
             "auth_install": True,
-            "sqlite_compose_action_plan": True,
-            "sqlite_compose_plan": True,
+            "sqlite_compose_action_plan": False,
+            "sqlite_compose_request": True,
+            "sqlite_capacity_observation": True,
+            "sqlite_compose_plan": False,
             "sqlite_compose": False,
             "sqlite_publish": False,
             "combined": False,

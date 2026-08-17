@@ -656,7 +656,7 @@ def compile_codex_private_sqlite_action_plan(
     private_runtime.validate_private_runtime_authority(runtime_authority)
     if (
         runtime_authority["policy_schema"]
-        != private_runtime.PRIVATE_STATE_POLICY_SCHEMA
+        != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError("private SQLite action plan requires policy v5")
     if close_request["runtime_authority"] != runtime_authority:
@@ -1287,7 +1287,7 @@ def validate_codex_private_sqlite_action_plan(
     private_runtime.validate_private_runtime_authority(plan["runtime_authority"])
     if (
         plan["runtime_authority"]["policy_schema"]
-        != private_runtime.PRIVATE_STATE_POLICY_SCHEMA
+        != private_runtime.LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V5
     ):
         raise BulkloadError("private SQLite action plan requires policy v5")
     accepted = _require_exact_keys(
