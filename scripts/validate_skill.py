@@ -45,7 +45,7 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     },
     "source_digests": {
         "scripts/bulkload_lib/cli.py": (
-            "a22ba444f296c275b959c8ed746dffc0d05ac6b274302cdee19c107063c4571f"
+            "90a534ebfec72ea7492990447a148f14049aa6ee80d10e20cf8d11b00773d193"
         ),
         "scripts/bulkload_lib/private_apply.py": (
             "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
@@ -60,11 +60,11 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "942d8254d2fc3f232cd59e82e1b37ff250ba560c0d2465d4806638512e1b9815"
         ),
         "scripts/bulkload_lib/sessions.py": (
-            "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
+            "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
         ),
     },
     "runtime_source_sha256": (
-        "14ecf2c208cefb06978a1073cc023400d6b0d498327e4d858b6c8aa978ea0c2b"
+        "17e2de0a56e1b18baf5d9b070c33f5390dd50620ee6908eb575c2842c5c63ef3"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
