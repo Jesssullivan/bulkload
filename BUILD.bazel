@@ -7,6 +7,7 @@ py_library(
     srcs = glob([".agents/skills/bulkload/scripts/bulkload_lib/**/*.py"]),
     data = [
         ".agents/skills/bulkload/references/codex-private-state-policy.v4.json",
+        ".agents/skills/bulkload/references/codex-private-state-policy.v5.json",
         ".agents/skills/bulkload/scripts/bulkload.py",
     ],
     imports = [".agents/skills/bulkload/scripts"],
@@ -86,6 +87,33 @@ py_test(
     main = "tests/test_private_sqlite_plan.py",
     size = "large",
     srcs = ["tests/test_private_sqlite_plan.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "private_sqlite_close_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_close.py",
+    size = "medium",
+    srcs = ["tests/test_private_sqlite_close.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "private_sqlite_action_plan_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_action_plan.py",
+    size = "large",
+    srcs = ["tests/test_private_sqlite_action_plan.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "private_sqlite_expected_output_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_expected_output.py",
+    size = "small",
+    srcs = ["tests/test_private_sqlite_expected_output.py"],
     deps = [":bulkload_lib"],
 )
 
@@ -175,6 +203,9 @@ test_suite(
         ":private_apply_tests",
         ":private_quiescence_tests",
         ":private_runtime_tests",
+        ":private_sqlite_action_plan_tests",
+        ":private_sqlite_close_tests",
+        ":private_sqlite_expected_output_tests",
         ":private_sqlite_plan_tests",
         ":private_state_tests",
         ":repo_contract_test",

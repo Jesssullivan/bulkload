@@ -26,12 +26,12 @@ every boundary.
    - authentication or credentials.
 4. Keep credentials and databases outside the generic repository adapter.
    Codex `auth.json` and provider-owned SQLite families are copy-eligible only
-   through an explicit typed opt-in plan. Policy v4 implements attended atomic
-   auth replacement plus a separate four-pass, session-bound SQLite
-   classification opening request. Destination SQLite remains exact with zero
-   auth-install mutations. SQLite composition, publication, installation, and
-   combined apply remain false. Never log credential values. Any live SQLite
-   WAL, SHM, or rollback journal hard-stops immutable capture.
+   through an explicit typed opt-in plan. Policy v5 retains attended atomic auth
+   replacement and the v4 four-pass SQLite opening, then adds fresh cross-plane closes and a descriptive offline action plan. Destination SQLite remains
+   exact with zero auth-install mutations. SQLite composition,
+   publication, installation, and combined apply remain false. Never log
+   credential values. Any live SQLite WAL, SHM, or rollback journal hard-stops
+   immutable capture.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
@@ -40,12 +40,11 @@ Read [references/migration-contract.md](references/migration-contract.md) for
 the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
-[references/codex-private-state-policy.v4.json](references/codex-private-state-policy.v4.json)
-before classifying Codex auth or SQLite, and use
+[references/codex-private-state-policy.v5.json](references/codex-private-state-policy.v5.json)
+before classifying Codex auth or SQLite. The retained [v4 policy](references/codex-private-state-policy.v4.json) and two exact ratified v4 runtime authorities validate legacy opening evidence only. Use
 [references/codex-private-auth-install.md](references/codex-private-auth-install.md)
-for the attended auth workflow. Read
-[references/codex-private-sqlite-compose-plan.md](references/codex-private-sqlite-compose-plan.md)
-before compiling the non-actionable SQLite opening request.
+for the attended auth workflow. Read the [v4 SQLite opening contract](references/codex-private-sqlite-compose-plan.md)
+before opening, and the [v5 close/action-plan contract](references/codex-private-sqlite-compose-action-plan.md) before closing or compiling an offline action plan.
 
 ## Capture two stable source passes
 
@@ -277,14 +276,15 @@ capture or operation. It is an operator procedural fence with
 cooperating Bulkload processes. Any SQLite WAL, SHM, or rollback journal blocks
 immutable capture.
 
-The private entrypoint pins policy v4 and the full Python runtime closure before
+The private entrypoint pins policy v5 and the full Python runtime closure before
 import, and the compatibility/install plans bind that authority. Review and
 accept both exact plan digests before attended auth apply. Offline receipts do
 not prove provider authentication. Require a fresh attended provider turn.
 Never infer SQLite authority, compose/install SQLite, or use a combined apply.
 The SQLite opening command consumes private and session A/B evidence, an exact
 registry and path map, and always leaves compose, publish, and apply false.
-Fresh post-plan closing captures belong to a later reviewed slice.
+V5 adds fresh cross-plane closes and an offline action plan whose command reopens every original v4 input before and after publication;
+the composer, publisher, installer, and live cutover remain absent.
 
 ## Compile and review the plan
 

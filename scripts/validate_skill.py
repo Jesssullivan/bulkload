@@ -24,47 +24,56 @@ ALLOWED_FRONTMATTER: Final = {
 }
 NAME_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MARKDOWN_LINK: Final = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
-PRIVATE_STATE_POLICY_NAME: Final = "codex-private-state-policy.v4.json"
+PRIVATE_STATE_POLICY_NAME: Final = "codex-private-state-policy.v5.json"
 PRIVATE_SOURCE_PATHS: Final = (
     "scripts/bulkload_lib/cli.py",
     "scripts/bulkload_lib/private_apply.py",
     "scripts/bulkload_lib/private_quiescence.py",
+    "scripts/bulkload_lib/private_sqlite_action_plan.py",
+    "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
     "scripts/bulkload_lib/private_state.py",
     "scripts/bulkload_lib/sessions.py",
 )
 EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
-    "schema": "dev.tinyland.bulkload.codex-private-state-policy.v4",
-    "implementation": "auth-atomic-replace-sqlite-compose-plan-v4",
+    "schema": "dev.tinyland.bulkload.codex-private-state-policy.v5",
+    "implementation": "auth-atomic-replace-sqlite-action-plan-v5",
     "readiness": {
         "auth_install": True,
         "combined": False,
+        "sqlite_compose_action_plan": True,
         "sqlite_compose_plan": True,
         "sqlite_compose": False,
         "sqlite_publish": False,
     },
     "source_digests": {
         "scripts/bulkload_lib/cli.py": (
-            "90a534ebfec72ea7492990447a148f14049aa6ee80d10e20cf8d11b00773d193"
+            "5d5aa2b9d9a8f04413a49dff92a8c4eb545d54a2970d9b5371b7b52bac9e4238"
         ),
         "scripts/bulkload_lib/private_apply.py": (
             "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
         ),
         "scripts/bulkload_lib/private_quiescence.py": (
-            "a7107156552e65db59e93c849d4e89c4322fc614aa27018c580f10768a510296"
+            "7b7e3e110f030a536f2b74bfc0079d59681b5af740f68859e96596f22d3d0423"
+        ),
+        "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+            "7da422b4fd63b8c9fbf78797f9a27684648cdf165ac93c4dca26bb3ddf4ba2e3"
+        ),
+        "scripts/bulkload_lib/private_sqlite_close.py": (
+            "676f71c01fc1151a1019bbef2f7b42d4cf0e0b933ce3487f2529efe4e9a1d864"
         ),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
-            "f67cc27b729914ae321ad81d1fa6934c9acea66b0ae8f5737b6f1de3da908ddd"
+            "e45dc732fe1a208bbbea1455d25435754d49397d9a0bea471d5bd5265321398c"
         ),
         "scripts/bulkload_lib/private_state.py": (
-            "942d8254d2fc3f232cd59e82e1b37ff250ba560c0d2465d4806638512e1b9815"
+            "67a764a4ca8783517c94bd98d5f41af7f42e35a40755361225d316fc9419ba01"
         ),
         "scripts/bulkload_lib/sessions.py": (
             "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
         ),
     },
     "runtime_source_sha256": (
-        "17e2de0a56e1b18baf5d9b070c33f5390dd50620ee6908eb575c2842c5c63ef3"
+        "cc9f96adb8189e0a41133244231edf51dd837fa75459728355b93eeb981c7392"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",
@@ -81,7 +90,11 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
         "codex-private-quiescence-attest",
         "codex-private-recover",
         "codex-private-rollback",
+        "codex-private-sqlite-close-request",
+        "codex-private-sqlite-compose-action-plan",
         "codex-private-sqlite-compose-plan",
+        "codex-private-sqlite-private-reclose",
+        "codex-private-sqlite-session-reclose",
         "codex-private-verify",
     ],
     "state_classes": {
@@ -125,8 +138,10 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
             "runtime_acceptance_required": True,
             "session_union_execution_verified": False,
             "source_sqlite_required_for_auth_install": False,
+            "sqlite_compose_action_plan_implemented": True,
             "sqlite_compose_plan_implemented": True,
-            "sqlite_compose_plan_scope": "four-pass-opening-request-only",
+            "sqlite_compose_plan_scope": "opening-v4-close-action-plan-v5",
+            "post_plan_close_implemented": True,
             "wal_aware_capture": False,
         },
     },
@@ -154,7 +169,13 @@ EXPECTED_CLI_COMMAND_HANDLERS: Final[dict[str, str]] = {
     "codex-private-verify": "_codex_private_verify",
     "codex-private-rollback": "_codex_private_rollback",
     "codex-private-recover": "_codex_private_recover",
+    "codex-private-sqlite-close-request": ("_codex_private_sqlite_close_request"),
+    "codex-private-sqlite-compose-action-plan": (
+        "_codex_private_sqlite_compose_action_plan"
+    ),
     "codex-private-sqlite-compose-plan": ("_codex_private_sqlite_compose_plan"),
+    "codex-private-sqlite-private-reclose": ("_codex_private_sqlite_private_reclose"),
+    "codex-private-sqlite-session-reclose": ("_codex_private_sqlite_session_reclose"),
     "doctor": "_doctor",
     "files": "_files",
     "plan": "_plan",
@@ -360,6 +381,12 @@ def validate_private_state_policy(
             "scripts/bulkload_lib/cli.py": cli_text.encode("utf-8"),
             "scripts/bulkload_lib/private_apply.py": b"legacy-self-test-only\n",
             "scripts/bulkload_lib/private_quiescence.py": b"legacy-self-test-only\n",
+            "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+                b"legacy-self-test-only\n"
+            ),
+            "scripts/bulkload_lib/private_sqlite_close.py": (
+                b"legacy-self-test-only\n"
+            ),
             "scripts/bulkload_lib/private_sqlite_plan.py": (b"legacy-self-test-only\n"),
             "scripts/bulkload_lib/private_state.py": (
                 (private_state_text or "").encode("utf-8")
@@ -368,11 +395,11 @@ def validate_private_state_policy(
         }
     if policy != expected_policy:
         raise SkillContractError(
-            "Codex private-state policy does not match the exact v4 contract"
+            "Codex private-state policy does not match the exact v5 contract"
         )
     if set(source_payloads) != set(PRIVATE_SOURCE_PATHS):
         raise SkillContractError(
-            "private-state core source inventory differs from the v4 contract"
+            "private-state core source inventory differs from the v5 contract"
         )
     for relative in PRIVATE_SOURCE_PATHS:
         observed = hashlib.sha256(source_payloads[relative]).hexdigest()
@@ -579,6 +606,12 @@ def self_test() -> None:
         "scripts/bulkload_lib/cli.py": valid_cli_text,
         "scripts/bulkload_lib/private_apply.py": "def apply(): return None\n",
         "scripts/bulkload_lib/private_quiescence.py": "def attest(): return None\n",
+        "scripts/bulkload_lib/private_sqlite_action_plan.py": (
+            "def compile_action_plan(): return None\n"
+        ),
+        "scripts/bulkload_lib/private_sqlite_close.py": (
+            "def compile_close_request(): return None\n"
+        ),
         "scripts/bulkload_lib/private_sqlite_plan.py": (
             "def compile_plan(): return None\n"
         ),

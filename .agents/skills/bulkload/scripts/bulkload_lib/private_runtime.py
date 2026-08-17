@@ -11,20 +11,94 @@ from typing import Any
 from .model import BulkloadError, canonical_bytes, sha256_bytes
 
 
-PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v4.json"
-PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v4"
+PRIVATE_STATE_POLICY_NAME = "codex-private-state-policy.v5.json"
+PRIVATE_STATE_POLICY_SCHEMA = "dev.tinyland.bulkload.codex-private-state-policy.v5"
+LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4 = (
+    "dev.tinyland.bulkload.codex-private-state-policy.v4"
+)
 PRIVATE_RUNTIME_AUTHORITY_SCHEMA = (
     "dev.tinyland.bulkload.codex-private-runtime-authority.v1"
 )
-PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-compose-plan-v4"
+PRIVATE_INSTALL_IMPLEMENTATION = "auth-atomic-replace-sqlite-action-plan-v5"
 PRIVATE_RUNTIME_SOURCE_KEYS = {
     "scripts/bulkload_lib/cli.py",
     "scripts/bulkload_lib/private_apply.py",
     "scripts/bulkload_lib/private_quiescence.py",
+    "scripts/bulkload_lib/private_sqlite_action_plan.py",
+    "scripts/bulkload_lib/private_sqlite_close.py",
     "scripts/bulkload_lib/private_sqlite_plan.py",
     "scripts/bulkload_lib/private_state.py",
     "scripts/bulkload_lib/sessions.py",
 }
+LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
+    "scripts/bulkload_lib/cli.py": (
+        "a22ba444f296c275b959c8ed746dffc0d05ac6b274302cdee19c107063c4571f"
+    ),
+    "scripts/bulkload_lib/private_apply.py": (
+        "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
+    ),
+    "scripts/bulkload_lib/private_quiescence.py": (
+        "a7107156552e65db59e93c849d4e89c4322fc614aa27018c580f10768a510296"
+    ),
+    "scripts/bulkload_lib/private_sqlite_plan.py": (
+        "f67cc27b729914ae321ad81d1fa6934c9acea66b0ae8f5737b6f1de3da908ddd"
+    ),
+    "scripts/bulkload_lib/private_state.py": (
+        "942d8254d2fc3f232cd59e82e1b37ff250ba560c0d2465d4806638512e1b9815"
+    ),
+    "scripts/bulkload_lib/sessions.py": (
+        "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
+    ),
+}
+ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
+    "scripts/bulkload_lib/cli.py": (
+        "90a534ebfec72ea7492990447a148f14049aa6ee80d10e20cf8d11b00773d193"
+    ),
+    "scripts/bulkload_lib/private_apply.py": (
+        "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
+    ),
+    "scripts/bulkload_lib/private_quiescence.py": (
+        "a7107156552e65db59e93c849d4e89c4322fc614aa27018c580f10768a510296"
+    ),
+    "scripts/bulkload_lib/private_sqlite_plan.py": (
+        "f67cc27b729914ae321ad81d1fa6934c9acea66b0ae8f5737b6f1de3da908ddd"
+    ),
+    "scripts/bulkload_lib/private_state.py": (
+        "942d8254d2fc3f232cd59e82e1b37ff250ba560c0d2465d4806638512e1b9815"
+    ),
+    "scripts/bulkload_lib/sessions.py": (
+        "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
+    ),
+}
+LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
+    "policy_sha256": (
+        "6167a5a60ec621400c564f689be8c6617caa06ea9b2b80197664e48e111f22fc"
+    ),
+    "runtime_source_sha256": (
+        "14ecf2c208cefb06978a1073cc023400d6b0d498327e4d858b6c8aa978ea0c2b"
+    ),
+    "source_digests": LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
+}
+ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
+    "policy_sha256": (
+        "d721c5bad5a046a5a67ec04a708bbf3401016be0a5bd8159a6fb6a41fc5269a3"
+    ),
+    "runtime_source_sha256": (
+        "17e2de0a56e1b18baf5d9b070c33f5390dd50620ee6908eb575c2842c5c63ef3"
+    ),
+    "source_digests": ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
+}
+_ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4 = frozenset(
+    canonical_bytes(authority)
+    for authority in (
+        LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+        ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+    )
+)
 PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-capture",
     "codex-close-capture",
@@ -40,7 +114,11 @@ PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-private-quiescence-attest",
     "codex-private-recover",
     "codex-private-rollback",
+    "codex-private-sqlite-close-request",
+    "codex-private-sqlite-compose-action-plan",
     "codex-private-sqlite-compose-plan",
+    "codex-private-sqlite-private-reclose",
+    "codex-private-sqlite-session-reclose",
     "codex-private-verify",
 ]
 PRIVATE_FORBIDDEN_COMMANDS = [
@@ -90,7 +168,9 @@ PRIVATE_STATE_CLASSES = {
         "session_union_execution_verified": False,
         "source_sqlite_required_for_auth_install": False,
         "sqlite_compose_plan_implemented": True,
-        "sqlite_compose_plan_scope": "four-pass-opening-request-only",
+        "sqlite_compose_action_plan_implemented": True,
+        "sqlite_compose_plan_scope": "opening-v4-close-action-plan-v5",
+        "post_plan_close_implemented": True,
         "wal_aware_capture": False,
     },
 }
@@ -262,6 +342,7 @@ def _validate_policy(
         or policy["readiness"]
         != {
             "auth_install": True,
+            "sqlite_compose_action_plan": True,
             "sqlite_compose_plan": True,
             "sqlite_compose": False,
             "sqlite_publish": False,
@@ -308,18 +389,28 @@ def validate_private_runtime_authority(value: Any) -> dict[str, Any]:
         },
         "private runtime authority",
     )
-    if (
-        value["schema"] != PRIVATE_RUNTIME_AUTHORITY_SCHEMA
-        or value["policy_schema"] != PRIVATE_STATE_POLICY_SCHEMA
-    ):
+    if value["schema"] != PRIVATE_RUNTIME_AUTHORITY_SCHEMA:
         raise BulkloadError("private runtime authority schema differs")
     for key in ("policy_sha256", "runtime_source_sha256"):
         _require_sha256(value[key], f"private runtime authority {key}")
     sources = value["source_digests"]
-    if not isinstance(sources, dict) or set(sources) != PRIVATE_RUNTIME_SOURCE_KEYS:
+    if not isinstance(sources, dict) or any(
+        not isinstance(path, str) for path in sources
+    ):
         raise BulkloadError("private runtime authority source inventory differs")
     for path, digest in sources.items():
         _require_sha256(digest, f"private runtime authority {path}")
+    if value["policy_schema"] == LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4:
+        if canonical_bytes(value) not in _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4:
+            raise BulkloadError(
+                "legacy private runtime authority differs from exact v4 closures"
+            )
+        return value
+    if (
+        value["policy_schema"] != PRIVATE_STATE_POLICY_SCHEMA
+        or set(sources) != PRIVATE_RUNTIME_SOURCE_KEYS
+    ):
+        raise BulkloadError("private runtime authority source inventory differs")
     return value
 
 

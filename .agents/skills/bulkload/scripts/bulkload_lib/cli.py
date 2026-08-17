@@ -45,6 +45,19 @@ from .private_sqlite_plan import (
     compile_codex_private_sqlite_compose_plan,
     validate_codex_private_sqlite_compose_plan_against_inputs,
 )
+from .private_sqlite_action_plan import (
+    compile_codex_private_sqlite_action_plan,
+    validate_codex_private_sqlite_action_plan_against_close,
+)
+from .private_sqlite_close import (
+    capture_codex_private_sqlite_session_reclose,
+    compile_codex_private_sqlite_close_request,
+    validate_codex_private_sqlite_close_request,
+    validate_codex_private_sqlite_close_request_against_inputs,
+    validate_codex_private_sqlite_private_reclose_capture,
+    validate_codex_private_sqlite_session_reclose_against_live,
+    validate_codex_private_sqlite_session_reclose_capture,
+)
 from .private_state import (
     DEFAULT_BACKUP_TIMEOUT_SECONDS,
     DEFAULT_MAX_METADATA_BYTES,
@@ -1170,6 +1183,372 @@ def _codex_private_plan(arguments: argparse.Namespace) -> int:
     return 4
 
 
+def _codex_private_sqlite_close_request(arguments: argparse.Namespace) -> int:
+    if arguments.output == "-":
+        raise BulkloadError(
+            "private SQLite close request requires an owner-private output file"
+        )
+    required_inputs = (
+        ("opening_plan", arguments.opening_plan),
+        ("compatibility_plan", arguments.compatibility_plan),
+        ("adapter_registry", arguments.adapter_registry),
+        ("path_map", arguments.path_map),
+        ("session_union_plan", arguments.session_union_plan),
+        ("session_source_a", arguments.session_source_a),
+        ("session_source_b", arguments.session_source_b),
+        ("session_destination_a", arguments.session_destination_a),
+        ("session_destination_b", arguments.session_destination_b),
+    )
+    optional_inputs = (
+        ("session_prefix_request", arguments.session_prefix_request),
+        ("session_source_prefix_a", arguments.session_source_prefix_a),
+        ("session_source_prefix_b", arguments.session_source_prefix_b),
+        (
+            "session_destination_prefix_a",
+            arguments.session_destination_prefix_a,
+        ),
+        (
+            "session_destination_prefix_b",
+            arguments.session_destination_prefix_b,
+        ),
+        ("session_close_request", arguments.session_close_request),
+        ("session_source_close_a", arguments.session_source_close_a),
+        ("session_source_close_b", arguments.session_source_close_b),
+        (
+            "session_destination_close_a",
+            arguments.session_destination_close_a,
+        ),
+        (
+            "session_destination_close_b",
+            arguments.session_destination_close_b,
+        ),
+    )
+    opening_bundles = {
+        "source_a": Path(arguments.source_a_bundle),
+        "source_b": Path(arguments.source_b_bundle),
+        "destination_a": Path(arguments.destination_a_bundle),
+        "destination_b": Path(arguments.destination_b_bundle),
+    }
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    documents: dict[str, dict[str, Any] | None] = {}
+    try:
+        for name, path in (*required_inputs, *optional_inputs):
+            if path is None:
+                documents[name] = None
+                continue
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            documents[name] = document
+            pinned.append((path, descriptor, expected))
+        with private_runtime.open_pinned_private_runtime_authority() as runtime:
+            close_request = compile_codex_private_sqlite_close_request(
+                documents["opening_plan"],
+                documents["session_union_plan"],
+                documents["session_source_a"],
+                documents["session_source_b"],
+                documents["session_destination_a"],
+                documents["session_destination_b"],
+                runtime.record,
+                accept_opening_plan=arguments.accept_opening_plan,
+                accept_session_union_plan=arguments.accept_session_union_plan,
+                writer_stop_epoch_id=arguments.writer_stop_epoch_id,
+                writer_stop_epoch_at=arguments.writer_stop_epoch_at,
+                acknowledge_provider_writers_stopped=(
+                    arguments.acknowledge_provider_writers_stopped
+                ),
+                opening_compatibility_plan=documents["compatibility_plan"],
+                opening_source_a_directory=opening_bundles["source_a"],
+                opening_source_b_directory=opening_bundles["source_b"],
+                opening_destination_a_directory=opening_bundles["destination_a"],
+                opening_destination_b_directory=opening_bundles["destination_b"],
+                opening_adapter_registry=documents["adapter_registry"],
+                opening_path_map=documents["path_map"],
+                opening_session_prefix_request=documents["session_prefix_request"],
+                opening_session_source_prefix_a=documents["session_source_prefix_a"],
+                opening_session_source_prefix_b=documents["session_source_prefix_b"],
+                opening_session_destination_prefix_a=documents[
+                    "session_destination_prefix_a"
+                ],
+                opening_session_destination_prefix_b=documents[
+                    "session_destination_prefix_b"
+                ],
+                opening_session_close_request=documents["session_close_request"],
+                opening_session_source_close_a=documents["session_source_close_a"],
+                opening_session_source_close_b=documents["session_source_close_b"],
+                opening_session_destination_close_a=documents[
+                    "session_destination_close_a"
+                ],
+                opening_session_destination_close_b=documents[
+                    "session_destination_close_b"
+                ],
+            )
+            validate_codex_private_sqlite_close_request(close_request)
+
+            def revalidate_inputs() -> None:
+                for path, descriptor, expected in pinned:
+                    _revalidate_pinned_codex_input(path, descriptor, expected)
+                runtime.revalidate()
+                validate_codex_private_sqlite_compose_plan_against_inputs(
+                    documents["opening_plan"],
+                    documents["compatibility_plan"],
+                    opening_bundles["source_a"],
+                    opening_bundles["source_b"],
+                    opening_bundles["destination_a"],
+                    opening_bundles["destination_b"],
+                    adapter_registry=documents["adapter_registry"],
+                    path_map=documents["path_map"],
+                    session_union_plan=documents["session_union_plan"],
+                    session_source_a=documents["session_source_a"],
+                    session_source_b=documents["session_source_b"],
+                    session_destination_a=documents["session_destination_a"],
+                    session_destination_b=documents["session_destination_b"],
+                    session_prefix_request=documents["session_prefix_request"],
+                    session_source_prefix_a=documents["session_source_prefix_a"],
+                    session_source_prefix_b=documents["session_source_prefix_b"],
+                    session_destination_prefix_a=documents[
+                        "session_destination_prefix_a"
+                    ],
+                    session_destination_prefix_b=documents[
+                        "session_destination_prefix_b"
+                    ],
+                    session_close_request=documents["session_close_request"],
+                    session_source_close_a=documents["session_source_close_a"],
+                    session_source_close_b=documents["session_source_close_b"],
+                    session_destination_close_a=documents[
+                        "session_destination_close_a"
+                    ],
+                    session_destination_close_b=documents[
+                        "session_destination_close_b"
+                    ],
+                )
+
+            revalidate_inputs()
+            opening = documents["opening_plan"]
+            protected_roots = [
+                *opening_bundles.values(),
+                *(
+                    Path(
+                        opening["private_opening"][role]["stable_projection"][
+                            authority
+                        ]["resolved_path"]
+                    )
+                    for role in ("source", "destination")
+                    for authority in ("codex_home", "sqlite_home")
+                ),
+            ]
+            _write_pinned_codex_json(
+                arguments.output,
+                close_request,
+                [
+                    documents["session_source_a"],
+                    documents["session_source_b"],
+                    documents["session_destination_a"],
+                    documents["session_destination_b"],
+                ],
+                pinned,
+                protected_roots=protected_roots,
+            )
+            try:
+                revalidate_inputs()
+            except BulkloadError as error:
+                raise BulkloadError(
+                    "private SQLite close inputs or runtime changed after "
+                    f"publication; fail-held evidence: {arguments.output}"
+                ) from error
+            runtime.revalidate()
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"close_request={close_request['close_request_sha256']} "
+            f"epoch={close_request['writer_stop_epoch']['epoch_id']} "
+            "provider_writer_proof=false"
+        )
+    return 0
+
+
+def _codex_private_sqlite_session_reclose(arguments: argparse.Namespace) -> int:
+    if arguments.output == "-":
+        raise BulkloadError(
+            "private SQLite session re-close requires an owner-private output file"
+        )
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    runtime: Any | None = None
+    try:
+        close_request, descriptor, expected = _read_pinned_codex_json(
+            arguments.close_request
+        )
+        pinned.append((arguments.close_request, descriptor, expected))
+        validate_codex_private_sqlite_close_request(close_request)
+        runtime = private_runtime.open_pinned_private_runtime_authority(
+            close_request["runtime_authority"]
+        )
+        root = Path(os.path.abspath(Path(arguments.root).expanduser()))
+        capture = capture_codex_private_sqlite_session_reclose(
+            root,
+            role=arguments.role,
+            close_request=close_request,
+            accept_close_request=arguments.accept_close_request,
+            writer_stop_epoch_id=arguments.writer_stop_epoch_id,
+            acknowledge_writers_quiesced=arguments.acknowledge_writers_quiesced,
+        )
+        validate_codex_private_sqlite_session_reclose_capture(capture)
+        _revalidate_pinned_codex_input(
+            arguments.close_request,
+            descriptor,
+            expected,
+        )
+        runtime.revalidate()
+        _write_pinned_codex_json(
+            arguments.output,
+            capture,
+            [capture["snapshot"]],
+            pinned,
+            protected_roots=[root],
+        )
+        validate_codex_private_sqlite_session_reclose_against_live(
+            capture,
+            root,
+            close_request,
+            role=arguments.role,
+            accept_close_request=arguments.accept_close_request,
+            writer_stop_epoch_id=arguments.writer_stop_epoch_id,
+            acknowledge_writers_quiesced=arguments.acknowledge_writers_quiesced,
+        )
+        _revalidate_pinned_codex_input(
+            arguments.close_request,
+            descriptor,
+            expected,
+        )
+        runtime.revalidate()
+    finally:
+        if runtime is not None:
+            runtime.close()
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"session_reclose={capture['reclose_capture_sha256']} "
+            f"capture={capture['snapshot']['capture_id']} "
+            "provider_writer_proof=false"
+        )
+    return 0
+
+
+def _codex_private_sqlite_private_reclose(arguments: argparse.Namespace) -> int:
+    close_request, descriptor, expected = _read_pinned_codex_json(
+        arguments.close_request
+    )
+    runtime: Any | None = None
+    try:
+        validate_codex_private_sqlite_close_request(close_request)
+        runtime = private_runtime.open_pinned_private_runtime_authority(
+            close_request["runtime_authority"]
+        )
+        if arguments.accept_close_request != close_request["close_request_sha256"]:
+            raise BulkloadError("accepted private SQLite close-request digest differs")
+        if (
+            arguments.writer_stop_epoch_id
+            != close_request["writer_stop_epoch"]["epoch_id"]
+        ):
+            raise BulkloadError("private SQLite writer-stop epoch acceptance differs")
+        opening = close_request["private_opening"][arguments.role]["binding"][
+            "stable_projection"
+        ]
+        codex_home = Path(arguments.codex_home)
+        sqlite_home = Path(arguments.sqlite_home)
+        if (
+            codex_home.expanduser().resolve()
+            != Path(opening["codex_home"]["resolved_path"])
+            or sqlite_home.expanduser().resolve()
+            != Path(opening["sqlite_home"]["resolved_path"])
+            or arguments.host_authority_id != opening["host_authority_id"]
+            or arguments.codex_version != opening["codex_version"]
+        ):
+            raise BulkloadError(
+                "private SQLite private re-close live authority differs "
+                "from the opening"
+            )
+        selected_state_classes = opening["selected_state_classes"]
+        if "sqlite" not in selected_state_classes:
+            raise BulkloadError(
+                "private SQLite private re-close opening does not select SQLite"
+            )
+        with acquire_codex_private_bulkload_lock(codex_home, sqlite_home) as lock:
+            with open_codex_private_quiescence_attestation(
+                Path(arguments.quiescence_attestation),
+                accept_attestation=arguments.accept_quiescence_attestation,
+                expected_purpose="close",
+                expected_host_authority_id=arguments.host_authority_id,
+                expected_codex_version=arguments.codex_version,
+                expected_selected_state_classes=selected_state_classes,
+                expected_codex_home=codex_home,
+                expected_sqlite_home=sqlite_home,
+                expected_operation_output=Path(arguments.output_directory),
+                expected_capture_role=arguments.role,
+                expected_plan_sha256=close_request["close_request_sha256"],
+            ) as quiescence:
+                quiescence.assert_bulkload_lock(lock)
+                recorded_roots = tuple(
+                    Path(
+                        close_request["private_opening"][role]["binding"][
+                            "stable_projection"
+                        ][authority]["resolved_path"]
+                    )
+                    for role in ("source", "destination")
+                    for authority in ("codex_home", "sqlite_home")
+                )
+                capture = capture_codex_private_state(
+                    codex_home,
+                    Path(arguments.output_directory),
+                    role=arguments.role,
+                    host_authority_id=arguments.host_authority_id,
+                    codex_version=arguments.codex_version,
+                    sqlite_home=sqlite_home,
+                    include_auth="auth" in selected_state_classes,
+                    include_sqlite=True,
+                    acknowledge_private_capture=(arguments.acknowledge_private_capture),
+                    quiescence=private_quiescence_capture_record(quiescence.value),
+                    max_sqlite_families=opening["budgets"]["max_sqlite_families"],
+                    max_total_sqlite_bytes=opening["budgets"]["max_total_sqlite_bytes"],
+                    backup_timeout_seconds=opening["budgets"]["backup_timeout_seconds"],
+                    max_thread_entries=opening["budgets"]["max_thread_entries"],
+                    max_thread_index_bytes=opening["budgets"]["max_thread_index_bytes"],
+                    max_metadata_entries=opening["budgets"]["max_metadata_entries"],
+                    max_metadata_bytes=opening["budgets"]["max_metadata_bytes"],
+                    recorded_protected_directories=recorded_roots,
+                )
+                validate_codex_private_sqlite_private_reclose_capture(
+                    capture,
+                    close_request,
+                    role=arguments.role,
+                )
+                _revalidate_pinned_codex_input(
+                    arguments.close_request,
+                    descriptor,
+                    expected,
+                )
+                lock.revalidate()
+                quiescence.revalidate()
+                runtime.revalidate()
+    finally:
+        if runtime is not None:
+            runtime.close()
+        os.close(descriptor)
+    print(
+        f"private_reclose={capture['capture_sha256']} "
+        f"capture={capture['capture_id']} "
+        "provider_writer_proof=false ready_for_apply=false"
+    )
+    return 0
+
+
 def _codex_private_sqlite_compose_plan(arguments: argparse.Namespace) -> int:
     bundle_arguments = {
         "source_a": (Path(arguments.source_a_bundle), "source"),
@@ -1343,6 +1722,220 @@ def _codex_private_sqlite_compose_plan(arguments: argparse.Namespace) -> int:
         f"blockers={len(plan['blockers'])} "
         "sqlite_compose=false sqlite_publish=false ready_for_apply=false"
     )
+    return 4
+
+
+def _codex_private_sqlite_compose_action_plan(
+    arguments: argparse.Namespace,
+) -> int:
+    if arguments.output == "-":
+        raise BulkloadError(
+            "private SQLite action plan requires an owner-private output file"
+        )
+    bundles = {
+        "source_a": Path(arguments.source_close_a_bundle),
+        "source_b": Path(arguments.source_close_b_bundle),
+        "destination_a": Path(arguments.destination_close_a_bundle),
+        "destination_b": Path(arguments.destination_close_b_bundle),
+    }
+    opening_bundles = {
+        "source_a": Path(arguments.opening_source_a_bundle),
+        "source_b": Path(arguments.opening_source_b_bundle),
+        "destination_a": Path(arguments.opening_destination_a_bundle),
+        "destination_b": Path(arguments.opening_destination_b_bundle),
+    }
+    input_paths = {
+        "opening_plan": arguments.opening_plan,
+        "close_request": arguments.close_request,
+        "opening_compatibility_plan": arguments.opening_compatibility_plan,
+        "opening_adapter_registry": arguments.opening_adapter_registry,
+        "opening_path_map": arguments.opening_path_map,
+        "opening_session_union_plan": arguments.opening_session_union_plan,
+        "opening_session_source_a": arguments.opening_session_source_a,
+        "opening_session_source_b": arguments.opening_session_source_b,
+        "opening_session_destination_a": (arguments.opening_session_destination_a),
+        "opening_session_destination_b": (arguments.opening_session_destination_b),
+        "session_source_a": arguments.session_source_close_a,
+        "session_source_b": arguments.session_source_close_b,
+        "session_destination_a": arguments.session_destination_close_a,
+        "session_destination_b": arguments.session_destination_close_b,
+    }
+    optional_input_paths = {
+        "opening_session_prefix_request": (arguments.opening_session_prefix_request),
+        "opening_session_source_prefix_a": (arguments.opening_session_source_prefix_a),
+        "opening_session_source_prefix_b": (arguments.opening_session_source_prefix_b),
+        "opening_session_destination_prefix_a": (
+            arguments.opening_session_destination_prefix_a
+        ),
+        "opening_session_destination_prefix_b": (
+            arguments.opening_session_destination_prefix_b
+        ),
+        "opening_session_close_request": (arguments.opening_session_close_request),
+        "opening_session_source_close_a": (arguments.opening_session_source_close_a),
+        "opening_session_source_close_b": (arguments.opening_session_source_close_b),
+        "opening_session_destination_close_a": (
+            arguments.opening_session_destination_close_a
+        ),
+        "opening_session_destination_close_b": (
+            arguments.opening_session_destination_close_b
+        ),
+    }
+    pinned: list[tuple[str, int, tuple[int, ...]]] = []
+    documents: dict[str, dict[str, Any] | None] = {}
+    try:
+        for name, path in input_paths.items():
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            documents[name] = document
+            pinned.append((path, descriptor, expected))
+        for name, path in optional_input_paths.items():
+            if path is None:
+                documents[name] = None
+                continue
+            document, descriptor, expected = _read_pinned_codex_json(path)
+            documents[name] = document
+            pinned.append((path, descriptor, expected))
+        with private_runtime.open_pinned_private_runtime_authority() as runtime:
+
+            def revalidate_opening_chain() -> None:
+                validate_codex_private_sqlite_close_request_against_inputs(
+                    documents["close_request"],
+                    documents["opening_plan"],
+                    documents["opening_session_union_plan"],
+                    documents["opening_session_source_a"],
+                    documents["opening_session_source_b"],
+                    documents["opening_session_destination_a"],
+                    documents["opening_session_destination_b"],
+                    runtime.record,
+                    opening_compatibility_plan=documents["opening_compatibility_plan"],
+                    opening_source_a_directory=opening_bundles["source_a"],
+                    opening_source_b_directory=opening_bundles["source_b"],
+                    opening_destination_a_directory=opening_bundles["destination_a"],
+                    opening_destination_b_directory=opening_bundles["destination_b"],
+                    opening_adapter_registry=documents["opening_adapter_registry"],
+                    opening_path_map=documents["opening_path_map"],
+                    opening_session_prefix_request=documents[
+                        "opening_session_prefix_request"
+                    ],
+                    opening_session_source_prefix_a=documents[
+                        "opening_session_source_prefix_a"
+                    ],
+                    opening_session_source_prefix_b=documents[
+                        "opening_session_source_prefix_b"
+                    ],
+                    opening_session_destination_prefix_a=documents[
+                        "opening_session_destination_prefix_a"
+                    ],
+                    opening_session_destination_prefix_b=documents[
+                        "opening_session_destination_prefix_b"
+                    ],
+                    opening_session_close_request=documents[
+                        "opening_session_close_request"
+                    ],
+                    opening_session_source_close_a=documents[
+                        "opening_session_source_close_a"
+                    ],
+                    opening_session_source_close_b=documents[
+                        "opening_session_source_close_b"
+                    ],
+                    opening_session_destination_close_a=documents[
+                        "opening_session_destination_close_a"
+                    ],
+                    opening_session_destination_close_b=documents[
+                        "opening_session_destination_close_b"
+                    ],
+                )
+
+            revalidate_opening_chain()
+            action_plan = compile_codex_private_sqlite_action_plan(
+                documents["opening_plan"],
+                documents["close_request"],
+                bundles["source_a"],
+                bundles["source_b"],
+                bundles["destination_a"],
+                bundles["destination_b"],
+                documents["session_source_a"],
+                documents["session_source_b"],
+                documents["session_destination_a"],
+                documents["session_destination_b"],
+                accept_opening_plan=arguments.accept_opening_plan,
+                accept_close_request=arguments.accept_close_request,
+                runtime_authority=runtime.record,
+            )
+
+            def revalidate_inputs() -> None:
+                for path, descriptor, expected in pinned:
+                    _revalidate_pinned_codex_input(path, descriptor, expected)
+                runtime.revalidate()
+                revalidate_opening_chain()
+                validate_codex_private_sqlite_action_plan_against_close(
+                    action_plan,
+                    documents["opening_plan"],
+                    documents["close_request"],
+                    bundles["source_a"],
+                    bundles["source_b"],
+                    bundles["destination_a"],
+                    bundles["destination_b"],
+                    documents["session_source_a"],
+                    documents["session_source_b"],
+                    documents["session_destination_a"],
+                    documents["session_destination_b"],
+                )
+
+            revalidate_inputs()
+            closing_snapshots = [
+                documents[name]["snapshot"]
+                for name in (
+                    "session_source_a",
+                    "session_source_b",
+                    "session_destination_a",
+                    "session_destination_b",
+                )
+            ]
+            close_request = documents["close_request"]
+            protected_roots = [
+                *bundles.values(),
+                *opening_bundles.values(),
+                *(
+                    Path(
+                        close_request["private_opening"][role]["binding"][
+                            "stable_projection"
+                        ][authority]["resolved_path"]
+                    )
+                    for role in ("source", "destination")
+                    for authority in ("codex_home", "sqlite_home")
+                ),
+            ]
+            _write_pinned_codex_json(
+                arguments.output,
+                action_plan,
+                closing_snapshots,
+                pinned,
+                protected_roots=protected_roots,
+            )
+            try:
+                revalidate_inputs()
+            except BulkloadError as error:
+                raise BulkloadError(
+                    "private SQLite action-plan inputs or runtime changed after "
+                    f"publication; fail-held evidence: {arguments.output}"
+                ) from error
+    finally:
+        for _, descriptor, _ in pinned:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if arguments.output != "-":
+        print(
+            f"action_plan={action_plan['action_plan_sha256']} "
+            "post_plan_close_proven=true "
+            f"descriptive_action_complete="
+            f"{str(action_plan['readiness']['descriptive_action_complete']).lower()} "
+            f"ready_for_offline_compose="
+            f"{str(action_plan['readiness']['ready_for_offline_compose']).lower()} "
+            "composer_implemented=false sqlite_compose=false "
+            "sqlite_publish=false ready_for_apply=false"
+        )
     return 4
 
 
@@ -1850,7 +2443,7 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_quiescence.add_argument("--operation-output", required=True)
     codex_private_quiescence.add_argument(
         "--purpose",
-        choices=("capture", "apply", "verify", "rollback", "recover"),
+        choices=("capture", "close", "apply", "verify", "rollback", "recover"),
         required=True,
     )
     codex_private_quiescence.add_argument(
@@ -1887,6 +2480,201 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_plan.add_argument("--destination-bundle", required=True)
     codex_private_plan.add_argument("--output", required=True)
     codex_private_plan.set_defaults(handler=_codex_private_plan)
+
+    codex_private_sqlite_close_request = commands.add_parser(
+        "codex-private-sqlite-close-request",
+        help=(
+            "bind one operator-attested writer-stop epoch to the exact private "
+            "SQLite opening and session-union bodies"
+        ),
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--opening-plan",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--accept-opening-plan",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--compatibility-plan",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--source-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--source-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--destination-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--destination-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--adapter-registry",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--path-map",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--session-union-plan",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--accept-session-union-plan",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--session-source-a",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--session-source-b",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--session-destination-a",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--session-destination-b",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument("--session-prefix-request")
+    codex_private_sqlite_close_request.add_argument("--session-source-prefix-a")
+    codex_private_sqlite_close_request.add_argument("--session-source-prefix-b")
+    codex_private_sqlite_close_request.add_argument("--session-destination-prefix-a")
+    codex_private_sqlite_close_request.add_argument("--session-destination-prefix-b")
+    codex_private_sqlite_close_request.add_argument("--session-close-request")
+    codex_private_sqlite_close_request.add_argument("--session-source-close-a")
+    codex_private_sqlite_close_request.add_argument("--session-source-close-b")
+    codex_private_sqlite_close_request.add_argument("--session-destination-close-a")
+    codex_private_sqlite_close_request.add_argument("--session-destination-close-b")
+    codex_private_sqlite_close_request.add_argument(
+        "--writer-stop-epoch-id",
+        required=True,
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--writer-stop-epoch-at",
+        required=True,
+        help="canonical UTC-seconds timestamp for the attended writer-stop epoch",
+    )
+    codex_private_sqlite_close_request.add_argument(
+        "--acknowledge-provider-writers-stopped",
+        action="store_true",
+        help=(
+            "record an operator procedural assertion; this does not establish "
+            "provider-writer proof"
+        ),
+    )
+    codex_private_sqlite_close_request.add_argument("--output", required=True)
+    codex_private_sqlite_close_request.set_defaults(
+        handler=_codex_private_sqlite_close_request
+    )
+
+    codex_private_sqlite_session_reclose = commands.add_parser(
+        "codex-private-sqlite-session-reclose",
+        help=(
+            "capture one fresh live session root against a private SQLite "
+            "writer-stop close request"
+        ),
+    )
+    codex_private_sqlite_session_reclose.add_argument(
+        "--close-request",
+        required=True,
+    )
+    codex_private_sqlite_session_reclose.add_argument(
+        "--accept-close-request",
+        required=True,
+    )
+    codex_private_sqlite_session_reclose.add_argument("--root", required=True)
+    codex_private_sqlite_session_reclose.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+    )
+    codex_private_sqlite_session_reclose.add_argument(
+        "--writer-stop-epoch-id",
+        required=True,
+    )
+    codex_private_sqlite_session_reclose.add_argument(
+        "--acknowledge-writers-quiesced",
+        action="store_true",
+        help="assert that every writer to this live session root is stopped",
+    )
+    codex_private_sqlite_session_reclose.add_argument("--output", required=True)
+    codex_private_sqlite_session_reclose.set_defaults(
+        handler=_codex_private_sqlite_session_reclose
+    )
+
+    codex_private_sqlite_private_reclose = commands.add_parser(
+        "codex-private-sqlite-private-reclose",
+        help=(
+            "capture one fresh private Codex/SQLite bundle bound to the exact "
+            "writer-stop close request"
+        ),
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--close-request",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--accept-close-request",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--writer-stop-epoch-id",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--codex-home",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--sqlite-home",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--output-directory",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--host-authority-id",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--codex-version",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--acknowledge-private-capture",
+        action="store_true",
+        help="acknowledge that the output contains private provider state",
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--quiescence-attestation",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.add_argument(
+        "--accept-quiescence-attestation",
+        required=True,
+    )
+    codex_private_sqlite_private_reclose.set_defaults(
+        handler=_codex_private_sqlite_private_reclose
+    )
 
     codex_private_sqlite_plan = commands.add_parser(
         "codex-private-sqlite-compose-plan",
@@ -1950,6 +2738,145 @@ def build_parser() -> argparse.ArgumentParser:
     codex_private_sqlite_plan.add_argument("--session-destination-close-b")
     codex_private_sqlite_plan.add_argument("--output", required=True)
     codex_private_sqlite_plan.set_defaults(handler=_codex_private_sqlite_compose_plan)
+
+    codex_private_sqlite_action_plan = commands.add_parser(
+        "codex-private-sqlite-compose-action-plan",
+        help=(
+            "compile a closed descriptive offline SQLite action plan; no "
+            "composer, publisher, installer, or apply is exposed"
+        ),
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-plan",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--accept-opening-plan",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--close-request",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--accept-close-request",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-compatibility-plan",
+        required=True,
+        help="the exact compatibility plan consumed by the v4 opening",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-source-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-source-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-destination-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-destination-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-adapter-registry",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-path-map",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-union-plan",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-a",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-b",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-a",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-b",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-prefix-request",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-prefix-a",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-prefix-b",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-prefix-a",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-prefix-b",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-close-request",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-close-a",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-source-close-b",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-close-a",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--opening-session-destination-close-b",
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--source-close-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--source-close-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--destination-close-a-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--destination-close-b-bundle",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--session-source-close-a",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--session-source-close-b",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--session-destination-close-a",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument(
+        "--session-destination-close-b",
+        required=True,
+    )
+    codex_private_sqlite_action_plan.add_argument("--output", required=True)
+    codex_private_sqlite_action_plan.set_defaults(
+        handler=_codex_private_sqlite_compose_action_plan
+    )
 
     codex_private_install_plan = commands.add_parser(
         "codex-private-install-plan",

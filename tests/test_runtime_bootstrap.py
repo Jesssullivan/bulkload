@@ -51,9 +51,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 path.relative_to(skill_root).as_posix(): path.read_bytes()
                 for path in sorted((skill_root / "scripts").rglob("*.py"))
             }
-            policy_path = (
-                skill_root / "references" / "codex-private-state-policy.v4.json"
-            )
+            policy_path = skill_root / "references" / bootstrap.POLICY_NAME
             policy = json.loads(policy_path.read_text())
             policy["runtime_source_sha256"] = bootstrap._runtime_digest(
                 runtime_payloads
@@ -80,9 +78,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             root = Path(directory)
             skill_root = root / "bulkload"
             shutil.copytree(BOOTSTRAP_PATH.parents[1], skill_root)
-            policy_path = (
-                skill_root / "references" / "codex-private-state-policy.v4.json"
-            )
+            policy_path = skill_root / "references" / bootstrap.POLICY_NAME
             runtime_payloads = {
                 path.relative_to(skill_root).as_posix(): path.read_bytes()
                 for path in sorted((skill_root / "scripts").rglob("*.py"))
@@ -111,7 +107,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
             runfiles = root / "runfiles"
             shutil.copytree(BOOTSTRAP_PATH.parents[1], source)
             launcher_relative = Path("scripts/bulkload.py")
-            policy_relative = Path("references/codex-private-state-policy.v4.json")
+            policy_relative = Path("references") / _load_bootstrap().POLICY_NAME
             leaves = [
                 *(
                     path.relative_to(source)
@@ -221,7 +217,7 @@ class RuntimeBootstrapTest(unittest.TestCase):
                 path.relative_to(skill_a).as_posix(): path.read_bytes()
                 for path in sorted((skill_a / "scripts").rglob("*.py"))
             }
-            policy_path = skill_a / "references" / "codex-private-state-policy.v4.json"
+            policy_path = skill_a / "references" / bootstrap.POLICY_NAME
             policy = json.loads(policy_path.read_text())
             policy["runtime_source_sha256"] = bootstrap._runtime_digest(
                 runtime_payloads

@@ -1443,7 +1443,7 @@ def _semantic_row_stream(
     deadline: float,
     state: dict[str, Any],
     plan_budget: dict[str, int] | None = None,
-) -> Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes]]:
+) -> Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes, int]]:
     if plan_budget is None:
         plan_budget = {"rows": 0, "bytes": 0}
     columns = [column["name"] for column in table_contract["columns"]]
@@ -1486,7 +1486,7 @@ def _semantic_row_stream_body(
     deadline: float,
     state: dict[str, Any],
     plan_budget: dict[str, int],
-) -> Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes]]:
+) -> Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes, int]]:
     columns = [column["name"] for column in table_contract["columns"]]
     identities = table_rule["identity_columns"]
     if not set(identities) <= set(columns):
@@ -1587,7 +1587,7 @@ def _semantic_row_stream_body(
                 or plan_budget["bytes"] > MAX_SQLITE_PLAN_ROW_BYTES
             ):
                 raise BulkloadError("SQLite semantic classification budget exceeded")
-            yield sort_key, identity, row_digest
+            yield sort_key, identity, row_digest, row_bytes
     except sqlite3.Error as error:
         if time.monotonic() > deadline or "interrupted" in str(error).casefold():
             raise BulkloadError(
@@ -1606,8 +1606,8 @@ def _semantic_row_stream_body(
 
 
 def _next_or_none(
-    iterator: Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes]],
-) -> tuple[tuple[tuple[str, str], ...], bytes, bytes] | None:
+    iterator: Iterator[tuple[tuple[tuple[str, str], ...], bytes, bytes, int]],
+) -> tuple[tuple[tuple[str, str], ...], bytes, bytes, int] | None:
     try:
         return next(iterator)
     except StopIteration:
@@ -1684,6 +1684,7 @@ def _classify_table(
     accepted_session_paths: dict[str, dict[str, str]],
     deadline: float,
     plan_budget: dict[str, int] | None = None,
+    include_expected_output: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if plan_budget is None:
         plan_budget = {"rows": 0, "bytes": 0}
@@ -1842,6 +1843,59 @@ def _classify_table(
         plan_budget=plan_budget,
     )
     shared_equal = source_only = destination_only = conflicts = 0
+    output_count = 0
+    output_bytes = 0
+    output_digest = hashlib.sha256()
+    output_digest.update(
+        canonical_bytes(
+            {
+                "table": table_rule["name"],
+                "columns": [column["name"] for column in source_table["columns"]],
+            }
+        )
+    )
+    partition_states = {
+        name: {
+            "row_count": 0,
+            "classified_bytes": 0,
+            "digest": hashlib.sha256(
+                canonical_bytes(
+                    {
+                        "table": table_rule["name"],
+                        "columns": [
+                            column["name"] for column in source_table["columns"]
+                        ],
+                        "partition": name,
+                    }
+                )
+            ),
+        }
+        for name in ("shared_equal", "source_only", "destination_only")
+    }
+
+    def include_output_row(
+        item: tuple[tuple[tuple[str, str], ...], bytes, bytes, int],
+    ) -> None:
+        nonlocal output_count, output_bytes
+        identity = item[1]
+        output_digest.update(len(identity).to_bytes(8, "big"))
+        output_digest.update(identity)
+        output_digest.update(item[2])
+        output_count += 1
+        output_bytes += item[3]
+
+    def include_partition_row(
+        name: str,
+        item: tuple[tuple[tuple[str, str], ...], bytes, bytes, int],
+    ) -> None:
+        partition = partition_states[name]
+        identity = item[1]
+        partition["digest"].update(len(identity).to_bytes(8, "big"))
+        partition["digest"].update(identity)
+        partition["digest"].update(item[2])
+        partition["row_count"] += 1
+        partition["classified_bytes"] += item[3]
+
     try:
         source_item = _next_or_none(source_rows)
         destination_item = _next_or_none(destination_rows)
@@ -1850,15 +1904,21 @@ def _classify_table(
                 source_item is not None and source_item[0] < destination_item[0]
             ):
                 source_only += 1
+                include_partition_row("source_only", source_item)
+                include_output_row(source_item)
                 source_item = _next_or_none(source_rows)
             elif source_item is None or destination_item[0] < source_item[0]:
                 destination_only += 1
+                include_partition_row("destination_only", destination_item)
+                include_output_row(destination_item)
                 destination_item = _next_or_none(destination_rows)
             else:
                 if source_item[1] != destination_item[1]:
                     raise BulkloadError("SQLite row identity sort key is ambiguous")
                 if source_item[2] == destination_item[2]:
                     shared_equal += 1
+                    include_partition_row("shared_equal", destination_item)
+                    include_output_row(destination_item)
                 else:
                     conflicts += 1
                 source_item = _next_or_none(source_rows)
@@ -1883,21 +1943,37 @@ def _classify_table(
                 "table": table_rule["name"],
             }
         )
-    return (
-        {
-            "name": table_rule["name"],
-            "merge_class": table_rule["merge_class"],
-            "identity_columns": table_rule["identity_columns"],
-            "source": source_state,
-            "destination": destination_state,
-            "shared_equal": shared_equal,
-            "source_only": source_only,
-            "destination_only": destination_only,
-            "conflicts": conflicts,
-            "semantic_classification_complete": not blockers,
-        },
-        blockers,
-    )
+    result = {
+        "name": table_rule["name"],
+        "merge_class": table_rule["merge_class"],
+        "identity_columns": table_rule["identity_columns"],
+        "source": source_state,
+        "destination": destination_state,
+        "shared_equal": shared_equal,
+        "source_only": source_only,
+        "destination_only": destination_only,
+        "conflicts": conflicts,
+        "semantic_classification_complete": not blockers,
+    }
+    if include_expected_output:
+        result["expected_output"] = (
+            {
+                "row_count": output_count,
+                "semantic_rows_sha256": output_digest.hexdigest(),
+                "classified_bytes": output_bytes,
+                "partitions": {
+                    name: {
+                        "row_count": partition["row_count"],
+                        "semantic_rows_sha256": partition["digest"].hexdigest(),
+                        "classified_bytes": partition["classified_bytes"],
+                    }
+                    for name, partition in partition_states.items()
+                },
+            }
+            if conflicts == 0
+            else None
+        )
+    return result, blockers
 
 
 def _artifact_binding(

@@ -284,6 +284,60 @@ class CodexPrivateQuiescenceTest(unittest.TestCase):
                 pinned.revalidate(require_operation_output_absent=True)
             private_quiescence.validate_codex_private_quiescence_attestation(value)
 
+            legacy = json.loads(json.dumps(value))
+            legacy["schema"] = (
+                private_quiescence.LEGACY_PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA
+            )
+            legacy["attestation_sha256"] = private_quiescence.object_digest(
+                legacy,
+                "attestation_sha256",
+            )
+            private_quiescence.validate_codex_private_quiescence_attestation(legacy)
+
+    def test_close_binds_one_request_digest_and_capture_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = QuiescenceFixture(Path(temporary))
+            value = fixture.create(
+                purpose="close",
+                capture_role="source",
+            )
+            with fixture.open(
+                value,
+                purpose="close",
+                capture_role="source",
+            ) as pinned:
+                pinned.revalidate(require_operation_output_absent=True)
+            self.assertEqual(
+                value["accepted_inputs"],
+                {
+                    "plan_sha256": PLAN_SHA256,
+                    "apply_receipt_sha256": None,
+                    "journal_sha256": None,
+                },
+            )
+            self.assertIs(value["provider_writer_proof"], False)
+
+            legacy = json.loads(json.dumps(value))
+            legacy["schema"] = (
+                private_quiescence.LEGACY_PRIVATE_QUIESCENCE_ATTESTATION_SCHEMA
+            )
+            legacy["attestation_sha256"] = private_quiescence.object_digest(
+                legacy,
+                "attestation_sha256",
+            )
+            with self.assertRaisesRegex(BulkloadError, "v2 attestation"):
+                private_quiescence.validate_codex_private_quiescence_attestation(legacy)
+
+            other_root = Path(temporary) / "other"
+            other_root.mkdir(mode=0o700)
+            other = QuiescenceFixture(other_root)
+            with self.assertRaisesRegex(BulkloadError, "only the exact"):
+                other.create(
+                    purpose="close",
+                    capture_role="destination",
+                    receipt_sha256=RECEIPT_SHA256,
+                )
+
     def test_output_binding_mismatch_and_existing_output_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = QuiescenceFixture(Path(temporary))
