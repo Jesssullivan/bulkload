@@ -252,10 +252,14 @@ def _stable_user_regular(
             raise BulkloadError(
                 f"destination Codex rollout mode must be exactly 0600: {path}"
             )
-    elif mode & 0o022 or not mode & stat.S_IRUSR:
-        raise BulkloadError(
-            f"Codex rollout is not owner-readable and non-writable-by-others: {path}"
-        )
+    else:
+        if mode & 0o7000:
+            raise BulkloadError(f"Codex rollout has privileged permission bits: {path}")
+        if mode & 0o022 or not mode & stat.S_IRUSR:
+            raise BulkloadError(
+                f"Codex rollout is not owner-readable and "
+                f"non-writable-by-others: {path}"
+            )
     return not mode & 0o077
 
 
@@ -429,11 +433,16 @@ def _validate_stable_directory(
             raise BulkloadError(
                 f"destination Codex session directory mode must be exactly 0700: {path}"
             )
-    elif mode & 0o022 or mode & 0o500 != 0o500:
-        raise BulkloadError(
-            f"Codex session directory is not owner-accessible and "
-            f"non-writable-by-others: {path}"
-        )
+    else:
+        if mode & 0o7000:
+            raise BulkloadError(
+                f"Codex session directory has privileged permission bits: {path}"
+            )
+        if mode & 0o022 or mode & 0o500 != 0o500:
+            raise BulkloadError(
+                f"Codex session directory is not owner-accessible and "
+                f"non-writable-by-others: {path}"
+            )
     return not mode & 0o077
 
 
@@ -546,7 +555,6 @@ def capture_codex_sessions(
     total_bytes = 0
     attempted_bytes = 0
     attempted_files = 0
-    non_private_directories = 0
     stack: list[_DirectoryFrame] = []
     directory_states: dict[str, tuple[int, ...]] = {}
     root_descriptor: int | None = None
@@ -559,8 +567,7 @@ def capture_codex_sessions(
 
     try:
         root_path_info = root.lstat()
-        if not _validate_stable_directory(root, root_path_info, role=role):
-            non_private_directories += 1
+        _validate_stable_directory(root, root_path_info, role=role)
         root_descriptor = _open_directory(
             root,
             parent_descriptor=None,
@@ -700,8 +707,7 @@ def capture_codex_sessions(
                             "Codex session directory budget exceeded "
                             f"({budgets['max_directories']})"
                         )
-                    if not _validate_stable_directory(path, info, role=role):
-                        non_private_directories += 1
+                    _validate_stable_directory(path, info, role=role)
                     child_descriptor = _open_directory(
                         name,
                         parent_descriptor=frame.descriptor,
@@ -965,8 +971,10 @@ def capture_codex_sessions(
         sessions = []
         directories = []
         total_bytes = 0
-        non_private_directories = 0
     non_private_files = sum(int(int(item["mode"], 8) & 0o077 != 0) for item in sessions)
+    non_private_directories = sum(
+        int(int(item["mode"], 8) & 0o077 != 0) for item in directories
+    )
     catalog = {
         "directories": directories,
         "sessions": sessions,
@@ -1323,21 +1331,29 @@ def validate_codex_session_snapshot(snapshot: dict[str, Any]) -> None:
         key=lambda item: (item["session_id"], item["relative_path"]),
     ):
         raise BulkloadError("Codex session records are not canonically ordered")
-    if snapshot.get("total_bytes") != computed_bytes:
+    if (
+        type(snapshot.get("total_bytes")) is not int
+        or snapshot["total_bytes"] != computed_bytes
+    ):
         raise BulkloadError("Codex session total_bytes mismatch")
     non_private_file_count = sum(
         int(int(item["mode"], 8) & 0o077 != 0) for item in sessions
     )
-    if snapshot.get("non_private_file_count") != non_private_file_count:
+    if (
+        type(snapshot.get("non_private_file_count")) is not int
+        or snapshot["non_private_file_count"] != non_private_file_count
+    ):
         raise BulkloadError("Codex session non-private file count mismatch")
+    non_private_directory_count = sum(
+        int(int(item["mode"], 8) & 0o077 != 0) for item in directories
+    )
     if (
         type(snapshot.get("non_private_directory_count")) is not int
-        or snapshot["non_private_directory_count"] < 0
-        or snapshot["non_private_directory_count"] > budgets["max_directories"]
+        or snapshot["non_private_directory_count"] != non_private_directory_count
     ):
-        raise BulkloadError("Codex session non-private directory count is invalid")
+        raise BulkloadError("Codex session non-private directory count mismatch")
     if snapshot["role"] == "destination" and (
-        non_private_file_count != 0 or snapshot["non_private_directory_count"] != 0
+        non_private_file_count != 0 or non_private_directory_count != 0
     ):
         raise BulkloadError("destination Codex session custody is not private")
     catalog = _catalog_body(snapshot)

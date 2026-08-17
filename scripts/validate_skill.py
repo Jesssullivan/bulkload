@@ -30,13 +30,13 @@ EXPECTED_PRIVATE_STATE_POLICY: Final[dict[str, Any]] = {
     "implementation": "capture-and-compatibility-plan",
     "ready_for_apply": False,
     "cli_source_sha256": (
-        "7ac31d3b5d63eedcf2d47e51f361418153935a8cf3d30eae8add8b68b72476b5"
+        "cee78d93032bf18ee9d2af7d95c34ef3b35a6bc394ee7df51ce55b5929813d8c"
     ),
     "private_state_source_sha256": (
         "418e4c52e360bf09639726888673ca4c79f534edf04d84d43d93267e67171cb8"
     ),
     "runtime_source_sha256": (
-        "adde391bba7c7d3c5d932bcaced63e93027eac9a03cf70f1a1f05eed2c3fcd70"
+        "0fc9c2275aed4b08dc3e0857df3ddb94f71cb841f6edc5826278a5bb3fceb9fe"
     ),
     "allowed_codex_cli_commands": [
         "codex-capture",

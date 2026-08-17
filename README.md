@@ -37,12 +37,14 @@ before mutation, refuses symlinked directory authority, and preserves a forced
 replacement under `~/.agents/backups/bulkload` before installing it.
 Runtime support requires Python 3.11 or newer, Git, and a Unix-like host.
 Codex evidence file publication requires macOS or Linux for an OS-backed atomic
-no-replace rename.
+no-replace rename. Every Codex evidence command requires an owner-private file
+destination; stdout publication is forbidden because it bypasses pinned output
+custody and post-publication input revalidation.
 
 For development:
 
 ```bash
-nix develop github:tinyland-inc/GloriousFlywheel/693574567f9b879486782f1fb7f432c54a2fe294#ci
+nix develop
 just flywheel-doctor
 just flywheel-verify
 just check
@@ -51,11 +53,90 @@ just demo
 
 The normal build/test path is attached to GloriousFlywheel and fails closed if
 the fleet profile is missing or contradictory. CI uses only the on-prem
-`tinyland-nix` capability-class ARC pool, the endpoint-free front-door kit, and
-the canonical `gloriousflywheel-bazel` wrapper. Pull requests cannot upload
-Bazel or Attic results. Nix reads use the token-free public Attic contract;
-trusted `main` pushes may warm only the shared Bazel cache. A cache hit is cache
-evidence, not proof of REAPI remote execution.
+`tinyland-nix` capability-class ARC pool and the repository-local public-read
+front door. Before checked-out source is consumed, a workflow-embedded
+materializer requires an empty, owned, nonsymlink workspace and creates a fresh
+private home, Git config, hook template, and temporary root. The sanctioned ARC
+runner and GitHub runtime are the bootstrap trust root: they supply the step
+environment, masking channel, fixed system Bash/base64/env/Git binaries, and
+system DNS/TLS/CA. Each matrix leg blanks shell loaders and options, dynamic
+loaders, proxy override channels, CA overrides, and TLS key logging before any
+step. Lower-case proxy blanks live at job scope and therefore reach the local
+composite and its pinned actions. FTP follows that split explicitly:
+`ftp_proxy` is job-scoped, while `FTP_PROXY` is materializer-scoped. After token
+and header destruction and exact checkout verification, the trusted
+materializer persists the five upper-case empty proxy records through its
+owned, canonical GitHub environment command file.
+Privileged non-profile Bash ignores imported functions and option state, and
+the materializer removes both proxy cases and every other transport channel
+again before its first child. The raw read-only GitHub token is masked, copied
+to a non-exported shell variable, and removed from the environment before one
+fixed base64 process receives it over stdin. Raw and encoded forms are cleared
+before fetch. Only the masked Basic header enters the minimal fetch environment through
+`--config-env`; automatic maintenance and commit-graph writes are disabled,
+and the header is cleared before detached checkout. The step then proves an
+exact, full-history, clean, alternate-free checkout with a tokenless origin and
+no credential, HTTP, include, or SSH configuration. This boundary does not
+claim resistance to a compromised runner or GitHub bootstrap.
+
+That front door calls only the public, immutable
+`tinyland-inc/ci-templates` v2.13.0 actions at commit
+`139bd4c7deabbe07c918dc764a3b9f054066431d`; it never resolves a private
+GloriousFlywheel action, source tree, or flake. Attic and Bazel cache endpoint
+locations remain runner-injected authority. A repository-owned, no-value
+preflight validates those raw authority-only endpoints and clears inherited
+credential channels before the pinned setup action may inspect or export them;
+a second pass binds the discovered reachability evidence before any Nix or
+Bazel command. Before
+discovery, command lookup is the reviewed Nix profile plus the fixed system
+path; after the pinned setup action contributes that profile through
+`GITHUB_PATH`, each step supplies only the reviewed system suffix. The guard
+refuses any other effective path.
+
+`GRPC_PROXY_EXP` is an absence-only fence, not an empty-value fence: grpc-java
+treats a present-empty value as an active proxy request and resolves it to
+localhost port 80. The guard scans the NUL-framed process environment and
+rejects both present-empty and nonempty forms before Nix setup and again before
+the Java/gRPC/Bazel consumers. Successful runner command files never create
+the variable. The fixed-Git fetch remains governed by its separate minimal
+transport environment.
+
+The exact guard is snapshotted before the selected repository consumer, then
+its captured bytes, digest, and authority are rechecked immediately before the
+selected Bazel call. Each Bazel leg receives a new private Bazelisk home, empty
+user home, test temporary root, and Nix/XDG runtime home. The source leg uses a
+separate private runtime home and enters `nix develop --ignore-environment`,
+retaining only `HOME` and the eight reviewed Nix/XDG home selectors. Workspace
+wrappers, ambient rc files, persistent caches, inherited username path
+components, and netrc credentials therefore cannot enter the public-read
+route. This is same-UID authority hygiene, not a filesystem sandbox.
+
+The Nix client uses the canonical direct `/nix/store` with `store = local` and
+`allow-symlinked-store = false`. Its only substituters and public keys are the
+runner-injected `bulkload-ci` `main` cache plus `cache.nixos.org`; signatures
+remain required. Store, daemon-socket, mirror, HTTP-family proxy, certificate,
+curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
+`GRPC_PROXY_EXP` is absent. Trusted substituters,
+remote builders, build and diff hooks, access tokens, user configuration,
+netrc, flake-provided configuration, secret signing keys, and plugins are also
+cleared and checked from effective Nix settings. Ambient `GIT_*`, `JUST_*`,
+`NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` fail closed.
+Pull requests cannot request Bazel or Attic uploads through this client; only a
+trusted push to `main` may warm the shared Bazel cache. The front door never
+selects a remote executor. A cache hit is cache evidence, not proof of REAPI
+remote execution.
+
+CI is one literal, fail-fast-disabled matrix with independently scheduled
+`source`, `build`, and `test` legs. Every leg runs exactly two workflow steps:
+the embedded materializer and the repository-local composite. The composite
+validates that literal gate, establishes the shared public-read boundary, and
+selects exactly one terminal repository consumer: source gates, Bazel
+`//:bulkload`, or Bazel `//:tests`. All later branch definitions are mutually
+exclusive and skipped, so no process or action executes after the selected
+consumer. The materializer registers no checkout post, and the exact nested
+action pins contain no post or nested action after their Bazel invocation. The
+contract tests also reject any composite step that redeclares a job-fenced
+shell, function, loader, proxy, CA, or keylog channel.
 
 For a source-only check on an intentionally unattached machine, run
 `nix develop --command just check-local`. That fallback is not CI or enrollment
