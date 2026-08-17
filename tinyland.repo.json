@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "repo": {
+    "name": "bulkload",
+    "github": "Jesssullivan/bulkload",
+    "description": "Manifest-first, verified repository and agent-context migration tooling"
+  },
+  "taxonomy": {
+    "primary_role": "private-migration-tooling",
+    "layers": [
+      "agent-skill",
+      "bazel-ssot",
+      "gloriousflywheel-consumer",
+      "operator-tooling"
+    ]
+  },
+  "contracts": {
+    "agent": "AGENTS.md",
+    "operator": "justfile",
+    "build": "BUILD.bazel",
+    "ci": ".github/workflows/ci.yml",
+    "design": "docs/design.md",
+    "flywheel": "justfile.flywheel",
+    "skill": ".agents/skills/bulkload/SKILL.md"
+  },
+  "enrollment": {
+    "forgeScope": "Jesssullivan",
+    "operatorOverlay": "jesssullivan-infra",
+    "executionPool": "tinyland-nix",
+    "substrateMode": "shared-cache-backed"
+  },
+  "boundaries": {
+    "default_read_only": true,
+    "deletes_destination_data": false,
+    "copies_credentials": false,
+    "invokes_terminal_multiplexers": false,
+    "owns_tcfs_runtime": false,
+    "owns_home_manager_activation": false
+  }
+}

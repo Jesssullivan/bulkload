@@ -1,0 +1,338 @@
+name: Bulkload public-read CI
+description: Run one terminal Bulkload gate through the sanctioned public-read Flywheel front door
+
+inputs:
+  gate:
+    description: "Exact terminal repository consumer: source, build, or test"
+    required: true
+  event-name:
+    description: Exact triggering event name
+    required: true
+  expected-sha:
+    description: Exact checked-out PR head or push commit
+    required: true
+  ref:
+    description: Exact triggering Git ref
+    required: true
+  repository:
+    description: Exact repository identity
+    required: true
+  head-repository:
+    description: PR head repository, or repository identity for a push
+    required: true
+  upload-bazel-results:
+    description: True only for a trusted push to refs/heads/main
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate the terminal gate selection
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        BULKLOAD_GATE: ${{ inputs.gate }}
+      run: |
+        set -euo pipefail
+        case "$BULKLOAD_GATE" in
+          source | build | test) ;;
+          *) exit 1 ;;
+        esac
+
+    - name: Snapshot the exact public-read guard
+      id: guard-snapshot
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+      run: |
+        set -euo pipefail
+        expected=ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d
+        source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
+        test "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" = "$expected"
+        guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
+        /bin/chmod 0700 "$guard_dir"
+        guard="$guard_dir/ci-public-read-guard.sh"
+        /usr/bin/install -m 0500 "$source_guard" "$guard"
+        test "$(/usr/bin/sha256sum "$guard" | /usr/bin/awk '{print $1}')" = "$expected"
+        printf 'guard_path=%s\n' "$guard" >> "$GITHUB_OUTPUT"
+
+    - name: Preflight raw runner endpoint authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
+        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BULKLOAD_REF: ${{ inputs.ref }}
+        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
+        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
+        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
+        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      run: |
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d
+        /bin/bash -p "$BULKLOAD_GUARD_PATH" preflight
+
+    - name: Discover sanctioned runner endpoint authority
+      id: endpoints
+      uses: tinyland-inc/ci-templates/.github/actions/nix-setup@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
+      with:
+        attic-cache: main
+
+    - name: Enforce the discovered public-read boundary
+      id: authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
+        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BULKLOAD_REF: ${{ inputs.ref }}
+        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
+        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
+        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
+        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+        BULKLOAD_ATTIC_REACHABLE: ${{ steps.endpoints.outputs.attic_reachable }}
+        BULKLOAD_BAZEL_CACHE_REACHABLE: ${{ steps.endpoints.outputs.bazel_cache_reachable }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      run: |
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d
+        /bin/bash -p "$BULKLOAD_GUARD_PATH" enforce
+
+    - name: Revalidate immutable Bazel build authority
+      if: ${{ inputs.gate == 'build' }}
+      id: bazel-build-authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
+        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BULKLOAD_REF: ${{ inputs.ref }}
+        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
+        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
+        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
+        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+        BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BULKLOAD_CAPTURED_BAZEL_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        BULKLOAD_BAZEL_PHASE: build
+        ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      run: |
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d
+        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel
+
+    - name: Build the Bulkload binary through the public Flywheel action
+      if: ${{ inputs.gate == 'build' }}
+      uses: tinyland-inc/ci-templates/.github/actions/flywheel-bazel@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        HOME: ${{ steps.bazel-build-authority.outputs.bazel_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ${{ steps.bazel-build-authority.outputs.bazelisk_home }}
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      with:
+        bazel_remote_cache: ${{ steps.authority.outputs.bazel_remote_cache }}
+        bazel_remote_executor: ""
+        command: build
+        config: flywheel
+        targets: //:bulkload
+
+    - name: Revalidate immutable Bazel test authority
+      if: ${{ inputs.gate == 'test' }}
+      id: bazel-test-authority
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        BULKLOAD_GUARD_PATH: ${{ steps.guard-snapshot.outputs.guard_path }}
+        BULKLOAD_EVENT_NAME: ${{ inputs.event-name }}
+        BULKLOAD_EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BULKLOAD_REF: ${{ inputs.ref }}
+        BULKLOAD_REPOSITORY: ${{ inputs.repository }}
+        BULKLOAD_HEAD_REPOSITORY: ${{ inputs.head-repository }}
+        BULKLOAD_UPLOAD_BAZEL_RESULTS: ${{ inputs.upload-bazel-results }}
+        BULKLOAD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        BULKLOAD_RUNNER_NAME: ${{ runner.name }}
+        BULKLOAD_CAPTURED_BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BULKLOAD_CAPTURED_BAZEL_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BULKLOAD_CAPTURED_NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        BULKLOAD_BAZEL_PHASE: test
+        ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      run: |
+        test "$(/usr/bin/sha256sum "$BULKLOAD_GUARD_PATH" | /usr/bin/awk '{print $1}')" = ce5113ebf69a19c2ead8e484f131c9782328ada44ba173465e348c6a539d348d
+        /bin/bash -p "$BULKLOAD_GUARD_PATH" bazel
+
+    - name: Test the complete Bulkload Bazel graph through the public Flywheel action
+      if: ${{ inputs.gate == 'test' }}
+      uses: tinyland-inc/ci-templates/.github/actions/flywheel-bazel@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        HOME: ${{ steps.bazel-test-authority.outputs.bazel_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}
+        BAZEL_REMOTE_EXECUTOR: ""
+        BAZEL_REMOTE_EXEC_HEADER: ""
+        BAZEL_CREDENTIAL_HELPER: ""
+        BAZEL_REMOTE_HEADER: ""
+        BAZEL_REMOTE_CACHE_HEADER: ""
+        GF_BAZEL_REMOTE_UPLOAD: ${{ steps.authority.outputs.bazel_remote_upload }}
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ${{ steps.bazel-test-authority.outputs.bazelisk_home }}
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+      with:
+        bazel_remote_cache: ${{ steps.authority.outputs.bazel_remote_cache }}
+        bazel_remote_executor: ""
+        command: test
+        config: flywheel
+        targets: //:tests
+
+    - name: Run repository-owned source gates
+      if: ${{ inputs.gate == 'source' }}
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
+        ATTIC_CACHE: main
+        ATTIC_PUBLIC_KEY: main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+        ATTIC_PUBLIC_READ_SITE: bulkload-ci
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+      run: |
+        set -euo pipefail
+        test -z "${NIX_ACCESS_TOKENS:-}"
+        test "$(nix config show accept-flake-config)" = false
+        test "$(nix config show netrc-file)" = /dev/null
+        test -z "$(nix config show access-tokens)"
+        test -z "$(nix config show post-build-hook)"
+        test -z "$(nix config show secret-key-files)"
+        test -z "$(nix config show plugin-files)"
+        nix config show substituters | tr ' ' '\n' | grep -Fx -- "${ATTIC_SERVER%/}/${ATTIC_CACHE}"
+        nix config show trusted-public-keys | tr ' ' '\n' | grep -Fx -- "$ATTIC_PUBLIC_KEY"
+        nix flake check --no-build --no-write-lock-file
+        exec nix develop --no-write-lock-file .#default --command just ci-source

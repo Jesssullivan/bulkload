@@ -1,0 +1,107 @@
+"""Canonical build and validation graph for bulkload."""
+
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "bulkload_lib",
+    srcs = glob([".agents/skills/bulkload/scripts/bulkload_lib/*.py"]),
+    imports = [".agents/skills/bulkload/scripts"],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "bulkload",
+    legacy_create_init = 0,
+    srcs = [".agents/skills/bulkload/scripts/bulkload.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "bulkload_tests",
+    legacy_create_init = 0,
+    main = "tests/test_bulkload.py",
+    size = "medium",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/unprivileged_test_main.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "repo_contract_test",
+    legacy_create_init = 0,
+    main = "scripts/validate_repo_manifest.py",
+    size = "small",
+    srcs = ["scripts/validate_repo_manifest.py"],
+    args = ["--self-test", "tinyland.repo.json"],
+    data = ["tinyland.repo.json"],
+)
+
+py_test(
+    name = "skill_contract_test",
+    legacy_create_init = 0,
+    main = "scripts/validate_skill.py",
+    size = "small",
+    srcs = ["scripts/validate_skill.py"],
+    args = [
+        "--allow-runfiles-symlinks",
+        "--self-test",
+        ".agents/skills/bulkload",
+    ],
+    data = [":skill_bundle"],
+)
+
+py_test(
+    name = "installer_test",
+    legacy_create_init = 0,
+    main = "tests/test_installer.py",
+    size = "small",
+    srcs = ["tests/test_installer.py"],
+    data = [
+        "scripts/install_lock.py",
+        "scripts/install-skill.sh",
+        "scripts/validate_skill.py",
+        ":skill_bundle",
+    ],
+)
+
+py_test(
+    name = "ci_contract_test",
+    legacy_create_init = 0,
+    main = "tests/test_ci_contract.py",
+    size = "small",
+    srcs = ["tests/test_ci_contract.py"],
+    data = [
+        "BUILD.bazel",
+        ".bazelrc",
+        ".bazelrc.flywheel",
+        ".bazelversion",
+        ".github/actionlint.yaml",
+        ".github/actions/bulkload-public-read-ci/action.yml",
+        ".github/workflows/ci.yml",
+        "flake.lock",
+        "flake.nix",
+        "justfile",
+        "justfile.flywheel",
+        "scripts/ci-public-read-guard.sh",
+        "tinyland.repo.json",
+    ],
+)
+
+filegroup(
+    name = "skill_bundle",
+    srcs = glob([".agents/skills/bulkload/**"]),
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        ":bulkload_tests",
+        ":ci_contract_test",
+        ":installer_test",
+        ":repo_contract_test",
+        ":skill_contract_test",
+    ],
+)

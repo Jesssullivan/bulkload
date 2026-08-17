@@ -1,0 +1,13 @@
+/.direnv/
+/.env.flywheel.local
+/.bulkload/
+/bazel-*
+/build/
+/.coverage
+/.pytest_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
+*.swp
+.DS_Store
+._*
