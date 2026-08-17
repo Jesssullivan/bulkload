@@ -6,7 +6,7 @@ py_library(
     name = "bulkload_lib",
     srcs = glob([".agents/skills/bulkload/scripts/bulkload_lib/**/*.py"]),
     data = [
-        ".agents/skills/bulkload/references/codex-private-state-policy.v3.json",
+        ".agents/skills/bulkload/references/codex-private-state-policy.v4.json",
         ".agents/skills/bulkload/scripts/bulkload.py",
     ],
     imports = [".agents/skills/bulkload/scripts"],
@@ -77,6 +77,15 @@ py_test(
     main = "tests/test_private_runtime.py",
     size = "small",
     srcs = ["tests/test_private_runtime.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "private_sqlite_plan_tests",
+    legacy_create_init = 0,
+    main = "tests/test_private_sqlite_plan.py",
+    size = "large",
+    srcs = ["tests/test_private_sqlite_plan.py"],
     deps = [":bulkload_lib"],
 )
 
@@ -166,6 +175,7 @@ test_suite(
         ":private_apply_tests",
         ":private_quiescence_tests",
         ":private_runtime_tests",
+        ":private_sqlite_plan_tests",
         ":private_state_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",

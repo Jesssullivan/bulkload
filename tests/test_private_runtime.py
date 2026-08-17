@@ -27,7 +27,11 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
         "scripts/bulkload_lib/cli.py": b"def main(): return 0\n",
         "scripts/bulkload_lib/private_apply.py": b"def apply(): return None\n",
         "scripts/bulkload_lib/private_quiescence.py": (b"def attest(): return None\n"),
+        "scripts/bulkload_lib/private_sqlite_plan.py": (
+            b"def compile_plan(): return None\n"
+        ),
         "scripts/bulkload_lib/private_state.py": b"def capture(): return None\n",
+        "scripts/bulkload_lib/sessions.py": b"def sessions(): return None\n",
         "scripts/bulkload_lib/other.py": b"VALUE = 1\n",
     }
     for relative, payload in payloads.items():
@@ -45,6 +49,8 @@ def _write_runtime_fixture(root: Path) -> dict[str, bytes]:
             "auth_install": True,
             "combined": False,
             "sqlite_compose": False,
+            "sqlite_compose_plan": True,
+            "sqlite_publish": False,
         },
         "source_digests": source_digests,
         "runtime_source_sha256": private_runtime._runtime_digest(payloads),

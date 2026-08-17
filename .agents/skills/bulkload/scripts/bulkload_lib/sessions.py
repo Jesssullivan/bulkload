@@ -2996,3 +2996,263 @@ def compile_codex_session_union_plan(
     if len(canonical_bytes(plan)) > MAX_CODEX_SESSION_PLAN_BYTES:
         raise BulkloadError("Codex session plan output byte budget exceeded")
     return plan
+
+
+def _validate_session_plan_evidence_binding(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        not in (
+            {"capture_id", "proof_sha256"},
+            {"capture_id", "snapshot_sha256", "close_capture_sha256"},
+        )
+        or not isinstance(value.get("capture_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["capture_id"]) is None
+    ):
+        raise BulkloadError(f"Codex session {label} binding is invalid")
+    for key, item in value.items():
+        if key == "capture_id":
+            continue
+        if not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None:
+            raise BulkloadError(f"Codex session {label} digest is invalid")
+    return value["capture_id"]
+
+
+def validate_codex_session_union_evidence_binding(
+    source: Any,
+    destination: Any,
+    evidence: Any,
+) -> set[str]:
+    """Validate and return every capture ID in an embedded v3 evidence body."""
+    for role, binding in (
+        ("source", source),
+        ("destination", destination),
+    ):
+        if not _valid_prefix_binding(binding):
+            raise BulkloadError(f"Codex session union plan {role} binding is invalid")
+    opening_ids = [
+        *source["capture_ids"],
+        *destination["capture_ids"],
+    ]
+    if len(set(opening_ids)) != 4:
+        raise BulkloadError(
+            "Codex session union plan opening captures are not globally distinct"
+        )
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "request_sha256",
+        "close_request_sha256",
+        "source_prefix_proofs",
+        "destination_prefix_proofs",
+        "source_close_snapshots",
+        "destination_close_snapshots",
+    }:
+        raise BulkloadError("Codex session union plan prefix evidence is invalid")
+    for key in ("request_sha256", "close_request_sha256"):
+        digest = evidence[key]
+        if digest is not None and (
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise BulkloadError(f"Codex session union plan {key} is invalid")
+    evidence_ids: list[str] = []
+    for role in ("source", "destination"):
+        proofs = evidence[f"{role}_prefix_proofs"]
+        closes = evidence[f"{role}_close_snapshots"]
+        if not isinstance(proofs, list) or len(proofs) not in {0, 2}:
+            raise BulkloadError(
+                f"Codex session union plan {role} prefix proofs are invalid"
+            )
+        if not isinstance(closes, list) or len(closes) not in {0, 2}:
+            raise BulkloadError(
+                f"Codex session union plan {role} close captures are invalid"
+            )
+        evidence_ids.extend(
+            _validate_session_plan_evidence_binding(
+                item,
+                label=f"{role} prefix proof",
+            )
+            for item in proofs
+        )
+        evidence_ids.extend(
+            _validate_session_plan_evidence_binding(
+                item,
+                label=f"{role} close capture",
+            )
+            for item in closes
+        )
+    has_request = evidence["request_sha256"] is not None
+    has_close = evidence["close_request_sha256"] is not None
+    has_any_bound_evidence = bool(evidence_ids)
+    if (
+        has_close
+        and not has_request
+        or has_any_bound_evidence
+        and not (has_request and has_close)
+        or has_close
+        and (
+            len(evidence["source_close_snapshots"]) != 2
+            or len(evidence["destination_close_snapshots"]) != 2
+        )
+        or not has_close
+        and any(
+            evidence[key]
+            for key in (
+                "source_prefix_proofs",
+                "destination_prefix_proofs",
+                "source_close_snapshots",
+                "destination_close_snapshots",
+            )
+        )
+    ):
+        raise BulkloadError("Codex session union plan evidence closure is invalid")
+    all_ids = [*opening_ids, *evidence_ids]
+    if len(set(all_ids)) != len(all_ids):
+        raise BulkloadError(
+            "Codex session union plan capture IDs are not globally distinct"
+        )
+    return set(all_ids)
+
+
+def _validate_session_plan_records(
+    value: Any,
+    *,
+    label: str,
+) -> None:
+    if not isinstance(value, list):
+        raise BulkloadError(f"Codex session plan {label} must be a list")
+    encodings: list[bytes] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise BulkloadError(f"Codex session plan {label} item is invalid")
+        encodings.append(canonical_bytes(item))
+    if len(encodings) != len(set(encodings)):
+        raise BulkloadError(f"Codex session plan {label} contains duplicates")
+
+
+def validate_codex_session_union_plan(plan: dict[str, Any]) -> None:
+    """Validate the exact v3 session-union envelope.
+
+    Structural validation is intentionally paired with
+    ``validate_codex_session_union_plan_against_inputs`` whenever the plan is
+    used as cross-plane authority. A self-digested plan alone is not evidence
+    that its intent was derived from the named captures.
+    """
+    if set(plan) != {
+        "schema",
+        "created_at",
+        "source",
+        "destination",
+        "prefix_evidence",
+        "intent",
+        "plan_sha256",
+    }:
+        raise BulkloadError("Codex session union plan has unexpected fields")
+    if plan.get("schema") != CODEX_SESSION_PLAN_SCHEMA:
+        raise BulkloadError("unsupported Codex session union plan schema")
+    if not isinstance(plan.get("created_at"), str) or not plan["created_at"]:
+        raise BulkloadError("Codex session union plan timestamp is invalid")
+    validate_codex_session_union_evidence_binding(
+        plan.get("source"),
+        plan.get("destination"),
+        plan.get("prefix_evidence"),
+    )
+
+    intent = plan.get("intent")
+    if not isinstance(intent, dict) or set(intent) != {
+        "ready_for_attended_copy",
+        "copy_if_absent",
+        "promote_source_superset",
+        "exact_common",
+        "preserve_destination",
+        "preserve_destination_superset",
+        "custody_findings",
+        "blockers",
+    }:
+        raise BulkloadError("Codex session union plan intent is invalid")
+    for key in (
+        "copy_if_absent",
+        "promote_source_superset",
+        "exact_common",
+        "preserve_destination",
+        "preserve_destination_superset",
+        "blockers",
+    ):
+        _validate_session_plan_records(intent[key], label=key)
+    custody = intent["custody_findings"]
+    if not isinstance(custody, dict) or set(custody) != {
+        "source_non_private_files",
+        "source_non_private_directories",
+        "destination_non_private_files",
+        "destination_non_private_directories",
+        "source_writers_quiesced",
+        "destination_writers_quiesced",
+    }:
+        raise BulkloadError("Codex session union plan custody findings are invalid")
+    for key in (
+        "source_non_private_files",
+        "source_non_private_directories",
+        "destination_non_private_files",
+        "destination_non_private_directories",
+    ):
+        if type(custody[key]) is not int or custody[key] < 0:
+            raise BulkloadError("Codex session union plan custody count is invalid")
+    for key in ("source_writers_quiesced", "destination_writers_quiesced"):
+        if custody[key] is not True:
+            raise BulkloadError("Codex session union plan lacks writer quiescence")
+    if (
+        type(intent["ready_for_attended_copy"]) is not bool
+        or intent["ready_for_attended_copy"] != (not intent["blockers"])
+        or intent["blockers"]
+        and (intent["copy_if_absent"] or intent["promote_source_superset"])
+    ):
+        raise BulkloadError("Codex session union plan readiness is inconsistent")
+    for blocker in intent["blockers"]:
+        if not isinstance(blocker.get("code"), str) or not blocker["code"]:
+            raise BulkloadError("Codex session union plan blocker is invalid")
+    if len(canonical_bytes(plan)) > MAX_CODEX_SESSION_PLAN_BYTES:
+        raise BulkloadError("Codex session plan output byte budget exceeded")
+    require_digest(plan, "plan_sha256")
+
+
+def validate_codex_session_union_plan_against_inputs(
+    plan: dict[str, Any],
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+    *,
+    prefix_request: dict[str, Any] | None = None,
+    source_prefix_a: dict[str, Any] | None = None,
+    source_prefix_b: dict[str, Any] | None = None,
+    destination_prefix_a: dict[str, Any] | None = None,
+    destination_prefix_b: dict[str, Any] | None = None,
+    close_request: dict[str, Any] | None = None,
+    source_close_a: dict[str, Any] | None = None,
+    source_close_b: dict[str, Any] | None = None,
+    destination_close_a: dict[str, Any] | None = None,
+    destination_close_b: dict[str, Any] | None = None,
+) -> None:
+    """Reject a fabricated v3 plan by recomputing it from every raw input."""
+    validate_codex_session_union_plan(plan)
+    recomputed = compile_codex_session_union_plan(
+        source_a,
+        source_b,
+        destination_a,
+        destination_b,
+        prefix_request=prefix_request,
+        source_prefix_a=source_prefix_a,
+        source_prefix_b=source_prefix_b,
+        destination_prefix_a=destination_prefix_a,
+        destination_prefix_b=destination_prefix_b,
+        close_request=close_request,
+        source_close_a=source_close_a,
+        source_close_b=source_close_b,
+        destination_close_a=destination_close_a,
+        destination_close_b=destination_close_b,
+    )
+    ignored = {"created_at", "plan_sha256"}
+    expected = {key: value for key, value in recomputed.items() if key not in ignored}
+    observed = {key: value for key, value in plan.items() if key not in ignored}
+    if observed != expected:
+        raise BulkloadError(
+            "Codex session union plan differs from its supplied evidence closure"
+        )

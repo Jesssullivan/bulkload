@@ -22,9 +22,11 @@ Portable candidates include closed rollout JSONL files, append-only
 SQLite families. Keep `config.toml`, rules directories, caches, installation
 IDs, shell snapshots, and active rollouts out of generic copying. Handle auth
 and SQLite only through the exact policy in
-`codex-private-state-policy.v3.json`. Policy v3 implements only a narrow,
-attended typed auth install while preserving destination SQLite exactly. It
-does not implement SQLite composition/installation or combined apply.
+`codex-private-state-policy.v4.json`. Policy v4 retains the narrow, attended
+typed auth install while preserving destination SQLite exactly and adds a
+separate four-pass, session-bound SQLite classification opening request. It
+does not implement SQLite composition, publication, installation, or combined
+apply.
 
 Before copying a rollout:
 
@@ -99,7 +101,9 @@ the source file before and after.
 
 ## Codex private state
 
-Read `codex-private-state-policy.v3.json` and
+Read `codex-private-state-policy.v4.json`,
+[`codex-private-sqlite-compose-plan.md`](codex-private-sqlite-compose-plan.md),
+and
 [`codex-private-auth-install.md`](codex-private-auth-install.md) before
 capturing or installing auth.
 
@@ -112,7 +116,9 @@ capturing or installing auth.
 - Any `-wal`, `-shm`, or `-journal` sidecar hard-stops immutable SQLite
   capture. Do not raw-copy or bypass the sidecar fence.
 - Preserve every destination SQLite family exactly and require zero SQLite
-  mutations. SQLite union/composer/install and combined apply remain false.
+  auth-install mutations. The v4 opening request may classify exact structural
+  and type-tagged row relations, but SQLite compose/publish/install and
+  combined apply remain false.
 - Treat each quiescence attestation as an operator procedural fence with
   `provider_writer_proof=false`. The directory `flock` coordinates Bulkload
   only; independently stop provider writers for the complete operation.
@@ -142,7 +148,7 @@ potentially portable only after exact path mapping. Project directory slugs may
 encode the physical cwd and may collide. Regenerate settings containing Nix
 store paths, plugins with platform binaries, caches, daemons, shell snapshots,
 and indexes. Move credentials only through a provider-specific typed policy.
-Policy v3 authorizes Codex `auth.json`, not Claude keychain or credential
+Policy v4 authorizes Codex `auth.json`, not Claude keychain or credential
 state, so use attended reauthentication for Claude.
 
 Do not blanket-rewrite binary or SQLite content. Use provider-supported

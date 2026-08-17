@@ -57,6 +57,8 @@ from bulkload_lib.sessions import (  # noqa: E402
     validate_codex_session_prefix_proof,
     validate_codex_session_prefix_request,
     validate_codex_session_snapshot,
+    validate_codex_session_union_plan,
+    validate_codex_session_union_plan_against_inputs,
 )
 from tests.unprivileged_test_main import run_unittest_main  # noqa: E402
 
@@ -333,6 +335,42 @@ class BulkloadProtocolTest(unittest.TestCase):
                 2,
             )
             self.assertEqual(plan["intent"]["blockers"], [])
+            validate_codex_session_union_plan(plan)
+            validate_codex_session_union_plan_against_inputs(
+                plan,
+                source_a,
+                source_b,
+                destination_a,
+                destination_b,
+            )
+
+            fabricated = json.loads(json.dumps(plan))
+            fabricated["intent"]["copy_if_absent"] = []
+            fabricated["plan_sha256"] = object_digest(
+                fabricated,
+                "plan_sha256",
+            )
+            validate_codex_session_union_plan(fabricated)
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "differs from its supplied evidence closure",
+            ):
+                validate_codex_session_union_plan_against_inputs(
+                    fabricated,
+                    source_a,
+                    source_b,
+                    destination_a,
+                    destination_b,
+                )
+
+            unexpected = json.loads(json.dumps(plan))
+            unexpected["unexpected"] = True
+            unexpected["plan_sha256"] = object_digest(
+                unexpected,
+                "plan_sha256",
+            )
+            with self.assertRaisesRegex(BulkloadError, "unexpected fields"):
+                validate_codex_session_union_plan(unexpected)
 
     def test_codex_session_union_blocks_same_uuid_different_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

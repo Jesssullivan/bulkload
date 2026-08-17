@@ -15,15 +15,17 @@ required proof digest, and only then accepts fresh source and destination A/B
 captures wrapped against that request.
 
 Codex auth and SQLite families are explicitly copy-eligible, opt-in state
-classes, but policy v3 implements only a narrow attended `auth.json` install.
+classes. Policy v4 retains the narrow attended `auth.json` install and adds a
+separate four-pass, session-bound SQLite classification/opening request.
 The preferred inputs are an auth-only source capture and an auth-plus-SQLite
 destination capture. A full source capture is accepted, but source SQLite is
 never consumed; destination SQLite is preserved exactly with zero mutation.
 The workflow provides digest-accepted planning, atomic auth replacement,
 journaling, offline verification, rollback, and interrupted-operation recovery.
-SQLite union/composition/installation and combined apply remain false and
-fail-held. Any live WAL, SHM, or rollback-journal sidecar blocks immutable
-SQLite capture.
+SQLite composition, publication, installation, combined apply, and any claim
+that the session union was executed remain false and fail-held. A later
+composer must obtain fresh post-plan closing A/B captures. Any live WAL, SHM,
+or rollback-journal sidecar blocks immutable SQLite capture.
 
 Quiescence evidence is an operator procedural assertion with
 `provider_writer_proof=false`; its advisory lock coordinates Bulkload only.
@@ -32,6 +34,8 @@ the plans. An offline receipt proves bytes and preservation invariants, not
 working provider authentication. A fresh attended provider turn is the final
 acceptance proof. See the
 [private auth install runbook](.agents/skills/bulkload/references/codex-private-auth-install.md).
+The plan-only database contract is in the
+[SQLite opening-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md).
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:
