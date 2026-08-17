@@ -10,9 +10,17 @@ import stat
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 from bulkload_lib.cli import main as cli_main
-from bulkload_lib.model import BulkloadError, read_json
+from bulkload_lib.model import (
+    BulkloadError,
+    canonical_bytes,
+    object_digest,
+    read_json,
+)
+from bulkload_lib import private_quiescence
+from bulkload_lib import private_runtime
 from bulkload_lib import private_state
 from bulkload_lib.private_state import (
     PRIVATE_CAPTURE_SCHEMA,
@@ -33,6 +41,47 @@ FAMILIES = (
     "memories_1.sqlite",
     "state_5.sqlite",
 )
+
+
+def compile_private_plan(source: Path, destination: Path) -> dict:
+    return compile_codex_private_state_plan(
+        source,
+        destination,
+        runtime_authority=private_runtime.current_private_runtime_authority(),
+    )
+
+
+def capture_quiescence(
+    home: Path,
+    output: Path,
+    role: str,
+    authority: str,
+    *,
+    include_auth: bool,
+    include_sqlite: bool,
+    sqlite_home: Path | None = None,
+) -> dict:
+    selected = [
+        name
+        for name, enabled in (
+            ("auth", include_auth),
+            ("sqlite", include_sqlite),
+        )
+        if enabled
+    ]
+    attestation = private_quiescence.create_codex_private_quiescence_attestation(
+        home,
+        output.parent / f".{output.name}.quiescence-{uuid.uuid4()}.json",
+        purpose="capture",
+        capture_role=role,
+        host_authority_id=authority,
+        codex_version="0.145.0",
+        selected_state_classes=selected,
+        sqlite_home=(sqlite_home if include_sqlite else None),
+        create_only_output=output,
+        acknowledge_writers_quiesced=True,
+    )
+    return private_state.private_quiescence_capture_record(attestation)
 
 
 def create_family(
@@ -151,12 +200,53 @@ def capture(root: Path, role: str, home: Path) -> tuple[dict, Path]:
         include_auth=True,
         include_sqlite=True,
         acknowledge_private_capture=True,
+        quiescence=capture_quiescence(
+            home,
+            output,
+            role,
+            SOURCE_AUTHORITY if role == "source" else DESTINATION_AUTHORITY,
+            include_auth=True,
+            include_sqlite=True,
+            sqlite_home=home,
+        ),
     )
     return value, output
 
 
+def rewrite_capture_manifest(
+    bundle: Path,
+    capture_value: dict,
+    quiescence_attestation: dict,
+) -> dict:
+    rewritten = json.loads(json.dumps(capture_value))
+    rewritten["quiescence"] = private_state.private_quiescence_capture_record(
+        quiescence_attestation
+    )
+    rewritten["capture_sha256"] = object_digest(rewritten, "capture_sha256")
+    manifest = bundle / PRIVATE_MANIFEST
+    manifest.write_bytes(canonical_bytes(rewritten) + b"\n")
+    manifest.chmod(0o600)
+    return rewritten
+
+
 class CodexPrivateStateTest(unittest.TestCase):
-    def test_capture_uses_online_backup_and_keeps_values_out_of_manifest(self) -> None:
+    def setUp(self) -> None:
+        self.process_runtime_authority = (
+            private_runtime._open_disk_private_runtime_authority_for_tests()
+        )
+        private_runtime.bind_process_private_runtime_authority(
+            self.process_runtime_authority
+        )
+
+    def tearDown(self) -> None:
+        private_runtime._unbind_process_private_runtime_authority_for_tests(
+            self.process_runtime_authority
+        )
+        self.process_runtime_authority.close()
+
+    def test_capture_uses_immutable_backup_and_keeps_values_out_of_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             secret = "DO_NOT_PUBLISH_THIS_FIXTURE"
@@ -164,13 +254,9 @@ class CodexPrivateStateTest(unittest.TestCase):
                 root,
                 "source",
                 auth=secret,
-                live_state_writer=True,
             )
-            assert writer is not None
-            try:
-                value, output = capture(root, "source", home)
-            finally:
-                writer.close()
+            self.assertIsNone(writer)
+            value, output = capture(root, "source", home)
 
             validate_codex_private_capture(value)
             self.assertEqual(value["schema"], PRIVATE_CAPTURE_SCHEMA)
@@ -210,14 +296,264 @@ class CodexPrivateStateTest(unittest.TestCase):
                 self.assertFalse((output / "sqlite" / f"{family}-wal").exists())
                 self.assertFalse((output / "sqlite" / f"{family}-shm").exists())
 
+    def test_capture_bundle_remains_portable_after_output_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, _ = create_home(root, "source", auth="source")
+            value, output = capture(root, "source", home)
+
+            observed, observed_root = private_state.read_codex_private_bundle(
+                output,
+                "source",
+            )
+            self.assertEqual(observed["capture_sha256"], value["capture_sha256"])
+            self.assertEqual(observed_root, output.resolve())
+
+            renamed = root / "renamed-source-bundle"
+            output.rename(renamed)
+            moved, moved_root = private_state.read_codex_private_bundle(
+                renamed,
+                "source",
+            )
+            self.assertEqual(moved["capture_sha256"], value["capture_sha256"])
+            self.assertEqual(moved_root, renamed.resolve())
+            self.assertEqual(
+                moved["capture_output"],
+                value["quiescence"]["attestation"]["operation_output"],
+            )
+
+    def test_capture_bundle_read_rejects_valid_different_output_attestation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, _ = create_home(root, "source", auth="source")
+            value, output = capture(root, "source", home)
+            other_output = root / "other-source-bundle"
+            replacement = capture_quiescence(
+                home,
+                other_output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=True,
+                sqlite_home=home,
+            )["attestation"]
+            rewritten = rewrite_capture_manifest(output, value, replacement)
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "capture output differs from quiescence attestation",
+            ):
+                validate_codex_private_capture(rewritten)
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "capture output differs from quiescence attestation",
+            ):
+                private_state.read_codex_private_bundle(output, "source")
+
+    def test_operation_attestation_keeps_its_receipt_output_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, _ = create_home(root, "destination", auth="destination")
+            receipt = root / "verify-receipt.json"
+            bundle = root / "verification-capture"
+            attestation = (
+                private_quiescence.create_codex_private_quiescence_attestation(
+                    home,
+                    root / "verify-quiescence.json",
+                    purpose="verify",
+                    host_authority_id=DESTINATION_AUTHORITY,
+                    codex_version="0.145.0",
+                    selected_state_classes=["auth"],
+                    sqlite_home=None,
+                    create_only_output=receipt,
+                    acknowledge_writers_quiesced=True,
+                    accepted_plan_sha256="1" * 64,
+                    accepted_apply_receipt_sha256="2" * 64,
+                )
+            )
+            value = capture_codex_private_state(
+                home,
+                bundle,
+                role="destination",
+                host_authority_id=DESTINATION_AUTHORITY,
+                codex_version="0.145.0",
+                include_auth=True,
+                include_sqlite=False,
+                acknowledge_private_capture=True,
+                quiescence=private_state.private_quiescence_capture_record(attestation),
+            )
+
+            observed, _ = private_state.read_codex_private_bundle(
+                bundle,
+                "destination",
+            )
+            self.assertEqual(observed["capture_sha256"], value["capture_sha256"])
+            self.assertEqual(
+                observed["quiescence"]["attestation"]["operation_output"]["path"],
+                os.fspath(receipt.resolve()),
+            )
+
+    def test_capture_validation_rejects_foreign_root_attestation_substitution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, _ = create_home(root, "source", auth="same")
+            foreign_home, _ = create_home(root, "foreign", auth="same")
+            output = root / "source-bundle"
+            original = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=False,
+            )
+            replacement = capture_quiescence(
+                foreign_home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=False,
+            )["attestation"]
+            value = capture_codex_private_state(
+                home,
+                output,
+                role="source",
+                host_authority_id=SOURCE_AUTHORITY,
+                codex_version="0.145.0",
+                include_auth=True,
+                include_sqlite=False,
+                acknowledge_private_capture=True,
+                quiescence=original,
+            )
+            rewrite_capture_manifest(output, value, replacement)
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "Codex root differs from quiescence attestation",
+            ):
+                private_state.read_codex_private_bundle(output, "source")
+
+    def test_capture_rejects_stale_output_parent_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, _ = create_home(root, "source", auth="source")
+            output = root / "source-bundle"
+            record = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=False,
+            )
+            attestation = record["attestation"]
+            attestation["operation_output"]["parent_identity"]["inode"] += 1
+            attestation["attestation_sha256"] = object_digest(
+                attestation,
+                "attestation_sha256",
+            )
+            record = private_state.private_quiescence_capture_record(attestation)
+
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "capture output differs from quiescence attestation",
+            ):
+                capture_codex_private_state(
+                    home,
+                    output,
+                    role="source",
+                    host_authority_id=SOURCE_AUTHORITY,
+                    codex_version="0.145.0",
+                    include_auth=True,
+                    include_sqlite=False,
+                    acknowledge_private_capture=True,
+                    quiescence=record,
+                )
+            self.assertFalse(output.exists())
+
+    def test_capture_rejects_live_wal_sidecars_without_mutating_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, writer = create_home(
+                root,
+                "source",
+                auth="fixture",
+                live_state_writer=True,
+            )
+            assert writer is not None
+            wal = home / "state_5.sqlite-wal"
+            shm = home / "state_5.sqlite-shm"
+            before = {
+                path.name: (
+                    path.read_bytes(),
+                    path.stat().st_ino,
+                    path.stat().st_mtime_ns,
+                )
+                for path in (wal, shm)
+            }
+            try:
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "requires absent live sidecars",
+                ):
+                    capture_codex_private_state(
+                        home,
+                        root / "blocked-bundle",
+                        role="source",
+                        host_authority_id=SOURCE_AUTHORITY,
+                        codex_version="0.145.0",
+                        sqlite_home=home,
+                        include_auth=True,
+                        include_sqlite=True,
+                        acknowledge_private_capture=True,
+                        quiescence=capture_quiescence(
+                            home,
+                            root / "blocked-bundle",
+                            "source",
+                            SOURCE_AUTHORITY,
+                            include_auth=True,
+                            include_sqlite=True,
+                            sqlite_home=home,
+                        ),
+                    )
+                after = {
+                    path.name: (
+                        path.read_bytes(),
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                    )
+                    for path in (wal, shm)
+                }
+                self.assertEqual(after, before)
+                self.assertFalse((root / "blocked-bundle").exists())
+                self.assertEqual(
+                    list(root.glob(".blocked-bundle.bulkload-private-*")),
+                    [],
+                )
+            finally:
+                writer.close()
+
     def test_capture_rejects_hardlinked_auth_and_retains_private_staging(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home, _ = create_home(root, "source", auth="fixture")
-            os.link(home / "auth.json", home / "auth.second-link")
             output = root / "blocked-bundle"
+            quiescence = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=False,
+            )
+            os.link(home / "auth.json", home / "auth.second-link")
 
             with self.assertRaisesRegex(BulkloadError, "preserved owner-private"):
                 capture_codex_private_state(
@@ -229,6 +565,7 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=False,
                     acknowledge_private_capture=True,
+                    quiescence=quiescence,
                 )
 
             self.assertFalse(output.exists())
@@ -254,6 +591,14 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=False,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "blocked-bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=True,
+                        include_sqlite=False,
+                    ),
                 )
 
     def test_capture_rejects_sqlite_family_set_change(self) -> None:
@@ -295,9 +640,18 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=False,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "blocked-bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=False,
+                        include_sqlite=True,
+                        sqlite_home=home,
+                    ),
                 )
 
-    def test_capture_enforces_budget_against_wal_backed_logical_size(self) -> None:
+    def test_capture_enforces_budget_against_quiesced_source_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / "source"
@@ -308,29 +662,38 @@ class CodexPrivateStateTest(unittest.TestCase):
             connection.execute("CREATE TABLE logs(payload BLOB)")
             connection.execute("INSERT INTO logs(payload) VALUES(zeroblob(1048576))")
             connection.commit()
-            try:
-                self.assertGreater(
-                    (home / "logs_1.sqlite-wal").stat().st_size,
-                    64 * 1024,
-                )
-                with self.assertRaisesRegex(
-                    BulkloadError,
-                    "snapshot exceeds the configured byte budget",
-                ):
-                    capture_codex_private_state(
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.close()
+            self.assertGreater(
+                (home / "logs_1.sqlite").stat().st_size,
+                64 * 1024,
+            )
+            with self.assertRaisesRegex(
+                BulkloadError,
+                "source bytes exceed the configured budget",
+            ):
+                capture_codex_private_state(
+                    home,
+                    root / "blocked-bundle",
+                    role="source",
+                    host_authority_id=SOURCE_AUTHORITY,
+                    codex_version="0.145.0",
+                    sqlite_home=home,
+                    include_auth=False,
+                    include_sqlite=True,
+                    acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
                         home,
                         root / "blocked-bundle",
-                        role="source",
-                        host_authority_id=SOURCE_AUTHORITY,
-                        codex_version="0.145.0",
-                        sqlite_home=home,
+                        "source",
+                        SOURCE_AUTHORITY,
                         include_auth=False,
                         include_sqlite=True,
-                        acknowledge_private_capture=True,
-                        max_total_sqlite_bytes=64 * 1024,
-                    )
-            finally:
-                connection.close()
+                        sqlite_home=home,
+                    ),
+                    max_total_sqlite_bytes=64 * 1024,
+                )
 
     def test_capture_enforces_thread_index_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -358,6 +721,15 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=False,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "blocked-bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=False,
+                        include_sqlite=True,
+                        sqlite_home=home,
+                    ),
                     max_thread_entries=1,
                 )
 
@@ -379,6 +751,15 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=False,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "blocked-bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=False,
+                        include_sqlite=True,
+                        sqlite_home=home,
+                    ),
                     max_metadata_entries=1,
                 )
 
@@ -409,6 +790,15 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=False,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        codex_home,
+                        root / "bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=False,
+                        include_sqlite=True,
+                        sqlite_home=sqlite_home,
+                    ),
                 )
 
     def test_auth_only_capture_ignores_stale_sqlite_environment(self) -> None:
@@ -432,6 +822,14 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=False,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=True,
+                        include_sqlite=False,
+                    ),
                 )
             self.assertEqual(value["selected_state_classes"], ["auth"])
             self.assertIsNone(value["sqlite_home"])
@@ -465,6 +863,14 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=False,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        root / "blocked-bundle",
+                        "source",
+                        SOURCE_AUTHORITY,
+                        include_auth=True,
+                        include_sqlite=False,
+                    ),
                 )
             self.assertFalse((root / "blocked-bundle").exists())
 
@@ -474,6 +880,15 @@ class CodexPrivateStateTest(unittest.TestCase):
             home, _ = create_home(root, "source", auth="source")
             output = root / "bundle"
             original_rename = private_state._rename_noreplace_at
+            quiescence = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=True,
+                sqlite_home=home,
+            )
 
             def mutate_after_rename(*args, **kwargs):
                 original_rename(*args, **kwargs)
@@ -501,6 +916,7 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=quiescence,
                 )
             self.assertTrue(output.is_dir())
 
@@ -510,6 +926,15 @@ class CodexPrivateStateTest(unittest.TestCase):
             home, _ = create_home(root, "source", auth="source")
             output = root / "bundle"
             original_rename = private_state._rename_noreplace_at
+            quiescence = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=True,
+                sqlite_home=home,
+            )
 
             def mutate_after_rename(*args, **kwargs):
                 original_rename(*args, **kwargs)
@@ -537,6 +962,7 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=quiescence,
                 )
             self.assertTrue(output.is_dir())
 
@@ -546,6 +972,15 @@ class CodexPrivateStateTest(unittest.TestCase):
             home, _ = create_home(root, "source", auth="source")
             output = root / "bundle"
             original_rename = private_state._rename_noreplace_at
+            quiescence = capture_quiescence(
+                home,
+                output,
+                "source",
+                SOURCE_AUTHORITY,
+                include_auth=True,
+                include_sqlite=True,
+                sqlite_home=home,
+            )
 
             def add_family_after_rename(*args, **kwargs):
                 original_rename(*args, **kwargs)
@@ -576,6 +1011,7 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=quiescence,
                 )
             self.assertTrue(output.is_dir())
 
@@ -592,7 +1028,7 @@ class CodexPrivateStateTest(unittest.TestCase):
             _, source = capture(root, "source", source_home)
             _, destination = capture(root, "destination", destination_home)
 
-            plan = compile_codex_private_state_plan(source, destination)
+            plan = compile_private_plan(source, destination)
 
             self.assertEqual(plan["schema"], PRIVATE_PLAN_SCHEMA)
             self.assertFalse(plan["ready_for_apply"])
@@ -628,7 +1064,7 @@ class CodexPrivateStateTest(unittest.TestCase):
             _, source = capture(root, "source", source_home)
             _, destination = capture(root, "destination", destination_home)
 
-            plan = compile_codex_private_state_plan(source, destination)
+            plan = compile_private_plan(source, destination)
 
             codes = [item["code"] for item in plan["blockers"]]
             self.assertIn("sqlite-header-mismatch", codes)
@@ -651,7 +1087,7 @@ class CodexPrivateStateTest(unittest.TestCase):
                 stream.write(b"tamper")
 
             with self.assertRaisesRegex(BulkloadError, "artifact digest mismatch"):
-                compile_codex_private_state_plan(source, destination)
+                compile_private_plan(source, destination)
 
     def test_sqlite_only_plan_does_not_require_auth(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -675,16 +1111,25 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=False,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        home,
+                        bundle,
+                        role,
+                        authority,
+                        include_auth=False,
+                        include_sqlite=True,
+                        sqlite_home=home,
+                    ),
                 )
                 bundles.append(bundle)
-            plan = compile_codex_private_state_plan(*bundles)
+            plan = compile_private_plan(*bundles)
             self.assertEqual(plan["auth"], {"action": "not-selected"})
             self.assertNotIn(
                 "source-auth-not-captured",
                 [item["code"] for item in plan["blockers"]],
             )
 
-    def test_private_cli_is_capture_and_plan_only(self) -> None:
+    def test_private_cli_capture_plan_and_apply_requires_exact_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_home, _ = create_home(root, "source", auth="source")
@@ -711,6 +1156,21 @@ class CodexPrivateStateTest(unittest.TestCase):
                     destination_bundle,
                 ),
             ):
+                attestation_path = root / f"{role}-quiescence.json"
+                attestation = (
+                    private_quiescence.create_codex_private_quiescence_attestation(
+                        home,
+                        attestation_path,
+                        purpose="capture",
+                        capture_role=role,
+                        host_authority_id=authority,
+                        codex_version="0.145.0",
+                        selected_state_classes=["auth", "sqlite"],
+                        sqlite_home=home,
+                        create_only_output=output,
+                        acknowledge_writers_quiesced=True,
+                    )
+                )
                 with mock.patch("sys.stdout", new=io.StringIO()):
                     result = cli_main(
                         [
@@ -725,6 +1185,10 @@ class CodexPrivateStateTest(unittest.TestCase):
                             role,
                             "--host-authority-id",
                             authority,
+                            "--quiescence-attestation",
+                            str(attestation_path),
+                            "--accept-quiescence-attestation",
+                            attestation["attestation_sha256"],
                             *common,
                         ]
                     )
@@ -786,6 +1250,15 @@ class CodexPrivateStateTest(unittest.TestCase):
                     include_auth=True,
                     include_sqlite=True,
                     acknowledge_private_capture=True,
+                    quiescence=capture_quiescence(
+                        codex_home,
+                        bundle,
+                        role,
+                        authority,
+                        include_auth=True,
+                        include_sqlite=True,
+                        sqlite_home=sqlite_home,
+                    ),
                 )
                 captures[role] = (codex_home, sqlite_home, bundle)
 

@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import quote
 import uuid
 
+from . import private_runtime
 from .model import (
     BulkloadError,
     canonical_bytes,
@@ -26,8 +27,8 @@ from .model import (
     utc_now,
 )
 
-PRIVATE_CAPTURE_SCHEMA = "dev.tinyland.bulkload.codex-private-state-capture.v1"
-PRIVATE_PLAN_SCHEMA = "dev.tinyland.bulkload.codex-private-state-plan.v1"
+PRIVATE_CAPTURE_SCHEMA = "dev.tinyland.bulkload.codex-private-state-capture.v3"
+PRIVATE_PLAN_SCHEMA = "dev.tinyland.bulkload.codex-private-state-plan.v3"
 PRIVATE_MANIFEST = "private-state-manifest.json"
 AUTH_BASENAME = "auth.json"
 SQLITE_DIRECTORY = "sqlite"
@@ -56,6 +57,24 @@ COUNTED_TABLES = frozenset(
         "threads",
     }
 )
+PRIVATE_QUIESCENCE_CLAIM = "operator-attested-procedural-fence"
+PRIVATE_QUIESCENCE_PURPOSES = frozenset(
+    {"capture", "apply", "verify", "rollback", "recover"}
+)
+PRIVATE_CAPTURE_QUIESCENCE_KEYS = {
+    "attestation",
+    "attestation_id",
+    "attestation_sha256",
+    "purpose",
+    "capture_role",
+    "claim",
+    "provider_writer_proof",
+    "host_authority_id",
+    "codex_version",
+    "selected_state_classes",
+    "accepted_inputs",
+    "bulkload_lock_scope_sha256",
+}
 
 
 def _identity(info: os.stat_result) -> dict[str, int]:
@@ -66,6 +85,29 @@ def _identity(info: os.stat_result) -> dict[str, int]:
         "mode": stat.S_IMODE(info.st_mode),
         "links": info.st_nlink,
     }
+
+
+def _directory_identity_record(info: os.stat_result) -> dict[str, int]:
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def private_quiescence_capture_record(
+    attestation: dict[str, Any],
+) -> dict[str, Any]:
+    """Project one non-secret attestation into durable capture authority."""
+    record = {
+        key: attestation[key]
+        for key in PRIVATE_CAPTURE_QUIESCENCE_KEYS
+        if key != "attestation"
+    }
+    record["attestation"] = json.loads(json.dumps(attestation))
+    _validate_private_capture_quiescence(record)
+    return record
 
 
 def _stable_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -581,8 +623,68 @@ def _discover_sqlite(
     return families
 
 
+SQLITE_LIVE_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _sqlite_live_namespace(
+    root_descriptor: int,
+    *,
+    max_families: int,
+) -> tuple[list[dict[str, Any]], str]:
+    records: list[dict[str, Any]] = []
+    sidecars: list[str] = []
+    with os.scandir(root_descriptor) as entries:
+        for entry in entries:
+            basename: str | None = None
+            if SQLITE_BASENAME.fullmatch(entry.name):
+                basename = entry.name
+            else:
+                for suffix in SQLITE_LIVE_COMPANION_SUFFIXES:
+                    candidate = entry.name.removesuffix(suffix)
+                    if candidate != entry.name and SQLITE_BASENAME.fullmatch(candidate):
+                        basename = candidate
+                        sidecars.append(entry.name)
+                        break
+            if basename is None:
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if (
+                entry.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o022
+            ):
+                raise BulkloadError(
+                    f"SQLite live namespace has unsafe custody: {entry.name}"
+                )
+            records.append(
+                {
+                    "name": entry.name,
+                    "device": info.st_dev,
+                    "inode": info.st_ino,
+                    "uid": info.st_uid,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "links": info.st_nlink,
+                    "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns,
+                    "ctime_ns": info.st_ctime_ns,
+                }
+            )
+    records.sort(key=lambda item: item["name"])
+    family_count = sum(1 for item in records if SQLITE_BASENAME.fullmatch(item["name"]))
+    if family_count > max_families:
+        raise BulkloadError("SQLite family count exceeds the configured budget")
+    if sidecars:
+        raise BulkloadError(
+            "quiesced immutable SQLite capture requires absent live sidecars: "
+            + ", ".join(sorted(sidecars))
+        )
+    return records, sha256_bytes(canonical_bytes(records))
+
+
 def _sqlite_uri(path: Path) -> str:
-    return f"file:{quote(os.fspath(path), safe='/')}?mode=ro"
+    return f"file:{quote(os.fspath(path), safe='/')}?mode=ro&immutable=1"
 
 
 def _schema_metadata(
@@ -734,6 +836,11 @@ def _online_backup(
     source_connection: sqlite3.Connection | None = None
     destination_connection: sqlite3.Connection | None = None
     started = time.monotonic()
+    source_sha256_before, source_size_before = _hash_regular_file(source)
+    if source_size_before != expected.st_size or _stable_artifact_stat(
+        source.stat(follow_symlinks=False)
+    ) != _stable_artifact_stat(expected):
+        raise BulkloadError(f"SQLite source changed before backup: {source.name}")
 
     def progress(_: int, __: int, ___: int) -> None:
         if time.monotonic() - started > timeout_seconds:
@@ -804,7 +911,12 @@ def _online_backup(
             source_connection.close()
 
     current = source.stat(follow_symlinks=False)
-    if _stable_identity(current) != _stable_identity(expected):
+    source_sha256_after, source_size_after = _hash_regular_file(source)
+    if (
+        _stable_artifact_stat(current) != _stable_artifact_stat(expected)
+        or source_size_after != source_size_before
+        or source_sha256_after != source_sha256_before
+    ):
         raise BulkloadError(f"SQLite source identity changed: {source.name}")
     destination.chmod(0o600)
     descriptor = os.open(destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -824,8 +936,9 @@ def _online_backup(
             "sha256": digest,
             "snapshot_size": size,
             "source_size": expected.st_size,
+            "source_sha256": source_sha256_before,
             "source_identity": _identity(expected),
-            "copy_method": "sqlite-online-backup-api",
+            "copy_method": "sqlite-immutable-backup-api",
         }
     )
     return metadata
@@ -839,6 +952,31 @@ def _path_is_within(candidate: Path, root: Path) -> bool:
         return False
 
 
+def _private_capture_output_binding(
+    target: Path,
+    parent: Path,
+    parent_info: os.stat_result,
+) -> dict[str, Any]:
+    return {
+        "path": os.fspath(target),
+        "parent_resolved_path": os.fspath(parent),
+        "parent_identity": _directory_identity_record(parent_info),
+        "leaf": target.name,
+    }
+
+
+def _validate_private_capture_output_binding(
+    capture: dict[str, Any],
+) -> None:
+    attestation = capture["quiescence"]["attestation"]
+    if attestation["purpose"] != "capture":
+        return
+    if attestation["operation_output"] != capture["capture_output"]:
+        raise BulkloadError(
+            "private capture output differs from quiescence attestation"
+        )
+
+
 def capture_codex_private_state(
     codex_home: Path,
     output_directory: Path,
@@ -850,6 +988,7 @@ def capture_codex_private_state(
     include_auth: bool,
     include_sqlite: bool,
     acknowledge_private_capture: bool,
+    quiescence: dict[str, Any],
     max_sqlite_families: int = DEFAULT_MAX_SQLITE_FAMILIES,
     max_total_sqlite_bytes: int = DEFAULT_MAX_TOTAL_SQLITE_BYTES,
     backup_timeout_seconds: int = DEFAULT_BACKUP_TIMEOUT_SECONDS,
@@ -857,6 +996,8 @@ def capture_codex_private_state(
     max_thread_index_bytes: int = DEFAULT_MAX_THREAD_INDEX_BYTES,
     max_metadata_entries: int = DEFAULT_MAX_METADATA_ENTRIES,
     max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
+    protected_directories: tuple[Path, ...] = (),
+    recorded_protected_directories: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     """Publish one private capture directory without installing live state."""
     if role not in {"source", "destination"}:
@@ -868,6 +1009,25 @@ def capture_codex_private_state(
         raise BulkloadError("private capture requires an explicit state class")
     if not acknowledge_private_capture:
         raise BulkloadError("private capture requires explicit acknowledgement")
+    quiescence_record = _validate_private_capture_quiescence(quiescence)
+    selected_state_classes = [
+        name
+        for name, selected in (
+            ("auth", include_auth),
+            ("sqlite", include_sqlite),
+        )
+        if selected
+    ]
+    if (
+        quiescence_record["host_authority_id"] != host_authority_id
+        or quiescence_record["codex_version"] != codex_version
+        or quiescence_record["selected_state_classes"] != selected_state_classes
+        or (
+            quiescence_record["purpose"] == "capture"
+            and quiescence_record["capture_role"] != role
+        )
+    ):
+        raise BulkloadError("private capture quiescence binding differs")
     if (
         max_sqlite_families < 1
         or max_total_sqlite_bytes < 1
@@ -904,10 +1064,50 @@ def capture_codex_private_state(
     target = parent / requested.name
     if target.exists() or target.is_symlink():
         raise BulkloadError("private output already exists")
-    if _path_is_within(target, codex_root) or (
-        sqlite_root is not None and _path_is_within(target, sqlite_root)
+    if quiescence_record["purpose"] == "capture" and quiescence_record["attestation"][
+        "operation_output"
+    ] != _private_capture_output_binding(target, parent, parent_info):
+        raise BulkloadError(
+            "private capture output differs from quiescence attestation"
+        )
+    protected_roots: list[Path] = [codex_root]
+    protected_identities: set[tuple[int, int]] = {
+        (codex_info.st_dev, codex_info.st_ino)
+    }
+    if sqlite_root is not None and sqlite_info is not None:
+        protected_roots.append(sqlite_root)
+        protected_identities.add((sqlite_info.st_dev, sqlite_info.st_ino))
+    for protected in protected_directories:
+        resolved, protected_info = _resolve_private_directory(
+            protected,
+            "private capture protected directory",
+        )
+        protected_roots.append(resolved)
+        protected_identities.add((protected_info.st_dev, protected_info.st_ino))
+    for protected in recorded_protected_directories:
+        expanded = protected.expanduser()
+        if not expanded.is_absolute():
+            raise BulkloadError("recorded private root must be absolute")
+        lexical = Path(os.path.abspath(expanded))
+        if (
+            target == lexical
+            or _path_is_within(target, lexical)
+            or _path_is_within(lexical, target)
+        ):
+            raise BulkloadError("private output overlaps a recorded live root")
+        if not lexical.exists() and not lexical.is_symlink():
+            continue
+        resolved, protected_info = _resolve_private_directory(
+            lexical,
+            "recorded private root",
+        )
+        protected_roots.append(resolved)
+        protected_identities.add((protected_info.st_dev, protected_info.st_ino))
+    if any(
+        target == root or _path_is_within(target, root) or _path_is_within(root, target)
+        for root in protected_roots
     ):
-        raise BulkloadError("private output must be outside captured roots")
+        raise BulkloadError("private output must be outside protected roots")
     staging_name = f".{requested.name}.bulkload-private-{secrets.token_hex(12)}"
     staging = parent / staging_name
     codex_descriptor = _open_private_directory_descriptor(
@@ -934,7 +1134,11 @@ def capture_codex_private_state(
         os.close(codex_descriptor)
         raise
     staging_descriptor = -1
+    staging_created = False
     published = False
+    initial_namespace: list[dict[str, Any]] | None = None
+    initial_namespace_sha256: str | None = None
+    discovered: list[tuple[str, os.stat_result]] | None = None
     try:
         input_bindings: list[tuple[Path, int, os.stat_result, str]] = [
             (codex_root, codex_descriptor, codex_info, "Codex home")
@@ -953,12 +1157,9 @@ def capture_codex_private_state(
                 )
             )
         output_lineage = _directory_identity_lineage(parent_descriptor)
-        captured_root_identities = {
-            (info.st_dev, info.st_ino) for _, _, info, _ in input_bindings
-        }
-        if output_lineage & captured_root_identities:
+        if output_lineage & protected_identities:
             raise BulkloadError(
-                "private output parent aliases or descends from a captured root"
+                "private output parent aliases or descends from a protected root"
             )
         for path, descriptor, info, label in (
             *input_bindings,
@@ -970,7 +1171,19 @@ def capture_codex_private_state(
             ),
         ):
             _revalidate_directory_binding(path, descriptor, info, label)
+        if include_sqlite:
+            assert sqlite_descriptor >= 0
+            initial_namespace, initial_namespace_sha256 = _sqlite_live_namespace(
+                sqlite_descriptor,
+                max_families=max_sqlite_families,
+            )
+            discovered = _discover_sqlite(
+                sqlite_descriptor,
+                max_families=max_sqlite_families,
+                max_total_bytes=max_total_sqlite_bytes,
+            )
         os.mkdir(staging_name, 0o700, dir_fd=parent_descriptor)
+        staging_created = True
         staging_info = os.stat(
             staging_name,
             dir_fd=parent_descriptor,
@@ -1027,10 +1240,14 @@ def capture_codex_private_state(
             )
 
         families: list[dict[str, Any]] = []
+        sqlite_live_namespace_sha256: str | None = None
         if include_sqlite:
             assert sqlite_root is not None
             assert sqlite_info is not None
             assert sqlite_descriptor >= 0
+            assert initial_namespace is not None
+            assert initial_namespace_sha256 is not None
+            assert discovered is not None
             sqlite_output = staging / SQLITE_DIRECTORY
             os.mkdir(SQLITE_DIRECTORY, 0o700, dir_fd=staging_descriptor)
             sqlite_output_info = os.stat(
@@ -1045,11 +1262,6 @@ def capture_codex_private_state(
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=staging_descriptor,
-            )
-            discovered = _discover_sqlite(
-                sqlite_descriptor,
-                max_families=max_sqlite_families,
-                max_total_bytes=max_total_sqlite_bytes,
             )
             try:
                 if (
@@ -1117,6 +1329,18 @@ def capture_codex_private_state(
                     raise BulkloadError(
                         "SQLite family authority changed during private capture"
                     )
+                final_namespace, final_namespace_sha256 = _sqlite_live_namespace(
+                    sqlite_descriptor,
+                    max_families=max_sqlite_families,
+                )
+                if (
+                    final_namespace != initial_namespace
+                    or final_namespace_sha256 != initial_namespace_sha256
+                ):
+                    raise BulkloadError(
+                        "SQLite live namespace changed during private capture"
+                    )
+                sqlite_live_namespace_sha256 = final_namespace_sha256
                 _fsync_directory_descriptor(sqlite_output_descriptor)
             finally:
                 os.close(sqlite_output_descriptor)
@@ -1131,25 +1355,24 @@ def capture_codex_private_state(
             "codex_version": codex_version,
             "codex_home": {
                 "resolved_path": os.fspath(codex_root),
-                "identity": _identity(codex_info),
+                "identity": _directory_identity_record(codex_info),
             },
             "sqlite_home": (
                 {
                     "resolved_path": os.fspath(sqlite_root),
-                    "identity": _identity(sqlite_info),
+                    "identity": _directory_identity_record(sqlite_info),
                     "authority_source": sqlite_authority_source,
                 }
                 if sqlite_root is not None and sqlite_info is not None
                 else None
             ),
-            "selected_state_classes": [
-                name
-                for name, selected in (
-                    ("auth", include_auth),
-                    ("sqlite", include_sqlite),
-                )
-                if selected
-            ],
+            "selected_state_classes": selected_state_classes,
+            "quiescence": quiescence_record,
+            "capture_output": _private_capture_output_binding(
+                target,
+                parent,
+                parent_info,
+            ),
             "budgets": {
                 "max_auth_bytes": MAX_AUTH_BYTES,
                 "max_manifest_bytes": MAX_PRIVATE_MANIFEST_BYTES,
@@ -1163,15 +1386,17 @@ def capture_codex_private_state(
             },
             "auth": auth,
             "sqlite_families": families,
+            "sqlite_live_namespace_sha256": sqlite_live_namespace_sha256,
             "copy_method": {
                 "auth": "pinned-private-file" if auth is not None else None,
-                "sqlite": ("sqlite-online-backup-api" if include_sqlite else None),
+                "sqlite": ("sqlite-immutable-backup-api" if include_sqlite else None),
                 "raw_wal_shm_copy": False,
             },
             "complete": True,
             "ready_for_apply": False,
         }
         capture["capture_sha256"] = object_digest(capture, "capture_sha256")
+        validate_codex_private_capture(capture)
         manifest_payload = canonical_bytes(capture) + b"\n"
         if len(manifest_payload) > MAX_PRIVATE_MANIFEST_BYTES:
             raise BulkloadError(
@@ -1228,6 +1453,10 @@ def capture_codex_private_state(
             raise BulkloadError("published private capture digest mismatch")
         return capture
     except BaseException as error:
+        if not staging_created:
+            raise BulkloadError(
+                f"private capture preflight failed ({error}); no output created"
+            ) from error
         if published:
             held = os.fstat(parent_descriptor)
             preserved = (
@@ -1283,6 +1512,85 @@ def _require_sha256(value: Any, label: str) -> None:
         raise BulkloadError(f"{label} must be a lowercase SHA-256 digest")
 
 
+def _validate_private_capture_quiescence(value: Any) -> dict[str, Any]:
+    record = _require_mapping(value, "private capture quiescence")
+    _require_exact_keys(
+        record,
+        PRIVATE_CAPTURE_QUIESCENCE_KEYS,
+        "private capture quiescence",
+    )
+    _require_uuid(record["attestation_id"], "private quiescence attestation ID")
+    attestation = _require_mapping(
+        record["attestation"],
+        "private capture quiescence attestation",
+    )
+    from . import private_quiescence
+
+    private_quiescence.validate_codex_private_quiescence_attestation(attestation)
+    projected = {
+        key: attestation[key]
+        for key in PRIVATE_CAPTURE_QUIESCENCE_KEYS
+        if key != "attestation"
+    }
+    if {
+        key: record[key]
+        for key in PRIVATE_CAPTURE_QUIESCENCE_KEYS
+        if key != "attestation"
+    } != projected:
+        raise BulkloadError(
+            "private capture quiescence projection differs from attestation"
+        )
+    for key in ("attestation_sha256", "bulkload_lock_scope_sha256"):
+        _require_sha256(record[key], f"private quiescence {key}")
+    if (
+        record["purpose"] not in PRIVATE_QUIESCENCE_PURPOSES
+        or record["claim"] != PRIVATE_QUIESCENCE_CLAIM
+        or record["provider_writer_proof"] is not False
+    ):
+        raise BulkloadError("private capture quiescence claim is invalid")
+    if record["purpose"] == "capture":
+        if record["capture_role"] not in {"source", "destination"}:
+            raise BulkloadError("private capture quiescence role is invalid")
+    elif record["capture_role"] is not None:
+        raise BulkloadError("operation quiescence capture role must be null")
+    _require_uuid(
+        record["host_authority_id"],
+        "private capture quiescence host authority ID",
+    )
+    if (
+        not isinstance(record["codex_version"], str)
+        or not record["codex_version"]
+        or len(record["codex_version"].encode("utf-8")) > 128
+    ):
+        raise BulkloadError("private capture quiescence Codex version is invalid")
+    selected = record["selected_state_classes"]
+    if (
+        not isinstance(selected, list)
+        or selected != sorted(set(selected))
+        or not selected
+        or not set(selected) <= {"auth", "sqlite"}
+    ):
+        raise BulkloadError("private capture quiescence state classes are invalid")
+    accepted_inputs = _require_mapping(
+        record["accepted_inputs"],
+        "private capture quiescence accepted inputs",
+    )
+    _require_exact_keys(
+        accepted_inputs,
+        {"plan_sha256", "apply_receipt_sha256", "journal_sha256"},
+        "private capture quiescence accepted inputs",
+    )
+    for key, digest in accepted_inputs.items():
+        if digest is not None:
+            _require_sha256(digest, f"private capture quiescence {key}")
+    if record["purpose"] == "capture":
+        if any(digest is not None for digest in accepted_inputs.values()):
+            raise BulkloadError("capture quiescence cannot bind operation inputs")
+    elif accepted_inputs["plan_sha256"] is None:
+        raise BulkloadError("operation quiescence must bind an install plan")
+    return record
+
+
 def _validate_recorded_identity(value: Any, label: str) -> None:
     identity = _require_mapping(value, label)
     _require_exact_keys(
@@ -1294,6 +1602,129 @@ def _validate_recorded_identity(value: Any, label: str) -> None:
         isinstance(identity[key], int) and identity[key] >= 0 for key in identity
     ):
         raise BulkloadError(f"{label} values must be non-negative integers")
+
+
+def _validate_recorded_directory_identity(value: Any, label: str) -> None:
+    identity = _require_mapping(value, label)
+    _require_exact_keys(
+        identity,
+        {"device", "inode", "uid", "mode"},
+        label,
+    )
+    if not all(
+        isinstance(identity[key], int) and identity[key] >= 0 for key in identity
+    ):
+        raise BulkloadError(f"{label} values must be non-negative integers")
+
+
+def _validate_recorded_capture_output(value: Any) -> dict[str, Any]:
+    output = _require_mapping(value, "private capture output")
+    _require_exact_keys(
+        output,
+        {"path", "parent_resolved_path", "parent_identity", "leaf"},
+        "private capture output",
+    )
+    if (
+        not isinstance(output["path"], str)
+        or not isinstance(output["parent_resolved_path"], str)
+        or not isinstance(output["leaf"], str)
+        or output["leaf"] in {"", ".", ".."}
+        or Path(output["leaf"]).name != output["leaf"]
+    ):
+        raise BulkloadError("private capture output path is invalid")
+    path = Path(output["path"])
+    parent = Path(output["parent_resolved_path"])
+    if (
+        not path.is_absolute()
+        or not parent.is_absolute()
+        or parent != Path(os.path.abspath(parent))
+        or path != parent / output["leaf"]
+    ):
+        raise BulkloadError("private capture output binding is invalid")
+    _validate_recorded_directory_identity(
+        output["parent_identity"],
+        "private capture output parent identity",
+    )
+    return output
+
+
+def _validate_capture_quiescence_authority(
+    capture: dict[str, Any],
+    quiescence: dict[str, Any],
+) -> None:
+    attestation = quiescence["attestation"]
+    _validate_private_capture_output_binding(capture)
+    if attestation["host"] != capture["host"]:
+        raise BulkloadError("private capture host differs from quiescence attestation")
+    if attestation["host_authority_id"] != capture["host_authority_id"]:
+        raise BulkloadError(
+            "private capture host authority differs from quiescence attestation"
+        )
+    if attestation["codex_version"] != capture["codex_version"]:
+        raise BulkloadError(
+            "private capture Codex version differs from quiescence attestation"
+        )
+    if attestation["selected_state_classes"] != capture["selected_state_classes"]:
+        raise BulkloadError(
+            "private capture state classes differ from quiescence attestation"
+        )
+    if (
+        attestation["purpose"] == "capture"
+        and attestation["capture_role"] != capture["role"]
+    ):
+        raise BulkloadError("private capture role differs from quiescence attestation")
+    if attestation["codex_home"] != capture["codex_home"]:
+        raise BulkloadError(
+            "private capture Codex root differs from quiescence attestation"
+        )
+    sqlite_home = capture["sqlite_home"]
+    attested_sqlite = attestation["sqlite_home"]
+    if sqlite_home is None:
+        if attested_sqlite is not None:
+            raise BulkloadError(
+                "private capture SQLite root differs from quiescence attestation"
+            )
+    elif attested_sqlite != {
+        "resolved_path": sqlite_home["resolved_path"],
+        "identity": sqlite_home["identity"],
+    }:
+        raise BulkloadError(
+            "private capture SQLite root differs from quiescence attestation"
+        )
+    if attestation["purpose"] != "capture" and capture["role"] != "destination":
+        raise BulkloadError(
+            "operation quiescence can authorize only a destination capture"
+        )
+    if attestation["purpose"] not in {"capture", "verify"}:
+        return
+    observed_auth = attestation["observed_auth"]
+    captured_auth = capture["auth"]
+    if observed_auth is None:
+        if captured_auth is not None:
+            raise BulkloadError(
+                "private capture auth differs from quiescence observation"
+            )
+    elif captured_auth is None or observed_auth != {
+        "sha256": captured_auth["sha256"],
+        "size": captured_auth["size"],
+        "identity": captured_auth["source_identity"],
+    }:
+        raise BulkloadError("private capture auth differs from quiescence observation")
+    observed_sqlite = attestation["observed_sqlite"]
+    if observed_sqlite is None:
+        if capture["sqlite_families"]:
+            raise BulkloadError(
+                "private capture SQLite differs from quiescence observation"
+            )
+    elif (
+        observed_sqlite["live_namespace_sha256"]
+        != capture["sqlite_live_namespace_sha256"]
+        or observed_sqlite["family_count"] != len(capture["sqlite_families"])
+        or observed_sqlite["live_sidecars_absent"] is not True
+    ):
+        raise BulkloadError(
+            "private capture SQLite differs from quiescence observation"
+        )
 
 
 def validate_codex_private_capture(value: dict[str, Any]) -> None:
@@ -1311,9 +1742,12 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
             "codex_home",
             "sqlite_home",
             "selected_state_classes",
+            "quiescence",
+            "capture_output",
             "budgets",
             "auth",
             "sqlite_families",
+            "sqlite_live_namespace_sha256",
             "copy_method",
             "complete",
             "ready_for_apply",
@@ -1328,6 +1762,7 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
         raise BulkloadError("invalid private capture role")
     if value["complete"] is not True or value["ready_for_apply"] is not False:
         raise BulkloadError("private capture readiness contract is invalid")
+    _validate_recorded_capture_output(value["capture_output"])
     for key in ("captured_at", "host", "codex_version"):
         if not isinstance(value[key], str) or not value[key]:
             raise BulkloadError(f"private capture {key} is invalid")
@@ -1342,7 +1777,10 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
         or not Path(codex_home["resolved_path"]).is_absolute()
     ):
         raise BulkloadError("Codex home authority path must be absolute")
-    _validate_recorded_identity(codex_home["identity"], "Codex home identity")
+    _validate_recorded_directory_identity(
+        codex_home["identity"],
+        "Codex home identity",
+    )
     selected = value["selected_state_classes"]
     if (
         not isinstance(selected, list)
@@ -1356,6 +1794,17 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
         raise BulkloadError("private capture auth selection is inconsistent")
     if ("sqlite" in selected) != (value["sqlite_home"] is not None):
         raise BulkloadError("private capture SQLite selection is inconsistent")
+    quiescence = _validate_private_capture_quiescence(value["quiescence"])
+    if (
+        quiescence["host_authority_id"] != value["host_authority_id"]
+        or quiescence["codex_version"] != value["codex_version"]
+        or quiescence["selected_state_classes"] != selected
+        or (
+            quiescence["purpose"] == "capture"
+            and quiescence["capture_role"] != value["role"]
+        )
+    ):
+        raise BulkloadError("private capture quiescence binding differs")
     if value["sqlite_home"] is not None:
         sqlite_home = _require_mapping(
             value["sqlite_home"],
@@ -1372,10 +1821,16 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
             or sqlite_home["authority_source"] != "explicit"
         ):
             raise BulkloadError("Codex SQLite authority is invalid")
-        _validate_recorded_identity(
+        _validate_recorded_directory_identity(
             sqlite_home["identity"],
             "Codex SQLite identity",
         )
+        _require_sha256(
+            value["sqlite_live_namespace_sha256"],
+            "SQLite live namespace digest",
+        )
+    elif value["sqlite_live_namespace_sha256"] is not None:
+        raise BulkloadError("unselected SQLite namespace digest must be null")
     budgets = _require_mapping(value["budgets"], "private capture budgets")
     _require_exact_keys(
         budgets,
@@ -1413,7 +1868,7 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
     if copy_method["auth"] != ("pinned-private-file" if "auth" in selected else None):
         raise BulkloadError("private capture auth copy method is inconsistent")
     if copy_method["sqlite"] != (
-        "sqlite-online-backup-api" if "sqlite" in selected else None
+        "sqlite-immutable-backup-api" if "sqlite" in selected else None
     ):
         raise BulkloadError("private capture SQLite copy method is inconsistent")
     families = value["sqlite_families"]
@@ -1443,6 +1898,7 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
                 "snapshot_journal_mode",
                 "snapshot_path",
                 "snapshot_size",
+                "source_sha256",
                 "source_identity",
                 "source_size",
                 "tables",
@@ -1458,14 +1914,15 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
             raise BulkloadError("private capture has an invalid SQLite basename")
         if item["snapshot_path"] != f"{SQLITE_DIRECTORY}/{item['basename']}":
             raise BulkloadError("private capture SQLite path is invalid")
-        if item.get("copy_method") != "sqlite-online-backup-api":
-            raise BulkloadError("private capture did not use SQLite backup API")
+        if item.get("copy_method") != "sqlite-immutable-backup-api":
+            raise BulkloadError("private capture did not use immutable SQLite backup")
         if item.get("quick_check") != "ok":
             raise BulkloadError("private capture SQLite quick_check is not green")
         if item.get("snapshot_journal_mode") != "delete":
             raise BulkloadError("private capture SQLite journal mode is invalid")
         for key in (
             "sha256",
+            "source_sha256",
             "schema_sha256",
             "migrations_sha256",
             "thread_ids_sha256",
@@ -1519,6 +1976,7 @@ def validate_codex_private_capture(value: dict[str, Any]) -> None:
             auth["source_identity"],
             "private auth source identity",
         )
+    _validate_capture_quiescence_authority(value, quiescence)
     _require_sha256(value["capture_sha256"], "private capture digest")
     if object_digest(value, "capture_sha256") != value["capture_sha256"]:
         raise BulkloadError("private capture digest mismatch")
@@ -1764,8 +2222,11 @@ def _state_thread_relation(
 def compile_codex_private_state_plan(
     source_directory: Path,
     destination_directory: Path,
+    *,
+    runtime_authority: dict[str, Any],
 ) -> dict[str, Any]:
     """Compile a compatibility plan. This function never installs state."""
+    private_runtime.validate_private_runtime_authority(runtime_authority)
     source, source_root = _read_private_bundle(source_directory, "source")
     destination, destination_root = _read_private_bundle(
         destination_directory,
@@ -1920,6 +2381,7 @@ def compile_codex_private_state_plan(
     plan: dict[str, Any] = {
         "schema": PRIVATE_PLAN_SCHEMA,
         "created_at": utc_now(),
+        "runtime_authority": json.loads(json.dumps(runtime_authority)),
         "source_capture_sha256": source["capture_sha256"],
         "destination_capture_sha256": destination["capture_sha256"],
         "source_host_authority_id": source["host_authority_id"],
@@ -1945,7 +2407,423 @@ def compile_codex_private_state_plan(
         expected_destination_capture_sha256=destination["capture_sha256"],
     )
     plan["plan_sha256"] = object_digest(plan, "plan_sha256")
+    validate_codex_private_state_plan(plan)
     return plan
+
+
+def _require_string_list(value: Any, label: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, str) and item for item in value)
+        or value != sorted(set(value))
+    ):
+        raise BulkloadError(f"{label} must be a canonical string list")
+    return value
+
+
+def _validate_private_plan_blocker(value: Any) -> None:
+    blocker = _require_mapping(value, "private plan blocker")
+    code = blocker.get("code")
+    exact_keys: dict[str, set[str]] = {
+        "same-host-authority": {"code"},
+        "codex-version-mismatch": {"code", "source", "destination"},
+        "state-class-selection-mismatch": {"code", "source", "destination"},
+        "source-auth-not-captured": {"code"},
+        "auth-installer-not-implemented": {"code"},
+        "sqlite-family-set-mismatch": {
+            "code",
+            "missing_from_source",
+            "missing_from_destination",
+        },
+        "sqlite-schema-mismatch": {
+            "code",
+            "basename",
+            "source_schema_sha256",
+            "destination_schema_sha256",
+            "source_latest_migration",
+            "destination_latest_migration",
+        },
+        "sqlite-header-mismatch": {
+            "code",
+            "basename",
+            "source_user_version",
+            "destination_user_version",
+            "source_application_id",
+            "destination_application_id",
+        },
+        "sqlite-composer-not-implemented": {
+            "code",
+            "basename",
+            "strategy",
+        },
+    }
+    if code not in exact_keys:
+        raise BulkloadError("private plan has an unknown blocker")
+    _require_exact_keys(blocker, exact_keys[code], "private plan blocker")
+    if code == "state-class-selection-mismatch":
+        source_classes = _require_string_list(
+            blocker["source"],
+            "source state classes",
+        )
+        destination_classes = _require_string_list(
+            blocker["destination"],
+            "destination state classes",
+        )
+        if not (set(source_classes) | set(destination_classes)) <= {
+            "auth",
+            "sqlite",
+        }:
+            raise BulkloadError("private plan state class is invalid")
+    elif code == "sqlite-family-set-mismatch":
+        _require_string_list(
+            blocker["missing_from_source"],
+            "SQLite families missing from source",
+        )
+        _require_string_list(
+            blocker["missing_from_destination"],
+            "SQLite families missing from destination",
+        )
+    elif code in {
+        "sqlite-schema-mismatch",
+        "sqlite-header-mismatch",
+        "sqlite-composer-not-implemented",
+    }:
+        if not SQLITE_BASENAME.fullmatch(blocker["basename"]):
+            raise BulkloadError("private plan blocker has an invalid SQLite basename")
+    if code == "sqlite-schema-mismatch":
+        _require_sha256(
+            blocker["source_schema_sha256"],
+            "source SQLite schema digest",
+        )
+        _require_sha256(
+            blocker["destination_schema_sha256"],
+            "destination SQLite schema digest",
+        )
+        for key in ("source_latest_migration", "destination_latest_migration"):
+            if blocker[key] is not None and not isinstance(blocker[key], int):
+                raise BulkloadError("private plan migration version is invalid")
+    elif code == "sqlite-header-mismatch":
+        if not all(
+            isinstance(blocker[key], int)
+            for key in (
+                "source_user_version",
+                "destination_user_version",
+                "source_application_id",
+                "destination_application_id",
+            )
+        ):
+            raise BulkloadError("private plan SQLite header is invalid")
+    elif code == "sqlite-composer-not-implemented":
+        if blocker["strategy"] not in {
+            "append-log-union",
+            "thread-and-edge-union",
+            "thread-keyed-goal-union",
+            "thread-keyed-memory-union",
+            "unsupported-family",
+        }:
+            raise BulkloadError("private plan SQLite strategy is invalid")
+
+
+def validate_codex_private_state_plan(value: dict[str, Any]) -> None:
+    """Validate one immutable compatibility plan before it can inform apply."""
+    _require_exact_keys(
+        value,
+        {
+            "schema",
+            "created_at",
+            "runtime_authority",
+            "source_capture_sha256",
+            "destination_capture_sha256",
+            "source_host_authority_id",
+            "destination_host_authority_id",
+            "codex_version",
+            "auth",
+            "sqlite_families",
+            "protected_live_roots",
+            "blockers",
+            "ready_for_apply",
+            "implementation",
+            "plan_sha256",
+        },
+        "private compatibility plan",
+    )
+    if value["schema"] != PRIVATE_PLAN_SCHEMA:
+        raise BulkloadError("unsupported private compatibility plan schema")
+    if not isinstance(value["created_at"], str) or not value["created_at"]:
+        raise BulkloadError("private compatibility plan timestamp is invalid")
+    private_runtime.validate_private_runtime_authority(value["runtime_authority"])
+    for key in ("source_capture_sha256", "destination_capture_sha256"):
+        _require_sha256(value[key], f"private compatibility plan {key}")
+    _require_uuid(value["source_host_authority_id"], "source host authority ID")
+    _require_uuid(
+        value["destination_host_authority_id"],
+        "destination host authority ID",
+    )
+
+    versions = _require_mapping(
+        value["codex_version"],
+        "private compatibility plan Codex versions",
+    )
+    _require_exact_keys(
+        versions,
+        {"source", "destination"},
+        "private compatibility plan Codex versions",
+    )
+    if not all(
+        isinstance(item, str) and item and len(item.encode("utf-8")) <= 128
+        for item in versions.values()
+    ):
+        raise BulkloadError("private compatibility plan Codex version is invalid")
+
+    auth = _require_mapping(value["auth"], "private compatibility plan auth")
+    action = auth.get("action")
+    if action in {"not-selected", "blocked"}:
+        _require_exact_keys(auth, {"action"}, "private compatibility plan auth")
+    elif action in {
+        "preserve-identical",
+        "install-source-after-destination-backup",
+    }:
+        _require_exact_keys(
+            auth,
+            {
+                "action",
+                "source_sha256",
+                "destination_sha256",
+                "executor_implemented",
+            },
+            "private compatibility plan auth",
+        )
+        _require_sha256(auth["source_sha256"], "private plan source auth digest")
+        if auth["destination_sha256"] is not None:
+            _require_sha256(
+                auth["destination_sha256"],
+                "private plan destination auth digest",
+            )
+        if action == "preserve-identical" and (
+            auth["source_sha256"] != auth["destination_sha256"]
+        ):
+            raise BulkloadError("private compatibility auth identity is invalid")
+        if action == "install-source-after-destination-backup" and (
+            auth["destination_sha256"] is not None
+            and auth["source_sha256"] == auth["destination_sha256"]
+        ):
+            raise BulkloadError("private compatibility auth replacement is invalid")
+        if auth["executor_implemented"] is not False:
+            raise BulkloadError("private compatibility auth readiness is invalid")
+    else:
+        raise BulkloadError("private compatibility auth action is invalid")
+
+    families = value["sqlite_families"]
+    if not isinstance(families, list):
+        raise BulkloadError("private compatibility SQLite families must be a list")
+    basenames: list[str] = []
+    for item_value in families:
+        item = _require_mapping(
+            item_value,
+            "private compatibility SQLite family",
+        )
+        expected = {
+            "basename",
+            "schema_compatible",
+            "header_compatible",
+            "compatible",
+            "strategy",
+            "source_sha256",
+            "destination_sha256",
+            "executor_implemented",
+        }
+        if str(item.get("basename", "")).startswith("state_"):
+            expected.add("thread_relation")
+        _require_exact_keys(
+            item,
+            expected,
+            "private compatibility SQLite family",
+        )
+        basename = item["basename"]
+        if not isinstance(basename, str) or not SQLITE_BASENAME.fullmatch(basename):
+            raise BulkloadError("private compatibility SQLite basename is invalid")
+        basenames.append(basename)
+        for key in ("schema_compatible", "header_compatible", "compatible"):
+            if not isinstance(item[key], bool):
+                raise BulkloadError("private compatibility flag is invalid")
+        if item["compatible"] != (
+            item["schema_compatible"] and item["header_compatible"]
+        ):
+            raise BulkloadError("private compatibility summary is invalid")
+        if item["strategy"] not in {
+            "append-log-union",
+            "thread-and-edge-union",
+            "thread-keyed-goal-union",
+            "thread-keyed-memory-union",
+            "unsupported-family",
+        }:
+            raise BulkloadError("private compatibility SQLite strategy is invalid")
+        _require_sha256(item["source_sha256"], "source SQLite snapshot digest")
+        _require_sha256(
+            item["destination_sha256"],
+            "destination SQLite snapshot digest",
+        )
+        if item["executor_implemented"] is not False:
+            raise BulkloadError("private compatibility SQLite readiness is invalid")
+        if "thread_relation" in item:
+            relation = _require_mapping(
+                item["thread_relation"],
+                "private compatibility thread relation",
+            )
+            _require_exact_keys(
+                relation,
+                {
+                    "source_threads",
+                    "destination_threads",
+                    "shared_threads",
+                    "source_only_threads",
+                    "destination_only_threads",
+                    "shared_path_mismatches",
+                    "source_ids_sha256",
+                    "destination_ids_sha256",
+                    "session_union_plan_required",
+                },
+                "private compatibility thread relation",
+            )
+            for key in (
+                "source_threads",
+                "destination_threads",
+                "shared_threads",
+                "source_only_threads",
+                "destination_only_threads",
+                "shared_path_mismatches",
+            ):
+                if not isinstance(relation[key], int) or relation[key] < 0:
+                    raise BulkloadError("private compatibility thread count is invalid")
+            _require_sha256(
+                relation["source_ids_sha256"],
+                "source thread ID digest",
+            )
+            _require_sha256(
+                relation["destination_ids_sha256"],
+                "destination thread ID digest",
+            )
+            expected_union = (
+                relation["source_only_threads"] > 0
+                or relation["shared_path_mismatches"] > 0
+            )
+            if (
+                relation["shared_threads"] + relation["source_only_threads"]
+                != relation["source_threads"]
+                or relation["shared_threads"] + relation["destination_only_threads"]
+                != relation["destination_threads"]
+                or relation["shared_threads"] > relation["source_threads"]
+                or relation["shared_threads"] > relation["destination_threads"]
+                or relation["shared_path_mismatches"] > relation["shared_threads"]
+            ):
+                raise BulkloadError("private thread-relation arithmetic is invalid")
+            if relation["session_union_plan_required"] is not expected_union:
+                raise BulkloadError("private thread-union summary is invalid")
+    if basenames != sorted(set(basenames)):
+        raise BulkloadError("private compatibility SQLite families are not canonical")
+
+    protected = _require_mapping(
+        value["protected_live_roots"],
+        "private compatibility protected roots",
+    )
+    _require_exact_keys(
+        protected,
+        {"source", "destination"},
+        "private compatibility protected roots",
+    )
+    for role in ("source", "destination"):
+        roots = _require_string_list(
+            protected[role],
+            f"private compatibility {role} roots",
+        )
+        if not all(Path(root).is_absolute() for root in roots):
+            raise BulkloadError("private compatibility root must be absolute")
+
+    blockers = value["blockers"]
+    if not isinstance(blockers, list):
+        raise BulkloadError("private compatibility blockers must be a list")
+    blocker_encodings = [canonical_bytes(blocker) for blocker in blockers]
+    if len(blocker_encodings) != len(set(blocker_encodings)):
+        raise BulkloadError("private compatibility blockers contain duplicates")
+    for blocker in blockers:
+        _validate_private_plan_blocker(blocker)
+    if value["ready_for_apply"] is not False:
+        raise BulkloadError("compatibility planning cannot authorize apply")
+    if value["implementation"] != "capture-and-compatibility-plan":
+        raise BulkloadError("private compatibility implementation is invalid")
+    _require_sha256(value["plan_sha256"], "private compatibility plan digest")
+    if object_digest(value, "plan_sha256") != value["plan_sha256"]:
+        raise BulkloadError("private compatibility plan digest mismatch")
+
+
+def read_private_json_document(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_PRIVATE_PLAN_BYTES,
+) -> dict[str, Any]:
+    """Read one owner-private, no-follow, bounded JSON evidence document."""
+    requested = path.expanduser()
+    parent, parent_info = _resolve_private_directory(
+        requested.parent,
+        f"{label} parent",
+    )
+    parent_descriptor = _open_private_directory_descriptor(
+        parent,
+        parent_info,
+        f"{label} parent",
+    )
+    try:
+        value = _read_private_json_file_at(
+            parent_descriptor,
+            requested.name,
+            label,
+            max_bytes=max_bytes,
+        )
+        _revalidate_directory_binding(
+            parent,
+            parent_descriptor,
+            parent_info,
+            f"{label} parent",
+        )
+        return value
+    finally:
+        os.close(parent_descriptor)
+
+
+def read_codex_private_state_plan(path: Path) -> dict[str, Any]:
+    value = read_private_json_document(path, label="private compatibility plan")
+    validate_codex_private_state_plan(value)
+    return value
+
+
+def validate_codex_private_state_plan_against_bundles(
+    value: dict[str, Any],
+    source_directory: Path,
+    destination_directory: Path,
+) -> None:
+    """Reject a structurally valid but fabricated compatibility plan."""
+    validate_codex_private_state_plan(value)
+    recomputed = compile_codex_private_state_plan(
+        source_directory,
+        destination_directory,
+        runtime_authority=value["runtime_authority"],
+    )
+    ignored = {"created_at", "plan_sha256"}
+    expected = {key: item for key, item in recomputed.items() if key not in ignored}
+    observed = {key: item for key, item in value.items() if key not in ignored}
+    if observed != expected:
+        raise BulkloadError(
+            "private compatibility plan differs from current bundle semantics"
+        )
+
+
+def read_codex_private_bundle(
+    path: Path,
+    expected_role: str,
+) -> tuple[dict[str, Any], Path]:
+    """Return one fully revalidated private bundle and its resolved path."""
+    return _read_private_bundle(path, expected_role)
 
 
 def write_private_json_noreplace(

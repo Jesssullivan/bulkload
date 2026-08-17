@@ -12,12 +12,26 @@ blocks divergent common sessions and portable file/directory collisions, and
 pins bounded evidence I/O. The in-review v3 planner recognizes proof-bound
 append-only prefix/superset histories, compiles a close request from every
 required proof digest, and only then accepts fresh source and destination A/B
-captures wrapped against that request. Codex auth and SQLite families are
-explicitly copy-eligible, opt-in state classes. The source-only private reader
-now creates owner-private `auth.json` captures and consistent SQLite online
-backups, then emits a compatibility plan. Composition, atomic installation,
-rollback execution, and live acceptance remain unimplemented and fail-held;
-generic file copying remains forbidden for them.
+captures wrapped against that request.
+
+Codex auth and SQLite families are explicitly copy-eligible, opt-in state
+classes, but policy v3 implements only a narrow attended `auth.json` install.
+The preferred inputs are an auth-only source capture and an auth-plus-SQLite
+destination capture. A full source capture is accepted, but source SQLite is
+never consumed; destination SQLite is preserved exactly with zero mutation.
+The workflow provides digest-accepted planning, atomic auth replacement,
+journaling, offline verification, rollback, and interrupted-operation recovery.
+SQLite union/composition/installation and combined apply remain false and
+fail-held. Any live WAL, SHM, or rollback-journal sidecar blocks immutable
+SQLite capture.
+
+Quiescence evidence is an operator procedural assertion with
+`provider_writer_proof=false`; its advisory lock coordinates Bulkload only.
+Private runtime and policy sources are pinned before import and bound through
+the plans. An offline receipt proves bytes and preservation invariants, not
+working provider authentication. A fresh attended provider turn is the final
+acceptance proof. See the
+[private auth install runbook](.agents/skills/bulkload/references/codex-private-auth-install.md).
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:

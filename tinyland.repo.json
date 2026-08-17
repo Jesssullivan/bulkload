@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repo": {
     "name": "bulkload",
     "github": "Jesssullivan/bulkload",
@@ -32,7 +32,16 @@
   "boundaries": {
     "default_read_only": true,
     "deletes_destination_data": false,
-    "copies_credentials": false,
+    "copies_generic_credentials": false,
+    "copies_typed_codex_auth": true,
+    "installs_typed_codex_auth": true,
+    "credential_copy_policy": "typed-opt-in-attended",
+    "captures_typed_codex_sqlite": true,
+    "captures_live_wal_sqlite": false,
+    "preserves_destination_codex_sqlite_during_auth_install": true,
+    "composes_typed_codex_sqlite": false,
+    "installs_typed_codex_sqlite": false,
+    "private_runtime_acceptance_required": true,
     "invokes_terminal_multiplexers": false,
     "owns_tcfs_runtime": false,
     "owns_home_manager_activation": false
