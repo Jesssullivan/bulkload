@@ -1,18 +1,10 @@
 {
-  "schema": "dev.tinyland.bulkload.codex-private-state-policy.v1",
-  "implementation": "plan-only",
+  "schema": "dev.tinyland.bulkload.codex-private-state-policy.v2",
+  "implementation": "capture-and-compatibility-plan",
   "ready_for_apply": false,
-  "cli_source_sha256": "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb",
-  "runtime_source_sha256_by_path": {
-    "scripts/bulkload.py": "a9df2769cfb2b7c4770950bf0d40ad1b8403835762475bf61dd0e77f7e46544a",
-    "scripts/bulkload_lib/__init__.py": "de2a7f4d6ec3468db41cb3b643469ec445cbbaf386f97230e4f72b7ebc3dd89f",
-    "scripts/bulkload_lib/cli.py": "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb",
-    "scripts/bulkload_lib/executor.py": "f4c48bc4e02ec8eb8efe164bd2523855ff82a71819e155b93803542da0364201",
-    "scripts/bulkload_lib/model.py": "6099e031801ac56038d0e1d9a76baefab057551f885840a5b7c3eee0abb6ac92",
-    "scripts/bulkload_lib/planner.py": "24ea53940dce472521460734bf31236380ea632fbfd4afc948c105b5a2473eb3",
-    "scripts/bulkload_lib/scanner.py": "813c49326f1ba3dfee82ef37de6671fe9fb46d771a8f19c45a604c55a4d4b9b5",
-    "scripts/bulkload_lib/sessions.py": "e03957286f916fc30c1c628a2883d468bbf36d2c419b54e8b2d65c403a2c36f4"
-  },
+  "cli_source_sha256": "cee78d93032bf18ee9d2af7d95c34ef3b35a6bc394ee7df51ce55b5929813d8c",
+  "private_state_source_sha256": "418e4c52e360bf09639726888673ca4c79f534edf04d84d43d93267e67171cb8",
+  "runtime_source_sha256": "0fc9c2275aed4b08dc3e0857df3ddb94f71cb841f6edc5826278a5bb3fceb9fe",
   "allowed_codex_cli_commands": [
     "codex-capture",
     "codex-close-capture",
@@ -20,20 +12,23 @@
     "codex-plan",
     "codex-prefix-proof",
     "codex-prefix-request",
-    "codex-prefix-requests"
+    "codex-prefix-requests",
+    "codex-private-capture",
+    "codex-private-plan"
   ],
   "state_classes": {
     "auth_file": {
       "classification": "copy-eligible",
       "default": "opt-in",
       "authority": "CODEX_HOME/auth.json",
-      "reader_implemented": false,
+      "reader_implemented": true,
       "executor_implemented": false,
-      "copy_method": "private-atomic-file",
+      "copy_method": "pinned-private-file-capture",
       "requirements": [
         "explicit-source-and-destination",
         "no-value-logging",
         "regular-single-link-current-user-file",
+        "owner-private-no-replace-capture",
         "source-and-destination-backup",
         "exact-owner-and-mode",
         "same-directory-atomic-install",
@@ -55,16 +50,23 @@
         "CODEX_HOME"
       ],
       "discovery": "enumerate-provider-owned-sqlite-families",
-      "reader_implemented": false,
+      "reader_implemented": true,
       "executor_implemented": false,
-      "copy_method": "sqlite-online-backup-or-quiesced-backup-api",
+      "copy_method": "sqlite-online-backup-api",
       "raw_database_wal_shm_copy": false,
       "requirements": [
+        "explicit-effective-sqlite-home",
         "enumerate-all-provider-owned-families",
+        "repeat-family-enumeration",
         "matching-codex-version",
         "compatible-migration-and-schema",
-        "writer-quiescence-or-online-backup",
-        "source-quick-check",
+        "compatible-user-version-and-application-id",
+        "online-backup-with-bounded-time",
+        "bounded-schema-migration-metadata",
+        "bounded-thread-index",
+        "snapshot-quick-check",
+        "snapshot-delete-journal-mode",
+        "owner-private-no-replace-capture",
         "destination-backup",
         "canonical-destination-rollout-paths",
         "same-directory-atomic-install",
@@ -82,6 +84,7 @@
     }
   },
   "forbidden_commands": [
+    "codex-private-apply",
     "codex-state-apply"
   ]
 }

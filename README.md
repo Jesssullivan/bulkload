@@ -13,9 +13,11 @@ pins bounded evidence I/O. The in-review v3 planner recognizes proof-bound
 append-only prefix/superset histories, compiles a close request from every
 required proof digest, and only then accepts fresh source and destination A/B
 captures wrapped against that request. Codex auth and SQLite families are
-explicitly copy-eligible, opt-in state classes, but remain plan-only until
-their dedicated private snapshot, rollback, atomic install, and acceptance
-executor exists; generic file copying remains forbidden for them.
+explicitly copy-eligible, opt-in state classes. The source-only private reader
+now creates owner-private `auth.json` captures and consistent SQLite online
+backups, then emits a compatibility plan. Composition, atomic installation,
+rollback execution, and live acceptance remain unimplemented and fail-held;
+generic file copying remains forbidden for them.
 
 The repository is private. Install the self-contained skill for Codex, Pi, and
 Claude with an authenticated GitHub CLI:

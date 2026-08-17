@@ -1,8 +1,8 @@
 # Bulkload v1 design
 
 Status: repository v1 complete; Codex session-union v3 prefix-proof extension
-and plan-only private-state policy in review; public-read CI repair naturally
-green on its source carrier, 2026-08-16
+and private auth/SQLite capture plus compatibility planning in review;
+public-read CI repair naturally green on its source carrier, 2026-08-16
 
 The public-read CI boundary is separately closed by a repository-local
 front door. It runs only on the literal `tinyland-nix` capability, rejects fork
@@ -492,20 +492,33 @@ fail-held final artifact; it is not authority and requires attended
 quarantine.
 
 The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v1.json`.
+`.agents/skills/bulkload/references/codex-private-state-policy.v2.json`.
 It classifies Codex auth and all provider-owned SQLite families as
-copy-eligible and opt-in, while explicitly setting `implementation=plan-only`
-and `ready_for_apply=false`. The validator parses the CLI and requires the
-exact command, alias, and handler topology for the entire surface, then checks
-the policy's exact Codex subset. The policy pins a complete path-to-SHA-256 map
-for the executable Python runtime, including the entrypoint and every
-`bulkload_lib` module, and separately binds the CLI member to that same map.
-This closes alternate Python syntax, imported helper drift, and hidden handler
-construction outside the recognized parser shape. A private-state reader or
-executor therefore cannot hide behind a non-prefixed command, alias, rebound
-handler, imported runtime change, or obfuscated parser without an explicit
-reviewed contract change. The extension deliberately exposes no session,
-auth, or SQLite apply command.
+copy-eligible and opt-in, while setting
+`implementation=capture-and-compatibility-plan` and
+`ready_for_apply=false`. `codex-private-capture` pins and copies a bounded
+owner-only `auth.json`, enumerates every top-level `*.sqlite` family, creates a
+consistent snapshot through SQLite's online backup API, normalizes the
+snapshot journal to `DELETE`, runs `quick_check`, and publishes the private
+bundle with an OS no-replace rename. It never copies source WAL/SHM files.
+The operator must resolve configured `sqlite_home`/`CODEX_SQLITE_HOME`/
+`CODEX_HOME` authority and pass the effective path explicitly; the reader will
+not silently fall back. Selected state classes and count/byte/time budgets are
+digest-bound, discovery is repeated after backup, and published artifacts are
+fully revalidated. `codex-private-plan` rehashes every artifact and compares
+exact Codex version, family, schema, migration, SQLite header, and bounded
+thread/path evidence.
+
+The validator parses the CLI and requires the exact command, alias, and handler
+topology for the entire surface, then checks the policy's exact Codex subset.
+The policy pins the SHA-256 of the CLI, the private-state module, and a
+canonical sorted digest manifest for the complete Python runtime dependency
+closure and entrypoint. This closes alternate syntax, imported side effects,
+and hidden handler construction outside the recognized parser shape. A
+composer or installer therefore cannot hide behind a non-prefixed command,
+alias, rebound handler, imported dependency, or obfuscated parser without an
+explicit reviewed contract change. The extension deliberately exposes no
+private auth or SQLite apply command.
 
 ## 8. Relationship to TCFS
 
@@ -594,8 +607,9 @@ Included:
 
 Deferred:
 
-- the typed Codex auth/SQLite reader and executor (the exact policy is
-  plan-only);
+- the typed Codex auth installer and SQLite family composers/installers (the
+  private capture reader and compatibility planner are implemented, but the
+  exact policy remains `ready_for_apply=false`);
 - browser-state movement;
 - automatic remote command execution;
 - deletion/mirror mode;
