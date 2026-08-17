@@ -1,6 +1,8 @@
 # Bulkload v1 design
 
-Status: source repair under review; landing held pending sanctioned CI, 2026-08-15
+Status: repository v1 complete; Codex session-union v3 prefix-proof extension
+and plan-only private-state policy in review; public-read CI repair naturally
+green on its source carrier, 2026-08-16
 
 The public-read CI boundary is separately closed by a repository-local
 front door. It runs only on the literal `tinyland-nix` capability, rejects fork
@@ -16,10 +18,11 @@ that root.
 
 Before any leg starts, the job environment blanks `BASH_ENV`, imported shell
 option and trace channels, loader injection, proxy override channels, CA
-overrides, and TLS key logging. Lower-case proxy blanks remain job-scoped for
-the local composite and pinned actions. After token and header destruction,
-exact checkout verification, and private checkout-state cleanup, the trusted
-materializer appends exactly four upper-case empty proxy records to an owned,
+overrides, and TLS key logging. Lower-case proxy blanks, including `ftp_proxy`,
+remain job-scoped for the local composite and pinned actions. The materializer
+step separately blanks `FTP_PROXY`. After token and header destruction, exact
+checkout verification, and private checkout-state cleanup, the trusted
+materializer appends exactly five upper-case empty proxy records to an owned,
 canonical regular `$GITHUB_ENV` file contained by
 `$RUNNER_TEMP/_runner_file_commands`. Bash runs privileged without profile or
 rc files, so imported functions and option state are ignored. The
@@ -61,19 +64,48 @@ proxy, CA, or keylog channel, including `LD_PRELOAD` and `BASH_FUNC_*`.
 
 The Nix client process is configured
 for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
-locations remain injected by the runner. A no-value repository preflight
-validates authority-only raw endpoints and clears inherited shell, Nix, and
-Bazel credential channels before the pinned discovery action; post-discovery
+locations for Attic and Bazel remain injected by the runner. A no-value
+repository preflight validates authority-only raw endpoints and clears
+inherited shell, Nix, and Bazel credential channels before the pinned discovery
+action; post-discovery
 enforcement revalidates the boundary and requires both cache reachability
-claims before any Nix or Bazel command. The exact guard is snapshotted before
-the selected repository consumer. Each Bazel leg performs a fresh digest and
-captured-authority check immediately before its terminal call and receives a
-new Bazelisk home plus an empty user home; workspace wrappers, system/user rc
-drift, and netrc credentials fail closed. Client access tokens, user Nix
-configuration, netrc, flake-config acceptance, post-build hooks, secret signing
-keys, and plugins are cleared. This source boundary does not attest the
-independent multi-user Nix daemon's own HTTP authentication or post-build
-policy. Bazel cache publication is false for every pull request and tag and
+claims before any Nix or Bazel command. Pre-discovery command lookup is the
+reviewed Nix profile plus the fixed system path; after discovery contributes
+that profile through `GITHUB_PATH`, step mappings carry only the reviewed
+system suffix. The guard rejects any other effective path.
+
+`GRPC_PROXY_EXP` is different from the empty-valued transport fences:
+grpc-java treats even a present-empty value as an active proxy request and
+resolves it to localhost port 80. It must therefore be exactly absent. The
+guard inspects the NUL-framed process environment and rejects both
+present-empty and nonempty forms before Nix setup, after discovery, and at each
+immediate Bazel boundary. The local composite never declares or persists the
+name, so Nix and the Java/gRPC/Bazel consumers receive absence rather than an
+empty record. Fixed-Git source fetching remains inside its separate minimal
+transport fence.
+
+The exact guard is snapshotted before the selected repository consumer. Each
+Bazel leg performs a fresh captured-byte, digest, and authority check
+immediately before its terminal call and receives a new private Bazelisk home,
+empty user home, test temporary root, and Nix/XDG runtime home. The source leg
+uses a distinct private runtime home and enters its development shell with the
+inherited environment cleared, retaining only `HOME` and its eight Nix/XDG
+home selectors. Workspace wrappers, persistent caches and Bazel servers,
+inherited username path components, system/user rc drift, and netrc
+credentials fail closed. This is same-UID authority hygiene, not a filesystem
+sandbox; exact source review remains part of the trust boundary.
+
+The Nix client binds the canonical direct `/nix/store` with `store = local` and
+`allow-symlinked-store = false`. Its exact substituter/key inventory is the
+runner-injected public `main` Attic cache plus `cache.nixos.org`, with
+signatures required. Store, daemon-socket, mirror, HTTP-family proxy,
+certificate, curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
+`GRPC_PROXY_EXP` is absent. Trusted
+substituters, remote builders, build and diff hooks, access tokens, user Nix
+configuration, netrc, flake-config acceptance, secret signing keys, and
+plugins are cleared and verified from effective settings. Ambient `GIT_*`,
+`JUST_*`, `NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` are
+rejected. Bazel cache publication is false for every pull request and tag and
 true only for a trusted push to `main`; remote execution is never selected.
 
 ## 1. Decision
@@ -113,17 +145,23 @@ greenfield copy model.
    parsed as a Codex rule and blocked startup because it was not UTF-8.
    Lossless quarantine of that sidecar restored startup while preserving
    evidence.
-5. Codex sessions were portable as append-only JSONL, but session indexes and
-   rotating authentication were not copy authorities. The historical session
-   was found and executed, yet its newest compaction no longer contained the
-   requested exact checklist. A fresh persisted Sting session with a nonce was
-   then resumed successfully, proving current auth, persistence, lookup, and
-   dialog continuity.
+5. Codex sessions were portable as append-only JSONL. Authentication and
+   provider-owned SQLite were initially, incorrectly excluded as copy
+   authorities; the operator later clarified that both are copy-eligible typed
+   state. Published Codex guidance independently documents copying
+   `auth.json` to a trusted headless machine. SQLite requires provider-aware
+   snapshots and composition rather than ordinary file copying. The historical
+   session was found and executed, yet its newest compaction no longer
+   contained the requested exact checklist. A fresh persisted Sting session
+   with a nonce was then resumed successfully, proving current auth,
+   persistence, lookup, and dialog continuity.
 6. `--ephemeral resume` on Codex 0.144.5 still appended to the historical
    rollout. The correct invariant is therefore observed immutability, not a
    flag name.
-7. Authentication succeeded only after attended device login. Credential
-   files were never treated as ordinary sync payloads.
+7. Authentication succeeded after attended device login, but reauthentication
+   was an operational choice rather than a portability requirement.
+   Credential files must never be treated as ordinary repo dirt; a dedicated
+   private adapter may move them without logging values.
 8. Byte hashes and status hashes were useful, but a single hash was not a
    completeness proof. The active lane required branch, HEAD, cleanliness,
    ancestry, signature, remote backing, and exact source/destination evidence.
@@ -139,11 +177,13 @@ not byte equality over an arbitrary directory.
 | Worktree topology | host-local Git administration | inventory, classify, recreate | linked worktree path, branch, HEAD, lock |
 | Working bytes | source worktree plus manifest | hash, additive copy, verify | modified tracked files, safe untracked files |
 | Agent continuity | append-only transcript authority | allowlisted copy, validate, resume proof | Codex JSONL, Claude project transcripts |
-| Generated state | destination runtime | regenerate | indexes, caches, `.direnv`, platform binaries |
-| Authentication | provider/operator | attended re-authentication | refresh tokens, browser cookies, auth DBs |
+| Generated state | destination runtime | regenerate | caches, `.direnv`, platform binaries |
+| Provider SQLite | provider runtime plus consistent snapshot | opt-in typed plan; snapshot/compose/verify | Codex state, log, goal, and memory databases |
+| Authentication | provider/operator | opt-in private atomic copy or attended re-authentication | Codex `auth.json` |
 
-The first four planes can contribute to a migration dossier. Generated state
-and authentication are never silently promoted into copy operations.
+Every plane has a separate contract. Generated caches are regenerated.
+Authentication and provider SQLite are never silently promoted through the
+generic file adapter, but they may enter an explicit typed migration dossier.
 
 ## 4. Safety properties
 
@@ -382,14 +422,90 @@ Agent context is an opt-in extension, not part of `~/git` discovery.
   them silently.
 - Prove continuity with a fresh non-secret nonce in a disposable or newly
   persisted session before trusting historical resume behavior.
-- Re-authenticate on the destination. Never copy refresh-token stores,
-  browser profiles, cookies, or provider credential databases.
+- Prefer an explicit typed auth plan when a trusted destination should retain
+  the same Codex login. Require private custody, no value logging, source and
+  destination backups, atomic install, rollback, and a fresh authenticated
+  provider turn. Attended reauthentication remains a fallback.
+- Treat every provider-owned SQLite family under the effective
+  `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
+  Use SQLite online backup or a quiesced backup API; never copy a live
+  database/WAL/SHM triplet as ordinary files. Validate version and schema
+  compatibility, `quick_check`, canonical destination rollout paths, index
+  parity, historical resume, and rollback.
+- Browser profiles, cookies, private keys, and unrelated provider credential
+  databases remain outside the Codex adapter.
 - Treat compaction as a semantic retention boundary. A transcript's presence
   does not prove every old instruction remains in active model context.
 
-The v1 CLI implements repository catalogs and content plans. The skill carries
-the typed agent-context procedure while provider-specific adapters remain a
-follow-up, because their formats and refresh semantics change independently.
+The v1 CLI implements repository catalogs and content plans. Its first
+provider-specific extension is a read-only Codex rollout catalog and
+collision-gated append-only UUID union plan. It validates JSONL identity and
+current-user ownership, rejects hardlinks and files writable by group or other,
+and requires explicit writer quiescence plus two byte-stable observations of
+both the source and destination. Destination custody is stricter than legacy
+source evidence: every destination rollout must be exactly `0600` beneath
+exactly `0700` directories.
+
+The Codex snapshot remains v2. The prefix-proof request/proof,
+close-request/close-capture wrapper, and union-plan schemas are v1/v1/v3
+respectively. Each snapshot binds a non-secret, operator-assigned
+host-authority UUID to the resolved root, its device/inode lineage, and typed
+directory records. One authority ID names one physical filesystem namespace
+even when a hostname changes or storage is shared; an independent namespace
+receives a different ID. The serialized non-private-directory count covers
+only those portable descendant directory records. The capture validates the
+root separately as namespace authority; it is not itself a catalog member or
+part of that descendant count.
+
+The scanner holds descriptor authority while traversing, rejects duplicate
+JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
+`session_meta`, and revalidates the resolved root, lineage, and every completed
+directory after the scan. Candidate file count and stable size are reserved
+before parsing, so malformed content cannot multiply the aggregate limits.
+Entry, directory, record, path, catalog, error, and output budgets make
+incomplete discovery explicit.
+
+Planning compares exact catalog bodies rather than trusting a digest alone.
+Within one host authority, equal or ancestor/descendant roots are rejected by
+resolved path and recorded lineage. Directory claims close the namespace before
+classification. Same-UUID differing bytes require targeted cross-catalog
+prefix evidence bound to both catalog digests, both root identities, the UUID,
+path, full hashes and sizes, and a JSONL record boundary. A proved source
+superset may be promoted; a proved destination superset is preserved. Equal
+sizes with different hashes, mid-record cuts, missing or replayed evidence,
+portable file/file, file/directory, or ancestor-prefix collisions are blockers,
+and any blocker suppresses all candidates. When prefix evidence is required,
+all required proof passes first feed an immutable close request that binds the
+opening custody, prefix request, proof capture IDs, and proof body digests.
+Fresh closing A/B captures for both roots are then created directly from the
+live roots and wrapped against that close-request digest; a stale v2 snapshot
+cannot be supplied for wrapping. Their catalogs and custody must exactly match
+the opening bodies. The plan binds each opening, proof, close request, and
+close wrapper by distinct capture ID or body digest as appropriate. Codex
+planning reads bounded exact-`0600` single-link evidence through pinned
+descriptors and publishes into a pinned owner-private directory with an OS
+no-replace rename. It verifies exact staging bytes and single-link custody,
+revalidates inputs plus the requested directory/target after publication, and
+never permits stdout as an evidence destination or pathname-deletes on
+failure. A nonzero result can therefore retain an owner-private staging or
+fail-held final artifact; it is not authority and requires attended
+quarantine.
+
+The exact private-state policy lives in
+`.agents/skills/bulkload/references/codex-private-state-policy.v1.json`.
+It classifies Codex auth and all provider-owned SQLite families as
+copy-eligible and opt-in, while explicitly setting `implementation=plan-only`
+and `ready_for_apply=false`. The validator parses the CLI and requires the
+exact command, alias, and handler topology for the entire surface, then checks
+the policy's exact Codex subset. The policy pins a complete path-to-SHA-256 map
+for the executable Python runtime, including the entrypoint and every
+`bulkload_lib` module, and separately binds the CLI member to that same map.
+This closes alternate Python syntax, imported helper drift, and hidden handler
+construction outside the recognized parser shape. A private-state reader or
+executor therefore cannot hide behind a non-prefixed command, alias, rebound
+handler, imported runtime change, or obfuscated parser without an explicit
+reviewed contract change. The extension deliberately exposes no session,
+auth, or SQLite apply command.
 
 ## 8. Relationship to TCFS
 
@@ -400,9 +516,10 @@ state, registered local/remote observations, Git topology, and monotonic remote
 catalog control state.
 
 The July TIN-2864 work is still source-only and digestless. It does not yet
-authorize live planning, deployment, reconciliation, credential handling, or a
-crypto ceremony. `bulkload` therefore does not call TCFS. Instead it records
-the exact operational requirements TCFS must eventually absorb:
+authorize live planning, deployment, reconciliation, unreviewed credential
+handling, or a crypto ceremony. `bulkload` therefore does not call TCFS.
+Instead it records the exact operational requirements TCFS must eventually
+absorb:
 
 - complete, repeatable enumeration;
 - typed namespace and Git claims;
@@ -417,20 +534,25 @@ legacy importer and audit adapter rather than remain a second sync system.
 
 ## 9. Threat model
 
-Primary hazards are source mutation during capture, path traversal, symlink
-escape or payload disclosure, incomplete reachable Git objects, omitted
+Primary hazards are source or destination mutation during capture, path
+traversal, symlink or hardlink aliasing, payload disclosure, incomplete
+reachable Git objects, omitted
 reflog/pseudo-ref recovery roots, unsafe remote
 helpers, case-folding collisions, stale remote refs, filename encoding,
 AppleDouble sidecars, unbounded ignored trees, secret-bearing untracked files,
 concurrent destination edits, partial transfer, and false confidence from a
-green transport exit code.
+green transport exit code. Provider-state hazards additionally include token
+disclosure, refresh races, partial WAL capture, stale absolute rollout paths,
+schema skew, an incomplete SQLite-family inventory, and replacing a healthy
+destination index without rollback.
 
-V1 mitigations are canonical sorted catalogs, the A/B barrier, no content in
-manifests, path normalization, a v1 block on symlink mutations, sensitive-path
-blocks re-enforced during plan validation, no deletion, pre-copy source rehash,
-external backups, atomic replacement, durable journal/directory entries, fresh
-verification, evidence outputs that neither overlap captured roots nor alias
-their input artifacts, and explicit incomplete/error states. Cross-filesystem
+V1 mitigations are canonical sorted catalogs, role-specific A/B barriers, no
+content in manifests, path normalization, a v1 block on symlink mutations,
+sensitive-path blocks re-enforced during plan validation, no deletion,
+pre-copy source rehash, external backups, atomic replacement, durable
+journal/directory entries, fresh verification, Codex evidence inputs and output
+parents pinned across final rename, pathname overlap guards for the repository
+adapter, and explicit incomplete/error states. Cross-filesystem
 atomicity, ACL/xattr fidelity, sparse files, hardlink identity, special files,
 case-insensitive collisions, submodule worktrees, and live concurrent writers
 remain blockers or follow-up work.
@@ -472,7 +594,9 @@ Included:
 
 Deferred:
 
-- credential or browser-state movement;
+- the typed Codex auth/SQLite reader and executor (the exact policy is
+  plan-only);
+- browser-state movement;
 - automatic remote command execution;
 - deletion/mirror mode;
 - conflict/index reconstruction;
@@ -510,6 +634,14 @@ Deferred:
 - Codex skill documentation: repository and user discovery under
   `.agents/skills`, symlink support, and optional `agents/openai.yaml`,
   <https://developers.openai.com/codex/skills/create-skill>.
+- Codex authentication documentation: trusted headless-device `auth.json`
+  copy fallback and password-equivalent handling,
+  <https://learn.chatgpt.com/docs/auth>.
+- Codex configuration and app-server documentation: `sqlite_home`,
+  `CODEX_SQLITE_HOME`, JSONL rollout logs, SQLite-backed resumable state, and
+  default JSONL scan-and-repair behavior,
+  <https://learn.chatgpt.com/docs/config-file/config-reference> and
+  <https://learn.chatgpt.com/docs/app-server>.
 - Pi skill documentation: discovery under `~/.agents/skills` and
   `~/.pi/agent/skills`, <https://pi.dev/docs/latest/skills>.
 - Claude Agent SDK skill documentation: user and project discovery under

@@ -1,0 +1,87 @@
+{
+  "schema": "dev.tinyland.bulkload.codex-private-state-policy.v1",
+  "implementation": "plan-only",
+  "ready_for_apply": false,
+  "cli_source_sha256": "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb",
+  "runtime_source_sha256_by_path": {
+    "scripts/bulkload.py": "a9df2769cfb2b7c4770950bf0d40ad1b8403835762475bf61dd0e77f7e46544a",
+    "scripts/bulkload_lib/__init__.py": "de2a7f4d6ec3468db41cb3b643469ec445cbbaf386f97230e4f72b7ebc3dd89f",
+    "scripts/bulkload_lib/cli.py": "4dbe4d74794c48be2af8a13541d428770ebec8f199fa91a8af612039223f38fb",
+    "scripts/bulkload_lib/executor.py": "f4c48bc4e02ec8eb8efe164bd2523855ff82a71819e155b93803542da0364201",
+    "scripts/bulkload_lib/model.py": "6099e031801ac56038d0e1d9a76baefab057551f885840a5b7c3eee0abb6ac92",
+    "scripts/bulkload_lib/planner.py": "24ea53940dce472521460734bf31236380ea632fbfd4afc948c105b5a2473eb3",
+    "scripts/bulkload_lib/scanner.py": "813c49326f1ba3dfee82ef37de6671fe9fb46d771a8f19c45a604c55a4d4b9b5",
+    "scripts/bulkload_lib/sessions.py": "e03957286f916fc30c1c628a2883d468bbf36d2c419b54e8b2d65c403a2c36f4"
+  },
+  "allowed_codex_cli_commands": [
+    "codex-capture",
+    "codex-close-capture",
+    "codex-close-request",
+    "codex-plan",
+    "codex-prefix-proof",
+    "codex-prefix-request",
+    "codex-prefix-requests"
+  ],
+  "state_classes": {
+    "auth_file": {
+      "classification": "copy-eligible",
+      "default": "opt-in",
+      "authority": "CODEX_HOME/auth.json",
+      "reader_implemented": false,
+      "executor_implemented": false,
+      "copy_method": "private-atomic-file",
+      "requirements": [
+        "explicit-source-and-destination",
+        "no-value-logging",
+        "regular-single-link-current-user-file",
+        "source-and-destination-backup",
+        "exact-owner-and-mode",
+        "same-directory-atomic-install",
+        "file-and-directory-fsync",
+        "rollback-retained"
+      ],
+      "acceptance": [
+        "destination-file-private",
+        "codex-authentication-succeeds",
+        "fresh-provider-turn-succeeds"
+      ]
+    },
+    "sqlite_families": {
+      "classification": "copy-eligible",
+      "default": "opt-in",
+      "authority_resolution": [
+        "sqlite_home",
+        "CODEX_SQLITE_HOME",
+        "CODEX_HOME"
+      ],
+      "discovery": "enumerate-provider-owned-sqlite-families",
+      "reader_implemented": false,
+      "executor_implemented": false,
+      "copy_method": "sqlite-online-backup-or-quiesced-backup-api",
+      "raw_database_wal_shm_copy": false,
+      "requirements": [
+        "enumerate-all-provider-owned-families",
+        "matching-codex-version",
+        "compatible-migration-and-schema",
+        "writer-quiescence-or-online-backup",
+        "source-quick-check",
+        "destination-backup",
+        "canonical-destination-rollout-paths",
+        "same-directory-atomic-install",
+        "file-and-directory-fsync",
+        "rollback-retained"
+      ],
+      "acceptance": [
+        "destination-quick-check",
+        "no-stale-source-rollout-paths",
+        "thread-and-spawn-edge-parity",
+        "history-picker-parity",
+        "representative-historical-resume",
+        "fresh-turn-persists"
+      ]
+    }
+  },
+  "forbidden_commands": [
+    "codex-state-apply"
+  ]
+}

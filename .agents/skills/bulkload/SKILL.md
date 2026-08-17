@@ -1,12 +1,13 @@
 ---
 name: bulkload
-description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, selected agent transcripts, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep credentials, live databases, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
+description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed plan-only Codex auth and SQLite state, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
 ---
 
 # Bulkload
 
 Runtime requirement: Python 3.11 or newer, Git, and a Unix-like host with file
-locking and dirfd support.
+locking and dirfd support. Codex evidence file publication requires macOS or
+Linux for an OS-backed atomic no-replace rename.
 
 Turn an ad hoc copy into a typed, digest-bound migration with a fresh proof at
 every boundary.
@@ -20,10 +21,14 @@ every boundary.
    - linked-worktree topology;
    - modified, staged, conflicted, deleted, and untracked working bytes;
    - agent transcripts and durable memory;
-   - generated indexes and caches; and
+   - generated indexes and caches;
+   - provider-owned SQLite families; and
    - authentication or credentials.
-4. Re-authenticate on the destination. Never copy credential stores, browser
-   profiles, `.env`, private keys, kubeconfigs, SQLite/WAL/SHM, or live auth.
+4. Keep credentials and databases outside the generic repository adapter.
+   Codex `auth.json` and provider-owned SQLite families are copy-eligible only
+   through an explicit typed opt-in plan. The current private-state contract is
+   plan-only and has no reader or executor. Never log credential values or copy
+   a live database/WAL/SHM triplet as ordinary files.
 5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
    rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
    of this workflow.
@@ -31,7 +36,9 @@ every boundary.
 Read [references/migration-contract.md](references/migration-contract.md) for
 the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
-Codex, Claude, or Pi state.
+Codex, Claude, or Pi state. Read
+[references/codex-private-state-policy.v1.json](references/codex-private-state-policy.v1.json)
+before classifying Codex auth or SQLite.
 
 ## Capture two stable source passes
 
@@ -59,11 +66,15 @@ writer, so pass A and pass B must have the same `catalog_sha256`. Treat any
 scan error or budget exceedance as incomplete.
 
 Keep capture, plan, and verification evidence outside every local source and
-destination root. The CLI rejects overlapping file outputs so writing evidence
-cannot create new dirt after the claim it records. An output or apply receipt
-must also be distinct from every input evidence artifact; the CLI rejects
-aliases before mutation. When emitting `-` over SSH, redirect only to a
-controller-side path outside the controller's captured roots.
+destination root. The repository adapter rejects resolved overlaps and input
+aliases before mutation; that pathname guard does not replace private,
+quiescent evidence custody. The Codex adapter additionally pins bounded input
+descriptors through a create-only atomic publish in its private output
+directory. It verifies the exact temporary payload and single-link custody,
+uses an OS no-replace rename, revalidates every input and the requested
+directory/target immediately after publication, and never overwrites an
+existing target. When emitting `-` over SSH, redirect only to a controller-side
+path outside the controller's captured roots.
 
 ## Capture the destination
 
@@ -84,6 +95,166 @@ trap - EXIT
 
 Keep the shell path literal and operator-reviewed. Do not interpolate an
 untrusted hostname or path.
+
+## Catalog a Codex session union
+
+Read [references/agent-context.md](references/agent-context.md), quiesce both
+Codex writers, and capture two distinct observations of each role:
+
+```bash
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/source/.codex/sessions \
+  --role source \
+  --host-authority-id 11111111-1111-4111-8111-111111111111 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-source-a.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/source/.codex/sessions \
+  --role source \
+  --host-authority-id 11111111-1111-4111-8111-111111111111 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-source-b.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/destination/.codex/sessions \
+  --role destination \
+  --host-authority-id 22222222-2222-4222-8222-222222222222 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-destination-a.json
+python3 scripts/bulkload.py codex-capture \
+  --root /absolute/destination/.codex/sessions \
+  --role destination \
+  --host-authority-id 22222222-2222-4222-8222-222222222222 \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-destination-b.json
+python3 scripts/bulkload.py codex-plan \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
+  --output /secure/evidence/codex-union-plan.json
+```
+
+If that first plan reports `same-uuid-prefix-proof-required`, compile the
+immutable request, then capture two more quiescent passes for every role named
+as `longer_role` in the request:
+
+```bash
+python3 scripts/bulkload.py codex-prefix-request \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
+  --output /secure/evidence/codex-prefix-request.json
+
+python3 scripts/bulkload.py codex-prefix-proof \
+  --prefix-request /secure/evidence/codex-prefix-request.json \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
+  --root /absolute/source/.codex/sessions \
+  --role source \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-source-prefix-a.json
+```
+
+Repeat the proof command into a distinct `source-prefix-b.json`. If the request
+also names destination-longer observations, repeat both passes with the
+destination root, `--role destination`, and distinct destination outputs.
+Never manufacture a proof for a role absent from the request.
+
+Keep both writers quiesced. After every required proof pass has completed,
+compile one immutable close request that binds the exact request, opening
+custody, proof capture IDs, and proof body digests:
+
+```bash
+python3 scripts/bulkload.py codex-close-request \
+  --prefix-request /secure/evidence/codex-prefix-request.json \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
+  --source-prefix-a /secure/evidence/codex-source-prefix-a.json \
+  --source-prefix-b /secure/evidence/codex-source-prefix-b.json \
+  --output /secure/evidence/codex-close-request.json
+
+python3 scripts/bulkload.py codex-close-capture \
+  --close-request /secure/evidence/codex-close-request.json \
+  --root /absolute/source/.codex/sessions \
+  --role source \
+  --acknowledge-writers-quiesced \
+  --output /secure/evidence/codex-source-close-a.json
+```
+
+Add the two `--destination-prefix-*` arguments when the prefix request names
+destination-longer observations. Repeat `codex-close-capture` for source B and
+destination A/B with distinct outputs and the same close request. Closing A/B
+is required for both roles even when only one role had longer files. Each
+command captures the live root and emits a v1 wrapper around an unchanged v2
+snapshot; it does not accept a pre-existing snapshot to wrap. Then compile the
+final plan:
+
+```bash
+python3 scripts/bulkload.py codex-plan \
+  --source-a /secure/evidence/codex-source-a.json \
+  --source-b /secure/evidence/codex-source-b.json \
+  --destination-a /secure/evidence/codex-destination-a.json \
+  --destination-b /secure/evidence/codex-destination-b.json \
+  --prefix-request /secure/evidence/codex-prefix-request.json \
+  --source-prefix-a /secure/evidence/codex-source-prefix-a.json \
+  --source-prefix-b /secure/evidence/codex-source-prefix-b.json \
+  --close-request /secure/evidence/codex-close-request.json \
+  --source-close-a /secure/evidence/codex-source-close-a.json \
+  --source-close-b /secure/evidence/codex-source-close-b.json \
+  --destination-close-a /secure/evidence/codex-destination-close-a.json \
+  --destination-close-b /secure/evidence/codex-destination-close-b.json \
+  --output /secure/evidence/codex-union-plan-v3.json
+```
+
+Add the two `--destination-prefix-*` arguments when the request names
+destination-longer observations. The final plan rejects missing, reused,
+pre-proof, wrong-request, or drifting closing evidence.
+
+Assign one non-secret canonical host-authority UUID to each filesystem
+namespace for this operation. Reuse it for every capture that can address the
+same physical namespace, including shared storage or a renamed host; use a
+different ID for an independent host-local namespace.
+
+Source capture accepts only current-user, single-link regular rollout JSONL
+files that are owner-readable and not writable by group/other. Destination
+capture additionally requires every file to be exactly `0600` and every
+directory to be exactly `0700`. Strict JSON parsing rejects duplicate keys and
+non-finite values; the first and only `session_meta` must carry the canonical
+UUID bound by the filename. Capture reserves every candidate file and its full
+stable size before parsing, bounds entries, directories, records, paths,
+errors, catalogs, and output, then revalidates the resolved root, root lineage,
+and every scanned directory.
+
+Planning requires four unique capture IDs, exact A/B catalog bodies for both
+roles, explicit quiescence, and distinct source/destination custody. Within one
+host authority it rejects equal, ancestor, descendant, symlinked, or bind-aliased
+roots from recorded filesystem lineage. It proposes destination-absent UUIDs
+and proof-bound source-superset promotions, preserves destination-only and
+proved destination-superset sessions, and blocks unproved or true same-UUID
+divergence plus portable file/file, file/directory, and ancestor-prefix
+namespace collisions. Prefix planning also requires a post-proof close request
+that binds every required proof digest, followed by fresh wrapped closing A/B
+catalogs for both roots that bind that request and match every opening catalog
+and custody claim. The plan binds each opening, prefix proof, close request,
+and close artifact by distinct capture ID or body digest as appropriate. Any
+blocker suppresses the complete copy candidate list.
+Codex evidence inputs must be owner-only, single-link regular files; the CLI
+pins them through a create-only atomic publish in an owner-private output
+directory. Stdout is never an evidence destination. It verifies exact
+temporary bytes and single-link custody, uses an OS no-replace rename,
+revalidates every input and the requested
+directory/target immediately after publication, and refuses an existing
+target. It never pathname-deletes on a failure: a nonzero result may leave an
+owner-private staging or fail-held final artifact for attended quarantine. It
+is a dry-run report: the protocol intentionally has no Codex-session apply
+command. Any future attended copier must recheck the exact source and
+`destination_before` hashes and sizes immediately before replacement. Never
+run it against active writers or treat path/size equality as content proof.
 
 ## Compile and review the plan
 

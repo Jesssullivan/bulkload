@@ -25,10 +25,7 @@ def _unprivileged_account() -> tuple[str, int, int]:
             continue
         if account.pw_uid > 0 and account.pw_gid > 0:
             return account.pw_name, account.pw_uid, account.pw_gid
-    for account in pwd.getpwall():
-        if account.pw_uid > 0 and account.pw_gid > 0:
-            return account.pw_name, account.pw_uid, account.pw_gid
-    raise RuntimeError("root test worker has no unprivileged account")
+    raise RuntimeError("root test worker has no sanctioned unprivileged account")
 
 
 def _prepare_owned_directory(path: Path, uid: int, gid: int) -> None:
