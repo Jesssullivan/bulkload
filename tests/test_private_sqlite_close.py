@@ -510,6 +510,7 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                     acknowledge_provider_writers_stopped=True,
                     **self.opening_revalidation_inputs(),
                 )
+
             with self.assertRaisesRegex(BulkloadError, "canonical UTC-seconds"):
                 compile_codex_private_sqlite_close_request(
                     self.opening_plan,
@@ -545,6 +546,34 @@ class CodexPrivateSqliteCloseTest(unittest.TestCase):
                     acknowledge_provider_writers_stopped=True,
                     **self.opening_revalidation_inputs(),
                 )
+
+    def test_close_request_rejects_both_legacy_v4_runtime_authorities(
+        self,
+    ) -> None:
+        for authority in (
+            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+        ):
+            with self.subTest(policy_sha256=authority["policy_sha256"]):
+                with self.assertRaisesRegex(
+                    BulkloadError,
+                    "requires the active runtime authority",
+                ):
+                    compile_codex_private_sqlite_close_request(
+                        self.opening_plan,
+                        self.session_plan,
+                        self.source_a,
+                        self.source_b,
+                        self.destination_a,
+                        self.destination_b,
+                        authority,
+                        accept_opening_plan=self.opening_plan["plan_sha256"],
+                        accept_session_union_plan=(self.session_plan["plan_sha256"]),
+                        writer_stop_epoch_id=self.epoch_id,
+                        writer_stop_epoch_at=utc_now(),
+                        acknowledge_provider_writers_stopped=True,
+                        **self.opening_revalidation_inputs(),
+                    )
 
     def capture_reclose(self, request: dict, root: Path, role: str) -> dict:
         return capture_codex_private_sqlite_session_reclose(

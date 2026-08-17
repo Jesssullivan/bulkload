@@ -50,6 +50,26 @@ LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
         "30342175e2aea9f3c08a801523529b99438e2447241918297c804124268279f7"
     ),
 }
+ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4 = {
+    "scripts/bulkload_lib/cli.py": (
+        "90a534ebfec72ea7492990447a148f14049aa6ee80d10e20cf8d11b00773d193"
+    ),
+    "scripts/bulkload_lib/private_apply.py": (
+        "4cfbc1173468884c2098da2397bf9b5c1f8c51251bc85ed66ed3170524a507de"
+    ),
+    "scripts/bulkload_lib/private_quiescence.py": (
+        "a7107156552e65db59e93c849d4e89c4322fc614aa27018c580f10768a510296"
+    ),
+    "scripts/bulkload_lib/private_sqlite_plan.py": (
+        "f67cc27b729914ae321ad81d1fa6934c9acea66b0ae8f5737b6f1de3da908ddd"
+    ),
+    "scripts/bulkload_lib/private_state.py": (
+        "942d8254d2fc3f232cd59e82e1b37ff250ba560c0d2465d4806638512e1b9815"
+    ),
+    "scripts/bulkload_lib/sessions.py": (
+        "35982ce66e2bcfc2b5c82ffc47560f43665aa5fe680681be57df994b8503b735"
+    ),
+}
 LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4 = {
     "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
     "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
@@ -61,6 +81,24 @@ LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4 = {
     ),
     "source_digests": LEGACY_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
 }
+ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4 = {
+    "schema": PRIVATE_RUNTIME_AUTHORITY_SCHEMA,
+    "policy_schema": LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4,
+    "policy_sha256": (
+        "d721c5bad5a046a5a67ec04a708bbf3401016be0a5bd8159a6fb6a41fc5269a3"
+    ),
+    "runtime_source_sha256": (
+        "17e2de0a56e1b18baf5d9b070c33f5390dd50620ee6908eb575c2842c5c63ef3"
+    ),
+    "source_digests": ACCEPTED_H5_PRIVATE_RUNTIME_SOURCE_DIGESTS_V4,
+}
+_ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4 = frozenset(
+    canonical_bytes(authority)
+    for authority in (
+        LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+        ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+    )
+)
 PRIVATE_ALLOWED_CODEX_CLI_COMMANDS = [
     "codex-capture",
     "codex-close-capture",
@@ -356,14 +394,16 @@ def validate_private_runtime_authority(value: Any) -> dict[str, Any]:
     for key in ("policy_sha256", "runtime_source_sha256"):
         _require_sha256(value[key], f"private runtime authority {key}")
     sources = value["source_digests"]
-    if not isinstance(sources, dict):
+    if not isinstance(sources, dict) or any(
+        not isinstance(path, str) for path in sources
+    ):
         raise BulkloadError("private runtime authority source inventory differs")
     for path, digest in sources.items():
         _require_sha256(digest, f"private runtime authority {path}")
     if value["policy_schema"] == LEGACY_PRIVATE_STATE_POLICY_SCHEMA_V4:
-        if value != LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4:
+        if canonical_bytes(value) not in _ACCEPTED_PRIVATE_RUNTIME_AUTHORITIES_V4:
             raise BulkloadError(
-                "legacy private runtime authority differs from exact v4 closure"
+                "legacy private runtime authority differs from exact v4 closures"
             )
         return value
     if (

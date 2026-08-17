@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
+import inspect
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -19,6 +21,10 @@ from bulkload_lib import (
     private_quiescence,
     private_runtime,
     private_state,
+)
+from tests.unprivileged_test_main import (
+    RUNTIME_SKILL_ROOT_ENV,
+    run_unittest_main,
 )
 
 
@@ -546,9 +552,69 @@ class PrivateApplyFixture:
 
 class CodexPrivateApplyTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.process_runtime_authority = (
-            private_runtime._open_disk_private_runtime_authority_for_tests()
-        )
+        projection = os.environ.get(RUNTIME_SKILL_ROOT_ENV)
+        privilege_drop = os.environ.get("BULKLOAD_TEST_PRIVILEGE_DROP") == "1"
+        if not privilege_drop:
+            if projection is not None:
+                self.fail("runtime skill projection exists without privilege drop")
+            self.process_runtime_authority = (
+                private_runtime._open_disk_private_runtime_authority_for_tests()
+            )
+        else:
+            if projection is None:
+                self.fail("privilege-dropped test lacks runtime skill projection")
+            projection_root = Path(projection)
+            try:
+                resolved_root = projection_root.resolve(strict=True)
+                test_root = Path(os.environ["TMPDIR"]).resolve(strict=True).parent
+            except (KeyError, OSError) as error:
+                self.fail(f"runtime skill projection cannot be resolved: {error}")
+            self.assertTrue(projection_root.is_absolute())
+            self.assertEqual(resolved_root, projection_root)
+            self.assertEqual(resolved_root.parent, test_root)
+            test_root_entry = os.lstat(test_root)
+            self.assertEqual(test_root_entry.st_uid, os.geteuid())
+            self.assertEqual(test_root_entry.st_gid, os.getegid())
+            self.assertTrue(stat.S_ISDIR(test_root_entry.st_mode))
+            self.assertEqual(stat.S_IMODE(test_root_entry.st_mode), 0o700)
+
+            observed_files: set[str] = set()
+            for path in (resolved_root, *sorted(resolved_root.rglob("*"))):
+                entry = os.lstat(path)
+                self.assertEqual(entry.st_uid, os.geteuid())
+                self.assertEqual(entry.st_gid, os.getegid())
+                self.assertFalse(stat.S_ISLNK(entry.st_mode))
+                if stat.S_ISDIR(entry.st_mode):
+                    self.assertEqual(stat.S_IMODE(entry.st_mode), 0o700)
+                else:
+                    self.assertTrue(stat.S_ISREG(entry.st_mode))
+                    self.assertEqual(stat.S_IMODE(entry.st_mode), 0o600)
+                    observed_files.add(path.relative_to(resolved_root).as_posix())
+            self.assertIn(
+                f"references/{private_runtime.PRIVATE_STATE_POLICY_NAME}",
+                observed_files,
+            )
+            self.assertTrue(
+                any(
+                    path.startswith("scripts/") and path.endswith(".py")
+                    for path in observed_files
+                )
+            )
+            self.assertTrue(
+                all(
+                    path == (f"references/{private_runtime.PRIVATE_STATE_POLICY_NAME}")
+                    or (path.startswith("scripts/") and path.endswith(".py"))
+                    for path in observed_files
+                )
+            )
+            with mock.patch.object(
+                private_runtime,
+                "_skill_root",
+                return_value=resolved_root,
+            ):
+                self.process_runtime_authority = (
+                    private_runtime._open_disk_private_runtime_authority_for_tests()
+                )
         private_runtime.bind_process_private_runtime_authority(
             self.process_runtime_authority
         )
@@ -564,6 +630,51 @@ class CodexPrivateApplyTest(unittest.TestCase):
         self.assertEqual(waited, pid)
         self.assertTrue(os.WIFEXITED(status))
         self.assertEqual(os.WEXITSTATUS(status), expected)
+
+    def test_mutation_suite_runs_as_an_unprivileged_user(self) -> None:
+        if hasattr(os, "geteuid"):
+            self.assertNotEqual(os.geteuid(), 0)
+
+    def test_production_mutations_refuse_root_before_read_or_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("apply", private_apply.apply_codex_private_install),
+                ("verify", private_apply.verify_codex_private_install),
+                ("rollback", private_apply.rollback_codex_private_install),
+                ("recovery", private_apply.recover_codex_private_mutation),
+            )
+            for operation, function in cases:
+                arguments: list[Path] = []
+                keywords: dict[str, Path] = {}
+                for parameter in inspect.signature(function).parameters.values():
+                    if parameter.default is not inspect.Parameter.empty:
+                        continue
+                    value = root / parameter.name
+                    if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                        arguments.append(value)
+                    elif parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                        keywords[parameter.name] = value
+                    else:
+                        self.fail(
+                            f"unsupported private mutation parameter: {parameter.name}"
+                        )
+                with (
+                    self.subTest(operation=operation),
+                    mock.patch.object(private_apply.os, "geteuid", return_value=0),
+                    mock.patch.object(
+                        private_apply,
+                        "read_codex_private_install_plan",
+                    ) as read_plan,
+                    self.assertRaises(BulkloadError) as raised,
+                ):
+                    function(*arguments, **keywords)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"private Codex {operation} refuses root",
+                )
+                read_plan.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_compiler_round_trip_and_full_apply_verify_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2117,15 +2228,22 @@ class CodexPrivateApplyTest(unittest.TestCase):
 
             prior_preflight = fixture.root / "prior-attempt-preflight"
             self.assertTrue(prior_preflight.is_dir())
-            with self.assertRaisesRegex(
-                BulkloadError,
-                "overlaps .*original evidence",
-            ):
+            with self.assertRaises(BulkloadError) as raised:
                 fixture.recover(
                     paths["journal"],
                     prefix="later-attempt",
                     preflight_capture_directory=(prior_preflight / "nested-preflight"),
                 )
+            self.assertIn(
+                str(raised.exception),
+                {
+                    "recovery preflight capture overlaps original recovery evidence",
+                    (
+                        "recovery preflight capture overlaps protected "
+                        "original evidence 3"
+                    ),
+                },
+            )
 
     def test_recovery_rejects_same_bytes_with_unknown_inode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2266,4 +2384,7 @@ class CodexPrivateApplyTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_unittest_main(
+        runtime_skill_root=private_runtime._skill_root(),
+        runtime_policy_name=private_runtime.PRIVATE_STATE_POLICY_NAME,
+    )

@@ -41,7 +41,7 @@ the state matrix and stop conditions. Read
 [references/agent-context.md](references/agent-context.md) before handling
 Codex, Claude, or Pi state. Read
 [references/codex-private-state-policy.v5.json](references/codex-private-state-policy.v5.json)
-before classifying Codex auth or SQLite. The retained [v4 policy](references/codex-private-state-policy.v4.json) validates legacy opening evidence only. Use
+before classifying Codex auth or SQLite. The retained [v4 policy](references/codex-private-state-policy.v4.json) and two exact ratified v4 runtime authorities validate legacy opening evidence only. Use
 [references/codex-private-auth-install.md](references/codex-private-auth-install.md)
 for the attended auth workflow. Read the [v4 SQLite opening contract](references/codex-private-sqlite-compose-plan.md)
 before opening, and the [v5 close/action-plan contract](references/codex-private-sqlite-compose-action-plan.md) before closing or compiling an offline action plan.
@@ -251,10 +251,10 @@ and close artifact by distinct capture ID or body digest as appropriate. Any
 blocker suppresses the complete copy candidate list.
 Codex evidence inputs must be owner-only, single-link regular files; the CLI
 pins them through a create-only atomic publish in an owner-private output
-directory. It verifies exact temporary bytes and single-link custody, uses an
-OS no-replace rename, revalidates every input and the requested
-directory/target immediately after publication, and refuses an existing
-target. It never pathname-deletes on a failure: a nonzero result may leave an
+directory. Stdout is never an evidence destination. It verifies exact temporary
+bytes and single-link custody, uses an OS no-replace rename, revalidates every
+input and the requested directory/target immediately after publication, and
+refuses an existing target. It never pathname-deletes on a failure: a nonzero result may leave an
 owner-private staging or fail-held final artifact for attended quarantine. It
 is a dry-run report: the protocol intentionally has no Codex-session apply
 command. Any future attended copier must recheck the exact source and

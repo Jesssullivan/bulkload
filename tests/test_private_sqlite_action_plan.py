@@ -816,11 +816,14 @@ class CodexPrivateSqliteActionPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(BulkloadError, "operation is unsafe"):
             validate_codex_private_sqlite_action_plan(tampered)
 
-    def test_action_plan_rejects_legacy_v4_runtime_authority(self) -> None:
-        with self.assertRaisesRegex(BulkloadError, "requires policy v5"):
-            self._compile(
-                runtime_authority=private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4
-            )
+    def test_action_plan_rejects_both_legacy_v4_runtime_authorities(self) -> None:
+        for authority in (
+            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
+        ):
+            with self.subTest(policy_sha256=authority["policy_sha256"]):
+                with self.assertRaisesRegex(BulkloadError, "requires policy v5"):
+                    self._compile(runtime_authority=authority)
 
     def test_against_close_recomputes_exact_table_semantics(self) -> None:
         plan = self._compile()

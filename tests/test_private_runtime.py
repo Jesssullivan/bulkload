@@ -130,30 +130,80 @@ class PrivateRuntimeAuthorityTest(unittest.TestCase):
                 ) as reopened:
                     self.assertEqual(reopened.record, expected)
 
-    def test_only_the_exact_legacy_v4_authority_is_accepted(self) -> None:
-        legacy = json.loads(
-            json.dumps(private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4)
+    def test_only_the_two_exact_legacy_v4_authorities_are_accepted(self) -> None:
+        authorities = (
+            private_runtime.LEGACY_PRIVATE_RUNTIME_AUTHORITY_V4,
+            private_runtime.ACCEPTED_H5_PRIVATE_RUNTIME_AUTHORITY_V4,
         )
-        self.assertEqual(
-            private_runtime.validate_private_runtime_authority(legacy),
-            legacy,
-        )
-        for field in (
-            "policy_sha256",
-            "runtime_source_sha256",
+        self.assertEqual(len(authorities), 2)
+        self.assertNotEqual(authorities[0], authorities[1])
+        for index, authority in enumerate(authorities):
+            with self.subTest(authority=index):
+                exact = json.loads(json.dumps(authority))
+                self.assertEqual(
+                    private_runtime.validate_private_runtime_authority(exact),
+                    exact,
+                )
+
+        for mask in range(16):
+            bits = tuple((mask >> index) & 1 for index in range(4))
+            mixed = json.loads(json.dumps(authorities[0]))
+            mixed["policy_sha256"] = authorities[bits[0]]["policy_sha256"]
+            mixed["runtime_source_sha256"] = authorities[bits[1]][
+                "runtime_source_sha256"
+            ]
+            for offset, path in enumerate(
+                (
+                    "scripts/bulkload_lib/cli.py",
+                    "scripts/bulkload_lib/sessions.py",
+                ),
+                start=2,
+            ):
+                mixed["source_digests"][path] = authorities[bits[offset]][
+                    "source_digests"
+                ][path]
+            with self.subTest(authority_mix=bits):
+                if bits in ((0, 0, 0, 0), (1, 1, 1, 1)):
+                    self.assertEqual(
+                        private_runtime.validate_private_runtime_authority(mixed),
+                        mixed,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        BulkloadError,
+                        "exact v4 closures",
+                    ):
+                        private_runtime.validate_private_runtime_authority(mixed)
+
+        unknown = json.loads(json.dumps(authorities[1]))
+        unknown["policy_sha256"] = "f" * 64
+        unknown["runtime_source_sha256"] = "e" * 64
+        unknown["source_digests"] = {
+            path: "d" * 64 for path in unknown["source_digests"]
+        }
+        with self.assertRaisesRegex(BulkloadError, "exact v4 closures"):
+            private_runtime.validate_private_runtime_authority(unknown)
+
+        extra = json.loads(json.dumps(authorities[1]))
+        extra["unexpected"] = "field"
+        missing = json.loads(json.dumps(authorities[1]))
+        missing.pop("runtime_source_sha256")
+        wrong_schema = json.loads(json.dumps(authorities[1]))
+        wrong_schema["schema"] += ".unknown"
+        extra_source = json.loads(json.dumps(authorities[1]))
+        extra_source["source_digests"]["scripts/bulkload_lib/unknown.py"] = "c" * 64
+        missing_source = json.loads(json.dumps(authorities[1]))
+        missing_source["source_digests"].pop("scripts/bulkload_lib/cli.py")
+        for label, malformed in (
+            ("extra", extra),
+            ("missing", missing),
+            ("schema", wrong_schema),
+            ("extra-source", extra_source),
+            ("missing-source", missing_source),
         ):
-            with self.subTest(field=field):
-                changed = json.loads(json.dumps(legacy))
-                changed[field] = "0" * 64
-                with self.assertRaisesRegex(
-                    BulkloadError,
-                    "exact v4 closure",
-                ):
-                    private_runtime.validate_private_runtime_authority(changed)
-        changed = json.loads(json.dumps(legacy))
-        changed["source_digests"]["scripts/bulkload_lib/cli.py"] = "0" * 64
-        with self.assertRaisesRegex(BulkloadError, "exact v4 closure"):
-            private_runtime.validate_private_runtime_authority(changed)
+            with self.subTest(malformed=label):
+                with self.assertRaises(BulkloadError):
+                    private_runtime.validate_private_runtime_authority(malformed)
 
     def test_path_replacement_and_inventory_drift_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
