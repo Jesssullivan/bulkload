@@ -1,8 +1,9 @@
 # Bulkload v1 design
 
-Status: repository v1 complete; Codex session-union v3 prefix-proof extension;
-private-state policy v7 narrow attended auth install, exact-v6 compatibility
-freeze, and internal read-only SQLite verifier oracle in review, 2026-07-29.
+Status: repository v1 and the Codex session-union v3 prefix-proof extension are
+landed; private-state policy v7 provides the narrow attended auth install,
+exact-v6 compatibility freeze, and an internal read-only SQLite verifier
+oracle as a source foundation, 2026-08-17.
 The oracle observes fixtures built separately without invoking the oracle and
 cannot write bundles or mint final receipts. SQLite composition, reservation, publication,
 installation, final verification, and combined private apply remain fail-held.

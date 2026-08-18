@@ -74,6 +74,23 @@ its exact SHA-256 and pass that digest back explicitly.
 The examples below use uppercase digest placeholders. Replace each placeholder
 only after reviewing the corresponding immutable artifact.
 
+Derive the exact installed Codex version in each operator shell instead of
+copying a historical example value:
+
+```bash
+codex_version_output="$(codex --version)"
+if [[ ! "$codex_version_output" =~ ^codex-cli\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  printf 'unsupported Codex version output: %q\n' "$codex_version_output" >&2
+  exit 1
+fi
+codex_version="${BASH_REMATCH[1]}"
+printf 'codex-version=%s\n' "$codex_version"
+```
+
+The source and destination values must match exactly before capture. Keep the
+reviewed `codex_version` value unchanged in the shell for every related command
+below; a mismatch blocks the compatibility plan.
+
 ## 1. Capture source auth only
 
 Create the procedural capture attestation:
@@ -86,7 +103,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --purpose capture \
   --capture-role source \
   --host-authority-id 11111111-1111-4111-8111-111111111111 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --acknowledge-writers-quiesced
 ```
@@ -99,7 +116,7 @@ scripts/bulkload.py codex-private-capture \
   --output-directory /secure/evidence/source-private \
   --role source \
   --host-authority-id 11111111-1111-4111-8111-111111111111 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --acknowledge-private-capture \
   --quiescence-attestation /secure/evidence/source-capture-quiescence.json \
@@ -129,7 +146,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --purpose capture \
   --capture-role destination \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --acknowledge-writers-quiesced
@@ -144,7 +161,7 @@ scripts/bulkload.py codex-private-capture \
   --output-directory /secure/evidence/destination-private \
   --role destination \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --acknowledge-private-capture \
@@ -212,7 +229,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --operation-output /secure/evidence/apply-receipt.json \
   --purpose apply \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --accept-plan INSTALL_PLAN_SHA256 \
@@ -236,7 +253,7 @@ scripts/bulkload.py codex-private-apply \
   --receipt /secure/evidence/apply-receipt.json \
   --accept-plan INSTALL_PLAN_SHA256 \
   --destination-host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --quiescence-attestation /secure/evidence/apply-quiescence.json \
   --accept-quiescence-attestation APPLY_ATTESTATION_SHA256 \
   --acknowledge-private-apply
@@ -265,7 +282,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --operation-output /secure/evidence/verify-receipt.json \
   --purpose verify \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --accept-plan INSTALL_PLAN_SHA256 \
@@ -287,7 +304,7 @@ scripts/bulkload.py codex-private-verify \
   --accept-plan INSTALL_PLAN_SHA256 \
   --accept-apply-receipt APPLY_RECEIPT_SHA256 \
   --destination-host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --quiescence-attestation /secure/evidence/verify-quiescence.json \
   --accept-quiescence-attestation VERIFY_ATTESTATION_SHA256 \
   --acknowledge-private-verify
@@ -316,7 +333,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --operation-output /secure/evidence/rollback-receipt.json \
   --purpose rollback \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --accept-plan INSTALL_PLAN_SHA256 \
@@ -345,7 +362,7 @@ scripts/bulkload.py codex-private-rollback \
   --accept-plan INSTALL_PLAN_SHA256 \
   --accept-apply-receipt APPLY_RECEIPT_SHA256 \
   --destination-host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --quiescence-attestation /secure/evidence/rollback-quiescence.json \
   --accept-quiescence-attestation ROLLBACK_ATTESTATION_SHA256 \
   --acknowledge-private-rollback \
@@ -396,7 +413,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --operation-output /secure/evidence/recovery-receipt.json \
   --purpose recover \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --accept-plan INSTALL_PLAN_SHA256 \
@@ -419,7 +436,7 @@ scripts/bulkload.py codex-private-recover \
   --accept-plan INSTALL_PLAN_SHA256 \
   --accept-journal APPLY_JOURNAL_SHA256 \
   --destination-host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --quiescence-attestation /secure/evidence/recovery-quiescence.json \
   --accept-quiescence-attestation RECOVERY_ATTESTATION_SHA256 \
   --acknowledge-private-recovery
@@ -442,7 +459,7 @@ scripts/bulkload.py codex-private-quiescence-attest \
   --operation-output /secure/evidence/rollback-recovery-receipt.json \
   --purpose recover \
   --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --include-auth \
   --include-sqlite \
   --accept-plan INSTALL_PLAN_SHA256 \
@@ -470,7 +487,7 @@ scripts/bulkload.py codex-private-recover \
   --accept-journal ROLLBACK_JOURNAL_SHA256 \
   --accept-apply-receipt APPLY_RECEIPT_SHA256 \
   --destination-host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --codex-version 0.145.0 \
+  --codex-version "$codex_version" \
   --quiescence-attestation \
     /secure/evidence/rollback-recovery-quiescence.json \
   --accept-quiescence-attestation ROLLBACK_RECOVERY_ATTESTATION_SHA256 \
