@@ -9,7 +9,7 @@ destination-absent UUIDs and proof-bound source-superset promotions only after
 stable source and destination A/B captures. Its v2 capture evidence binds typed
 directory claims and root lineage to an explicit filesystem-authority ID,
 blocks divergent common sessions and portable file/directory collisions, and
-pins bounded evidence I/O. The in-review v3 planner recognizes proof-bound
+pins bounded evidence I/O. The landed v3 planner recognizes proof-bound
 append-only prefix/superset histories, compiles a close request from every
 required proof digest, and only then accepts fresh source and destination A/B
 captures wrapped against that request.
@@ -41,11 +41,16 @@ The plan-only database contracts are in the
 and [v5 close/action-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-action-plan.md).
 The frozen v6 request and volatile capacity contract is in the
 [compose-request reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-request.md).
-The staged writer, receipt, and first v7 read-only-oracle boundary is in the
+The landed v7 source foundation and first internal read-only-oracle boundary
+are in the
 [offline composition contract](.agents/skills/bulkload/references/codex-private-sqlite-offline-composer.md).
 
-The repository is private. Install the self-contained skill for Codex, Pi, and
-Claude with an authenticated GitHub CLI:
+The repository is private. `v0.1.0` is not installable until an attended
+release publishes its signed annotated tag. The command below deliberately
+fails closed while that tag is absent; the reviewed release scope is in
+[the v0.1.0 release notes](docs/release-v0.1.0.md). After publication, install
+the self-contained skill for Codex, Pi, and Claude with an authenticated
+GitHub CLI:
 
 ```bash
 bash -c 'set -euo pipefail; repo=Jesssullivan/bulkload; tag=v0.1.0; tmp="$(mktemp -d)"; trap '\''rm -rf "$tmp"'\'' EXIT; gh repo clone "$repo" "$tmp/bulkload" -- --branch "$tag" --depth 1; local_tag="$(git -C "$tmp/bulkload" rev-parse "refs/tags/$tag^{tag}")"; remote_tag="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha)"; test "$local_tag" = "$remote_tag"; test "$(gh api "repos/$repo/git/tags/$remote_tag" --jq .verification.verified)" = true; remote_commit="$(gh api "repos/$repo/git/tags/$remote_tag" --jq '\''.object | select(.type == "commit") | .sha'\'')"; test -n "$remote_commit"; test "$(git -C "$tmp/bulkload" rev-parse HEAD)" = "$remote_commit"; "$tmp/bulkload/scripts/install-skill.sh" --all'
@@ -57,6 +62,10 @@ and the cloned tag object and checked-out commit exactly match that API proof.
 
 Codex and Pi discover the canonical copy at `~/.agents/skills/bulkload`.
 Claude receives a symlink at `~/.claude/skills/bulkload` to that same copy.
+`scripts/install-skill.sh --all` installs only that portable skill; it does not
+install a `bulkload` command on `PATH`. Invoke the installed entrypoint as
+`~/.agents/skills/bulkload/scripts/bulkload.py`, or use the repository/Bazel
+launcher during development.
 The installer validates the canonical, private-backup, and Claude destinations
 before mutation, refuses symlinked directory authority, and preserves a forced
 replacement under `~/.agents/backups/bulkload` before installing it.
