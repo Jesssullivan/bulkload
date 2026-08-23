@@ -95,6 +95,12 @@ scripts/bulkload.py agent-plan \
 Planning requires exact A/B catalog equality for each role and four unique
 capture IDs. Review:
 
+For a four-capture set larger than 512 MiB, push both source captures from Neo
+to the private Sting evidence directory and run `agent-plan` on Sting beside
+the destination captures. The command fails closed unless Linux reports the
+required memory reserve; do not raise the bound, add swap, or reuse captures.
+Every transfer still originates on Neo.
+
 - `ready` and every blocker;
 - known `holds`, especially Claude auth;
 - every Git ref/recovery action and worktree target;
@@ -113,9 +119,9 @@ union members remain.
 ## Preseed without touching live state
 
 The stage protocol is destination `prepare`, source `push`, destination
-`materialize`. Install the same closure on both hosts. Relay the accepted plan
-Neo-to-Sting with the source and destination GNU rsync paths and hashes bound in
-that plan; rehash the source executable before relay, require the destination's
+`materialize`. Install the same closure on both hosts. Keep the accepted plan
+on Sting, with the source and destination GNU rsync paths and hashes bound in
+that plan; rehash the source executable before transport, require the destination's
 immutable Nix-store path, and let destination `prepare` rehash it locally. Use
 `--checksum --delay-updates`, strict SSH, and exact owner-private paths. Every
 connection originates on Neo: Neo may pull destination A/B captures and the
@@ -131,15 +137,16 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode prepare \
   --output /home/jess/.bulkload-evidence/preseed-prepare.json
 ```
 
-On Neo, after pulling that exact receipt:
+On Neo, after pulling that exact receipt and its sibling
+`.transport-allowlist-preseed.nul` over the same Neo-originated connection:
 
 ```bash
 scripts/bulkload.py agent-stage --phase preseed --transport-mode push \
-  --plan /secure/evidence/preliminary-plan.json \
   --accept-plan-sha256 PLAN_SHA256 \
   --stage-root /srv/fast-local/jess/bulkload/stage \
   --destination-ssh-host jess@sting \
   --prepare-receipt /secure/evidence/preseed-prepare.json \
+  --transport-allowlist /secure/evidence/preseed-allowlist.nul \
   --output /secure/evidence/preseed-push.json
 ```
 
@@ -156,9 +163,11 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode materialize \
   --output /home/jess/.bulkload-evidence/preseed-stage.json
 ```
 
-`prepare` creates the absent owner-private stage/quarantine and gates capacity.
-Push accepts only the plan's NUL allowlist through compatible captured GNU
-rsync; materialize revalidates its chained receipts and every byte. Changed-late
+`prepare` creates the absent owner-private stage/quarantine, writes and seals the
+plan-derived NUL allowlist, and gates capacity. Push streams only that sealed
+allowlist through compatible captured GNU rsync; it does not load the multi-GiB
+plan on Neo. Materialize revalidates the plan, allowlist authority, chained
+receipts, and every byte. Changed-late
 preliminary entries defer rather than gain apply authority. A failed reflink is
 a hard stop. `--allow-accounted-copy` covers only charged incoming/transformed
 bytes, never a hidden full rollback copy.

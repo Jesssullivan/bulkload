@@ -1398,6 +1398,25 @@ def _provider_classification(provider: str, relative: str) -> str:
     return "unknown"
 
 
+def provider_item_identity(item: dict[str, Any]) -> str:
+    """Return the stable identity, using the common path identity implicitly."""
+    return item.get("identity", item["relative_path"])
+
+
+def provider_item_destination(item: dict[str, Any]) -> str:
+    """Return the destination-relative path without serializing common copies."""
+    return item.get("destination_relative_path", item["relative_path"])
+
+
+def expand_provider_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Materialize compact provider defaults only at the execution boundary."""
+    return {
+        **item,
+        "destination_relative_path": provider_item_destination(item),
+        "identity": provider_item_identity(item),
+    }
+
+
 def _capture_provider(
     provider: str,
     root: Path,
@@ -1433,7 +1452,18 @@ def _capture_provider(
     files: list[tuple[str, Path]] = []
     blockers: list[dict[str, str]] = []
     charged = 0
-    for current, directories, names in os.walk(root, topdown=True, followlinks=False):
+
+    def unreadable(error: OSError) -> None:
+        blockers.append(
+            {
+                "code": "unreadable-agent-state",
+                "path": os.fspath(error.filename or root),
+            }
+        )
+
+    for current, directories, names in os.walk(
+        root, topdown=True, followlinks=False, onerror=unreadable
+    ):
         retained_directories: list[str] = []
         for name in sorted(directories):
             path = Path(current) / name
@@ -1577,8 +1607,6 @@ def _capture_provider(
             items.append(
                 {
                     "classification": "sqlite",
-                    "destination_relative_path": relative,
-                    "identity": relative,
                     "logical": logical,
                     "mode": f"{stat.S_IMODE(path.stat().st_mode):04o}",
                     "relative_path": relative,
@@ -1622,12 +1650,10 @@ def _capture_provider(
                     encoded_source, encoded_destination
                 ).replace(encoded_source.lstrip(b"-"), encoded_destination.lstrip(b"-"))
                 destination_relative = os.fsdecode(encoded_relative)
-        record.update(
-            {
-                "destination_relative_path": destination_relative,
-                "identity": identity,
-            }
-        )
+        if destination_relative != relative:
+            record["destination_relative_path"] = destination_relative
+        if identity != relative:
+            record["identity"] = identity
         if classification.startswith("append-jsonl"):
             try:
                 append_records = _jsonl_records(
@@ -1638,12 +1664,8 @@ def _capture_provider(
                 )
             except _MalformedAppendState:
                 record = _file_record(path, relative, classification="portable-private")
-                record.update(
-                    {
-                        "destination_relative_path": relative,
-                        "identity": relative,
-                    }
-                )
+                record.pop("destination_relative_path", None)
+                record.pop("identity", None)
             else:
                 record.update(append_records)
         elif classification.endswith("rewrite") and record["kind"] == "regular":
@@ -1674,7 +1696,7 @@ def _capture_provider(
                 items,
                 key=lambda item: (
                     item["classification"],
-                    item["identity"],
+                    provider_item_identity(item),
                     item["relative_path"],
                 ),
             ),

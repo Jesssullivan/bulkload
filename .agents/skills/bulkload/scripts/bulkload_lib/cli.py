@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -12,37 +14,75 @@ from . import __version__
 from .executor import (
     DEFAULT_CAPACITY_RESERVE_BYTES,
     apply_agent_plan,
+    push_agent_transport,
     recover_agent_apply,
     rollback_agent_apply,
     stage_agent_plan,
+    validate_stage_receipt,
     verify_agent_plan,
 )
 from .model import (
     BulkloadError,
+    MAX_JSON_BYTES,
     assert_no_overlap,
-    atomic_write_json,
+    atomic_write,
     canonical_bytes,
     read_json,
 )
-from .planner import compile_agent_plan
+from .planner import compile_agent_plan_authorities
 from .scanner import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
     canonical_path_map,
     capture_agent_state,
+    validate_agent_capture,
 )
 
 
+MAX_PUBLIC_JSON_BYTES = MAX_JSON_BYTES
+LARGE_PLAN_THRESHOLD_BYTES = 512 * 1024**2
+
+
 def _write(path: str, value: dict[str, Any]) -> None:
+    payload = canonical_bytes(value) + b"\n"
+    if len(payload) > MAX_PUBLIC_JSON_BYTES:
+        raise BulkloadError("public JSON output exceeds the bounded read contract")
     if path == "-":
-        sys.stdout.buffer.write(canonical_bytes(value) + b"\n")
+        sys.stdout.buffer.write(payload)
     else:
-        atomic_write_json(Path(path), value)
+        atomic_write(Path(path), payload, mode=0o600)
 
 
 def _load(path: str) -> dict[str, Any]:
-    return read_json(Path(path).expanduser())
+    candidate = Path(path).expanduser()
+    size = candidate.stat(follow_symlinks=False).st_size
+    _require_large_evidence_memory(size)
+    return read_json(candidate)
+
+
+def _available_linux_memory() -> int:
+    try:
+        fields = {
+            line.split(":", 1)[0]: int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines()
+            if ":" in line and len(line.split()) >= 2
+        }
+        return fields["MemAvailable"]
+    except (FileNotFoundError, KeyError, OSError, UnicodeDecodeError, ValueError):
+        raise BulkloadError(
+            "large Bulkload evidence requires the memory-qualified destination"
+        ) from None
+
+
+def _require_large_evidence_memory(size: int, *, multiplier: int = 4) -> None:
+    if size <= LARGE_PLAN_THRESHOLD_BYTES:
+        return
+    required = size * multiplier + 2 * 1024**3
+    if _available_linux_memory() < required:
+        raise BulkloadError(
+            "destination memory is below the bounded Bulkload evidence gate"
+        )
 
 
 def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
@@ -76,7 +116,18 @@ def _protect_output(arguments: argparse.Namespace) -> None:
     elif arguments.command == "agent-plan":
         for name in ("source_a", "source_b", "destination_a", "destination_b"):
             roots.extend(_catalog_roots(_load(getattr(arguments, name))["catalog"]))
-    elif hasattr(arguments, "plan"):
+    elif arguments.command == "agent-stage" and arguments.transport_mode == "push":
+        if not arguments.prepare_receipt or not arguments.transport_allowlist:
+            raise BulkloadError(
+                "transport push requires a prepare receipt and sealed allowlist"
+            )
+        prepare = _load(arguments.prepare_receipt)
+        validate_stage_receipt(prepare)
+        roots.extend(Path(value) for value in prepare["transport"]["source_roots"])
+        roots.extend(
+            (Path(arguments.prepare_receipt), Path(arguments.transport_allowlist))
+        )
+    elif hasattr(arguments, "plan") and arguments.plan:
         plan = _load(arguments.plan)
         roots.extend(_catalog_roots(plan["source"]["catalog"]))
         roots.extend(_catalog_roots(plan["destination"]["catalog"]))
@@ -152,15 +203,76 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
-    return compile_agent_plan(
-        _load(arguments.source_a),
-        _load(arguments.source_b),
-        _load(arguments.destination_a),
-        _load(arguments.destination_b),
+    paths = [
+        Path(getattr(arguments, name)).expanduser()
+        for name in ("source_a", "source_b", "destination_a", "destination_b")
+    ]
+    sizes = [path.stat(follow_symlinks=False).st_size for path in paths]
+    if any(size > MAX_JSON_BYTES for size in sizes):
+        raise BulkloadError("AgentCaptureV4 exceeds the bounded JSON contract")
+    total = sum(sizes)
+    if total > LARGE_PLAN_THRESHOLD_BYTES:
+        required = total * 4 + 2 * 1024**3
+        if _available_linux_memory() < required:
+            raise BulkloadError(
+                "destination memory is below the bounded AgentPlanV4 planning gate"
+            )
+
+    def stable_authority(
+        first_path: Path, second_path: Path, role: str
+    ) -> tuple[dict[str, Any], tuple[str, str]]:
+        first = _load(os.fspath(first_path))
+        validate_agent_capture(first, expected_role=role)
+        first_id = first["capture_id"]
+        catalog_sha256 = first["catalog_sha256"]
+        first_complete = first["complete"]
+        del first
+        gc.collect()
+        second = _load(os.fspath(second_path))
+        validate_agent_capture(second, expected_role=role)
+        if (
+            first_id == second["capture_id"]
+            or catalog_sha256 != second["catalog_sha256"]
+            or not first_complete
+            or not second["complete"]
+        ):
+            raise BulkloadError(f"{role} A/B captures are not stable and complete")
+        return second, (first_id, second["capture_id"])
+
+    source, source_ids = stable_authority(paths[0], paths[1], "source")
+    destination, destination_ids = stable_authority(paths[2], paths[3], "destination")
+    return compile_agent_plan_authorities(
+        source,
+        source_ids,
+        destination,
+        destination_ids,
     )
 
 
 def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
+    if arguments.transport_mode == "push":
+        if (
+            arguments.plan is not None
+            or arguments.prepare_receipt is None
+            or arguments.transport_allowlist is None
+            or arguments.destination_ssh_host is None
+            or arguments.transport_receipt is not None
+        ):
+            raise BulkloadError(
+                "transport push requires only prepare receipt, allowlist, and destination host"
+            )
+        return push_agent_transport(
+            _load(arguments.prepare_receipt),
+            Path(arguments.transport_allowlist),
+            accepted_plan_sha256=arguments.accept_plan_sha256,
+            phase=arguments.phase,
+            stage_root=Path(arguments.stage_root),
+            destination_ssh_host=arguments.destination_ssh_host,
+        )
+    if arguments.plan is None or arguments.transport_allowlist is not None:
+        raise BulkloadError(
+            "plan staging requires a plan and forbids a transport allowlist"
+        )
     return stage_agent_plan(
         _load(arguments.plan),
         accepted_plan_sha256=arguments.accept_plan_sha256,
@@ -264,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
         "agent-stage", help="materialize preseed or final stage"
     )
     stage.add_argument("--phase", choices=("preseed", "final"), required=True)
-    stage.add_argument("--plan", required=True)
+    stage.add_argument("--plan")
     stage.add_argument("--accept-plan-sha256", required=True)
     stage.add_argument("--stage-root", required=True)
     stage.add_argument("--allow-accounted-copy", action="store_true")
@@ -275,6 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage.add_argument("--destination-ssh-host")
     stage.add_argument("--prepare-receipt")
+    stage.add_argument("--transport-allowlist")
     stage.add_argument("--transport-receipt")
     stage.add_argument(
         "--capacity-reserve-bytes", type=int, default=DEFAULT_CAPACITY_RESERVE_BYTES

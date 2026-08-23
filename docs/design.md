@@ -98,6 +98,14 @@ sibling typed catalog and is preserved without pretending it is a repository.
 Catalogs retain logical Git/provider install roots, physical backing roots, and
 nofollow link proofs. Translation uses logical paths; writes use backings, so
 Sting's Home Manager `.codex`, `.claude`, `.gstack`, and `git` links remain.
+AgentPlanV4 retains each catalog once; operations bind catalog identities rather
+than embedding repeated workspace or provider records.
+Capture, plan, and receipt JSON have a hard 4 GiB ceiling. When the four input
+captures total more than 512 MiB, planning is destination-only: Neo pushes the
+source evidence to Sting, and Sting must expose at least four times the combined
+input size plus 2 GiB as `MemAvailable`. A and B are loaded and released
+sequentially; equal catalog digests bind the stable body without retaining four
+decoded manifests at once.
 
 ## Agent state
 
@@ -150,10 +158,12 @@ Triggers, views, virtual tables, corrupt databases, and unknown families stop.
 ## Stage and capacity
 
 Destination prepare creates the external mode-0700 stage/quarantine, verifies
-captured GNU rsync, and gates capacity. Neo pushes only the plan's NUL allowlist
-through strict SSH; Sting materializes only after validating chained prepare/
-push receipts and every byte. No Sting-originated credential is needed and no
-live path changes. Preliminary changed-late entries defer. Final accepts a
+captured GNU rsync, writes a mode-0600 plan-derived NUL allowlist, and gates
+capacity. Neo pulls the small prepare receipt and allowlist over its outbound
+connection, then streams only that sealed authority through strict SSH without
+decoding AgentPlanV4. Sting materializes only after validating the plan,
+allowlist, chained prepare/push receipts, and every byte. No Sting-originated
+credential is needed and no live path changes. Preliminary changed-late entries defer. Final accepts a
 fresh plan, reuses verified content objects across plan digests, restages every
 operation, snapshots destination SQLite, and seals the only apply manifest.
 

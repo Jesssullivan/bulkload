@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
@@ -14,12 +15,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from bulkload_lib.cli import build_parser
+from bulkload_lib.cli import _agent_plan, build_parser
 from bulkload_lib.executor import (
     _git,
     _git_worktree_state,
     _rollback_steps,
+    _snapshot_allowlist_stream,
     apply_agent_plan,
+    push_agent_transport,
     recover_agent_apply,
     rollback_agent_apply,
     stage_agent_plan,
@@ -38,8 +41,9 @@ from bulkload_lib.model import (
     sha256_bytes,
     translate_path,
 )
-from bulkload_lib.planner import compile_agent_plan
+from bulkload_lib.planner import compile_agent_plan, materialize_plan_operation
 from bulkload_lib.scanner import (
+    _capture_provider,
     canonical_path_map,
     canonical_provider_policy,
     capture_agent_state,
@@ -370,6 +374,29 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 "agent-recover",
             },
         )
+        push = parser.parse_args(
+            [
+                "agent-stage",
+                "--phase",
+                "preseed",
+                "--transport-mode",
+                "push",
+                "--accept-plan-sha256",
+                "0" * 64,
+                "--stage-root",
+                "/srv/fast-local/jess/bulkload/stage",
+                "--destination-ssh-host",
+                "jess@sting",
+                "--prepare-receipt",
+                "/secure/preseed-prepare.json",
+                "--transport-allowlist",
+                "/secure/preseed-allowlist.nul",
+                "--output",
+                "/secure/preseed-push.json",
+            ]
+        )
+        self.assertIsNone(push.plan)
+        self.assertEqual(push.transport_mode, "push")
 
     def test_longest_path_prefix_wins(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -468,6 +495,16 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 )
             )
             self.assertTrue(workspace["recovery_anchors"])
+
+            plan = fixture.plan()
+            git_operation = next(
+                item
+                for item in plan["operations"]
+                if item["kind"] == "git-workspace-union"
+            )
+            self.assertIn("source_ref", git_operation)
+            self.assertNotIn("source", git_operation)
+            self.assertNotIn("destination_before", git_operation)
 
     def test_invalid_git_candidate_falls_back_to_exact_non_git(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -654,6 +691,40 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 if item["relative_path"] == "mystery.bin"
             )
             self.assertEqual(mystery["classification"], "portable-private")
+
+    def test_provider_walk_error_is_a_capture_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "provider"
+            root.mkdir()
+
+            def denied_walk(*_arguments: object, **arguments: object) -> list[object]:
+                callback = arguments["onerror"]
+                assert callable(callback)
+                callback(OSError(13, "denied", os.fspath(root / "unreadable")))
+                return []
+
+            with mock.patch("bulkload_lib.scanner.os.walk", side_effect=denied_walk):
+                _provider, blockers = _capture_provider(
+                    "claude",
+                    root,
+                    role="source",
+                    path_map=canonical_path_map(
+                        [(os.fspath(root.parent), "/destination")]
+                    ),
+                    exclusions=(),
+                    max_files=10,
+                    max_bytes=1024,
+                    max_sqlite_rows=10,
+                )
+            self.assertEqual(
+                blockers,
+                [
+                    {
+                        "code": "unreadable-agent-state",
+                        "path": os.fspath(root / "unreadable"),
+                    }
+                ],
+            )
 
     def test_provider_regenerate_symlinks_are_pruned_before_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -986,6 +1057,50 @@ class SchemaAndCaptureTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_sequential_file_planner_binds_all_four_capture_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = CutoverFixture(root, sqlite_union=False)
+            captures = [
+                fixture.capture("source"),
+                fixture.capture("source"),
+                fixture.capture("destination"),
+                fixture.capture("destination"),
+            ]
+            paths = []
+            for index, capture in enumerate(captures):
+                path = root / f"capture-{index}.json"
+                path.write_bytes(canonical_bytes(capture) + b"\n")
+                paths.append(path)
+            arguments = argparse.Namespace(
+                source_a=str(paths[0]),
+                source_b=str(paths[1]),
+                destination_a=str(paths[2]),
+                destination_b=str(paths[3]),
+            )
+            plan = _agent_plan(arguments)
+            self.assertEqual(
+                set(plan["source"]["capture_ids"] + plan["destination"]["capture_ids"]),
+                {capture["capture_id"] for capture in captures},
+            )
+
+    def test_duplicate_provider_identity_returns_blocked_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            sessions = fixture.source_home / ".codex/sessions"
+            sessions.mkdir(parents=True)
+            collision_id = "01234567-89ab-4cde-8fab-0123456789ab"
+            for name in (f"{collision_id}-a.jsonl", f"copy-{collision_id}.jsonl"):
+                (sessions / name).write_text(
+                    json.dumps({"session_id": name}) + "\n", encoding="utf-8"
+                )
+            plan = fixture.plan()
+            self.assertFalse(plan["ready"])
+            self.assertIn(
+                "agent-identity-collision",
+                {item["code"] for item in plan["blockers"]},
+            )
+
     def test_opaque_non_git_cannot_overwrite_typed_destination_git(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=False)
@@ -1070,7 +1185,9 @@ class PlannerTests(unittest.TestCase):
             operation = next(
                 item for item in plan["operations"] if item["kind"] == "sqlite-union"
             )
-            self.assertIsNotNone(operation["destination_before"])
+            self.assertIsNotNone(
+                materialize_plan_operation(plan, operation)["destination_before"]
+            )
 
     def test_append_divergence_is_source_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1086,7 +1203,9 @@ class PlannerTests(unittest.TestCase):
                 if item["kind"] == "file-install"
                 and item["destination_path"].endswith("history.jsonl")
             )
-            self.assertIsNotNone(operation["destination_before"])
+            self.assertIsNotNone(
+                materialize_plan_operation(plan, operation)["destination_before"]
+            )
 
     def test_claude_rewrite_and_nonportable_auth_hold(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1108,7 +1227,8 @@ class PlannerTests(unittest.TestCase):
                 for item in plan["operations"]
                 if item["kind"] == "file-install"
                 and item["owner"]["name"] == "claude"
-                and item["source"]["kind"] == "regular"
+                and materialize_plan_operation(plan, item)["source"]["kind"]
+                == "regular"
             )
             self.assertEqual(operation["transform"], "path-rewrite")
             self.assertNotIn("CLAUDE-SECRET", canonical_bytes(plan).decode())
@@ -1137,7 +1257,9 @@ class PlannerTests(unittest.TestCase):
                 for item in plan["operations"]
                 if item["kind"] == "git-workspace-union"
             )
-            self.assertIsNotNone(operation["destination_before"])
+            self.assertIsNotNone(
+                materialize_plan_operation(plan, operation)["destination_before"]
+            )
 
     def test_structural_file_directory_collision_blocks_during_planning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1382,18 +1504,30 @@ os.execv(arguments[0], arguments)
             tampered_prepare = copy.deepcopy(prepare)
             tampered_prepare["capacity"]["charged_bytes"] += 1
             with self.assertRaisesRegex(BulkloadError, "receipt_sha256 mismatch"):
-                stage_agent_plan(
-                    preliminary,
+                push_agent_transport(
+                    tampered_prepare,
+                    fixture.stage / ".transport-allowlist-preseed.nul",
                     accepted_plan_sha256=preliminary["plan_sha256"],
                     phase="preseed",
                     stage_root=fixture.stage,
-                    allow_accounted_copy=True,
-                    reserve_bytes=0,
-                    transport_mode="push",
                     destination_ssh_host=socket.gethostname(),
-                    prepare_receipt=tampered_prepare,
                     _ssh_binary=str(fake_ssh),
                 )
+            allowlist_path = fixture.stage / ".transport-allowlist-preseed.nul"
+            allowlist_payload = allowlist_path.read_bytes()
+            allowlist_path.write_bytes(allowlist_payload + b"tampered\0")
+            with self.assertRaisesRegex(BulkloadError, "custody|digest"):
+                push_agent_transport(
+                    prepare,
+                    allowlist_path,
+                    accepted_plan_sha256=preliminary["plan_sha256"],
+                    phase="preseed",
+                    stage_root=fixture.stage,
+                    destination_ssh_host=socket.gethostname(),
+                    _ssh_binary=str(fake_ssh),
+                )
+            allowlist_path.write_bytes(allowlist_payload)
+            allowlist_path.chmod(0o600)
             marker = fixture.root / "transport-failed"
             destination_before = (fixture.destination_repo / "tracked.txt").read_bytes()
             with mock.patch.dict(
@@ -1402,16 +1536,13 @@ os.execv(arguments[0], arguments)
                 clear=False,
             ):
                 with self.assertRaises(BulkloadError) as failure:
-                    stage_agent_plan(
-                        preliminary,
+                    push_agent_transport(
+                        prepare,
+                        fixture.stage / ".transport-allowlist-preseed.nul",
                         accepted_plan_sha256=preliminary["plan_sha256"],
                         phase="preseed",
                         stage_root=fixture.stage,
-                        allow_accounted_copy=True,
-                        reserve_bytes=0,
-                        transport_mode="push",
                         destination_ssh_host=socket.gethostname(),
-                        prepare_receipt=prepare,
                         _ssh_binary=str(fake_ssh),
                     )
             self.assertNotIn("SYNTHETIC-TRANSPORT-SECRET", str(failure.exception))
@@ -1423,19 +1554,35 @@ os.execv(arguments[0], arguments)
             (fixture.source_repo / "tracked.txt").write_text(
                 "late before preseed\n", encoding="utf-8"
             )
-            preseed_transport = stage_agent_plan(
-                preliminary,
-                accepted_plan_sha256=preliminary["plan_sha256"],
-                phase="preseed",
-                stage_root=fixture.stage,
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="push",
-                destination_ssh_host=socket.gethostname(),
-                prepare_receipt=prepare,
-                _ssh_binary=str(fake_ssh),
-            )
+            unplanned = fixture.source_home / "not-in-accepted-plan.txt"
+            unplanned.write_text("must not enter quarantine\n", encoding="utf-8")
+
+            def mutate_after_snapshot(
+                source: object, snapshot: object, **arguments: object
+            ) -> None:
+                _snapshot_allowlist_stream(source, snapshot, **arguments)
+                relative = os.fspath(unplanned).removeprefix("/")
+                allowlist_path.write_bytes(
+                    allowlist_payload + os.fsencode(relative) + b"\0"
+                )
+
+            with mock.patch(
+                "bulkload_lib.executor._snapshot_allowlist_stream",
+                side_effect=mutate_after_snapshot,
+            ):
+                preseed_transport = push_agent_transport(
+                    prepare,
+                    allowlist_path,
+                    accepted_plan_sha256=preliminary["plan_sha256"],
+                    phase="preseed",
+                    stage_root=fixture.stage,
+                    destination_ssh_host=socket.gethostname(),
+                    _ssh_binary=str(fake_ssh),
+                )
             quarantine = fixture.stage / ".transport-quarantine"
+            self.assertFalse(quarantine.joinpath(*unplanned.parts[1:]).exists())
+            allowlist_path.write_bytes(allowlist_payload)
+            allowlist_path.chmod(0o600)
             quarantine.chmod(0o755)
             with self.assertRaisesRegex(BulkloadError, "custody mode"):
                 stage_agent_plan(
@@ -1476,16 +1623,13 @@ os.execv(arguments[0], arguments)
                 reserve_bytes=0,
                 transport_mode="prepare",
             )
-            final_transport = stage_agent_plan(
-                final_plan,
+            final_transport = push_agent_transport(
+                final_prepare,
+                fixture.stage / ".transport-allowlist-final.nul",
                 accepted_plan_sha256=final_plan["plan_sha256"],
                 phase="final",
                 stage_root=fixture.stage,
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="push",
                 destination_ssh_host=socket.gethostname(),
-                prepare_receipt=final_prepare,
                 _ssh_binary=str(fake_ssh),
             )
             final = stage_agent_plan(
@@ -1514,6 +1658,15 @@ os.execv(arguments[0], arguments)
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=False)
             plan = fixture.plan()
+            prepare = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=fixture.stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+            )
             with mock.patch("bulkload_lib.executor.subprocess.run") as invoked:
                 for value in (
                     "/srv/fast-local/jess/bad path",
@@ -1527,38 +1680,24 @@ os.execv(arguments[0], arguments)
                         self.subTest(value=value),
                         self.assertRaisesRegex(BulkloadError, "remote-safe"),
                     ):
-                        stage_agent_plan(
-                            plan,
+                        push_agent_transport(
+                            prepare,
+                            fixture.stage / ".transport-allowlist-preseed.nul",
                             accepted_plan_sha256=plan["plan_sha256"],
                             phase="preseed",
                             stage_root=Path(value),
-                            allow_accounted_copy=True,
-                            reserve_bytes=0,
-                            transport_mode="push",
                             destination_ssh_host="untrusted",
                         )
                 invoked.assert_not_called()
-            prepare = stage_agent_plan(
-                plan,
-                accepted_plan_sha256=plan["plan_sha256"],
-                phase="preseed",
-                stage_root=fixture.stage,
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="prepare",
-            )
             with mock.patch("bulkload_lib.executor.subprocess.run") as invoked:
                 with self.assertRaisesRegex(BulkloadError, "shell-safe"):
-                    stage_agent_plan(
-                        plan,
+                    push_agent_transport(
+                        prepare,
+                        fixture.stage / ".transport-allowlist-preseed.nul",
                         accepted_plan_sha256=plan["plan_sha256"],
                         phase="preseed",
                         stage_root=fixture.stage,
-                        allow_accounted_copy=True,
-                        reserve_bytes=0,
-                        transport_mode="push",
                         destination_ssh_host=socket.gethostname(),
-                        prepare_receipt=prepare,
                         _ssh_binary="/tmp/ssh`touch`",
                     )
                 invoked.assert_not_called()
