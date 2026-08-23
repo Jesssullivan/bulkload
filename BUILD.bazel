@@ -10,25 +10,7 @@ py_library(
         ".agents/skills/bulkload/scripts/bulkload_lib/executor.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/model.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/planner.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_apply.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_quiescence.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_runtime.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_action_plan.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_close.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_plan.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_protocol.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_request.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_sqlite_verifier.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/private_state.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/scanner.py",
-        ".agents/skills/bulkload/scripts/bulkload_lib/sessions.py",
-    ],
-    data = [
-        ".agents/skills/bulkload/references/codex-private-state-policy.v4.json",
-        ".agents/skills/bulkload/references/codex-private-state-policy.v5.json",
-        ".agents/skills/bulkload/references/codex-private-state-policy.v6.json",
-        ".agents/skills/bulkload/references/codex-private-state-policy.v7.json",
-        ".agents/skills/bulkload/scripts/bulkload.py",
     ],
     imports = [".agents/skills/bulkload/scripts"],
     visibility = ["//visibility:public"],
@@ -49,11 +31,8 @@ py_test(
     name = "bulkload_tests",
     legacy_create_init = 0,
     main = "tests/test_bulkload.py",
-    size = "medium",
-    srcs = [
-        "tests/test_bulkload.py",
-        "tests/unprivileged_test_main.py",
-    ],
+    size = "large",
+    srcs = ["tests/test_bulkload.py"],
     deps = [":bulkload_lib"],
 )
 
@@ -64,154 +43,6 @@ py_test(
     size = "small",
     srcs = ["tests/test_bazel_binary_smoke.py"],
     data = [":bulkload"],
-)
-
-py_test(
-    name = "private_state_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_state.py",
-    size = "medium",
-    srcs = ["tests/test_private_state.py"],
-    deps = [":bulkload_lib"],
-)
-
-py_test(
-    name = "private_apply_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_apply.py",
-    size = "medium",
-    srcs = [
-        "tests/test_private_apply.py",
-        "tests/unprivileged_test_main.py",
-    ],
-    deps = [":bulkload_lib"],
-)
-
-py_test(
-    name = "private_quiescence_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_quiescence.py",
-    size = "small",
-    srcs = ["tests/test_private_quiescence.py"],
-    deps = [":bulkload_lib"],
-)
-
-py_test(
-    name = "private_runtime_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_runtime.py",
-    size = "small",
-    srcs = ["tests/test_private_runtime.py"],
-    data = [
-        ".agents/skills/bulkload/references/codex-private-runtime-inventory.v6.json",
-    ],
-    deps = [":bulkload_lib"],
-)
-
-py_test(
-    name = "private_sqlite_plan_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_plan.py",
-    size = "large",
-    srcs = ["tests/test_private_sqlite_plan.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_legacy_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_close_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_close.py",
-    size = "medium",
-    srcs = ["tests/test_private_sqlite_close.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_legacy_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_action_plan_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_action_plan.py",
-    size = "large",
-    srcs = ["tests/test_private_sqlite_action_plan.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_legacy_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_expected_output_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_expected_output.py",
-    size = "small",
-    srcs = ["tests/test_private_sqlite_expected_output.py"],
-    deps = [":bulkload_lib"],
-)
-
-py_library(
-    name = "private_sqlite_legacy_test_fixtures",
-    testonly = True,
-    srcs = ["tests/private_sqlite_legacy_fixtures.py"],
-    deps = [":bulkload_lib"],
-)
-
-py_library(
-    name = "private_sqlite_v7_test_fixtures",
-    testonly = True,
-    srcs = ["tests/private_sqlite_v7_fixtures.py"],
-    deps = [":bulkload_lib"],
-)
-
-py_library(
-    name = "private_sqlite_public_oracle_test_fixtures",
-    testonly = True,
-    srcs = ["tests/private_sqlite_public_oracle_fixtures.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_legacy_test_fixtures",
-        ":private_sqlite_v7_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_protocol_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_protocol.py",
-    size = "small",
-    srcs = ["tests/test_private_sqlite_protocol.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_v7_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_verifier_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_verifier.py",
-    size = "large",
-    srcs = ["tests/test_private_sqlite_verifier.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_v7_test_fixtures",
-    ],
-)
-
-py_test(
-    name = "private_sqlite_public_oracle_tests",
-    legacy_create_init = 0,
-    main = "tests/test_private_sqlite_public_oracle.py",
-    size = "large",
-    srcs = ["tests/test_private_sqlite_public_oracle.py"],
-    deps = [
-        ":bulkload_lib",
-        ":private_sqlite_public_oracle_test_fixtures",
-    ],
 )
 
 py_test(
@@ -239,11 +70,7 @@ py_test(
     main = "scripts/validate_skill.py",
     size = "small",
     srcs = ["scripts/validate_skill.py"],
-    args = [
-        "--allow-runfiles-symlinks",
-        "--self-test",
-        ".agents/skills/bulkload",
-    ],
+    args = ["--allow-runfiles-symlinks", "--self-test", ".agents/skills/bulkload"],
     data = [":skill_bundle"],
 )
 
@@ -297,17 +124,6 @@ test_suite(
         ":bulkload_tests",
         ":ci_contract_test",
         ":installer_test",
-        ":private_apply_tests",
-        ":private_quiescence_tests",
-        ":private_runtime_tests",
-        ":private_sqlite_action_plan_tests",
-        ":private_sqlite_close_tests",
-        ":private_sqlite_expected_output_tests",
-        ":private_sqlite_plan_tests",
-        ":private_sqlite_protocol_tests",
-        ":private_sqlite_public_oracle_tests",
-        ":private_sqlite_verifier_tests",
-        ":private_state_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",
         ":skill_contract_test",

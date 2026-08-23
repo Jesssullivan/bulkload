@@ -1,493 +1,247 @@
 ---
 name: bulkload
-description: Inventory, plan, transfer, and independently verify a one-way migration of one Git repository, its dirty or untracked working state, a collision-gated append-only Codex session union, selected agent transcripts, typed private Codex capture, or a narrow attended Codex auth install, or a fleet under ~/git. Use for dev-box moves, crash recovery, worktree parity audits, Neo-to-Sting-style migrations, rsync replacement planning, or any request to preserve Git and agent context across machines. Keep generic secret copying, raw live database copying, SQLite composition/installation, generated caches, terminal multiplexers, deployment, activation, and bidirectional synchronization out of scope.
+description: Capture, plan, stage, apply, verify, roll back, and recover a typed one-way Git and agent-state cutover with AgentCaptureV4 and GitWorkspaceV2.
 ---
 
 # Bulkload
 
-Runtime requirement: Python 3.11 or newer linked with SQLite 3.37.0 or newer,
-Git, and a Unix-like host with file locking, `pread`, and dirfd support. Codex evidence
-publication requires macOS or Linux for an OS-backed atomic no-replace rename. Turn an ad hoc copy into a typed,
-digest-bound migration with a fresh proof at every boundary.
+Use Bulkload for a reviewed machine cutover that must retain a `~/git` fleet,
+linked worktrees, exact index/dirt state, non-Git fleet content, Codex, Claude,
+Pi, or declared mutable-seat state. The supported runtime is Python 3.11 or
+newer, Git, SQLite, and a filesystem with verified reflinks for live rollback.
 
-## Establish the boundary
+Read [the migration contract](references/migration-contract.md) and
+[agent-state guide](references/agent-context.md) before creating a plan.
 
-1. Read the source and destination repository `AGENTS.md` files.
-2. Identify the protected owner checkout and declare it read-only.
-3. Separate these state classes before running anything:
-   - Git refs and objects;
-   - linked-worktree topology;
-   - modified, staged, conflicted, deleted, and untracked working bytes;
-   - agent transcripts and durable memory;
-   - generated indexes and caches;
-   - provider-owned SQLite families; and
-   - authentication or credentials.
-4. Keep credentials and databases outside the generic repository adapter.
-   Codex `auth.json` and provider-owned SQLite families are copy-eligible only through an explicit typed opt-in plan.
-   Policy v7 retains attended atomic auth replacement and freezes v6 request/capacity artifacts as validator-only evidence.
-   Its internal read-only SQLite oracle has no CLI and cannot claim sealing, full recomputation, final verification,
-   composition, publication, installation, or apply.
-   Destination SQLite remains exact during auth. Never log credential values.
-   Any live SQLite WAL, SHM, or rollback journal hard-stops immutable capture.
-5. Never invoke `cmux` or another terminal multiplexer. Never clean, prune,
-   rebase, delete, switch Home Manager, deploy, reconcile, or activate as part
-   of this workflow.
+## Keep the boundary explicit
 
-Read the [migration contract](references/migration-contract.md) and [agent-context guide](references/agent-context.md).
-Before classifying Codex state, read policy [v7](references/codex-private-state-policy.v7.json); retain
-[v6](references/codex-private-state-policy.v6.json), its [full runtime inventory](references/codex-private-runtime-inventory.v6.json),
-[v5](references/codex-private-state-policy.v5.json), and [v4](references/codex-private-state-policy.v4.json) only as exact
-legacy producer authority. Use the [auth runbook](references/codex-private-auth-install.md), [v4 opening contract](references/codex-private-sqlite-compose-plan.md),
-[v5 close/action contract](references/codex-private-sqlite-compose-action-plan.md), [v6 request/capacity contract](references/codex-private-sqlite-compose-request.md),
-and [v7 offline-composer boundary](references/codex-private-sqlite-offline-composer.md).
+1. Quiesce writers for each A/B capture pair. Resume them during preliminary
+   preseed; quiesce again for fresh final A/B captures through verification.
+2. Declare the source and destination home/Git maps. The longest source prefix
+   wins, so map `/Users/jess/git` explicitly to
+   `/srv/fast-local/jess/git` in addition to any broader home map.
+3. Declare every directory seat and regular-file singleton. A whole-home seat
+   is invalid; an absent optional file is captured as such.
+4. Keep evidence, stage, journal, and rollback roots outside every live root.
+5. Never put credential values, SQLite rows, raw symlink targets, or
+   unsanitized remote URLs in output or chat.
+6. Never invoke a terminal multiplexer, TCFS runtime, Home Manager, deploy,
+   activation, browser migration, or credential rotation from this workflow.
 
-## Capture two stable source passes
+`AgentCaptureV4` knows Codex, Claude, Pi, and mutable-seat state. Ordinary
+descendants of a declared provider root default to byte-exact portable-private
+state. Exact managed exclusions and regenerate trees are pruned first; unsafe
+special entries, typed-state ambiguity, and structural collisions block. Codex
+and Pi auth are typed source-authority operations. Claude
+auth is nonportable: preserve it as a hold and authenticate on the destination
+attended. Offline receipts do not prove provider acceptance.
 
-Run from the installed skill directory or use the Bazel-built `bulkload`
-binary:
+## Capture twice per role
+
+Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both
+enter Python with `-I -S` and pin the complete application-source closure
+before importing the CLI.
 
 ```bash
-scripts/bulkload.py capture \
-  --mode repo \
-  --root /absolute/source/repo \
+scripts/bulkload.py agent-capture \
+  --role source \
+  --home /Users/jess \
+  --git-root /Users/jess/git \
+  --rsync-path /absolute/pinned/gnu-rsync \
+  --path-map /Users/jess=/home/jess \
+  --path-map /Users/jess/git=/srv/fast-local/jess/git \
+  --acknowledge-writers-quiesced \
   --output /secure/evidence/source-a.json
-
-scripts/bulkload.py capture \
-  --mode repo \
-  --root /absolute/source/repo \
-  --output /secure/evidence/source-b.json
 ```
 
-Use `--mode fleet --root /absolute/path/to/git` for all discovered repositories
-under one root. Do not use `--include-ignored` unless the operator explicitly
-needs an inventory of generated state; ignored paths never become copy actions.
+Repeat into `source-b.json` with no intervening writer. On the destination,
+use `--role destination`, the live destination `--home` and `--git-root`, and
+the same source-to-destination path maps. Repeat into two destination files.
+Use exact provider-specific maps for `.codex`, `.claude`, and `.gstack` backing
+paths in addition to the home/Git maps. Root translation uses the logical path;
+reads/writes use the nofollow-proven physical backing, so Home Manager links are
+never replaced. Obtain `--rsync-path` from the pinned flake shell; capture binds
+its absolute path, hash, protocol, and features. Add identical reviewed
+`--managed-exclusion PROVIDER:RELATIVE` values on both roles. Add directory
+state with `--seat NAME=/absolute/path` and singleton history with
+`--file-seat NAME=/absolute/file`.
 
-Pause writers before capture when possible. A complete scan can still race a
-writer, so pass A and pass B must have the same `catalog_sha256`. Treat any
-scan error or budget exceedance as incomplete.
+Before `agent-plan`, Neo pulls destination A/B into the owner-private evidence
+paths above through its outbound strict-SSH connection. Use the exact source
+rsync binding from source capture and the immutable Nix-store rsync path passed
+to destination capture. Sting never opens a connection or holds a Neo
+credential; the accepted four-capture plan subsequently binds both tools.
 
-Keep capture, plan, and verification evidence outside every local source and
-destination root. The repository adapter rejects resolved overlaps and input
-aliases before mutation; that pathname guard does not replace private,
-quiescent evidence custody. The Codex adapter additionally pins bounded input
-descriptors through a create-only atomic publish in its private output
-directory. It verifies the exact temporary payload and single-link custody,
-uses an OS no-replace rename, revalidates every input and the requested
-directory/target immediately after publication, and never overwrites an
-existing target. When emitting `-` over SSH, redirect only to a controller-side
-path outside the controller's captured roots.
+Capture records hashes and typed metadata only. SQLite capture uses the backup
+API and includes committed WAL state. Any changing database family, malformed
+JSONL, unsafe schema, special entry, active Git operation, corrupt object,
+unsafe special entry, unsupported typed state, or budget overrun makes capture
+incomplete. Unknown-named files inside a declared provider root are known
+portable-private bytes; only explicitly typed Claude path-bearing text rewrites.
 
-## Capture the destination
-
-Install the same reviewed skill revision on the destination and capture there.
-For SSH, redirect canonical JSON back to the controller rather than reading
-credential files or copying the whole agent home:
-
-```bash
-umask 077
-destination_tmp="$(mktemp /secure/evidence/.destination.XXXXXX)"
-trap 'rm -f "$destination_tmp"' EXIT
-ssh destination-host \
-  '~/.agents/skills/bulkload/scripts/bulkload.py capture --mode repo --root /absolute/destination/repo --output -' \
-  > "$destination_tmp"
-mv -f "$destination_tmp" /secure/evidence/destination.json
-trap - EXIT
-```
-
-Keep the shell path literal and operator-reviewed. Do not interpolate an
-untrusted hostname or path.
-
-## Catalog a Codex session union
-
-Read [references/agent-context.md](references/agent-context.md), quiesce both
-Codex writers, and capture two distinct observations of each role:
+## Compile and review
 
 ```bash
-scripts/bulkload.py codex-capture \
-  --root /absolute/source/.codex/sessions \
-  --role source \
-  --host-authority-id 11111111-1111-4111-8111-111111111111 \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-source-a.json
-scripts/bulkload.py codex-capture \
-  --root /absolute/source/.codex/sessions \
-  --role source \
-  --host-authority-id 11111111-1111-4111-8111-111111111111 \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-source-b.json
-scripts/bulkload.py codex-capture \
-  --root /absolute/destination/.codex/sessions \
-  --role destination \
-  --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-destination-a.json
-scripts/bulkload.py codex-capture \
-  --root /absolute/destination/.codex/sessions \
-  --role destination \
-  --host-authority-id 22222222-2222-4222-8222-222222222222 \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-destination-b.json
-scripts/bulkload.py codex-plan \
-  --source-a /secure/evidence/codex-source-a.json \
-  --source-b /secure/evidence/codex-source-b.json \
-  --destination-a /secure/evidence/codex-destination-a.json \
-  --destination-b /secure/evidence/codex-destination-b.json \
-  --output /secure/evidence/codex-union-plan.json
-```
-
-If that first plan reports `same-uuid-prefix-proof-required`, compile the
-immutable request, then capture two more quiescent passes for every role named
-as `longer_role` in the request:
-
-```bash
-scripts/bulkload.py codex-prefix-request \
-  --source-a /secure/evidence/codex-source-a.json \
-  --source-b /secure/evidence/codex-source-b.json \
-  --destination-a /secure/evidence/codex-destination-a.json \
-  --destination-b /secure/evidence/codex-destination-b.json \
-  --output /secure/evidence/codex-prefix-request.json
-
-scripts/bulkload.py codex-prefix-proof \
-  --prefix-request /secure/evidence/codex-prefix-request.json \
-  --source-a /secure/evidence/codex-source-a.json \
-  --source-b /secure/evidence/codex-source-b.json \
-  --destination-a /secure/evidence/codex-destination-a.json \
-  --destination-b /secure/evidence/codex-destination-b.json \
-  --root /absolute/source/.codex/sessions \
-  --role source \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-source-prefix-a.json
-```
-
-Repeat the proof command into a distinct `source-prefix-b.json`. If the request
-also names destination-longer observations, repeat both passes with the
-destination root, `--role destination`, and distinct destination outputs.
-Never manufacture a proof for a role absent from the request.
-
-Keep both writers quiesced. After every required proof pass has completed,
-compile one immutable close request that binds the exact request, opening
-custody, proof capture IDs, and proof body digests:
-
-```bash
-scripts/bulkload.py codex-close-request \
-  --prefix-request /secure/evidence/codex-prefix-request.json \
-  --source-a /secure/evidence/codex-source-a.json \
-  --source-b /secure/evidence/codex-source-b.json \
-  --destination-a /secure/evidence/codex-destination-a.json \
-  --destination-b /secure/evidence/codex-destination-b.json \
-  --source-prefix-a /secure/evidence/codex-source-prefix-a.json \
-  --source-prefix-b /secure/evidence/codex-source-prefix-b.json \
-  --output /secure/evidence/codex-close-request.json
-
-scripts/bulkload.py codex-close-capture \
-  --close-request /secure/evidence/codex-close-request.json \
-  --root /absolute/source/.codex/sessions \
-  --role source \
-  --acknowledge-writers-quiesced \
-  --output /secure/evidence/codex-source-close-a.json
-```
-
-Add the two `--destination-prefix-*` arguments when the prefix request names
-destination-longer observations. Repeat `codex-close-capture` for source B and
-destination A/B with distinct outputs and the same close request. Closing A/B
-is required for both roles even when only one role had longer files. Each
-command captures the live root and emits a v1 wrapper around an unchanged v2
-snapshot; it does not accept a pre-existing snapshot to wrap. Then compile the
-final plan:
-
-```bash
-scripts/bulkload.py codex-plan \
-  --source-a /secure/evidence/codex-source-a.json \
-  --source-b /secure/evidence/codex-source-b.json \
-  --destination-a /secure/evidence/codex-destination-a.json \
-  --destination-b /secure/evidence/codex-destination-b.json \
-  --prefix-request /secure/evidence/codex-prefix-request.json \
-  --source-prefix-a /secure/evidence/codex-source-prefix-a.json \
-  --source-prefix-b /secure/evidence/codex-source-prefix-b.json \
-  --close-request /secure/evidence/codex-close-request.json \
-  --source-close-a /secure/evidence/codex-source-close-a.json \
-  --source-close-b /secure/evidence/codex-source-close-b.json \
-  --destination-close-a /secure/evidence/codex-destination-close-a.json \
-  --destination-close-b /secure/evidence/codex-destination-close-b.json \
-  --output /secure/evidence/codex-union-plan-v3.json
-```
-
-Add the two `--destination-prefix-*` arguments when the request names
-destination-longer observations. The final plan rejects missing, reused,
-pre-proof, wrong-request, or drifting closing evidence.
-
-Assign one non-secret canonical host-authority UUID to each filesystem
-namespace for this operation. Reuse it for every capture that can address the
-same physical namespace, including shared storage or a renamed host; use a
-different ID for an independent host-local namespace.
-
-Source capture accepts only current-user, single-link regular rollout JSONL
-files that are owner-readable and not writable by group/other. Destination
-capture additionally requires every file to be exactly `0600` and every
-directory to be exactly `0700`. Strict JSON parsing rejects duplicate keys and
-non-finite values; the first and only `session_meta` must carry the canonical
-UUID bound by the filename. Capture reserves every candidate file and its full
-stable size before parsing, bounds entries, directories, records, paths,
-errors, catalogs, and output, then revalidates the resolved root, root lineage,
-and every scanned directory.
-
-Planning requires four unique capture IDs, exact A/B catalog bodies for both
-roles, explicit quiescence, and distinct source/destination custody. Within one
-host authority it rejects equal, ancestor, descendant, symlinked, or bind-aliased
-roots from recorded filesystem lineage. It proposes destination-absent UUIDs
-and proof-bound source-superset promotions, preserves destination-only and
-proved destination-superset sessions, and blocks unproved or true same-UUID
-divergence plus portable file/file, file/directory, and ancestor-prefix
-namespace collisions. Prefix planning also requires a post-proof close request
-that binds every required proof digest, followed by fresh wrapped closing A/B
-catalogs for both roots that bind that request and match every opening catalog
-and custody claim. The plan binds each opening, prefix proof, close request,
-and close artifact by distinct capture ID or body digest as appropriate. Any
-blocker suppresses the complete copy candidate list.
-Codex evidence inputs must be owner-only, single-link regular files; the CLI
-pins them through a create-only atomic publish in an owner-private output
-directory. It verifies exact temporary bytes and single-link custody, uses an
-OS no-replace rename, revalidates every input and the requested
-directory/target immediately after publication, and refuses an existing
-target. It never pathname-deletes on a failure: a nonzero result may leave an
-owner-private staging or fail-held final artifact for attended quarantine. It
-is a dry-run report: the protocol intentionally has no Codex-session apply
-command. Any future attended copier must recheck the exact source and
-`destination_before` hashes and sizes immediately before replacement. Never
-run it against active writers or treat path/size equality as content proof.
-
-## Handle private Codex auth
-
-Follow
-[references/codex-private-auth-install.md](references/codex-private-auth-install.md)
-exactly. Prefer source auth-only and destination auth-plus-SQLite captures.
-Full/full inputs are accepted, but source SQLite is never consumed. Every
-destination family is preserved exact with zero mutations, while
-`sqlite_union_ready=false`.
-
-Create and digest-accept a fresh, purpose-bound quiescence attestation for each
-capture or operation. It is an operator procedural fence with
-`provider_writer_proof=false`; the advisory `flock` coordinates only
-cooperating Bulkload processes. Any SQLite WAL, SHM, or rollback journal blocks
-immutable capture.
-
-Execute `scripts/bulkload.py` directly, or use the Bazel-built binary. Both
-supported launchers enter Python with `-I -S` before Python startup hooks. The
-private entrypoint then pins policy v7 and the complete Bulkload
-application-source closure before importing the command implementation;
-it does not claim to bind the Python interpreter or standard-library closure.
-Compatibility/install plans bind that application authority. Review and
-accept both plan digests before attended auth apply. Offline receipts do not prove
-provider authentication, so require a fresh attended provider turn. Never infer SQLite authority, compose/install
-SQLite, or use a combined apply. The immutable v4/v5 chain binds private and session A/B evidence, an exact
-registry/path map, fresh cross-plane closes, and a descriptive action plan. V6 request/capacity bodies remain accepted
-only under their exact frozen producer closure; their active commands are retired. V7 adds only an internal read-only
-oracle over separately hand-built or already present offline bundles. Its in-memory diagnostic keeps every final/public
-claim false. Writer, final-receipt, publisher, installer, and live-cutover integration remain later slices.
-
-## Compile and review the plan
-
-```bash
-scripts/bulkload.py plan \
+scripts/bulkload.py agent-plan \
   --source-a /secure/evidence/source-a.json \
   --source-b /secure/evidence/source-b.json \
-  --destination /secure/evidence/destination.json \
+  --destination-a /secure/evidence/destination-a.json \
+  --destination-b /secure/evidence/destination-b.json \
   --output /secure/evidence/plan.json
 ```
 
-Planning refuses a moving source. It records blockers for divergent Git heads,
-missing or different source local refs, missing explicit destination anchors for
-reflog/pseudo-ref recovery roots, missing repositories, staged/index state,
-conflicts, active Git operations, deletions, sensitive paths, symlink mutations, submodules,
-effective LFS or other content filters, legacy grafts, unportable Git attribute
-authorities, shallow or partial/promisor history, alternates, and
-destination-only dirt.
+Planning requires exact A/B catalog equality for each role and four unique
+capture IDs. Review:
 
-The plan carries canonical status and non-remote-ref bodies for both sides.
-Validation recomputes their digests and reasserts ready-plan branch, HEAD, ref,
-and dirt relationships; apply repeats those relationships from live captures.
+- `ready` and every blocker;
+- known `holds`, especially Claude auth;
+- every Git ref/recovery action and worktree target;
+- every source-authority auth or mutable-seat operation;
+- every append/SQLite union;
+- the capacity formula; and
+- the exact `plan_sha256`.
 
-Capture derives raw working status from HEAD, index stages, direct no-follow
-hashing, and untracked enumeration. It never runs `git status` or a Git diff
-command, so repository-configured clean/process filters are not executed. It
-classifies a tracked regular file whose full permission mode differs from the
-canonical index projection (`0644` or `0755`) as mode dirt; apply and verify bind
-the exact four-octal source mode. It catalogs every name under `refs/`, disables
-replacement-object semantics for tree identity, blocks legacy graft authority,
-and walks the object closure from
-HEAD, every non-remote ref, and every recovery-only local reflog or known
-pseudo-ref root with lazy fetching disabled. A missing reachable commit, tag,
-tree, or blob makes capture incomplete. Recovery acquisition is bounded; a
-reflog, authority-byte, or candidate-root budget excess makes capture
-incomplete. Active rebase, apply-mailbox, sequencer, bisect, merge,
-cherry-pick, and revert markers are inspected without following them, recorded
-as typed state, and make v1 capture incomplete. Shallow repositories are
-also incomplete in v1 because their declared boundary can legitimize missing
-ancestry. Effective partial/promisor configuration from repository, worktree,
-included, global, or system scope is rejected before object reads so capture
-cannot lazily fetch or mutate a repository. A read-only full Git fsck also
-rejects corrupt stored objects. Apply fences the canonical
-non-remote-ref digest; `refs/remotes/` remains repeated-catalog evidence rather
-than cross-host parity authority. Supported URL and scp-style remote locators
-are credential-sanitized, local paths are digest-redacted, and helper, unknown,
-or malformed locator forms make capture incomplete without recording the raw
-value. Symlink payloads are hashed, never serialized verbatim. Fleet discovery
-also fails closed on bare repositories and symlink or special-file `.git`
-authority instead of silently omitting or following it.
+Source bytes, Git dirt/deletions, non-Git files, portable state, and divergent
+append state overwrite with exact `destination_before` rollback custody.
+Compatible SQLite rows union; schema/shared-row/key ambiguity uses a reversible
+source snapshot. Destination ref divergence is retained at a deterministic
+`refs/bulkload/recovery/destination/*` ref before update. Destination-only
+union members remain.
 
-Review the exact plan body and repeat its `plan_sha256` only after every
-operation and blocker is understood. Never edit the plan by hand; recapture
-and regenerate it.
+## Preseed without touching live state
 
-The built-in sensitive-path classifier is defense in depth, not a proof that
-an innocuously named file contains no credential. Inspect every operation at
-the source and run the operator-approved redacted secret scanner when
-available. Any suspected credential or decrypted secret blocks acceptance.
+The stage protocol is destination `prepare`, source `push`, destination
+`materialize`. Install the same closure on both hosts. Relay the accepted plan
+Neo-to-Sting with the source and destination GNU rsync paths and hashes bound in
+that plan; rehash the source executable before relay, require the destination's
+immutable Nix-store path, and let destination `prepare` rehash it locally. Use
+`--checksum --delay-updates`, strict SSH, and exact owner-private paths. Every
+connection originates on Neo: Neo may pull destination A/B captures and the
+prepare receipt over that connection, but Sting never authenticates to Neo.
 
-## Reconcile Git semantically
-
-Use fetch/push or a verified Git bundle for commits and refs. Reconcile every
-source non-remote ref, including stash, notes, replace, and custom namespaces;
-each must retain the same object, symbolic target, and reachable object closure.
-For each source recovery-only reflog or pseudo-ref OID, create a reviewed
-temporary destination retention ref at that exact OID before recapture. V1 does
-not serialize every reachable destination object, so ancestry without an exact
-anchor remains a conservative blocker.
-Destination-only local refs are reported and preserved, except extra replacement
-refs, which block. Recreate a clean worktree from the exact reviewed ref. Never
-copy `.git`, `.git/worktrees`, or a linked-worktree `.git` pointer between
-hosts. Worktree basename equality is not identity, and sibling-worktree dirt
-requires a separate capture of each worktree.
-
-After Git reconciliation, repeat both source captures and the destination
-capture. Only then compile the working-byte plan.
-
-For an attended live-remote proof, prefer the provider API with a literal,
-operator-reviewed repository and ref. For a non-provider Git remote, run
-`git ls-remote` outside any repository with system/global Git configuration
-disabled, a literal reviewed URL, and a literal refspec:
+On Sting:
 
 ```bash
-scratch="$(mktemp -d)"
-env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-  GIT_TERMINAL_PROMPT=0 \
-  git -C "$scratch" ls-remote --exit-code LITERAL_URL LITERAL_REFSPEC
-rmdir "$scratch"
+scripts/bulkload.py agent-stage --phase preseed --transport-mode prepare \
+  --plan /home/jess/.bulkload-evidence/preliminary-plan.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --stage-root /srv/fast-local/jess/bulkload/stage \
+  --output /home/jess/.bulkload-evidence/preseed-prepare.json
 ```
 
-Do not evaluate a repository-derived URL or SSH command, put credentials in the
-URL, or record credential-helper output. If private authentication needs local
-Git configuration, use an attended provider API instead of weakening this
-isolation. A
-worktree-topology finding is expected across hosts because Git records absolute
-host-local paths; compare typed branch, HEAD, lock, and reconstructability facts
-instead of raw list equality.
-
-## Apply safe working bytes
-
-Prefer local application when source and destination roots are both visible:
+On Neo, after pulling that exact receipt:
 
 ```bash
-scripts/bulkload.py apply \
-  --plan /secure/evidence/plan.json \
-  --accept-plan FULL_PLAN_SHA256 \
-  --source-root /absolute/source/root \
-  --destination-root /absolute/destination/root \
-  --state-root /separate/private/bulkload-state \
-  --receipt /secure/evidence/apply-receipt.json
+scripts/bulkload.py agent-stage --phase preseed --transport-mode push \
+  --plan /secure/evidence/preliminary-plan.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --stage-root /srv/fast-local/jess/bulkload/stage \
+  --destination-ssh-host jess@sting \
+  --prepare-receipt /secure/evidence/preseed-prepare.json \
+  --output /secure/evidence/preseed-push.json
 ```
 
-The source, destination, and state roots must be pairwise disjoint, and the
-receipt must be outside both repositories. Application binds those roots to
-the plan's Git and file preconditions, backs up replacements, journals each
-step, re-hashes the source, performs same-directory temporary-file replacement,
-and durably creates each new ancestor before fsyncing files and directory
-entries. The journal name is durable before destination mutation. Replaying the
-same accepted plan verifies completed operations and resumes pending ones. Use
-one private state root as the journal and backup authority for a destination.
-Apply takes
-advisory locks on the destination repository directories and refuses to run as
-root; non-cooperating writers must still be paused.
-
-For an attended cross-host transfer, first reconstruct the exact Git source at
-an isolated destination-side staging root. Export only a ready plan's
-NUL-delimited expected-source allowlist into that disposable staging root. It
-contains every eligible dirty source file, including one that already matches
-the live destination and therefore needs no operation there. Never point this
-transport at the live destination and never add a delete option:
+Back on Sting:
 
 ```bash
-bash -c '
-set -euo pipefail
-umask 077
-allowlist=$(mktemp /secure/evidence/.bulkload-files.XXXXXX)
-cleanup() { rm -f -- "$allowlist"; }
-trap cleanup EXIT
-scripts/bulkload.py files --null \
-  --plan /secure/evidence/plan.json \
-  --accept-plan FULL_PLAN_SHA256 >"$allowlist"
-rsync -a --from0 --files-from="$allowlist" --checksum --delay-updates \
-  --no-devices --no-specials \
-  /absolute/source/root/ destination-host:/absolute/private/staging-source/
-'
+scripts/bulkload.py agent-stage --phase preseed --transport-mode materialize \
+  --plan /home/jess/.bulkload-evidence/preliminary-plan.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --stage-root /srv/fast-local/jess/bulkload/stage \
+  --prepare-receipt /srv/fast-local/jess/bulkload/stage/.prepare-receipt-preseed.json \
+  --transport-receipt /srv/fast-local/jess/bulkload/stage/.transport-receipt-preseed.json \
+  --allow-accounted-copy \
+  --output /home/jess/.bulkload-evidence/preseed-stage.json
 ```
 
-The transfer may race or contain unreviewed bytes, so staging is quarantine,
-not proof. On the destination host, run the normal digest-accepted `apply` with
-that reconstructed staging repository as `--source-root`; its Git and content
-preconditions rebind every byte before the live destination changes. If either
-side lacks the needed rsync features, stop and use a separately reviewed
-staging transport.
+`prepare` creates the absent owner-private stage/quarantine and gates capacity.
+Push accepts only the plan's NUL allowlist through compatible captured GNU
+rsync; materialize revalidates its chained receipts and every byte. Changed-late
+preliminary entries defer rather than gain apply authority. A failed reflink is
+a hard stop. `--allow-accounted-copy` covers only charged incoming/transformed
+bytes, never a hidden full rollback copy.
 
-## Verify independently
+The capacity contract is:
 
-Capture the destination again after application, then verify:
+```text
+available >= incoming_unique + sqlite_compose + exact_overwritten + reserve
+```
+
+Do not place the stage on a non-reflink filesystem. For Sting use the reviewed
+XFS authority beneath `/srv/fast-local`.
+
+## Seal the final stage
+
+Quiesce again, take fresh source/destination A/B captures, compile and accept a
+fresh plan, then repeat all three modes with `--phase final`. Final may reuse
+verified preseed content objects across a different plan digest, but restages
+every final-plan operation and binds only that fresh plan. It rechecks source
+bytes and destination SQLite and writes no live path. Only the materialized
+final receipt has `ready_for_apply=true`. Compatible SQLite rows union; unsafe
+schema/shared-key cases stage the source snapshot. Every result passes integrity,
+foreign-key, and fresh logical-catalog checks.
+
+## Apply
 
 ```bash
-scripts/bulkload.py verify \
-  --plan /secure/evidence/plan.json \
-  --accept-plan FULL_PLAN_SHA256 \
-  --destination /secure/evidence/destination-after.json \
-  --output /secure/evidence/verification.json
+scripts/bulkload.py agent-apply \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --journal /home/jess/.bulkload-evidence/apply-journal.json \
+  --rollback-root /srv/fast-local/jess/bulkload/rollback \
+  --output /home/jess/.bulkload-evidence/apply-receipt.json
 ```
 
-Require `verified: true`, zero failures, exact branch/HEAD/status evidence, an unchanged destination non-remote ref
-catalog, exact capture mode, and expected file identities. Reusing the pre-plan destination snapshot fails, including
-for a no-op plan. A newly active alternate, graft, submodule, content filter, LFS attribute, or external attribute
-authority also fails. Retain all captures, plan, application and verification receipts, exclusions, tool revision, and
-operator decision together. `verified: true` proves only the accepted content plan—not a live remote head, upstream
-agreement, commit signature, or historical session continuity. Collect those proofs separately before claiming
-`EXACT_ACTIVE_LANE` or `SESSION_NATIVE`.
+Apply first revalidates destination preconditions. Before its first live
+mutation it snapshots every exact overwritten entry with a required reflink,
+records absent targets and transaction-created parents, seals rollback, and
+persists the journal.
+File changes use a same-directory reflink temporary, rename, file fsync, and
+directory fsync. Git objects are additive; refs and worktree topology use Git.
+Every mutation advances the durable journal.
 
-## Report accurately
+Re-running a completed apply returns the exact stored receipt. Do not edit a
+plan, stage manifest, journal, or receipt by hand.
 
-Use these claim classes:
+## Verify
 
-- `EXACT_ACTIVE_LANE`: branch, HEAD, upstream, status, and required bytes match.
-- `PROTECTED_PARITY`: protected dirt matches and neither side was mutated.
-- `REMOTE_RECONSTRUCT`: committed state is remote-backed and the worktree can
-  be recreated; its host-local directory was not mirrored.
-- `EXCLUDE_PRESERVE`: dirty rescue/validation state is inventoried and retained
-  but is not a migration input.
-- `SESSION_NATIVE`: fresh destination auth and an intentional resume proved
-  dialog continuity.
-- `DONE_WITH_CONCERNS`: required work can resume, with named deferred gaps.
+```bash
+scripts/bulkload.py agent-verify \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --apply-receipt /home/jess/.bulkload-evidence/apply-receipt.json \
+  --output /home/jess/.bulkload-evidence/verify-receipt.json
+```
 
-Never report “all worktrees synced” merely because the active lane is ready.
+Verification freshly reads file bytes/modes, exact indexes, refs, worktrees,
+Git object integrity, SQLite logical state, removed sidecars, and holds. Require
+`verified=true` and `failures=[]`. Then perform fresh attended provider picker,
+resume/dialog, and authentication checks; these remain outside the offline
+receipt.
 
-## Interpret exit status
+## Roll back or recover
 
-- `0`: command completed and its positive claim is true.
-- `2`: malformed input, failed invariant, or unsafe operation; an output plan
-  is not promised.
-- `3`: capture evidence was written but is incomplete.
-- `4`: a digest-valid plan was written but contains blockers and is not ready.
-- `5`: verification evidence was written and reports one or more failures.
-- `6`: `doctor` could not find Git.
+Attended rollback requires the exact apply receipt digest:
 
-A sensitive path that requires a working-byte operation intentionally blocks
-the whole v1 plan. A clean tracked sensitive path is privately attested against
-the Git index, remains redacted and ineligible, and never becomes a copy
-operation. Preserve an owner checkout with sensitive dirt, use a clean
-reconstruction for safe work, and report `EXCLUDE_PRESERVE`; do not invent an
-exclude flag or silently weaken the plan.
+```bash
+scripts/bulkload.py agent-rollback \
+  --apply-receipt /home/jess/.bulkload-evidence/apply-receipt.json \
+  --accept-receipt-sha256 APPLY_RECEIPT_SHA256 \
+  --output /home/jess/.bulkload-evidence/rollback-receipt.json
+```
+
+After interruption, inspect the durable journal and choose exactly one path:
+
+```bash
+scripts/bulkload.py agent-recover \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --journal /home/jess/.bulkload-evidence/apply-journal.json \
+  --strategy forward \
+  --output /home/jess/.bulkload-evidence/recovery-receipt.json
+```
+
+Use `--strategy rollback` to restore the sealed snapshot instead. Both paths
+are idempotent and remain bound to the same transaction. Never improvise file
+copies or delete a journal after a crash.

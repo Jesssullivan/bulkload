@@ -16,30 +16,28 @@ operation is read-only.
 ## Hard rules
 
 - Never promote credentials, auth stores, databases, browser profiles, `.env`
-  files, private keys, kubeconfigs, or decrypted secret material through the
-  generic repository-file adapter. Codex `auth.json` and provider-owned SQLite
-  families are copy-eligible only through an explicit typed, private,
-  provider-specific plan. Policy v7 retains the attended atomic `auth.json`
-  install and freezes exact v6 request/capacity artifacts as validator-only
-  legacy evidence. Its CLI-inaccessible SQLite oracle is read-only,
-  fixture-driven, and cannot claim final verification or write a bundle.
-  Prefer an auth-only source capture and an
-  auth-plus-SQLite destination capture for auth install; a full source capture
-  is accepted but its SQLite is never consumed by that installer. Destination
-  SQLite must remain byte-exact with zero auth-install mutations. SQLite
-  composition, reservation, publication, installation, final receipt, and
-  combined apply remain fail-held. Never log credential values or raw database contents. Any live
-  SQLite WAL, SHM, or rollback-journal sidecar hard-stops immutable capture.
-- A private-state quiescence attestation is an operator procedural fence with
-  `provider_writer_proof=false`. Its advisory `flock` coordinates cooperating
-  Bulkload processes only; it does not stop or prove the absence of provider
-  writers.
-- Private-state operations must use the supported `-I -S` launcher and the
-  pre-import pinned Bulkload application-source closure bound into their plans.
-  This does not bind the Python interpreter or standard-library closure.
-  Offline apply/verify receipts do not prove working provider authentication;
-  require a fresh attended provider turn before claiming it.
-- Never delete source data. Never delete destination data in v1.
+  files, private keys, kubeconfigs, or decrypted secret material through a
+  generic file adapter. `AgentCaptureV4` is the only copy authority for Codex,
+  Claude, Pi, and declared mutable-seat state. It records hashes and typed
+  structure, never credential values or SQLite rows. Claude auth is a
+  nonportable hold. Descendants of a declared provider root default to typed
+  portable-private state; special entries, unsafe typed state, and structural
+  collisions stop planning.
+- Writers are briefly quiesced for each stable capture pair. They may resume
+  during preliminary preseed; final authority comes from fresh quiesced source
+  and destination captures and a fresh plan. Keep writers stopped for final
+  stage, apply, verify, rollback, and recovery. SQLite/WAL state uses the backup
+  API, composed only when schema and shared primary-key rows agree, and checked
+  independently before a final receipt. Offline receipts still require a fresh
+  attended provider turn before claiming runtime authentication.
+- All commands use the supported `-I -S` launcher and bind the pinned Bulkload
+  application-source closure into captures and plans. This does not bind the
+  Python interpreter or standard-library closure.
+- Never delete source data. Final destination changes require the exact plan
+  digest, a sealed final stage, an exact-overwrite capacity gate, and a complete
+  reflinked rollback snapshot. A failed reflink is a hard stop; never silently
+  fall back to a full duplicate. Preseed writes only beneath its external stage
+  root and must not mutate any live destination path.
 - Never apply a plan without an exact plan digest supplied by the operator.
 - Require two byte-stable source catalogs before creating an actionable plan.
 - Treat Git refs/objects, worktree bytes, worktree administration, agent

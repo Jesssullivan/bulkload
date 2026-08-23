@@ -1,4 +1,4 @@
 interface:
   display_name: "Bulkload"
-  short_description: "Plan safe repo, session, and Codex state moves"
-  default_prompt: "Use $bulkload to inventory and verify a one-way repository, append-only Codex session, or typed private-state migration."
+  short_description: "Cut over typed Git and agent state safely"
+  default_prompt: "Use $bulkload to capture, plan, stage, apply, verify, roll back, or recover an AgentCaptureV4 Git and agent-state cutover."

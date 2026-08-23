@@ -1,748 +1,205 @@
-# Bulkload v1 design
+# Bulkload AgentCaptureV4 design
 
-Status: repository v1 and the Codex session-union v3 prefix-proof extension are
-landed; private-state policy v7 provides the narrow attended auth install,
-exact-v6 compatibility freeze, and an internal read-only SQLite verifier
-oracle as a source foundation, 2026-08-17.
-The oracle observes fixtures built separately without invoking the oracle and
-cannot write bundles or mint final receipts. SQLite composition, reservation, publication,
-installation, final verification, and combined private apply remain fail-held.
+Status: implemented cutover product, 2026-08-22.
 
-The public-read CI boundary is separately closed by a repository-local
-front door. It runs only on the literal `tinyland-nix` capability, rejects fork
-pull requests before scheduling, and consumes the public immutable
-`tinyland-inc/ci-templates` v2.13.0 actions at commit
-`139bd4c7deabbe07c918dc764a3b9f054066431d`. It does not import private
-GloriousFlywheel action or flake source. The Nix client process is configured
-for token-free reads at the `bulkload-ci` site and `main` cache, while endpoint
-locations remain injected by the runner. A no-value repository preflight
-validates authority-only raw endpoints and clears inherited shell, Nix, and
-Bazel credential channels before the pinned discovery action; post-discovery
-enforcement revalidates the boundary and requires both cache reachability
-claims before any Nix or Bazel command. The exact guard is snapshotted before
-repository-owned source gates. Both Bazel calls are preceded by a fresh digest
-and captured-authority check and receive distinct, newly allocated Bazelisk
-homes plus empty user homes; workspace wrappers, system/user rc drift, and
-netrc credentials fail closed. Client access tokens, user Nix
-configuration, netrc, flake-config acceptance, post-build hooks, secret signing
-keys, and plugins are cleared. This source boundary does not attest the
-independent multi-user Nix daemon's own HTTP authentication or post-build
-policy. Bazel cache publication is false for every pull request and tag and
-true only for a trusted push to `main`; remote execution is never selected.
+## Decision
 
-## 1. Decision
-
-Build `bulkload` as a manifest-first controller and portable Agent Skill for
-one-way migration of one Git repository or a fleet rooted at `~/git`. It must
-make the safe path boring: two stable source observations, one destination
-observation, an immutable reviewed plan, explicit digest acceptance, additive
-application, and an independent post-apply verification receipt.
-
-`bulkload` is not a second filesystem and not a generic home-directory clone.
-It classifies state by authority and chooses the right movement mechanism for
-each class. In particular, it does not pretend that a Git worktree registry,
-uncommitted bytes, agent transcripts, caches, and rotating credentials are one
-homogeneous tree.
-
-## 2. Evidence from the Neo to Sting migration
-
-The design is grounded in the July 2026 TCFS/Sting migration rather than a
-greenfield copy model.
-
-1. The protected `tummycrypt` owner checkout was dirty and intentionally kept
-   intact on both hosts. A clean sibling worktree carried TIN-2864 development.
-   This made ownership and mutation authority explicit.
-2. Git branch state moved correctly through refs: the Sting TIN-2864 worktree
-   was clean but its remote-tracking ref was stale. A targeted fetch plus
-   `merge --ff-only` moved it from `e5ea0810` to signed head `36d8c0f6` without
-   touching any dirty tree.
-3. Worktree registries did not and should not match. Neo had seven worktrees;
-   Sting had twenty-five historical, validation, rescue, and draft entries.
-   Several identical basenames referred to different branches or commits.
-   Basename equality was therefore not identity or parity.
-   The protected checkout's 122 untracked paths and regular-file manifest were
-   nevertheless exact; ignored build/cache output remained host-local.
-4. The original archive mixed portable state with host metadata. It contained
-   4,923 AppleDouble `._*` sidecars. One 163-byte `._default.rules` file was
-   parsed as a Codex rule and blocked startup because it was not UTF-8.
-   Lossless quarantine of that sidecar restored startup while preserving
-   evidence.
-5. Codex sessions were portable as append-only JSONL. Authentication and
-   provider-owned SQLite were initially, incorrectly excluded as copy
-   authorities; the operator later clarified that both are copy-eligible typed
-   state. Published Codex guidance independently documents copying
-   `auth.json` to a trusted headless machine. SQLite requires provider-aware
-   snapshots and composition rather than ordinary file copying. The historical
-   session was found and executed, yet its newest compaction no longer
-   contained the requested exact checklist. A fresh persisted Sting session
-   with a nonce was then resumed successfully, proving current auth,
-   persistence, lookup, and dialog continuity.
-6. `--ephemeral resume` on Codex 0.144.5 still appended to the historical
-   rollout. The correct invariant is therefore observed immutability, not a
-   flag name.
-7. Authentication succeeded after attended device login, but reauthentication
-   was an operational choice rather than a portability requirement.
-   Credential files must never be treated as ordinary repo dirt; a dedicated
-   private adapter may move them without logging values.
-8. Byte hashes and status hashes were useful, but a single hash was not a
-   completeness proof. The active lane required branch, HEAD, cleanliness,
-   ancestry, signature, remote backing, and exact source/destination evidence.
-
-These facts establish the central rule: parity is a set of typed invariants,
-not byte equality over an arbitrary directory.
-
-## 3. State taxonomy
-
-| Plane | Authority | v1 action | Typical examples |
-|---|---|---|---|
-| Git object/ref | remote or reviewed bundle | fetch, verify, recreate | commits, branches, tags, stash, notes, custom refs |
-| Worktree topology | host-local Git administration | inventory, classify, recreate | linked worktree path, branch, HEAD, lock |
-| Working bytes | source worktree plus manifest | hash, additive copy, verify | modified tracked files, safe untracked files |
-| Agent continuity | append-only transcript authority | allowlisted copy, validate, resume proof | Codex JSONL, Claude project transcripts |
-| Generated state | destination runtime | regenerate | caches, `.direnv`, platform binaries |
-| Provider SQLite | provider runtime plus consistent snapshot | opt-in immutable capture; preserve destination exact during auth install; internal fixture-only read oracle; no composer/installer | Codex state, log, goal, and memory databases |
-| Authentication | provider/operator | opt-in private atomic replace with rollback, or attended re-authentication | Codex `auth.json` |
-
-Every plane has a separate contract. Generated caches are regenerated.
-Authentication and provider SQLite are never silently promoted through the
-generic file adapter, but they may enter an explicit typed migration dossier.
-
-## 4. Safety properties
-
-### 4.1 Read-only first
-
-Repository `capture`, `plan`, `verify`, and `files` are read-only. Repository
-`apply` is separate and requires the exact `plan_sha256`. Private policy v7
-also exposes a separately attended, digest-accepted auth-only apply, freezes
-the exact v6 request/capacity producer closure as validator-only legacy
-authority, and adds a CLI-inaccessible read-only SQLite oracle. None can
-compose, reserve, publish, install, finally verify, or activate SQLite. The CLI never invokes a terminal
-multiplexer, Home Manager, a deploy, or a product runtime.
-
-### 4.2 Repeated-catalog barrier
-
-Pass A and pass B capture the source independently. Planning is refused unless
-their canonical `catalog_sha256` values match exactly. Timestamps and host
-envelope data are excluded from the catalog digest; every repository fact,
-status classification, ref, worktree record, and inventoried file is included.
-Each envelope also has a random 128-bit `capture_id`, and planning rejects reuse
-of one envelope as both passes.
-
-This closes the most common omission race: creating a digest over a catalog
-that was still changing or incomplete. It does not make a live filesystem
-snapshot atomic. Any capture error marks the catalog incomplete and blocks
-planning.
-
-### 4.3 Typed operations
-
-The planner emits operations, findings, and blockers. Safe v1 operations are
-limited to additive or replacing copies of regular files. Clean tracked
-symlinks are attested against the Git index and recreated through Git; dirty or
-untracked symlink mutations block the plan. A clean tracked sensitive path is
-privately attested against the Git index but remains redacted and ineligible.
-Deletions, conflicts, sensitive working-byte changes, missing repositories, and
-divergent Git heads are blockers or operator instructions, never implicit file
-operations.
-
-### 4.4 Immutable acceptance
-
-The plan digest covers the stable source catalog, destination catalog, expected
-file facts, operations, and blockers. `apply` requires the operator to repeat
-that digest. It binds the live destination to the captured hostname and
-resolved root, then re-hashes each source file immediately before copying.
-Destination replacements are backed up under an explicit external backup root
-and installed by same-directory temporary file plus rename. Every newly created
-state, backup, and destination directory entry is fsynced, and the journal name
-is persisted before any destination mutation.
-
-The source root is bound semantically by Git and file preconditions rather than
-by hostname/path so a reviewed cross-host transfer can use a quarantined,
-destination-side reconstruction. The destination identity is not portable.
-
-Repository preconditions carry the canonical status body and non-remote ref
-records, not only caller-supplied digests or path lists. Ready-plan validation
-recomputes those digests and reasserts branch/HEAD equality, source-ref
-composition, the absence of destination-only replacement refs, and that
-destination dirt is a subset of source dirt. Apply repeats those relationships
-from fresh live captures and derives its allowed destination dirt from the live
-source status body before any copy.
-
-The same preconditions bind recovery-only Git roots found in local reflogs and
-known pseudo-refs. A source recovery root is retained only when the destination
-has an explicit anchor at that exact object: HEAD, a non-remote ref tip, or its
-own recovery-root catalog. Merely being an ancestor of a destination ref is
-deliberately insufficient proof in v1. Serializing every object reachable from
-every destination ref would make repo and fleet manifests grow outside the file
-and byte budgets and can add millions of OIDs. The bounded remediation is to
-create a temporary reviewed destination retention ref at each missing OID,
-recapture, and keep that ref through verification. Capture caps recovery
-acquisition at 4,096 local reflogs, 16 MiB per authority file, 64 MiB total
-authority bytes, and 4,096 candidate roots; exceeding any cap is incomplete,
-never an omitted ready plan.
-
-### 4.5 Independent verification
-
-Verification consumes a fresh destination capture, not the apply process's
-claims. It checks capture mode, expected HEAD/status, the destination
-non-remote-ref digest, and every copied path's type, mode, size, and content
-digest. It rejects reuse of the exact pre-plan destination snapshot even when a
-no-op plan leaves the catalog unchanged, and it fails if the destination has
-acquired alternates, grafts, submodules, content filters, LFS attributes, or
-external attribute authority. The receipt records what was observed; it does
-not expand the authority of the plan.
-
-## 5. Catalog contract
-
-The snapshot schema is `dev.tinyland.bulkload.snapshot.v1`.
-
-Repository discovery recognizes a worktree only when `.git` is a real directory
-or a regular Git pointer file. A symlink or special-file `.git` authority makes
-capture incomplete. Bare repositories are detected explicitly and also make v1
-capture incomplete: they require a separate object/ref transport rather than
-being silently omitted from a fleet manifest.
-
-Each envelope records:
-
-- capture time, hostname, logical root, and mode (`repo` or `fleet`);
-- whether discovery completed without errors;
-- a sorted repository catalog;
-- `catalog_sha256`, computed from canonical JSON over the catalog only; and
-- `snapshot_sha256`, computed over the full envelope except its own digest.
-
-Each repository records logical path, real path, Git common directory, branch,
-HEAD, upstream, sanitized remotes, every name under `refs/` with its resolved
-object and symbolic target, a canonical full `refs_sha256`, a
-`local_refs_sha256` that excludes host-local `refs/remotes/`, recovery-only
-roots and their digest, worktree records, status facts, and file facts.
-Recovery acquisition reads both old and new OIDs from real reflog records plus
-`AUTO_MERGE`, `BISECT_HEAD`, `CHERRY_PICK_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`,
-`ORIG_HEAD`, `REBASE_HEAD`, and `REVERT_HEAD`; remote-tracking reflogs remain
-host-local and are excluded. Supported network and scp-style remote locators
-have user-info and query or fragment data removed; local-path remotes are
-represented by a typed digest, and remote-helper, unknown-scheme, or malformed
-locators make capture incomplete without serializing the raw value. File facts
-contain paths and digests, never file contents; symlink payloads are hashed
-rather than recorded. Apply and verification fence the non-remote digest;
-remote-tracking movement remains
-recorded by the repeated catalog barrier but does not invalidate an already
-reviewed working-byte plan.
-
-Object reachability is not resumable-operation parity. Capture therefore
-inspects worktree-local Git administration markers without following them and
-records a sorted typed `git_operation_state`. Any active rebase, apply-mailbox,
-sequencer, bisect, merge, cherry-pick, or revert makes the repository and
-envelope incomplete; apply repeats the same live capture fence.
-
-Every tracked regular file and symlink is also compared with its stage-zero Git
-index blob and canonical full regular-file permission mode (`0644` or `0755`).
-A `0600` file backed by a `100644` index entry is therefore typed as mode dirt,
-copied with `0600`, and verified with that exact mode rather than falsely
-passing on content alone. Status is derived from the HEAD tree, index stages,
-direct no-follow byte hashes, and untracked enumeration; capture never
-runs `git status`, `git diff`, or another worktree conversion command. A path
-whose raw working bytes differ from the index is therefore classified as dirty
-even when assume-unchanged, skip-worktree, or stat-cache metadata would hide it
-from normal Git status.
-
-Capture also walks the object closure reachable from detached HEAD, every
-non-remote ref, and every recovery-only root with replacement semantics and
-lazy fetching disabled. A missing commit, tag, tree, or blob therefore makes
-the capture incomplete before a plan can become ready; a ref name and OID alone
-are not a completeness proof. The closure is checked but not serialized as an
-unbounded object inventory. Shallow
-repositories are incomplete in v1 because a shallow boundary deliberately
-hides ancestry that this protocol promises to retain. Effective
-partial/promisor configuration from repository, worktree, include, global, or
-system scope is rejected before object reads, preventing a capture from lazily
-fetching missing objects or mutating the repository it observes. A full
-read-only `git fsck` additionally verifies stored object integrity; corrupt
-historical content therefore fails capture even when its filename still looks
-like the expected object ID.
-
-Snapshot validation recomputes `status_sha256` from the canonical status body
-and requires each file record's status to equal that repository status entry.
-An externally supplied, self-digested envelope therefore cannot detach the
-plan-visible dirt from the apply-time Git precondition.
-
-Capture strips ambient `GIT_*` repository, index, namespace, and object-store
-overrides before invoking Git and sets `GIT_NO_REPLACE_OBJECTS=1`. Replacement
-refs are still cataloged as state, but cannot change the HEAD tree used for
-identity. A nonempty legacy `.git/info/grafts` authority blocks planning.
-Effective `filter` attributes are queried with NUL framing in both working-tree
-and cached views for every catalog path. Any effective LFS or other
-content-filter path blocks planning; nonempty `.git/info/attributes` or an
-external/global attributes authority is recorded as unportable and also blocks
-v1 planning. Attribute inspection never invokes the configured filter program.
-
-Tracked and non-ignored untracked files are inventoried. Ignored/generated
-files are excluded by default; `--include-ignored` is an explicit, bounded
-inventory mode and does not make them eligible for copying. Sensitive-looking
-paths are recorded as blocked without a content digest, even if they are
-already tracked. Remote URL user-info, query strings, and fragments are never
-serialized.
-
-File and byte budgets are enforced before hashing a file. In fleet mode they
-apply independently to each repository; an exceeded budget makes the complete
-snapshot fail closed.
-
-## 6. Planning and application
-
-The intended operator sequence is:
+Bulkload performs a reviewed, one-way union of a `~/git` fleet and typed agent
+state. Its public surface is exactly:
 
 ```text
-source capture A ─┐
-                  ├─ exact catalog equality ─ destination capture ─ plan
-source capture B ─┘                                      │
-                                                        review
-                                                          │
-                                             accept exact plan digest
-                                                          │
-                                            additive apply or rsync list
-                                                          │
-                                           fresh destination capture
-                                                          │
-                                                 verify + receipt
+preliminary capture/plan -> agent-stage preseed
+fresh final capture/plan -> agent-stage final
+              -> agent-apply -> agent-verify
+                              -> agent-rollback | agent-recover
 ```
 
-For one repository, logical path is `.`. For fleet mode, logical paths are
-relative to the declared fleet root. The same plan can therefore generate a
-NUL-delimited allowlist for `rsync --from0 --files-from=-` without embedding
-source-host absolute paths in file names. That allowlist contains every
-expected dirty source file, not only live-destination mutations, so an isolated
-clean Git staging tree receives bytes that already happen to match the live
-destination.
+Capture, plan, stage, and verify do not mutate live destination paths. Apply is
+the only forward live mutation. Every operation is bound to an exact plan
+digest, a sealed final stage, an exact-overwrite capacity observation, a
+complete reflinked rollback snapshot, a durable journal, and an independently
+generated receipt.
 
-Git reconciliation remains explicit:
+Each stage phase uses destination `prepare`, source-to-destination `push`, then
+destination `materialize`; these are modes of `agent-stage`, not extra public
+commands. Preliminary writers resume during preseed. Fresh final A/B captures
+and their new plan digest are the only apply authority.
 
-- fetch/push or a verified Git bundle moves refs and objects;
-- every source non-remote ref must exist at the same object and symbolic target
-  on the destination, with its reachable object closure present;
-- every source recovery-only reflog or pseudo-ref root must have an explicit
-  destination anchor at the same OID; use a temporary retention ref and
-  recapture rather than relying on an unbounded ancestry catalog;
-- destination-only local refs are retained and reported, never deleted; an
-  extra replacement ref blocks because it changes ordinary Git object semantics;
-- remote-tracking refs remain host-local evidence and are not parity authority;
-- `git worktree add` recreates clean linked worktrees from exact refs;
-- `git worktree repair` repairs pointers only when both sides were deliberately
-  moved together;
-- dirty working bytes are handled by the content plan;
-- index conflicts and staged topology are blockers in v1.
+The former repository v1, Codex session v3, and private policy v4-v7
+planner/oracle chain are superseded and removed. There is one implementation,
+one CLI, and one Bazel test family.
 
-Git bundles contain only the refs selected at creation plus their reachable
-objects and prerequisites. `--all` can select `refs/stash` and other local refs;
-a narrower selection can omit them. Bundles still omit the working tree,
-index, untracked bytes, per-repository configuration, and hooks. That
-limitation is a feature here: it prevents a Git-object transport from being
-mistaken for total working-state parity.
+## Schemas
 
-## 7. Agent context policy
+- `dev.tinyland.bulkload.agent-capture.v4`
+- `dev.tinyland.bulkload.git-workspace.v2`
+- `dev.tinyland.bulkload.agent-plan.v4`
+- `dev.tinyland.bulkload.agent-stage-receipt.v4`
+- `dev.tinyland.bulkload.agent-apply-receipt.v4`
+- `dev.tinyland.bulkload.agent-verify-receipt.v4`
+- `dev.tinyland.bulkload.agent-rollback-receipt.v4`
+- `dev.tinyland.bulkload.agent-recover-receipt.v4`
+- `dev.tinyland.bulkload.agent-journal.v4`
 
-Agent context is an opt-in extension, not part of `~/git` discovery.
+All artifacts use sorted, compact UTF-8 JSON and a SHA-256 over the complete
+body excluding its own digest field. Capture and plan bind the pinned Bulkload
+application-source closure. Provider values, authentication contents, SQLite
+rows, symlink payloads, and unsanitized remote URLs never appear in evidence or
+errors.
 
-- Copy transcript stores only from explicit allowlists.
-- Preserve append-only source files and compare prefix/hash evidence before
-  deciding whether destination content is a superset.
-- Regenerate indexes and platform caches on the destination.
-- Quarantine AppleDouble files and other unsupported metadata; never discard
-  them silently.
-- Prove continuity with a fresh non-secret nonce in a disposable or newly
-  persisted session before trusting historical resume behavior.
-- Prefer an explicit typed auth plan when a trusted destination should retain
-  the same Codex login. Require private custody, no value logging, source and
-  destination backups, atomic install, rollback, and a fresh authenticated
-  provider turn. Attended reauthentication remains a fallback.
-- Treat every provider-owned SQLite family under the effective
-  `sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority as one typed set.
-  The current immutable reader hard-stops if any WAL, SHM, or rollback-journal
-  sidecar exists. It never copies a live database family as ordinary files.
-  Policy v7 does not compose or install SQLite; during auth install it
-  independently captures and preserves every destination family exactly with
-  zero mutations. Its frozen v6 validators and internal read-only oracle do
-  not expose SQLite request, capacity, composition, or final-verification
-  commands and do not touch live roots.
-- Prefer an auth-only source capture and an auth-plus-SQLite destination
-  capture for the narrow auth installer. A full source capture plus a full
-  destination capture is also accepted, but source SQLite is never consumed.
-- Browser profiles, cookies, private keys, and unrelated provider credential
-  databases remain outside the Codex adapter.
-- Treat compaction as a semantic retention boundary. A transcript's presence
-  does not prove every old instruction remains in active model context.
+## Capture barrier
 
-The v1 CLI implements repository catalogs and content plans. Its first
-provider-specific extension is a read-only Codex rollout catalog and
-collision-gated append-only UUID union plan. It validates JSONL identity and
-current-user ownership, rejects hardlinks and files writable by group or other,
-and requires explicit writer quiescence plus two byte-stable observations of
-both the source and destination. Destination custody is stricter than legacy
-source evidence: every destination rollout must be exactly `0600` beneath
-exactly `0700` directories.
+Planning requires two distinct source captures and two distinct destination
+captures. Each pair must have identical catalog bodies and catalog digests.
+All four capture IDs must differ. Writers must be operator-quiesced throughout
+each capture; this is a procedural fence, not proof that a provider process was
+stopped.
 
-The Codex snapshot remains v2. The prefix-proof request/proof,
-close-request/close-capture wrapper, and union-plan schemas are v1/v1/v3
-respectively. Each snapshot binds a non-secret, operator-assigned
-host-authority UUID to the resolved root, its device/inode lineage, and typed
-directory records. One authority ID names one physical filesystem namespace
-even when a hostname changes or storage is shared; an independent namespace
-receives a different ID.
+Declared provider descendants default to portable-private after exact managed
+exclusions and regenerate pruning. A scan failure, special file, unsafe Git
+authority, active Git operation, external alternate, corrupt object, malformed
+JSONL, unsupported typed state, or budget exceedance makes capture incomplete.
 
-The scanner holds descriptor authority while traversing, rejects duplicate
-JSON keys, non-finite values, non-canonical UUIDs, missing or repeated
-`session_meta`, and revalidates the resolved root, lineage, and every completed
-directory after the scan. Candidate file count and stable size are reserved
-before parsing, so malformed content cannot multiply the aggregate limits.
-Entry, directory, record, path, catalog, error, and output budgets make
-incomplete discovery explicit.
+## GitWorkspaceV2
 
-Planning compares exact catalog bodies rather than trusting a digest alone.
-Within one host authority, equal or ancestor/descendant roots are rejected by
-resolved path and recorded lineage. Directory claims close the namespace before
-classification. Same-UUID differing bytes require targeted cross-catalog
-prefix evidence bound to both catalog digests, both root identities, the UUID,
-path, full hashes and sizes, and a JSONL record boundary. A proved source
-superset may be promoted; a proved destination superset is preserved. Equal
-sizes with different hashes, mid-record cuts, missing or replayed evidence,
-portable file/file, file/directory, or ancestor-prefix collisions are blockers,
-and any blocker suppresses all candidates. When prefix evidence is required,
-all required proof passes first feed an immutable close request that binds the
-opening custody, prefix request, proof capture IDs, and proof body digests.
-Fresh closing A/B captures for both roots are then created directly from the
-live roots and wrapped against that close-request digest; a stale v2 snapshot
-cannot be supplied for wrapping. Their catalogs and custody must exactly match
-the opening bodies. The plan binds each opening, proof, close request, and
-close wrapper by distinct capture ID or body digest as appropriate. Codex
-planning reads bounded exact-`0600` single-link evidence through pinned
-descriptors and publishes into a pinned owner-private directory with an OS
-no-replace rename. It verifies exact staging bytes and single-link custody,
-revalidates inputs plus the requested directory/target after publication, and
-never pathname-deletes on failure. A nonzero result can therefore retain an
-owner-private staging or fail-held final artifact; it is not authority and
-requires attended quarantine.
+Each Git workspace records:
 
-The exact private-state policy lives in
-`.agents/skills/bulkload/references/codex-private-state-policy.v7.json`.
-It classifies Codex auth and provider-owned SQLite as explicit opt-in state,
-but makes ten separate readiness claims:
+- logical, source, translated destination, and common Git paths;
+- object format, HEAD, branch, and sanitized remote backing;
+- every ref, including tags, notes, stash, custom refs, and symbolic targets;
+- reflog and pseudo-ref recovery anchors;
+- the complete local object-file transport set and full `git fsck` result;
+- every linked or detached worktree, including lock/prune state;
+- the exact raw index digest and typed index entries, stages, intent-to-add,
+  skip-worktree, and assume-unchanged flags;
+- every worktree directory, regular file, and symlink with exact mode, size,
+  and content digest; and
+- derived staged, conflicted, modified, deleted, and untracked dirt.
 
-- `auth_install=true`: an attended, journaled atomic replacement of an
-  existing destination `auth.json` is implemented, with a complete rollback
-  copy, offline verification, manual rollback, and crash recovery;
-- `sqlite_compose_plan=false`: v7 retains the v4 validator but exposes no
-  current opening producer command;
-- `sqlite_compose_action_plan=false`: v7 retains exact v5 close/action
-  validators but exposes no current close, reclose, or action-plan producer;
-- `sqlite_compose_request=false`: exact v6 request artifacts remain
-  validator-only legacy evidence and their producer command is retired;
-- `sqlite_capacity_observation=false`: exact v6 observations remain
-  validator-only legacy evidence and their producer command is retired;
-- `sqlite_verifier_oracle_internal_only=true`: an internal, CLI-inaccessible read-only
-  oracle observes bundle fixtures built separately without invoking it and
-  emits only a diagnostic report with every final/public claim false;
-- `sqlite_independent_verification=false`: the later final verifier receipt
-  and complete original-input recomputation are not implemented;
-- `sqlite_compose=false`: no source SQLite family is merged or installed; and
-- `sqlite_publish=false`: no composed family or versioned directory can be
-  published; and
-- `combined=false`: there is no combined auth-plus-SQLite apply.
+The `.git` pointer and linked-worktree administration are never copied as
+working bytes. Apply initializes or reuses the destination repository, adds
+verified object files, recreates worktrees through Git, installs the exact
+index, then overlays exact working bytes and deletions.
 
-The supported installer input matrices are source `["auth"]` to destination
-`["auth","sqlite"]` (preferred), and source `["auth","sqlite"]` to the same
-destination selection. In both cases the install plan selects the destination
-state classes, consumes only source auth, emits
-`sqlite_union_ready=false`, records zero SQLite mutations, and binds every
-destination SQLite family as `preserve-destination-exact`. An auth-only
-destination is deliberately unsupported because a changing auth file must not
-bypass the destination SQLite preservation proof.
+Destination ref divergence does not destroy an object or ref tip. Before a
+source ref update, Bulkload creates a deterministic
+`refs/bulkload/recovery/destination/<digest>` ref at the destination tip.
+Source recovery-only OIDs receive `refs/bulkload/recovery/source/<oid>` anchors.
+Destination-only refs remain. Source worktree bytes, modes, index, deletions,
+and directory topology are authoritative; exact destination state enters the
+rollback journal before mutation.
 
-`codex-private-capture` accepts only a short-lived, digest-accepted quiescence
-attestation bound to the exact role, roots, selected state classes, Codex
-version, host authority, and output. The attestation states
-`provider_writer_proof=false`: it records the operator's procedural fence.
-The accompanying nonblocking directory `flock` coordinates only cooperating
-Bulkload processes and cannot stop or detect a Codex writer.
+The longest path-map prefix wins. This deliberately maps
+`/Users/jess/git` to `/srv/fast-local/jess/git` even when the broader source
+home maps elsewhere. Non-Git content beneath the declared Git fleet root is a
+sibling typed catalog and is preserved without pretending it is a repository.
+Catalogs retain logical Git/provider install roots, physical backing roots, and
+nofollow link proofs. Translation uses logical paths; writes use backings, so
+Sting's Home Manager `.codex`, `.claude`, `.gstack`, and `git` links remain.
 
-For SQLite selection, the operator must resolve configured
-`sqlite_home`/`CODEX_SQLITE_HOME`/`CODEX_HOME` authority and pass the effective
-path explicitly. Any observed `-wal`, `-shm`, or `-journal` companion rejects
-the immutable capture. With no sidecar present, the reader opens the source
-immutably, snapshots every top-level `*.sqlite` family through SQLite's backup
-API, normalizes the evidence copy to `DELETE` journal mode, runs
-`quick_check`, and binds schema, migration, header, thread/path, namespace,
-count, byte, and time evidence. It never copies source sidecars.
+## Agent state
 
-`codex-private-plan` remains a non-actionable compatibility dossier. In exact
-reviewed v4/v5 historical checkouts only,
-`codex-private-sqlite-compose-plan` consumed source A/B and destination A/B
-private bundles plus the recomputed session-union closure, exact adapter
-registry, and exact path map. The active v7 CLI retires that producer command,
-the v5 close/action producers, and the v6 request/capacity producers while
-retaining their immutable validators. The historical output embeds
-and revalidates the complete registry and path-map bodies while binding their
-digests to the accepted inputs. It is an immutable opening request and always
-records that fresh post-plan close captures remain required. It does not claim
-that the session union was executed or verified. Its eight private capture and
-attestation IDs are globally distinct and disjoint from session evidence.
-Classification binds
-observed foreign-key topology and actions exactly, fail-holds every
-trigger/view and unsafe or secondary UNIQUE claim, requires an exact
-UUID-to-session-path binding, reapplies captured family/count/byte budgets, and
-permits equal lexical roots only under distinct role-bound host authorities.
-The registry-bound schema contract carries a canonical raw-schema catalog,
-typed virtual/shadow omissions, and the exact producer classification-blocker
-set; the family role blockers must equal that set plus reconstructed
-foreign-key-shape blockers. Internal `sqlite_%` table state, including
-AUTOINCREMENT high-water authority, failed or malformed migrations, and
-explicit table-column collation clauses therefore remain structurally bound
-blockers. Source/destination migration counts and latest versions are
-cross-bound to the opening projections. Safely named unknown families are also
-retained as fail-held evidence. A single aggregate ledger covers all
-source/destination rows and typed bytes across every table and family, while
-SQLite progress handlers provide cooperative checks against the shared
-deadline. The historical producer
-CLI recomputed the complete plan against pinned inputs before and after
-create-only publication.
-Its full contract is in the
-[SQLite opening-plan reference](../.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md).
-`codex-private-install-plan` consumes its exact accepted digest and compiles
-only the narrow auth-install plan. Apply revalidates source auth and the entire
-destination auth-plus-SQLite capture, backs up destination auth, journals each
-durable transition, replaces auth in the destination directory, then captures
-and compares destination auth and SQLite again. Verify uses a fresh
-attestation and capture. Rollback requires an exact apply receipt plus an
-operator assertion that no provider writes occurred after apply. Recovery
-classifies the durable journal before choosing a bounded forward or rollback
-path. Every receipt remains an offline byte-and-custody claim with
-`provider_runtime_acceptance_verified=false`; only a fresh attended provider
-turn can establish working authentication.
+Provider roots are explicit and typed. Both roles bind one component-bounded
+managed-exclusion policy. Relative symlinks must remain within the provider;
+Codex session links may name archived sessions. Absolute/private symlinks stop
+unless pruned as exact managed or regenerate state.
 
-The supported direct and Bazel launchers enter Python with `-I -S` before
-Python startup hooks. The command entrypoint then opens and pins the canonical
-policy and complete Bulkload application-source inventory before importing the
-command implementation. This is not a claim that Bulkload binds the Python
-interpreter or standard-library closure. The application authority
-record—policy digest, closure digest, and exact full source
-inventory with per-file digests—is carried by the compatibility and install plans and revalidated
-through publication and mutation boundaries. A changed or replaced runtime
-therefore fails closed rather than executing against a previously accepted
-plan. The validator also requires the exact command/handler topology and
-forbidden SQLite/combined command set.
+### Codex
 
-V7's first SQLite-composition slice is deliberately verifier-first. The
-protocol module defines strict manifest, writer-receipt, future final-receipt,
-and diagnostic-oracle schemas, but the only executable addition is an internal
-read-only oracle in a source file distinct from every historical producer.
-It opens a supplied owner-private fixture bundle without mutation, binds the
-active pinned verifier source, separately scans schema, migrations, foreign
-keys, and type-tagged rows, and compares those observations with the supplied v5/v6 evidence and
-protocol artifacts. The oracle does not import a writer or
-final verifier implementation, has no registered CLI command, and cannot
-upgrade `failures=[]` into sealed-bundle, complete-input-recomputation,
-independent-final-verification, provider-acceptance, or cutover authority. The
-public wrapper creates its diagnostic observation UUID and timestamp itself;
-neither is caller-supplied. The writer, final receipt integration, publisher,
-and any command enablement are separate reviewed slices.
+The adapter includes every SQLite family (including committed WAL state),
+sessions, archived sessions, history, goals, memory, queue, rules/skills, and
+`auth.json`. SQLite capture uses the backup API over a stable family; it does
+not raw-copy a live main/WAL pair. Auth is source-authoritative typed state and
+is installed only inside the same rollback transaction.
 
-The operator sequence, exact arguments, evidence custody, and recovery rules
-are in the
-[private auth install runbook](../.agents/skills/bulkload/references/codex-private-auth-install.md).
+### Claude
 
-## 8. Relationship to TCFS
+Projects, transcripts, history, todos, plans, memory, queue, commands, agents,
+skills, settings, and unknown-named binary state are unioned. Only explicit
+path-bearing JSON/JSONL/text and path-encoded project names rewrite. Credentials are
+nonportable: they produce a visible hold, preserve destination auth, and
+require attended destination authentication.
 
-This tool is deliberately interim. TCFS is intended to replace the manual
-working-byte plane with a product contract built from chunked content-addressed
-storage, manifests, hydration, namespace composition, vector-clock/conflict
-state, registered local/remote observations, Git topology, and monotonic remote
-catalog control state.
+### Pi
 
-The July TIN-2864 work is still source-only and digestless. It does not yet
-authorize live planning, deployment, reconciliation, unreviewed credential
-handling, or a crypto ceremony. `bulkload` therefore does not call TCFS.
-Instead it records the exact operational requirements TCFS must eventually
-absorb:
+Sessions, archives, history, state, memory, queue, skills, prompts, settings,
+models, and typed auth are unioned. Pi auth is source-authoritative and receives
+the same private rollback custody as Codex auth.
 
-- complete, repeatable enumeration;
-- typed namespace and Git claims;
-- no-loss hydration and replay;
-- monotonic publication/catalog state;
-- explicit conflict and writer fencing;
-- rotation and garbage-collection safety; and
-- portable, independently verifiable receipts.
+### Mutable seat state
 
-When TCFS supplies those properties end to end, `bulkload` should shrink to a
-legacy importer and audit adapter rather than remain a second sync system.
+An operator may declare named directory seats or exact optional regular-file
+singletons. Their state enters as a source-authority overlay. Whole-home seats
+are invalid and undeclared home content stays out of scope.
 
-## 9. Threat model
+Append JSONL uses record digests: source supersets install, destination
+supersets remain, and forks install source with destination custody. Equal bytes
+with different mode install the source mode. Shared portable/non-Git paths are
+source authoritative; destination-only union identities remain.
 
-Primary hazards are source or destination mutation during capture, path
-traversal, symlink or hardlink aliasing, payload disclosure, incomplete
-reachable Git objects, omitted
-reflog/pseudo-ref recovery roots, unsafe remote
-helpers, case-folding collisions, stale remote refs, filename encoding,
-AppleDouble sidecars, unbounded ignored trees, secret-bearing untracked files,
-concurrent destination edits, partial transfer, and false confidence from a
-green transport exit code. Provider-state hazards additionally include token
-disclosure, refresh races, a false quiescence claim, partial WAL capture,
-stale absolute rollout paths, schema skew, an incomplete SQLite-family
-inventory, changed runtime source after plan review, unintended SQLite
-mutation, and replacing healthy destination auth without rollback.
+SQLite compatible union requires matching application ID, user version, schema,
+columns, primary keys, foreign-key topology, and table set. Rows use type-tagged
+hashes. Schema/shared-row/duplicate canonical-key conflicts select the consistent
+source snapshot while preserving the exact destination rollback. Otherwise
+source-only rows enter a reflinked destination snapshot. The result must pass
+`quick_check`, `foreign_key_check`, and a fresh logical catalog before sealing.
+Triggers, views, virtual tables, corrupt databases, and unknown families stop.
 
-V1 mitigations are canonical sorted catalogs, role-specific A/B barriers, no
-content in manifests, path normalization, a v1 block on symlink mutations,
-sensitive-path blocks re-enforced during plan validation, no deletion,
-pre-copy source rehash, external backups, atomic replacement, durable
-journal/directory entries, fresh verification, Codex evidence inputs and output
-parents pinned across final rename, pathname overlap guards for the repository
-adapter, and explicit incomplete/error states. Private-state policy v7 retains
-pre-import runtime pinning, digest-bound procedural quiescence, a cooperating-
-Bulkload lock, hard rejection of SQLite sidecars, complete destination SQLite
-preservation, an external auth backup, a durable state-machine journal, and
-fresh offline capture. Its separate SQLite opening request adds four-pass
-stability, exact session-plan recomputation, schema/migration registry keys,
-allowlisted path normalization, globally disjoint evidence identity, exact
-foreign-key closure, trigger/view and UNIQUE fail-holds, bounded semantic row
-preflight, complete embedded registry/path-map bodies, a canonical raw-schema
-record catalog, typed schema omissions, registry-bound producer blockers,
-exact stable-projection budget/count/latest-migration bindings, bidirectional
-rowset/digest claims, plan-wide row/byte charging with structural lower bounds,
-cooperative SQLite progress deadlines, exact edge/collation/table-set blocker
-derivation, explicit column-collation and unknown-family blockers, and
-type-tagged row digests. Its close/action-plan layer binds fresh cross-plane
-captures to one writer-stop epoch, recomputes closed classifications, and
-describes deterministic output and a create-only graph. The action-plan
-consumer reopens the complete original v4 input set before compilation and
-after publication instead of trusting a persisted revalidation flag. Frozen
-v6 evidence separately pins an exact `0700` workspace, action-derived absent
-output and staging namespace, protected-root lineages, checked capacity
-requirement, and caller-available `fstatvfs` observation. V7 registers neither
-legacy producer command. Its separately implemented read-only oracle adds
-strict artifact custody, manifest/receipt binding, SQLite engine consistency,
-schema/migration/edge/semantic comparisons, exact active verifier-source
-binding, bounded in-process identity ordering without SQLite-side sorting or
-temporary files, including database-encoding-compatible TEXT keys, and an
-all-false final/public claim surface. Its progress
-handler and monotonic checks are cooperative; they do not preempt blocked
-filesystem I/O, and callers must add an external process timeout before using
-the oracle against an unresponsive or adversarial volume. It reserves nothing,
-binds no writer runtime, and publishes no final receipt. Compose, publish,
-install, final verification, and apply remain false. Neither the operator
-attestation nor the lock becomes provider-writer proof.
-Cross-filesystem atomicity, ACL/xattr
-fidelity, sparse files, hardlink identity, special files, case-insensitive
-collisions, submodule worktrees, live concurrent writers, and provider runtime
-acceptance remain blockers or separate proof steps.
+## Stage and capacity
 
-## 10. Implementation layout
+Destination prepare creates the external mode-0700 stage/quarantine, verifies
+captured GNU rsync, and gates capacity. Neo pushes only the plan's NUL allowlist
+through strict SSH; Sting materializes only after validating chained prepare/
+push receipts and every byte. No Sting-originated credential is needed and no
+live path changes. Preliminary changed-late entries defer. Final accepts a
+fresh plan, reuses verified content objects across plan digests, restages every
+operation, snapshots destination SQLite, and seals the only apply manifest.
 
-- `.agents/skills/bulkload/`: canonical portable skill and executable Python.
-- `BUILD.bazel`: build/test SSOT for the exact skill code.
-- `justfile`: human and agent entrypoint; delegates normal build/test to the
-  GloriousFlywheel wrapper.
-- `justfile.flywheel` and `.bazelrc.flywheel`: generated, endpoint-free
-  GloriousFlywheel front-door kit pinned by CI to an immutable core revision.
-- `.github/workflows/ci.yml`: direct `tinyland-nix` cache-first validation; no
-  hosted or dynamic runner fallback.
-- `scripts/install-skill.sh`: locked user-scope installation with fail-before-
-  mutation destination preflight and no-follow private backup containment.
-- `tests/`: deterministic fixture tests for catalogs, barriers, plans, apply,
-  verification, traversal rejection, and installer behavior.
-- `docs/design.md`: design and evidence authority.
-- `docs/neo-sting-retrospective.md`: dated dialog and execution retrospective.
-- `tinyland.repo.json`: machine-readable role and boundary declaration.
+Reflink reuse is mandatory when an exact destination byte source is selected.
+A failed clone is a hard stop. A full copy is allowed only for truly incoming
+or transformed data when the operator supplies `--allow-accounted-copy`; it is
+then identified in the receipt and charged before materialization.
 
-## 11. One-day sprint boundary
+The capacity contract is:
 
-Included:
+```text
+available >= incoming_unique + sqlite_compose + exact_overwritten + reserve
+```
 
-1. Repo and fleet discovery.
-2. Canonical catalogs with Git/worktree/status/file facts.
-3. Two-pass stability barrier.
-4. Deterministic plan and digest.
-5. Safe local additive apply plus external backup and receipt.
-6. NUL allowlist export for reviewed rsync transport.
-7. Independent verification.
-8. Portable Agent Skill and authenticated one-line private install.
-9. Bazel tests on the sanctioned GloriousFlywheel cache-first ARC path.
-10. Narrow attended Codex `auth.json` install with exact destination SQLite
-    preservation, offline verification, rollback, and recovery.
+It never budgets or creates a full destination duplicate. On Sting, stage and
+rollback live on the same reflink-capable XFS authority as the destination.
+Every clone is required, fsynced, and rehashed. Rollback contains only entries
+the transaction can overwrite or delete. Existing Git objects are additive;
+ref tips have logical rollback plus durable recovery refs.
 
-Deferred:
+## Apply, recovery, and verification
 
-- SQLite union, composition, or installation, including WAL-aware live-family
-  capture;
-- combined auth-plus-SQLite apply;
-- browser-state movement;
-- automatic remote command execution;
-- deletion/mirror mode;
-- conflict/index reconstruction;
-- ACL, xattr, hardlink, sparse-file, and special-file fidelity;
-- provider-specific Claude/Codex database writers;
-- TCFS runtime integration.
+Apply refuses a stale destination precondition. Before its first live mutation
+it reflink-snapshots every existing target, records absent targets and exact
+transaction-created parent directories, observes capacity, and seals rollback.
+File installation uses a
+same-directory reflinked temporary plus rename and directory fsync. Git ref
+updates use Git's ref transaction primitives. Journal progress is persisted
+after every mutation.
 
-## 12. Research basis
+Re-running apply against a completed journal returns the exact stored receipt.
+Recovery reads the same journal and deterministically continues forward or
+restores rollback state. Rollback is itself idempotent and requires the exact
+apply receipt digest. Additive Git object files may remain after rollback; no
+source or previously existing destination object becomes unreachable because
+ref state is restored.
 
-- Tridgell and Mackerras, *The rsync algorithm*: remote delta discovery and
-  pipelining, <https://rsync.samba.org/tech_report/>.
-- Samba rsync manual: archive semantics, dry-run, checksum mode, itemized
-  changes, file allowlists, delayed updates, and cross-filesystem hazards,
-  <https://download.samba.org/pub/rsync/rsync.1>.
-- Git worktree manual: linked-worktree administration, locks, repair, and
-  prune behavior, <https://git-scm.com/docs/git-worktree>.
-- Git bundle manual: explicitly selected refs/objects and prerequisites, while
-  worktree, index, untracked bytes, config, and hooks remain outside the bundle,
-  <https://git-scm.com/docs/git-bundle>.
-- Git replace manual: replacement refs and `GIT_NO_REPLACE_OBJECTS`,
-  <https://git-scm.com/docs/git-replace>.
-- Git attributes manual: check-in conversion and external clean/process filter
-  execution, which is why capture derives raw status without `git status` or
-  diff commands, <https://git-scm.com/docs/gitattributes>.
-- Linux `rename(2)` and `fsync(2)` contracts: same-filesystem atomic name
-  replacement plus the separate directory sync needed to persist a directory
-  entry, <https://man7.org/linux/man-pages/man2/rename.2.html> and
-  <https://man7.org/linux/man-pages/man2/fsync.2.html>.
-- Chandy and Lamport, *Distributed Snapshots: Determining Global States of
-  Distributed Systems*: coordinated consistent global-state capture in an
-  asynchronous system,
-  <https://lamport.azurewebsites.net/pubs/chandy.pdf>.
-- Agent Skills specification: portable `SKILL.md`, scripts, references, and
-  progressive disclosure, <https://agentskills.io/specification>.
-- Codex skill documentation: repository and user discovery under
-  `.agents/skills`, symlink support, and optional `agents/openai.yaml`,
-  <https://developers.openai.com/codex/skills/create-skill>.
-- Codex authentication documentation: trusted headless-device `auth.json`
-  copy fallback and password-equivalent handling,
-  <https://learn.chatgpt.com/docs/auth>.
-- Codex configuration and app-server documentation: `sqlite_home`,
-  `CODEX_SQLITE_HOME`, JSONL rollout logs, SQLite-backed resumable state, and
-  default JSONL scan-and-repair behavior,
-  <https://learn.chatgpt.com/docs/config-file/config-reference> and
-  <https://learn.chatgpt.com/docs/app-server>.
-- Pi skill documentation: discovery under `~/.agents/skills` and
-  `~/.pi/agent/skills`, <https://pi.dev/docs/latest/skills>.
-- Claude Agent SDK skill documentation: user and project discovery under
-  `.claude/skills`, <https://code.claude.com/docs/en/agent-sdk/skills>.
-- Bazel Central Registry, `rules_python` 2.2.0; this repository pins and tests
-  Bazel 8.2.1, <https://registry.bazel.build/modules/rules_python>.
+Verification reads live paths afresh. It checks every staged byte and mode,
+every exact index, all planned and recovery refs, Git object integrity, every
+SQLite logical catalog, absence of retired sidecars, and all known holds. The
+receipt keeps `provider_runtime_acceptance_verified=false`; a fresh attended
+Codex/Claude/Pi action is required before claiming working authentication or
+resume continuity.
 
-These sources constrain, rather than broaden, the protocol. Bulkload treats
-worktree administration as path-bound; bundles remain object/ref transports;
-and rsync is restricted to reviewed `--from0 --files-from` transfers into
-quarantine. On Linux filesystems honoring the cited contracts, same-directory
-rename plus file/directory sync remains the durability primitive. Equal A/B
-catalogs are only an observational stability barrier, not a Chandy-Lamport-style
-coordinated consistent cut and not an atomic point-in-time snapshot. Concurrent
-writers still require quiescence or a stronger snapshot authority, and any scan
-error, changed catalog, or live precondition mismatch fails closed.
+## Explicit boundaries
 
-## 13. Acceptance criteria
-
-The sprint is complete when a fixture with a clean repo, a modified tracked
-file, a safe untracked file, and a sensitive untracked file can:
-
-1. produce two exact stable source catalogs;
-2. reject a changed second pass;
-3. block the sensitive path;
-4. create a deterministic plan for safe files;
-5. require the exact plan digest to apply;
-6. preserve replaced destination bytes in an external backup;
-7. verify fresh destination facts independently; and
-8. install one canonical skill usable by Codex, Pi, and Claude.
+Bulkload does not invoke a terminal multiplexer, TCFS runtime, Home Manager,
+deployment, activation, browser profile migration, or credential rotation. It
+does not mirror undeclared home state and never deletes source data. It does
+not silently resolve structural ambiguity, unsafe typed state, capacity
+shortfall, failed reflinks, or post-plan destination movement.
