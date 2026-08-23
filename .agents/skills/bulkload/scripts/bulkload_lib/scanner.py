@@ -1149,7 +1149,13 @@ def snapshot_sqlite(
     source = resolve_real(source)
     related = [
         source,
-        *[Path(os.fspath(source) + suffix) for suffix in SQLITE_SIDECARS],
+        # This backup reader can update volatile -shm lock metadata itself.
+        # Main/WAL/journal files remain the durable source-motion fence.
+        *[
+            Path(os.fspath(source) + suffix)
+            for suffix in SQLITE_SIDECARS
+            if suffix != "-shm"
+        ],
     ]
     before = {os.fspath(path): _stable_stat(path) for path in related if path.exists()}
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
