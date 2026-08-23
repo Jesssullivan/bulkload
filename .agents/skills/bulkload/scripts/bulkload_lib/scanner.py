@@ -1145,19 +1145,8 @@ def _sqlite_catalog_from_snapshot(path: Path, *, max_rows: int) -> dict[str, Any
 def snapshot_sqlite(
     source: Path, destination: Path, *, max_rows: int
 ) -> dict[str, Any]:
-    """Read the live DB including committed WAL state through SQLite backup."""
+    """Read one consistent image, including committed WAL state, through backup."""
     source = resolve_real(source)
-    related = [
-        source,
-        # This backup reader can update volatile -shm lock metadata itself.
-        # Main/WAL/journal files remain the durable source-motion fence.
-        *[
-            Path(os.fspath(source) + suffix)
-            for suffix in SQLITE_SIDECARS
-            if suffix != "-shm"
-        ],
-    ]
-    before = {os.fspath(path): _stable_stat(path) for path in related if path.exists()}
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         source_connection = sqlite3.connect(
@@ -1172,11 +1161,6 @@ def snapshot_sqlite(
         finally:
             destination_connection.close()
             source_connection.close()
-        after = {
-            os.fspath(path): _stable_stat(path) for path in related if path.exists()
-        }
-        if before != after:
-            raise BulkloadError("SQLite family changed during capture")
         os.chmod(destination, 0o600)
         return _sqlite_catalog_from_snapshot(destination, max_rows=max_rows)
     except sqlite3.Error as error:
