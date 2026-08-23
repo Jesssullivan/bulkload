@@ -17,7 +17,13 @@ from .model import (
     sha256_bytes,
     utc_now,
 )
-from .scanner import stable_capture_pair
+from .scanner import (
+    expand_provider_item,
+    provider_item_destination,
+    provider_item_identity,
+    stable_capture_pair,
+    validate_agent_capture,
+)
 
 
 def _fingerprint(item: dict[str, Any], *, translated: bool = False) -> tuple[Any, ...]:
@@ -45,6 +51,126 @@ def _operation(kind: str, **fields: Any) -> dict[str, Any]:
     operation = {"kind": kind, **fields}
     operation["operation_id"] = sha256_bytes(canonical_bytes(operation))
     return operation
+
+
+def _catalog_ref(
+    owner_class: str,
+    *,
+    identity: str | None = None,
+    name: str | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, str]:
+    value = {"class": owner_class}
+    if identity is not None:
+        value["identity"] = identity
+    if name is not None:
+        value["name"] = name
+    if workspace_id is not None:
+        value["workspace_id"] = workspace_id
+    return value
+
+
+def _reference_key(reference: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        reference.get("class", ""),
+        reference.get("name", ""),
+        reference.get("workspace_id", reference.get("identity", "")),
+    )
+
+
+def _catalog_reference_index(
+    catalog: dict[str, Any],
+) -> dict[tuple[str, str, str], tuple[dict[str, Any], str | None]]:
+    result: dict[tuple[str, str, str], tuple[dict[str, Any], str | None]] = {}
+
+    def add(reference: dict[str, str], item: dict[str, Any], root: str | None) -> None:
+        key = _reference_key(reference)
+        if key in result:
+            raise BulkloadError("AgentPlanV4 catalog reference is not unique")
+        result[key] = (item, root)
+
+    for item in catalog.get("git_workspaces", []):
+        add(
+            _catalog_ref("git-workspace", workspace_id=item["workspace_id"]),
+            item,
+            None,
+        )
+    for item in catalog.get("non_git", []):
+        add(
+            _catalog_ref("non-git", identity=item["identity"]),
+            item,
+            catalog["root_bindings"]["git_root"],
+        )
+    for provider in catalog.get("providers", []):
+        for item in provider.get("items", []):
+            add(
+                _catalog_ref(
+                    "provider",
+                    name=provider["name"],
+                    identity=provider_item_identity(item),
+                ),
+                item,
+                provider["path"],
+            )
+    for seat in catalog.get("seats", []):
+        for item in seat.get("items", []):
+            add(
+                _catalog_ref(
+                    "mutable-seat", name=seat["name"], identity=item["identity"]
+                ),
+                item,
+                seat["path"],
+            )
+    return result
+
+
+class PlanOperationResolver:
+    def __init__(self, plan: dict[str, Any]) -> None:
+        self._source = _catalog_reference_index(plan["source"]["catalog"])
+        self._destination = _catalog_reference_index(plan["destination"]["catalog"])
+
+    @staticmethod
+    def _resolve(
+        index: dict[tuple[str, str, str], tuple[dict[str, Any], str | None]],
+        reference: dict[str, str] | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if reference is None:
+            return None, None
+        try:
+            return index[_reference_key(reference)]
+        except KeyError as error:
+            raise BulkloadError(
+                "AgentPlanV4 catalog reference is unresolved"
+            ) from error
+
+    def materialize(self, operation: dict[str, Any]) -> dict[str, Any]:
+        source, source_root = self._resolve(self._source, operation.get("source_ref"))
+        destination, _ = self._resolve(
+            self._destination, operation.get("destination_ref")
+        )
+        if (operation.get("source_ref") or {}).get("class") == "provider":
+            assert source is not None
+            source = expand_provider_item(source)
+        if (operation.get("destination_ref") or {}).get("class") == "provider":
+            assert destination is not None
+            destination = expand_provider_item(destination)
+        result = {
+            key: value
+            for key, value in operation.items()
+            if key not in {"source_ref", "destination_ref"}
+        }
+        result["source"] = source
+        if source_root is not None:
+            result["source_root"] = source_root
+        result["destination_before"] = destination
+        return result
+
+
+def materialize_plan_operation(
+    plan: dict[str, Any], operation: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve compact plan references without serializing catalog copies."""
+    return PlanOperationResolver(plan).materialize(operation)
 
 
 def _block(
@@ -267,10 +393,17 @@ def _plan_git(
         operations.append(
             _operation(
                 "git-workspace-union",
-                destination_before=destination_workspace,
+                destination_ref=_catalog_ref(
+                    "git-workspace",
+                    workspace_id=destination_workspace["workspace_id"],
+                )
+                if destination_workspace is not None
+                else None,
                 destination_path=target_primary,
                 ref_actions=ref_actions,
-                source=source_workspace,
+                source_ref=_catalog_ref(
+                    "git-workspace", workspace_id=source_workspace["workspace_id"]
+                ),
             )
         )
 
@@ -313,11 +446,12 @@ def _plan_non_git(
             operations.append(
                 _operation(
                     "file-install",
-                    destination_before=before,
+                    destination_ref=_catalog_ref("non-git", identity=before["identity"])
+                    if before is not None
+                    else None,
                     destination_path=target,
                     owner={"class": "non-git", "name": "git-root"},
-                    source=item,
-                    source_root=source["root_bindings"]["git_root"],
+                    source_ref=_catalog_ref("non-git", identity=item["identity"]),
                 )
             )
 
@@ -332,7 +466,7 @@ def _items_by_identity(
     result: dict[str, dict[str, Any]] = {}
     duplicates: list[str] = []
     for item in provider.get("items", []):
-        identity = item["identity"]
+        identity = provider_item_identity(item)
         if identity in result:
             duplicates.append(identity)
         else:
@@ -379,7 +513,7 @@ def _plan_providers(
             destination_provider
         )
         destination_paths = {
-            item["destination_relative_path"]: item
+            provider_item_destination(item): item
             for item in destination_provider.get("items", [])
         }
         for identity in sorted(set(source_duplicates + destination_duplicates)):
@@ -389,12 +523,12 @@ def _plan_providers(
             destination_item = destination_items.get(identity)
             target = str(
                 Path(source_provider["destination_path"])
-                / source_item["destination_relative_path"]
+                / provider_item_destination(source_item)
             )
             owner = {"class": "provider", "name": name}
             if _structural_collision(
                 source_item,
-                destination_paths.get(source_item["destination_relative_path"]),
+                destination_paths.get(provider_item_destination(source_item)),
             ):
                 _block(blockers, "structural-type-collision", target)
                 continue
@@ -416,11 +550,16 @@ def _plan_providers(
                 operations.append(
                     _operation(
                         "sqlite-union",
-                        destination_before=destination_item,
+                        destination_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        )
+                        if destination_item is not None
+                        else None,
                         destination_path=target,
                         owner=owner,
-                        source=source_item,
-                        source_root=source_provider["path"],
+                        source_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        ),
                     )
                 )
                 continue
@@ -444,11 +583,16 @@ def _plan_providers(
                     operations.append(
                         _operation(
                             "file-install",
-                            destination_before=destination_item,
+                            destination_ref=_catalog_ref(
+                                "provider", name=name, identity=identity
+                            )
+                            if destination_item is not None
+                            else None,
                             destination_path=target,
                             owner=owner,
-                            source=source_item,
-                            source_root=source_provider["path"],
+                            source_ref=_catalog_ref(
+                                "provider", name=name, identity=identity
+                            ),
                             transform="path-rewrite"
                             if classification.endswith("rewrite")
                             else None,
@@ -459,11 +603,16 @@ def _plan_providers(
                 operations.append(
                     _operation(
                         "auth-install",
-                        destination_before=destination_item,
+                        destination_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        )
+                        if destination_item is not None
+                        else None,
                         destination_path=target,
                         owner=owner,
-                        source=source_item,
-                        source_root=source_provider["path"],
+                        source_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        ),
                     )
                 )
                 continue
@@ -474,11 +623,16 @@ def _plan_providers(
                 operations.append(
                     _operation(
                         "file-install",
-                        destination_before=destination_item,
+                        destination_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        )
+                        if destination_item is not None
+                        else None,
                         destination_path=target,
                         owner=owner,
-                        source=source_item,
-                        source_root=source_provider["path"],
+                        source_ref=_catalog_ref(
+                            "provider", name=name, identity=identity
+                        ),
                         transform="path-rewrite" if translated else None,
                     )
                 )
@@ -529,7 +683,11 @@ def _plan_seats(
             operations.append(
                 _operation(
                     "file-install",
-                    destination_before=before,
+                    destination_ref=_catalog_ref(
+                        "mutable-seat", name=name, identity=before["identity"]
+                    )
+                    if before is not None
+                    else None,
                     destination_path=(
                         source_seat["destination_path"]
                         if source_seat["root_kind"] == "file"
@@ -539,8 +697,9 @@ def _plan_seats(
                         )
                     ),
                     owner={"class": "mutable-seat", "name": name},
-                    source=item,
-                    source_root=source_seat["path"],
+                    source_ref=_catalog_ref(
+                        "mutable-seat", name=name, identity=item["identity"]
+                    ),
                 )
             )
 
@@ -576,7 +735,7 @@ def _all_destination_file_digests(catalog: dict[str, Any]) -> set[str]:
 def _capacity_contract(
     source: dict[str, Any],
     destination: dict[str, Any],
-    operations: list[dict[str, Any]],
+    operations: Iterable[dict[str, Any]],
 ) -> dict[str, int | str]:
     destination_digests = _all_destination_file_digests(destination)
     unique: dict[str, int] = {}
@@ -657,26 +816,21 @@ def _capacity_contract(
     }
 
 
-def compile_agent_plan(
-    source_a: dict[str, Any],
-    source_b: dict[str, Any],
-    destination_a: dict[str, Any],
-    destination_b: dict[str, Any],
+def compile_agent_plan_authorities(
+    source_capture: dict[str, Any],
+    source_capture_ids: tuple[str, str],
+    destination_capture: dict[str, Any],
+    destination_capture_ids: tuple[str, str],
 ) -> dict[str, Any]:
-    stable_capture_pair(source_a, source_b, role="source")
-    stable_capture_pair(destination_a, destination_b, role="destination")
-    source = source_a["catalog"]
-    destination = destination_a["catalog"]
+    validate_agent_capture(source_capture, expected_role="source")
+    validate_agent_capture(destination_capture, expected_role="destination")
+    source = source_capture["catalog"]
+    destination = destination_capture["catalog"]
     if source["path_map"] != destination["path_map"]:
         raise BulkloadError("source and destination path-map contracts differ")
     if source["provider_policy"] != destination["provider_policy"]:
         raise BulkloadError("source and destination managed-exclusion policies differ")
-    capture_ids = {
-        source_a["capture_id"],
-        source_b["capture_id"],
-        destination_a["capture_id"],
-        destination_b["capture_id"],
-    }
+    capture_ids = {*source_capture_ids, *destination_capture_ids}
     if len(capture_ids) != 4:
         raise BulkloadError("all four capture IDs must be globally distinct")
     operations: list[dict[str, Any]] = []
@@ -691,14 +845,24 @@ def compile_agent_plan(
     )
     blockers.sort(key=lambda item: (item["code"], item["path"], item.get("detail", "")))
     holds.sort(key=lambda item: (item["code"], item["path"]))
+    authority = {
+        "source": {"catalog": source},
+        "destination": {"catalog": destination},
+    }
+    expanded_operations: Iterable[dict[str, Any]] = ()
+    if not blockers:
+        resolver = PlanOperationResolver(authority)
+        expanded_operations = (
+            resolver.materialize(operation) for operation in operations
+        )
     plan = {
         "blockers": blockers,
-        "capacity": _capacity_contract(source, destination, operations),
+        "capacity": _capacity_contract(source, destination, expanded_operations),
         "created_at": utc_now(),
         "destination": {
-            "capture_ids": [destination_a["capture_id"], destination_b["capture_id"]],
+            "capture_ids": list(destination_capture_ids),
             "catalog": destination,
-            "catalog_sha256": destination_a["catalog_sha256"],
+            "catalog_sha256": destination_capture["catalog_sha256"],
         },
         "holds": holds,
         "operations": operations if not blockers else [],
@@ -708,12 +872,28 @@ def compile_agent_plan(
         "required_stage_phases": ["preseed", "final"],
         "schema": AGENT_PLAN_SCHEMA,
         "source": {
-            "capture_ids": [source_a["capture_id"], source_b["capture_id"]],
+            "capture_ids": list(source_capture_ids),
             "catalog": source,
-            "catalog_sha256": source_a["catalog_sha256"],
+            "catalog_sha256": source_capture["catalog_sha256"],
         },
     }
     return seal(plan, "plan_sha256")
+
+
+def compile_agent_plan(
+    source_a: dict[str, Any],
+    source_b: dict[str, Any],
+    destination_a: dict[str, Any],
+    destination_b: dict[str, Any],
+) -> dict[str, Any]:
+    stable_capture_pair(source_a, source_b, role="source")
+    stable_capture_pair(destination_a, destination_b, role="destination")
+    return compile_agent_plan_authorities(
+        source_a,
+        (source_a["capture_id"], source_b["capture_id"]),
+        destination_a,
+        (destination_a["capture_id"], destination_b["capture_id"]),
+    )
 
 
 def validate_agent_plan(value: dict[str, Any], *, require_ready: bool = False) -> None:
@@ -788,6 +968,7 @@ def validate_agent_plan(value: dict[str, Any], *, require_ready: bool = False) -
         raise BulkloadError(
             "AgentPlanV4 destination runtime closure differs from this executable"
         )
+    resolver = PlanOperationResolver(value) if value.get("operations") else None
     for operation in value.get("operations", []):
         expected = sha256_bytes(
             canonical_bytes(
@@ -796,3 +977,5 @@ def validate_agent_plan(value: dict[str, Any], *, require_ready: bool = False) -
         )
         if operation.get("operation_id") != expected:
             raise BulkloadError("AgentPlanV4 operation digest mismatch")
+        assert resolver is not None
+        resolver.materialize(operation)

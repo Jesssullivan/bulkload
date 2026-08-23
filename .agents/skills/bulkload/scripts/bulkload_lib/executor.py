@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from .model import (
     AGENT_STAGE_SCHEMA,
     AGENT_VERIFY_SCHEMA,
     BulkloadError,
+    MAX_JSON_BYTES,
     accounted_copy,
     assert_no_overlap,
     atomic_write,
@@ -42,7 +44,7 @@ from .model import (
     sha256_symlink,
     utc_now,
 )
-from .planner import validate_agent_plan
+from .planner import PlanOperationResolver, validate_agent_plan
 from .scanner import (
     DEFAULT_MAX_SQLITE_ROWS,
     _quote_identifier,
@@ -157,7 +159,10 @@ def _git(repository: Path, arguments: Sequence[str], *, check: bool = True) -> b
 
 
 def _live_roots(plan: dict[str, Any]) -> list[Path]:
-    catalog = plan["destination"]["catalog"]
+    return [Path(value) for value in _catalog_roots(plan["destination"]["catalog"])]
+
+
+def _catalog_roots(catalog: dict[str, Any]) -> list[str]:
     values = {
         catalog["root_bindings"]["git_root"],
         catalog["root_bindings"]["home"],
@@ -170,7 +175,10 @@ def _live_roots(plan: dict[str, Any]) -> list[Path]:
     values.update(
         seat["path"] for seat in catalog.get("seats", []) if seat.get("exists")
     )
-    return sorted((Path(value) for value in values), key=os.fspath)
+    roots = sorted(os.fspath(Path(value)) for value in values)
+    if any(not Path(value).is_absolute() for value in roots):
+        raise BulkloadError("catalog live roots must be absolute")
+    return roots
 
 
 def _object_path(stage_root: Path, digest: str) -> Path:
@@ -186,7 +194,9 @@ def _source_path(path: str | Path, mirror: Path | None) -> Path:
 
 def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
     paths: set[str] = set()
-    for operation in plan["operations"]:
+    resolver = PlanOperationResolver(plan)
+    for compact_operation in plan["operations"]:
+        operation = resolver.materialize(compact_operation)
         source = operation["source"]
         if operation["kind"] == "git-workspace-union":
             common = Path(source["common_git_dir"]) / "objects"
@@ -278,7 +288,8 @@ def _transport_ssh(ssh_binary: str | None) -> str:
 
 
 def _transport_body(
-    plan: dict[str, Any],
+    plan_sha256: str,
+    holds: list[dict[str, Any]],
     phase: str,
     stage_root: Path,
     transport: dict[str, Any],
@@ -287,9 +298,9 @@ def _transport_body(
     manifest = {
         "created_at": utc_now(),
         "entries": [],
-        "holds": plan["holds"],
+        "holds": holds,
         "phase": phase,
-        "plan_sha256": plan["plan_sha256"],
+        "plan_sha256": plan_sha256,
         "stage_id": new_id(),
         "stage_root": os.fspath(stage_root),
     }
@@ -301,7 +312,7 @@ def _transport_body(
         "manifest_sha256": manifest["manifest_sha256"],
         "materialization": {},
         "phase": phase,
-        "plan_sha256": plan["plan_sha256"],
+        "plan_sha256": plan_sha256,
         "ready_for_apply": False,
         "receipt_id": new_id(),
         "schema": AGENT_STAGE_SCHEMA,
@@ -309,6 +320,55 @@ def _transport_body(
         "transport": transport,
     }
     return seal(receipt, "receipt_sha256")
+
+
+def _allowlist_path(stage_root: Path, phase: str) -> Path:
+    return stage_root / f".transport-allowlist-{phase}.nul"
+
+
+def _snapshot_allowlist_stream(
+    source: Any,
+    snapshot: Any,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    info = os.fstat(source.fileno())
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size != expected_size
+        or info.st_size > MAX_JSON_BYTES
+    ):
+        raise BulkloadError("transport allowlist custody is invalid")
+    digest = hashlib.sha256()
+    pending = b""
+    previous: bytes | None = None
+    while chunk := source.read(1024 * 1024):
+        digest.update(chunk)
+        snapshot.write(chunk)
+        pending += chunk
+        records = pending.split(b"\0")
+        pending = records.pop()
+        for record in records:
+            if (
+                not record
+                or record.startswith(b"/")
+                or any(part in {b"", b".", b".."} for part in record.split(b"/"))
+                or previous is not None
+                and record <= previous
+            ):
+                raise BulkloadError("transport allowlist is not canonical")
+            previous = record
+        if len(pending) > 1024 * 1024:
+            raise BulkloadError("transport allowlist path exceeds the bounded contract")
+    if pending:
+        raise BulkloadError("transport allowlist is not NUL terminated")
+    if digest.hexdigest() != expected_sha256:
+        raise BulkloadError("transport allowlist digest mismatch")
+    snapshot.flush()
+    os.fsync(snapshot.fileno())
+    snapshot.seek(0)
 
 
 def _validate_prepare_receipt(
@@ -319,6 +379,8 @@ def _validate_prepare_receipt(
 ) -> None:
     validate_stage_receipt(receipt)
     payload = b"".join(os.fsencode(item) + b"\0" for item in _plan_source_paths(plan))
+    source = plan["source"]["catalog"]
+    destination = plan["destination"]["catalog"]
     if (
         receipt["plan_sha256"] != plan["plan_sha256"]
         or receipt["phase"] != phase
@@ -327,10 +389,14 @@ def _validate_prepare_receipt(
         or receipt["manifest"]["entries"]
         or receipt["transport"]["mode"] != "destination-prepare"
         or receipt["transport"]["allowlist_sha256"] != sha256_bytes(payload)
+        or receipt["transport"]["allowlist_size"] != len(payload)
+        or receipt["transport"]["destination_host"]
+        != destination["transport"]["hostname"]
         or receipt["transport"]["destination_rsync"]
-        != plan["destination"]["catalog"]["transport"]["rsync"]
-        or receipt["transport"]["source_rsync"]
-        != plan["source"]["catalog"]["transport"]["rsync"]
+        != destination["transport"]["rsync"]
+        or receipt["transport"]["source_host"] != source["transport"]["hostname"]
+        or receipt["transport"]["source_roots"] != _catalog_roots(source)
+        or receipt["transport"]["source_rsync"] != source["transport"]["rsync"]
         or receipt["transport"]["transport_receipt_sha256"] is not None
     ):
         raise BulkloadError("prepare receipt is detached from the accepted stage plan")
@@ -340,63 +406,94 @@ def _validate_prepare_receipt(
         raise BulkloadError("prepare receipt quarantine binding is invalid")
 
 
-def _push_source_transport(
-    plan: dict[str, Any],
+def push_agent_transport(
+    prepare_receipt: dict[str, Any],
+    allowlist_path: Path,
+    *,
+    accepted_plan_sha256: str,
     phase: str,
     stage_root: Path,
     destination_ssh_host: str,
-    prepare_receipt: dict[str, Any],
-    *,
-    ssh_binary: str | None,
+    _ssh_binary: str | None = None,
 ) -> dict[str, Any]:
-    source = plan["source"]["catalog"]["transport"]
-    destination = plan["destination"]["catalog"]["transport"]
-    _validate_prepare_receipt(plan, phase, stage_root, prepare_receipt)
-    if socket.gethostname() != source["hostname"]:
-        raise BulkloadError("transport push must run on the captured source host")
-    host = _transport_host(destination_ssh_host, destination["hostname"])
-    ssh_path = _transport_ssh(ssh_binary)
-    source_binding = inspect_rsync(source["rsync"]["path"])
-    if source_binding != source["rsync"]:
-        raise BulkloadError("source rsync differs from captured authority")
-    _probe_remote_rsync(ssh_path, host, destination["rsync"])
-    allowlist = _plan_source_paths(plan)
-    payload = b"".join(os.fsencode(item) + b"\0" for item in allowlist)
-    quarantine = Path(prepare_receipt["transport"]["quarantine_root"])
-    result = subprocess.run(
-        [
-            source_binding["path"],
-            "-a",
-            "--from0",
-            "--files-from=-",
-            "--checksum",
-            "--delay-updates",
-            "--ignore-missing-args",
-            "--no-devices",
-            "--no-specials",
-            f"--rsync-path={destination['rsync']['path']}",
-            "/",
-            f"{host}:{quarantine}/",
-        ],
-        input=payload,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=_transport_environment(ssh_path),
+    validate_stage_receipt(prepare_receipt)
+    stage_root = _remote_safe_stage_root(stage_root)
+    transport_authority = prepare_receipt["transport"]
+    if (
+        prepare_receipt["plan_sha256"] != accepted_plan_sha256
+        or prepare_receipt["phase"] != phase
+        or prepare_receipt["stage_root"] != os.fspath(stage_root)
+        or prepare_receipt["ready_for_apply"]
+        or prepare_receipt["manifest"]["entries"]
+        or transport_authority["mode"] != "destination-prepare"
+        or transport_authority["transport_receipt_sha256"] is not None
+        or transport_authority["quarantine_root"]
+        != os.fspath(stage_root / ".transport-quarantine")
+    ):
+        raise BulkloadError("prepare receipt is detached from the accepted push")
+    assert_no_overlap(
+        stage_root,
+        [Path(value) for value in transport_authority["source_roots"]],
+        "stage root",
     )
+    if socket.gethostname() != transport_authority["source_host"]:
+        raise BulkloadError("transport push must run on the captured source host")
+    host = _transport_host(
+        destination_ssh_host, transport_authority["destination_host"]
+    )
+    ssh_path = _transport_ssh(_ssh_binary)
+    source_binding = inspect_rsync(transport_authority["source_rsync"]["path"])
+    if source_binding != transport_authority["source_rsync"]:
+        raise BulkloadError("source rsync differs from captured authority")
+    _probe_remote_rsync(ssh_path, host, transport_authority["destination_rsync"])
+    quarantine = Path(prepare_receipt["transport"]["quarantine_root"])
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(allowlist_path, flags)
+    with (
+        os.fdopen(descriptor, "rb", buffering=0, closefd=True) as allowlist,
+        tempfile.TemporaryFile(prefix="bulkload-allowlist-") as snapshot,
+    ):
+        os.fchmod(snapshot.fileno(), 0o600)
+        _snapshot_allowlist_stream(
+            allowlist,
+            snapshot,
+            expected_size=transport_authority["allowlist_size"],
+            expected_sha256=transport_authority["allowlist_sha256"],
+        )
+        result = subprocess.run(
+            [
+                source_binding["path"],
+                "-a",
+                "--from0",
+                "--files-from=-",
+                "--checksum",
+                "--delay-updates",
+                "--ignore-missing-args",
+                "--no-devices",
+                "--no-specials",
+                f"--rsync-path={transport_authority['destination_rsync']['path']}",
+                "/",
+                f"{host}:{quarantine}/",
+            ],
+            stdin=snapshot,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=_transport_environment(ssh_path),
+        )
     if result.returncode != 0:
         raise BulkloadError("authenticated rsync quarantine push failed")
-    transport = {
-        "allowlist_sha256": sha256_bytes(payload),
-        "destination_rsync": destination["rsync"],
-        "mode": "ssh-rsync-push",
-        "quarantine_root": os.fspath(quarantine),
-        "source_host": source["hostname"],
-        "source_rsync": source_binding,
-        "transport_receipt_sha256": prepare_receipt["receipt_sha256"],
-    }
+    transport = dict(transport_authority)
+    transport["mode"] = "ssh-rsync-push"
+    transport["source_rsync"] = source_binding
+    transport["transport_receipt_sha256"] = prepare_receipt["receipt_sha256"]
     receipt = _transport_body(
-        plan, phase, stage_root, transport, prepare_receipt["capacity"]
+        accepted_plan_sha256,
+        prepare_receipt["manifest"]["holds"],
+        phase,
+        stage_root,
+        transport,
+        prepare_receipt["capacity"],
     )
     with tempfile.TemporaryDirectory(prefix="bulkload-transport-") as temporary:
         local_receipt = Path(temporary) / f"transport-receipt-{phase}.json"
@@ -417,7 +514,7 @@ def _push_source_transport(
                 "--delay-updates",
                 "--no-devices",
                 "--no-specials",
-                f"--rsync-path={destination['rsync']['path']}",
+                f"--rsync-path={transport_authority['destination_rsync']['path']}",
                 os.fspath(local_receipt),
                 f"{host}:{stage_root}/.transport-receipt-{phase}.json",
             ],
@@ -444,21 +541,19 @@ def _materialized_transport(
     expected_allowlist = b"".join(
         os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
     )
+    expected_transport = dict(prepare_receipt["transport"])
+    expected_transport["mode"] = "ssh-rsync-push"
+    expected_transport["transport_receipt_sha256"] = prepare_receipt["receipt_sha256"]
     if (
         transport_receipt["plan_sha256"] != plan["plan_sha256"]
         or transport_receipt["phase"] != phase
         or transport_receipt["stage_root"] != os.fspath(stage_root)
         or transport_receipt["ready_for_apply"]
         or transport_receipt["manifest"]["entries"]
-        or transport_receipt["transport"]["mode"] != "ssh-rsync-push"
+        or transport_receipt["transport"] != expected_transport
         or transport_receipt["transport"]["allowlist_sha256"]
         != sha256_bytes(expected_allowlist)
-        or transport_receipt["transport"]["source_rsync"]
-        != plan["source"]["catalog"]["transport"]["rsync"]
-        or transport_receipt["transport"]["destination_rsync"]
-        != plan["destination"]["catalog"]["transport"]["rsync"]
-        or transport_receipt["transport"]["transport_receipt_sha256"]
-        != prepare_receipt["receipt_sha256"]
+        or transport_receipt["transport"]["allowlist_size"] != len(expected_allowlist)
     ):
         raise BulkloadError(
             "transport receipt is detached from the accepted stage plan"
@@ -924,7 +1019,6 @@ def _stage_file_operation(
         "destination_path": operation["destination_path"],
         "operation_id": operation["operation_id"],
         "owner": operation["owner"],
-        "source": operation["source"],
     }
 
 
@@ -1004,7 +1098,6 @@ def _stage_git_operation(
                     ),
                     "destination_path": os.fspath(target),
                     "relative_path": record["relative_path"],
-                    "source": record,
                 }
             )
         deletions = [
@@ -1061,8 +1154,8 @@ def _stage_git_operation(
                 if destination_index and destination_index.get("exists")
                 else None,
                 "index_expected_exists": index["exists"],
+                "locked": bool(source_worktree.get("locked")),
                 "path": os.fspath(destination_path),
-                "source": source_worktree,
             }
         )
     return {
@@ -1074,7 +1167,6 @@ def _stage_git_operation(
         "objects": objects,
         "operation_id": operation["operation_id"],
         "ref_actions": operation["ref_actions"],
-        "source": source,
         "worktrees": worktrees,
     }
 
@@ -1145,10 +1237,13 @@ def validate_stage_receipt(
         value["transport"],
         {
             "allowlist_sha256",
+            "allowlist_size",
+            "destination_host",
             "destination_rsync",
             "mode",
             "quarantine_root",
             "source_host",
+            "source_roots",
             "source_rsync",
             "transport_receipt_sha256",
         },
@@ -1161,6 +1256,25 @@ def validate_stage_receipt(
         "ssh-rsync-quarantine",
     }:
         raise BulkloadError("AgentStageV4 transport mode is invalid")
+    transport = value["transport"]
+    if (
+        not isinstance(transport["allowlist_size"], int)
+        or isinstance(transport["allowlist_size"], bool)
+        or not 0 <= transport["allowlist_size"] <= MAX_JSON_BYTES
+        or not isinstance(transport["allowlist_sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", transport["allowlist_sha256"])
+        or not isinstance(transport["source_host"], str)
+        or not transport["source_host"]
+        or not isinstance(transport["destination_host"], str)
+        or not transport["destination_host"]
+        or not isinstance(transport["source_roots"], list)
+        or any(
+            not isinstance(root, str) or not Path(root).is_absolute()
+            for root in transport["source_roots"]
+        )
+        or transport["source_roots"] != sorted(set(transport["source_roots"]))
+    ):
+        raise BulkloadError("AgentStageV4 transport authority is invalid")
 
 
 def _verify_stage_objects(manifest: dict[str, Any], stage_root: Path) -> None:
@@ -1210,14 +1324,13 @@ def stage_agent_plan(
     destination_ssh_host: str | None = None,
     prepare_receipt: dict[str, Any] | None = None,
     transport_receipt: dict[str, Any] | None = None,
-    _ssh_binary: str | None = None,
 ) -> dict[str, Any]:
     validate_agent_plan(plan, require_ready=True)
     if accepted_plan_sha256 != plan["plan_sha256"]:
         raise BulkloadError("accepted plan digest does not match AgentPlanV4")
     if phase not in {"preseed", "final"}:
         raise BulkloadError("agent-stage phase must be preseed or final")
-    if transport_mode not in {"local", "prepare", "push", "materialize"}:
+    if transport_mode not in {"local", "prepare", "materialize"}:
         raise BulkloadError("agent-stage transport mode is invalid")
     stage_root = _remote_safe_stage_root(stage_root)
     assert_no_overlap(stage_root, _live_roots(plan), "stage root")
@@ -1256,37 +1369,31 @@ def stage_agent_plan(
         payload = b"".join(
             os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
         )
+        atomic_write(_allowlist_path(stage_root, phase), payload, mode=0o600)
         transport = {
             "allowlist_sha256": sha256_bytes(payload),
+            "allowlist_size": len(payload),
+            "destination_host": destination["hostname"],
             "destination_rsync": destination_binding,
             "mode": "destination-prepare",
             "quarantine_root": os.fspath(quarantine),
             "source_host": source["hostname"],
+            "source_roots": _catalog_roots(plan["source"]["catalog"]),
             "source_rsync": source["rsync"],
             "transport_receipt_sha256": None,
         }
-        receipt = _transport_body(plan, phase, stage_root, transport, capacity)
-        atomic_write_json(stage_root / f".prepare-receipt-{phase}.json", receipt)
-        return receipt
-    if transport_mode == "push":
-        if (
-            destination_ssh_host is None
-            or prepare_receipt is None
-            or transport_receipt is not None
-        ):
-            raise BulkloadError(
-                "transport push requires destination host and exact prepare receipt"
-            )
-        return _push_source_transport(
-            plan,
+        receipt = _transport_body(
+            plan["plan_sha256"],
+            plan["holds"],
             phase,
             stage_root,
-            destination_ssh_host,
-            prepare_receipt,
-            ssh_binary=_ssh_binary,
+            transport,
+            capacity,
         )
+        atomic_write_json(stage_root / f".prepare-receipt-{phase}.json", receipt)
+        return receipt
     if destination_ssh_host is not None:
-        raise BulkloadError("destination SSH host is valid only for transport push")
+        raise BulkloadError("destination SSH host is invalid for plan staging")
     if transport_mode == "materialize":
         if transport_receipt is None or prepare_receipt is None:
             raise BulkloadError(
@@ -1349,16 +1456,21 @@ def stage_agent_plan(
         source_mirror = None
         transport = {
             "allowlist_sha256": sha256_bytes(payload),
+            "allowlist_size": len(payload),
+            "destination_host": destination["hostname"],
             "destination_rsync": destination_binding,
             "mode": "local",
             "quarantine_root": None,
             "source_host": source["hostname"],
+            "source_roots": _catalog_roots(plan["source"]["catalog"]),
             "source_rsync": source_binding,
             "transport_receipt_sha256": None,
         }
     stats = defaultdict(int)
     entries: list[dict[str, Any]] = []
-    for operation in plan["operations"]:
+    resolver = PlanOperationResolver(plan)
+    for compact_operation in plan["operations"]:
+        operation = resolver.materialize(compact_operation)
         try:
             if operation["kind"] == "git-workspace-union":
                 entries.append(
@@ -1702,7 +1814,7 @@ def _apply_git_entry(
     intended_worktrees = {}
     for worktree in entry["worktrees"]:
         before = worktrees_before.get(worktree["path"])
-        locked = bool(worktree["source"].get("locked"))
+        locked = bool(worktree.get("locked"))
         intended_worktrees[worktree["path"]] = {
             "branch": worktree["branch"],
             "detached": worktree["detached"],
@@ -1799,10 +1911,10 @@ def _apply_git_entry(
             _git_crash_fence("head")
         if target != primary:
             observed_locked = (_resolve_git_dir(target) / "locked").exists()
-            if worktree["source"].get("locked") and not observed_locked:
+            if worktree.get("locked") and not observed_locked:
                 _git(primary, ["worktree", "lock", os.fspath(target)])
                 _git_crash_fence("lock")
-            elif not worktree["source"].get("locked") and observed_locked:
+            elif not worktree.get("locked") and observed_locked:
                 _git(primary, ["worktree", "unlock", os.fspath(target)])
                 _git_crash_fence("lock")
     observed_refs = _git_ref_state(primary, ref_names)
@@ -2382,7 +2494,7 @@ def _verify_git_entry(entry: dict[str, Any]) -> list[dict[str, str]]:
             "branch": worktree["branch"],
             "detached": worktree["detached"],
             "head": worktree["head"],
-            "locked": bool(worktree["source"].get("locked")),
+            "locked": bool(worktree.get("locked")),
         }
         if any(observed_state[key] != value for key, value in expected_state.items()):
             failures.append(

@@ -157,7 +157,10 @@ def _parse_finite(value: str) -> float:
     return result
 
 
-def read_json(path: Path, *, max_bytes: int = 512 * 1024 * 1024) -> dict[str, Any]:
+MAX_JSON_BYTES = 4 * 1024**3
+
+
+def read_json(path: Path, *, max_bytes: int = MAX_JSON_BYTES) -> dict[str, Any]:
     try:
         info = path.stat(follow_symlinks=False)
         if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:

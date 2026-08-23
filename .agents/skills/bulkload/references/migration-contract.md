@@ -14,12 +14,17 @@
 | Mutable seat | exact directory or optional regular file | explicit source-authority overlay | exact typed entries/absence |
 | Unsafe/ambiguous state | blocker | never inferred | no receipt |
 
+
 ## Required sequence
 
 1. Briefly quiesce; capture preliminary source and destination A/B pairs.
-2. Compile/review/accept the preliminary plan, then resume writers.
-3. On Sting prepare the private stage; from Neo push the exact allowlist; on
-   Sting materialize preseed. Every SSH connection originates on Neo.
+2. Compile/review/accept the preliminary plan, then resume writers. If the four
+   captures total more than 512 MiB, Neo first pushes its two captures to the
+   private Sting evidence directory and planning runs on memory-qualified Sting.
+3. On Sting prepare the private stage and sealed NUL allowlist; Neo pulls the
+   small prepare receipt and allowlist, then streams that authority without
+   loading AgentPlanV4; on Sting materialize preseed. Every SSH connection
+   originates on Neo.
 4. Quiesce again; capture fresh final A/B pairs and accept a fresh plan digest.
 5. Repeat prepare/push/materialize with `--phase final`; keep writers stopped.
 6. Pass the exact capacity gates and reflink-snapshot every overwritten entry.
@@ -79,8 +84,9 @@ The plan and receipts separate:
 The gate is `available >= incoming + compose + overwritten + reserve`. A full
 destination rollback duplicate is forbidden.
 
-Destination `prepare` creates mode-0700 stage/quarantine and gates capacity.
-Neo `push` binds the plan's NUL allowlist plus captured GNU-rsync evidence;
+Destination `prepare` creates mode-0700 stage/quarantine, writes a mode-0600
+plan-derived allowlist, and gates capacity. Neo `push` validates and streams
+that sealed allowlist plus captured GNU-rsync evidence without decoding the plan;
 Sting `materialize` requires chained prepare/push receipt digests and gates
 again. Plans and receipts use exact owner-private paths and travel only over
 Neo-initiated strict SSH; no Sting-originated credential exists.
