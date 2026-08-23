@@ -469,6 +469,160 @@ class SchemaAndCaptureTests(unittest.TestCase):
             )
             self.assertTrue(workspace["recovery_anchors"])
 
+    def test_invalid_git_candidate_falls_back_to_exact_non_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            invalid = fixture.source_git / "invalid-candidate"
+            (invalid / ".git").mkdir(parents=True)
+            marker = invalid / ".git/opaque.bin"
+            marker.write_bytes(b"not a repository\x00")
+            payload = invalid / "payload.bin"
+            payload.write_bytes(b"opaque payload\xff")
+
+            capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            non_git = {
+                item["relative_path"]: item for item in capture["catalog"]["non_git"]
+            }
+            self.assertEqual(
+                non_git["invalid-candidate/.git/opaque.bin"]["sha256"],
+                hashlib.sha256(marker.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                non_git["invalid-candidate/payload.bin"]["sha256"],
+                hashlib.sha256(payload.read_bytes()).hexdigest(),
+            )
+
+            unreadable = fixture.source_git / "unreadable-candidate"
+            unreadable.mkdir()
+            unreadable_git = unreadable / ".git"
+            unreadable_git.write_bytes(b"not git\n")
+            path_open = Path.open
+
+            def guarded_open(path: Path, *args, **kwargs):
+                if path == unreadable_git:
+                    raise PermissionError("unreadable test authority")
+                return path_open(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", guarded_open):
+                unreadable_capture = fixture.capture("source")
+            self.assertFalse(unreadable_capture["complete"])
+            self.assertIn(
+                "git-discovery-failed",
+                {item["code"] for item in unreadable_capture["catalog"]["blockers"]},
+            )
+
+            unsafe = fixture.source_git / "unsafe-candidate"
+            unsafe.mkdir()
+            os.symlink("../invalid-candidate/.git", unsafe / ".git")
+            external = fixture.source_git / "external-authority"
+            external.mkdir()
+            (external / ".git").write_text(
+                "gitdir: /unavailable/git/authority\n", encoding="utf-8"
+            )
+            blocked = fixture.capture("source")
+            self.assertFalse(blocked["complete"])
+            self.assertTrue(
+                {"unsafe-git-authority", "git-discovery-failed"}.issubset(
+                    {item["code"] for item in blocked["catalog"]["blockers"]}
+                )
+            )
+
+    def test_alternates_and_fsck_failures_use_opaque_non_git_custody(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            alternate = fixture.source_git / "alternate-repo"
+            initialize_repository(alternate)
+            external_objects = fixture.root / "external-objects"
+            external_objects.mkdir()
+            alternates = alternate / ".git/objects/info/alternates"
+            alternates.write_text(str(external_objects) + "\n", encoding="utf-8")
+
+            corrupt = fixture.source_git / "corrupt-repo"
+            initialize_repository(corrupt)
+            corrupt_object = corrupt / ".git/objects/aa" / ("0" * 38)
+            corrupt_object.parent.mkdir()
+            corrupt_object.write_bytes(b"not a loose object")
+
+            capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            workspace_paths = {
+                item["path"] for item in capture["catalog"]["git_workspaces"]
+            }
+            self.assertNotIn(str(alternate.resolve()), workspace_paths)
+            self.assertNotIn(str(corrupt.resolve()), workspace_paths)
+            non_git = {
+                item["relative_path"]: item for item in capture["catalog"]["non_git"]
+            }
+            self.assertEqual(
+                non_git["alternate-repo/.git/objects/info/alternates"]["sha256"],
+                hashlib.sha256(alternates.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                non_git["corrupt-repo/.git/objects/aa/" + "0" * 38]["sha256"],
+                hashlib.sha256(corrupt_object.read_bytes()).hexdigest(),
+            )
+
+            alternates.unlink()
+            os.symlink(external_objects, alternates)
+            unsafe_alternates = fixture.capture("source")
+            self.assertFalse(unsafe_alternates["complete"])
+            self.assertIn(
+                "Git alternates authority is unsafe",
+                {
+                    item.get("detail")
+                    for item in unsafe_alternates["catalog"]["blockers"]
+                },
+            )
+            alternates.unlink()
+            alternates.write_text(str(external_objects) + "\n", encoding="utf-8")
+
+            linked = add_linked_worktree(
+                alternate, fixture.source_git / "alternate-linked"
+            )
+            linked.rename(fixture.root / "moved-linked-worktree")
+            blocked = fixture.capture("source")
+            self.assertFalse(blocked["complete"])
+            self.assertIn(
+                "Git workspace has blockers in addition to opaque-only state",
+                {item.get("detail") for item in blocked["catalog"]["blockers"]},
+            )
+
+    def test_missing_fetch_head_recovery_oid_is_non_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            git_dir = fixture.source_repo / ".git"
+            missing = "f" * 40
+            (git_dir / "FETCH_HEAD").write_text(
+                f"{missing}\tnot-for-merge\tbranch 'stale' of example.invalid\n",
+                encoding="utf-8",
+            )
+            capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            anchors = capture["catalog"]["git_workspaces"][0]["recovery_anchors"]
+            self.assertNotIn(missing, {item["oid"] for item in anchors})
+
+            (git_dir / "FETCH_HEAD").unlink()
+            (git_dir / "ORIG_HEAD").write_text(missing + "\n", encoding="ascii")
+            blocked_pseudo = fixture.capture("source")
+            self.assertFalse(blocked_pseudo["complete"])
+            self.assertIn(
+                "a Git recovery anchor object is missing",
+                {item.get("detail") for item in blocked_pseudo["catalog"]["blockers"]},
+            )
+
+            (git_dir / "ORIG_HEAD").unlink()
+            (git_dir / "logs/missing-anchor").write_text(
+                f"{'0' * 40} {missing} actor <actor@example.invalid> 0 +0000\told\n",
+                encoding="ascii",
+            )
+            blocked_reflog = fixture.capture("source")
+            self.assertFalse(blocked_reflog["complete"])
+            self.assertIn(
+                "a Git recovery anchor object is missing",
+                {item.get("detail") for item in blocked_reflog["catalog"]["blockers"]},
+            )
+
     def test_capture_pair_rejects_motion_and_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=False)
@@ -544,6 +698,116 @@ class SchemaAndCaptureTests(unittest.TestCase):
             self.assertIn(
                 "codex:absolute-private",
                 {item["path"] for item in blocked["catalog"]["blockers"]},
+            )
+
+    def test_provider_regenerate_trees_prune_special_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            roots = {
+                "codex": fixture.source_home / ".codex",
+                "claude": fixture.source_home / ".claude",
+                "pi": fixture.source_home / ".pi/agent",
+            }
+            regenerate = {
+                "codex": ("logs", "tmp", "shell_snapshots"),
+                "claude": (
+                    "cache",
+                    "debug",
+                    "logs",
+                    "telemetry",
+                    "security/agent-sdk-venv",
+                    "agent-notes-rescue/archive/tmp",
+                ),
+                "pi": ("cache", "logs", "tmp"),
+            }
+            for provider, relatives in regenerate.items():
+                for relative in relatives:
+                    parent = roots[provider] / relative
+                    parent.mkdir(parents=True)
+                    os.symlink("/private/runtime-only", parent / "special-link")
+
+            capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            providers = {
+                provider["name"]: provider
+                for provider in capture["catalog"]["providers"]
+            }
+            for provider, relatives in regenerate.items():
+                captured = {
+                    item["relative_path"] for item in providers[provider]["items"]
+                }
+                for relative in relatives:
+                    self.assertFalse(
+                        any(
+                            path == relative or path.startswith(relative + "/")
+                            for path in captured
+                        ),
+                        (provider, relative, captured),
+                    )
+
+    def test_claude_opaque_history_and_rescue_state_remain_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            claude = fixture.source_home / ".claude"
+            payloads = {
+                "projects/repo/tool-results/result.sqlite": b"binary sqlite\x00\xff",
+                "projects/repo/reports/history.jsonl": b"binary history\x00\xff",
+                "agent-notes-rescue/auth.json": b"opaque auth-shaped state",
+                "agent-notes-rescue/state.sqlite": b"opaque sqlite-shaped state",
+                "history.jsonl": b'{"stable-but-incomplete":true}',
+            }
+            for relative, payload in payloads.items():
+                path = claude / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+            capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            provider = next(
+                item
+                for item in capture["catalog"]["providers"]
+                if item["name"] == "claude"
+            )
+            items = {item["relative_path"]: item for item in provider["items"]}
+            for relative, payload in payloads.items():
+                self.assertEqual(items[relative]["classification"], "portable-private")
+                self.assertEqual(
+                    items[relative]["sha256"], hashlib.sha256(payload).hexdigest()
+                )
+                self.assertNotIn("translated_sha256", items[relative])
+                self.assertNotIn("records", items[relative])
+
+    def test_mutable_seat_skips_socket_but_blocks_other_special_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            seat = fixture.source_home / "runtime-seat"
+            seat.mkdir()
+            (seat / "state.bin").write_bytes(b"durable")
+            socket_path = seat / "runtime.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                fixture.source_seats = [("runtime", seat)]
+                capture = fixture.capture("source")
+            finally:
+                listener.close()
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            captured_seat = next(
+                item
+                for item in capture["catalog"]["seats"]
+                if item["name"] == "runtime"
+            )
+            self.assertEqual(
+                {item["relative_path"] for item in captured_seat["items"]},
+                {"state.bin"},
+            )
+
+            os.mkfifo(seat / "runtime.pipe")
+            blocked = fixture.capture("source")
+            self.assertFalse(blocked["complete"])
+            self.assertIn(
+                str(seat / "runtime.pipe"),
+                {item.get("path") for item in blocked["catalog"]["blockers"]},
             )
 
     def test_provider_policy_excludes_managed_links_and_retains_private_state(
@@ -722,6 +986,36 @@ class SchemaAndCaptureTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_opaque_non_git_cannot_overwrite_typed_destination_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            source_opaque = fixture.source_git / "opaque"
+            source_opaque.mkdir()
+            (source_opaque / ".git").write_bytes(b"not git\n")
+            (source_opaque / "payload.bin").write_bytes(b"source opaque")
+            destination_git = fixture.destination_git / "opaque"
+            initialize_repository(destination_git)
+
+            plan = compile_agent_plan(
+                fixture.capture("source"),
+                fixture.capture("source"),
+                fixture.capture("destination"),
+                fixture.capture("destination"),
+            )
+            self.assertIn(
+                {
+                    "code": "non-git-git-workspace-collision",
+                    "path": str(destination_git.resolve()),
+                },
+                plan["blockers"],
+            )
+            self.assertFalse(
+                any(
+                    Path(operation["destination_path"]).is_relative_to(destination_git)
+                    for operation in plan["operations"]
+                )
+            )
+
     def test_plan_preserves_ref_divergence_with_recovery_ref(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=False)

@@ -56,9 +56,11 @@ each capture; this is a procedural fence, not proof that a provider process was
 stopped.
 
 Declared provider descendants default to portable-private after exact managed
-exclusions and regenerate pruning. A scan failure, special file, unsafe Git
-authority, active Git operation, external alternate, corrupt object, malformed
-JSONL, unsupported typed state, or budget exceedance makes capture incomplete.
+exclusions and regenerate pruning. Readable invalid Git candidates and
+workspaces whose only typed failure is alternates or `git fsck` retain exact
+non-Git byte custody; malformed stable append JSONL retains exact private bytes.
+A scan failure, special file, unsafe Git authority, active Git operation,
+unsupported typed state, or budget exceedance still makes capture incomplete.
 
 ## GitWorkspaceV2
 

@@ -73,11 +73,13 @@ to destination capture. Sting never opens a connection or holds a Neo
 credential; the accepted four-capture plan subsequently binds both tools.
 
 Capture records hashes and typed metadata only. SQLite capture uses the backup
-API and includes committed WAL state. Any changing database family, malformed
-JSONL, unsafe schema, special entry, active Git operation, corrupt object,
-unsafe special entry, unsupported typed state, or budget overrun makes capture
-incomplete. Unknown-named files inside a declared provider root are known
-portable-private bytes; only explicitly typed Claude path-bearing text rewrites.
+API and includes committed WAL state. Readable invalid Git candidates and
+alternates/fsck-only repositories retain exact non-Git bytes; malformed stable
+append JSONL retains exact portable-private bytes. Scan failures, unsafe schema
+or Git authority, non-runtime special entries, active Git operations,
+unsupported typed state, and budget overruns remain incomplete. Unknown-named
+files inside a declared provider root are known portable-private bytes; only
+explicitly typed Claude path-bearing text rewrites.
 
 ## Compile and review
 
