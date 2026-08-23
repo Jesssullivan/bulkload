@@ -2123,10 +2123,10 @@ os.execv(arguments[0], arguments)
     def test_capacity_gate_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             observation = os.statvfs(temporary)
-            available = observation.f_bavail * observation.f_frsize
+            total = observation.f_blocks * observation.f_frsize
             with self.assertRaisesRegex(BulkloadError, "capacity gate failed"):
                 require_capacity(
-                    Path(temporary), charged_bytes=available + 1, reserve_bytes=0
+                    Path(temporary), charged_bytes=total + 1, reserve_bytes=0
                 )
 
 
