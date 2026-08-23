@@ -24,6 +24,7 @@ from .executor import (
 from .model import (
     BulkloadError,
     MAX_JSON_BYTES,
+    QuiescenceRefusal,
     assert_no_overlap,
     atomic_write,
     canonical_bytes,
@@ -443,6 +444,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _protect_output(arguments)
         result = arguments.handler(arguments)
         _write(arguments.output, result)
+    except QuiescenceRefusal as error:
+        print(f"bulkload: REFUSED: {error}", file=sys.stderr)
+        return 3
     except (BulkloadError, OSError, sqlite3.Error) as error:
         print(f"bulkload: FAIL: {error}", file=sys.stderr)
         return 1

@@ -10,13 +10,17 @@ linked worktrees, exact index/dirt state, non-Git fleet content, Codex, Claude,
 Pi, or declared mutable-seat state. The supported runtime is Python 3.11 or
 newer, Git, SQLite, and a filesystem with verified reflinks for live rollback.
 
-Read [the migration contract](references/migration-contract.md) and
-[agent-state guide](references/agent-context.md) before creating a plan.
+Read [the migration contract](references/migration-contract.md),
+[agent-state guide](references/agent-context.md), and
+[the ceremony](references/ceremony.md) before creating a plan. The ceremony is
+the agent contract for quiescence: it is read-only, fail-closed, and binding.
 
 ## Keep the boundary explicit
 
-1. Quiesce writers for each A/B capture pair. Resume them during preliminary
-   preseed; quiesce again for fresh final A/B captures through verification.
+1. The operator quiesces writers for each A/B capture pair. This skill never
+   sends a signal to a process; it verifies quiescence read-only and refuses
+   fail-closed. Writers resume during preliminary preseed; the operator
+   quiesces them again for fresh final A/B captures through verification.
 2. Declare the source and destination home/Git maps. The longest source prefix
    wins, so map `/Users/jess/git` explicitly to
    `/srv/fast-local/jess/git` in addition to any broader home map.
@@ -27,6 +31,12 @@ Read [the migration contract](references/migration-contract.md) and
    unsanitized remote URLs in output or chat.
 6. Never invoke a terminal multiplexer, TCFS runtime, Home Manager, deploy,
    activation, browser migration, or credential rotation from this workflow.
+7. Never send a signal to a process this skill did not start. Terminal, daemon,
+   and launchd ownership stays with the operator. Report a live or suspended
+   writer, then stop.
+8. Exclude the migration agent's own provider state as a reviewed managed
+   exclusion on both roles. A capture pair that contains its own author can
+   never be byte-equal.
 
 `AgentCaptureV4` knows Codex, Claude, Pi, and mutable-seat state. Ordinary
 descendants of a declared provider root default to byte-exact portable-private

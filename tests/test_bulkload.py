@@ -1003,9 +1003,16 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 )
                 connection.execute("INSERT INTO state VALUES (1, 'wal')")
                 connection.commit()
-                capture = fixture.capture("source")
+                write_ahead_log = database.with_name("state.sqlite-wal")
+                retained = write_ahead_log.read_bytes()
             finally:
                 connection.close()
+            # A clean close unlinks both sidecars. Restoring only the
+            # write-ahead log reproduces the quiet-with-WAL state the quiescence
+            # probe admits, and keeps the -wal/-shm asymmetry under test.
+            write_ahead_log.write_bytes(retained)
+            self.assertFalse(database.with_name("state.sqlite-shm").exists())
+            capture = fixture.capture("source")
             self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
             providers = {
                 provider["name"]: provider
