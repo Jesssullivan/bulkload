@@ -97,6 +97,22 @@ def _non_git_collision(catalog: dict[str, Any], target: str) -> bool:
     return False
 
 
+def _containing_git_worktree(
+    workspaces: Iterable[dict[str, Any]], target: str
+) -> str | None:
+    candidate = Path(target)
+    for workspace in workspaces:
+        roots = {workspace["destination_path"]}
+        roots.update(worktree["path"] for worktree in workspace.get("worktrees", []))
+        for root in sorted(roots):
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                continue
+            return root
+    return None
+
+
 def _plan_git(
     source: dict[str, Any],
     destination: dict[str, Any],
@@ -274,8 +290,21 @@ def _plan_non_git(
     destination_items = {
         item["identity"]: item for item in destination.get("non_git", [])
     }
+    blocked_worktrees: set[str] = set()
     for identity, item in sorted(source_items.items()):
         target = str(Path(destination_root) / item["destination_relative_path"])
+        git_collision = _containing_git_worktree(
+            destination.get("git_workspaces", []), target
+        )
+        if git_collision is not None:
+            if git_collision not in blocked_worktrees:
+                _block(
+                    blockers,
+                    "non-git-git-workspace-collision",
+                    git_collision,
+                )
+                blocked_worktrees.add(git_collision)
+            continue
         before = destination_items.get(identity)
         if _structural_collision(item, before):
             _block(blockers, "structural-type-collision", target)

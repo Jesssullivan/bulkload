@@ -86,6 +86,14 @@ MANAGED_EXCLUSION_NAMESPACES = {
 SAFE_EXECUTABLE_PATH = re.compile(r"/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
 
 
+class _OpaqueGitFallback(BulkloadError):
+    """A readable workspace that must travel as exact opaque bytes."""
+
+
+class _MalformedAppendState(BulkloadError):
+    """Stable append state whose records cannot be typed safely."""
+
+
 def shell_safe_executable(raw_path: str, label: str) -> str:
     if not os.path.isabs(raw_path):
         raise BulkloadError(f"{label} path must be explicit and absolute")
@@ -196,7 +204,20 @@ def _is_regenerate_namespace(provider: str, relative: str) -> bool:
     parts = PurePosixPath(relative).parts
     if parts[:1] == (".tmp",):
         return True
-    return provider == "codex" and parts[:2] == ("plugins", "cache")
+    if provider == "codex":
+        return parts[:1] in {("logs",), ("tmp",), ("shell_snapshots",)} or parts[
+            :2
+        ] == ("plugins", "cache")
+    if provider == "claude":
+        return (
+            parts[:1] in {("cache",), ("debug",), ("logs",), ("telemetry",)}
+            or parts[:2] == ("security", "agent-sdk-venv")
+            or (
+                parts[:1] == ("agent-notes-rescue",)
+                and any(part in {".tmp", "tmp"} for part in parts[1:])
+            )
+        )
+    return provider == "pi" and parts[:1] in {("cache",), ("logs",), ("tmp",)}
 
 
 def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
@@ -387,6 +408,7 @@ def _walk_entries(
     classification: str,
     excluded_roots: Iterable[Path] = (),
     skip_git_admin: bool = False,
+    skip_sockets: bool = False,
     max_files: int,
     max_bytes: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -394,8 +416,17 @@ def _walk_entries(
     blockers: list[dict[str, str]] = []
     excluded = {os.fspath(path.resolve()) for path in excluded_roots}
     charged_bytes = 0
+
+    def unreadable(error: OSError) -> None:
+        blockers.append(
+            {
+                "code": "unreadable-filesystem-entry",
+                "path": os.fspath(error.filename or root),
+            }
+        )
+
     for current_text, directories, files in os.walk(
-        root, topdown=True, followlinks=False
+        root, topdown=True, followlinks=False, onerror=unreadable
     ):
         current = Path(current_text)
         retained: list[str] = []
@@ -432,6 +463,18 @@ def _walk_entries(
             if skip_git_admin and current == root and filename == ".git":
                 continue
             try:
+                if skip_sockets:
+                    try:
+                        if stat.S_ISSOCK(child.stat(follow_symlinks=False).st_mode):
+                            continue
+                    except OSError:
+                        blockers.append(
+                            {
+                                "code": "unreadable-filesystem-entry",
+                                "path": os.fspath(child),
+                            }
+                        )
+                        continue
                 relative = child.relative_to(root).as_posix()
                 record = _file_record(child, relative, classification=classification)
                 entries.append(record)
@@ -486,6 +529,19 @@ def _discover_git_roots(root: Path) -> tuple[list[Path], list[dict[str, str]]]:
             continue
         directories[:] = sorted(name for name in directories if name != ".git")
     return sorted(set(repositories), key=os.fspath), blockers
+
+
+def _gitfile_declares_authority(repository: Path) -> bool:
+    git_entry = repository / ".git"
+    try:
+        if not stat.S_ISREG(git_entry.stat(follow_symlinks=False).st_mode):
+            return False
+        with git_entry.open("rb", buffering=0) as stream:
+            return stream.read(8).startswith(b"gitdir:")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
 
 
 def _parse_worktree_list(repository: Path) -> list[dict[str, Any]]:
@@ -592,6 +648,8 @@ def _recovery_anchors(
         # data in diagnostics or in the capture.
         object_type = _git(repository, ["cat-file", "-t", oid], check=False).strip()
         if not object_type:
+            if sources[oid] == {"FETCH_HEAD"}:
+                continue
             raise BulkloadError("a Git recovery anchor object is missing")
         result.append({"oid": oid, "sources": sorted(sources[oid])})
     return result
@@ -604,8 +662,17 @@ def _object_files(
     if not objects.is_dir():
         raise BulkloadError("Git object directory is missing")
     alternates = objects / "info" / "alternates"
-    if alternates.exists() and alternates.stat().st_size:
-        raise BulkloadError("Git alternates are unportable")
+    try:
+        alternate_info = alternates.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        alternate_info = None
+    except OSError as error:
+        raise BulkloadError("Git alternates authority is unreadable") from error
+    if alternate_info is not None:
+        if not stat.S_ISREG(alternate_info.st_mode):
+            raise BulkloadError("Git alternates authority is unsafe")
+        if alternate_info.st_size:
+            raise _OpaqueGitFallback("Git alternates require opaque byte custody")
     records: list[dict[str, Any]] = []
     charged = 0
     for current, directories, files in os.walk(objects, followlinks=False):
@@ -961,7 +1028,22 @@ def _capture_workspace(
     )
     refs = _parse_refs(representative)
     recovery = _recovery_anchors(representative, common_dir, git_dirs)
-    _git(representative, ["fsck", "--full", "--no-dangling"])
+    try:
+        object_files = _object_files(
+            common_dir, max_files=max_files, max_bytes=max_bytes
+        )
+    except _OpaqueGitFallback:
+        if blockers:
+            raise BulkloadError(
+                "Git workspace has blockers in addition to opaque-only state"
+            ) from None
+        raise
+    try:
+        _git(representative, ["fsck", "--full", "--no-dangling"])
+    except BulkloadError as error:
+        if blockers or str(error) != "Git inspection command failed (fsck)":
+            raise
+        raise _OpaqueGitFallback("Git fsck requires opaque byte custody") from error
     try:
         logical = representative.relative_to(git_root).as_posix()
     except ValueError:
@@ -981,9 +1063,7 @@ def _capture_workspace(
         "destination_path": destination_path,
         "head": primary_worktree["head"] if primary_worktree else None,
         "logical_path": logical,
-        "object_files": _object_files(
-            common_dir, max_files=max_files, max_bytes=max_bytes
-        ),
+        "object_files": object_files,
         "object_format": object_format,
         "path": os.fspath(representative),
         "recovery_anchors": recovery,
@@ -1188,13 +1268,13 @@ def _jsonl_records(
         with path.open("rb", buffering=0) as stream:
             for line in stream:
                 if not line.endswith(b"\n"):
-                    raise BulkloadError(
+                    raise _MalformedAppendState(
                         "append-only JSONL has an incomplete final record"
                     )
                 try:
                     json.loads(line)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise BulkloadError(
+                    raise _MalformedAppendState(
                         "append-only state contains invalid JSONL"
                     ) from error
                 transformed = line
@@ -1241,7 +1321,16 @@ def _sqlite_primary(path: str) -> str | None:
 
 def _provider_classification(provider: str, relative: str) -> str:
     lowered = relative.lower()
-    leaf = PurePosixPath(lowered).name
+    parts = PurePosixPath(lowered).parts
+    leaf = parts[-1]
+    if provider == "claude" and (
+        parts[:1] == ("agent-notes-rescue",)
+        or (
+            parts[:1] == ("projects",)
+            and any(part in {"tool-results", "reports"} for part in parts[1:])
+        )
+    ):
+        return "portable-private"
     if _sqlite_primary(lowered) is not None:
         return "sqlite"
     if provider == "codex":
@@ -1403,7 +1492,11 @@ def _capture_provider(
                 raise BulkloadError(f"{provider} state capture budget exceeded")
     sqlite_paths: dict[str, Path] = {}
     for relative, path in files:
-        primary = _sqlite_primary(relative.lower())
+        primary = (
+            _sqlite_primary(relative.lower())
+            if _provider_classification(provider, relative) == "sqlite"
+            else None
+        )
         if primary is not None and not relative.lower().endswith(SQLITE_SIDECARS):
             sqlite_paths[primary] = path
     items: list[dict[str, Any]] = []
@@ -1495,7 +1588,7 @@ def _capture_provider(
                 }
             )
             continue
-        if primary is not None:
+        if classification == "sqlite" and primary is not None:
             # An orphan sidecar is unknown rather than silently omitted.
             if primary not in sqlite_paths:
                 blockers.append(
@@ -1536,14 +1629,23 @@ def _capture_provider(
             }
         )
         if classification.startswith("append-jsonl"):
-            record.update(
-                _jsonl_records(
+            try:
+                append_records = _jsonl_records(
                     path,
                     replacements=replacements
                     if classification.endswith("rewrite")
                     else (),
                 )
-            )
+            except _MalformedAppendState:
+                record = _file_record(path, relative, classification="portable-private")
+                record.update(
+                    {
+                        "destination_relative_path": relative,
+                        "identity": relative,
+                    }
+                )
+            else:
+                record.update(append_records)
         elif classification.endswith("rewrite") and record["kind"] == "regular":
             payload = path.read_bytes()
             transformed = payload
@@ -1665,6 +1767,7 @@ def _capture_seat(
     entries, blockers = _walk_entries(
         root,
         classification="mutable-seat",
+        skip_sockets=True,
         max_files=max_files,
         max_bytes=max_bytes,
     )
@@ -1726,6 +1829,8 @@ def capture_agent_state(
     discovered, discovery_blockers = _discover_git_roots(git_root)
     blockers.extend(discovery_blockers)
     by_common: dict[Path, Path] = {}
+    roots_by_common: dict[Path, set[Path]] = defaultdict(set)
+    opaque_git_roots: set[Path] = set()
     for repository in discovered:
         try:
             common = resolve_real(
@@ -1748,19 +1853,28 @@ def capture_agent_state(
                     .strip()
                 )
             )
+            roots_by_common[common].add(repository)
             if common not in by_common or git_dir == common:
                 by_common[common] = repository
         except BulkloadError as error:
-            blockers.append(
-                {
-                    "code": "git-discovery-failed",
-                    "path": os.fspath(repository),
-                    "detail": str(error),
-                }
-            )
+            if (
+                str(error) == "Git inspection command failed (rev-parse)"
+                and not _gitfile_declares_authority(repository)
+            ):
+                opaque_git_roots.add(repository)
+            else:
+                blockers.append(
+                    {
+                        "code": "git-discovery-failed",
+                        "path": os.fspath(repository),
+                        "detail": str(error),
+                    }
+                )
     workspaces: list[dict[str, Any]] = []
     nested_roots = set(discovered)
-    for representative in sorted(by_common.values(), key=os.fspath):
+    for common, representative in sorted(
+        by_common.items(), key=lambda item: os.fspath(item[1])
+    ):
         try:
             workspace, workspace_blockers = _capture_workspace(
                 representative,
@@ -1773,6 +1887,18 @@ def capture_agent_state(
             )
             workspaces.append(workspace)
             blockers.extend(workspace_blockers)
+        except _OpaqueGitFallback:
+            roots = roots_by_common[common]
+            if any(common == root or root in common.parents for root in roots):
+                opaque_git_roots.update(roots)
+            else:
+                blockers.append(
+                    {
+                        "code": "git-workspace-capture-failed",
+                        "path": os.fspath(representative),
+                        "detail": "opaque Git authority is outside the captured fleet",
+                    }
+                )
         except BulkloadError as error:
             blockers.append(
                 {
@@ -1789,6 +1915,56 @@ def capture_agent_state(
         max_bytes=max_bytes,
     )
     blockers.extend(non_git_blockers)
+    outer_opaque_roots: list[Path] = []
+    for root in sorted(
+        opaque_git_roots, key=lambda item: (len(item.parts), os.fspath(item))
+    ):
+        if any(
+            parent == root or parent in root.parents for parent in outer_opaque_roots
+        ):
+            continue
+        outer_opaque_roots.append(root)
+    for opaque_root in outer_opaque_roots:
+        prefix = opaque_root.relative_to(git_root)
+        if prefix.parts:
+            try:
+                non_git.append(
+                    _file_record(
+                        opaque_root, prefix.as_posix(), classification="non-git"
+                    )
+                )
+            except BulkloadError as error:
+                blockers.append(
+                    {
+                        "code": "unreadable-git-authority",
+                        "path": os.fspath(opaque_root),
+                        "detail": str(error),
+                    }
+                )
+                continue
+        opaque_entries, opaque_blockers = _walk_entries(
+            opaque_root,
+            classification="non-git",
+            excluded_roots={
+                candidate
+                for candidate in discovered
+                if candidate != opaque_root
+                and candidate not in opaque_git_roots
+                and opaque_root in candidate.parents
+            },
+            max_files=max_files,
+            max_bytes=max_bytes,
+        )
+        blockers.extend(opaque_blockers)
+        for entry in opaque_entries:
+            if prefix.parts:
+                entry["relative_path"] = (
+                    PurePosixPath(prefix.as_posix()) / entry["relative_path"]
+                ).as_posix()
+            non_git.append(entry)
+    non_git.sort(key=lambda item: (item["relative_path"], item["kind"]))
+    if len(non_git) > max_files or sum(item["size"] for item in non_git) > max_bytes:
+        raise BulkloadError("filesystem capture budget exceeded")
     for entry in non_git:
         entry["destination_relative_path"] = entry["relative_path"]
         entry["identity"] = entry["relative_path"]
