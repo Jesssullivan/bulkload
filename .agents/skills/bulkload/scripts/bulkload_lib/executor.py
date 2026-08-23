@@ -1,704 +1,3011 @@
-"""Digest-bound local application, journaling, and independent verification."""
+"""Reflink-aware staging and journaled AgentPlanV4 execution."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
-import hashlib
+from collections import defaultdict
+import json
 import os
 from pathlib import Path
+import re
+import shutil
 import socket
+import sqlite3
 import stat
+import subprocess
 import tempfile
-from typing import Any, BinaryIO
+from typing import Any, Iterable, Sequence
 
 from .model import (
+    AGENT_APPLY_SCHEMA,
+    AGENT_JOURNAL_SCHEMA,
+    AGENT_RECOVER_SCHEMA,
+    AGENT_ROLLBACK_SCHEMA,
+    AGENT_STAGE_SCHEMA,
+    AGENT_VERIFY_SCHEMA,
     BulkloadError,
-    RECEIPT_SCHEMA,
-    VERIFY_SCHEMA,
+    accounted_copy,
+    assert_no_overlap,
+    atomic_write,
     atomic_write_json,
     canonical_bytes,
     durable_makedirs,
-    normalize_relative,
-    object_digest,
-    safe_join,
+    fsync_directory,
+    new_id,
+    read_json,
+    reflink_clone,
+    require_capacity,
+    require_digest,
+    require_exact_keys,
+    seal,
+    sha256_bytes,
+    sha256_file,
+    sha256_symlink,
     utc_now,
 )
-from .planner import validate_plan, validate_snapshot
-from .scanner import capture_git_runtime, catalog_map, find_file, inspect_path
-
-UNSUPPORTED_GIT_AUTHORITY_FLAGS = (
-    "has_alternates",
-    "has_content_filters",
-    "has_grafts",
-    "has_gitmodules",
-    "has_lfs_attributes",
-    "has_unportable_attributes",
+from .planner import validate_agent_plan
+from .scanner import (
+    DEFAULT_MAX_SQLITE_ROWS,
+    _quote_identifier,
+    _sqlite_catalog_from_snapshot,
+    _typed_sql_value,
+    inspect_rsync,
+    shell_safe_executable,
+    snapshot_sqlite,
+    sqlite_catalog,
 )
 
 
-def _identity(item: dict[str, Any] | None) -> dict[str, Any] | None:
-    if item is None:
-        return None
-    keys = ("kind", "mode", "sha256", "size")
-    return {key: item.get(key) for key in keys if key in item}
+DEFAULT_CAPACITY_RESERVE_BYTES = 10 * 1024**3
+SSH_OPTIONS = (
+    "-oBatchMode=yes",
+    "-oStrictHostKeyChecking=yes",
+    "-oClearAllForwardings=yes",
+)
+REMOTE_STAGE_ROOT = re.compile(r"/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+")
 
 
-def _repo_root(fleet_root: Path, logical: str) -> Path:
-    fleet_root = fleet_root.expanduser().resolve()
-    if logical == ".":
-        return fleet_root
-    return safe_join(fleet_root, normalize_relative(logical), allow_leaf_symlink=False)
+class _StageSourceChanged(BulkloadError):
+    """A preliminary-plan entry moved and is not eligible for authority."""
 
 
-def _current_identity(root: Path, path: str, git_class: str) -> dict[str, Any] | None:
-    target = safe_join(root, path)
-    try:
-        target.lstat()
-    except FileNotFoundError:
-        return None
-    return _identity(inspect_path(root, path, git_class, None))
+def _remote_safe_stage_root(path: Path) -> Path:
+    value = os.fspath(path)
+    if not REMOTE_STAGE_ROOT.fullmatch(value) or any(
+        component in {".", ".."} for component in value.split("/")
+    ):
+        raise BulkloadError("stage root is not a canonical remote-safe absolute path")
+    return Path(value)
 
 
-def _append_journal(stream: BinaryIO, event: dict[str, Any]) -> None:
-    stream.write(canonical_bytes(event) + b"\n")
-    stream.flush()
-    os.fsync(stream.fileno())
+def _write_apply_journal(path: Path, journal: dict[str, Any]) -> None:
+    seal(journal, "journal_sha256")
+    atomic_write_json(path, journal)
 
 
-def _copy_backup(source: Path, destination: Path, expected: dict[str, Any]) -> None:
-    durable_makedirs(destination.parent)
-    if destination.exists() or destination.is_symlink():
-        actual = _current_identity(destination.parent, destination.name, "tracked")
-        if actual != expected:
-            raise BulkloadError(
-                f"existing backup has unexpected identity: {destination}"
-            )
-        return
-    source_info = source.lstat()
-    if stat.S_ISREG(source_info.st_mode):
-        _atomic_copy_regular(source, destination, expected)
-    else:
-        raise BulkloadError(f"backup source has unsupported type: {source}")
-    actual = _current_identity(destination.parent, destination.name, "tracked")
-    if actual != expected:
-        raise BulkloadError(f"backup verification failed: {destination}")
-
-
-def _atomic_copy_regular(
-    source: Path, destination: Path, expected: dict[str, Any]
-) -> None:
-    source_before = source.lstat()
-    if not stat.S_ISREG(source_before.st_mode):
-        raise BulkloadError(f"source ceased to be a regular file: {source}")
-    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    source_fd = os.open(source, source_flags)
-    temp_fd, temp_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.bulkload-", dir=destination.parent
-    )
-    temp_path = Path(temp_name)
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        opened = os.fstat(source_fd)
-        if _stat_identity(opened) != _stat_identity(source_before):
-            raise BulkloadError(f"source changed while opening: {source}")
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            size += len(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(temp_fd, view)
-                view = view[written:]
-        source_after = os.fstat(source_fd)
-        if _stat_identity(source_after) != _stat_identity(source_before):
-            raise BulkloadError(f"source changed while copying: {source}")
-        if digest.hexdigest() != expected.get("sha256") or size != expected.get("size"):
-            raise BulkloadError(
-                f"source content no longer matches the accepted plan: {source}"
-            )
-        os.fchmod(temp_fd, int(expected["mode"], 8))
-        os.fsync(temp_fd)
-        os.close(temp_fd)
-        temp_fd = -1
-        os.replace(temp_path, destination)
-        _fsync_directory(destination.parent)
-    finally:
-        os.close(source_fd)
-        if temp_fd >= 0:
-            os.close(temp_fd)
-        temp_path.unlink(missing_ok=True)
-
-
-def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _paths_overlap(left: Path, right: Path) -> bool:
-    for candidate, parent in ((left, right), (right, left)):
-        try:
-            candidate.relative_to(parent)
-        except ValueError:
-            continue
-        return True
-    return False
-
-
-def _runtime_map(values: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {item["logical_path"]: item for item in values}
-
-
-def _unsafe_status(status: dict[str, Any]) -> bool:
-    index = status.get("index")
-    worktree = status.get("worktree")
-    return (
-        index not in {" ", "?"}
-        or index == "U"
-        or worktree == "U"
-        or f"{index}{worktree}" in {"AA", "DD"}
-    )
-
-
-def _preflight_plan(
-    intent: dict[str, Any], source_root: Path, destination_root: Path
-) -> list[dict[str, Any]]:
-    operations = intent.get("operations", [])
-    expected_file_items = intent.get("expected_files", [])
-    expected_files = {
-        (item["repo"], item["path"]): item for item in expected_file_items
+def _read_apply_journal(path: Path) -> dict[str, Any]:
+    journal = read_json(path)
+    if journal.get("schema") != AGENT_JOURNAL_SCHEMA:
+        raise BulkloadError("apply journal schema is invalid")
+    require_digest(journal, "journal_sha256")
+    allowed = {
+        "apply_receipt",
+        "capacity",
+        "created_git_objects",
+        "created_git_roots",
+        "created_worktrees",
+        "git_prepared",
+        "git_refs_after",
+        "git_refs_before",
+        "git_worktrees_after",
+        "git_worktrees_before",
+        "journal_id",
+        "journal_sha256",
+        "mutations",
+        "plan_sha256",
+        "progress",
+        "recovery_receipts",
+        "rollback_progress",
+        "rollback_receipt",
+        "rollback_root",
+        "rollback_snapshots",
+        "schema",
+        "snapshot_progress",
+        "stage_manifest_sha256",
+        "stage_receipt_sha256",
+        "state",
+        "transaction_id",
+        "updated_at",
+        "verify_receipt_sha256",
     }
-    operation_keys = {(item["repo"], item["path"]) for item in operations}
-    expected_source_items = intent.get("expected_repositories", [])
-    expected_destination_items = intent.get("destination_repositories_before", [])
-    expected_sources = _runtime_map(expected_source_items)
-    expected_destinations = _runtime_map(expected_destination_items)
-    if (
-        len(expected_sources) != len(expected_source_items)
-        or len(expected_destinations) != len(expected_destination_items)
-        or set(expected_sources) != set(expected_destinations)
-    ):
-        raise BulkloadError("plan repository preconditions are inconsistent")
+    unknown = set(journal) - allowed
+    if unknown:
+        raise BulkloadError(f"AgentJournalV4 has unapproved fields: {sorted(unknown)}")
+    return journal
 
-    for logical, source_expected in expected_sources.items():
-        source_repo = _repo_root(source_root, logical)
-        destination_repo = _repo_root(destination_root, logical)
-        source_runtime = capture_git_runtime(source_repo)
-        destination_runtime = capture_git_runtime(destination_repo)
-        for side, runtime in (
-            ("source", source_runtime),
-            ("destination", destination_runtime),
-        ):
-            active = sorted(
-                flag for flag in UNSUPPORTED_GIT_AUTHORITY_FLAGS if runtime.get(flag)
-            )
-            if active:
-                raise BulkloadError(
-                    f"{side} acquired unsupported Git authority: {logical}: {active}"
-                )
-        for field in (
-            "branch",
-            "git_operation_state",
-            "head",
-            "local_refs",
-            "local_refs_sha256",
-            "recovery_roots",
-            "recovery_roots_sha256",
-            "status",
-            "status_sha256",
-        ):
-            if source_runtime.get(field) != source_expected.get(field):
-                raise BulkloadError(f"source Git {field} changed: {logical}")
-        destination_expected = expected_destinations[logical]
-        for field in (
-            "branch",
-            "git_operation_state",
-            "head",
-            "local_refs",
-            "local_refs_sha256",
-            "recovery_roots",
-            "recovery_roots_sha256",
-        ):
-            if destination_runtime.get(field) != destination_expected.get(field):
-                raise BulkloadError(f"destination Git {field} changed: {logical}")
-        for field in ("branch", "head"):
-            if source_runtime[field] != destination_runtime[field]:
-                raise BulkloadError(
-                    f"source and destination Git {field} differ: {logical}"
-                )
-        source_refs = {item["name"]: item for item in source_runtime["local_refs"]}
-        destination_refs = {
-            item["name"]: item for item in destination_runtime["local_refs"]
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "LC_ALL": "C",
         }
-        for name, source_ref in source_refs.items():
-            if destination_refs.get(name) != source_ref:
-                raise BulkloadError(
-                    f"source ref differs at destination: {logical}: {name}"
-                )
-        extra_replace_refs = sorted(
-            name
-            for name in destination_refs.keys() - source_refs.keys()
-            if name.startswith("refs/replace/")
-        )
-        if extra_replace_refs:
-            raise BulkloadError(
-                f"destination has extra replacement refs: {logical}: {extra_replace_refs}"
-            )
-        if any(_unsafe_status(item) for item in source_runtime["status"]):
-            raise BulkloadError(f"source index or conflict state is unsafe: {logical}")
-        if any(_unsafe_status(item) for item in destination_runtime["status"]):
-            raise BulkloadError(
-                f"destination index or conflict state is unsafe: {logical}"
-            )
-        allowed_dirty = {item["path"] for item in source_runtime["status"]}
-        live_dirty = {item["path"] for item in destination_runtime["status"]}
-        unexpected_dirty = sorted(live_dirty - allowed_dirty)
-        if unexpected_dirty:
-            raise BulkloadError(
-                f"destination acquired unplanned dirt: {logical}: {unexpected_dirty}"
-            )
-
-    for key, expected in expected_files.items():
-        logical, relative = key
-        source_identity = _current_identity(
-            _repo_root(source_root, logical), relative, expected["git_class"]
-        )
-        if source_identity != expected["identity"]:
-            raise BulkloadError(f"source expected file changed: {logical}/{relative}")
-        if key not in operation_keys:
-            destination_identity = _current_identity(
-                _repo_root(destination_root, logical), relative, expected["git_class"]
-            )
-            if destination_identity != expected["identity"]:
-                raise BulkloadError(
-                    f"destination unchanged-file precondition changed: {logical}/{relative}"
-                )
-
-    preflight: list[dict[str, Any]] = []
-    for operation in operations:
-        if operation.get("op") != "copy":
-            raise BulkloadError(f"unsupported operation: {operation.get('op')}")
-        logical = operation["repo"]
-        relative = normalize_relative(operation["path"])
-        source_repo = _repo_root(source_root, logical)
-        destination_repo = _repo_root(destination_root, logical)
-        source_path = safe_join(source_repo, relative, allow_leaf_symlink=True)
-        destination_path = safe_join(
-            destination_repo, relative, allow_leaf_symlink=True
-        )
-        source_identity = _current_identity(
-            source_repo, relative, operation["git_class"]
-        )
-        destination_identity = _current_identity(
-            destination_repo, relative, operation["git_class"]
-        )
-        if source_identity != operation.get("after"):
-            raise BulkloadError(f"source precondition changed: {logical}/{relative}")
-        if destination_identity == operation.get("after"):
-            state = "already-applied"
-        elif destination_identity == operation.get("before"):
-            state = "pending"
-        else:
-            raise BulkloadError(
-                f"destination precondition changed: {logical}/{relative}"
-            )
-        preflight.append(
-            {
-                "destination": destination_path,
-                "logical": logical,
-                "operation": operation,
-                "relative": relative,
-                "source": source_path,
-                "state": state,
-            }
-        )
-    return preflight
-
-
-def _open_private_regular(path: Path, flags: int) -> int:
-    descriptor = os.open(
-        path,
-        flags | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
     )
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise BulkloadError(f"state path is not a regular file: {path}")
-        os.fchmod(descriptor, 0o600)
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
+    return environment
 
 
-@contextmanager
-def _lock_destination_repositories(
-    intent: dict[str, Any], destination_root: Path
-) -> Any:
-    paths = {destination_root}
-    for item in intent.get("expected_repositories", []):
-        paths.add(_repo_root(destination_root, item["logical_path"]))
-    opened: dict[tuple[int, int], int] = {}
-    try:
-        flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _git(repository: Path, arguments: Sequence[str], *, check: bool = True) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", os.fspath(repository), *arguments],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_git_environment(),
+    )
+    if check and result.returncode != 0:
+        raise BulkloadError(
+            f"Git mutation/verification failed ({arguments[0] if arguments else 'unknown'})"
         )
-        for path in paths:
-            descriptor = os.open(path, flags)
-            identity = os.fstat(descriptor)
-            key = (identity.st_dev, identity.st_ino)
-            if key in opened:
-                os.close(descriptor)
-            else:
-                opened[key] = descriptor
-        for key in sorted(opened):
-            fcntl.flock(opened[key], fcntl.LOCK_EX)
-        yield
-    finally:
-        for key in sorted(opened, reverse=True):
-            descriptor = opened[key]
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
+    return result.stdout
 
 
-def apply_plan(
-    plan: dict[str, Any],
-    *,
-    source_root: Path,
-    destination_root: Path,
-    accepted_digest: str,
-    state_root: Path,
-    receipt_path: Path,
-) -> dict[str, Any]:
-    validate_plan(plan)
-    if accepted_digest != plan["plan_sha256"]:
-        raise BulkloadError("operator-supplied plan digest does not match")
-    intent = plan["intent"]
-    if not intent.get("ready") or intent.get("blockers"):
-        raise BulkloadError("blocked plans cannot be applied")
+def _live_roots(plan: dict[str, Any]) -> list[Path]:
+    catalog = plan["destination"]["catalog"]
+    values = {
+        catalog["root_bindings"]["git_root"],
+        catalog["root_bindings"]["home"],
+    }
+    values.update(
+        provider["path"]
+        for provider in catalog.get("providers", [])
+        if provider.get("exists")
+    )
+    values.update(
+        seat["path"] for seat in catalog.get("seats", []) if seat.get("exists")
+    )
+    return sorted((Path(value) for value in values), key=os.fspath)
 
-    source_root = source_root.expanduser().resolve()
-    destination_root = destination_root.expanduser().resolve()
-    state_root = state_root.expanduser().resolve()
-    receipt_path = receipt_path.expanduser().resolve()
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        raise BulkloadError("apply refuses to run as root")
-    if _paths_overlap(source_root, destination_root):
-        raise BulkloadError("source and destination roots must be disjoint")
-    if _paths_overlap(state_root, source_root) or _paths_overlap(
-        state_root, destination_root
-    ):
-        raise BulkloadError("state root must be disjoint from source and destination")
+
+def _object_path(stage_root: Path, digest: str) -> Path:
+    return stage_root / "objects" / digest[:2] / digest
+
+
+def _source_path(path: str | Path, mirror: Path | None) -> Path:
+    source = Path(path)
+    if not source.is_absolute():
+        raise BulkloadError("AgentPlanV4 source path is not absolute")
+    return source if mirror is None else mirror.joinpath(*source.parts[1:])
+
+
+def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
+    paths: set[str] = set()
+    for operation in plan["operations"]:
+        source = operation["source"]
+        if operation["kind"] == "git-workspace-union":
+            common = Path(source["common_git_dir"]) / "objects"
+            paths.update(
+                os.fspath(common / item["relative_path"])
+                for item in source.get("object_files", [])
+            )
+            for worktree in source.get("worktrees", []):
+                paths.update(
+                    os.fspath(Path(worktree["path"]) / item["relative_path"])
+                    for item in worktree.get("files", [])
+                )
+                if worktree["index"]["exists"]:
+                    paths.add(worktree["index"]["path"])
+            continue
+        path = Path(operation["source_root"]) / source["relative_path"]
+        paths.add(os.fspath(path))
+        if operation["kind"] == "sqlite-union":
+            paths.update(
+                os.fspath(Path(os.fspath(path) + f"-{item['kind']}"))
+                for item in source.get("sidecars", [])
+            )
+    result = []
+    for raw in sorted(paths):
+        path = Path(raw)
+        if not path.is_absolute() or any(
+            part in {"", ".", ".."} for part in path.parts
+        ):
+            raise BulkloadError("transport allowlist contains a non-canonical path")
+        result.append(path.relative_to("/").as_posix())
+    return result
+
+
+def _transport_environment(ssh_path: str) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("RSYNC_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+    }
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "RSYNC_RSH": f"{ssh_path} {' '.join(SSH_OPTIONS)}",
+        }
+    )
+    return environment
+
+
+def _probe_remote_rsync(ssh_path: str, host: str, binding: dict[str, Any]) -> None:
+    outputs = []
+    for argument in ("--version", "--help"):
+        result = subprocess.run(
+            [ssh_path, *SSH_OPTIONS, "--", host, binding["path"], argument],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=_transport_environment(ssh_path),
+        )
+        if result.returncode != 0:
+            raise BulkloadError("authenticated destination rsync feature probe failed")
+        outputs.append(result.stdout)
+    match = re.search(rb"protocol version (\d+)", outputs[0])
     if (
-        _paths_overlap(receipt_path, source_root)
-        or _paths_overlap(receipt_path, destination_root)
-        or _paths_overlap(receipt_path, state_root)
+        match is None
+        or int(match.group(1)) != binding["protocol"]
+        or b"--from0" not in outputs[1]
+        or b"--files-from" not in outputs[1]
+        or b"--ignore-missing-args" not in outputs[1]
+    ):
+        raise BulkloadError("destination rsync differs from captured feature authority")
+
+
+def _transport_host(value: str, expected: str) -> str:
+    match = re.fullmatch(
+        r"(?:(?:[a-z_][a-z0-9_-]{0,31})@)?([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)",
+        value,
+    )
+    if match is None or match.group(1) != expected:
+        raise BulkloadError("SSH authority differs from captured hostname")
+    return value
+
+
+def _transport_ssh(ssh_binary: str | None) -> str:
+    path = ssh_binary or shutil.which("ssh")
+    if path is None:
+        raise BulkloadError("an explicit safe SSH executable is unavailable")
+    return shell_safe_executable(path, "SSH")
+
+
+def _transport_body(
+    plan: dict[str, Any],
+    phase: str,
+    stage_root: Path,
+    transport: dict[str, Any],
+    capacity: dict[str, Any],
+) -> dict[str, Any]:
+    manifest = {
+        "created_at": utc_now(),
+        "entries": [],
+        "holds": plan["holds"],
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "stage_id": new_id(),
+        "stage_root": os.fspath(stage_root),
+    }
+    seal(manifest, "manifest_sha256")
+    receipt = {
+        "capacity": capacity,
+        "created_at": utc_now(),
+        "manifest": manifest,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "materialization": {},
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "ready_for_apply": False,
+        "receipt_id": new_id(),
+        "schema": AGENT_STAGE_SCHEMA,
+        "stage_root": os.fspath(stage_root),
+        "transport": transport,
+    }
+    return seal(receipt, "receipt_sha256")
+
+
+def _validate_prepare_receipt(
+    plan: dict[str, Any],
+    phase: str,
+    stage_root: Path,
+    receipt: dict[str, Any],
+) -> None:
+    validate_stage_receipt(receipt)
+    payload = b"".join(os.fsencode(item) + b"\0" for item in _plan_source_paths(plan))
+    if (
+        receipt["plan_sha256"] != plan["plan_sha256"]
+        or receipt["phase"] != phase
+        or receipt["stage_root"] != os.fspath(stage_root)
+        or receipt["ready_for_apply"]
+        or receipt["manifest"]["entries"]
+        or receipt["transport"]["mode"] != "destination-prepare"
+        or receipt["transport"]["allowlist_sha256"] != sha256_bytes(payload)
+        or receipt["transport"]["destination_rsync"]
+        != plan["destination"]["catalog"]["transport"]["rsync"]
+        or receipt["transport"]["source_rsync"]
+        != plan["source"]["catalog"]["transport"]["rsync"]
+        or receipt["transport"]["transport_receipt_sha256"] is not None
+    ):
+        raise BulkloadError("prepare receipt is detached from the accepted stage plan")
+    if receipt["transport"]["quarantine_root"] != os.fspath(
+        stage_root / ".transport-quarantine"
+    ):
+        raise BulkloadError("prepare receipt quarantine binding is invalid")
+
+
+def _push_source_transport(
+    plan: dict[str, Any],
+    phase: str,
+    stage_root: Path,
+    destination_ssh_host: str,
+    prepare_receipt: dict[str, Any],
+    *,
+    ssh_binary: str | None,
+) -> dict[str, Any]:
+    source = plan["source"]["catalog"]["transport"]
+    destination = plan["destination"]["catalog"]["transport"]
+    _validate_prepare_receipt(plan, phase, stage_root, prepare_receipt)
+    if socket.gethostname() != source["hostname"]:
+        raise BulkloadError("transport push must run on the captured source host")
+    host = _transport_host(destination_ssh_host, destination["hostname"])
+    ssh_path = _transport_ssh(ssh_binary)
+    source_binding = inspect_rsync(source["rsync"]["path"])
+    if source_binding != source["rsync"]:
+        raise BulkloadError("source rsync differs from captured authority")
+    _probe_remote_rsync(ssh_path, host, destination["rsync"])
+    allowlist = _plan_source_paths(plan)
+    payload = b"".join(os.fsencode(item) + b"\0" for item in allowlist)
+    quarantine = Path(prepare_receipt["transport"]["quarantine_root"])
+    result = subprocess.run(
+        [
+            source_binding["path"],
+            "-a",
+            "--from0",
+            "--files-from=-",
+            "--checksum",
+            "--delay-updates",
+            "--ignore-missing-args",
+            "--no-devices",
+            "--no-specials",
+            f"--rsync-path={destination['rsync']['path']}",
+            "/",
+            f"{host}:{quarantine}/",
+        ],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=_transport_environment(ssh_path),
+    )
+    if result.returncode != 0:
+        raise BulkloadError("authenticated rsync quarantine push failed")
+    transport = {
+        "allowlist_sha256": sha256_bytes(payload),
+        "destination_rsync": destination["rsync"],
+        "mode": "ssh-rsync-push",
+        "quarantine_root": os.fspath(quarantine),
+        "source_host": source["hostname"],
+        "source_rsync": source_binding,
+        "transport_receipt_sha256": prepare_receipt["receipt_sha256"],
+    }
+    receipt = _transport_body(
+        plan, phase, stage_root, transport, prepare_receipt["capacity"]
+    )
+    with tempfile.TemporaryDirectory(prefix="bulkload-transport-") as temporary:
+        local_receipt = Path(temporary) / f"transport-receipt-{phase}.json"
+        descriptor = os.open(
+            local_receipt,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(canonical_bytes(receipt) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        receipt_result = subprocess.run(
+            [
+                source_binding["path"],
+                "-a",
+                "--checksum",
+                "--delay-updates",
+                "--no-devices",
+                "--no-specials",
+                f"--rsync-path={destination['rsync']['path']}",
+                os.fspath(local_receipt),
+                f"{host}:{stage_root}/.transport-receipt-{phase}.json",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=_transport_environment(ssh_path),
+        )
+    if receipt_result.returncode != 0:
+        raise BulkloadError("authenticated transport-receipt push failed")
+    return receipt
+
+
+def _materialized_transport(
+    plan: dict[str, Any],
+    phase: str,
+    stage_root: Path,
+    prepare_receipt: dict[str, Any],
+    transport_receipt: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    _validate_prepare_receipt(plan, phase, stage_root, prepare_receipt)
+    validate_stage_receipt(transport_receipt)
+    expected_allowlist = b"".join(
+        os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
+    )
+    if (
+        transport_receipt["plan_sha256"] != plan["plan_sha256"]
+        or transport_receipt["phase"] != phase
+        or transport_receipt["stage_root"] != os.fspath(stage_root)
+        or transport_receipt["ready_for_apply"]
+        or transport_receipt["manifest"]["entries"]
+        or transport_receipt["transport"]["mode"] != "ssh-rsync-push"
+        or transport_receipt["transport"]["allowlist_sha256"]
+        != sha256_bytes(expected_allowlist)
+        or transport_receipt["transport"]["source_rsync"]
+        != plan["source"]["catalog"]["transport"]["rsync"]
+        or transport_receipt["transport"]["destination_rsync"]
+        != plan["destination"]["catalog"]["transport"]["rsync"]
+        or transport_receipt["transport"]["transport_receipt_sha256"]
+        != prepare_receipt["receipt_sha256"]
     ):
         raise BulkloadError(
-            "receipt must be outside source, destination, and state roots"
+            "transport receipt is detached from the accepted stage plan"
         )
-    destination_target = intent["destination_target"]
-    if socket.gethostname() != destination_target["host"]:
-        raise BulkloadError("destination host does not match the accepted plan")
-    if str(destination_root) != destination_target["root"]:
-        raise BulkloadError("destination root does not match the accepted plan")
+    quarantine = stage_root / ".transport-quarantine"
+    if transport_receipt["transport"]["quarantine_root"] != os.fspath(quarantine):
+        raise BulkloadError("transport receipt quarantine binding is invalid")
+    for path in (stage_root, quarantine):
+        info = path.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+            raise BulkloadError("prepared stage/quarantine custody mode is invalid")
+    transport = dict(transport_receipt["transport"])
+    transport["mode"] = "ssh-rsync-quarantine"
+    transport["transport_receipt_sha256"] = transport_receipt["receipt_sha256"]
+    return quarantine, transport
 
-    durable_makedirs(state_root)
-    if not stat.S_ISDIR(state_root.lstat().st_mode):
-        raise BulkloadError("state root must be a real directory")
-    if stat.S_IMODE(state_root.stat().st_mode) & 0o077:
-        raise BulkloadError("state root must not be group- or world-accessible")
 
-    run_root = safe_join(
-        state_root, f"runs/{plan['plan_sha256']}", allow_leaf_symlink=False
-    )
-    backup_root = safe_join(
-        state_root, f"backups/{plan['plan_sha256']}", allow_leaf_symlink=False
-    )
-    durable_makedirs(run_root)
-    journal_path = run_root / "journal.jsonl"
+def _verify_record(
+    path: Path, record: dict[str, Any], *, translated: bool = False
+) -> None:
+    expected_kind = record.get("kind", "regular")
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise _StageSourceChanged(
+            f"required state disappeared before staging: {path}"
+        ) from error
+    if expected_kind == "regular":
+        if not stat.S_ISREG(info.st_mode):
+            raise _StageSourceChanged(f"state type changed before staging: {path}")
+        expected_sha = record.get("sha256")
+        if sha256_file(path) != expected_sha or info.st_size != record.get("size"):
+            raise _StageSourceChanged(f"state bytes changed before staging: {path}")
+    elif expected_kind == "symlink":
+        if not stat.S_ISLNK(info.st_mode) or sha256_symlink(path) != record.get(
+            "sha256"
+        ):
+            raise _StageSourceChanged(f"symbolic link changed before staging: {path}")
+    elif expected_kind == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            raise _StageSourceChanged(f"directory changed before staging: {path}")
+    else:
+        raise _StageSourceChanged("unsupported staged entry kind")
+    if f"{stat.S_IMODE(info.st_mode):04o}" != record.get("mode"):
+        raise _StageSourceChanged(f"state mode changed before staging: {path}")
 
-    applied: list[dict[str, Any]] = []
-    with _lock_destination_repositories(intent, destination_root):
-        preflight = _preflight_plan(intent, source_root, destination_root)
-        journal_descriptor = _open_private_regular(
-            journal_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT
+
+def _rewrite_payload(source: Path, path_map: list[dict[str, str]]) -> bytes:
+    try:
+        payload = source.read_bytes()
+    except OSError as error:
+        raise BulkloadError(f"cannot read path-rewritten state {source}") from error
+    result = payload
+    for entry in sorted(path_map, key=lambda item: len(item["source"]), reverse=True):
+        result = result.replace(
+            os.fsencode(entry["source"]), os.fsencode(entry["destination"])
         )
-        try:
-            _fsync_directory(journal_path.parent)
-        except BaseException:
-            os.close(journal_descriptor)
-            raise
-        journal = os.fdopen(journal_descriptor, "ab", buffering=0)
-        try:
-            _apply_locked(
-                journal,
-                preflight,
-                applied,
-                plan,
-                backup_root,
-                destination_root,
+    # Validate structured JSON when the suffix promises it; other Claude
+    # state (for example Markdown commands) must still be portable UTF-8.
+    try:
+        if source.suffix.lower() == ".jsonl":
+            for line in result.splitlines():
+                if line:
+                    json.loads(line)
+        elif source.suffix.lower() == ".json":
+            json.loads(result)
+        else:
+            result.decode("utf-8", errors="strict")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BulkloadError("path rewriting produced invalid provider JSON") from error
+    return result
+
+
+def _publish_object(temporary: Path, target: Path, digest: str, size: int) -> bool:
+    """Publish by an O_EXCL hard-link; never replace an existing object."""
+    try:
+        os.link(temporary, target, follow_symlinks=False)
+        fsync_directory(target.parent)
+        created = True
+    except FileExistsError:
+        created = False
+    finally:
+        temporary.unlink(missing_ok=True)
+    try:
+        info = target.stat(follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise BulkloadError("content-addressed object publication failed") from error
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size != size
+        or sha256_file(target) != digest
+    ):
+        raise BulkloadError("stage content-addressed object is corrupt")
+    return created
+
+
+def _object_temporary(target: Path) -> Path:
+    durable_makedirs(target.parent)
+    return target.parent / f".{target.name}.ingest-{new_id()}"
+
+
+def _write_object_bytes(
+    stage_root: Path, digest: str, payload: bytes, mode: int
+) -> Path:
+    target = _object_path(stage_root, digest)
+    if target.exists():
+        if sha256_file(target) != digest:
+            raise BulkloadError("stage content-addressed object is corrupt")
+        return target
+    temporary = _object_temporary(target)
+    atomic_write(temporary, payload, mode=mode)
+    _publish_object(temporary, target, digest, len(payload))
+    return target
+
+
+def _materialize_file(
+    *,
+    stage_root: Path,
+    source_path: Path,
+    record: dict[str, Any],
+    destination_candidate: Path | None,
+    path_map: list[dict[str, str]],
+    transform: str | None,
+    allow_accounted_copy: bool,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    _verify_record(source_path, record)
+    kind = record.get("kind", "regular")
+    mode = int(record.get("mode", "0600"), 8)
+    if kind == "directory":
+        return {"blob_sha256": None, "kind": kind, "mode": record["mode"], "size": 0}
+    if kind == "symlink":
+        payload = os.fsencode(os.readlink(source_path))
+        digest = sha256_bytes(payload)
+        if digest != record["sha256"]:
+            raise _StageSourceChanged("symbolic-link payload changed before staging")
+        _write_object_bytes(stage_root, digest, payload, 0o600)
+        stats["metadata_bytes"] += len(payload)
+        return {
+            "blob_sha256": digest,
+            "kind": kind,
+            "mode": record["mode"],
+            "size": len(payload),
+        }
+
+    if transform == "path-rewrite":
+        if not allow_accounted_copy:
+            raise BulkloadError(
+                "path rewriting requires explicit capacity-accounted materialization"
             )
-        finally:
-            journal.close()
+        payload = _rewrite_payload(source_path, path_map)
+        digest = sha256_bytes(payload)
+        expected = record.get("translated_sha256")
+        if digest != expected:
+            raise _StageSourceChanged(
+                "path-rewritten state digest differs from the plan"
+            )
+        _write_object_bytes(stage_root, digest, payload, mode)
+        stats["accounted_copy_bytes"] += len(payload)
+        return {
+            "blob_sha256": digest,
+            "kind": kind,
+            "mode": record["mode"],
+            "size": len(payload),
+        }
 
-    receipt: dict[str, Any] = {
-        "applied_at": utc_now(),
-        "operations": applied,
-        "plan_sha256": plan["plan_sha256"],
-        "schema": RECEIPT_SCHEMA,
-        "state_root": str(state_root),
+    digest = record["sha256"]
+    target = _object_path(stage_root, digest)
+    if target.exists():
+        if sha256_file(target) != digest:
+            raise BulkloadError("stage content-addressed object is corrupt")
+        stats["reused_object_bytes"] += record["size"]
+        return {
+            "blob_sha256": digest,
+            "kind": kind,
+            "mode": record["mode"],
+            "size": record["size"],
+        }
+    if destination_candidate is not None and destination_candidate.exists():
+        info = destination_candidate.stat(follow_symlinks=False)
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_size == record["size"]
+            and (sha256_file(destination_candidate) == digest)
+        ):
+            temporary = _object_temporary(target)
+            reflink_clone(
+                destination_candidate,
+                temporary,
+                expected_sha256=digest,
+                mode=mode,
+            )
+            _publish_object(temporary, target, digest, record["size"])
+            stats["destination_reflink_bytes"] += record["size"]
+            return {
+                "blob_sha256": digest,
+                "kind": kind,
+                "mode": record["mode"],
+                "size": record["size"],
+            }
+    temporary = _object_temporary(target)
+    try:
+        reflink_clone(source_path, temporary, expected_sha256=digest, mode=mode)
+        _publish_object(temporary, target, digest, record["size"])
+        stats["source_reflink_bytes"] += record["size"]
+    except BulkloadError as clone_error:
+        temporary.unlink(missing_ok=True)
+        try:
+            _verify_record(source_path, record)
+        except _StageSourceChanged:
+            raise
+        if not allow_accounted_copy:
+            raise clone_error
+        temporary = _object_temporary(target)
+        try:
+            accounted_copy(
+                source_path,
+                temporary,
+                expected_sha256=digest,
+                mode=mode,
+            )
+            _publish_object(temporary, target, digest, record["size"])
+        except BulkloadError as copy_error:
+            temporary.unlink(missing_ok=True)
+            try:
+                _verify_record(source_path, record)
+            except _StageSourceChanged:
+                raise
+            raise copy_error
+        stats["accounted_copy_bytes"] += record["size"]
+    return {
+        "blob_sha256": digest,
+        "kind": kind,
+        "mode": record["mode"],
+        "size": record["size"],
     }
-    receipt["receipt_sha256"] = object_digest(receipt, "receipt_sha256")
+
+
+def _typed_row(values: Sequence[Any]) -> list[list[Any]]:
+    return [_typed_sql_value(value) for value in values]
+
+
+def _row_key(values: Sequence[Any], columns: list[str], primary_key: list[str]) -> str:
+    typed = _typed_row(values)
+    if primary_key:
+        key = [typed[columns.index(column)] for column in primary_key]
+        return sha256_bytes(canonical_bytes(key))
+    return sha256_bytes(canonical_bytes(typed))
+
+
+def _row_digest(values: Sequence[Any]) -> str:
+    return sha256_bytes(canonical_bytes(_typed_row(values)))
+
+
+def _sqlite_union_is_safe(
+    source_record: dict[str, Any], destination_record: dict[str, Any]
+) -> bool:
+    source = source_record["logical"]
+    destination = destination_record["logical"]
+    if any(
+        source[key] != destination[key]
+        for key in ("application_id", "schema_sha256", "user_version")
+    ):
+        return False
+    destination_tables = {table["name"]: table for table in destination["tables"]}
+    for source_table in source["tables"]:
+        destination_table = destination_tables.get(source_table["name"])
+        if destination_table is None:
+            return False
+        for table in (source_table, destination_table):
+            keys = [row["key_sha256"] for row in table["rows"]]
+            if table["primary_key"] and len(keys) != len(set(keys)):
+                return False
+        destination_rows = {
+            row["key_sha256"]: row["row_sha256"] for row in destination_table["rows"]
+        }
+        for row in source_table["rows"]:
+            observed = destination_rows.get(row["key_sha256"])
+            if observed is not None and observed != row["row_sha256"]:
+                return False
+    return True
+
+
+def _compose_sqlite(
+    source_snapshot: Path,
+    destination_snapshot: Path | None,
+    output: Path,
+    source_record: dict[str, Any],
+    destination_record: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if destination_snapshot is None or destination_record is None:
+        source_authoritative = True
+    else:
+        source_authoritative = not _sqlite_union_is_safe(
+            source_record, destination_record
+        )
+    if source_authoritative:
+        reflink_clone(
+            source_snapshot,
+            output,
+            expected_sha256=sha256_file(source_snapshot),
+            mode=0o600,
+        )
+        return _sqlite_catalog_from_snapshot(output, max_rows=DEFAULT_MAX_SQLITE_ROWS)
+    reflink_clone(
+        destination_snapshot,
+        output,
+        expected_sha256=sha256_file(destination_snapshot),
+        mode=0o600,
+    )
+    source_connection = sqlite3.connect(
+        f"file:{source_snapshot.as_posix()}?mode=ro", uri=True
+    )
+    output_connection = sqlite3.connect(output)
+    try:
+        output_connection.execute("PRAGMA foreign_keys=OFF")
+        output_connection.execute("BEGIN IMMEDIATE")
+        for table in source_record["logical"]["tables"]:
+            name = table["name"]
+            columns = table["columns"]
+            primary_key = table["primary_key"]
+            quoted = _quote_identifier(name)
+            destination_rows: dict[str, str] = {}
+            destination_counts: dict[str, int] = defaultdict(int)
+            for values in output_connection.execute(f"SELECT * FROM {quoted}"):
+                digest = _row_digest(values)
+                if primary_key:
+                    destination_rows[_row_key(values, columns, primary_key)] = digest
+                else:
+                    destination_counts[digest] += 1
+            placeholders = ",".join("?" for _ in columns)
+            column_list = ",".join(_quote_identifier(column) for column in columns)
+            insert = f"INSERT INTO {quoted} ({column_list}) VALUES ({placeholders})"
+            source_counts: dict[str, int] = defaultdict(int)
+            for values in source_connection.execute(f"SELECT * FROM {quoted}"):
+                key = _row_key(values, columns, primary_key)
+                digest = _row_digest(values)
+                if not primary_key:
+                    source_counts[digest] += 1
+                    if source_counts[digest] > destination_counts[digest]:
+                        output_connection.execute(insert, values)
+                    continue
+                observed = destination_rows.get(key)
+                if observed is not None and observed != digest:
+                    raise BulkloadError("SQLite shared row diverged after planning")
+                if observed is None:
+                    output_connection.execute(insert, values)
+                    destination_rows[key] = digest
+        output_connection.commit()
+        if output_connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise BulkloadError("composed SQLite quick_check failed")
+        if output_connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise BulkloadError("composed SQLite foreign-key check failed")
+    except BaseException:
+        output_connection.rollback()
+        raise
+    finally:
+        output_connection.close()
+        source_connection.close()
+    return _sqlite_catalog_from_snapshot(output, max_rows=DEFAULT_MAX_SQLITE_ROWS)
+
+
+def _sqlite_stage_entry(
+    operation: dict[str, Any],
+    *,
+    stage_root: Path,
+    source_mirror: Path | None,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    temporary_root = stage_root / ".sqlite-work"
+    durable_makedirs(temporary_root)
+    source_path = _source_path(
+        Path(operation["source_root"]) / operation["source"]["relative_path"],
+        source_mirror,
+    )
+    source_snapshot = temporary_root / f"source-{operation['operation_id']}.sqlite"
+    source_snapshot.unlink(missing_ok=True)
+    source_catalog = snapshot_sqlite(
+        source_path, source_snapshot, max_rows=DEFAULT_MAX_SQLITE_ROWS
+    )
+    if (
+        source_catalog["logical_sha256"]
+        != operation["source"]["logical"]["logical_sha256"]
+    ):
+        raise BulkloadError("source SQLite state changed after planning")
+    destination_before = operation.get("destination_before")
+    destination_snapshot: Path | None = None
+    if destination_before is not None:
+        destination_path = Path(operation["destination_path"])
+        destination_snapshot = (
+            temporary_root / f"destination-{operation['operation_id']}.sqlite"
+        )
+        destination_snapshot.unlink(missing_ok=True)
+        destination_catalog = snapshot_sqlite(
+            destination_path,
+            destination_snapshot,
+            max_rows=DEFAULT_MAX_SQLITE_ROWS,
+        )
+        if (
+            destination_catalog["logical_sha256"]
+            != destination_before["logical"]["logical_sha256"]
+        ):
+            raise BulkloadError("destination SQLite state changed after planning")
+    composed = temporary_root / f"composed-{operation['operation_id']}.sqlite"
+    composed.unlink(missing_ok=True)
+    logical = _compose_sqlite(
+        source_snapshot,
+        destination_snapshot,
+        composed,
+        operation["source"],
+        destination_before,
+    )
+    digest = sha256_file(composed)
+    target = _object_path(stage_root, digest)
+    if not target.exists():
+        temporary = _object_temporary(target)
+        reflink_clone(composed, temporary, expected_sha256=digest, mode=0o600)
+        _publish_object(temporary, target, digest, composed.stat().st_size)
+        stats["sqlite_compose_bytes"] += composed.stat().st_size
+    source_snapshot.unlink(missing_ok=True)
+    if destination_snapshot is not None:
+        destination_snapshot.unlink(missing_ok=True)
+    composed.unlink(missing_ok=True)
+    return {
+        "blob_sha256": digest,
+        "destination_before": destination_before,
+        "destination_path": operation["destination_path"],
+        "expected_logical": logical,
+        "kind": "sqlite",
+        "mode": operation["source"]["mode"],
+        "operation_id": operation["operation_id"],
+        "owner": operation["owner"],
+        "size": target.stat().st_size,
+    }
+
+
+def _stage_file_operation(
+    operation: dict[str, Any],
+    *,
+    stage_root: Path,
+    plan: dict[str, Any],
+    source_mirror: Path | None,
+    allow_accounted_copy: bool,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    source_path = _source_path(
+        Path(operation["source_root"]) / operation["source"]["relative_path"],
+        source_mirror,
+    )
+    material = _materialize_file(
+        stage_root=stage_root,
+        source_path=source_path,
+        record=operation["source"],
+        destination_candidate=Path(operation["destination_path"]),
+        path_map=plan["path_map"],
+        transform=operation.get("transform"),
+        allow_accounted_copy=allow_accounted_copy,
+        stats=stats,
+    )
+    return {
+        **material,
+        "destination_before": operation.get("destination_before"),
+        "destination_path": operation["destination_path"],
+        "operation_id": operation["operation_id"],
+        "owner": operation["owner"],
+        "source": operation["source"],
+    }
+
+
+def _stage_git_operation(
+    operation: dict[str, Any],
+    *,
+    stage_root: Path,
+    plan: dict[str, Any],
+    source_mirror: Path | None,
+    allow_accounted_copy: bool,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    source = operation["source"]
+    destination_before = operation.get("destination_before")
+    destination_common = (
+        Path(destination_before["common_git_dir"])
+        if destination_before is not None
+        else (
+            Path(operation["destination_path"]) / ".git"
+            if source.get("worktrees")
+            else Path(operation["destination_path"])
+        )
+    )
+    objects: list[dict[str, Any]] = []
+    for record in source.get("object_files", []):
+        source_path = _source_path(
+            Path(source["common_git_dir"]) / "objects" / record["relative_path"],
+            source_mirror,
+        )
+        target = destination_common / "objects" / record["relative_path"]
+        material = _materialize_file(
+            stage_root=stage_root,
+            source_path=source_path,
+            record=record,
+            destination_candidate=target,
+            path_map=plan["path_map"],
+            transform=None,
+            allow_accounted_copy=allow_accounted_copy,
+            stats=stats,
+        )
+        objects.append({**material, "relative_path": record["relative_path"]})
+    worktrees: list[dict[str, Any]] = []
+    destination_worktrees = {
+        worktree["path"]: worktree
+        for worktree in (destination_before or {}).get("worktrees", [])
+    }
+    for source_worktree in source.get("worktrees", []):
+        destination_path = Path(source_worktree["destination_path"])
+        destination_worktree = destination_worktrees.get(os.fspath(destination_path))
+        destination_files = {
+            item["relative_path"]: item
+            for item in (destination_worktree or {}).get("files", [])
+        }
+        files: list[dict[str, Any]] = []
+        source_file_names: set[str] = set()
+        for record in source_worktree.get("files", []):
+            source_file_names.add(record["relative_path"])
+            source_path = _source_path(
+                Path(source_worktree["path"]) / record["relative_path"], source_mirror
+            )
+            target = destination_path / record["relative_path"]
+            material = _materialize_file(
+                stage_root=stage_root,
+                source_path=source_path,
+                record=record,
+                destination_candidate=target,
+                path_map=plan["path_map"],
+                transform=None,
+                allow_accounted_copy=allow_accounted_copy,
+                stats=stats,
+            )
+            files.append(
+                {
+                    **material,
+                    "destination_before": destination_files.get(
+                        record["relative_path"]
+                    ),
+                    "destination_path": os.fspath(target),
+                    "relative_path": record["relative_path"],
+                    "source": record,
+                }
+            )
+        deletions = [
+            os.fspath(destination_path / relative)
+            for relative in destination_files
+            if relative not in source_file_names
+        ]
+        index = source_worktree["index"]
+        destination_index = (destination_worktree or {}).get("index")
+        destination_index_before = None
+        if destination_index and destination_index.get("exists"):
+            destination_index_before = {
+                "kind": "regular",
+                "mode": destination_index["mode"],
+                "sha256": destination_index["sha256"],
+                "size": destination_index["size"],
+            }
+        staged_index = None
+        if index["exists"]:
+            material = _materialize_file(
+                stage_root=stage_root,
+                source_path=_source_path(index["path"], source_mirror),
+                record={
+                    "kind": "regular",
+                    "mode": index["mode"],
+                    "sha256": index["sha256"],
+                    "size": index["size"],
+                },
+                destination_candidate=(
+                    Path(destination_worktree["index"]["path"])
+                    if destination_worktree and destination_worktree["index"]["exists"]
+                    else None
+                ),
+                path_map=plan["path_map"],
+                transform=None,
+                allow_accounted_copy=allow_accounted_copy,
+                stats=stats,
+            )
+            staged_index = {
+                **material,
+                "destination_before": destination_index_before,
+                "expected": index,
+            }
+        worktrees.append(
+            {
+                "branch": source_worktree["branch"],
+                "deletions": sorted(deletions),
+                "detached": source_worktree["detached"],
+                "files": files,
+                "head": source_worktree["head"],
+                "index": staged_index,
+                "index_destination_before": destination_index_before,
+                "index_destination_path": destination_index.get("path")
+                if destination_index and destination_index.get("exists")
+                else None,
+                "index_expected_exists": index["exists"],
+                "path": os.fspath(destination_path),
+                "source": source_worktree,
+            }
+        )
+    return {
+        "destination_before": destination_before,
+        "destination_common_git_dir": os.fspath(destination_common),
+        "destination_path": operation["destination_path"],
+        "kind": "git-workspace",
+        "object_format": source["object_format"],
+        "objects": objects,
+        "operation_id": operation["operation_id"],
+        "ref_actions": operation["ref_actions"],
+        "source": source,
+        "worktrees": worktrees,
+    }
+
+
+def _stage_receipt_path(stage_root: Path, phase: str) -> Path:
+    return stage_root / f"receipt-{phase}.json"
+
+
+def validate_stage_receipt(
+    value: dict[str, Any], *, require_final: bool = False
+) -> None:
+    require_exact_keys(
+        value,
+        {
+            "capacity",
+            "created_at",
+            "manifest",
+            "manifest_sha256",
+            "materialization",
+            "phase",
+            "plan_sha256",
+            "ready_for_apply",
+            "receipt_id",
+            "receipt_sha256",
+            "schema",
+            "stage_root",
+            "transport",
+        },
+        "AgentStageV4 receipt",
+    )
+    if value.get("schema") != AGENT_STAGE_SCHEMA:
+        raise BulkloadError("input is not an AgentStageV4 receipt")
+    require_digest(value, "receipt_sha256")
+    if value.get("phase") not in {"preseed", "final"}:
+        raise BulkloadError("AgentStageV4 phase is invalid")
+    manifest = value.get("manifest")
+    if not isinstance(manifest, dict):
+        raise BulkloadError("AgentStageV4 lacks its embedded sealed manifest")
+    require_digest(manifest, "manifest_sha256")
+    require_exact_keys(
+        manifest,
+        {
+            "created_at",
+            "entries",
+            "holds",
+            "manifest_sha256",
+            "phase",
+            "plan_sha256",
+            "stage_id",
+            "stage_root",
+        },
+        "AgentStageV4 embedded manifest",
+    )
+    if value.get("manifest_sha256") != manifest["manifest_sha256"]:
+        raise BulkloadError("AgentStageV4 manifest binding is invalid")
+    if (
+        manifest.get("phase") != value["phase"]
+        or manifest.get("plan_sha256") != value.get("plan_sha256")
+        or manifest.get("stage_root") != value.get("stage_root")
+        or not isinstance(manifest.get("entries"), list)
+    ):
+        raise BulkloadError("AgentStageV4 embedded manifest contract is invalid")
+    if require_final and (
+        value["phase"] != "final" or value.get("ready_for_apply") is not True
+    ):
+        raise BulkloadError("final sealed AgentStageV4 receipt is required")
+    require_exact_keys(
+        value["transport"],
+        {
+            "allowlist_sha256",
+            "destination_rsync",
+            "mode",
+            "quarantine_root",
+            "source_host",
+            "source_rsync",
+            "transport_receipt_sha256",
+        },
+        "AgentStageV4 transport",
+    )
+    if value["transport"]["mode"] not in {
+        "local",
+        "destination-prepare",
+        "ssh-rsync-push",
+        "ssh-rsync-quarantine",
+    }:
+        raise BulkloadError("AgentStageV4 transport mode is invalid")
+
+
+def _verify_stage_objects(manifest: dict[str, Any], stage_root: Path) -> None:
+    blobs: dict[str, int] = {}
+
+    def add(entry: dict[str, Any]) -> None:
+        digest = entry.get("blob_sha256")
+        if digest is not None:
+            blobs[digest] = int(entry["size"])
+
+    for entry in manifest["entries"]:
+        if entry["kind"] in {"file", "sqlite"}:
+            add(entry)
+        elif entry["kind"] == "git-workspace":
+            for item in entry["objects"]:
+                add(item)
+            for worktree in entry["worktrees"]:
+                for item in worktree["files"]:
+                    add(item)
+                if worktree["index"] is not None:
+                    add(worktree["index"])
+        else:
+            raise BulkloadError("stage manifest contains an unknown entry kind")
+    for digest, size in sorted(blobs.items()):
+        path = _object_path(stage_root, digest)
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise BulkloadError("sealed stage object is missing") from error
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != size
+            or sha256_file(path) != digest
+        ):
+            raise BulkloadError("sealed stage object failed exact verification")
+
+
+def stage_agent_plan(
+    plan: dict[str, Any],
+    *,
+    accepted_plan_sha256: str,
+    phase: str,
+    stage_root: Path,
+    allow_accounted_copy: bool,
+    reserve_bytes: int = DEFAULT_CAPACITY_RESERVE_BYTES,
+    transport_mode: str = "local",
+    destination_ssh_host: str | None = None,
+    prepare_receipt: dict[str, Any] | None = None,
+    transport_receipt: dict[str, Any] | None = None,
+    _ssh_binary: str | None = None,
+) -> dict[str, Any]:
+    validate_agent_plan(plan, require_ready=True)
+    if accepted_plan_sha256 != plan["plan_sha256"]:
+        raise BulkloadError("accepted plan digest does not match AgentPlanV4")
+    if phase not in {"preseed", "final"}:
+        raise BulkloadError("agent-stage phase must be preseed or final")
+    if transport_mode not in {"local", "prepare", "push", "materialize"}:
+        raise BulkloadError("agent-stage transport mode is invalid")
+    stage_root = _remote_safe_stage_root(stage_root)
+    assert_no_overlap(stage_root, _live_roots(plan), "stage root")
+    if transport_mode == "prepare":
+        if (
+            destination_ssh_host is not None
+            or prepare_receipt is not None
+            or transport_receipt is not None
+        ):
+            raise BulkloadError(
+                "destination preparation does not accept transport inputs"
+            )
+        if (
+            socket.gethostname()
+            != plan["destination"]["catalog"]["transport"]["hostname"]
+        ):
+            raise BulkloadError(
+                "transport preparation must run on captured destination"
+            )
+        durable_makedirs(stage_root)
+        os.chmod(stage_root, 0o700)
+        quarantine = stage_root / ".transport-quarantine"
+        durable_makedirs(quarantine)
+        os.chmod(quarantine, 0o700)
+        charged = int(plan["capacity"]["incoming_unique_bytes"])
+        if phase == "final":
+            charged += int(plan["capacity"]["sqlite_compose_bytes"])
+        capacity = require_capacity(
+            stage_root, charged_bytes=charged, reserve_bytes=reserve_bytes
+        )
+        source = plan["source"]["catalog"]["transport"]
+        destination = plan["destination"]["catalog"]["transport"]
+        destination_binding = inspect_rsync(destination["rsync"]["path"])
+        if destination_binding != destination["rsync"]:
+            raise BulkloadError("destination rsync differs from captured authority")
+        payload = b"".join(
+            os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
+        )
+        transport = {
+            "allowlist_sha256": sha256_bytes(payload),
+            "destination_rsync": destination_binding,
+            "mode": "destination-prepare",
+            "quarantine_root": os.fspath(quarantine),
+            "source_host": source["hostname"],
+            "source_rsync": source["rsync"],
+            "transport_receipt_sha256": None,
+        }
+        receipt = _transport_body(plan, phase, stage_root, transport, capacity)
+        atomic_write_json(stage_root / f".prepare-receipt-{phase}.json", receipt)
+        return receipt
+    if transport_mode == "push":
+        if (
+            destination_ssh_host is None
+            or prepare_receipt is None
+            or transport_receipt is not None
+        ):
+            raise BulkloadError(
+                "transport push requires destination host and exact prepare receipt"
+            )
+        return _push_source_transport(
+            plan,
+            phase,
+            stage_root,
+            destination_ssh_host,
+            prepare_receipt,
+            ssh_binary=_ssh_binary,
+        )
+    if destination_ssh_host is not None:
+        raise BulkloadError("destination SSH host is valid only for transport push")
+    if transport_mode == "materialize":
+        if transport_receipt is None or prepare_receipt is None:
+            raise BulkloadError(
+                "transport materialization requires exact prepare and push receipts"
+            )
+        if (
+            socket.gethostname()
+            != plan["destination"]["catalog"]["transport"]["hostname"]
+        ):
+            raise BulkloadError(
+                "transport materialization must run on captured destination"
+            )
+    elif transport_receipt is not None or prepare_receipt is not None:
+        raise BulkloadError("local staging does not accept a transport receipt")
+    stage_root = Path(os.path.realpath(stage_root))
+    durable_makedirs(stage_root)
+    os.chmod(stage_root, 0o700)
+    receipt_path = _stage_receipt_path(stage_root, phase)
+    if receipt_path.exists():
+        receipt = read_json(receipt_path)
+        validate_stage_receipt(receipt, require_final=phase == "final")
+        if receipt["plan_sha256"] != plan["plan_sha256"]:
+            raise BulkloadError("existing stage receipt belongs to a different plan")
+        _verify_stage_objects(receipt["manifest"], stage_root)
+        return receipt
+    if phase == "final":
+        preseed_receipt_path = _stage_receipt_path(stage_root, "preseed")
+        if not preseed_receipt_path.exists():
+            raise BulkloadError("final staging requires the sealed preseed receipt")
+        preseed = read_json(preseed_receipt_path)
+        validate_stage_receipt(preseed)
+        _verify_stage_objects(preseed["manifest"], stage_root)
+
+    charged = int(plan["capacity"]["incoming_unique_bytes"])
+    if phase == "final":
+        charged += int(plan["capacity"]["sqlite_compose_bytes"])
+    capacity = require_capacity(
+        stage_root, charged_bytes=charged, reserve_bytes=reserve_bytes
+    )
+    if transport_mode == "materialize":
+        assert transport_receipt is not None
+        source_mirror, transport = _materialized_transport(
+            plan, phase, stage_root, prepare_receipt, transport_receipt
+        )
+    else:
+        source = plan["source"]["catalog"]["transport"]
+        destination = plan["destination"]["catalog"]["transport"]
+        if source["hostname"] != destination["hostname"]:
+            raise BulkloadError("cross-host stage must use source push and materialize")
+        source_binding = inspect_rsync(source["rsync"]["path"])
+        destination_binding = inspect_rsync(destination["rsync"]["path"])
+        if (
+            source_binding != source["rsync"]
+            or destination_binding != destination["rsync"]
+        ):
+            raise BulkloadError("local rsync differs from captured authority")
+        payload = b"".join(
+            os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
+        )
+        source_mirror = None
+        transport = {
+            "allowlist_sha256": sha256_bytes(payload),
+            "destination_rsync": destination_binding,
+            "mode": "local",
+            "quarantine_root": None,
+            "source_host": source["hostname"],
+            "source_rsync": source_binding,
+            "transport_receipt_sha256": None,
+        }
+    stats = defaultdict(int)
+    entries: list[dict[str, Any]] = []
+    for operation in plan["operations"]:
+        try:
+            if operation["kind"] == "git-workspace-union":
+                entries.append(
+                    _stage_git_operation(
+                        operation,
+                        stage_root=stage_root,
+                        plan=plan,
+                        source_mirror=source_mirror,
+                        allow_accounted_copy=allow_accounted_copy,
+                        stats=stats,
+                    )
+                )
+            elif operation["kind"] == "sqlite-union":
+                if phase == "final":
+                    entries.append(
+                        _sqlite_stage_entry(
+                            operation,
+                            stage_root=stage_root,
+                            source_mirror=source_mirror,
+                            stats=stats,
+                        )
+                    )
+            elif operation["kind"] in {"file-install", "auth-install"}:
+                staged = _stage_file_operation(
+                    operation,
+                    stage_root=stage_root,
+                    plan=plan,
+                    source_mirror=source_mirror,
+                    allow_accounted_copy=allow_accounted_copy,
+                    stats=stats,
+                )
+                staged["payload_kind"] = staged["kind"]
+                staged["kind"] = "file"
+                staged["operation_kind"] = operation["kind"]
+                entries.append(staged)
+            else:
+                raise BulkloadError("AgentPlanV4 contains an unknown operation")
+        except _StageSourceChanged:
+            if phase == "final":
+                raise
+            stats["deferred_operations"] += 1
+    manifest = {
+        "created_at": utc_now(),
+        "entries": entries,
+        "holds": plan["holds"],
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "stage_id": new_id(),
+        "stage_root": os.fspath(stage_root),
+    }
+    seal(manifest, "manifest_sha256")
+    receipt = {
+        "capacity": capacity,
+        "created_at": utc_now(),
+        "manifest": manifest,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "materialization": dict(sorted(stats.items())),
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "ready_for_apply": phase == "final",
+        "receipt_id": new_id(),
+        "schema": AGENT_STAGE_SCHEMA,
+        "stage_root": os.fspath(stage_root),
+        "transport": transport,
+    }
+    seal(receipt, "receipt_sha256")
     atomic_write_json(receipt_path, receipt)
     return receipt
 
 
-def _apply_locked(
-    journal: BinaryIO,
-    preflight: list[dict[str, Any]],
-    applied: list[dict[str, Any]],
-    plan: dict[str, Any],
-    backup_root: Path,
-    destination_root: Path,
-) -> None:
-    _append_journal(
-        journal,
-        {
-            "event": "apply-start",
-            "plan_sha256": plan["plan_sha256"],
-            "time": utc_now(),
-        },
-    )
-    for item in preflight:
-        operation = item["operation"]
-        relative = item["relative"]
-        logical = item["logical"]
-        destination = item["destination"]
-        source = item["source"]
-        backup_relative = f"{'__root__' if logical == '.' else logical}/{relative}"
-        backup = safe_join(backup_root, backup_relative, allow_leaf_symlink=True)
-        if item["state"] == "already-applied":
-            current = _current_identity(
-                _repo_root(destination_root, logical), relative, operation["git_class"]
-            )
-            if current != operation["after"]:
-                raise BulkloadError(
-                    f"destination changed after preflight: {logical}/{relative}"
-                )
-            if operation.get("before") is not None:
-                backup_identity = _current_identity(
-                    backup.parent, backup.name, operation["git_class"]
-                )
-                if backup_identity != operation["before"]:
-                    raise BulkloadError(
-                        f"already-applied replacement has no exact backup: {logical}/{relative}"
-                    )
-            result = {"path": relative, "repo": logical, "result": "verified-existing"}
-            applied.append(result)
-            _append_journal(
-                journal, {"event": "copy-skip", **result, "time": utc_now()}
-            )
-            continue
+def _current_record(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    mode = f"{stat.S_IMODE(info.st_mode):04o}"
+    if stat.S_ISREG(info.st_mode):
+        return {
+            "kind": "regular",
+            "mode": mode,
+            "sha256": sha256_file(path),
+            "size": info.st_size,
+        }
+    if stat.S_ISLNK(info.st_mode):
+        return {
+            "kind": "symlink",
+            "mode": mode,
+            "sha256": sha256_symlink(path),
+            "size": len(os.fsencode(os.readlink(path))),
+        }
+    if stat.S_ISDIR(info.st_mode):
+        return {"kind": "directory", "mode": mode, "sha256": None, "size": 0}
+    raise BulkloadError(f"destination contains a special entry: {path}")
 
-        durable_makedirs(destination.parent)
-        current = _current_identity(
-            _repo_root(destination_root, logical), relative, operation["git_class"]
-        )
-        if current != operation.get("before"):
-            raise BulkloadError(
-                f"destination changed after preflight: {logical}/{relative}"
-            )
-        if operation.get("before") is not None:
-            _copy_backup(destination, backup, operation["before"])
-            current = _current_identity(
-                _repo_root(destination_root, logical), relative, operation["git_class"]
-            )
-            if current != operation["before"]:
-                raise BulkloadError(
-                    f"destination changed during backup: {logical}/{relative}"
-                )
-            _append_journal(
-                journal,
-                {
-                    "event": "backup-complete",
-                    "path": relative,
-                    "repo": logical,
-                    "time": utc_now(),
-                },
-            )
 
-        if operation["after"]["kind"] != "file":
-            raise BulkloadError(
-                f"unsupported source kind: {operation['after']['kind']}"
-            )
-        _atomic_copy_regular(source, destination, operation["after"])
-
-        actual = _current_identity(
-            _repo_root(destination_root, logical), relative, operation["git_class"]
-        )
-        if actual != operation["after"]:
-            raise BulkloadError(f"post-copy verification failed: {logical}/{relative}")
-        result = {"path": relative, "repo": logical, "result": "copied"}
-        applied.append(result)
-        _append_journal(
-            journal, {"event": "copy-complete", **result, "time": utc_now()}
-        )
-
-    _append_journal(
-        journal,
-        {
-            "event": "apply-complete",
-            "plan_sha256": plan["plan_sha256"],
-            "time": utc_now(),
-        },
+def _same_record(
+    current: dict[str, Any] | None, expected: dict[str, Any] | None
+) -> bool:
+    if current is None or expected is None:
+        return current is expected
+    return all(
+        current.get(key) == expected.get(key)
+        for key in ("kind", "mode", "sha256", "size")
+        if key in expected
     )
 
 
-def verify_plan(
-    plan: dict[str, Any], destination: dict[str, Any], accepted_digest: str
+def _snapshot_target(target: Path, rollback_root: Path) -> tuple[dict[str, Any], int]:
+    before = _current_record(target)
+    token = sha256_bytes(os.fsencode(os.path.abspath(os.fspath(target))))
+    snapshot = rollback_root / "files" / token[:2] / token
+    if before is None:
+        if snapshot.exists() or snapshot.is_symlink():
+            raise BulkloadError("rollback root contains an unexpected stale snapshot")
+        return {"before": None, "snapshot": None, "target": os.fspath(target)}, 0
+    if before["kind"] == "regular":
+        if snapshot.exists():
+            if (
+                not snapshot.is_file()
+                or snapshot.stat().st_size != before["size"]
+                or sha256_file(snapshot) != before["sha256"]
+            ):
+                raise BulkloadError("existing rollback snapshot is not exact")
+        else:
+            reflink_clone(
+                target,
+                snapshot,
+                expected_sha256=before["sha256"],
+                mode=int(before["mode"], 8),
+            )
+        return {
+            "before": before,
+            "snapshot": os.fspath(snapshot.relative_to(rollback_root)),
+            "target": os.fspath(target),
+        }, before["size"]
+    if before["kind"] == "symlink":
+        payload = os.fsencode(os.readlink(target))
+        if snapshot.exists():
+            if sha256_file(snapshot) != before["sha256"]:
+                raise BulkloadError("existing rollback symlink snapshot is not exact")
+        else:
+            atomic_write(snapshot, payload)
+        return {
+            "before": before,
+            "snapshot": os.fspath(snapshot.relative_to(rollback_root)),
+            "target": os.fspath(target),
+        }, len(payload)
+    return {
+        "before": before,
+        "snapshot": None,
+        "target": os.fspath(target),
+    }, 0
+
+
+def _atomic_install_blob(
+    stage_root: Path, entry: dict[str, Any], target: Path
 ) -> dict[str, Any]:
-    validate_plan(plan)
-    if accepted_digest != plan["plan_sha256"]:
-        raise BulkloadError("operator-supplied plan digest does not match")
-    validate_snapshot(destination)
-    intent = plan["intent"]
-    repositories = catalog_map(destination)
-    failures: list[dict[str, Any]] = []
-    if destination["snapshot_sha256"] == intent["destination_snapshot_sha256"]:
-        failures.append(
-            {
-                "code": "destination-snapshot-not-fresh",
-                "snapshot_sha256": destination["snapshot_sha256"],
-            }
-        )
-    destination_target = intent["destination_target"]
-    if destination.get("mode") != intent["mode"]:
-        failures.append(
-            {
-                "actual": destination.get("mode"),
-                "code": "destination-mode-mismatch",
-                "expected": intent["mode"],
-            }
-        )
-    for field in ("host", "root"):
-        if destination.get(field) != destination_target[field]:
-            failures.append(
-                {
-                    "actual": destination.get(field),
-                    "code": f"destination-{field}-mismatch",
-                    "expected": destination_target[field],
-                }
-            )
+    kind = entry.get("payload_kind", entry["kind"])
+    mode = int(entry["mode"], 8)
+    if kind == "directory":
+        durable_makedirs(target)
+        os.chmod(target, mode)
+        fsync_directory(target)
+        return _current_record(target) or {}
+    blob = _object_path(stage_root, entry["blob_sha256"])
+    if sha256_file(blob) != entry["blob_sha256"]:
+        raise BulkloadError("sealed stage object changed before apply")
+    durable_makedirs(target.parent)
+    temporary = target.parent / f".{target.name}.bulkload-{new_id()}"
+    if kind in {"regular", "sqlite"}:
+        reflink_clone(blob, temporary, expected_sha256=entry["blob_sha256"], mode=mode)
+    elif kind == "symlink":
+        payload = blob.read_bytes()
+        os.symlink(os.fsdecode(payload), temporary)
+    else:
+        raise BulkloadError("unsupported staged object kind")
+    os.replace(temporary, target)
+    fsync_directory(target.parent)
+    return _current_record(target) or {}
 
-    destination_before = _runtime_map(intent.get("destination_repositories_before", []))
-    for expected in intent.get("expected_repositories", []):
-        logical = expected["logical_path"]
-        actual = repositories.get(logical)
-        if actual is None:
-            failures.append({"code": "repository-missing", "repo": logical})
+
+def _resolve_git_dir(worktree: Path) -> Path:
+    return Path(
+        _git(worktree, ["rev-parse", "--path-format=absolute", "--git-dir"])
+        .decode()
+        .strip()
+    )
+
+
+def _ensure_git_workspace(
+    entry: dict[str, Any],
+    journal: dict[str, Any],
+    journal_path: Path,
+) -> Path:
+    primary = Path(entry["destination_path"])
+    bare = not entry["worktrees"]
+    marker = primary / ("HEAD" if bare else ".git")
+    if not marker.exists():
+        if primary.exists() and any(primary.iterdir()):
+            raise BulkloadError("new Git workspace destination is non-empty")
+        durable_makedirs(primary.parent)
+        if primary.parent.stat().st_dev != Path(journal["rollback_root"]).stat().st_dev:
+            raise BulkloadError(
+                "new Git workspace and rollback root must share a device"
+            )
+        created = journal.setdefault("created_git_roots", [])
+        if os.fspath(primary) not in created:
+            created.append(os.fspath(primary))
+            _write_apply_journal(journal_path, journal)
+        durable_makedirs(primary)
+        arguments = ["init"]
+        if bare:
+            arguments.append("--bare")
+        if entry["object_format"] != "sha1":
+            arguments.append(f"--object-format={entry['object_format']}")
+        arguments.append(os.fspath(primary))
+        result = subprocess.run(
+            ["git", *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+        )
+        if result.returncode != 0:
+            raise BulkloadError("cannot initialize destination Git workspace")
+    return primary
+
+
+def _git_ref_state(
+    repository: Path, names: Iterable[str]
+) -> dict[str, dict[str, str | None] | None]:
+    result: dict[str, dict[str, str | None] | None] = {}
+    for name in sorted(set(names)):
+        payload = _git(repository, ["rev-parse", "--verify", name], check=False).strip()
+        if not payload:
+            result[name] = None
             continue
-        for flag in UNSUPPORTED_GIT_AUTHORITY_FLAGS:
-            if actual.get(flag):
-                failures.append(
-                    {
-                        "authority": flag,
-                        "code": "repository-unsupported-git-authority",
-                        "repo": logical,
-                    }
-                )
-        for field in ("branch", "head", "status_sha256"):
-            if actual.get(field) != expected.get(field):
-                failures.append(
-                    {
-                        "actual": actual.get(field),
-                        "code": f"repository-{field}-mismatch",
-                        "expected": expected.get(field),
-                        "repo": logical,
-                    }
-                )
-        before = destination_before.get(logical)
-        if before is None or actual.get("local_refs_sha256") != before.get(
-            "local_refs_sha256"
-        ):
-            failures.append(
-                {
-                    "actual": actual.get("local_refs_sha256"),
-                    "code": "repository-local_refs_sha256-mismatch",
-                    "expected": (before.get("local_refs_sha256") if before else None),
-                    "repo": logical,
-                }
-            )
-        if before is None or actual.get("recovery_roots_sha256") != before.get(
-            "recovery_roots_sha256"
-        ):
-            failures.append(
-                {
-                    "actual": actual.get("recovery_roots_sha256"),
-                    "code": "repository-recovery_roots_sha256-mismatch",
-                    "expected": (
-                        before.get("recovery_roots_sha256") if before else None
-                    ),
-                    "repo": logical,
-                }
-            )
-    for expected in intent.get("expected_files", []):
-        logical = expected["repo"]
-        repo = repositories.get(logical)
-        actual = find_file(repo, expected["path"]) if repo is not None else None
-        if _identity(actual) != expected.get("identity"):
-            failures.append(
-                {
-                    "actual": _identity(actual),
-                    "code": "file-identity-mismatch",
-                    "expected": expected.get("identity"),
-                    "path": expected["path"],
-                    "repo": logical,
-                }
-            )
-
-    result: dict[str, Any] = {
-        "destination_snapshot_sha256": destination["snapshot_sha256"],
-        "failures": failures,
-        "plan_sha256": plan["plan_sha256"],
-        "schema": VERIFY_SCHEMA,
-        "verified": not failures and not intent.get("blockers"),
-        "verified_at": utc_now(),
-    }
-    result["verification_sha256"] = object_digest(result, "verification_sha256")
+        symbolic = _git(repository, ["symbolic-ref", "-q", name], check=False).strip()
+        result[name] = {
+            "oid": payload.decode("ascii"),
+            "symbolic_target": symbolic.decode("utf-8") if symbolic else None,
+        }
     return result
 
 
-def export_copy_paths(plan: dict[str, Any], accepted_digest: str) -> list[str]:
-    validate_plan(plan)
-    if accepted_digest != plan["plan_sha256"]:
-        raise BulkloadError("operator-supplied plan digest does not match")
-    intent = plan["intent"]
-    if not intent.get("ready") or intent.get("blockers"):
-        raise BulkloadError("blocked plans cannot export a transfer allowlist")
-    values: list[str] = []
-    for expected in intent.get("expected_files", []):
-        logical = expected["repo"]
-        relative = normalize_relative(expected["path"])
-        values.append(
-            relative if logical == "." else f"{normalize_relative(logical)}/{relative}"
+def _git_worktree_state(worktree: Path) -> dict[str, Any]:
+    symbolic = _git(worktree, ["symbolic-ref", "-q", "HEAD"], check=False).strip()
+    head = _git(worktree, ["rev-parse", "--verify", "HEAD"], check=False).strip()
+    git_dir = _resolve_git_dir(worktree)
+    locked_path = git_dir / "locked"
+    locked = locked_path.exists()
+    lock_reason = None
+    if locked:
+        try:
+            payload = locked_path.read_bytes()
+            if payload and not payload.endswith(b"\n"):
+                raise ValueError("missing terminator")
+            lock_reason = (payload[:-1] if payload else payload).decode("utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise BulkloadError("Git worktree lock reason is not portable") from error
+    return {
+        "branch": symbolic.decode("utf-8") if symbolic else None,
+        "detached": not bool(symbolic),
+        "head": head.decode("ascii") if head else None,
+        "locked": locked,
+        "lock_reason": lock_reason,
+    }
+
+
+def _git_crash_fence(boundary: str) -> None:
+    if os.environ.get("BULKLOAD_TEST_CRASH_GIT_AFTER") == boundary:
+        raise BulkloadError(f"injected crash after Git {boundary} mutation")
+
+
+def _preflight_git_targets(entry: dict[str, Any], journal: dict[str, Any]) -> None:
+    created_roots = set(journal.get("created_git_roots", []))
+    created_paths = {item["path"] for item in journal.get("created_worktrees", [])}
+    primary_target = Path(entry["destination_path"])
+    primary_marker = primary_target / ("HEAD" if not entry["worktrees"] else ".git")
+    if (
+        not (primary_marker.exists() or primary_marker.is_symlink())
+        and (primary_target.exists() or primary_target.is_symlink())
+        and os.fspath(primary_target) not in created_roots
+    ):
+        raise BulkloadError("new Git workspace destination already exists")
+    for worktree in entry["worktrees"]:
+        target = Path(worktree["path"])
+        marker = target / ".git"
+        if (
+            target != primary_target
+            and not (marker.exists() or marker.is_symlink())
+            and (target.exists() or target.is_symlink())
+            and os.fspath(target) not in created_paths
+        ):
+            raise BulkloadError("new Git worktree destination already exists")
+
+
+def _apply_git_entry(
+    entry: dict[str, Any],
+    *,
+    stage_root: Path,
+    journal: dict[str, Any],
+    journal_path: Path,
+) -> None:
+    primary = _ensure_git_workspace(entry, journal, journal_path)
+    common = Path(
+        _git(primary, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .decode()
+        .strip()
+    )
+    if os.fspath(common) != entry["destination_common_git_dir"]:
+        raise BulkloadError(
+            "destination Git common directory differs from stage binding"
         )
-    return sorted(values)
+    ref_names = [action["name"] for action in entry["ref_actions"]]
+    ref_names.extend(
+        ref["name"] for ref in (entry.get("destination_before") or {}).get("refs", [])
+    )
+    git_refs_before = journal.setdefault("git_refs_before", {})
+    if os.fspath(primary) not in git_refs_before:
+        git_refs_before[os.fspath(primary)] = _git_ref_state(primary, ref_names)
+    created_worktrees = journal.setdefault("created_worktrees", [])
+    created_paths = {item["path"] for item in created_worktrees}
+    worktrees_before = journal.setdefault("git_worktrees_before", {}).setdefault(
+        os.fspath(primary), {}
+    )
+    for worktree in entry["worktrees"]:
+        target = Path(worktree["path"])
+        if (
+            (target / ".git").exists()
+            and os.fspath(target) not in created_paths
+            and os.fspath(target) not in worktrees_before
+        ):
+            worktrees_before[os.fspath(target)] = _git_worktree_state(target)
+
+    intended_refs = dict(git_refs_before[os.fspath(primary)])
+    for action in entry["ref_actions"]:
+        intended_refs[action["name"]] = {
+            "oid": action["oid"],
+            "symbolic_target": action.get("symbolic_target"),
+        }
+    intended_worktrees = {}
+    for worktree in entry["worktrees"]:
+        before = worktrees_before.get(worktree["path"])
+        locked = bool(worktree["source"].get("locked"))
+        intended_worktrees[worktree["path"]] = {
+            "branch": worktree["branch"],
+            "detached": worktree["detached"],
+            "head": worktree["head"],
+            "locked": locked,
+            "lock_reason": (
+                before["lock_reason"] if locked and before and before["locked"] else ""
+            )
+            if locked
+            else None,
+        }
+    for field, intended in (
+        ("git_refs_after", intended_refs),
+        ("git_worktrees_after", intended_worktrees),
+    ):
+        recorded = journal.setdefault(field, {})
+        if os.fspath(primary) in recorded and recorded[os.fspath(primary)] != intended:
+            raise BulkloadError("Git intended after-state changed during recovery")
+        recorded[os.fspath(primary)] = intended
+    _write_apply_journal(journal_path, journal)
+
+    created_objects = journal.setdefault("created_git_objects", [])
+    for object_entry in entry["objects"]:
+        target = common / "objects" / object_entry["relative_path"]
+        if target.exists():
+            if sha256_file(target) != object_entry["blob_sha256"]:
+                raise BulkloadError("destination Git object file diverges")
+            continue
+        record = {
+            "path": os.fspath(target),
+            "sha256": object_entry["blob_sha256"],
+        }
+        if record not in created_objects:
+            created_objects.append(record)
+            _write_apply_journal(journal_path, journal)
+        _atomic_install_blob(stage_root, {**object_entry, "kind": "regular"}, target)
+    for action in entry["ref_actions"]:
+        observed = _git_ref_state(primary, [action["name"]])[action["name"]]
+        expected = intended_refs[action["name"]]
+        if observed == expected:
+            continue
+        if action.get("symbolic_target"):
+            _git(primary, ["symbolic-ref", action["name"], action["symbolic_target"]])
+        else:
+            _git(primary, ["update-ref", action["name"], action["oid"]])
+        _git_crash_fence("ref")
+    for worktree in entry["worktrees"]:
+        target = Path(worktree["path"])
+        if target == primary:
+            continue
+        if not (target / ".git").exists():
+            durable_makedirs(target.parent)
+            record = {"path": os.fspath(target), "repository": os.fspath(primary)}
+            if record not in created_worktrees:
+                created_worktrees.append(record)
+                _write_apply_journal(journal_path, journal)
+            if worktree["branch"]:
+                _git(
+                    primary,
+                    [
+                        "worktree",
+                        "add",
+                        "--force",
+                        "--no-checkout",
+                        os.fspath(target),
+                        worktree["branch"],
+                    ],
+                )
+            else:
+                _git(
+                    primary,
+                    [
+                        "worktree",
+                        "add",
+                        "--detach",
+                        "--no-checkout",
+                        os.fspath(target),
+                        worktree["head"],
+                    ],
+                )
+            _git_crash_fence("head")
+    for worktree in entry["worktrees"]:
+        target = Path(worktree["path"])
+        observed = _git_worktree_state(target)
+        if worktree["branch"] and observed["branch"] != worktree["branch"]:
+            _git(target, ["symbolic-ref", "HEAD", worktree["branch"]])
+            _git_crash_fence("head")
+        elif (
+            not worktree["branch"]
+            and worktree["head"]
+            and (observed["branch"] is not None or observed["head"] != worktree["head"])
+        ):
+            _git(target, ["update-ref", "--no-deref", "HEAD", worktree["head"]])
+            _git_crash_fence("head")
+        if target != primary:
+            observed_locked = (_resolve_git_dir(target) / "locked").exists()
+            if worktree["source"].get("locked") and not observed_locked:
+                _git(primary, ["worktree", "lock", os.fspath(target)])
+                _git_crash_fence("lock")
+            elif not worktree["source"].get("locked") and observed_locked:
+                _git(primary, ["worktree", "unlock", os.fspath(target)])
+                _git_crash_fence("lock")
+    observed_refs = _git_ref_state(primary, ref_names)
+    observed_worktrees = {
+        worktree["path"]: _git_worktree_state(Path(worktree["path"]))
+        for worktree in entry["worktrees"]
+    }
+    if observed_refs != intended_refs or observed_worktrees != intended_worktrees:
+        raise BulkloadError("Git preparation did not reach its intended after-state")
+    _git(primary, ["fsck", "--full", "--no-dangling"])
+
+
+def _collect_mutations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    mutations: list[dict[str, Any]] = []
+    for entry in manifest["entries"]:
+        if entry["kind"] in {"file", "sqlite"}:
+            mutations.append(
+                {
+                    "action": "install",
+                    "entry": entry,
+                    "target": entry["destination_path"],
+                }
+            )
+            if entry["kind"] == "sqlite":
+                sidecars = {
+                    f"-{item['kind']}": {
+                        "kind": "regular",
+                        "sha256": item["sha256"],
+                        "size": item["size"],
+                    }
+                    for item in (entry.get("destination_before") or {}).get(
+                        "sidecars", []
+                    )
+                }
+                for suffix in ("-wal", "-shm", "-journal"):
+                    mutations.append(
+                        {
+                            "action": "delete",
+                            "destination_before": sidecars.get(suffix),
+                            "target": entry["destination_path"] + suffix,
+                        }
+                    )
+        elif entry["kind"] == "git-workspace":
+
+            def preserve_reflog(path: Path, git_dir: Path) -> None:
+                mutations.append(
+                    {
+                        "action": "preserve-git-reflog",
+                        "destination_before": _current_record(path),
+                        "target": os.fspath(path),
+                    }
+                )
+                parent = path.parent
+                while parent != git_dir:
+                    if not (parent.exists() or parent.is_symlink()):
+                        mutations.append(
+                            {
+                                "action": "preserve-git-directory",
+                                "destination_before": None,
+                                "target": os.fspath(parent),
+                            }
+                        )
+                    parent = parent.parent
+
+            common = Path(entry["destination_common_git_dir"])
+            for action in entry["ref_actions"]:
+                preserve_reflog(common / "logs" / action["name"], common)
+            destination_worktrees = {
+                item["path"]: item
+                for item in (entry.get("destination_before") or {}).get("worktrees", [])
+            }
+            for worktree in entry["worktrees"]:
+                destination_worktree = destination_worktrees.get(worktree["path"])
+                if destination_worktree is not None and (
+                    destination_worktree["branch"],
+                    destination_worktree["head"],
+                ) != (worktree["branch"], worktree["head"]):
+                    git_dir = Path(destination_worktree["git_dir"])
+                    preserve_reflog(git_dir / "logs" / "HEAD", git_dir)
+                for file_entry in worktree["files"]:
+                    mutations.append(
+                        {
+                            "action": "install",
+                            "entry": file_entry,
+                            "target": file_entry["destination_path"],
+                        }
+                    )
+                for target in worktree["deletions"]:
+                    relative = str(Path(target).relative_to(worktree["path"]))
+                    destination_before = next(
+                        (
+                            item
+                            for item in (
+                                next(
+                                    (
+                                        candidate
+                                        for candidate in (
+                                            entry.get("destination_before") or {}
+                                        ).get("worktrees", [])
+                                        if candidate["path"] == worktree["path"]
+                                    ),
+                                    {"files": []},
+                                )["files"]
+                            )
+                            if item["relative_path"] == relative
+                        ),
+                        None,
+                    )
+                    mutations.append(
+                        {
+                            "action": "rmdir"
+                            if (destination_before or {}).get("kind") == "directory"
+                            else "delete",
+                            "destination_before": destination_before,
+                            "target": target,
+                        }
+                    )
+                # Existing worktree indexes can be snapshotted before topology mutation.
+                destination_before = next(
+                    (
+                        item
+                        for item in (entry.get("destination_before") or {}).get(
+                            "worktrees", []
+                        )
+                        if item["path"] == worktree["path"]
+                    ),
+                    None,
+                )
+                if worktree["index"] is not None and destination_before is not None:
+                    mutations.append(
+                        {
+                            "action": "install-index",
+                            "entry": worktree["index"],
+                            "target": destination_before["index"]["path"],
+                            "worktree": worktree["path"],
+                        }
+                    )
+                elif (
+                    not worktree["index_expected_exists"]
+                    and worktree["index_destination_path"] is not None
+                ):
+                    mutations.append(
+                        {
+                            "action": "delete",
+                            "destination_before": worktree["index_destination_before"],
+                            "target": worktree["index_destination_path"],
+                        }
+                    )
+    # Git owns newly created repository/worktree roots. Journal only their
+    # otherwise implicit parents so the Git rollback steps retain authority.
+    skip_roots: set[str] = set()
+    for entry in manifest["entries"]:
+        if entry["kind"] != "git-workspace":
+            continue
+        destination_before = entry.get("destination_before") or {}
+        if not destination_before:
+            skip_roots.add(entry["destination_path"])
+        existing_worktrees = {
+            item["path"] for item in destination_before.get("worktrees", [])
+        }
+        skip_roots.update(
+            item["path"]
+            for item in entry["worktrees"]
+            if item["path"] not in existing_worktrees
+        )
+
+    known_targets = {item["target"] for item in mutations}
+    missing_parents: set[str] = set()
+
+    def collect_missing_parents(target: Path) -> None:
+        parent = target.parent
+        while parent != parent.parent and not (parent.exists() or parent.is_symlink()):
+            value = os.fspath(parent)
+            if value not in known_targets and value not in skip_roots:
+                missing_parents.add(value)
+            parent = parent.parent
+
+    for mutation in mutations:
+        if mutation["action"].startswith("preserve-git-"):
+            continue
+        collect_missing_parents(Path(mutation["target"]))
+    for root in skip_roots:
+        collect_missing_parents(Path(root))
+    mutations.extend(
+        {"action": "mkdir", "destination_before": None, "target": target}
+        for target in missing_parents
+    )
+
+    # One target must have one deterministic intended mutation.
+    result: dict[str, dict[str, Any]] = {}
+    for mutation in mutations:
+        target = mutation["target"]
+        if target in result and result[target] != mutation:
+            raise BulkloadError(f"multiple stage mutations target one path: {target}")
+        result[target] = mutation
+
+    def order(mutation: dict[str, Any]) -> tuple[int, int, str]:
+        depth = len(Path(mutation["target"]).parts)
+        if mutation["action"] == "mkdir":
+            return (0, depth, mutation["target"])
+        if mutation["action"] == "rmdir":
+            return (2, -depth, mutation["target"])
+        return (1, 0, mutation["target"])
+
+    return sorted(result.values(), key=order)
+
+
+def _snapshot_all(
+    journal: dict[str, Any],
+    *,
+    journal_path: Path,
+    rollback_root: Path,
+) -> int:
+    mutations = journal["mutations"]
+    snapshots = journal["rollback_snapshots"]
+    if len(snapshots) > len(mutations):
+        raise BulkloadError("rollback snapshot progress exceeds mutation inventory")
+    for mutation in mutations[len(snapshots) :]:
+        snapshot, _ = _snapshot_target(Path(mutation["target"]), rollback_root)
+        snapshot["action"] = mutation["action"]
+        snapshots.append(snapshot)
+        journal["snapshot_progress"] = len(snapshots)
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+        raw = os.environ.get("BULKLOAD_TEST_CRASH_AFTER_SNAPSHOT")
+        if raw is not None and raw.isdecimal() and len(snapshots) >= int(raw):
+            raise BulkloadError("injected crash after durable rollback snapshot")
+    return sum(int((item["before"] or {}).get("size", 0)) for item in snapshots)
+
+
+def _revalidate_mutation_preconditions(mutations: list[dict[str, Any]]) -> None:
+    for mutation in mutations:
+        target = Path(mutation["target"])
+        if mutation["action"].startswith("preserve-git-"):
+            if not _same_record(
+                _current_record(target), mutation.get("destination_before")
+            ):
+                raise BulkloadError(f"destination changed after planning: {target}")
+            continue
+        entry = mutation.get("entry", {})
+        expected = entry.get("destination_before", mutation.get("destination_before"))
+        if entry.get("kind") == "sqlite":
+            if expected is None:
+                if target.exists() or target.is_symlink():
+                    raise BulkloadError(
+                        "destination SQLite appeared after final staging"
+                    )
+            else:
+                observed = sqlite_catalog(target)
+                if observed["logical_sha256"] != expected["logical"]["logical_sha256"]:
+                    raise BulkloadError(
+                        "destination SQLite changed after final staging"
+                    )
+            continue
+        current = _current_record(target)
+        if not _same_record(current, expected):
+            raise BulkloadError(f"destination changed after planning: {target}")
+
+
+def _crash_fence(journal: dict[str, Any]) -> None:
+    raw = os.environ.get("BULKLOAD_TEST_CRASH_AFTER")
+    if raw is None:
+        return
+    try:
+        threshold = int(raw)
+    except ValueError:
+        return
+    if journal.get("progress", 0) >= threshold:
+        raise BulkloadError("injected crash after durable mutation boundary")
+
+
+def _apply_mutations(
+    journal: dict[str, Any],
+    *,
+    journal_path: Path,
+    manifest: dict[str, Any],
+    stage_root: Path,
+) -> None:
+    if not journal.get("git_prepared"):
+        git_entries = [
+            entry for entry in manifest["entries"] if entry["kind"] == "git-workspace"
+        ]
+        for entry in git_entries:
+            _preflight_git_targets(entry, journal)
+        for entry in git_entries:
+            _apply_git_entry(
+                entry,
+                stage_root=stage_root,
+                journal=journal,
+                journal_path=journal_path,
+            )
+        journal["git_prepared"] = True
+        known_targets = {mutation["target"] for mutation in journal["mutations"]}
+        for entry in manifest["entries"]:
+            if entry["kind"] != "git-workspace":
+                continue
+            for worktree in entry["worktrees"]:
+                index_path = _resolve_git_dir(Path(worktree["path"])) / "index"
+                if os.fspath(index_path) in known_targets:
+                    continue
+                if worktree["index"] is not None:
+                    mutation = {
+                        "action": "install-index",
+                        "entry": worktree["index"],
+                        "target": os.fspath(index_path),
+                        "worktree": worktree["path"],
+                    }
+                else:
+                    mutation = {
+                        "action": "delete",
+                        "destination_before": None,
+                        "target": os.fspath(index_path),
+                    }
+                journal["mutations"].append(mutation)
+                journal["rollback_snapshots"].append(
+                    {
+                        "action": mutation["action"],
+                        "before": None,
+                        "snapshot": None,
+                        "target": os.fspath(index_path),
+                    }
+                )
+                journal["snapshot_progress"] = len(journal["rollback_snapshots"])
+        _write_apply_journal(journal_path, journal)
+    mutations = journal["mutations"]
+    for index in range(journal.get("progress", 0), len(mutations)):
+        mutation = mutations[index]
+        target = Path(mutation["target"])
+        if mutation["action"] == "mkdir":
+            durable_makedirs(target)
+            after = _current_record(target)
+        elif mutation["action"].startswith("preserve-git-"):
+            after = _current_record(target)
+        elif mutation["action"] == "rmdir":
+            if target.exists() or target.is_symlink():
+                if not target.is_dir() or target.is_symlink():
+                    raise BulkloadError("transactional rmdir target is not a directory")
+                target.rmdir()
+                fsync_directory(target.parent)
+            after = None
+        elif mutation["action"] == "delete":
+            if target.is_dir() and not target.is_symlink():
+                raise BulkloadError(
+                    "transactional deletion of a directory is forbidden"
+                )
+            target.unlink(missing_ok=True)
+            if target.parent.exists():
+                fsync_directory(target.parent)
+            after = None
+        else:
+            entry = mutation["entry"]
+            if mutation["action"] == "install-index" and not target.parent.exists():
+                target = _resolve_git_dir(Path(mutation["worktree"])) / "index"
+                mutation["target"] = os.fspath(target)
+            after = _atomic_install_blob(stage_root, entry, target)
+        mutation["after"] = after
+        journal["progress"] = index + 1
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+        _crash_fence(journal)
+    journal["state"] = "mutations-applied"
+    journal["updated_at"] = utc_now()
+    _write_apply_journal(journal_path, journal)
+
+
+def _load_manifest(stage_receipt: dict[str, Any]) -> dict[str, Any]:
+    validate_stage_receipt(stage_receipt)
+    manifest = stage_receipt["manifest"]
+    _verify_stage_objects(manifest, Path(stage_receipt["stage_root"]))
+    return manifest
+
+
+def _receipt_from_journal(journal: dict[str, Any]) -> dict[str, Any]:
+    receipt = journal.get("apply_receipt")
+    if not isinstance(receipt, dict):
+        raise BulkloadError("completed journal lacks its exact apply receipt")
+    require_digest(receipt, "receipt_sha256")
+    return receipt
+
+
+def apply_agent_plan(
+    plan: dict[str, Any],
+    stage_receipt: dict[str, Any],
+    *,
+    accepted_plan_sha256: str,
+    journal_path: Path,
+    rollback_root: Path,
+    reserve_bytes: int = DEFAULT_CAPACITY_RESERVE_BYTES,
+) -> dict[str, Any]:
+    validate_agent_plan(plan, require_ready=True)
+    validate_stage_receipt(stage_receipt, require_final=True)
+    if accepted_plan_sha256 != plan["plan_sha256"]:
+        raise BulkloadError("accepted plan digest does not match AgentPlanV4")
+    if stage_receipt["plan_sha256"] != plan["plan_sha256"]:
+        raise BulkloadError("final stage belongs to a different plan")
+    manifest = _load_manifest(stage_receipt)
+    stage_root = Path(stage_receipt["stage_root"])
+    journal_path = Path(os.path.abspath(os.fspath(journal_path.expanduser())))
+    rollback_root = Path(os.path.abspath(os.fspath(rollback_root.expanduser())))
+    protected = [*_live_roots(plan), stage_root]
+    assert_no_overlap(journal_path, protected, "apply journal")
+    assert_no_overlap(rollback_root, protected, "rollback root")
+    assert_no_overlap(journal_path, [rollback_root], "apply journal")
+    durable_makedirs(journal_path.parent)
+    durable_makedirs(rollback_root)
+    if journal_path.exists():
+        journal = _read_apply_journal(journal_path)
+        if (
+            journal.get("plan_sha256") != plan["plan_sha256"]
+            or journal.get("stage_manifest_sha256") != manifest["manifest_sha256"]
+            or journal.get("stage_receipt_sha256") != stage_receipt["receipt_sha256"]
+            or journal.get("rollback_root") != os.fspath(rollback_root)
+        ):
+            raise BulkloadError("existing apply journal belongs to another transaction")
+        if journal.get("state") in {"applied", "verified"}:
+            return _receipt_from_journal(journal)
+        if journal.get("state") == "rolled-back":
+            raise BulkloadError("a rolled-back journal cannot be applied again")
+    else:
+        if any(rollback_root.iterdir()):
+            raise BulkloadError("new rollback root must be empty")
+        mutations = _collect_mutations(manifest)
+        _revalidate_mutation_preconditions(mutations)
+        exact_overwritten = sum(
+            (_current_record(Path(item["target"])) or {}).get("size", 0)
+            for item in mutations
+        )
+        capacity = require_capacity(
+            rollback_root,
+            charged_bytes=exact_overwritten,
+            reserve_bytes=reserve_bytes,
+        )
+        journal = {
+            "apply_receipt": None,
+            "capacity": capacity,
+            "created_git_objects": [],
+            "created_git_roots": [],
+            "created_worktrees": [],
+            "git_prepared": False,
+            "git_refs_before": {},
+            "journal_id": new_id(),
+            "mutations": mutations,
+            "plan_sha256": plan["plan_sha256"],
+            "progress": 0,
+            "rollback_snapshots": [],
+            "rollback_root": os.fspath(rollback_root),
+            "schema": AGENT_JOURNAL_SCHEMA,
+            "snapshot_progress": 0,
+            "stage_manifest_sha256": manifest["manifest_sha256"],
+            "stage_receipt_sha256": stage_receipt["receipt_sha256"],
+            "state": "preparing-rollback",
+            "transaction_id": new_id(),
+            "updated_at": utc_now(),
+        }
+        _write_apply_journal(journal_path, journal)
+    if journal.get("state") == "preparing-rollback":
+        _revalidate_mutation_preconditions(journal["mutations"])
+        charged = _snapshot_all(
+            journal,
+            journal_path=journal_path,
+            rollback_root=rollback_root,
+        )
+        exact_overwritten = int(journal["capacity"]["charged_bytes"])
+        if charged != exact_overwritten:
+            raise BulkloadError(
+                "rollback exact-overwrite charge changed during snapshot"
+            )
+        journal["state"] = "rollback-sealed"
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+    if journal.get("state") not in {"rollback-sealed", "mutations-applied"}:
+        raise BulkloadError("apply journal is in an unsupported transaction state")
+    _apply_mutations(
+        journal,
+        journal_path=journal_path,
+        manifest=manifest,
+        stage_root=stage_root,
+    )
+    receipt = {
+        "applied_at": utc_now(),
+        "capacity": journal["capacity"],
+        "holds": plan["holds"],
+        "journal_path": os.fspath(journal_path),
+        "mutation_count": len(journal["mutations"]),
+        "plan_sha256": plan["plan_sha256"],
+        "provider_runtime_acceptance_verified": False,
+        "receipt_id": new_id(),
+        "rollback_root": os.fspath(rollback_root),
+        "schema": AGENT_APPLY_SCHEMA,
+        "stage_manifest_sha256": manifest["manifest_sha256"],
+        "transaction_id": journal["transaction_id"],
+    }
+    seal(receipt, "receipt_sha256")
+    journal["apply_receipt"] = receipt
+    journal["state"] = "applied"
+    journal["updated_at"] = utc_now()
+    _write_apply_journal(journal_path, journal)
+    return receipt
+
+
+def validate_apply_receipt(value: dict[str, Any]) -> None:
+    require_exact_keys(
+        value,
+        {
+            "applied_at",
+            "capacity",
+            "holds",
+            "journal_path",
+            "mutation_count",
+            "plan_sha256",
+            "provider_runtime_acceptance_verified",
+            "receipt_id",
+            "receipt_sha256",
+            "rollback_root",
+            "schema",
+            "stage_manifest_sha256",
+            "transaction_id",
+        },
+        "AgentApplyV4 receipt",
+    )
+    if value.get("schema") != AGENT_APPLY_SCHEMA:
+        raise BulkloadError("input is not an AgentApplyV4 receipt")
+    require_digest(value, "receipt_sha256")
+    if value.get("provider_runtime_acceptance_verified") is not False:
+        raise BulkloadError("offline receipt overclaims provider runtime acceptance")
+
+
+def _verify_git_entry(entry: dict[str, Any]) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    repository = Path(entry["destination_path"])
+    observed_format = (
+        _git(repository, ["rev-parse", "--show-object-format"], check=False)
+        .decode(errors="replace")
+        .strip()
+    )
+    if observed_format != entry["object_format"]:
+        failures.append(
+            {"code": "git-object-format-mismatch", "path": os.fspath(repository)}
+        )
+    for action in entry["ref_actions"]:
+        observed = _git_ref_state(repository, [action["name"]])[action["name"]]
+        expected = {
+            "oid": action["oid"],
+            "symbolic_target": action.get("symbolic_target"),
+        }
+        if observed != expected:
+            failures.append({"code": "git-ref-mismatch", "path": action["name"]})
+    action_names = {action["name"] for action in entry["ref_actions"]}
+    for ref in (entry.get("destination_before") or {}).get("refs", []):
+        if ref["name"] in action_names:
+            continue
+        observed = _git_ref_state(repository, [ref["name"]])[ref["name"]]
+        expected = {
+            "oid": ref["oid"],
+            "symbolic_target": ref.get("symbolic_target"),
+        }
+        if observed != expected:
+            failures.append(
+                {"code": "git-destination-ref-mismatch", "path": ref["name"]}
+            )
+    for worktree in entry["worktrees"]:
+        path = Path(worktree["path"])
+        if not (path / ".git").exists():
+            failures.append({"code": "git-worktree-missing", "path": os.fspath(path)})
+            continue
+        index = _resolve_git_dir(path) / "index"
+        if worktree["index"] is not None:
+            if (
+                not index.exists()
+                or sha256_file(index) != worktree["index"]["blob_sha256"]
+            ):
+                failures.append({"code": "git-index-mismatch", "path": os.fspath(path)})
+        elif index.exists() or index.is_symlink():
+            failures.append({"code": "git-index-mismatch", "path": os.fspath(path)})
+        observed_state = _git_worktree_state(path)
+        expected_state = {
+            "branch": worktree["branch"],
+            "detached": worktree["detached"],
+            "head": worktree["head"],
+            "locked": bool(worktree["source"].get("locked")),
+        }
+        if any(observed_state[key] != value for key, value in expected_state.items()):
+            failures.append(
+                {"code": "git-worktree-state-mismatch", "path": os.fspath(path)}
+            )
+        for file_entry in worktree["files"]:
+            current = _current_record(Path(file_entry["destination_path"]))
+            expected = {
+                "kind": file_entry["kind"],
+                "mode": file_entry["mode"],
+                "sha256": file_entry["blob_sha256"],
+                "size": file_entry["size"],
+            }
+            if not _same_record(current, expected):
+                failures.append(
+                    {
+                        "code": "git-worktree-byte-mismatch",
+                        "path": file_entry["destination_path"],
+                    }
+                )
+        for target in worktree["deletions"]:
+            if Path(target).exists() or Path(target).is_symlink():
+                failures.append(
+                    {"code": "git-worktree-deletion-mismatch", "path": target}
+                )
+    try:
+        _git(repository, ["fsck", "--full", "--no-dangling"])
+    except BulkloadError:
+        failures.append({"code": "git-fsck-failed", "path": os.fspath(repository)})
+    return failures
+
+
+def verify_agent_plan(
+    plan: dict[str, Any],
+    stage_receipt: dict[str, Any],
+    apply_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    validate_agent_plan(plan, require_ready=True)
+    validate_stage_receipt(stage_receipt, require_final=True)
+    validate_apply_receipt(apply_receipt)
+    if (
+        len(
+            {
+                plan["plan_sha256"],
+                stage_receipt["plan_sha256"],
+                apply_receipt["plan_sha256"],
+            }
+        )
+        != 1
+    ):
+        raise BulkloadError("verify inputs do not share one plan digest")
+    manifest = _load_manifest(stage_receipt)
+    if apply_receipt.get("stage_manifest_sha256") != manifest["manifest_sha256"]:
+        raise BulkloadError("apply receipt is detached from the final stage manifest")
+    journal_path = Path(apply_receipt["journal_path"])
+    journal = _read_apply_journal(journal_path)
+    if (
+        journal.get("transaction_id") != apply_receipt["transaction_id"]
+        or journal.get("apply_receipt") != apply_receipt
+        or journal.get("stage_receipt_sha256") != stage_receipt["receipt_sha256"]
+    ):
+        raise BulkloadError("verify evidence is detached from its journal")
+    failures: list[dict[str, str]] = []
+    for entry in manifest["entries"]:
+        if entry["kind"] == "git-workspace":
+            failures.extend(_verify_git_entry(entry))
+        elif entry["kind"] == "sqlite":
+            target = Path(entry["destination_path"])
+            try:
+                observed = sqlite_catalog(target)
+            except BulkloadError:
+                failures.append(
+                    {
+                        "code": "sqlite-verification-failed",
+                        "path": entry["destination_path"],
+                    }
+                )
+            else:
+                if (
+                    observed["logical_sha256"]
+                    != entry["expected_logical"]["logical_sha256"]
+                ):
+                    failures.append(
+                        {
+                            "code": "sqlite-logical-mismatch",
+                            "path": entry["destination_path"],
+                        }
+                    )
+                for suffix in ("-wal", "-shm", "-journal"):
+                    if Path(entry["destination_path"] + suffix).exists():
+                        failures.append(
+                            {
+                                "code": "sqlite-sidecar-after-apply",
+                                "path": entry["destination_path"],
+                            }
+                        )
+        elif entry["kind"] == "file":
+            current = _current_record(Path(entry["destination_path"]))
+            expected = {
+                "kind": entry["payload_kind"],
+                "mode": entry["mode"],
+                "sha256": entry["blob_sha256"],
+                "size": entry["size"],
+            }
+            if not _same_record(current, expected):
+                failures.append(
+                    {
+                        "code": "file-verification-failed",
+                        "path": entry["destination_path"],
+                    }
+                )
+    receipt = {
+        "apply_receipt_sha256": apply_receipt["receipt_sha256"],
+        "failures": sorted(failures, key=lambda item: (item["code"], item["path"])),
+        "holds": plan["holds"],
+        "independent_fresh_observation": True,
+        "plan_sha256": plan["plan_sha256"],
+        "provider_runtime_acceptance_verified": False,
+        "receipt_id": new_id(),
+        "schema": AGENT_VERIFY_SCHEMA,
+        "verified": not failures,
+        "verified_at": utc_now(),
+    }
+    seal(receipt, "receipt_sha256")
+    if not failures:
+        journal["state"] = "verified"
+        journal["verify_receipt_sha256"] = receipt["receipt_sha256"]
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+    return receipt
+
+
+def _restore_snapshot(snapshot: dict[str, Any], rollback_root: Path) -> None:
+    target = Path(snapshot["target"])
+    before = snapshot["before"]
+    if before is None:
+        current = _current_record(target)
+        if current is None:
+            return
+        if current["kind"] == "directory":
+            try:
+                target.rmdir()
+            except OSError as error:
+                raise BulkloadError(
+                    "rollback refuses a non-empty newly created directory"
+                ) from error
+            fsync_directory(target.parent)
+        else:
+            target.unlink()
+            fsync_directory(target.parent)
+        return
+    if before["kind"] == "directory":
+        if not (target.exists() or target.is_symlink()):
+            durable_makedirs(target)
+        elif not target.is_dir() or target.is_symlink():
+            raise BulkloadError("rollback directory target changed type")
+        os.chmod(target, int(before["mode"], 8))
+        fsync_directory(target)
+        return
+    relative = snapshot["snapshot"]
+    if relative is None:
+        raise BulkloadError("rollback snapshot is missing")
+    stored = rollback_root / relative
+    durable_makedirs(target.parent)
+    temporary = target.parent / f".{target.name}.rollback-{new_id()}"
+    if before["kind"] == "regular":
+        reflink_clone(
+            stored,
+            temporary,
+            expected_sha256=before["sha256"],
+            mode=int(before["mode"], 8),
+        )
+    else:
+        os.symlink(os.fsdecode(stored.read_bytes()), temporary)
+    os.replace(temporary, target)
+    fsync_directory(target.parent)
+
+
+def _mutation_after_record(mutation: dict[str, Any]) -> dict[str, Any] | None:
+    if "after" in mutation:
+        return mutation["after"]
+    if mutation["action"] in {"delete", "rmdir"}:
+        return None
+    if mutation["action"] == "mkdir":
+        return {"kind": "directory", "mode": "0700", "sha256": None, "size": 0}
+    entry = mutation["entry"]
+    return {
+        "kind": entry.get("payload_kind", "regular")
+        if entry["kind"] != "sqlite"
+        else "regular",
+        "mode": entry["mode"],
+        "sha256": entry["blob_sha256"],
+        "size": entry["size"],
+    }
+
+
+def _validate_rollback_preconditions(journal: dict[str, Any]) -> None:
+    snapshots = journal.get("rollback_snapshots", [])
+    mutations = journal.get("mutations", [])
+    if len(snapshots) > len(mutations):
+        raise BulkloadError("rollback snapshot inventory exceeds mutations")
+    for mutation, snapshot in zip(mutations, snapshots):
+        if mutation["action"].startswith("preserve-git-"):
+            current = _current_record(Path(mutation["target"]))
+            if "after" in mutation and not (
+                _same_record(current, snapshot["before"])
+                or _same_record(current, mutation["after"])
+            ):
+                raise BulkloadError(
+                    f"destination changed outside the transaction: {mutation['target']}"
+                )
+            continue
+        current = _current_record(Path(mutation["target"]))
+        if not (
+            _same_record(current, snapshot["before"])
+            or _same_record(current, _mutation_after_record(mutation))
+        ):
+            raise BulkloadError(
+                f"destination changed outside the transaction: {mutation['target']}"
+            )
+    for repository_text, refs_before in journal.get("git_refs_before", {}).items():
+        refs_after = journal.get("git_refs_after", {}).get(repository_text, {})
+        repository = Path(repository_text)
+        for name, before in refs_before.items():
+            current = _git_ref_state(repository, [name])[name]
+            allowed = (
+                (before, refs_after.get(name, before))
+                if not journal.get("git_prepared")
+                else (refs_after.get(name, before),)
+            )
+            if current not in allowed:
+                raise BulkloadError(f"Git ref changed outside the transaction: {name}")
+    for repository_text, worktrees_before in journal.get(
+        "git_worktrees_before", {}
+    ).items():
+        worktrees_after = journal.get("git_worktrees_after", {}).get(
+            repository_text, {}
+        )
+        for path, before in worktrees_before.items():
+            current = _git_worktree_state(Path(path))
+            after = worktrees_after.get(path, before)
+            if set(before) != set(after):
+                raise BulkloadError("Git worktree journal state fields changed")
+            head_applied = {
+                key: after[key] if key in {"branch", "detached", "head"} else value
+                for key, value in before.items()
+            }
+            allowed = (
+                (after,)
+                if journal.get("git_prepared")
+                else (
+                    before,
+                    head_applied,
+                    after,
+                )
+            )
+            if current not in allowed:
+                raise BulkloadError(
+                    f"Git worktree changed outside the transaction: {path}"
+                )
+
+
+def _rollback_steps(journal: dict[str, Any]) -> list[tuple[str, Any]]:
+    steps: list[tuple[str, Any]] = []
+    created_directories = {
+        item["target"]
+        for item in journal.get("mutations", [])
+        if item["action"] == "mkdir"
+        or item["action"] == "preserve-git-directory"
+        or item.get("entry", {}).get("payload_kind", item.get("entry", {}).get("kind"))
+        == "directory"
+    }
+
+    def delayed_directory(snapshot: dict[str, Any]) -> bool:
+        return (
+            snapshot.get("before") is None and snapshot["target"] in created_directories
+        )
+
+    steps.extend(
+        ("snapshot", item)
+        for item in reversed(journal.get("rollback_snapshots", []))
+        if not delayed_directory(item) and item.get("action") != "preserve-git-reflog"
+    )
+    steps.extend(
+        ("created-worktree", item)
+        for item in reversed(journal.get("created_worktrees", []))
+    )
+    for repository, refs in sorted(journal.get("git_refs_before", {}).items()):
+        for name, state in sorted(refs.items()):
+            steps.append(
+                (
+                    "git-ref",
+                    {"name": name, "repository": repository, "state": state},
+                )
+            )
+    for repository, worktrees in sorted(
+        journal.get("git_worktrees_before", {}).items()
+    ):
+        for path, state in sorted(worktrees.items()):
+            steps.append(
+                (
+                    "git-worktree",
+                    {"path": path, "repository": repository, "state": state},
+                )
+            )
+    steps.extend(
+        ("snapshot", item)
+        for item in reversed(journal.get("rollback_snapshots", []))
+        if item.get("action") == "preserve-git-reflog"
+    )
+    steps.extend(
+        ("created-object", item)
+        for item in reversed(journal.get("created_git_objects", []))
+    )
+    created_roots = set(journal.get("created_git_roots", []))
+    steps.extend(
+        ("git-fsck", repository)
+        for repository in sorted(journal.get("git_refs_before", {}))
+        if repository not in created_roots
+    )
+    steps.extend(
+        ("created-root", item)
+        for item in reversed(journal.get("created_git_roots", []))
+    )
+    steps.extend(
+        ("snapshot", item)
+        for item in reversed(journal.get("rollback_snapshots", []))
+        if delayed_directory(item)
+    )
+    return steps
+
+
+def _execute_rollback_step(kind: str, payload: Any, rollback_root: Path) -> None:
+    if kind == "snapshot":
+        _restore_snapshot(payload, rollback_root)
+        return
+    if kind == "created-worktree":
+        worktree = Path(payload["path"])
+        if worktree.exists():
+            repository = Path(payload["repository"])
+            if (_resolve_git_dir(worktree) / "locked").exists():
+                _git(repository, ["worktree", "unlock", os.fspath(worktree)])
+            _git(worktree, ["read-tree", "HEAD"])
+            _git(worktree, ["checkout-index", "-a", "-f"])
+            _git(repository, ["worktree", "remove", os.fspath(worktree)])
+        return
+    if kind == "git-ref":
+        repository = Path(payload["repository"])
+        state = payload["state"]
+        if _git_ref_state(repository, [payload["name"]])[payload["name"]] == state:
+            return
+        if state is None:
+            _git(repository, ["update-ref", "--no-deref", "-d", payload["name"]])
+        elif state.get("symbolic_target"):
+            _git(
+                repository,
+                ["symbolic-ref", payload["name"], state["symbolic_target"]],
+            )
+        else:
+            _git(
+                repository,
+                ["update-ref", "--no-deref", payload["name"], state["oid"]],
+            )
+        if _git_ref_state(repository, [payload["name"]])[payload["name"]] != state:
+            raise BulkloadError("Git ref rollback did not reach its before-state")
+        return
+    if kind == "git-worktree":
+        repository = Path(payload["repository"])
+        path = Path(payload["path"])
+        state = payload["state"]
+        current = _git_worktree_state(path)
+        if state["branch"] and current["branch"] != state["branch"]:
+            _git(path, ["symbolic-ref", "HEAD", state["branch"]])
+        elif (
+            not state["branch"]
+            and state["head"]
+            and (current["branch"] is not None or current["head"] != state["head"])
+        ):
+            _git(path, ["update-ref", "--no-deref", "HEAD", state["head"]])
+        if path != repository:
+            desired_reason = state["lock_reason"]
+            if state["locked"] and (
+                not current["locked"] or current["lock_reason"] != desired_reason
+            ):
+                if current["locked"]:
+                    _git(repository, ["worktree", "unlock", os.fspath(path)])
+                arguments = ["worktree", "lock"]
+                if desired_reason:
+                    arguments.extend(["--reason", desired_reason])
+                _git(repository, [*arguments, os.fspath(path)])
+            elif not state["locked"] and current["locked"]:
+                _git(repository, ["worktree", "unlock", os.fspath(path)])
+        return
+    if kind == "created-object":
+        path = Path(payload["path"])
+        if path.exists():
+            if not path.is_file() or sha256_file(path) != payload["sha256"]:
+                raise BulkloadError(
+                    "transaction-created Git object changed before rollback"
+                )
+            path.unlink()
+            fsync_directory(path.parent)
+        return
+    if kind == "git-fsck":
+        _git(Path(payload), ["fsck", "--full", "--no-dangling"])
+        return
+    if kind == "created-root":
+        root = Path(payload)
+        artifact = (
+            rollback_root
+            / "created-git-roots"
+            / sha256_bytes(os.fsencode(os.path.abspath(payload)))
+        )
+        if root.exists() and artifact.exists():
+            raise BulkloadError("created Git root exists beside its rollback artifact")
+        if root.exists():
+            if root.stat().st_dev != rollback_root.stat().st_dev:
+                raise BulkloadError("created Git root cannot be atomically rolled back")
+            durable_makedirs(artifact.parent)
+            os.replace(root, artifact)
+            fsync_directory(root.parent)
+            fsync_directory(artifact.parent)
+        return
+    raise BulkloadError("unknown rollback journal step")
+
+
+def _rollback_crash_fence(progress: int) -> None:
+    raw = os.environ.get("BULKLOAD_TEST_CRASH_ROLLBACK_AFTER")
+    if raw is not None and raw.isdecimal() and progress >= int(raw):
+        raise BulkloadError("injected crash after durable rollback boundary")
+
+
+def _verify_rollback_end_state(journal: dict[str, Any]) -> None:
+    for snapshot in journal.get("rollback_snapshots", []):
+        if not _same_record(
+            _current_record(Path(snapshot["target"])), snapshot["before"]
+        ):
+            raise BulkloadError("rollback end-state differs from its exact snapshot")
+
+    created_roots = set(journal.get("created_git_roots", []))
+    for root in created_roots:
+        path = Path(root)
+        if path.exists() or path.is_symlink():
+            raise BulkloadError("transaction-created Git root survived rollback")
+    for repository_text, refs in journal.get("git_refs_before", {}).items():
+        if repository_text in created_roots:
+            continue
+        repository = Path(repository_text)
+        for name, before in refs.items():
+            if _git_ref_state(repository, [name])[name] != before:
+                raise BulkloadError("Git ref differs from its rollback before-state")
+    for repository_text, worktrees in journal.get("git_worktrees_before", {}).items():
+        if repository_text in created_roots:
+            continue
+        for path, before in worktrees.items():
+            if _git_worktree_state(Path(path)) != before:
+                raise BulkloadError(
+                    "Git worktree differs from its rollback before-state"
+                )
+
+    for item in journal.get("created_git_objects", []):
+        path = Path(item["path"])
+        if path.exists() or path.is_symlink():
+            raise BulkloadError("transaction-created Git object survived rollback")
+    topology: dict[str, set[str]] = {}
+    for item in journal.get("created_worktrees", []):
+        path = Path(item["path"])
+        if path.exists() or path.is_symlink():
+            raise BulkloadError("transaction-created Git worktree survived rollback")
+        repository_text = item["repository"]
+        if repository_text in created_roots:
+            continue
+        if repository_text not in topology:
+            fields = _git(
+                Path(repository_text), ["worktree", "list", "--porcelain", "-z"]
+            ).split(b"\0")
+            try:
+                topology[repository_text] = {
+                    field[9:].decode("utf-8")
+                    for field in fields
+                    if field.startswith(b"worktree ")
+                }
+            except UnicodeDecodeError as error:
+                raise BulkloadError(
+                    "Git worktree rollback topology is not portable"
+                ) from error
+        if item["path"] in topology[repository_text]:
+            raise BulkloadError("transaction-created Git worktree remains registered")
+
+
+def rollback_agent_apply(
+    apply_receipt: dict[str, Any],
+    *,
+    accepted_receipt_sha256: str,
+) -> dict[str, Any]:
+    validate_apply_receipt(apply_receipt)
+    if accepted_receipt_sha256 != apply_receipt["receipt_sha256"]:
+        raise BulkloadError("accepted apply receipt digest does not match")
+    journal_path = Path(apply_receipt["journal_path"])
+    journal = _read_apply_journal(journal_path)
+    if (
+        journal.get("transaction_id") != apply_receipt["transaction_id"]
+        or journal.get("apply_receipt") != apply_receipt
+        or journal.get("stage_manifest_sha256")
+        != apply_receipt["stage_manifest_sha256"]
+    ):
+        raise BulkloadError("apply receipt is detached from its journal")
+    if journal.get("state") == "rolled-back":
+        receipt = journal.get("rollback_receipt")
+        if not isinstance(receipt, dict):
+            raise BulkloadError("rolled-back journal lacks its exact receipt")
+        require_digest(receipt, "receipt_sha256")
+        return receipt
+    rollback_root = Path(journal["rollback_root"])
+    if journal.get("state") != "rolling-back":
+        _validate_rollback_preconditions(journal)
+        journal["rollback_progress"] = 0
+        journal["state"] = "rolling-back"
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+    steps = _rollback_steps(journal)
+    progress = int(journal.get("rollback_progress", 0))
+    if progress > len(steps):
+        raise BulkloadError("rollback progress exceeds its exact step inventory")
+    for index in range(progress, len(steps)):
+        kind, payload = steps[index]
+        _execute_rollback_step(kind, payload, rollback_root)
+        journal["rollback_progress"] = index + 1
+        journal["updated_at"] = utc_now()
+        _write_apply_journal(journal_path, journal)
+        _rollback_crash_fence(index + 1)
+    _verify_rollback_end_state(journal)
+    receipt = {
+        "apply_receipt_sha256": apply_receipt["receipt_sha256"],
+        "plan_sha256": apply_receipt["plan_sha256"],
+        "receipt_id": new_id(),
+        "restored_entries": len(journal.get("rollback_snapshots", [])),
+        "rolled_back_at": utc_now(),
+        "schema": AGENT_ROLLBACK_SCHEMA,
+        "transaction_id": journal["transaction_id"],
+    }
+    seal(receipt, "receipt_sha256")
+    journal["rollback_receipt"] = receipt
+    journal["state"] = "rolled-back"
+    journal["updated_at"] = utc_now()
+    _write_apply_journal(journal_path, journal)
+    return receipt
+
+
+def recover_agent_apply(
+    plan: dict[str, Any],
+    stage_receipt: dict[str, Any],
+    *,
+    journal_path: Path,
+    strategy: str,
+) -> dict[str, Any]:
+    if strategy not in {"forward", "rollback"}:
+        raise BulkloadError("recovery strategy must be forward or rollback")
+    validate_agent_plan(plan, require_ready=True)
+    validate_stage_receipt(stage_receipt, require_final=True)
+    journal = _read_apply_journal(journal_path)
+    if (
+        journal.get("plan_sha256") != plan.get("plan_sha256")
+        or journal.get("stage_receipt_sha256") != stage_receipt["receipt_sha256"]
+        or journal.get("stage_manifest_sha256") != stage_receipt["manifest_sha256"]
+    ):
+        raise BulkloadError("recovery plan differs from journal authority")
+    existing_recovery = journal.get("recovery_receipts", {}).get(strategy)
+    if isinstance(existing_recovery, dict):
+        if existing_recovery.get("schema") != AGENT_RECOVER_SCHEMA:
+            raise BulkloadError("stored recovery receipt has the wrong schema")
+        require_digest(existing_recovery, "receipt_sha256")
+        return existing_recovery
+    if strategy == "forward":
+        apply_receipt = apply_agent_plan(
+            plan,
+            stage_receipt,
+            accepted_plan_sha256=plan["plan_sha256"],
+            journal_path=journal_path,
+            rollback_root=Path(journal["rollback_root"]),
+            reserve_bytes=0,
+        )
+        result_sha = apply_receipt["receipt_sha256"]
+        state = "applied"
+    else:
+        existing = journal.get("apply_receipt")
+        if not isinstance(existing, dict):
+            # Mint a bounded recovery-only apply receipt authority from the
+            # journal; rollback still uses only pre-mutation reflink snapshots.
+            existing = {
+                "applied_at": journal["updated_at"],
+                "capacity": journal["capacity"],
+                "holds": plan["holds"],
+                "journal_path": os.fspath(journal_path),
+                "mutation_count": len(journal["mutations"]),
+                "plan_sha256": journal["plan_sha256"],
+                "provider_runtime_acceptance_verified": False,
+                "receipt_id": new_id(),
+                "rollback_root": journal["rollback_root"],
+                "schema": AGENT_APPLY_SCHEMA,
+                "stage_manifest_sha256": journal["stage_manifest_sha256"],
+                "transaction_id": journal["transaction_id"],
+            }
+            seal(existing, "receipt_sha256")
+            journal["apply_receipt"] = existing
+            _write_apply_journal(journal_path, journal)
+        rollback = rollback_agent_apply(
+            existing, accepted_receipt_sha256=existing["receipt_sha256"]
+        )
+        result_sha = rollback["receipt_sha256"]
+        state = "rolled-back"
+    receipt = {
+        "journal_path": os.fspath(journal_path),
+        "plan_sha256": plan["plan_sha256"],
+        "receipt_id": new_id(),
+        "result_receipt_sha256": result_sha,
+        "schema": AGENT_RECOVER_SCHEMA,
+        "strategy": strategy,
+        "transaction_state": state,
+    }
+    seal(receipt, "receipt_sha256")
+    journal = _read_apply_journal(journal_path)
+    journal.setdefault("recovery_receipts", {})[strategy] = receipt
+    journal["updated_at"] = utc_now()
+    _write_apply_journal(journal_path, journal)
+    return receipt

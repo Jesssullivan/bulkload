@@ -86,10 +86,10 @@ class InstallerTest(unittest.TestCase):
             claude = home / ".claude/skills/bulkload"
             self.assertTrue((canonical / "SKILL.md").is_file())
             for relative in (
-                "references/codex-private-state-policy.v7.json",
-                "references/codex-private-sqlite-offline-composer.md",
-                "scripts/bulkload_lib/private_sqlite_protocol.py",
-                "scripts/bulkload_lib/private_sqlite_verifier.py",
+                "references/agent-context.md",
+                "references/migration-contract.md",
+                "scripts/bulkload_lib/scanner.py",
+                "scripts/bulkload_lib/executor.py",
             ):
                 self.assertTrue((canonical / relative).is_file(), relative)
             self.assertTrue(claude.is_symlink())

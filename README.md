@@ -1,188 +1,225 @@
 # bulkload
 
-`bulkload` turns a one-off repository or `~/git` migration into a reviewed
-protocol: capture two stable source catalogs, capture the destination, compile
-an immutable plan, apply only explicitly safe file operations, and verify the
-accepted plan against fresh destination truth while emitting a verification
-receipt. It also provides a dry-run-only Codex rollout adapter that proposes
-destination-absent UUIDs and proof-bound source-superset promotions only after
-stable source and destination A/B captures. Its v2 capture evidence binds typed
-directory claims and root lineage to an explicit filesystem-authority ID,
-blocks divergent common sessions and portable file/directory collisions, and
-pins bounded evidence I/O. The landed v3 planner recognizes proof-bound
-append-only prefix/superset histories, compiles a close request from every
-required proof digest, and only then accepts fresh source and destination A/B
-captures wrapped against that request.
+Bulkload is a typed, receipt-driven cutover tool for a `~/git` fleet and the
+Codex, Claude, Pi, and mutable-seat state needed to continue work on another
+machine. Source-authoritative conflicts are reversible through exact destination
+rollback custody; structural ambiguity and unsafe state stop. Credentials and
+SQLite are never treated as ordinary repository files.
 
-Codex auth and SQLite families are explicitly copy-eligible, opt-in state
-classes. Policy v7 retains the narrow attended `auth.json` install, freezes
-the exact accepted-H7 v6 compose-request and capacity artifacts as
-validator-only legacy evidence, and adds a CLI-inaccessible read-only oracle
-for independently hand-built SQLite bundle fixtures.
-The preferred inputs are an auth-only source capture and an auth-plus-SQLite
-destination capture. A full source capture is accepted, but source SQLite is
-never consumed; destination SQLite is preserved exactly with zero mutation.
-The workflow provides digest-accepted planning, atomic auth replacement,
-journaling, offline verification, rollback, and interrupted-operation recovery.
-The oracle cannot write a bundle or mint final verification authority. SQLite
-composition, capacity reservation, publication, installation, combined apply,
-and any claim that the session union was executed remain false and fail-held.
-Any live WAL, SHM, or rollback-journal sidecar blocks immutable SQLite capture.
+Nine product schemas cover `AgentCaptureV4`, `GitWorkspaceV2`, plan, the five
+phase receipts, and the durable journal. They drive one consolidated surface:
 
-Quiescence evidence is an operator procedural assertion with
-`provider_writer_proof=false`; its advisory lock coordinates Bulkload only.
-Private runtime and policy sources are pinned before import and bound through
-the plans. An offline receipt proves bytes and preservation invariants, not
-working provider authentication. A fresh attended provider turn is the final
-acceptance proof. See the
-[private auth install runbook](.agents/skills/bulkload/references/codex-private-auth-install.md).
-The plan-only database contracts are in the
-[SQLite opening-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-plan.md)
-and [v5 close/action-plan reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-action-plan.md).
-The frozen v6 request and volatile capacity contract is in the
-[compose-request reference](.agents/skills/bulkload/references/codex-private-sqlite-compose-request.md).
-The landed v7 source foundation and first internal read-only-oracle boundary
-are in the
-[offline composition contract](.agents/skills/bulkload/references/codex-private-sqlite-offline-composer.md).
-
-The repository is private. `v0.1.0` is not installable until an attended
-release publishes its signed annotated tag. The command below deliberately
-fails closed while that tag is absent; the reviewed release scope is in
-[the v0.1.0 release notes](docs/release-v0.1.0.md). After publication, install
-the self-contained skill for Codex, Pi, and Claude with an authenticated
-GitHub CLI:
-
-```bash
-bash -c 'set -euo pipefail; repo=Jesssullivan/bulkload; tag=v0.1.0; tmp="$(mktemp -d)"; trap '\''rm -rf "$tmp"'\'' EXIT; gh repo clone "$repo" "$tmp/bulkload" -- --branch "$tag" --depth 1; local_tag="$(git -C "$tmp/bulkload" rev-parse "refs/tags/$tag^{tag}")"; remote_tag="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha)"; test "$local_tag" = "$remote_tag"; test "$(gh api "repos/$repo/git/tags/$remote_tag" --jq .verification.verified)" = true; remote_commit="$(gh api "repos/$repo/git/tags/$remote_tag" --jq '\''.object | select(.type == "commit") | .sha'\'')"; test -n "$remote_commit"; test "$(git -C "$tmp/bulkload" rev-parse HEAD)" = "$remote_commit"; "$tmp/bulkload/scripts/install-skill.sh" --all'
+```text
+agent-capture
+agent-plan
+agent-stage --phase preseed
+agent-stage --phase final
+agent-apply
+agent-verify
+agent-rollback
+agent-recover
 ```
 
-The one-liner is safe to paste from fish or Bash. It refuses to execute the
-installer unless GitHub reports the annotated `v0.1.0` tag signature verified
-and the cloned tag object and checked-out commit exactly match that API proof.
+## Safety model
 
-Codex and Pi discover the canonical copy at `~/.agents/skills/bulkload`.
-Claude receives a symlink at `~/.claude/skills/bulkload` to that same copy.
-`scripts/install-skill.sh --all` installs only that portable skill; it does not
-install a `bulkload` command on `PATH`. Invoke the installed entrypoint as
-`~/.agents/skills/bulkload/scripts/bulkload.py`, or use the repository/Bazel
-launcher during development.
-The installer validates the canonical, private-backup, and Claude destinations
-before mutation, refuses symlinked directory authority, and preserves a forced
-replacement under `~/.agents/backups/bulkload` before installing it.
-Runtime support requires Python 3.11 or newer linked with SQLite 3.37.0 or
-newer, Git, and a Unix-like host with file locking, `pread`, and dirfd support.
-Codex evidence file publication requires macOS or Linux for an OS-backed atomic
-no-replace rename. Every Codex evidence command requires an owner-private file
-destination; stdout publication is forbidden because it bypasses pinned output
-custody and post-publication input revalidation.
+- Two stable captures are required for both source and destination.
+- `/Users/jess/git` maps exactly to `/srv/fast-local/jess/git`; longest path-map
+  prefix wins.
+- Destination `prepare`, Neo-to-Sting `push`, and destination `materialize`
+  write only to an external owner-private stage/quarantine.
+- Final apply requires the exact plan digest and a sealed final-stage receipt.
+- Before mutation, only exact overwritten entries are snapshotted with required
+  verified reflinks. There is no silent full-copy fallback.
+- The durable journal makes apply, rollback, and crash recovery idempotent.
+- Evidence contains hashes and typed structure, never credential values,
+  SQLite rows, symlink payloads, or unsanitized remote URLs.
+- Offline verification never claims provider authentication; run a fresh
+  attended provider action after cutover.
 
-For development:
+Git preservation includes refs, tags, notes, stash, custom and symbolic refs,
+reflog/pseudo-ref recovery roots, linked and detached worktrees, the exact
+index (all stages and intent-to-add), working-tree deletions, symlinks, modes,
+and untracked dirt. Divergent destination ref tips receive durable
+`refs/bulkload/recovery/destination/*` anchors before source refs move.
+
+Codex includes SQLite/WAL, sessions, archives, history, goals, memory, queue,
+rules/skills, and typed auth. Claude state is unioned with path rewriting only
+for explicit path-bearing text; unknown-named binaries retain exact bytes and
+Claude auth remains a nonportable hold. Pi state and auth are typed. Declared
+provider descendants default to portable-private state after exact managed
+exclusions. SQLite unions compatible rows and uses a reversible source snapshot
+when schema, shared rows, or canonical primary keys conflict.
+
+See [the design](docs/design.md), [migration contract](.agents/skills/bulkload/references/migration-contract.md),
+and [agent-state guide](.agents/skills/bulkload/references/agent-context.md).
+
+## Development
+
+The repository uses Bazel as the build/test source of truth and the
+GloriousFlywheel wrapper for the normal attached path:
 
 ```bash
 nix develop
-just flywheel-doctor
-just flywheel-verify
 just check
-just demo
 ```
 
-The normal build/test path is attached to GloriousFlywheel and fails closed if
-the fleet profile is missing or contradictory. CI uses only the on-prem
-`tinyland-nix` capability-class ARC pool and the repository-local public-read
-front door. Before checked-out source is consumed, a workflow-embedded
-materializer requires an empty, owned, nonsymlink workspace and creates a fresh
-private home, Git config, hook template, and temporary root. The sanctioned ARC
-runner and GitHub runtime are the bootstrap trust root: they supply the step
-environment, masking channel, fixed system Bash/base64/env/Git binaries, and
-system DNS/TLS/CA. Each matrix leg blanks shell loaders and options, dynamic
-loaders, proxy override channels, CA overrides, and TLS key logging before any
-step. Lower-case proxy blanks live at job scope and therefore reach the local
-composite and its pinned actions. FTP follows that split explicitly:
-`ftp_proxy` is job-scoped, while `FTP_PROXY` is materializer-scoped. After token
-and header destruction and exact checkout verification, the trusted
-materializer persists the five upper-case empty proxy records through its
-owned, canonical GitHub environment command file.
-Privileged non-profile Bash ignores imported functions and option state, and
-the materializer removes both proxy cases and every other transport channel
-again before its first child. The raw read-only GitHub token is masked, copied
-to a non-exported shell variable, and removed from the environment before one
-fixed base64 process receives it over stdin. Raw and encoded forms are cleared
-before fetch. Only the masked Basic header enters the minimal fetch environment through
-`--config-env`; automatic maintenance and commit-graph writes are disabled,
-and the header is cleared before detached checkout. The step then proves an
-exact, full-history, clean, alternate-free checkout with a tokenless origin and
-no credential, HTTP, include, or SSH configuration. This boundary does not
-claim resistance to a compromised runner or GitHub bootstrap.
+For an explicitly source-only local fallback:
 
-That front door calls only the public, immutable
-`tinyland-inc/ci-templates` v2.13.0 actions at commit
-`139bd4c7deabbe07c918dc764a3b9f054066431d`; it never resolves a private
-GloriousFlywheel action, source tree, or flake. Attic and Bazel cache endpoint
-locations remain runner-injected authority. A repository-owned, no-value
-preflight validates those raw authority-only endpoints and clears inherited
-credential channels before the pinned setup action may inspect or export them;
-a second pass binds the discovered reachability evidence before any Nix or
-Bazel command. Before
-discovery, command lookup is the reviewed Nix profile plus the fixed system
-path; after the pinned setup action contributes that profile through
-`GITHUB_PATH`, each step supplies only the reviewed system suffix. The guard
-refuses any other effective path.
+```bash
+just check-local
+```
 
-`GRPC_PROXY_EXP` is an absence-only fence, not an empty-value fence: grpc-java
-treats a present-empty value as an active proxy request and resolves it to
-localhost port 80. The guard scans the NUL-framed process environment and
-rejects both present-empty and nonempty forms before Nix setup and again before
-the Java/gRPC/Bazel consumers. Successful runner command files never create
-the variable. The fixed-Git fetch remains governed by its separate minimal
-transport environment.
+Useful direct gates:
 
-The exact guard is snapshotted before the selected repository consumer, then
-its captured bytes, digest, and authority are rechecked immediately before the
-selected Bazel call. Each Bazel leg receives a new private Bazelisk home, empty
-user home, test temporary root, and Nix/XDG runtime home. The source leg uses a
-separate private runtime home and enters `nix develop --ignore-environment`,
-retaining only `HOME` and the eight reviewed Nix/XDG home selectors. Workspace
-wrappers, ambient rc files, persistent caches, inherited username path
-components, and netrc credentials therefore cannot enter the public-read
-route. This is same-UID authority hygiene, not a filesystem sandbox.
+```bash
+just skill-validate
+just repo-manifest-validate
+just python-lint
+just shell-lint
+just workflow-lint
+```
 
-The Nix client uses the canonical direct `/nix/store` with `store = local` and
-`allow-symlinked-store = false`. Its only substituters and public keys are the
-runner-injected `bulkload-ci` `main` cache plus `cache.nixos.org`; signatures
-remain required. Store, daemon-socket, mirror, HTTP-family proxy, certificate,
-curl, JVM, Bazel shell, and Bazelisk command selectors are empty;
-`GRPC_PROXY_EXP` is absent. Trusted substituters,
-remote builders, build and diff hooks, access tokens, user configuration,
-netrc, flake-provided configuration, secret signing keys, and plugins are also
-cleared and checked from effective Nix settings. Ambient `GIT_*`, `JUST_*`,
-`NIX_MIRRORS_*`, exported Bash functions, and `SHELLCHECK_OPTS` fail closed.
-Pull requests cannot request Bazel or Attic uploads through this client; only a
-trusted push to `main` may warm the shared Bazel cache. The front door never
-selects a remote executor. A cache hit is cache evidence, not proof of REAPI
-remote execution.
+## Minimal operator sequence
 
-CI is one literal, fail-fast-disabled matrix with independently scheduled
-`source`, `build`, and `test` legs. Every leg runs exactly two workflow steps:
-the embedded materializer and the repository-local composite. The composite
-validates that literal gate, establishes the shared public-read boundary, and
-selects exactly one terminal repository consumer: source gates, Bazel
-`//:bulkload`, or Bazel `//:tests`. All later branch definitions are mutually
-exclusive and skipped, so no process or action executes after the selected
-consumer. The materializer registers no checkout post, and the exact nested
-action pins contain no post or nested action after their Bazel invocation. The
-contract tests also reject any composite step that redeclares a job-fenced
-shell, function, loader, proxy, CA, or keylog channel.
+Install the same Bulkload closure on Neo and Sting. Resolve an explicit GNU
+rsync from each pinned dev shell; capture binds its path, hash, protocol, and
+features. Native Neo `/usr/bin/rsync` is not accepted.
 
-For a source-only check on an intentionally unattached machine, run
-`nix develop --command just check-local`. That fallback is not CI or enrollment
-evidence and must never replace the shared runner path.
+Capture source and destination A/B under brief quiescence with identical
+managed exclusions and source maps. The longest-prefix live mappings are:
 
-The protocol is in [docs/design.md](docs/design.md), and the dated real-world
-evidence is in [docs/neo-sting-retrospective.md](docs/neo-sting-retrospective.md).
-The canonical agent workflow is in
-[.agents/skills/bulkload/SKILL.md](.agents/skills/bulkload/SKILL.md).
+```text
+/Users/jess/git     -> /srv/fast-local/jess/git
+/Users/jess/.codex  -> /srv/fast-local/jess/state/codex
+/Users/jess/.claude -> /srv/fast-local/jess/state/claude
+/Users/jess/.gstack -> /srv/fast-local/jess/state/gstack
+/Users/jess          -> /home/jess
+```
 
-CLI exits are claim-bearing: `0` means the requested positive claim holds;
-`3` is an incomplete capture, `4` is a written but blocked plan, `5` is a
-written failed verification, and `2` is an unsafe or malformed request. See the
-skill for the full protocol and exit contract.
+Sting captures the logical `/home/jess` install links and their physical
+backings; apply never replaces `.codex`, `.claude`, `.gstack`, or `git` links.
+Use repeatable `--seat` for Claude Desktop, Emacs, gregs-org, Atuin, and gstack;
+use `--file-seat` for `.bash_history` and optional-absent `.zsh_history`. Never
+declare the whole home. Supply the exact Lab authority exclusions on both roles,
+including the managed Codex leaves and Pi `AGENTS.md`/`APPEND_SYSTEM.md`.
+
+Before planning, Neo pulls both destination captures over its existing outbound
+SSH authentication. `DEST_RSYNC` is the exact immutable Nix-store path passed
+to destination capture; no connection or credential originates on Sting:
+
+```bash
+SSH_BIN=/usr/bin/ssh
+SSH_RSH="$SSH_BIN -oBatchMode=yes -oStrictHostKeyChecking=yes -oClearAllForwardings=yes"
+SOURCE_A=/secure/evidence/source-a.json
+RSYNC="$(python3 -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalog"]["transport"]["rsync"]["path"])' "$SOURCE_A")"
+test "$(python3 -I -S -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$RSYNC")" = "$(python3 -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalog"]["transport"]["rsync"]["sha256"])' "$SOURCE_A")"
+DEST_RSYNC='/nix/store/REVIEWED_HASH-rsync-REVIEWED_VERSION/bin/rsync'
+python3 -I -S -c 'import re,sys; assert re.fullmatch(r"/nix/store/[0-9a-z]{32}-rsync-[A-Za-z0-9._+-]+/bin/rsync", sys.argv[1])' "$DEST_RSYNC"
+
+RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
+  --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
+  jess@sting:/home/jess/.bulkload-evidence/destination-a.json \
+  /secure/evidence/destination-a.json
+RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
+  --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
+  jess@sting:/home/jess/.bulkload-evidence/destination-b.json \
+  /secure/evidence/destination-b.json
+```
+
+`agent-plan` validates all four self-digested captures. Accept its exact digest
+only after review; then resume writers for preliminary preseed.
+
+Relay the accepted preliminary plan and all receipts over connections initiated
+by Neo. Sting never needs a Neo credential or a Sting-originated connection.
+With owner-private evidence directories already established:
+
+```bash
+SSH_BIN=/usr/bin/ssh
+SSH_RSH="$SSH_BIN -oBatchMode=yes -oStrictHostKeyChecking=yes -oClearAllForwardings=yes"
+PLAN=/secure/evidence/preliminary-plan.json
+PLAN_SHA256='REVIEWED_PRELIMINARY_PLAN_SHA256'
+STAGE=/srv/fast-local/jess/bulkload/stage
+
+python3 -I -S -c 'import hashlib,json,sys; value=json.load(open(sys.argv[1])); recorded=value.pop("plan_sha256"); expected=hashlib.sha256(json.dumps(value,allow_nan=False,ensure_ascii=False,separators=(",",":"),sort_keys=True).encode()).hexdigest(); assert recorded == expected == sys.argv[2]' "$PLAN" "$PLAN_SHA256"
+plan_binding() {
+  python3 -I -S -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]]["catalog"]["transport"]["rsync"][sys.argv[3]])' \
+    "$PLAN" "$1" "$2"
+}
+RSYNC="$(plan_binding source path)"
+DEST_RSYNC="$(plan_binding destination path)"
+test "$(python3 -I -S -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$RSYNC")" = "$(plan_binding source sha256)"
+python3 -I -S -c 'import re,sys; assert re.fullmatch(r"/nix/store/[0-9a-z]{32}-rsync-[A-Za-z0-9._+-]+/bin/rsync", sys.argv[1])' "$DEST_RSYNC"
+
+RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
+  --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
+  "$PLAN" \
+  jess@sting:/home/jess/.bulkload-evidence/preliminary-plan.json
+```
+
+On Sting, `prepare` creates the absent stage/quarantine at mode 0700 and runs
+the destination capacity gate:
+
+```bash
+bulkload agent-stage --phase preseed --transport-mode prepare \
+  --plan /home/jess/.bulkload-evidence/preliminary-plan.json \
+  --accept-plan-sha256 "$PLAN_SHA256" --stage-root "$STAGE" \
+  --output /home/jess/.bulkload-evidence/preseed-prepare.json
+```
+
+Neo pulls that exact receipt over its existing outbound authentication, then
+pushes the digest-bound allowlist and bytes. No destination live path changes:
+
+```bash
+RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
+  --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
+  jess@sting:/home/jess/.bulkload-evidence/preseed-prepare.json \
+  /secure/evidence/preseed-prepare.json
+
+bulkload agent-stage --phase preseed --transport-mode push \
+  --plan /secure/evidence/preliminary-plan.json \
+  --accept-plan-sha256 "$PLAN_SHA256" --stage-root "$STAGE" \
+  --destination-ssh-host jess@sting \
+  --prepare-receipt /secure/evidence/preseed-prepare.json \
+  --output /secure/evidence/preseed-push.json
+```
+
+On Sting, materialize only from the chained prepare/push receipts:
+
+```bash
+bulkload agent-stage --phase preseed --transport-mode materialize \
+  --plan /home/jess/.bulkload-evidence/preliminary-plan.json \
+  --accept-plan-sha256 "$PLAN_SHA256" --stage-root "$STAGE" \
+  --prepare-receipt "$STAGE/.prepare-receipt-preseed.json" \
+  --transport-receipt "$STAGE/.transport-receipt-preseed.json" \
+  --allow-accounted-copy \
+  --output /home/jess/.bulkload-evidence/preseed-stage.json
+```
+
+Changed-late preliminary entries are deferred. For final, quiesce again, take
+fresh source/destination A/B captures, compile and accept a fresh plan digest,
+and repeat `prepare`, Neo `push`, and Sting `materialize` with `--phase final`.
+The same stage reuses verified content objects across plan digests, but every
+final operation is restaged and only the final materialized receipt is apply
+authority.
+
+Apply and verify:
+
+```bash
+bulkload agent-apply \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --journal /home/jess/.bulkload-evidence/apply-journal.json \
+  --rollback-root /srv/fast-local/jess/bulkload/rollback \
+  --output /home/jess/.bulkload-evidence/apply-receipt.json
+
+bulkload agent-verify \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --apply-receipt /home/jess/.bulkload-evidence/apply-receipt.json \
+  --output /home/jess/.bulkload-evidence/verify-receipt.json
+```
+
+Use `agent-recover --strategy forward|rollback` after an interrupted journal,
+or `agent-rollback` with the exact apply receipt digest for an attended revert.
+The full command and custody contract is in the installed Skill.

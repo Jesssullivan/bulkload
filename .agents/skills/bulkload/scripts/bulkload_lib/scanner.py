@@ -1,37 +1,59 @@
-"""Read-only Git, worktree, and working-byte catalog acquisition."""
+"""AgentCaptureV4 and GitWorkspaceV2 read-only capture."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from collections import defaultdict
 import hashlib
+import json
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import socket
+import sqlite3
 import stat
 import subprocess
-from typing import Any, Iterable
-import unicodedata
-import uuid
+import tempfile
+from typing import Any, Iterable, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from .model import (
+    AGENT_CAPTURE_SCHEMA,
+    GIT_WORKSPACE_SCHEMA,
     BulkloadError,
-    SNAPSHOT_SCHEMA,
     canonical_bytes,
+    new_id,
     normalize_relative,
-    object_digest,
-    portability_reason,
-    sanitize_remote_url,
-    sensitive_reason,
+    require_digest,
+    require_exact_keys,
+    resolve_real,
+    runtime_source_digest,
+    seal,
     sha256_bytes,
+    sha256_file,
+    sha256_symlink,
+    translate_path,
     utc_now,
 )
 
-DEFAULT_MAX_FILES = 250_000
-DEFAULT_MAX_BYTES = 50 * 1024 * 1024 * 1024
-MAX_RECOVERY_AUTHORITY_BYTES = 64 * 1024 * 1024
-MAX_RECOVERY_CANDIDATES = 4_096
-MAX_RECOVERY_REFLOGS = 4_096
-PSEUDO_REF_NAMES = (
+
+DEFAULT_MAX_FILES = 2_000_000
+DEFAULT_MAX_BYTES = 4 * 1024**4
+DEFAULT_MAX_SQLITE_ROWS = 5_000_000
+ZERO_OIDS = {"0" * 40, "0" * 64}
+HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
+SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+GIT_OPERATION_MARKERS = {
+    "BISECT_LOG": "bisect",
+    "CHERRY_PICK_HEAD": "cherry-pick",
+    "MERGE_HEAD": "merge",
+    "REVERT_HEAD": "revert",
+    "rebase-apply": "rebase-or-am",
+    "rebase-merge": "rebase",
+    "sequencer": "sequencer",
+}
+PSEUDO_REFS = {
     "AUTO_MERGE",
     "BISECT_HEAD",
     "CHERRY_PICK_HEAD",
@@ -40,1334 +62,2037 @@ PSEUDO_REF_NAMES = (
     "ORIG_HEAD",
     "REBASE_HEAD",
     "REVERT_HEAD",
-)
-GIT_OPERATION_MARKERS = (
-    ("bisect", "BISECT_ANCESTORS_OK"),
-    ("bisect", "BISECT_EXPECTED_REV"),
-    ("bisect", "BISECT_HEAD"),
-    ("bisect", "BISECT_LOG"),
-    ("bisect", "BISECT_NAMES"),
-    ("bisect", "BISECT_START"),
-    ("bisect", "BISECT_TERMS"),
-    ("bisect", "refs/bisect"),
-    ("cherry-pick", "CHERRY_PICK_HEAD"),
-    ("merge", "MERGE_HEAD"),
-    ("rebase", "REBASE_HEAD"),
-    ("rebase", "rebase-apply"),
-    ("rebase", "rebase-merge"),
-    ("revert", "REVERT_HEAD"),
-    ("sequencer", "sequencer"),
-)
-GIT_OPERATION_STATE_NAMES = frozenset(
-    operation for operation, _marker in GIT_OPERATION_MARKERS
-)
-PRIVATE_WORKTREE_PREFIX = "_bulkload_private_"
+}
+MANAGED_EXCLUSION_NAMESPACES = {
+    "codex": {
+        "AGENTS.md",
+        "config.toml",
+        "instructions.md",
+        "prompts",
+        "rules",
+        "skills",
+    },
+    "claude": {"agents", "commands", "skills"},
+    "pi": {
+        "AGENTS.md",
+        "APPEND_SYSTEM.md",
+        "agents",
+        "commands",
+        "prompts",
+        "skills",
+        "tinyland",
+    },
+}
+SAFE_EXECUTABLE_PATH = re.compile(r"/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
+
+
+def shell_safe_executable(raw_path: str, label: str) -> str:
+    if not os.path.isabs(raw_path):
+        raise BulkloadError(f"{label} path must be explicit and absolute")
+    path = os.path.realpath(os.path.abspath(raw_path))
+    if not SAFE_EXECUTABLE_PATH.fullmatch(path):
+        raise BulkloadError(f"{label} path is not canonical and shell-safe")
+    try:
+        info = Path(path).stat(follow_symlinks=False)
+    except OSError as error:
+        raise BulkloadError(f"{label} executable is unavailable") from error
+    if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+        raise BulkloadError(f"{label} is not a regular executable")
+    return path
+
+
+def inspect_rsync(raw_path: str) -> dict[str, Any]:
+    """Bind one explicit GNU rsync executable and its required features."""
+    path = shell_safe_executable(raw_path, "rsync")
+    try:
+        version = subprocess.run(
+            [path, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        help_result = subprocess.run(
+            [path, "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise BulkloadError("pinned GNU rsync executable is unavailable") from error
+    match = re.search(rb"protocol version (\d+)", version.stdout)
+    if (
+        version.returncode != 0
+        or help_result.returncode != 0
+        or match is None
+        or int(match.group(1)) < 30
+        or b"--from0" not in help_result.stdout
+        or b"--files-from" not in help_result.stdout
+        or b"--ignore-missing-args" not in help_result.stdout
+    ):
+        raise BulkloadError("pinned rsync lacks the required GNU transport features")
+    return {
+        "features": [
+            "checksum",
+            "delay-updates",
+            "files-from",
+            "from0",
+            "ignore-missing-args",
+        ],
+        "path": path,
+        "protocol": int(match.group(1)),
+        "sha256": sha256_file(Path(path)),
+    }
+
+
+def canonical_provider_policy(
+    entries: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    exclusions: list[dict[str, str]] = []
+    for provider, raw_relative in entries:
+        if provider not in MANAGED_EXCLUSION_NAMESPACES:
+            raise BulkloadError(f"unknown managed-exclusion provider: {provider!r}")
+        relative = normalize_relative(raw_relative)
+        parts = PurePosixPath(relative).parts
+        if parts[0] not in MANAGED_EXCLUSION_NAMESPACES[provider]:
+            raise BulkloadError(
+                "managed exclusion is outside the provider's source-managed namespaces"
+            )
+        exclusions.append({"provider": provider, "relative_path": relative})
+    exclusions.sort(key=lambda item: (item["provider"], item["relative_path"]))
+    if len({(item["provider"], item["relative_path"]) for item in exclusions}) != len(
+        exclusions
+    ):
+        raise BulkloadError("duplicate managed exclusion")
+    for index, first in enumerate(exclusions):
+        first_parts = PurePosixPath(first["relative_path"]).parts
+        for second in exclusions[index + 1 :]:
+            if first["provider"] != second["provider"]:
+                continue
+            second_parts = PurePosixPath(second["relative_path"]).parts
+            if (
+                first_parts == second_parts[: len(first_parts)]
+                or second_parts == first_parts[: len(second_parts)]
+            ):
+                raise BulkloadError("managed exclusions overlap ambiguously")
+    return {
+        "default": "declared-root-portable-private",
+        "managed_exclusions": exclusions,
+        "portable_symlinks": "relative-within-provider-root",
+    }
+
+
+def _is_excluded(relative: str, exclusions: Sequence[str]) -> bool:
+    parts = PurePosixPath(relative).parts
+    return any(
+        PurePosixPath(exclusion).parts == parts[: len(PurePosixPath(exclusion).parts)]
+        for exclusion in exclusions
+    )
+
+
+def _is_regenerate_namespace(provider: str, relative: str) -> bool:
+    """Prune exact rebuildable trees before inspecting their symlinks."""
+    parts = PurePosixPath(relative).parts
+    if parts[:1] == (".tmp",):
+        return True
+    return provider == "codex" and parts[:2] == ("plugins", "cache")
+
+
+def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    seen_sources: set[str] = set()
+    for raw_source, raw_destination in entries:
+        # Source-map authority is the declared logical install path. Resolving
+        # a provider/HM symlink here would erase the operator-reviewed binding.
+        source = os.path.abspath(os.fspath(Path(raw_source).expanduser()))
+        # The destination is interpreted on another host. Resolving it through
+        # source-host symlinks (for example macOS /home) would corrupt the
+        # wire contract before Sting ever sees it.
+        destination = os.path.abspath(os.fspath(Path(raw_destination).expanduser()))
+        if source in seen_sources:
+            raise BulkloadError(f"duplicate path-map source: {source}")
+        seen_sources.add(source)
+        result.append({"source": source, "destination": destination})
+    result.sort(key=lambda item: item["source"])
+    # Overlap is intentional: the longest exact source prefix wins. This is
+    # what allows /Users/jess to map to a destination home while the more
+    # specific /Users/jess/git maps to Sting's XFS-backed fast-local root.
+    return result
 
 
 def _git_environment() -> dict[str, str]:
     environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
     }
     environment.update(
         {
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_NO_LAZY_FETCH": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_PAGER": "cat",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "LC_ALL": "C",
         }
     )
     return environment
 
 
 def _git(
-    repo: Path,
-    *arguments: str,
+    repository: Path,
+    arguments: Sequence[str],
+    *,
+    input_bytes: bytes | None = None,
     check: bool = True,
-    input_data: bytes | None = None,
 ) -> bytes:
-    io_arguments: dict[str, Any]
-    if input_data is None:
-        io_arguments = {"stdin": subprocess.DEVNULL}
-    else:
-        io_arguments = {"input": input_data}
-    process = subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *arguments],
-        env=_git_environment(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        **io_arguments,
-    )
-    if check and process.returncode != 0:
-        detail = process.stderr.decode("utf-8", "replace").strip()
-        raise BulkloadError(f"git {' '.join(arguments)} failed in {repo}: {detail}")
-    return process.stdout
-
-
-def _decode_path(value: bytes) -> str:
     try:
-        decoded = value.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise BulkloadError("non-UTF-8 filename is unsupported in v1") from error
-    return normalize_relative(decoded)
-
-
-def _decode_git_text(value: bytes, label: str) -> str:
-    try:
-        return value.decode("utf-8", "strict")
-    except UnicodeDecodeError as error:
-        raise BulkloadError(
-            f"non-UTF-8 Git metadata is unsupported: {label}"
-        ) from error
-
-
-def _decode_git_ascii(value: bytes, label: str) -> str:
-    try:
-        return value.decode("ascii", "strict")
-    except UnicodeDecodeError as error:
-        raise BulkloadError(
-            f"non-ASCII Git metadata is unsupported: {label}"
-        ) from error
-
-
-def _nul_paths(payload: bytes) -> list[str]:
-    return [_decode_path(part) for part in payload.split(b"\0") if part]
-
-
-def _parse_index(payload: bytes) -> dict[str, list[dict[str, Any]]]:
-    entries: dict[str, list[dict[str, Any]]] = {}
-    for raw in payload.split(b"\0"):
-        if not raw:
-            continue
-        metadata, separator, raw_path = raw.partition(b"\t")
-        fields = metadata.split(b" ")
-        if not separator or len(fields) != 3:
-            raise BulkloadError("unexpected git ls-files --stage record")
-        mode, object_id, stage = fields
-        path = _decode_path(raw_path)
-        entry = {
-            "mode": _decode_git_ascii(mode, "index mode"),
-            "object": _decode_git_ascii(object_id, "index object ID"),
-            "stage": int(_decode_git_ascii(stage, "index stage")),
-        }
-        entries.setdefault(path, []).append(entry)
-    for values in entries.values():
-        values.sort(key=lambda item: (item["stage"], item["mode"], item["object"]))
-    return entries
-
-
-def _parse_tree(payload: bytes) -> dict[str, dict[str, str]]:
-    entries: dict[str, dict[str, str]] = {}
-    for raw in payload.split(b"\0"):
-        if not raw:
-            continue
-        metadata, separator, raw_path = raw.partition(b"\t")
-        fields = metadata.split(b" ")
-        if not separator or len(fields) != 3:
-            raise BulkloadError("unexpected git ls-tree record")
-        mode, object_type, object_id = fields
-        path = _decode_path(raw_path)
-        if path in entries:
-            raise BulkloadError(f"duplicate git ls-tree path: {path}")
-        entries[path] = {
-            "mode": _decode_git_ascii(mode, "tree mode"),
-            "object": _decode_git_ascii(object_id, "tree object ID"),
-            "type": _decode_git_ascii(object_type, "tree object type"),
-        }
-    return entries
-
-
-def _git_marker_error(repo: Path) -> str | None:
-    marker = repo / ".git"
-    try:
-        info = marker.lstat()
-    except FileNotFoundError:
-        return None
+        result = subprocess.run(
+            ["git", "-C", os.fspath(repository), *arguments],
+            check=False,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+        )
     except OSError as error:
-        return f"cannot inspect .git authority at {marker}: {type(error).__name__}"
-    if stat.S_ISLNK(info.st_mode):
-        return f"symlink .git authority is unsupported: {marker}"
-    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-        return f"special .git authority is unsupported: {marker}"
-    return ""
+        raise BulkloadError("Git is unavailable") from error
+    if check and result.returncode != 0:
+        # Git errors can echo configured remote values. Do not surface stderr.
+        raise BulkloadError(
+            f"Git inspection command failed ({arguments[0] if arguments else 'unknown'})"
+        )
+    return result.stdout
 
 
-def _bare_repository_error(repo: Path) -> str | None:
-    required = {
-        "HEAD": stat.S_ISREG,
-        "config": stat.S_ISREG,
-        "objects": stat.S_ISDIR,
-    }
-    records: dict[str, os.stat_result] = {}
-    for name in required:
+def _decode_path(payload: bytes, label: str) -> str:
+    try:
+        value = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise BulkloadError(f"{label} is not portable UTF-8") from error
+    normalize_relative(value)
+    return value
+
+
+def _stable_stat(path: Path) -> tuple[int, ...]:
+    info = path.stat(follow_symlinks=False)
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode),
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _declared_root(
+    requested: Path, *, allow_absent: bool
+) -> tuple[Path, Path, dict[str, Any] | None, bool]:
+    """Keep logical install authority separate from a stable backing root."""
+    logical = Path(os.path.abspath(os.fspath(requested.expanduser())))
+    try:
+        before = _stable_stat(logical)
+    except FileNotFoundError:
+        if allow_absent:
+            return logical, logical, None, False
+        raise BulkloadError(f"declared root does not exist: {logical}") from None
+    kind = before[2]
+    proof = None
+    if kind == stat.S_IFLNK:
+        if before[4] != 1:
+            raise BulkloadError("declared root symlink has multiple directory entries")
         try:
-            records[name] = (repo / name).lstat()
-        except FileNotFoundError:
-            return None
-    invalid = [
-        name
-        for name, predicate in required.items()
-        if not predicate(records[name].st_mode)
-    ]
-    if invalid:
-        return f"bare Git authority uses symlink or special paths: {repo}: {sorted(invalid)}"
-    ref_authorities = {
-        "packed-refs": stat.S_ISREG,
-        "refs": stat.S_ISDIR,
-        "reftable": stat.S_ISDIR,
-    }
-    found_ref_authority = False
-    invalid_ref_authorities: list[str] = []
-    for name, predicate in ref_authorities.items():
-        try:
-            info = (repo / name).lstat()
-        except FileNotFoundError:
-            continue
-        found_ref_authority = True
-        if not predicate(info.st_mode):
-            invalid_ref_authorities.append(name)
-    if not found_ref_authority:
+            target = Path(os.readlink(logical))
+            immediate = target if target.is_absolute() else logical.parent / target
+            immediate_info = immediate.lstat()
+        except OSError as error:
+            raise BulkloadError(
+                "declared root symlink is broken or unreadable"
+            ) from error
+        if stat.S_ISLNK(immediate_info.st_mode):
+            raise BulkloadError("declared root contains a multi-link symlink chain")
+        if not stat.S_ISDIR(immediate_info.st_mode):
+            raise BulkloadError("declared root symlink does not name a directory")
+        backing = resolve_real(immediate)
+        proof = {
+            "kind": "symlink",
+            "mode": f"{before[3]:04o}",
+            "sha256": sha256_symlink(logical),
+            "size": before[5],
+        }
+    elif kind == stat.S_IFDIR:
+        backing = resolve_real(logical)
+    else:
+        raise BulkloadError("declared root is neither a directory nor a directory link")
+    if _stable_stat(logical) != before:
+        raise BulkloadError("declared root changed during capture")
+    return logical, backing, proof, True
+
+
+def _portable_symlink_destination(root: Path, path: Path) -> str | None:
+    try:
+        target = os.readlink(path)
+    except OSError:
         return None
-    if invalid_ref_authorities:
-        return (
-            f"bare Git authority uses symlink or special paths: {repo}: "
-            f"{sorted(invalid_ref_authorities)}"
-        )
-    is_bare = _decode_git_ascii(
-        _git(repo, "rev-parse", "--is-bare-repository"),
-        "bare repository state",
-    ).strip()
-    if is_bare == "true":
-        return f"bare Git repository is unsupported in v1: {repo}"
-    if is_bare != "false":
-        return f"invalid bare repository state at {repo}"
-    return None
+    if not target or "\x00" in target or Path(target).is_absolute():
+        return None
+    relative_parent = path.relative_to(root).parent.as_posix()
+    candidate = os.path.normpath(os.path.join(relative_parent, target))
+    if candidate in {"", ".", ".."} or candidate.startswith("../"):
+        return None
+    return candidate
 
 
-def discover_repositories(root: Path, mode: str) -> tuple[list[Path], list[str]]:
-    root = root.expanduser().resolve()
-    if mode == "repo":
-        marker_error = _git_marker_error(root)
-        if marker_error:
-            raise BulkloadError(marker_error)
-        bare_error = _bare_repository_error(root)
-        if bare_error:
-            raise BulkloadError(bare_error)
-        top = _decode_git_text(
-            _git(root, "rev-parse", "--show-toplevel"), "repository top-level"
-        ).strip()
-        if Path(top).resolve() != root:
-            raise BulkloadError(f"repo root must be the Git top-level: {top}")
-        return [root], []
-    if mode != "fleet":
-        raise BulkloadError(f"unknown capture mode: {mode}")
+def _portable_symlink(root: Path, path: Path) -> bool:
+    return _portable_symlink_destination(root, path) is not None
 
-    repositories: list[Path] = []
-    errors: list[str] = []
 
-    def record_walk_error(error: OSError) -> None:
-        errors.append(
-            f"walk error at {error.filename or root}: {type(error).__name__}: {error}"
-        )
+def _file_record(path: Path, relative: str, *, classification: str) -> dict[str, Any]:
+    normalized = normalize_relative(relative)
+    before = _stable_stat(path)
+    file_type = before[2]
+    mode = f"{before[3]:04o}"
+    if file_type == stat.S_IFREG:
+        digest = sha256_file(path)
+        size = before[5]
+        kind = "regular"
+    elif file_type == stat.S_IFLNK:
+        digest = sha256_symlink(path)
+        size = len(os.fsencode(os.readlink(path)))
+        kind = "symlink"
+    elif file_type == stat.S_IFDIR:
+        digest = None
+        size = 0
+        kind = "directory"
+    else:
+        raise BulkloadError(f"special filesystem entry is unsupported: {path}")
+    if _stable_stat(path) != before:
+        raise BulkloadError(f"filesystem entry changed during capture: {path}")
+    return {
+        "classification": classification,
+        "kind": kind,
+        "mode": mode,
+        "relative_path": normalized,
+        "sha256": digest,
+        "size": size,
+    }
 
-    for directory, dirnames, filenames in os.walk(
-        root, followlinks=False, onerror=record_walk_error
+
+def _walk_entries(
+    root: Path,
+    *,
+    classification: str,
+    excluded_roots: Iterable[Path] = (),
+    skip_git_admin: bool = False,
+    max_files: int,
+    max_bytes: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    entries: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
+    excluded = {os.fspath(path.resolve()) for path in excluded_roots}
+    charged_bytes = 0
+    for current_text, directories, files in os.walk(
+        root, topdown=True, followlinks=False
     ):
-        current = Path(directory)
-        marker_present = ".git" in dirnames or ".git" in filenames
-        if marker_present:
-            marker_error = _git_marker_error(current)
-            if marker_error:
-                errors.append(marker_error)
+        current = Path(current_text)
+        retained: list[str] = []
+        for directory in sorted(directories):
+            child = current / directory
+            if skip_git_admin and directory == ".git":
+                continue
+            try:
+                resolved_text = os.fspath(child.resolve())
+            except (OSError, RuntimeError):
+                blockers.append({"code": "unresolvable-path", "path": os.fspath(child)})
+                continue
+            if resolved_text in excluded:
+                continue
+            try:
+                relative = child.relative_to(root).as_posix()
+                record = _file_record(child, relative, classification=classification)
+                if record["kind"] == "symlink":
+                    entries.append(record)
+                    continue
+                entries.append(record)
+                retained.append(directory)
+            except BulkloadError as error:
+                blockers.append(
+                    {
+                        "code": "unsupported-filesystem-entry",
+                        "path": os.fspath(child),
+                        "detail": str(error),
+                    }
+                )
+        directories[:] = retained
+        for filename in sorted(files):
+            child = current / filename
+            if skip_git_admin and current == root and filename == ".git":
+                continue
+            try:
+                relative = child.relative_to(root).as_posix()
+                record = _file_record(child, relative, classification=classification)
+                entries.append(record)
+                charged_bytes += record["size"]
+            except BulkloadError as error:
+                blockers.append(
+                    {
+                        "code": "unsupported-filesystem-entry",
+                        "path": os.fspath(child),
+                        "detail": str(error),
+                    }
+                )
+            if len(entries) > max_files or charged_bytes > max_bytes:
+                raise BulkloadError("filesystem capture budget exceeded")
+    entries.sort(key=lambda item: (item["relative_path"], item["kind"]))
+    return entries, blockers
+
+
+def _discover_git_roots(root: Path) -> tuple[list[Path], list[dict[str, str]]]:
+    repositories: list[Path] = []
+    blockers: list[dict[str, str]] = []
+    for current_text, directories, _ in os.walk(root, topdown=True, followlinks=False):
+        current = Path(current_text)
+        git_entry = current / ".git"
+        try:
+            git_info = git_entry.lstat()
+        except FileNotFoundError:
+            git_info = None
+        except OSError:
+            blockers.append(
+                {"code": "unreadable-git-authority", "path": os.fspath(git_entry)}
+            )
+            git_info = None
+        if git_info is not None:
+            if stat.S_ISLNK(git_info.st_mode) or not (
+                stat.S_ISDIR(git_info.st_mode) or stat.S_ISREG(git_info.st_mode)
+            ):
+                blockers.append(
+                    {"code": "unsafe-git-authority", "path": os.fspath(git_entry)}
+                )
             else:
                 repositories.append(current.resolve())
-            dirnames[:] = []
+            directories[:] = [name for name in directories if name != ".git"]
             continue
-        bare_error = _bare_repository_error(current)
-        if bare_error:
-            errors.append(bare_error)
-            dirnames[:] = []
+        if (
+            (current / "HEAD").is_file()
+            and (current / "objects").is_dir()
+            and (current / "refs").is_dir()
+        ):
+            repositories.append(current.resolve())
+            directories[:] = []
             continue
-        retained: list[str] = []
-        for name in sorted(dirnames):
-            child = current / name
-            if child.is_symlink():
-                errors.append(
-                    f"symlink directory is unsupported during fleet discovery: {child}"
-                )
-                continue
-            retained.append(name)
-        dirnames[:] = retained
-    if not repositories:
-        errors.append(f"no Git repositories found beneath {root}")
-    return sorted(set(repositories), key=lambda item: item.as_posix()), errors
+        directories[:] = sorted(name for name in directories if name != ".git")
+    return sorted(set(repositories), key=os.fspath), blockers
 
 
-def _parse_worktrees(payload: bytes) -> list[dict[str, Any]]:
+def _parse_worktree_list(repository: Path) -> list[dict[str, Any]]:
+    payload = _git(repository, ["worktree", "list", "--porcelain", "-z"])
     records: list[dict[str, Any]] = []
-    current: dict[str, Any] = {}
-    for raw in payload.split(b"\0"):
-        if not raw:
-            if current:
+    current: dict[str, Any] | None = None
+    for raw_field in payload.split(b"\0"):
+        if not raw_field:
+            if current is not None:
                 records.append(current)
-                current = {}
+                current = None
             continue
-        key, separator, value = raw.partition(b" ")
-        decoded_key = _decode_git_ascii(key, "worktree record key")
-        decoded_value = (
-            _decode_git_text(value, "worktree record value") if separator else True
-        )
-        if decoded_key == "worktree":
-            current["path"] = decoded_value
-        elif decoded_key == "HEAD":
-            current["head"] = decoded_value
-        elif decoded_key == "branch":
-            prefix = "refs/heads/"
-            current["branch"] = (
-                decoded_value[len(prefix) :]
-                if isinstance(decoded_value, str) and decoded_value.startswith(prefix)
-                else decoded_value
-            )
-        elif decoded_key in {"bare", "detached", "prunable"}:
-            current[decoded_key] = decoded_value
-        elif decoded_key == "locked":
-            current["locked"] = decoded_value
-        else:
-            current[decoded_key] = decoded_value
-    if current:
+        try:
+            field = raw_field.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise BulkloadError(
+                "Git worktree metadata is not portable UTF-8"
+            ) from error
+        if field.startswith("worktree "):
+            if current is not None:
+                records.append(current)
+            current = {"path": field[9:]}
+            continue
+        if current is None:
+            raise BulkloadError("malformed Git worktree inventory")
+        if field.startswith("HEAD "):
+            current["head"] = field[5:]
+        elif field.startswith("branch "):
+            current["branch"] = field[7:]
+        elif field == "detached":
+            current["detached"] = True
+        elif field.startswith("locked"):
+            current["locked"] = True
+        elif field.startswith("prunable"):
+            current["prunable"] = True
+        elif field == "bare":
+            current["bare"] = True
+    if current is not None:
         records.append(current)
-    return sorted(records, key=lambda item: str(item.get("path", "")))
+    return records
 
 
-@contextmanager
-def _open_parent(root: Path, relative: str) -> Iterable[tuple[int, str]]:
-    parts = normalize_relative(relative).split("/")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(root, flags)
-    try:
-        for component in parts[:-1]:
-            child = os.open(component, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
-        yield descriptor, parts[-1]
-    finally:
-        os.close(descriptor)
-
-
-def _stable_file_digest(
-    parent_descriptor: int,
-    leaf: str,
-    display_path: Path,
-    before: os.stat_result,
-    maximum_bytes: int | None,
-    git_object_format: str | None,
-    redact_budget_details: bool = False,
-    include_sha256: bool = True,
-) -> tuple[str | None, int, str | None]:
-    if not stat.S_ISREG(before.st_mode):
-        raise BulkloadError(f"not a regular file: {display_path}")
-    if maximum_bytes is not None and before.st_size > maximum_bytes:
-        if redact_budget_details:
-            raise BulkloadError("file exceeds remaining byte budget")
-        raise BulkloadError(
-            f"file exceeds remaining byte budget: {before.st_size} > {maximum_bytes}"
-        )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
-    digest = hashlib.sha256() if include_sha256 else None
-    git_digest = (
-        hashlib.new(git_object_format) if git_object_format is not None else None
-    )
-    if git_digest is not None:
-        git_digest.update(f"blob {before.st_size}\0".encode("ascii"))
-    try:
-        opened = os.fstat(descriptor)
-        identity = _stat_identity(opened)
-        if identity != _stat_identity(before) or not stat.S_ISREG(opened.st_mode):
-            raise BulkloadError(f"file changed while opening: {display_path}")
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            if digest is not None:
-                digest.update(chunk)
-            if git_digest is not None:
-                git_digest.update(chunk)
-        after_open = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    after_path = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
-    if _stat_identity(after_open) != identity or _stat_identity(after_path) != identity:
-        raise BulkloadError(f"file changed while hashing: {display_path}")
-    return (
-        digest.hexdigest() if digest is not None else None,
-        before.st_size,
-        git_digest.hexdigest() if git_digest is not None else None,
-    )
-
-
-def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
-
-
-def inspect_path(
-    root: Path,
-    relative: str,
-    git_class: str,
-    status: dict[str, Any] | None,
-    maximum_bytes: int | None = None,
-    git_object_format: str | None = None,
-    redact_budget_details: bool = False,
-) -> dict[str, Any]:
-    path = root / relative
-    record: dict[str, Any] = {
-        "git_class": git_class,
-        "path": relative,
-        "status": status,
-    }
-    sensitive = sensitive_reason(relative)
-    portability = portability_reason(relative)
-    inspect_tracked_sensitive = sensitive is not None and git_class == "tracked"
-    reason = sensitive or portability
-    if reason is not None and not inspect_tracked_sensitive:
-        record.update(
-            {
-                "blocked_reason": reason,
-                "eligible": False,
-                "kind": "redacted",
-            }
-        )
-        return record
-    try:
-        with _open_parent(root, relative) as (parent_descriptor, leaf):
-            info = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
-            mode = stat.S_IMODE(info.st_mode)
-            record["mode"] = format(mode, "04o")
-            if mode & 0o7000:
-                record.update(
-                    {
-                        "blocked_reason": "setuid, setgid, and sticky modes are unsupported",
-                        "eligible": False,
-                        "kind": "unsafe-mode",
-                    }
-                )
-            elif stat.S_ISREG(info.st_mode):
-                if (
-                    inspect_tracked_sensitive
-                    and maximum_bytes is not None
-                    and info.st_size > maximum_bytes
-                ):
-                    raise BulkloadError(
-                        "redacted tracked file exceeds remaining byte budget"
-                    )
-                digest, size, git_blob = _stable_file_digest(
-                    parent_descriptor,
-                    leaf,
-                    path,
-                    info,
-                    maximum_bytes,
-                    git_object_format,
-                    redact_budget_details,
-                    include_sha256=not inspect_tracked_sensitive,
-                )
-                record.update(
-                    {
-                        "eligible": git_class != "ignored",
-                        "kind": "file",
-                        "size": size,
-                    }
-                )
-                if digest is not None:
-                    record["sha256"] = digest
-                if git_blob is not None:
-                    record["git_blob_oid"] = git_blob
-            elif stat.S_ISLNK(info.st_mode):
-                target = os.readlink(leaf, dir_fd=parent_descriptor)
-                after = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
-                if _stat_identity(after) != _stat_identity(info):
-                    raise BulkloadError(f"symlink changed while reading: {path}")
-                target_bytes = os.fsencode(target)
-                target_size = len(target_bytes)
-                if maximum_bytes is not None and target_size > maximum_bytes:
-                    if inspect_tracked_sensitive or redact_budget_details:
-                        raise BulkloadError("symlink exceeds remaining byte budget")
-                    raise BulkloadError(
-                        f"symlink exceeds remaining byte budget: {target_size} > {maximum_bytes}"
-                    )
-                record.update(
-                    {
-                        "blocked_reason": "symlink mutations are unsupported in v1",
-                        "eligible": False,
-                        "kind": "symlink",
-                        "size": target_size,
-                    }
-                )
-                if not inspect_tracked_sensitive:
-                    record["sha256"] = hashlib.sha256(target_bytes).hexdigest()
-                if git_object_format is not None:
-                    git_digest = hashlib.new(git_object_format)
-                    git_digest.update(f"blob {target_size}\0".encode("ascii"))
-                    git_digest.update(target_bytes)
-                    record["git_blob_oid"] = git_digest.hexdigest()
-            else:
-                record.update(
-                    {
-                        "blocked_reason": "special files are unsupported",
-                        "eligible": False,
-                        "kind": "special",
-                    }
-                )
-    except FileNotFoundError:
-        record.update(
-            {
-                "blocked_reason": "tracked path is absent",
-                "eligible": False,
-                "kind": "missing",
-            }
-        )
-    if inspect_tracked_sensitive:
-        for field in ("kind", "mode", "size", "git_blob_oid"):
-            if field in record:
-                record[f"{PRIVATE_WORKTREE_PREFIX}{field}"] = record.pop(field)
-        record.pop("sha256", None)
-        record.update(
-            {
-                "blocked_reason": sensitive,
-                "eligible": False,
-                "kind": "redacted",
-            }
-        )
-    return record
-
-
-def _worktree_field(item: dict[str, Any], field: str) -> Any:
-    return item.get(f"{PRIVATE_WORKTREE_PREFIX}{field}", item.get(field))
-
-
-def _mode_matches_index(item: dict[str, Any], index_mode: str) -> bool:
-    kind = _worktree_field(item, "kind")
-    if index_mode == "120000":
-        return kind == "symlink"
-    if index_mode not in {"100644", "100755"} or kind != "file":
-        return False
-    mode = _worktree_field(item, "mode")
-    if not isinstance(mode, str):
-        return False
-    expected = 0o755 if index_mode == "100755" else 0o644
-    return int(mode, 8) == expected
-
-
-def _derive_status(
-    index_entries: dict[str, list[dict[str, Any]]],
-    head_entries: dict[str, dict[str, str]],
-    files: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    tracked_files = {
-        item["path"]: item for item in files if item["git_class"] == "tracked"
-    }
-    records: list[dict[str, Any]] = []
-    authority_paths = set(index_entries) | set(head_entries)
-    for path in sorted(authority_paths):
-        entries = index_entries.get(path, [])
-        if not entries:
-            records.append({"index": "D", "path": path, "worktree": " "})
-            continue
-        stage_zero = [entry for entry in entries if entry["stage"] == 0]
-        if len(stage_zero) != 1 or any(entry["stage"] != 0 for entry in entries):
-            records.append({"index": "U", "path": path, "worktree": "U"})
-            continue
-
-        index_entry = stage_zero[0]
-        head_entry = head_entries.get(path)
-        if head_entry is None:
-            index_code = "A"
-        elif index_entry["mode"] != head_entry["mode"]:
-            index_code = "T"
-        elif index_entry["object"] != head_entry["object"]:
-            index_code = "M"
-        else:
-            index_code = " "
-
-        item = tracked_files.get(path)
-        if item is None or _worktree_field(item, "kind") == "missing":
-            worktree_code = "D"
-        elif not _mode_matches_index(item, index_entry["mode"]):
-            worktree_code = "T"
-        elif _worktree_field(item, "git_blob_oid") != index_entry["object"]:
-            worktree_code = "M"
-        else:
-            worktree_code = " "
-        if index_code != " " or worktree_code != " ":
-            records.append(
-                {"index": index_code, "path": path, "worktree": worktree_code}
-            )
-
-    for item in files:
-        if item["git_class"] == "untracked" and item["path"] not in authority_paths:
-            records.append({"index": "?", "path": item["path"], "worktree": "?"})
-    return sorted(records, key=lambda item: item["path"])
-
-
-def _capture_remotes(repo: Path) -> list[dict[str, Any]]:
-    remotes: list[dict[str, Any]] = []
-    for name in _decode_git_text(_git(repo, "remote"), "remote name").splitlines():
-        urls = _decode_git_text(
-            _git(repo, "remote", "get-url", "--all", name), "remote URL"
-        ).splitlines()
-        remotes.append(
-            {
-                "name": name,
-                "urls": sorted({sanitize_remote_url(url) for url in urls}),
-            }
-        )
-    return sorted(remotes, key=lambda item: item["name"])
-
-
-def _capture_refs(repo: Path) -> list[dict[str, str | None]]:
+def _parse_refs(repository: Path) -> list[dict[str, Any]]:
     payload = _git(
-        repo,
-        "for-each-ref",
-        "--format=%(refname)%00%(objectname)%00%(symref)",
+        repository,
+        ["for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)"],
     )
-    refs: list[dict[str, str | None]] = []
-    for raw in payload.splitlines():
-        if not raw:
-            continue
-        fields = raw.split(b"\0")
-        if len(fields) != 3:
-            raise BulkloadError("git for-each-ref emitted an incomplete record")
-        refname = _decode_git_text(fields[0], "ref name")
-        object_name = _decode_git_ascii(fields[1], "ref object ID")
-        symref_text = _decode_git_text(fields[2], "symbolic ref target")
+    refs: list[dict[str, Any]] = []
+    for raw_line in payload.splitlines():
+        fields = raw_line.decode("utf-8", errors="strict").split("\t")
+        if len(fields) != 3 or not HEX_OID.fullmatch(fields[1]):
+            raise BulkloadError("malformed Git ref inventory")
         refs.append(
             {
-                "name": refname,
-                "object": object_name,
-                "symref": symref_text or None,
+                "name": fields[0],
+                "oid": fields[1],
+                "symbolic_target": fields[2] or None,
             }
         )
     return sorted(refs, key=lambda item: item["name"])
 
 
-def _read_git_admin_file(path: Path, label: str) -> bytes | None:
+def _read_oid_lines(path: Path) -> set[str]:
+    result: set[str] = set()
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        raise BulkloadError(f"Git authority is not a regular file: {label}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        opened = os.fstat(descriptor)
-        if _stat_identity(opened) != _stat_identity(info):
-            raise BulkloadError(f"Git authority changed while opening: {label}")
-        payload = b""
-        while True:
-            chunk = os.read(descriptor, 64 * 1024)
-            if not chunk:
-                break
-            payload += chunk
-            if len(payload) > 16 * 1024 * 1024:
-                raise BulkloadError(f"Git authority is unreasonably large: {label}")
-        after = os.fstat(descriptor)
-        if _stat_identity(after) != _stat_identity(info):
-            raise BulkloadError(f"Git authority changed while reading: {label}")
-    finally:
-        os.close(descriptor)
-    return payload
-
-
-def _capture_git_operation_state(git_dir: Path) -> list[str]:
-    """Type active Git administration without following marker paths."""
-    active: set[str] = set()
-    for operation, relative in GIT_OPERATION_MARKERS:
-        marker = git_dir.joinpath(*relative.split("/"))
-        try:
-            marker.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise BulkloadError(
-                f"cannot inspect Git operation marker {relative}: {error}"
-            ) from error
-        active.add(operation)
-    return sorted(active)
-
-
-def _pseudo_ref_objects(git_dir: Path, object_length: int) -> tuple[set[str], int]:
-    values: set[str] = set()
-    observed_bytes = 0
-    for name in PSEUDO_REF_NAMES:
-        payload = _read_git_admin_file(git_dir / name, f"pseudo-ref {name}")
-        if payload is None:
-            continue
-        observed_bytes += len(payload)
-        if observed_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
-            raise BulkloadError("recovery authority byte budget exceeded")
-        for line in payload.splitlines():
-            fields = line.split()
-            if not fields:
+        payload = path.read_bytes()
+    except OSError:
+        return result
+    for line in payload.splitlines():
+        fields = line.split()
+        for value in fields[:2]:
+            try:
+                decoded = value.decode("ascii")
+            except UnicodeDecodeError:
                 continue
-            object_id = _decode_git_ascii(fields[0], f"{name} object ID")
-            if len(object_id) != object_length or any(
-                character not in "0123456789abcdef" for character in object_id
-            ):
-                raise BulkloadError(f"invalid Git pseudo-ref object ID: {name}")
-            values.add(object_id)
-            if len(values) > MAX_RECOVERY_CANDIDATES:
-                raise BulkloadError("recovery root budget exceeded")
-    return values, observed_bytes
+            if HEX_OID.fullmatch(decoded) and decoded not in ZERO_OIDS:
+                result.add(decoded)
+    return result
 
 
-def _reachable_recovery_candidates(
-    repo: Path,
-    roots: set[str],
-    candidates: set[str],
-    object_length: int,
-) -> set[str]:
-    if not candidates:
-        return set()
-    process = subprocess.Popen(
-        [
-            "git",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(repo),
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            "--stdin",
-            "--missing=error",
-        ],
-        env=_git_environment(),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    reachable: set[str] = set()
-    try:
-        process.stdin.write(("\n".join(sorted(roots)) + "\n").encode("ascii"))
-        process.stdin.close()
-        for line in process.stdout:
-            object_id = _decode_git_ascii(
-                line.strip(), "local ref reachability object ID"
-            )
-            if len(object_id) != object_length or any(
-                character not in "0123456789abcdef" for character in object_id
-            ):
-                raise BulkloadError("invalid Git object ID in local ref reachability")
-            if object_id in candidates:
-                reachable.add(object_id)
-    except BaseException:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        raise
-    finally:
-        if not process.stdin.closed:
-            process.stdin.close()
-        process.stdout.close()
-    returncode = process.wait()
-    if returncode != 0:
-        raise BulkloadError(f"Git local ref reachability failed in {repo}")
-    return reachable
+def _recovery_anchors(
+    repository: Path, common_dir: Path, git_dirs: Sequence[Path]
+) -> list[dict[str, Any]]:
+    sources: dict[str, set[str]] = defaultdict(set)
+    roots = [common_dir, *git_dirs]
+    for authority in roots:
+        logs = authority / "logs"
+        if logs.is_dir():
+            for current, directories, files in os.walk(logs, followlinks=False):
+                directories[:] = sorted(directories)
+                for filename in sorted(files):
+                    path = Path(current) / filename
+                    relative = path.relative_to(authority).as_posix()
+                    for oid in _read_oid_lines(path):
+                        sources[oid].add(relative)
+        for name in PSEUDO_REFS:
+            path = authority / name
+            if path.is_file():
+                for oid in _read_oid_lines(path):
+                    sources[oid].add(name)
+    result: list[dict[str, Any]] = []
+    for oid in sorted(sources):
+        # The type query distinguishes a missing object without exposing its
+        # data in diagnostics or in the capture.
+        object_type = _git(repository, ["cat-file", "-t", oid], check=False).strip()
+        if not object_type:
+            raise BulkloadError("a Git recovery anchor object is missing")
+        result.append({"oid": oid, "sources": sorted(sources[oid])})
+    return result
 
 
-def _capture_recovery_roots(
-    repo: Path,
-    git_dir: Path,
-    common_dir: Path,
-    head: str,
-    refs: list[dict[str, str | None]],
-) -> list[str]:
-    object_length = len(head)
-    local_roots = {
-        head,
-        *(
-            str(item["object"])
-            for item in refs
-            if not str(item["name"]).startswith("refs/remotes/")
-        ),
-    }
-    reflog_objects: set[str] = set()
-    reflog_names = _decode_git_text(
-        _git(repo, "reflog", "list"), "reflog name"
-    ).splitlines()
-    local_reflog_names: list[str] = []
-    for name in reflog_names:
-        if name == "HEAD":
-            local_reflog_names.append(name)
-        elif name.startswith("refs/remotes/"):
+def _object_files(
+    common_dir: Path, *, max_files: int, max_bytes: int
+) -> list[dict[str, Any]]:
+    objects = common_dir / "objects"
+    if not objects.is_dir():
+        raise BulkloadError("Git object directory is missing")
+    alternates = objects / "info" / "alternates"
+    if alternates.exists() and alternates.stat().st_size:
+        raise BulkloadError("Git alternates are unportable")
+    records: list[dict[str, Any]] = []
+    charged = 0
+    for current, directories, files in os.walk(objects, followlinks=False):
+        directories[:] = sorted(directories)
+        for filename in sorted(files):
+            path = Path(current) / filename
+            relative = path.relative_to(objects).as_posix()
+            info = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                raise BulkloadError("Git object storage contains a special entry")
+            # commit-graph and multi-pack-index are regenerated; all object and
+            # pack payloads remain additive transport authority.
+            if relative in {"info/commit-graph", "pack/multi-pack-index"}:
+                continue
+            record = _file_record(path, relative, classification="git-object")
+            records.append(record)
+            charged += record["size"]
+            if len(records) > max_files or charged > max_bytes:
+                raise BulkloadError("Git object capture budget exceeded")
+    return sorted(records, key=lambda item: item["relative_path"])
+
+
+def _index_entries(worktree: Path) -> list[dict[str, Any]]:
+    payload = _git(worktree, ["ls-files", "--stage", "-z"])
+    flag_payload = _git(worktree, ["ls-files", "-v", "-z"])
+    debug_payload = _git(worktree, ["ls-files", "--debug", "-z"])
+    flags: dict[str, str] = {}
+    for raw in flag_payload.split(b"\0"):
+        if not raw:
             continue
-        elif name.startswith("refs/"):
-            local_reflog_names.append(name)
-        else:
-            raise BulkloadError(f"invalid Git reflog name: {name!r}")
-    reflog_names = local_reflog_names
-    if len(reflog_names) > MAX_RECOVERY_REFLOGS:
-        raise BulkloadError(
-            f"recovery reflog budget exceeded: {len(reflog_names)} > {MAX_RECOVERY_REFLOGS}"
-        )
-    observed_authority_bytes = 0
-    for name in reflog_names:
-        if name != "HEAD" and any(
-            component in {"", ".", ".."} for component in name.split("/")
-        ):
-            raise BulkloadError(f"invalid Git reflog name: {name!r}")
-        worktree_local = name == "HEAD" or name.startswith(
-            ("refs/bisect/", "refs/rewritten/", "refs/worktree/")
-        )
-        authority_root = git_dir if worktree_local else common_dir
-        payload = _read_git_admin_file(authority_root / "logs" / name, f"reflog {name}")
-        if payload is None:
-            raise BulkloadError(f"listed Git reflog is absent: {name}")
-        observed_authority_bytes += len(payload)
-        if observed_authority_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
-            raise BulkloadError("recovery authority byte budget exceeded")
-        for line in payload.splitlines():
-            header = line.partition(b"\t")[0]
-            fields = header.split(b" ", 2)
-            if len(fields) != 3:
-                raise BulkloadError(f"invalid Git reflog record: {name}")
-            for raw_object_id in fields[:2]:
-                object_id = _decode_git_ascii(raw_object_id, f"{name} reflog object ID")
-                if object_id == "0" * object_length:
-                    continue
-                if len(object_id) != object_length or any(
-                    character not in "0123456789abcdef" for character in object_id
-                ):
-                    raise BulkloadError(f"invalid Git reflog object ID: {name}")
-                reflog_objects.add(object_id)
-                if len(reflog_objects - local_roots) > MAX_RECOVERY_CANDIDATES:
-                    raise BulkloadError("recovery root budget exceeded")
-    pseudo_objects, pseudo_bytes = _pseudo_ref_objects(git_dir, object_length)
-    observed_authority_bytes += pseudo_bytes
-    if observed_authority_bytes > MAX_RECOVERY_AUTHORITY_BYTES:
-        raise BulkloadError(
-            "recovery authority byte budget exceeded: "
-            f"{observed_authority_bytes} > {MAX_RECOVERY_AUTHORITY_BYTES}"
-        )
-    candidates = (reflog_objects | pseudo_objects) - local_roots
-    if len(candidates) > MAX_RECOVERY_CANDIDATES:
-        raise BulkloadError(
-            f"recovery root budget exceeded: {len(candidates)} > {MAX_RECOVERY_CANDIDATES}"
-        )
-    reachable = _reachable_recovery_candidates(
-        repo, local_roots, candidates, object_length
-    )
-    return sorted(candidates - reachable)
-
-
-def _verify_local_ref_object_closure(
-    repo: Path,
-    head: str,
-    refs: list[dict[str, str | None]],
-    recovery_roots: list[str],
-) -> None:
-    roots = sorted(
-        {
-            head,
-            *(
-                str(item["object"])
-                for item in refs
-                if not str(item["name"]).startswith("refs/remotes/")
-            ),
-            *recovery_roots,
-        }
-    )
-    _git(
-        repo,
-        "rev-list",
-        "--objects",
-        "--stdin",
-        "--quiet",
-        "--missing=error",
-        input_data=("\n".join(roots) + "\n").encode("ascii"),
-    )
-    _git(
-        repo,
-        "fsck",
-        "--full",
-        "--no-dangling",
-        "--no-reflogs",
-        "--no-progress",
-    )
-
-
-def _optional_git_text(repo: Path, *arguments: str) -> str | None:
-    process = subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *arguments],
-        env=_git_environment(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if process.returncode != 0:
-        return None
-    return _decode_git_text(process.stdout, "optional Git query").strip() or None
-
-
-def _git_config_value(repo: Path, *arguments: str) -> tuple[bool, str]:
-    process = subprocess.run(
-        [
-            "git",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(repo),
-            "config",
-            *arguments,
-        ],
-        env=_git_environment(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if process.returncode == 1:
-        return False, ""
-    if process.returncode != 0:
-        raise BulkloadError("effective Git configuration query failed")
-    return True, _decode_git_text(process.stdout, "Git configuration value").strip()
-
-
-def _has_promisor_configuration(repo: Path) -> bool:
-    present, _ = _git_config_value(repo, "--get", "extensions.partialClone")
-    if present:
-        return True
-    for name in _decode_git_text(_git(repo, "remote"), "remote name").splitlines():
-        present, _ = _git_config_value(
-            repo, "--get", f"remote.{name}.partialclonefilter"
-        )
-        if present:
-            return True
-        present, _ = _git_config_value(repo, "--get", f"remote.{name}.promisor")
-        if not present:
-            continue
-        typed_present, normalized = _git_config_value(
-            repo,
-            "--type=bool",
-            "--get",
-            f"remote.{name}.promisor",
-        )
-        if not typed_present or normalized != "false":
-            return True
-    return False
-
-
-def _effective_filters(repo: Path, paths: list[str]) -> set[str]:
-    if not paths:
-        return set()
-    request = b"\0".join(os.fsencode(path) for path in paths) + b"\0"
-    expected = set(paths)
-    values: set[str] = set()
-    for cached in (False, True):
-        arguments = ["check-attr"]
-        if cached:
-            arguments.append("--cached")
-        arguments.extend(("-z", "--stdin", "filter"))
-        payload = _git(repo, *arguments, input_data=request)
-        if not payload.endswith(b"\0"):
-            raise BulkloadError("git check-attr omitted its trailing NUL")
-        fields = payload[:-1].split(b"\0")
-        if len(fields) != len(paths) * 3:
-            raise BulkloadError("git check-attr emitted an incomplete filter catalog")
-        seen: set[str] = set()
-        for index in range(0, len(fields), 3):
-            path = _decode_path(fields[index])
-            attribute = _decode_git_ascii(fields[index + 1], "attribute name")
-            value = _decode_git_text(fields[index + 2], "attribute value")
-            if attribute != "filter" or path not in expected or path in seen:
-                raise BulkloadError(
-                    "git check-attr emitted an unexpected filter record"
-                )
-            seen.add(path)
-            if value not in {"unspecified", "unset"}:
-                values.add(value)
-        if seen != expected:
-            raise BulkloadError("git check-attr omitted a filter path")
-    return values
-
-
-def _has_unportable_attribute_authority(repo: Path) -> bool:
-    info_raw = _git(repo, "rev-parse", "--git-path", "info/attributes")
-    info_path = Path(_decode_git_text(info_raw, "attributes path").strip())
-    if not info_path.is_absolute():
-        info_path = repo / info_path
-    try:
-        info = info_path.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
-            return True
-
-    if _optional_git_text(repo, "config", "--path", "--get", "core.attributesFile"):
-        return True
-
-    home = Path.home()
-    xdg = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
-    for candidate in (xdg / "git" / "attributes", home / ".gitattributes"):
+        if len(raw) < 3 or raw[1:2] != b" ":
+            raise BulkloadError("malformed Git index flag inventory")
+        path = _decode_path(raw[2:], "Git index path")
+        flags[path] = chr(raw[0])
+    debug_flags: dict[str, int] = {}
+    position = 0
+    while position < len(debug_payload):
+        terminator = debug_payload.find(b"\0", position)
+        if terminator < 0:
+            raise BulkloadError("malformed Git index debug inventory")
+        path = _decode_path(debug_payload[position:terminator], "Git index path")
+        position = terminator + 1
+        metadata: list[bytes] = []
+        for _ in range(5):
+            newline = debug_payload.find(b"\n", position)
+            if newline < 0:
+                raise BulkloadError("malformed Git index debug inventory")
+            metadata.append(debug_payload[position:newline])
+            position = newline + 1
         try:
-            info = candidate.lstat()
-        except FileNotFoundError:
+            raw_flags = metadata[-1].rsplit(b"flags:", 1)[1].strip()
+            debug_flags[path] = int(raw_flags, 16)
+        except (IndexError, ValueError) as error:
+            raise BulkloadError("malformed Git index debug flags") from error
+    entries: list[dict[str, Any]] = []
+    for raw in payload.split(b"\0"):
+        if not raw:
             continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
-            return True
-    return False
+        try:
+            header, raw_path = raw.split(b"\t", 1)
+            mode, oid, stage_text = header.decode("ascii").split(" ")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise BulkloadError("malformed Git index inventory") from error
+        path = _decode_path(raw_path, "Git index path")
+        stage = int(stage_text)
+        entries.append(
+            {
+                "assume_unchanged": flags.get(path, "H").islower(),
+                "intent_to_add": bool(debug_flags.get(path, 0) & 0x20000000),
+                "mode": mode,
+                "oid": oid,
+                "path": path,
+                "skip_worktree": flags.get(path) == "S",
+                "stage": stage,
+            }
+        )
+    return sorted(entries, key=lambda item: (item["path"], item["stage"]))
 
 
-def capture_git_runtime(repo: Path) -> dict[str, Any]:
-    """Capture the mutable Git identity used by apply-time preconditions."""
-    record = capture_repository(
-        repo.expanduser().resolve(),
-        ".",
-        include_ignored=False,
-        max_files=2**63 - 1,
-        max_bytes=2**127 - 1,
+def _head_entries(worktree: Path) -> dict[str, tuple[str, str]]:
+    payload = _git(
+        worktree, ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], check=False
     )
-    if not record["complete"]:
-        raise BulkloadError(f"runtime capture is incomplete: {record['errors']}")
-    return {
-        "branch": record["branch"],
-        "git_operation_state": record["git_operation_state"],
-        "has_alternates": record["has_alternates"],
-        "has_content_filters": record["has_content_filters"],
-        "has_grafts": record["has_grafts"],
-        "has_gitmodules": record["has_gitmodules"],
-        "has_lfs_attributes": record["has_lfs_attributes"],
-        "has_unportable_attributes": record["has_unportable_attributes"],
-        "head": record["head"],
-        "local_refs": [
-            item
-            for item in record["refs"]
-            if not item["name"].startswith("refs/remotes/")
-        ],
-        "local_refs_sha256": record["local_refs_sha256"],
-        "recovery_roots": record["recovery_roots"],
-        "recovery_roots_sha256": record["recovery_roots_sha256"],
-        "refs_sha256": record["refs_sha256"],
-        "status": record["status"],
-        "status_sha256": record["status_sha256"],
-    }
+    result: dict[str, tuple[str, str]] = {}
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            header, path_bytes = raw.split(b"\t", 1)
+            mode, _kind, oid = header.decode("ascii").split(" ")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise BulkloadError("malformed Git HEAD tree inventory") from error
+        result[_decode_path(path_bytes, "Git tree path")] = (mode, oid)
+    return result
 
 
-def _path_collisions(paths: Iterable[str]) -> list[list[str]]:
-    collision_groups: dict[str, list[str]] = {}
-    for path in paths:
-        key = unicodedata.normalize("NFC", path).casefold()
-        collision_groups.setdefault(key, []).append(path)
-    return [
-        sorted(set(group)) for group in collision_groups.values() if len(set(group)) > 1
-    ]
+def _git_blob_sha(repository: Path, oid: str, cache: dict[str, str]) -> str | None:
+    if oid in ZERO_OIDS:
+        return None
+    if oid in cache:
+        return cache[oid]
+    process = subprocess.Popen(
+        ["git", "-C", os.fspath(repository), "cat-file", "blob", oid],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_git_environment(),
+    )
+    digest = hashlib.sha256()
+    assert process.stdout is not None
+    with process.stdout:
+        while chunk := process.stdout.read(1024 * 1024):
+            digest.update(chunk)
+    if process.wait() != 0:
+        raise BulkloadError("cannot inspect indexed Git blob")
+    cache[oid] = digest.hexdigest()
+    return cache[oid]
 
 
-def capture_repository(
-    repo: Path,
-    logical_path: str,
+def _capture_worktree(
+    worktree_record: dict[str, Any],
     *,
-    include_ignored: bool,
+    path_map: list[dict[str, str]],
+    role: str,
+    nested_roots: set[Path],
     max_files: int,
     max_bytes: int,
-) -> dict[str, Any]:
-    if _has_promisor_configuration(repo):
-        raise BulkloadError("partial/promisor Git repositories are unsupported in v1")
-    errors: list[str] = []
-    branch = _optional_git_text(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-    head = _decode_git_ascii(_git(repo, "rev-parse", "HEAD"), "HEAD").strip()
-    object_format = _decode_git_ascii(
-        _git(repo, "rev-parse", "--show-object-format"), "object format"
-    ).strip()
-    if object_format not in {"sha1", "sha256"}:
-        raise BulkloadError(f"unsupported Git object format: {object_format}")
-    shallow = _decode_git_ascii(
-        _git(repo, "rev-parse", "--is-shallow-repository"), "shallow state"
-    ).strip()
-    if shallow not in {"true", "false"}:
-        raise BulkloadError("git rev-parse emitted an invalid shallow-state value")
-    if shallow == "true":
-        errors.append("shallow Git history is unsupported in v1")
-    index_entries = _parse_index(_git(repo, "ls-files", "--stage", "-z"))
-    head_entries = _parse_tree(_git(repo, "ls-tree", "-r", "-z", "--full-tree", head))
-    tracked_authority = set(index_entries) | set(head_entries)
-    tracked = sorted(tracked_authority)
-    untracked = _nul_paths(
-        _git(repo, "ls-files", "-z", "--others", "--exclude-standard")
-    )
-    untracked = [path for path in untracked if path not in tracked_authority]
-    ignored: list[str] = []
-    if include_ignored:
-        ignored = _nul_paths(
-            _git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    path = resolve_real(Path(worktree_record["path"]))
+    git_dir = resolve_real(
+        Path(
+            _git(path, ["rev-parse", "--path-format=absolute", "--git-dir"])
+            .decode()
+            .strip()
         )
-
-    classified: list[tuple[str, str]] = []
-    classified.extend((path, "tracked") for path in tracked)
-    classified.extend((path, "untracked") for path in untracked)
-    classified.extend((path, "ignored") for path in ignored)
-    classified = sorted(set(classified), key=lambda item: (item[0], item[1]))
-    if len(classified) > max_files:
-        errors.append(f"file budget exceeded: {len(classified)} > {max_files}")
-        classified = classified[:max_files]
-
-    files: list[dict[str, Any]] = []
-    observed_bytes = 0
-    budget_bytes = 0
-    has_redacted_bytes = False
-    for relative, git_class in classified:
-        try:
-            item = inspect_path(
-                repo,
-                relative,
-                git_class,
-                None,
-                max_bytes - budget_bytes,
-                object_format if git_class == "tracked" else None,
-                has_redacted_bytes,
-            )
-        except (BulkloadError, OSError) as error:
-            errors.append(f"{relative}: {type(error).__name__}: {error}")
-            continue
-        budget_size = _worktree_field(item, "size")
-        if isinstance(budget_size, int):
-            budget_bytes += budget_size
-        public_size = item.get("size")
-        if isinstance(public_size, int):
-            observed_bytes += public_size
-        elif isinstance(budget_size, int):
-            has_redacted_bytes = True
-        if budget_bytes > max_bytes:
-            errors.append(
-                "byte budget exceeded"
-                if has_redacted_bytes
-                else f"byte budget exceeded: {budget_bytes} > {max_bytes}"
-            )
-            break
-        files.append(item)
-
-    statuses = _derive_status(index_entries, head_entries, files)
-    status_by_path = {record["path"]: record for record in statuses}
-    for item in files:
-        item["status"] = status_by_path.get(item["path"])
-
-    for item in files:
-        if item["git_class"] != "tracked":
-            continue
-        entries = index_entries.get(item["path"], [])
-        if item["kind"] != "redacted":
-            item["index_entries"] = entries
-        stage_zero = [entry for entry in entries if entry["stage"] == 0]
-        if len(stage_zero) != 1:
-            continue
-        entry = stage_zero[0]
-        if entry["mode"] not in {"100644", "100755", "120000"}:
-            if item.get("status") is None:
-                errors.append(
-                    f"{item['path']}: unsupported clean tracked index mode {entry['mode']}"
-                )
-            continue
-        mode_matches = _mode_matches_index(item, entry["mode"])
-        content_matches = _worktree_field(item, "git_blob_oid") == entry["object"]
-        if item.get("status") is None and (not mode_matches or not content_matches):
-            errors.append(
-                f"{item['path']}: clean status hides tracked bytes or mode differing from index"
-            )
-
-    for item in files:
-        for field in tuple(item):
-            if field.startswith(PRIVATE_WORKTREE_PREFIX):
-                del item[field]
-        if any(field.startswith(PRIVATE_WORKTREE_PREFIX) for field in item):
-            raise BulkloadError("private worktree identity escaped snapshot scrubbing")
-        if item.get("kind") == "redacted" and set(item) != {
-            "blocked_reason",
-            "eligible",
-            "git_class",
-            "kind",
-            "path",
-            "status",
-        }:
-            raise BulkloadError("redacted worktree record contains identity metadata")
-
-    collisions = _path_collisions(item["path"] for item in files)
-    if collisions:
-        errors.append(
-            f"casefold or Unicode-normalization path collisions: {collisions}"
+    )
+    destination_path = (
+        os.fspath(path) if role == "destination" else translate_path(path, path_map)
+    )
+    index_path_text = (
+        _git(path, ["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        .decode()
+        .strip()
+    )
+    index_path = Path(index_path_text)
+    if index_path.exists():
+        index_record: dict[str, Any] = {
+            "exists": True,
+            "mode": f"{stat.S_IMODE(index_path.stat().st_mode):04o}",
+            "path": os.fspath(index_path.resolve()),
+            "sha256": sha256_file(index_path),
+            "size": index_path.stat().st_size,
+        }
+    else:
+        index_record = {
+            "exists": False,
+            "mode": None,
+            "path": index_path_text,
+            "sha256": None,
+            "size": 0,
+        }
+    entries, blockers = _walk_entries(
+        path,
+        classification="git-worktree",
+        excluded_roots={root for root in nested_roots if root != path},
+        skip_git_admin=True,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    index_entries = _index_entries(path)
+    if any(entry["mode"] == "040000" for entry in index_entries):
+        blockers.append(
+            {
+                "code": "unsupported-sparse-index",
+                "path": os.fspath(path),
+            }
         )
-
-    common_dir_raw = _decode_git_text(
-        _git(repo, "rev-parse", "--git-common-dir"), "Git common directory"
-    ).strip()
-    common_dir = (
-        (repo / common_dir_raw).resolve()
-        if not Path(common_dir_raw).is_absolute()
-        else Path(common_dir_raw).resolve()
-    )
-    git_dir_raw = _decode_git_text(
-        _git(repo, "rev-parse", "--git-dir"), "Git directory"
-    ).strip()
-    git_dir = (
-        (repo / git_dir_raw).resolve()
-        if not Path(git_dir_raw).is_absolute()
-        else Path(git_dir_raw).resolve()
-    )
-    git_operation_state = _capture_git_operation_state(git_dir)
-    if git_operation_state:
-        errors.append(
-            f"active Git operation state is unsupported in v1: {git_operation_state}"
-        )
-    alternates = Path(
-        _decode_git_text(
-            _git(repo, "rev-parse", "--git-path", "objects/info/alternates"),
-            "alternates path",
-        ).strip()
-    )
-    if not alternates.is_absolute():
-        alternates = repo / alternates
-    grafts = Path(
-        _decode_git_text(
-            _git(repo, "rev-parse", "--git-path", "info/grafts"), "grafts path"
-        ).strip()
-    )
-    if not grafts.is_absolute():
-        grafts = repo / grafts
-
-    has_lfs = False
-    has_content_filters = False
-    has_unportable_attributes = False
-    try:
-        has_unportable_attributes = _has_unportable_attribute_authority(repo)
-        if not has_unportable_attributes:
-            effective_filters = _effective_filters(
-                repo,
-                sorted(
-                    {path for path, git_class in classified if git_class != "ignored"}
-                ),
-            )
-            has_lfs = "lfs" in effective_filters
-            has_content_filters = bool(effective_filters - {"lfs"})
-    except (BulkloadError, OSError) as error:
-        errors.append(f"Git attributes: {type(error).__name__}: {error}")
-
-    refs = _capture_refs(repo)
-    recovery_roots = _capture_recovery_roots(repo, git_dir, common_dir, head, refs)
-    _verify_local_ref_object_closure(repo, head, refs, recovery_roots)
-    local_refs = [item for item in refs if not item["name"].startswith("refs/remotes/")]
-
-    return {
-        "branch": branch,
-        "complete": not errors,
-        "errors": errors,
-        "files": sorted(files, key=lambda item: (item["path"], item["git_class"])),
-        "git_dir": str(git_dir),
-        "git_operation_state": git_operation_state,
-        "has_alternates": alternates.exists(),
-        "has_content_filters": has_content_filters,
-        "has_grafts": grafts.exists() and grafts.stat().st_size > 0,
-        "has_gitmodules": (repo / ".gitmodules").exists()
-        or any(
-            entry["mode"] == "160000"
-            for entries in index_entries.values()
-            for entry in entries
-        )
-        or any(entry["mode"] == "160000" for entry in head_entries.values()),
-        "has_lfs_attributes": has_lfs,
-        "has_unportable_attributes": has_unportable_attributes,
-        "head": head,
-        "logical_path": logical_path,
-        "local_refs_sha256": sha256_bytes(canonical_bytes(local_refs)),
-        "observed_bytes": observed_bytes,
-        "recovery_roots": recovery_roots,
-        "recovery_roots_sha256": sha256_bytes(canonical_bytes(recovery_roots)),
-        "refs": refs,
-        "refs_sha256": sha256_bytes(canonical_bytes(refs)),
-        "remotes": _capture_remotes(repo),
-        "root": str(repo),
-        "status": statuses,
-        "status_sha256": sha256_bytes(canonical_bytes(statuses)),
-        "upstream": _optional_git_text(
-            repo, "rev-parse", "--abbrev-ref", "@{upstream}"
-        ),
-        "worktree_common_dir": str(common_dir),
-        "worktrees": _parse_worktrees(
-            _git(repo, "worktree", "list", "--porcelain", "-z")
-        ),
+    head_entries = _head_entries(path)
+    by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in index_entries:
+        by_path[entry["path"]].append(entry)
+    blob_cache: dict[str, str] = {}
+    file_map = {
+        entry["relative_path"]: entry
+        for entry in entries
+        if entry["kind"] != "directory"
     }
-
-
-def capture_snapshot(
-    root: Path,
-    mode: str,
-    *,
-    include_ignored: bool = False,
-    max_files: int = DEFAULT_MAX_FILES,
-    max_bytes: int = DEFAULT_MAX_BYTES,
-) -> dict[str, Any]:
-    root = root.expanduser().resolve()
-    repositories, discovery_errors = discover_repositories(root, mode)
-    catalog: list[dict[str, Any]] = []
-    errors: list[str] = list(discovery_errors)
-    for repo in repositories:
-        relative = repo.relative_to(root).as_posix()
-        logical = (
-            "." if mode == "repo" or relative == "." else normalize_relative(relative)
+    dirt: list[dict[str, Any]] = []
+    for relative in sorted(set(head_entries) | set(by_path) | set(file_map)):
+        index_for_path = by_path.get(relative, [])
+        stage_zero = next(
+            (entry for entry in index_for_path if entry["stage"] == 0), None
         )
+        head_entry = head_entries.get(relative)
+        file_entry = file_map.get(relative)
+        conflicted = any(entry["stage"] != 0 for entry in index_for_path)
+        staged = False
+        if stage_zero is None:
+            staged = head_entry is not None or conflicted
+        elif head_entry != (stage_zero["mode"], stage_zero["oid"]):
+            staged = True
+        tracked = bool(index_for_path)
+        missing = (
+            tracked
+            and file_entry is None
+            and not (
+                stage_zero is not None
+                and (stage_zero["skip_worktree"] or stage_zero["mode"] == "160000")
+            )
+        )
+        modified = False
+        if stage_zero is not None and file_entry is not None:
+            expected_kind = "symlink" if stage_zero["mode"] == "120000" else "regular"
+            expected_mode = "0755" if stage_zero["mode"] == "100755" else "0644"
+            expected_sha = _git_blob_sha(path, stage_zero["oid"], blob_cache)
+            modified = (
+                file_entry["kind"] != expected_kind
+                or file_entry["sha256"] != expected_sha
+                or (expected_kind == "regular" and file_entry["mode"] != expected_mode)
+            )
+        untracked = not tracked and file_entry is not None
+        status = {
+            "conflicted": conflicted,
+            "missing": missing,
+            "modified": modified,
+            "path": relative,
+            "staged": staged,
+            "untracked": untracked,
+        }
+        if any(value for key, value in status.items() if key != "path"):
+            dirt.append(status)
+        if file_entry is not None:
+            file_entry["status"] = status
+    operation_state: list[str] = []
+    for marker, operation in GIT_OPERATION_MARKERS.items():
+        candidate = git_dir / marker
+        if candidate.exists() or candidate.is_symlink():
+            operation_state.append(operation)
+    if operation_state:
+        blockers.append(
+            {
+                "code": "active-git-operation",
+                "path": os.fspath(path),
+                "detail": ",".join(sorted(operation_state)),
+            }
+        )
+    return (
+        {
+            "branch": worktree_record.get("branch"),
+            "destination_path": destination_path,
+            "detached": bool(worktree_record.get("detached")),
+            "dirt": dirt,
+            "files": entries,
+            "git_dir": os.fspath(git_dir),
+            "head": worktree_record.get("head"),
+            "index": {**index_record, "entries": index_entries},
+            "locked": bool(worktree_record.get("locked")),
+            "operation_state": sorted(operation_state),
+            "path": os.fspath(path),
+            "prunable": bool(worktree_record.get("prunable")),
+        },
+        blockers,
+    )
+
+
+def _sanitize_remote(raw: str) -> str:
+    if not raw or any(character in raw for character in "\r\n\x00"):
+        raise BulkloadError("unsupported Git remote locator")
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*::", raw):
+        raise BulkloadError("remote-helper URLs are unportable")
+    if "://" in raw:
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"file", "git", "http", "https", "ssh"}:
+            raise BulkloadError("unsupported Git remote scheme")
+        if parsed.scheme.lower() == "file":
+            return f"local-path:sha256:{sha256_bytes(raw.encode())}"
+        host = parsed.hostname
+        if not host:
+            raise BulkloadError("malformed Git remote URL")
+        if ":" in host:
+            host = f"[{host}]"
+        authority = host + (f":{parsed.port}" if parsed.port else "")
+        return urlunsplit((parsed.scheme.lower(), authority, parsed.path, "", ""))
+    locator = raw.split("?", 1)[0].split("#", 1)[0]
+    if ":" in locator and "/" not in locator.split(":", 1)[0]:
+        host, path = locator.rsplit("@", 1)[-1].split(":", 1)
+        if host and path:
+            return f"{host}:{path}"
+    return f"local-path:sha256:{sha256_bytes(raw.encode())}"
+
+
+def _capture_remotes(repository: Path) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for raw_name in _git(repository, ["remote"]).splitlines():
+        name = raw_name.decode("utf-8", errors="strict")
+        raw_url = (
+            _git(repository, ["remote", "get-url", name])
+            .decode("utf-8", errors="strict")
+            .strip()
+        )
+        result.append({"name": name, "url": _sanitize_remote(raw_url)})
+    return sorted(result, key=lambda item: item["name"])
+
+
+def _capture_workspace(
+    representative: Path,
+    *,
+    git_root: Path,
+    path_map: list[dict[str, str]],
+    role: str,
+    nested_roots: set[Path],
+    max_files: int,
+    max_bytes: int,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    common_dir = resolve_real(
+        Path(
+            _git(
+                representative,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .decode()
+            .strip()
+        )
+    )
+    worktree_inventory = _parse_worktree_list(representative)
+    worktrees: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
+    git_dirs: list[Path] = []
+    for record in worktree_inventory:
+        if record.get("bare"):
+            continue
         try:
-            record = capture_repository(
-                repo,
-                logical,
-                include_ignored=include_ignored,
+            captured, observed_blockers = _capture_worktree(
+                record,
+                path_map=path_map,
+                role=role,
+                nested_roots=nested_roots,
                 max_files=max_files,
                 max_bytes=max_bytes,
             )
-        except (BulkloadError, OSError) as error:
-            errors.append(f"{logical}: {type(error).__name__}: {error}")
-            continue
-        catalog.append(record)
-        errors.extend(f"{logical}: {error}" for error in record["errors"])
-
-    snapshot: dict[str, Any] = {
-        "captured_at": utc_now(),
-        "capture_id": uuid.uuid4().hex,
-        "catalog": sorted(catalog, key=lambda item: item["logical_path"]),
-        "catalog_sha256": sha256_bytes(
-            canonical_bytes(sorted(catalog, key=lambda item: item["logical_path"]))
+            worktrees.append(captured)
+            git_dirs.append(Path(captured["git_dir"]))
+            blockers.extend(observed_blockers)
+        except BulkloadError as error:
+            blockers.append(
+                {
+                    "code": "worktree-capture-failed",
+                    "path": record.get("path", "redacted"),
+                    "detail": str(error),
+                }
+            )
+    object_format = (
+        _git(representative, ["rev-parse", "--show-object-format"]).decode().strip()
+    )
+    refs = _parse_refs(representative)
+    recovery = _recovery_anchors(representative, common_dir, git_dirs)
+    _git(representative, ["fsck", "--full", "--no-dangling"])
+    try:
+        logical = representative.relative_to(git_root).as_posix()
+    except ValueError:
+        logical = f"external/{sha256_bytes(os.fsencode(representative))[:24]}"
+    destination_path = (
+        os.fspath(representative)
+        if role == "destination"
+        else translate_path(representative, path_map)
+    )
+    primary_worktree = next(
+        (item for item in worktrees if item["path"] == os.fspath(representative)),
+        None,
+    )
+    workspace = {
+        "branch": primary_worktree["branch"] if primary_worktree else None,
+        "common_git_dir": os.fspath(common_dir),
+        "destination_path": destination_path,
+        "head": primary_worktree["head"] if primary_worktree else None,
+        "logical_path": logical,
+        "object_files": _object_files(
+            common_dir, max_files=max_files, max_bytes=max_bytes
         ),
-        "complete": not errors and all(item["complete"] for item in catalog),
-        "errors": errors,
-        "host": socket.gethostname(),
-        "include_ignored": include_ignored,
-        "mode": mode,
-        "root": str(root),
-        "schema": SNAPSHOT_SCHEMA,
+        "object_format": object_format,
+        "path": os.fspath(representative),
+        "recovery_anchors": recovery,
+        "refs": refs,
+        "remotes": _capture_remotes(representative),
+        "schema": GIT_WORKSPACE_SCHEMA,
+        "worktrees": sorted(worktrees, key=lambda item: item["path"]),
     }
-    snapshot["snapshot_sha256"] = object_digest(snapshot, "snapshot_sha256")
-    return snapshot
+    workspace["workspace_id"] = sha256_bytes(
+        canonical_bytes(
+            {
+                "destination_path": destination_path,
+                "object_format": object_format,
+                "remote_names": [remote["name"] for remote in workspace["remotes"]],
+            }
+        )
+    )
+    return workspace, blockers
 
 
-def find_file(repo_record: dict[str, Any], path: str) -> dict[str, Any] | None:
-    for item in repo_record.get("files", []):
-        if item.get("path") == path and item.get("git_class") != "ignored":
-            return item
+def _typed_sql_value(value: Any) -> list[Any]:
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["integer", int(value)]
+    if isinstance(value, int):
+        return ["integer", value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise BulkloadError("SQLite contains a non-finite REAL value")
+        return ["real", value.hex()]
+    if isinstance(value, str):
+        return ["text", value]
+    if isinstance(value, bytes):
+        return ["blob-sha256", sha256_bytes(value), len(value)]
+    raise BulkloadError("SQLite returned an unsupported value type")
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _sqlite_catalog_from_snapshot(path: Path, *, max_rows: int) -> dict[str, Any]:
+    try:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise BulkloadError("cannot open a consistent SQLite snapshot") from error
+    try:
+        check = connection.execute("PRAGMA quick_check").fetchone()
+        if check != ("ok",):
+            raise BulkloadError("SQLite quick_check failed")
+        schema_rows = connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY type,name"
+        ).fetchall()
+        schema: list[dict[str, Any]] = []
+        unsupported: list[str] = []
+        for row_type, name, table_name, sql in schema_rows:
+            schema.append(
+                {
+                    "name": name,
+                    "sql_sha256": sha256_bytes((sql or "").encode("utf-8")),
+                    "table": table_name,
+                    "type": row_type,
+                }
+            )
+            if row_type in {"trigger", "view"} or (
+                row_type == "table" and sql and "CREATE VIRTUAL TABLE" in sql.upper()
+            ):
+                unsupported.append(f"{row_type}:{name}")
+        table_names = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        tables: list[dict[str, Any]] = []
+        charged_rows = 0
+        for table_name in table_names:
+            columns_raw = connection.execute(
+                f"PRAGMA table_xinfo({_quote_identifier(table_name)})"
+            ).fetchall()
+            columns = [row[1] for row in columns_raw]
+            if any(row[6] != 0 for row in columns_raw):
+                unsupported.append(f"generated-column:{table_name}")
+            pk_columns = [
+                row[1]
+                for row in sorted(columns_raw, key=lambda item: item[5])
+                if row[5]
+            ]
+            rows: list[dict[str, str]] = []
+            query = f"SELECT * FROM {_quote_identifier(table_name)}"
+            for values in connection.execute(query):
+                charged_rows += 1
+                if charged_rows > max_rows:
+                    raise BulkloadError("SQLite row capture budget exceeded")
+                typed = [_typed_sql_value(value) for value in values]
+                row_sha = sha256_bytes(canonical_bytes(typed))
+                if pk_columns:
+                    positions = [columns.index(column) for column in pk_columns]
+                    key = [typed[position] for position in positions]
+                    key_sha = sha256_bytes(canonical_bytes(key))
+                else:
+                    key_sha = row_sha
+                rows.append({"key_sha256": key_sha, "row_sha256": row_sha})
+            rows.sort(key=lambda item: (item["key_sha256"], item["row_sha256"]))
+            tables.append(
+                {
+                    "columns": columns,
+                    "name": table_name,
+                    "primary_key": pk_columns,
+                    "row_count": len(rows),
+                    "rows": rows,
+                    "rows_sha256": sha256_bytes(canonical_bytes(rows)),
+                }
+            )
+        foreign_keys: list[dict[str, Any]] = []
+        for table_name in table_names:
+            for row in connection.execute(
+                f"PRAGMA foreign_key_list({_quote_identifier(table_name)})"
+            ):
+                foreign_keys.append(
+                    {
+                        "from": row[3],
+                        "on_delete": row[6],
+                        "on_update": row[5],
+                        "table": table_name,
+                        "to": row[4],
+                        "to_table": row[2],
+                    }
+                )
+        catalog = {
+            "application_id": connection.execute("PRAGMA application_id").fetchone()[0],
+            "foreign_keys": sorted(
+                foreign_keys,
+                key=lambda item: (
+                    item["table"],
+                    item["from"],
+                    item["to_table"],
+                    item["to"] or "",
+                ),
+            ),
+            "page_size": connection.execute("PRAGMA page_size").fetchone()[0],
+            "schema": schema,
+            "schema_sha256": sha256_bytes(canonical_bytes(schema)),
+            "tables": tables,
+            "unsupported_schema": sorted(unsupported),
+            "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
+        }
+        catalog["logical_sha256"] = sha256_bytes(canonical_bytes(catalog))
+        return catalog
+    except sqlite3.Error as error:
+        raise BulkloadError("cannot inspect SQLite state") from error
+    finally:
+        connection.close()
+
+
+def snapshot_sqlite(
+    source: Path, destination: Path, *, max_rows: int
+) -> dict[str, Any]:
+    """Read the live DB including committed WAL state through SQLite backup."""
+    source = resolve_real(source)
+    related = [
+        source,
+        *[Path(os.fspath(source) + suffix) for suffix in SQLITE_SIDECARS],
+    ]
+    before = {os.fspath(path): _stable_stat(path) for path in related if path.exists()}
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        source_connection = sqlite3.connect(
+            f"file:{source.as_posix()}?mode=ro", uri=True, timeout=5.0
+        )
+        destination_connection = sqlite3.connect(destination)
+        try:
+            source_connection.execute("PRAGMA query_only=ON")
+            source_connection.backup(destination_connection, pages=1024, sleep=0.01)
+            destination_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            destination_connection.commit()
+        finally:
+            destination_connection.close()
+            source_connection.close()
+        after = {
+            os.fspath(path): _stable_stat(path) for path in related if path.exists()
+        }
+        if before != after:
+            raise BulkloadError("SQLite family changed during capture")
+        os.chmod(destination, 0o600)
+        return _sqlite_catalog_from_snapshot(destination, max_rows=max_rows)
+    except sqlite3.Error as error:
+        destination.unlink(missing_ok=True)
+        raise BulkloadError("SQLite backup capture failed") from error
+
+
+def sqlite_catalog(
+    source: Path, *, max_rows: int = DEFAULT_MAX_SQLITE_ROWS
+) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="bulkload-sqlite-") as temporary:
+        return snapshot_sqlite(
+            source, Path(temporary) / "snapshot.sqlite", max_rows=max_rows
+        )
+
+
+def _jsonl_records(
+    path: Path, *, replacements: Sequence[tuple[bytes, bytes]] = ()
+) -> dict[str, Any]:
+    hashes: list[str] = []
+    transformed_hashes: list[str] = []
+    hasher = hashlib.sha256()
+    transformed_hasher = hashlib.sha256()
+    try:
+        with path.open("rb", buffering=0) as stream:
+            for line in stream:
+                if not line.endswith(b"\n"):
+                    raise BulkloadError(
+                        "append-only JSONL has an incomplete final record"
+                    )
+                try:
+                    json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise BulkloadError(
+                        "append-only state contains invalid JSONL"
+                    ) from error
+                transformed = line
+                for source, destination in replacements:
+                    transformed = transformed.replace(source, destination)
+                try:
+                    json.loads(transformed)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise BulkloadError(
+                        "path rewriting produced invalid JSONL"
+                    ) from error
+                hashes.append(sha256_bytes(line))
+                transformed_hashes.append(sha256_bytes(transformed))
+                hasher.update(line)
+                transformed_hasher.update(transformed)
+    except OSError as error:
+        raise BulkloadError(f"cannot read append-only state {path}") from error
+    return {
+        "records": hashes,
+        "records_sha256": sha256_bytes(canonical_bytes(hashes)),
+        "sha256": hasher.hexdigest(),
+        "translated_records": transformed_hashes,
+        "translated_sha256": transformed_hasher.hexdigest(),
+    }
+
+
+def _session_identity(relative: str, path: Path) -> str:
+    stem = path.stem.lower()
+    match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        stem,
+    )
+    return match.group(0) if match else relative
+
+
+def _sqlite_primary(path: str) -> str | None:
+    for sidecar in SQLITE_SIDECARS:
+        if path.endswith(sidecar):
+            return path[: -len(sidecar)]
+    if path.lower().endswith(SQLITE_SUFFIXES):
+        return path
     return None
 
 
-def dirty_paths(repo_record: dict[str, Any]) -> set[str]:
-    return {item["path"] for item in repo_record.get("status", [])}
+def _provider_classification(provider: str, relative: str) -> str:
+    lowered = relative.lower()
+    leaf = PurePosixPath(lowered).name
+    if _sqlite_primary(lowered) is not None:
+        return "sqlite"
+    if provider == "codex":
+        if relative == "auth.json":
+            return "portable-auth"
+        if lowered == "history.jsonl" or lowered.startswith(
+            ("sessions/", "archived_sessions/")
+        ):
+            return "append-jsonl"
+        if lowered.startswith(("goals/", "memory/", "queue/")):
+            return "union-state"
+        if lowered.startswith(("rules/", "skills/", "prompts/")) or leaf in {
+            "config.toml",
+            "instructions.md",
+        }:
+            return "portable-state"
+        if lowered.startswith(("logs/", "tmp/", "shell_snapshots/")) or leaf in {
+            "models_cache.json",
+            "version.json",
+        }:
+            return "regenerate"
+    elif provider == "claude":
+        if leaf in {".credentials.json", "auth.json", "credentials.json"}:
+            return "nonportable-auth"
+        if lowered == "history.jsonl" or (
+            lowered.startswith("projects/") and lowered.endswith(".jsonl")
+        ):
+            return "append-jsonl-rewrite"
+        if lowered.startswith(
+            (
+                "projects/",
+                "todos/",
+                "plans/",
+                "memory/",
+                "queue/",
+                "commands/",
+                "agents/",
+                "skills/",
+            )
+        ) or leaf.startswith("settings"):
+            return "portable-state-rewrite"
+        if (
+            lowered.startswith(("cache/", "debug/", "logs/", "telemetry/"))
+            or leaf == "stats-cache.json"
+        ):
+            return "regenerate"
+    elif provider == "pi":
+        if leaf in {"auth.json", "credentials.json"}:
+            return "portable-auth"
+        if lowered == "history.jsonl" or lowered.startswith(
+            ("sessions/", "history/", "archive/")
+        ):
+            return "append-jsonl"
+        if lowered.startswith(
+            ("state/", "memory/", "queue/", "skills/", "prompts/")
+        ) or leaf in {
+            "settings.json",
+            "models.json",
+        }:
+            return "portable-state"
+        if lowered.startswith(("cache/", "logs/", "tmp/")):
+            return "regenerate"
+    if provider in {"codex", "claude", "pi"}:
+        return "portable-private"
+    return "unknown"
 
 
-def catalog_map(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {item["logical_path"]: item for item in snapshot.get("catalog", [])}
+def _capture_provider(
+    provider: str,
+    root: Path,
+    *,
+    role: str,
+    path_map: list[dict[str, str]],
+    exclusions: Sequence[str],
+    max_files: int,
+    max_bytes: int,
+    max_sqlite_rows: int,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    logical_root, backing_root, root_link, exists = _declared_root(
+        root, allow_absent=True
+    )
+    if not exists:
+        return {
+            "destination_path": os.fspath(logical_root)
+            if role == "destination"
+            else translate_path(logical_root, path_map),
+            "exists": False,
+            "items": [],
+            "logical_path": os.fspath(logical_root),
+            "name": provider,
+            "path": os.fspath(backing_root),
+            "root_link": root_link,
+        }, []
+    root = backing_root
+    destination_root = (
+        os.fspath(root)
+        if role == "destination"
+        else translate_path(logical_root, path_map)
+    )
+    files: list[tuple[str, Path]] = []
+    blockers: list[dict[str, str]] = []
+    charged = 0
+    for current, directories, names in os.walk(root, topdown=True, followlinks=False):
+        retained_directories: list[str] = []
+        for name in sorted(directories):
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
+                provider, relative
+            ):
+                continue
+            try:
+                info = path.stat(follow_symlinks=False)
+            except OSError:
+                blockers.append(
+                    {"code": "unreadable-agent-state", "path": os.fspath(path)}
+                )
+                continue
+            if stat.S_ISLNK(info.st_mode) and _portable_symlink(root, path):
+                files.append((relative, path))
+                charged += info.st_size
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                blockers.append(
+                    {"code": "special-agent-state", "path": f"{provider}:{relative}"}
+                )
+                continue
+            files.append((relative, path))
+            retained_directories.append(name)
+            if len(files) > max_files:
+                raise BulkloadError(f"{provider} state capture budget exceeded")
+        directories[:] = retained_directories
+        for name in sorted(names):
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
+                provider, relative
+            ):
+                continue
+            try:
+                info = path.stat(follow_symlinks=False)
+            except OSError:
+                blockers.append(
+                    {"code": "unreadable-agent-state", "path": os.fspath(path)}
+                )
+                continue
+            if stat.S_ISLNK(info.st_mode) and _portable_symlink(root, path):
+                files.append((relative, path))
+                charged += info.st_size
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                blockers.append(
+                    {"code": "special-agent-state", "path": f"{provider}:{relative}"}
+                )
+                continue
+            files.append((relative, path))
+            charged += info.st_size
+            if len(files) > max_files or charged > max_bytes:
+                raise BulkloadError(f"{provider} state capture budget exceeded")
+    sqlite_paths: dict[str, Path] = {}
+    for relative, path in files:
+        primary = _sqlite_primary(relative.lower())
+        if primary is not None and not relative.lower().endswith(SQLITE_SIDECARS):
+            sqlite_paths[primary] = path
+    items: list[dict[str, Any]] = []
+    replacements = [
+        (os.fsencode(entry["source"]), os.fsencode(entry["destination"]))
+        for entry in sorted(
+            path_map, key=lambda item: len(item["source"]), reverse=True
+        )
+    ]
+    for relative, path in files:
+        classification = _provider_classification(provider, relative)
+        file_type = stat.S_IFMT(path.stat(follow_symlinks=False).st_mode)
+        is_symlink = file_type == stat.S_IFLNK
+        if file_type == stat.S_IFDIR:
+            classification = (
+                "portable-directory-rewrite"
+                if classification.endswith("rewrite")
+                else "portable-directory"
+            )
+        if is_symlink:
+            link_destination = _portable_symlink_destination(root, path)
+            archived_session_link = (
+                provider == "codex"
+                and classification == "append-jsonl"
+                and PurePosixPath(relative).parts[:1] == ("sessions",)
+                and link_destination is not None
+                and PurePosixPath(link_destination).parts[:1] == ("archived_sessions",)
+            )
+            if (
+                classification
+                in {
+                    "append-jsonl",
+                    "append-jsonl-rewrite",
+                    "nonportable-auth",
+                    "portable-auth",
+                    "sqlite",
+                }
+                and not archived_session_link
+            ):
+                blockers.append(
+                    {"code": "typed-agent-symlink", "path": f"{provider}:{relative}"}
+                )
+                continue
+            classification = "portable-symlink"
+        primary = _sqlite_primary(relative.lower())
+        if classification == "sqlite":
+            if relative.lower().endswith(SQLITE_SIDECARS):
+                continue
+            try:
+                logical = sqlite_catalog(path, max_rows=max_sqlite_rows)
+            except BulkloadError as error:
+                blockers.append(
+                    {
+                        "code": "sqlite-capture-failed",
+                        "path": f"{provider}:{relative}",
+                        "detail": str(error),
+                    }
+                )
+                continue
+            sidecars = []
+            for suffix in SQLITE_SIDECARS:
+                sidecar = Path(os.fspath(path) + suffix)
+                if sidecar.exists():
+                    sidecars.append(
+                        {
+                            "kind": suffix[1:],
+                            "sha256": sha256_file(sidecar),
+                            "size": sidecar.stat().st_size,
+                        }
+                    )
+            if logical["unsupported_schema"]:
+                blockers.append(
+                    {
+                        "code": "unsupported-sqlite-schema",
+                        "path": f"{provider}:{relative}",
+                    }
+                )
+            items.append(
+                {
+                    "classification": "sqlite",
+                    "destination_relative_path": relative,
+                    "identity": relative,
+                    "logical": logical,
+                    "mode": f"{stat.S_IMODE(path.stat().st_mode):04o}",
+                    "relative_path": relative,
+                    "sidecars": sidecars,
+                    "size": path.stat().st_size
+                    + sum(item["size"] for item in sidecars),
+                }
+            )
+            continue
+        if primary is not None:
+            # An orphan sidecar is unknown rather than silently omitted.
+            if primary not in sqlite_paths:
+                blockers.append(
+                    {"code": "orphan-sqlite-sidecar", "path": f"{provider}:{relative}"}
+                )
+            continue
+        if classification == "unknown":
+            blockers.append(
+                {"code": "unknown-agent-state", "path": f"{provider}:{relative}"}
+            )
+        if classification in {"portable-auth", "nonportable-auth"} and (
+            stat.S_IMODE(path.stat().st_mode) & 0o077
+        ):
+            blockers.append(
+                {"code": "insecure-auth-mode", "path": f"{provider}:{relative}"}
+            )
+        record = _file_record(path, relative, classification=classification)
+        identity = (
+            _session_identity(relative, path)
+            if classification.startswith("append-jsonl")
+            else relative
+        )
+        destination_relative = relative
+        if classification.endswith("rewrite"):
+            destination_relative = relative
+            for source, destination in replacements:
+                encoded_source = source.replace(b"/", b"-")
+                encoded_destination = destination.replace(b"/", b"-")
+                encoded_relative = os.fsencode(destination_relative)
+                encoded_relative = encoded_relative.replace(
+                    encoded_source, encoded_destination
+                ).replace(encoded_source.lstrip(b"-"), encoded_destination.lstrip(b"-"))
+                destination_relative = os.fsdecode(encoded_relative)
+        record.update(
+            {
+                "destination_relative_path": destination_relative,
+                "identity": identity,
+            }
+        )
+        if classification.startswith("append-jsonl"):
+            record.update(
+                _jsonl_records(
+                    path,
+                    replacements=replacements
+                    if classification.endswith("rewrite")
+                    else (),
+                )
+            )
+        elif classification.endswith("rewrite") and record["kind"] == "regular":
+            payload = path.read_bytes()
+            transformed = payload
+            for source, destination in replacements:
+                transformed = transformed.replace(source, destination)
+            try:
+                if path.suffix.lower() == ".json":
+                    json.loads(transformed)
+                else:
+                    transformed.decode("utf-8", errors="strict")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                blockers.append(
+                    {
+                        "code": "unportable-path-rewrite-state",
+                        "path": f"{provider}:{relative}",
+                    }
+                )
+            record["translated_sha256"] = sha256_bytes(transformed)
+            record["translated_size"] = len(transformed)
+        items.append(record)
+    return (
+        {
+            "destination_path": destination_root,
+            "exists": True,
+            "items": sorted(
+                items,
+                key=lambda item: (
+                    item["classification"],
+                    item["identity"],
+                    item["relative_path"],
+                ),
+            ),
+            "logical_path": os.fspath(logical_root),
+            "name": provider,
+            "path": os.fspath(root),
+            "root_link": root_link,
+        },
+        blockers,
+    )
+
+
+def _capture_seat(
+    name: str,
+    root: Path,
+    *,
+    root_kind: str,
+    role: str,
+    path_map: list[dict[str, str]],
+    home: Path,
+    max_files: int,
+    max_bytes: int,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+        raise BulkloadError(f"invalid mutable-seat name: {name!r}")
+    if root_kind == "file":
+        logical = Path(os.path.abspath(os.fspath(root.expanduser())))
+        destination = (
+            os.fspath(logical)
+            if role == "destination"
+            else translate_path(logical, path_map)
+        )
+        try:
+            before = _stable_stat(logical)
+        except FileNotFoundError:
+            return {
+                "destination_path": destination,
+                "exists": False,
+                "items": [],
+                "logical_path": os.fspath(logical),
+                "name": name,
+                "path": os.fspath(logical.parent),
+                "root_kind": "file",
+                "root_link": None,
+            }, []
+        if before[2] != stat.S_IFREG:
+            raise BulkloadError("file seat is not an exact regular file")
+        backing = resolve_real(logical)
+        record = _file_record(backing, backing.name, classification="mutable-seat")
+        record["destination_relative_path"] = record["relative_path"]
+        record["identity"] = record["relative_path"]
+        if _stable_stat(logical) != before:
+            raise BulkloadError("file seat changed during capture")
+        return {
+            "destination_path": destination,
+            "exists": True,
+            "items": [record],
+            "logical_path": os.fspath(logical),
+            "name": name,
+            "path": os.fspath(backing.parent),
+            "root_kind": "file",
+            "root_link": None,
+        }, []
+    if root_kind != "directory":
+        raise BulkloadError("mutable-seat kind must be directory or file")
+    logical_root, backing_root, root_link, exists = _declared_root(
+        root, allow_absent=True
+    )
+    if logical_root == home or backing_root == home:
+        raise BulkloadError("mutable-seat directory may not be the declared home root")
+    if not exists:
+        return {
+            "destination_path": os.fspath(logical_root)
+            if role == "destination"
+            else translate_path(logical_root, path_map),
+            "exists": False,
+            "items": [],
+            "logical_path": os.fspath(logical_root),
+            "name": name,
+            "path": os.fspath(backing_root),
+            "root_kind": "directory",
+            "root_link": root_link,
+        }, []
+    root = backing_root
+    destination = (
+        os.fspath(root)
+        if role == "destination"
+        else translate_path(logical_root, path_map)
+    )
+    entries, blockers = _walk_entries(
+        root,
+        classification="mutable-seat",
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    for entry in entries:
+        entry["destination_relative_path"] = entry["relative_path"]
+        entry["identity"] = entry["relative_path"]
+    return {
+        "destination_path": destination,
+        "exists": True,
+        "items": entries,
+        "logical_path": os.fspath(logical_root),
+        "name": name,
+        "path": os.fspath(root),
+        "root_kind": "directory",
+        "root_link": root_link,
+    }, blockers
+
+
+def capture_agent_state(
+    *,
+    role: str,
+    home: Path,
+    git_root: Path,
+    codex_root: Path | None,
+    claude_root: Path | None,
+    pi_root: Path | None,
+    seats: Sequence[tuple[str, Path] | tuple[str, Path, str]],
+    path_map: list[dict[str, str]],
+    writers_quiesced: bool,
+    managed_exclusions: Sequence[tuple[str, str]] = (),
+    rsync_path: Path | None = None,
+    max_files: int = DEFAULT_MAX_FILES,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
+) -> dict[str, Any]:
+    if role not in {"source", "destination"}:
+        raise BulkloadError("capture role must be source or destination")
+    if not writers_quiesced:
+        raise BulkloadError(
+            "agent-capture requires an explicit writer-quiescence acknowledgement"
+        )
+    home = resolve_real(home)
+    git_logical_root, git_root, git_root_link, _ = _declared_root(
+        git_root, allow_absent=False
+    )
+    if not path_map:
+        raise BulkloadError("AgentCaptureV4 requires an explicit path map")
+    if rsync_path is None:
+        raise BulkloadError("AgentCaptureV4 requires an explicit pinned rsync path")
+    transport = {
+        "hostname": socket.gethostname(),
+        "rsync": inspect_rsync(os.fspath(rsync_path)),
+    }
+    provider_policy = canonical_provider_policy(managed_exclusions)
+    exclusions = defaultdict(list)
+    for item in provider_policy["managed_exclusions"]:
+        exclusions[item["provider"]].append(item["relative_path"])
+    blockers: list[dict[str, str]] = []
+    discovered, discovery_blockers = _discover_git_roots(git_root)
+    blockers.extend(discovery_blockers)
+    by_common: dict[Path, Path] = {}
+    for repository in discovered:
+        try:
+            common = resolve_real(
+                Path(
+                    _git(
+                        repository,
+                        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    )
+                    .decode()
+                    .strip()
+                )
+            )
+            git_dir = resolve_real(
+                Path(
+                    _git(
+                        repository,
+                        ["rev-parse", "--path-format=absolute", "--git-dir"],
+                    )
+                    .decode()
+                    .strip()
+                )
+            )
+            if common not in by_common or git_dir == common:
+                by_common[common] = repository
+        except BulkloadError as error:
+            blockers.append(
+                {
+                    "code": "git-discovery-failed",
+                    "path": os.fspath(repository),
+                    "detail": str(error),
+                }
+            )
+    workspaces: list[dict[str, Any]] = []
+    nested_roots = set(discovered)
+    for representative in sorted(by_common.values(), key=os.fspath):
+        try:
+            workspace, workspace_blockers = _capture_workspace(
+                representative,
+                git_root=git_root,
+                path_map=path_map,
+                role=role,
+                nested_roots=nested_roots,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            )
+            workspaces.append(workspace)
+            blockers.extend(workspace_blockers)
+        except BulkloadError as error:
+            blockers.append(
+                {
+                    "code": "git-workspace-capture-failed",
+                    "path": os.fspath(representative),
+                    "detail": str(error),
+                }
+            )
+    non_git, non_git_blockers = _walk_entries(
+        git_root,
+        classification="non-git",
+        excluded_roots=discovered,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    blockers.extend(non_git_blockers)
+    for entry in non_git:
+        entry["destination_relative_path"] = entry["relative_path"]
+        entry["identity"] = entry["relative_path"]
+    provider_roots = {
+        "codex": codex_root or home / ".codex",
+        "claude": claude_root or home / ".claude",
+        "pi": pi_root or home / ".pi" / "agent",
+    }
+    providers: list[dict[str, Any]] = []
+    for provider, root in provider_roots.items():
+        try:
+            captured, provider_blockers = _capture_provider(
+                provider,
+                root,
+                role=role,
+                path_map=path_map,
+                exclusions=exclusions[provider],
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_sqlite_rows=max_sqlite_rows,
+            )
+            providers.append(captured)
+            blockers.extend(provider_blockers)
+        except BulkloadError as error:
+            blockers.append(
+                {
+                    "code": "provider-capture-failed",
+                    "path": provider,
+                    "detail": str(error),
+                }
+            )
+    seat_records: list[dict[str, Any]] = []
+    for declaration in seats:
+        name, root = declaration[:2]
+        root_kind = declaration[2] if len(declaration) == 3 else "directory"
+        captured, seat_blockers = _capture_seat(
+            name,
+            root,
+            root_kind=root_kind,
+            role=role,
+            path_map=path_map,
+            home=home,
+            max_files=max_files,
+            max_bytes=max_bytes,
+        )
+        seat_records.append(captured)
+        blockers.extend(seat_blockers)
+    try:
+        destination_git_root = (
+            os.fspath(git_root)
+            if role == "destination"
+            else translate_path(git_logical_root, path_map)
+        )
+        destination_home = (
+            os.fspath(home) if role == "destination" else translate_path(home, path_map)
+        )
+    except BulkloadError as error:
+        blockers.append(
+            {"code": "unmapped-root", "path": "root-bindings", "detail": str(error)}
+        )
+        destination_git_root = "unmapped"
+        destination_home = "unmapped"
+    catalog = {
+        "blockers": sorted(
+            blockers,
+            key=lambda item: (
+                item["code"],
+                item.get("path", ""),
+                item.get("detail", ""),
+            ),
+        ),
+        "git_workspaces": sorted(workspaces, key=lambda item: item["destination_path"]),
+        "non_git": non_git,
+        "path_map": path_map,
+        "provider_policy": provider_policy,
+        "providers": sorted(providers, key=lambda item: item["name"]),
+        "root_bindings": {
+            "destination_git_root": destination_git_root,
+            "destination_home": destination_home,
+            "git_root": os.fspath(git_root),
+            "git_logical_root": os.fspath(git_logical_root),
+            "git_root_link": git_root_link,
+            "home": os.fspath(home),
+        },
+        "runtime_source_sha256": runtime_source_digest(),
+        "seats": sorted(seat_records, key=lambda item: item["name"]),
+        "transport": transport,
+    }
+    capture = {
+        "capture_id": new_id(),
+        "catalog": catalog,
+        "catalog_sha256": sha256_bytes(canonical_bytes(catalog)),
+        "complete": not blockers,
+        "hostname": socket.gethostname(),
+        "observed_at": utc_now(),
+        "role": role,
+        "schema": AGENT_CAPTURE_SCHEMA,
+        "writers_quiesced": True,
+    }
+    return seal(capture, "capture_sha256")
+
+
+def validate_agent_capture(
+    value: dict[str, Any], *, expected_role: str | None = None
+) -> None:
+    require_exact_keys(
+        value,
+        {
+            "capture_id",
+            "capture_sha256",
+            "catalog",
+            "catalog_sha256",
+            "complete",
+            "hostname",
+            "observed_at",
+            "role",
+            "schema",
+            "writers_quiesced",
+        },
+        "AgentCaptureV4",
+    )
+    if value.get("schema") != AGENT_CAPTURE_SCHEMA:
+        raise BulkloadError("input is not AgentCaptureV4")
+    require_digest(value, "capture_sha256")
+    if value.get("role") not in {"source", "destination"}:
+        raise BulkloadError("AgentCaptureV4 role is invalid")
+    if expected_role is not None and value["role"] != expected_role:
+        raise BulkloadError(f"AgentCaptureV4 role must be {expected_role}")
+    if value.get("writers_quiesced") is not True:
+        raise BulkloadError("AgentCaptureV4 lacks writer quiescence")
+    catalog = value.get("catalog")
+    if not isinstance(catalog, dict):
+        raise BulkloadError("AgentCaptureV4 catalog is missing")
+    require_exact_keys(
+        catalog,
+        {
+            "blockers",
+            "git_workspaces",
+            "non_git",
+            "path_map",
+            "provider_policy",
+            "providers",
+            "root_bindings",
+            "runtime_source_sha256",
+            "seats",
+            "transport",
+        },
+        "AgentCaptureV4 catalog",
+    )
+    if value.get("catalog_sha256") != sha256_bytes(canonical_bytes(catalog)):
+        raise BulkloadError("AgentCaptureV4 catalog digest mismatch")
+    require_exact_keys(
+        catalog["provider_policy"],
+        {"default", "managed_exclusions", "portable_symlinks"},
+        "AgentCaptureV4 provider policy",
+    )
+    if catalog["provider_policy"] != canonical_provider_policy(
+        [
+            (item["provider"], item["relative_path"])
+            for item in catalog["provider_policy"]["managed_exclusions"]
+        ]
+    ):
+        raise BulkloadError("AgentCaptureV4 provider policy is invalid")
+    require_exact_keys(
+        catalog["transport"], {"hostname", "rsync"}, "AgentCaptureV4 transport"
+    )
+    require_exact_keys(
+        catalog["transport"]["rsync"],
+        {"features", "path", "protocol", "sha256"},
+        "AgentCaptureV4 rsync binding",
+    )
+    if catalog["transport"]["rsync"]["features"] != [
+        "checksum",
+        "delay-updates",
+        "files-from",
+        "from0",
+        "ignore-missing-args",
+    ]:
+        raise BulkloadError("AgentCaptureV4 rsync feature binding is invalid")
+    require_exact_keys(
+        catalog["root_bindings"],
+        {
+            "destination_git_root",
+            "destination_home",
+            "git_logical_root",
+            "git_root",
+            "git_root_link",
+            "home",
+        },
+        "AgentCaptureV4 root bindings",
+    )
+    for provider in catalog["providers"]:
+        require_exact_keys(
+            provider,
+            {
+                "destination_path",
+                "exists",
+                "items",
+                "logical_path",
+                "name",
+                "path",
+                "root_link",
+            },
+            "AgentCaptureV4 provider",
+        )
+    for seat in catalog["seats"]:
+        require_exact_keys(
+            seat,
+            {
+                "destination_path",
+                "exists",
+                "items",
+                "logical_path",
+                "name",
+                "path",
+                "root_kind",
+                "root_link",
+            },
+            "AgentCaptureV4 mutable seat",
+        )
+        if seat["root_kind"] not in {"directory", "file"}:
+            raise BulkloadError("AgentCaptureV4 mutable-seat kind is invalid")
+    links = [catalog["root_bindings"]["git_root_link"]]
+    links.extend(provider["root_link"] for provider in catalog["providers"])
+    links.extend(seat["root_link"] for seat in catalog["seats"])
+    for link in links:
+        if link is not None:
+            require_exact_keys(
+                link, {"kind", "mode", "sha256", "size"}, "declared-root link"
+            )
+    for workspace in catalog.get("git_workspaces", []):
+        if not isinstance(workspace, dict):
+            raise BulkloadError("AgentCaptureV4 Git workspace is not an object")
+        require_exact_keys(
+            workspace,
+            {
+                "branch",
+                "common_git_dir",
+                "destination_path",
+                "head",
+                "logical_path",
+                "object_files",
+                "object_format",
+                "path",
+                "recovery_anchors",
+                "refs",
+                "remotes",
+                "schema",
+                "worktrees",
+                "workspace_id",
+            },
+            "GitWorkspaceV2",
+        )
+        if workspace.get("schema") != GIT_WORKSPACE_SCHEMA:
+            raise BulkloadError("AgentCaptureV4 contains an invalid GitWorkspaceV2")
+        for worktree in workspace.get("worktrees", []):
+            require_exact_keys(
+                worktree,
+                {
+                    "branch",
+                    "destination_path",
+                    "detached",
+                    "dirt",
+                    "files",
+                    "git_dir",
+                    "head",
+                    "index",
+                    "locked",
+                    "operation_state",
+                    "path",
+                    "prunable",
+                },
+                "GitWorkspaceV2 worktree",
+            )
+            require_exact_keys(
+                worktree["index"],
+                {"entries", "exists", "mode", "path", "sha256", "size"},
+                "GitWorkspaceV2 index",
+            )
+    if value.get("complete") != (not catalog.get("blockers")):
+        raise BulkloadError("AgentCaptureV4 completeness disagrees with blockers")
+
+
+def stable_capture_pair(
+    first: dict[str, Any], second: dict[str, Any], *, role: str
+) -> None:
+    validate_agent_capture(first, expected_role=role)
+    validate_agent_capture(second, expected_role=role)
+    if first["capture_id"] == second["capture_id"]:
+        raise BulkloadError(f"{role} A/B captures reuse one capture ID")
+    if (
+        first["catalog_sha256"] != second["catalog_sha256"]
+        or first["catalog"] != second["catalog"]
+    ):
+        raise BulkloadError(f"{role} A/B captures are not byte-stable")
+    if not first["complete"] or not second["complete"]:
+        raise BulkloadError(f"{role} captures contain blockers")

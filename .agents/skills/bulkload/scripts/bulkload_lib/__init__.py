@@ -1,12 +1,17 @@
-"""Manifest-first repository migration primitives."""
+"""Bulkload's consolidated AgentCaptureV4 product surface."""
 
-from .model import PLAN_SCHEMA, SNAPSHOT_SCHEMA, VERIFY_SCHEMA, BulkloadError
+from .model import (
+    AGENT_CAPTURE_SCHEMA,
+    AGENT_PLAN_SCHEMA,
+    GIT_WORKSPACE_SCHEMA,
+    BulkloadError,
+)
 
 __all__ = [
+    "AGENT_CAPTURE_SCHEMA",
+    "AGENT_PLAN_SCHEMA",
+    "GIT_WORKSPACE_SCHEMA",
     "BulkloadError",
-    "PLAN_SCHEMA",
-    "SNAPSHOT_SCHEMA",
-    "VERIFY_SCHEMA",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
