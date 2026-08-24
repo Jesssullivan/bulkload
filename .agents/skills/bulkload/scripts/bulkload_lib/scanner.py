@@ -2894,7 +2894,8 @@ def _git_snapshot_authorities(git_root: Path) -> tuple[list[Path], list[Path]]:
                     )
                     .decode()
                     .strip()
-                )
+                ),
+                must_exist=False,
             )
             if not _within(git_dir, git_root) or not _within(index, git_root):
                 raise BulkloadError("Git admin authority is outside live snapshot root")
