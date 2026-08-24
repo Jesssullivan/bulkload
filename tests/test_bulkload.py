@@ -330,6 +330,31 @@ class CutoverFixture:
 
 
 class SchemaAndCaptureTests(unittest.TestCase):
+    def test_live_snapshot_git_authority_accepts_unborn_absent_index_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            git_root = Path(temporary).resolve() / "git"
+            repository = git_root / "demo"
+            repository.mkdir(parents=True)
+            git(repository, "init")
+            self.assertFalse((repository / ".git" / "index").exists())
+
+            repositories, _controls = scanner._git_snapshot_authorities(git_root)
+            self.assertIn(repository.resolve(), repositories)
+
+            real_git = scanner._git
+            external_index = Path(temporary) / "external" / "index"
+
+            def report_external_index(
+                path: Path, arguments: list[str], **kwargs: object
+            ) -> bytes:
+                if arguments[-2:] == ["--git-path", "index"]:
+                    return os.fsencode(external_index) + b"\n"
+                return real_git(path, arguments, **kwargs)
+
+            with mock.patch.object(scanner, "_git", side_effect=report_external_index):
+                with self.assertRaisesRegex(BulkloadError, "outside live snapshot"):
+                    scanner._git_snapshot_authorities(git_root)
+
     def test_live_capture_seals_immutable_snapshot_without_quiescence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
