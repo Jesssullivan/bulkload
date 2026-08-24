@@ -889,9 +889,9 @@ def compile_agent_plan(
     stable_capture_pair(source_a, source_b, role="source")
     stable_capture_pair(destination_a, destination_b, role="destination")
     return compile_agent_plan_authorities(
-        source_a,
+        source_b,
         (source_a["capture_id"], source_b["capture_id"]),
-        destination_a,
+        destination_b,
         (destination_a["capture_id"], destination_b["capture_id"]),
     )
 

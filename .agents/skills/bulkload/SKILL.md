@@ -10,17 +10,17 @@ linked worktrees, exact index/dirt state, non-Git fleet content, Codex, Claude,
 Pi, or declared mutable-seat state. The supported runtime is Python 3.11 or
 newer, Git, SQLite, and a filesystem with verified reflinks for live rollback.
 
-Read [the migration contract](references/migration-contract.md),
-[agent-state guide](references/agent-context.md), and
-[the ceremony](references/ceremony.md) before creating a plan. The ceremony is
-the agent contract for quiescence: it is read-only, fail-closed, and binding.
+Read [the migration contract](references/migration-contract.md) and
+[agent-state guide](references/agent-context.md) before creating a plan.
 
 ## Keep the boundary explicit
 
-1. The operator quiesces writers for each A/B capture pair. This skill never
-   sends a signal to a process; it verifies quiescence read-only and refuses
-   fail-closed. Writers resume during preliminary preseed; the operator
-   quiesces them again for fresh final A/B captures through verification.
+1. Keep Codex, Claude, Pi, Emacs, and terminal sessions alive. Capture A into
+   immutable custody, then capture B with A's explicit `snapshot-seal.json` as
+   its base. For final, begin a no-interaction interval before source B and keep
+   it through Sting verification and Neo's cutover-release verification;
+   Bulkload proves two matching live epochs before and after transport, then
+   two more after destination verification, and never signals a session.
 2. Declare the source and destination home/Git maps. The longest source prefix
    wins, so map `/Users/jess/git` explicitly to
    `/srv/fast-local/jess/git` in addition to any broader home map.
@@ -31,12 +31,6 @@ the agent contract for quiescence: it is read-only, fail-closed, and binding.
    unsanitized remote URLs in output or chat.
 6. Never invoke a terminal multiplexer, TCFS runtime, Home Manager, deploy,
    activation, browser migration, or credential rotation from this workflow.
-7. Never send a signal to a process this skill did not start. Terminal, daemon,
-   and launchd ownership stays with the operator. Report a live or suspended
-   writer, then stop.
-8. Exclude the migration agent's own provider state as a reviewed managed
-   exclusion on both roles. A capture pair that contains its own author can
-   never be byte-equal.
 
 `AgentCaptureV4` knows Codex, Claude, Pi, and mutable-seat state. Ordinary
 descendants of a declared provider root default to byte-exact portable-private
@@ -60,11 +54,12 @@ scripts/bulkload.py agent-capture \
   --rsync-path /absolute/pinned/gnu-rsync \
   --path-map /Users/jess=/home/jess \
   --path-map /Users/jess/git=/srv/fast-local/jess/git \
-  --acknowledge-writers-quiesced \
   --output /secure/evidence/source-a.json
 ```
 
-Repeat into `source-b.json` with no intervening writer. On the destination,
+Repeat into `source-b.json` with
+`--snapshot-base-seal /secure/evidence/.source-a.json.snapshot/snapshot-seal.json`.
+On the destination,
 use `--role destination`, the live destination `--home` and `--git-root`, and
 the same source-to-destination path maps. Repeat into two destination files.
 Use exact provider-specific maps for `.codex`, `.claude`, and `.gstack` backing
@@ -102,8 +97,9 @@ scripts/bulkload.py agent-plan \
   --output /secure/evidence/plan.json
 ```
 
-Planning requires exact A/B catalog equality for each role and four unique
-capture IDs. Review:
+Planning requires four unique capture IDs, identical static contracts, B's
+exact A-seal binding, and no A-only identity lost from B. B is plan authority.
+Review:
 
 For a four-capture set larger than 512 MiB, push both source captures from Neo
 to the private Sting evidence directory and run `agent-plan` on Sting beside
@@ -193,8 +189,9 @@ XFS authority beneath `/srv/fast-local`.
 
 ## Seal the final stage
 
-Quiesce again, take fresh source/destination A/B captures, compile and accept a
-fresh plan, then repeat all three modes with `--phase final`. Final may reuse
+Keep sessions alive, begin the attended no-interaction interval, take fresh
+source/destination A/base-B captures, compile and accept a fresh plan, then
+repeat all three modes with `--phase final`. Final may reuse
 verified preseed content objects across a different plan digest, but restages
 every final-plan operation and binds only that fresh plan. It rechecks source
 bytes and destination SQLite and writes no live path. Only the materialized
@@ -237,9 +234,25 @@ scripts/bulkload.py agent-verify \
 
 Verification freshly reads file bytes/modes, exact indexes, refs, worktrees,
 Git object integrity, SQLite logical state, removed sidecars, and holds. Require
-`verified=true` and `failures=[]`. Then perform fresh attended provider picker,
-resume/dialog, and authentication checks; these remain outside the offline
-receipt.
+`verified=true` and `failures=[]`. Neo then pulls that exact receipt over its
+existing outbound strict-SSH connection and, while the no-interaction interval
+continues, emits the cutover-release receipt:
+
+```bash
+scripts/bulkload.py agent-verify \
+  --plan /secure/evidence/final-plan.json \
+  --stage-receipt /secure/evidence/final-stage.json \
+  --apply-receipt /secure/evidence/apply-receipt.json \
+  --destination-verify-receipt /secure/evidence/verify-receipt.json \
+  --output /secure/evidence/cutover-release.json
+```
+
+Release requires the exact successful Sting verify/apply/plan identity and two
+matching current Neo generations equal to immutable source B. Only then may
+interaction resume on Sting; this is an observational cut at the release
+receipt, not a claim that future Neo writes are impossible. Then perform fresh
+attended provider picker, resume/dialog, and authentication checks; these remain
+outside the offline receipt.
 
 ## Roll back or recover
 

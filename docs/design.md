@@ -50,10 +50,21 @@ errors.
 ## Capture barrier
 
 Planning requires two distinct source captures and two distinct destination
-captures. Each pair must have identical catalog bodies and catalog digests.
-All four capture IDs must differ. Writers must be operator-quiesced throughout
-each capture; this is a procedural fence, not proof that a provider process was
-stopped.
+captures. All four IDs differ. Each immutable-live B explicitly binds A's seal,
+retains every A identity, and shares A's static contract; B is plan authority.
+Sessions remain alive. Final authority instead requires an attended
+no-interaction interval plus two matching complete live epochs before and after
+source transport. The interval remains active through Sting verification; Neo
+then binds that exact verify/apply/plan identity and runs two matching live
+epochs before emitting the sealed cutover-release receipt. That receipt is an
+observational release cut, not atomicity after interaction resumes. No process
+is signaled.
+
+Capture evaluates at most three independent common Git authorities in parallel.
+Each authority uses one persistent `git cat-file --batch` reader and one object
+digest cache shared by all of its linked worktrees; `git fsck --full` still runs
+once per common authority. Results are sorted before sealing, so scheduling does
+not affect canonical evidence bytes.
 
 Declared provider descendants default to portable-private after exact managed
 exclusions and regenerate pruning. Readable invalid Git candidates and

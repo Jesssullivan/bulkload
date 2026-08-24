@@ -41,10 +41,6 @@ class BulkloadError(RuntimeError):
     """A fail-closed protocol, custody, or safety error."""
 
 
-class QuiescenceRefusal(BulkloadError):
-    """A declared capture root is not quiet. Nothing was read beyond metadata."""
-
-
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 

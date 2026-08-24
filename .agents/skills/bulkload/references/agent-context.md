@@ -1,8 +1,11 @@
 # Agent-state guide
 
 Agent homes are provider-owned state, not generic dotfile trees. Capture them
-only through `AgentCaptureV4`, with writers quiesced and evidence outside every
-live root.
+only through `AgentCaptureV4` immutable-live A/base-B custody, with evidence
+outside every live root. Sessions remain alive; the final no-interaction
+interval is enforced by matching pre/post-transport live epochs and remains in
+force through Sting verification and Neo's matching post-verify cutover-release
+epochs.
 
 ## Codex
 
