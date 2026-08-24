@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import socket
 import sqlite3
 import stat
@@ -22,9 +23,18 @@ from .model import (
     AGENT_CAPTURE_SCHEMA,
     GIT_WORKSPACE_SCHEMA,
     BulkloadError,
+    MAX_JSON_BYTES,
+    assert_no_overlap,
+    atomic_write_json,
     canonical_bytes,
+    durable_makedirs,
+    ensure_safe_target,
+    fsync_directory,
     new_id,
     normalize_relative,
+    reflink_clone,
+    read_json,
+    require_capacity,
     require_digest,
     require_exact_keys,
     resolve_real,
@@ -42,6 +52,8 @@ DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
+LIVE_SNAPSHOT_MODE = "immutable-live"
+SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
 HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
@@ -1879,6 +1891,1523 @@ def _capture_seat(
     }, blockers
 
 
+def _snapshot_contract(catalog: dict[str, Any]) -> str:
+    """Bind the policy and live roots while excluding mutable catalog bytes."""
+    providers = [
+        {
+            key: provider[key]
+            for key in (
+                "destination_path",
+                "exists",
+                "logical_path",
+                "name",
+                "path",
+                "root_link",
+            )
+        }
+        for provider in catalog["providers"]
+    ]
+    seats = [
+        {
+            key: seat[key]
+            for key in (
+                "destination_path",
+                "exists",
+                "logical_path",
+                "name",
+                "path",
+                "root_kind",
+                "root_link",
+            )
+        }
+        for seat in catalog["seats"]
+    ]
+    return sha256_bytes(
+        canonical_bytes(
+            {
+                "path_map": catalog["path_map"],
+                "provider_policy": catalog["provider_policy"],
+                "providers": providers,
+                "root_bindings": catalog["root_bindings"],
+                "runtime_source_sha256": catalog["runtime_source_sha256"],
+                "seats": seats,
+                "transport": catalog["transport"],
+            }
+        )
+    )
+
+
+def _tree_census(
+    root: Path,
+    *,
+    provider: str | None,
+    exclusions: Sequence[str],
+    content: bool = False,
+    portable: bool = False,
+) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    charged_bytes = 0
+
+    def observe(path: Path, relative: str) -> tuple[str, int]:
+        before = _stable_stat(path)
+        live_sqlite = (
+            provider is not None
+            and relative != "."
+            and _provider_classification(provider, relative) == "sqlite"
+            and not relative.lower().endswith(SQLITE_SIDECARS)
+        )
+        if before[2] == stat.S_IFREG:
+            kind = "regular"
+            content_digest = sha256_file(path) if content and not live_sqlite else None
+            size = before[5]
+        elif before[2] == stat.S_IFLNK:
+            kind = "symlink"
+            content_digest = sha256_symlink(path)
+            size = 0
+        elif before[2] == stat.S_IFDIR:
+            kind = "directory"
+            content_digest = None
+            size = 0
+        elif before[2] == stat.S_IFSOCK:
+            kind = "socket"
+            content_digest = None
+            size = 0
+        else:
+            kind = "special"
+            content_digest = None
+            size = 0
+        after = _stable_stat(path)
+        stable_identity = (
+            before[:5] == after[:5] if live_sqlite or not content else before == after
+        )
+        if not stable_identity:
+            raise BulkloadError(f"live snapshot census entry changed: {path}")
+        if portable:
+            authority = [before[2], before[3]]
+            if not live_sqlite:
+                authority.append(before[5])
+        else:
+            authority = (
+                list(before) if content and not live_sqlite else list(before[:5])
+            )
+        digest.update(
+            canonical_bytes([relative, kind, authority, content_digest]) + b"\0"
+        )
+        return kind, size
+
+    root_info = root.stat(follow_symlinks=False)
+    if stat.S_ISREG(root_info.st_mode):
+        _, charged_bytes = observe(root, ".")
+        return digest.hexdigest(), charged_bytes
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise BulkloadError(f"snapshot root is not a regular file or directory: {root}")
+    observe(root, ".")
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        retained = []
+        for name in sorted(directories):
+            child = current_path / name
+            relative = child.relative_to(root).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            kind, _ = observe(child, relative)
+            if kind == "directory":
+                retained.append(name)
+        directories[:] = retained
+        sqlite_primaries = {
+            name.lower()
+            for name in files
+            if provider is not None and name.lower().endswith(SQLITE_SUFFIXES)
+        }
+        for name in sorted(files):
+            child = current_path / name
+            relative = child.relative_to(root).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            if (
+                provider is not None
+                and name.lower().endswith(SQLITE_SIDECARS)
+                and _sqlite_primary(name.lower()) in sqlite_primaries
+            ):
+                continue
+            _, size = observe(child, relative)
+            charged_bytes += size
+    return digest.hexdigest(), charged_bytes
+
+
+def _tree_generation(
+    root: Path, *, provider: str | None, exclusions: Sequence[str]
+) -> str:
+    return _tree_census(
+        root,
+        provider=provider,
+        exclusions=exclusions,
+        content=True,
+        portable=True,
+    )[0]
+
+
+def _base_regular_reusable(
+    source: Path,
+    base: Path | None,
+    mode: int,
+    base_record: dict[str, Any] | None = None,
+) -> bool:
+    if base is None:
+        return False
+    if base_record is None:
+        try:
+            base_info = base.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(base_info.st_mode):
+            return False
+        expected_mode = f"{stat.S_IMODE(base_info.st_mode):04o}"
+        expected_size = base_info.st_size
+        expected_digest = sha256_file(base)
+    else:
+        if base_record["kind"] != "regular":
+            return False
+        expected_mode = base_record["mode"]
+        expected_size = base_record["size"]
+        expected_digest = base_record["sha256"]
+    if (
+        expected_mode != f"{mode:04o}"
+        or expected_size != source.stat(follow_symlinks=False).st_size
+    ):
+        return False
+    before = _stable_stat(source)
+    reusable = sha256_file(source) == expected_digest
+    if _stable_stat(source) != before:
+        raise BulkloadError(f"live file changed during base comparison: {source}")
+    return reusable
+
+
+def _copy_live_regular(
+    source: Path,
+    destination: Path,
+    mode: int,
+    *,
+    base: Path | None = None,
+    base_record: dict[str, Any] | None = None,
+) -> str:
+    durable_makedirs(destination.parent)
+    if _base_regular_reusable(source, base, mode, base_record):
+        before = _stable_stat(source)
+        expected = (
+            base_record["sha256"] if base_record is not None else sha256_file(base)
+        )
+        result = reflink_clone(base, destination, expected_sha256=expected, mode=mode)
+        if _stable_stat(source) != before:
+            destination.unlink(missing_ok=True)
+            raise BulkloadError(f"live file changed during base clone: {source}")
+        return f"base-{result['method']}"
+    source_info = source.stat(follow_symlinks=False)
+    if source_info.st_dev == destination.parent.stat().st_dev:
+        for _ in range(3):
+            before = _stable_stat(source)
+            try:
+                result = reflink_clone(source, destination, mode=mode)
+            except BulkloadError:
+                if destination.exists() or destination.is_symlink():
+                    raise
+                break
+            if _stable_stat(source) == before:
+                return result["method"]
+            destination.unlink(missing_ok=True)
+        else:
+            raise BulkloadError(f"live file did not converge for snapshot: {source}")
+    for _ in range(3):
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.snapshot-", dir=destination.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            source_fd = os.open(
+                source,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            before = os.fstat(source_fd)
+            with (
+                os.fdopen(source_fd, "rb", buffering=0, closefd=True) as input_stream,
+                os.fdopen(descriptor, "wb", buffering=0, closefd=True) as output,
+            ):
+                shutil.copyfileobj(input_stream, output, 1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+                after = os.fstat(input_stream.fileno())
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                temporary.unlink(missing_ok=True)
+                continue
+            os.chmod(temporary, mode)
+            os.replace(temporary, destination)
+            fsync_directory(destination.parent)
+            return "capacity-accounted-copy"
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+    raise BulkloadError(f"live file did not converge for snapshot: {source}")
+
+
+def _copy_live_tree(
+    source: Path,
+    destination: Path,
+    *,
+    provider: str | None,
+    exclusions: Sequence[str],
+    max_sqlite_rows: int,
+    base: Path | None = None,
+    base_records: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, int], dict[str, dict[str, int | str]]]:
+    methods: dict[str, int] = defaultdict(int)
+    ledger: dict[str, dict[str, int | str]] = {}
+
+    def record(relative: str, method: str, live: Path, target: Path) -> None:
+        source_info = live.stat(follow_symlinks=False)
+        destination_info = target.stat(follow_symlinks=False)
+        ledger[relative] = {
+            "destination_device": destination_info.st_dev,
+            "method": method,
+            "source_device": source_info.st_dev,
+        }
+
+    source_info = source.stat(follow_symlinks=False)
+    if stat.S_ISREG(source_info.st_mode):
+        method = _copy_live_regular(
+            source,
+            destination,
+            stat.S_IMODE(source_info.st_mode),
+            base=base,
+            base_record=(base_records or {}).get("."),
+        )
+        methods[method] += 1
+        record(
+            ".",
+            method,
+            base if method.startswith("base-") and base is not None else source,
+            destination,
+        )
+        return dict(methods), ledger
+    if not stat.S_ISDIR(source_info.st_mode):
+        raise BulkloadError(
+            f"snapshot root is not a regular file or directory: {source}"
+        )
+    durable_makedirs(destination, mode=stat.S_IMODE(source.stat().st_mode))
+    record(".", "directory", source, destination)
+    for current, directories, files in os.walk(source, topdown=True, followlinks=False):
+        current_path = Path(current)
+        relative_parent = current_path.relative_to(source)
+        target_parent = destination / relative_parent
+        retained = []
+        for name in sorted(directories):
+            child = current_path / name
+            relative = child.relative_to(source).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            info = child.stat(follow_symlinks=False)
+            target = target_parent / name
+            base_target = base / relative if base is not None else None
+            if stat.S_ISLNK(info.st_mode):
+                before = _stable_stat(child)
+                link_target = os.readlink(child)
+                if _stable_stat(child) != before:
+                    raise BulkloadError(
+                        f"live symlink changed during snapshot: {child}"
+                    )
+                os.symlink(link_target, target)
+                methods["symlink"] += 1
+                record(relative, "symlink", child, target)
+            elif stat.S_ISDIR(info.st_mode):
+                durable_makedirs(target, mode=stat.S_IMODE(info.st_mode))
+                retained.append(name)
+                methods["directory"] += 1
+                record(relative, "directory", child, target)
+            else:
+                raise BulkloadError(f"snapshot tree contains special entry: {child}")
+        directories[:] = retained
+        sqlite_primaries = {
+            name.lower()
+            for name in files
+            if provider is not None and name.lower().endswith(SQLITE_SUFFIXES)
+        }
+        for name in sorted(files):
+            child = current_path / name
+            relative = child.relative_to(source).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            if any(name.lower().endswith(suffix) for suffix in SQLITE_SIDECARS):
+                primary_name = _sqlite_primary(name.lower())
+                if provider is not None and primary_name in sqlite_primaries:
+                    continue
+                raise BulkloadError(f"orphan SQLite sidecar in live snapshot: {child}")
+            info = child.stat(follow_symlinks=False)
+            target = target_parent / name
+            base_target = base / relative if base is not None else None
+            if stat.S_ISLNK(info.st_mode):
+                before = _stable_stat(child)
+                link_target = os.readlink(child)
+                if _stable_stat(child) != before:
+                    raise BulkloadError(
+                        f"live symlink changed during snapshot: {child}"
+                    )
+                os.symlink(link_target, target)
+                methods["symlink"] += 1
+                record(relative, "symlink", child, target)
+            elif not stat.S_ISREG(info.st_mode):
+                raise BulkloadError(f"snapshot tree contains special entry: {child}")
+            elif (
+                provider is not None
+                and _provider_classification(provider, relative) == "sqlite"
+            ):
+                snapshot_sqlite(child, target, max_rows=max_sqlite_rows)
+                os.chmod(target, stat.S_IMODE(info.st_mode))
+                methods["sqlite-online-backup"] += 1
+                record(relative, "sqlite-online-backup", child, target)
+            else:
+                method = _copy_live_regular(
+                    child,
+                    target,
+                    stat.S_IMODE(info.st_mode),
+                    base=base_target,
+                    base_record=(base_records or {}).get(relative),
+                )
+                methods[method] += 1
+                record(
+                    relative,
+                    method,
+                    base_target
+                    if method.startswith("base-") and base_target is not None
+                    else child,
+                    target,
+                )
+    return dict(methods), ledger
+
+
+def _snapshot_index_record(
+    path: Path,
+    *,
+    root_index: int,
+    relative: str,
+    transfer: dict[str, int | str],
+) -> dict[str, Any]:
+    info = path.stat(follow_symlinks=False)
+    mode = f"{stat.S_IMODE(info.st_mode):04o}"
+    if stat.S_ISREG(info.st_mode):
+        kind = "regular"
+        size = info.st_size
+        digest = sha256_file(path)
+    elif stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+        size = len(os.fsencode(os.readlink(path)))
+        digest = sha256_symlink(path)
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+        size = 0
+        digest = None
+    else:
+        raise BulkloadError(f"snapshot payload contains special entry: {path}")
+    return {
+        "destination_device": transfer["destination_device"],
+        "kind": kind,
+        "method": transfer["method"],
+        "mode": mode,
+        "relative_path": relative,
+        "root_index": root_index,
+        "sha256": digest,
+        "size": size,
+        "source_device": transfer["source_device"],
+    }
+
+
+def _snapshot_delta_charge(
+    source: Path,
+    base: Path | None,
+    *,
+    provider: str | None,
+    exclusions: Sequence[str],
+    base_records: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    info = source.stat(follow_symlinks=False)
+    if stat.S_ISREG(info.st_mode):
+        return (
+            0
+            if _base_regular_reusable(
+                source,
+                base,
+                stat.S_IMODE(info.st_mode),
+                (base_records or {}).get("."),
+            )
+            else info.st_size
+        )
+    charged = 0
+    for current, directories, files in os.walk(source, topdown=True, followlinks=False):
+        current_path = Path(current)
+        retained = []
+        for name in sorted(directories):
+            child = current_path / name
+            relative = child.relative_to(source).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            if stat.S_ISDIR(child.stat(follow_symlinks=False).st_mode):
+                retained.append(name)
+        directories[:] = retained
+        sqlite_primaries = {
+            name.lower()
+            for name in files
+            if provider is not None and name.lower().endswith(SQLITE_SUFFIXES)
+        }
+        for name in sorted(files):
+            child = current_path / name
+            relative = child.relative_to(source).as_posix()
+            if provider is not None and (
+                _is_excluded(relative, exclusions)
+                or _is_regenerate_namespace(provider, relative)
+            ):
+                continue
+            if (
+                provider is not None
+                and name.lower().endswith(SQLITE_SIDECARS)
+                and _sqlite_primary(name.lower()) in sqlite_primaries
+            ):
+                continue
+            child_info = child.stat(follow_symlinks=False)
+            if not stat.S_ISREG(child_info.st_mode):
+                continue
+            base_path = base / relative if base is not None else None
+            if (
+                provider is not None
+                and _provider_classification(provider, relative) == "sqlite"
+            ):
+                charged += child_info.st_size
+            elif not _base_regular_reusable(
+                child,
+                base_path,
+                stat.S_IMODE(child_info.st_mode),
+                (base_records or {}).get(relative),
+            ):
+                charged += child_info.st_size
+    return charged
+
+
+def _snapshot_namespace(root: Path) -> list[tuple[str, Path]]:
+    observed: list[tuple[str, Path]] = [(".", root)]
+    if root.is_dir():
+        for current, directories, files in os.walk(
+            root, topdown=True, followlinks=False
+        ):
+            directories[:] = sorted(directories)
+            current_path = Path(current)
+            observed.extend(
+                (
+                    (current_path / name).relative_to(root).as_posix(),
+                    current_path / name,
+                )
+                for name in directories
+            )
+            observed.extend(
+                (
+                    (current_path / name).relative_to(root).as_posix(),
+                    current_path / name,
+                )
+                for name in sorted(files)
+            )
+    return sorted(observed)
+
+
+def _write_snapshot_index(
+    path: Path,
+    roots: Sequence[dict[str, str]],
+    ledgers: Sequence[dict[str, dict[str, int | str]]],
+) -> tuple[str, int]:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        with os.fdopen(descriptor, "wb", buffering=0, closefd=True) as stream:
+            for root_index, (binding, ledger) in enumerate(zip(roots, ledgers)):
+                root = Path(binding["snapshot"])
+                for relative, payload_path in _snapshot_namespace(root):
+                    try:
+                        transfer = ledger[relative]
+                    except KeyError as error:
+                        raise BulkloadError(
+                            "snapshot payload lacks per-entry transfer custody"
+                        ) from error
+                    record = _snapshot_index_record(
+                        payload_path,
+                        root_index=root_index,
+                        relative=relative,
+                        transfer=transfer,
+                    )
+                    payload = canonical_bytes(record) + b"\n"
+                    stream.write(payload)
+                    digest.update(payload)
+                    count += 1
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        path.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+    return digest.hexdigest(), count
+
+
+def validate_snapshot_custody(
+    snapshot: dict[str, Any],
+    *,
+    mirror: Path | None = None,
+    required_paths: set[Path] | None = None,
+    collect_records: bool = False,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Reopen a seal/index and either all payloads or an explicit stage subset."""
+
+    def actual(raw: str) -> Path:
+        path = Path(raw)
+        if not path.is_absolute():
+            raise BulkloadError("snapshot custody path is not absolute")
+        return path if mirror is None else mirror.joinpath(*path.parts[1:])
+
+    require_digest(snapshot, "seal_sha256")
+    seal_path = actual(snapshot["seal_path"])
+    index_path = actual(snapshot["index_path"])
+    try:
+        seal_info = seal_path.stat(follow_symlinks=False)
+        seal_bytes = seal_path.read_bytes()
+        snapshot_root_info = seal_path.parent.stat(follow_symlinks=False)
+        index_info = index_path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise BulkloadError("live snapshot custody is unavailable") from error
+    if (
+        not stat.S_ISREG(seal_info.st_mode)
+        or seal_bytes != canonical_bytes(snapshot) + b"\n"
+        or not stat.S_ISDIR(snapshot_root_info.st_mode)
+        or required_paths is None
+        and stat.S_IMODE(snapshot_root_info.st_mode) != 0o700
+        or not stat.S_ISREG(index_info.st_mode)
+        or index_info.st_size > MAX_JSON_BYTES
+        or sha256_file(index_path) != snapshot["index_sha256"]
+    ):
+        raise BulkloadError("live snapshot custody seal or index differs")
+    actual_roots = [actual(item["snapshot"]) for item in snapshot["roots"]]
+    original_roots = [Path(item["snapshot"]) for item in snapshot["roots"]]
+    if len({os.fspath(path) for path in actual_roots}) != len(actual_roots):
+        raise BulkloadError("live snapshot custody roots are not unique")
+    for root in actual_roots:
+        if not _within(root, seal_path.parent):
+            raise BulkloadError("live snapshot payload escapes custody root")
+    required = (
+        None
+        if required_paths is None
+        else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
+    )
+    seen: set[Path] = set()
+    collected: dict[tuple[str, str], dict[str, Any]] = {}
+    digest = hashlib.sha256()
+    namespace_digest = hashlib.sha256()
+    count = 0
+    previous: tuple[int, str] | None = None
+    try:
+        with index_path.open("rb", buffering=0) as stream:
+            for line in stream:
+                if not line.endswith(b"\n") or len(line) > 64 * 1024:
+                    raise BulkloadError("snapshot payload index line is malformed")
+                digest.update(line)
+                try:
+                    record = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise BulkloadError(
+                        "snapshot payload index is malformed"
+                    ) from error
+                require_exact_keys(
+                    record,
+                    {
+                        "destination_device",
+                        "kind",
+                        "method",
+                        "mode",
+                        "relative_path",
+                        "root_index",
+                        "sha256",
+                        "size",
+                        "source_device",
+                    },
+                    "snapshot payload index entry",
+                )
+                if canonical_bytes(record) + b"\n" != line:
+                    raise BulkloadError("snapshot payload index is not canonical")
+                root_index = record["root_index"]
+                relative = record["relative_path"]
+                if (
+                    not isinstance(root_index, int)
+                    or isinstance(root_index, bool)
+                    or not 0 <= root_index < len(actual_roots)
+                    or not isinstance(relative, str)
+                ):
+                    raise BulkloadError("snapshot payload index identity is invalid")
+                if relative == ".":
+                    path = actual_roots[root_index]
+                    original_path = original_roots[root_index]
+                else:
+                    normalize_relative(relative)
+                    path = ensure_safe_target(actual_roots[root_index], relative)
+                    original_path = ensure_safe_target(
+                        original_roots[root_index], relative
+                    )
+                key = (root_index, relative)
+                if previous is not None and key <= previous:
+                    raise BulkloadError("snapshot payload index order is invalid")
+                previous = key
+                namespace_digest.update(canonical_bytes(list(key)) + b"\0")
+                if collect_records:
+                    collected[(snapshot["roots"][root_index]["label"], relative)] = (
+                        record
+                    )
+                if required is None or original_path in required:
+                    observed = _snapshot_index_record(
+                        path,
+                        root_index=root_index,
+                        relative=relative,
+                        transfer={
+                            "destination_device": record["destination_device"],
+                            "method": record["method"],
+                            "source_device": record["source_device"],
+                        },
+                    )
+                    if observed != record:
+                        raise BulkloadError(
+                            "snapshot payload differs from sealed index"
+                        )
+                    seen.add(original_path)
+                count += 1
+    except OSError as error:
+        raise BulkloadError("snapshot payload index cannot be read") from error
+    observed_namespace = hashlib.sha256()
+    observed_count = 0
+    if required is None:
+        top_level = {item.name for item in seal_path.parent.iterdir()}
+        if top_level != {"roots", "snapshot-index.jsonl", "snapshot-seal.json"}:
+            raise BulkloadError("live snapshot top-level namespace differs")
+        roots_parent = seal_path.parent / "roots"
+        roots_info = roots_parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(roots_info.st_mode) or {
+            item.name for item in roots_parent.iterdir()
+        } != {root["label"] for root in snapshot["roots"]}:
+            raise BulkloadError("live snapshot declared roots differ")
+        for root_index, root in enumerate(actual_roots):
+            for relative, _ in _snapshot_namespace(root):
+                observed_namespace.update(
+                    canonical_bytes([root_index, relative]) + b"\0"
+                )
+                observed_count += 1
+    if (
+        count != snapshot["index_entries"]
+        or digest.hexdigest() != snapshot["index_sha256"]
+        or required is not None
+        and seen != required
+        or required is None
+        and (
+            observed_count != count
+            or observed_namespace.hexdigest() != namespace_digest.hexdigest()
+        )
+    ):
+        raise BulkloadError("snapshot payload index count or digest differs")
+    return collected
+
+
+def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
+    """Fence final transport against any source mutation after snapshot B."""
+    expected_rows = []
+    for root in snapshot["roots"]:
+        expected_rows.append(
+            {
+                "generation_sha256": root["generation_sha256"],
+                "label": root["label"],
+                "sqlite": root["sqlite"],
+            }
+        )
+    expected = sha256_bytes(
+        canonical_bytes(
+            {
+                "declarations": snapshot["declarations"],
+                "git_generation_sha256": snapshot["git_generation_sha256"],
+                "roots": expected_rows,
+            }
+        )
+    )
+
+    def epoch() -> str:
+        declarations = []
+        for declaration in snapshot["declarations"]:
+            logical = Path(declaration["logical"])
+            if declaration["kind"] == "seat-file":
+                try:
+                    info = logical.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    observed = (logical, logical, None, False)
+                else:
+                    if not stat.S_ISREG(info.st_mode):
+                        raise BulkloadError("declared file seat changed type after B")
+                    observed = (logical, resolve_real(logical), None, True)
+            else:
+                observed = _declared_root(logical, allow_absent=True)
+            declarations.append(
+                {
+                    "backing": os.fspath(observed[1]),
+                    "exists": observed[3],
+                    "kind": declaration["kind"],
+                    "link": observed[2],
+                    "logical": os.fspath(observed[0]),
+                    "name": declaration["name"],
+                }
+            )
+        rows = []
+        git_generation = None
+        for root in snapshot["roots"]:
+            live = Path(root["live"])
+            sqlite_rows = []
+            for sqlite in root["sqlite"]:
+                logical = sqlite_catalog(
+                    live / sqlite["relative_path"],
+                    max_rows=snapshot["max_sqlite_rows"],
+                )
+                sqlite_rows.append(
+                    {
+                        "logical_sha256": logical["logical_sha256"],
+                        "relative_path": sqlite["relative_path"],
+                    }
+                )
+            rows.append(
+                {
+                    "generation_sha256": _tree_generation(
+                        live,
+                        provider=root["provider"],
+                        exclusions=root["exclusions"],
+                    ),
+                    "label": root["label"],
+                    "sqlite": sqlite_rows,
+                }
+            )
+            if root["label"] == "git":
+                git_generation = _git_live_generation(live)
+        return sha256_bytes(
+            canonical_bytes(
+                {
+                    "declarations": declarations,
+                    "git_generation_sha256": git_generation,
+                    "roots": rows,
+                }
+            )
+        )
+
+    first = epoch()
+    second = epoch()
+    if first != expected or second != expected or first != second:
+        raise BulkloadError("live source changed after immutable snapshot B")
+
+
+def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:
+    candidate = Path(path)
+    for binding in sorted(
+        roots, key=lambda item: len(Path(item["snapshot"]).parts), reverse=True
+    ):
+        try:
+            relative = candidate.relative_to(binding["snapshot"])
+        except ValueError:
+            continue
+        return os.fspath(Path(binding["live"]) / relative)
+    raise BulkloadError(f"snapshot path has no live root binding: {candidate}")
+
+
+def _remove_snapshot_partial(path: Path) -> None:
+    """Remove only an exact capture-owned partial path."""
+    if ".partial-" not in path.name or path.is_symlink():
+        raise BulkloadError("refusing non-partial snapshot cleanup")
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _remove_snapshot_published(path: Path, snapshot_id: str) -> None:
+    """Remove only a final tree whose seal proves this failed capture owns it."""
+    if path.is_symlink() or not path.is_dir():
+        raise BulkloadError("refusing unsafe published snapshot cleanup")
+    seal_path = path / "snapshot-seal.json"
+    try:
+        seal_value = json.loads(seal_path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise BulkloadError("published snapshot ownership cannot be proved") from error
+    if seal_value.get("snapshot_id") != snapshot_id:
+        raise BulkloadError("published snapshot belongs to a different capture")
+    shutil.rmtree(path)
+    fsync_directory(path.parent)
+
+
+def _git_live_generation(git_root: Path) -> str:
+    repositories, blockers = _discover_git_roots(git_root)
+    if blockers:
+        raise BulkloadError("Git namespace is not convergent for live snapshot")
+    authorities: dict[str, Path] = {}
+    for repository in repositories:
+        common = resolve_real(
+            Path(
+                _git(
+                    repository,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .decode()
+                .strip()
+            )
+        )
+        authorities.setdefault(os.fspath(common), repository)
+    rows = []
+    for common, repository in sorted(authorities.items()):
+        worktrees = _parse_worktree_list(repository)
+        observed_worktrees = []
+        for worktree in worktrees:
+            if worktree.get("bare"):
+                continue
+            path = Path(worktree["path"])
+            index_text = (
+                _git(
+                    path, ["rev-parse", "--path-format=absolute", "--git-path", "index"]
+                )
+                .decode()
+                .strip()
+            )
+            index = Path(index_text)
+            observed_worktrees.append(
+                {
+                    "branch": worktree.get("branch"),
+                    "detached": bool(worktree.get("detached")),
+                    "head": worktree.get("head"),
+                    "index_sha256": sha256_file(index) if index.exists() else None,
+                    "locked": bool(worktree.get("locked")),
+                    "path": os.fspath(path),
+                    "prunable": bool(worktree.get("prunable")),
+                }
+            )
+        rows.append(
+            {
+                "common": common,
+                "refs": _parse_refs(repository),
+                "worktrees": observed_worktrees,
+            }
+        )
+    return sha256_bytes(canonical_bytes(rows))
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _git_snapshot_authorities(git_root: Path) -> tuple[list[Path], list[Path]]:
+    """Bind every Git admin/worktree authority and the exact link files to rewrite."""
+    repositories, blockers = _discover_git_roots(git_root)
+    if blockers:
+        raise BulkloadError("Git namespace is not convergent for live snapshot")
+    controls: set[Path] = set()
+    for repository in repositories:
+        if not _within(repository, git_root):
+            raise BulkloadError("Git worktree authority is outside live snapshot root")
+        common = resolve_real(
+            Path(
+                _git(
+                    repository,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .decode()
+                .strip()
+            )
+        )
+        if not _within(common, git_root):
+            raise BulkloadError("Git common authority is outside live snapshot root")
+        git_entry = repository / ".git"
+        if git_entry.is_file() and _gitfile_declares_authority(repository):
+            controls.add(git_entry)
+        for worktree in _parse_worktree_list(repository):
+            if worktree.get("bare"):
+                continue
+            worktree_path = resolve_real(Path(worktree["path"]))
+            if not _within(worktree_path, git_root):
+                raise BulkloadError("Git linked worktree is outside live snapshot root")
+            git_dir = resolve_real(
+                Path(
+                    _git(
+                        worktree_path,
+                        ["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+                    )
+                    .decode()
+                    .strip()
+                )
+            )
+            index = resolve_real(
+                Path(
+                    _git(
+                        worktree_path,
+                        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                    )
+                    .decode()
+                    .strip()
+                )
+            )
+            if not _within(git_dir, git_root) or not _within(index, git_root):
+                raise BulkloadError("Git admin authority is outside live snapshot root")
+            gitdir_control = git_dir / "gitdir"
+            if gitdir_control.is_file():
+                controls.add(gitdir_control)
+    return repositories, sorted(controls, key=os.fspath)
+
+
+def _rewrite_git_snapshot_links(
+    controls: Sequence[Path], roots: Sequence[dict[str, str]]
+) -> None:
+    """Rewrite only parsed Git control files, never same-named user files."""
+    for live_path in controls:
+        path = _snapshot_path(live_path, roots, label="snapshot")
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise BulkloadError("cannot inspect snapshotted Git link") from error
+        if not payload or len(payload) > 64 * 1024 or b"\0" in payload:
+            raise BulkloadError("snapshotted Git link is malformed")
+        newline = b"\n" if payload.endswith(b"\n") else b""
+        raw_target = payload[:-1] if newline else payload
+        prefix = b"gitdir: " if live_path.name == ".git" else b""
+        if prefix and not raw_target.startswith(prefix):
+            raise BulkloadError("snapshotted Git file authority is malformed")
+        raw_value = raw_target[len(prefix) :]
+        try:
+            value = os.fsdecode(raw_value)
+        except UnicodeDecodeError as error:
+            raise BulkloadError("snapshotted Git link is not portable") from error
+        declared = Path(value)
+        live_target = resolve_real(
+            declared if declared.is_absolute() else live_path.parent / declared
+        )
+        snapshot_target = _snapshot_path(live_target, roots, label="snapshot")
+        rewritten = prefix + os.fsencode(snapshot_target) + newline
+        if rewritten == payload:
+            continue
+        with path.open("wb", buffering=0) as stream:
+            stream.write(rewritten)
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o600)
+        fsync_directory(path.parent)
+
+
+def _rewrite_catalog_to_live(
+    catalog: dict[str, Any],
+    *,
+    roots: Sequence[dict[str, str]],
+    original_path_map: list[dict[str, str]],
+    home: Path,
+    git_logical: Path,
+    git_backing: Path,
+    git_root_link: dict[str, Any] | None,
+    provider_bindings: dict[str, tuple[Path, Path, dict[str, Any] | None, bool]],
+    seat_bindings: dict[str, tuple[Path, Path, dict[str, Any] | None, bool]],
+    role: str,
+) -> None:
+    catalog["path_map"] = original_path_map
+    catalog["root_bindings"] = {
+        "destination_git_root": os.fspath(git_backing)
+        if role == "destination"
+        else translate_path(git_logical, original_path_map),
+        "destination_home": os.fspath(home)
+        if role == "destination"
+        else translate_path(home, original_path_map),
+        "git_logical_root": os.fspath(git_logical),
+        "git_root": os.fspath(git_backing),
+        "git_root_link": git_root_link,
+        "home": os.fspath(home),
+    }
+    for provider in catalog["providers"]:
+        logical, backing, link, exists = provider_bindings[provider["name"]]
+        provider.update(
+            {
+                "destination_path": os.fspath(backing)
+                if role == "destination"
+                else translate_path(logical, original_path_map),
+                "exists": exists,
+                "logical_path": os.fspath(logical),
+                "path": os.fspath(backing),
+                "root_link": link,
+            }
+        )
+    for seat in catalog["seats"]:
+        logical, backing, link, exists = seat_bindings[seat["name"]]
+        seat.update(
+            {
+                "destination_path": os.fspath(logical)
+                if role == "destination"
+                else translate_path(logical, original_path_map),
+                "exists": exists,
+                "logical_path": os.fspath(logical),
+                "path": os.fspath(
+                    backing.parent if seat["root_kind"] == "file" else backing
+                ),
+                "root_link": link,
+            }
+        )
+    for workspace in catalog["git_workspaces"]:
+        live_workspace_path = _reverse_snapshot_path(workspace["path"], roots)
+        workspace["common_git_dir"] = _reverse_snapshot_path(
+            workspace["common_git_dir"], roots
+        )
+        workspace["path"] = live_workspace_path
+        workspace["destination_path"] = (
+            live_workspace_path
+            if role == "destination"
+            else translate_path(live_workspace_path, original_path_map)
+        )
+        for worktree in workspace["worktrees"]:
+            worktree["git_dir"] = _reverse_snapshot_path(worktree["git_dir"], roots)
+            live_worktree_path = _reverse_snapshot_path(worktree["path"], roots)
+            worktree["path"] = live_worktree_path
+            worktree["destination_path"] = (
+                live_worktree_path
+                if role == "destination"
+                else translate_path(live_worktree_path, original_path_map)
+            )
+            worktree["index"]["path"] = _reverse_snapshot_path(
+                worktree["index"]["path"], roots
+            )
+        workspace["workspace_id"] = sha256_bytes(
+            canonical_bytes(
+                {
+                    "destination_path": workspace["destination_path"],
+                    "object_format": workspace["object_format"],
+                    "remote_names": [remote["name"] for remote in workspace["remotes"]],
+                }
+            )
+        )
+
+
+def _capture_live_snapshot(
+    *,
+    role: str,
+    home: Path,
+    git_root: Path,
+    codex_root: Path | None,
+    claude_root: Path | None,
+    pi_root: Path | None,
+    seats: Sequence[tuple[str, Path] | tuple[str, Path, str]],
+    path_map: list[dict[str, str]],
+    managed_exclusions: Sequence[tuple[str, str]],
+    rsync_path: Path | None,
+    max_files: int,
+    max_bytes: int,
+    max_sqlite_rows: int,
+    snapshot_root: Path,
+    snapshot_reserve_bytes: int,
+    snapshot_base_seal: Path | None,
+) -> dict[str, Any]:
+    snapshot_id = new_id()
+    snapshot_root = Path(os.path.abspath(os.fspath(snapshot_root)))
+    partial = snapshot_root.parent / f".{snapshot_root.name}.partial-{snapshot_id}"
+    if snapshot_root.exists() or snapshot_root.is_symlink() or partial.exists():
+        raise BulkloadError("live snapshot custody path already exists")
+    git_logical, git_backing, git_link, _ = _declared_root(git_root, allow_absent=False)
+    provider_arguments = {
+        "codex": codex_root or home / ".codex",
+        "claude": claude_root or home / ".claude",
+        "pi": pi_root or home / ".pi" / "agent",
+    }
+    provider_bindings = {
+        name: _declared_root(path, allow_absent=True)
+        for name, path in provider_arguments.items()
+    }
+    seat_bindings: dict[str, tuple[Path, Path, dict[str, Any] | None, bool]] = {}
+    seat_kinds: dict[str, str] = {}
+    for declaration in seats:
+        name, path = declaration[:2]
+        kind = declaration[2] if len(declaration) == 3 else "directory"
+        if (
+            not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name)
+            or name in seat_bindings
+            or kind not in {"directory", "file"}
+        ):
+            raise BulkloadError("live snapshot mutable-seat declaration is invalid")
+        seat_kinds[name] = kind
+        if kind == "file":
+            logical = Path(os.path.abspath(os.fspath(path.expanduser())))
+            try:
+                info = logical.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                seat_bindings[name] = (logical, logical, None, False)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise BulkloadError("file seat is not an exact regular file")
+            seat_bindings[name] = (logical, resolve_real(logical), None, True)
+        else:
+            seat_bindings[name] = _declared_root(path, allow_absent=True)
+    provider_policy = canonical_provider_policy(managed_exclusions)
+    exclusions = defaultdict(list)
+    for item in provider_policy["managed_exclusions"]:
+        exclusions[item["provider"]].append(item["relative_path"])
+    declarations = [
+        {
+            "backing": os.fspath(git_backing),
+            "exists": True,
+            "kind": "git",
+            "link": git_link,
+            "logical": os.fspath(git_logical),
+            "name": "git",
+        }
+    ]
+    declarations.extend(
+        {
+            "backing": os.fspath(binding[1]),
+            "exists": binding[3],
+            "kind": "provider",
+            "link": binding[2],
+            "logical": os.fspath(binding[0]),
+            "name": name,
+        }
+        for name, binding in provider_bindings.items()
+    )
+    declarations.extend(
+        {
+            "backing": os.fspath(binding[1]),
+            "exists": binding[3],
+            "kind": f"seat-{seat_kinds[name]}",
+            "link": binding[2],
+            "logical": os.fspath(binding[0]),
+            "name": name,
+        }
+        for name, binding in seat_bindings.items()
+    )
+    descriptors: list[tuple[str, Path, str | None, Sequence[str]]] = [
+        ("git", git_backing, None, ())
+    ]
+    descriptors.extend(
+        (f"provider-{name}", binding[1], name, exclusions[name])
+        for name, binding in provider_bindings.items()
+        if binding[3]
+    )
+    descriptors.extend(
+        (f"seat-{name}", binding[1], None, ())
+        for name, binding in seat_bindings.items()
+        if binding[3]
+    )
+    live_roots = [item[1] for item in descriptors]
+    for index, root in enumerate(live_roots):
+        root_info = root.stat(follow_symlinks=False)
+        if not (stat.S_ISREG(root_info.st_mode) or stat.S_ISDIR(root_info.st_mode)):
+            raise BulkloadError(f"live snapshot root has unsupported type: {root}")
+        for other in live_roots[index + 1 :]:
+            if _within(root, other) or _within(other, root):
+                raise BulkloadError("live snapshot roots overlap or alias")
+    assert_no_overlap(snapshot_root, live_roots, "live snapshot root")
+    assert_no_overlap(partial, live_roots, "live snapshot partial root")
+    _, git_controls = _git_snapshot_authorities(git_backing)
+    roots: list[dict[str, str]] = []
+    for label, live, provider, excluded in descriptors:
+        roots.append(
+            {
+                "exclusions": list(excluded),
+                "generation_sha256": None,
+                "label": label,
+                "live": os.fspath(live),
+                "provider": provider,
+                "snapshot": os.fspath(snapshot_root / "roots" / label),
+                "sqlite": [],
+            }
+        )
+    work_roots = [
+        {
+            "live": binding["live"],
+            "snapshot": os.fspath(
+                partial / Path(binding["snapshot"]).relative_to(snapshot_root)
+            ),
+        }
+        for binding in roots
+    ]
+    base_snapshot: dict[str, Any] | None = None
+    base_paths: list[Path | None] = [None] * len(roots)
+    base_records: list[dict[str, dict[str, Any]]] = [{} for _ in roots]
+    if snapshot_base_seal is not None:
+        base_snapshot = read_json(snapshot_base_seal)
+        if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
+            raise BulkloadError("snapshot base seal is not immutable-live custody")
+        base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
+        records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        for (label, relative), record in base_index.items():
+            records_by_label[label][relative] = record
+        del base_index
+        base_root = Path(base_snapshot["seal_path"]).parent
+        assert_no_overlap(snapshot_root, [base_root], "live snapshot root")
+        assert_no_overlap(partial, [base_root], "live snapshot partial root")
+        base_by_label = {item["label"]: item for item in base_snapshot["roots"]}
+        if len(base_by_label) != len(base_snapshot["roots"]):
+            raise BulkloadError("snapshot base root labels are not unique")
+        for index, root in enumerate(roots):
+            try:
+                base_root = base_by_label[root["label"]]
+            except KeyError as error:
+                raise BulkloadError("snapshot base lacks a required root") from error
+            if any(
+                base_root[key] != root[key]
+                for key in ("live", "provider", "exclusions")
+            ):
+                raise BulkloadError("snapshot base root contract differs")
+            base_paths[index] = Path(base_root["snapshot"])
+            base_records[index] = records_by_label[root["label"]]
+    methods: dict[str, int] = defaultdict(int)
+    transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
+    censuses: list[tuple[str, int]] = []
+    durable_makedirs(snapshot_root.parent)
+    for _, live, provider, excluded in descriptors:
+        observed = _tree_census(live, provider=provider, exclusions=excluded)
+        censuses.append(observed)
+    charged_bytes = sum(
+        _snapshot_delta_charge(
+            live,
+            base_paths[index],
+            provider=provider,
+            exclusions=excluded,
+            base_records=base_records[index],
+        )
+        for index, (_, live, provider, excluded) in enumerate(descriptors)
+    )
+    capacity = require_capacity(
+        snapshot_root.parent,
+        charged_bytes=charged_bytes,
+        reserve_bytes=snapshot_reserve_bytes,
+    )
+    published = False
+    try:
+        durable_makedirs(partial)
+        git_generation = _git_live_generation(git_backing)
+        git_tree_generation = _tree_generation(
+            git_backing, provider=None, exclusions=()
+        )
+        for index, (_, live, provider, excluded) in enumerate(descriptors):
+            work_target = Path(work_roots[index]["snapshot"])
+            observed_methods, observed_ledger = _copy_live_tree(
+                live,
+                work_target,
+                provider=provider,
+                exclusions=excluded,
+                max_sqlite_rows=max_sqlite_rows,
+                base=base_paths[index],
+                base_records=base_records[index],
+            )
+            transfer_ledgers.append(observed_ledger)
+            for method, count in observed_methods.items():
+                methods[method] += count
+            after = _tree_census(live, provider=provider, exclusions=excluded)
+            if censuses[index][0] != after[0]:
+                raise BulkloadError(f"live snapshot path set changed: {live}")
+        _rewrite_git_snapshot_links(git_controls, work_roots)
+        if _git_live_generation(git_backing) != git_generation:
+            raise BulkloadError("Git authority changed during live snapshot")
+        if (
+            _tree_generation(git_backing, provider=None, exclusions=())
+            != git_tree_generation
+        ):
+            raise BulkloadError("Git bytes changed during live snapshot")
+        for index, (_, _, provider, excluded) in enumerate(descriptors):
+            roots[index]["generation_sha256"] = (
+                git_tree_generation
+                if roots[index]["label"] == "git"
+                else _tree_generation(
+                    Path(work_roots[index]["snapshot"]),
+                    provider=provider,
+                    exclusions=excluded,
+                )
+            )
+        augmented_map = canonical_path_map(
+            [
+                *[(item["source"], item["destination"]) for item in path_map],
+                *[
+                    (
+                        binding["snapshot"],
+                        translate_path(binding["live"], path_map),
+                    )
+                    for binding in work_roots
+                    if any(
+                        Path(binding["live"]) == Path(item["source"])
+                        or Path(item["source"]) in Path(binding["live"]).parents
+                        for item in path_map
+                    )
+                ],
+            ]
+        )
+        snapshot_seats = []
+        for declaration in seats:
+            name = declaration[0]
+            binding = seat_bindings[name]
+            snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
+            snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
+        captured = capture_agent_state(
+            role=role,
+            home=home,
+            git_root=_snapshot_path(git_backing, work_roots, label="snapshot"),
+            codex_root=_snapshot_path(
+                provider_bindings["codex"][1], work_roots, label="snapshot"
+            )
+            if provider_bindings["codex"][3]
+            else provider_bindings["codex"][0],
+            claude_root=_snapshot_path(
+                provider_bindings["claude"][1], work_roots, label="snapshot"
+            )
+            if provider_bindings["claude"][3]
+            else provider_bindings["claude"][0],
+            pi_root=_snapshot_path(
+                provider_bindings["pi"][1], work_roots, label="snapshot"
+            )
+            if provider_bindings["pi"][3]
+            else provider_bindings["pi"][0],
+            seats=snapshot_seats,
+            path_map=augmented_map,
+            writers_quiesced=True,
+            managed_exclusions=managed_exclusions,
+            rsync_path=rsync_path,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            max_sqlite_rows=max_sqlite_rows,
+        )
+        catalog = captured["catalog"]
+        _rewrite_catalog_to_live(
+            catalog,
+            roots=work_roots,
+            original_path_map=path_map,
+            home=home,
+            git_logical=git_logical,
+            git_backing=git_backing,
+            git_root_link=git_link,
+            provider_bindings=provider_bindings,
+            seat_bindings=seat_bindings,
+            role=role,
+        )
+        providers_by_name = {
+            provider["name"]: provider for provider in catalog["providers"]
+        }
+        for root in roots:
+            provider_name = root["provider"]
+            if provider_name is None:
+                continue
+            root["sqlite"] = [
+                {
+                    "logical_sha256": item["logical"]["logical_sha256"],
+                    "relative_path": item["relative_path"],
+                }
+                for item in providers_by_name[provider_name]["items"]
+                if item["classification"] == "sqlite"
+            ]
+        partial_index = partial / "snapshot-index.jsonl"
+        index_sha256, index_entries = _write_snapshot_index(
+            partial_index, work_roots, transfer_ledgers
+        )
+        index_path = snapshot_root / "snapshot-index.jsonl"
+        snapshot = {
+            "base": None
+            if base_snapshot is None
+            else {
+                "seal_path": base_snapshot["seal_path"],
+                "seal_sha256": base_snapshot["seal_sha256"],
+                "snapshot_id": base_snapshot["snapshot_id"],
+            },
+            "capacity": capacity,
+            "contract_sha256": _snapshot_contract(catalog),
+            "declarations": declarations,
+            "git_generation_sha256": git_generation,
+            "index_entries": index_entries,
+            "index_path": os.fspath(index_path),
+            "index_sha256": index_sha256,
+            "inventory_sha256": sha256_bytes(canonical_bytes(catalog)),
+            "max_sqlite_rows": max_sqlite_rows,
+            "methods": dict(sorted(methods.items())),
+            "mode": LIVE_SNAPSHOT_MODE,
+            "roots": roots,
+            "snapshot_id": snapshot_id,
+        }
+        seal_path = snapshot_root / "snapshot-seal.json"
+        snapshot = seal({**snapshot, "seal_path": os.fspath(seal_path)}, "seal_sha256")
+        partial_seal = partial / "snapshot-seal.json"
+        atomic_write_json(partial_seal, snapshot)
+        require_digest(snapshot, "seal_sha256")
+        if partial_seal.read_bytes() != canonical_bytes(snapshot) + b"\n":
+            raise BulkloadError("live snapshot seal bytes did not persist")
+        os.replace(partial, snapshot_root)
+        published = True
+        fsync_directory(snapshot_root.parent)
+        catalog["snapshot"] = snapshot
+        captured.update(
+            {
+                "capture_id": snapshot_id,
+                "catalog_sha256": sha256_bytes(canonical_bytes(catalog)),
+                "observed_at": utc_now(),
+                "writers_quiesced": False,
+            }
+        )
+        return seal(captured, "capture_sha256")
+    except BaseException:
+        if partial.exists() and not partial.is_symlink():
+            _remove_snapshot_partial(partial)
+        elif published and snapshot_root.exists() and not snapshot_root.is_symlink():
+            _remove_snapshot_published(snapshot_root, snapshot_id)
+        raise
+
+
+def _snapshot_path(path: Path, roots: Sequence[dict[str, str]], *, label: str) -> Path:
+    for binding in roots:
+        live = Path(binding["live"])
+        try:
+            relative = path.relative_to(live)
+        except ValueError:
+            continue
+        return Path(binding[label]) / relative
+    raise BulkloadError(f"live snapshot has no root binding for {path}")
+
+
 def capture_agent_state(
     *,
     role: str,
@@ -1890,18 +3419,44 @@ def capture_agent_state(
     seats: Sequence[tuple[str, Path] | tuple[str, Path, str]],
     path_map: list[dict[str, str]],
     writers_quiesced: bool,
+    snapshot_root: Path | None = None,
+    snapshot_base_seal: Path | None = None,
     managed_exclusions: Sequence[tuple[str, str]] = (),
     rsync_path: Path | None = None,
     max_files: int = DEFAULT_MAX_FILES,
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
+    snapshot_reserve_bytes: int = SNAPSHOT_RESERVE_BYTES,
 ) -> dict[str, Any]:
     if role not in {"source", "destination"}:
         raise BulkloadError("capture role must be source or destination")
-    if not writers_quiesced:
-        raise BulkloadError(
-            "agent-capture requires an explicit writer-quiescence acknowledgement"
+    if not writers_quiesced and snapshot_root is not None:
+        return _capture_live_snapshot(
+            role=role,
+            home=home,
+            git_root=git_root,
+            codex_root=codex_root,
+            claude_root=claude_root,
+            pi_root=pi_root,
+            seats=seats,
+            path_map=path_map,
+            managed_exclusions=managed_exclusions,
+            rsync_path=rsync_path,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            max_sqlite_rows=max_sqlite_rows,
+            snapshot_root=snapshot_root,
+            snapshot_reserve_bytes=snapshot_reserve_bytes,
+            snapshot_base_seal=snapshot_base_seal,
         )
+    if not writers_quiesced and snapshot_root is None:
+        raise BulkloadError(
+            "live agent-capture requires an explicit immutable snapshot root"
+        )
+    if writers_quiesced and snapshot_root is not None:
+        raise BulkloadError("quiesced capture does not accept a live snapshot root")
+    if snapshot_base_seal is not None:
+        raise BulkloadError("snapshot base seal requires a live snapshot root")
     home = resolve_real(home)
     git_logical_root, git_root, git_root_link, _ = _declared_root(
         git_root, allow_absent=False
@@ -2142,7 +3697,7 @@ def capture_agent_state(
         )
         destination_git_root = "unmapped"
         destination_home = "unmapped"
-    catalog = {
+    catalog: dict[str, Any] = {
         "blockers": sorted(
             blockers,
             key=lambda item: (
@@ -2168,8 +3723,10 @@ def capture_agent_state(
         "seats": sorted(seat_records, key=lambda item: item["name"]),
         "transport": transport,
     }
+    capture_id = new_id()
+    catalog["snapshot"] = None
     capture = {
-        "capture_id": new_id(),
+        "capture_id": capture_id,
         "catalog": catalog,
         "catalog_sha256": sha256_bytes(canonical_bytes(catalog)),
         "complete": not blockers,
@@ -2177,7 +3734,7 @@ def capture_agent_state(
         "observed_at": utc_now(),
         "role": role,
         "schema": AGENT_CAPTURE_SCHEMA,
-        "writers_quiesced": True,
+        "writers_quiesced": writers_quiesced,
     }
     return seal(capture, "capture_sha256")
 
@@ -2208,8 +3765,6 @@ def validate_agent_capture(
         raise BulkloadError("AgentCaptureV4 role is invalid")
     if expected_role is not None and value["role"] != expected_role:
         raise BulkloadError(f"AgentCaptureV4 role must be {expected_role}")
-    if value.get("writers_quiesced") is not True:
-        raise BulkloadError("AgentCaptureV4 lacks writer quiescence")
     catalog = value.get("catalog")
     if not isinstance(catalog, dict):
         raise BulkloadError("AgentCaptureV4 catalog is missing")
@@ -2225,12 +3780,153 @@ def validate_agent_capture(
             "root_bindings",
             "runtime_source_sha256",
             "seats",
+            "snapshot",
             "transport",
         },
         "AgentCaptureV4 catalog",
     )
     if value.get("catalog_sha256") != sha256_bytes(canonical_bytes(catalog)):
         raise BulkloadError("AgentCaptureV4 catalog digest mismatch")
+    snapshot = catalog["snapshot"]
+    if value.get("writers_quiesced") is False:
+        if not isinstance(snapshot, dict):
+            raise BulkloadError("live AgentCaptureV4 lacks immutable snapshot custody")
+        require_exact_keys(
+            snapshot,
+            {
+                "base",
+                "capacity",
+                "contract_sha256",
+                "declarations",
+                "git_generation_sha256",
+                "index_entries",
+                "index_path",
+                "index_sha256",
+                "inventory_sha256",
+                "max_sqlite_rows",
+                "methods",
+                "mode",
+                "roots",
+                "seal_path",
+                "seal_sha256",
+                "snapshot_id",
+            },
+            "AgentCaptureV4 live snapshot",
+        )
+        require_digest(snapshot, "seal_sha256")
+        require_exact_keys(
+            snapshot["capacity"],
+            {
+                "available_bytes",
+                "charged_bytes",
+                "free_bytes",
+                "required_bytes",
+                "reserve_bytes",
+                "total_bytes",
+            },
+            "AgentCaptureV4 live snapshot capacity",
+        )
+        capacity = snapshot["capacity"]
+        if (
+            any(not isinstance(item, int) or item < 0 for item in capacity.values())
+            or capacity["required_bytes"]
+            != capacity["charged_bytes"] + capacity["reserve_bytes"]
+            or capacity["available_bytes"] < capacity["required_bytes"]
+        ):
+            raise BulkloadError("AgentCaptureV4 live snapshot capacity is invalid")
+        if (
+            snapshot["mode"] != LIVE_SNAPSHOT_MODE
+            or snapshot["snapshot_id"] != value["capture_id"]
+            or snapshot["contract_sha256"] != _snapshot_contract(catalog)
+            or snapshot["inventory_sha256"]
+            != sha256_bytes(canonical_bytes({**catalog, "snapshot": None}))
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["git_generation_sha256"])
+            or not isinstance(snapshot["index_entries"], int)
+            or isinstance(snapshot["index_entries"], bool)
+            or snapshot["index_entries"] < 1
+            or not Path(snapshot["index_path"]).is_absolute()
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["index_sha256"])
+            or not isinstance(snapshot["max_sqlite_rows"], int)
+            or isinstance(snapshot["max_sqlite_rows"], bool)
+            or snapshot["max_sqlite_rows"] < 1
+        ):
+            raise BulkloadError("AgentCaptureV4 live snapshot seal is invalid")
+        if snapshot["base"] is not None:
+            require_exact_keys(
+                snapshot["base"],
+                {"seal_path", "seal_sha256", "snapshot_id"},
+                "AgentCaptureV4 live snapshot base",
+            )
+            if (
+                not Path(snapshot["base"]["seal_path"]).is_absolute()
+                or not re.fullmatch(r"[0-9a-f]{64}", snapshot["base"]["seal_sha256"])
+                or not isinstance(snapshot["base"]["snapshot_id"], str)
+            ):
+                raise BulkloadError("AgentCaptureV4 live snapshot base is invalid")
+        if not isinstance(snapshot["declarations"], list):
+            raise BulkloadError("AgentCaptureV4 live declarations are invalid")
+        declaration_names: set[tuple[str, str]] = set()
+        for declaration in snapshot["declarations"]:
+            require_exact_keys(
+                declaration,
+                {"backing", "exists", "kind", "link", "logical", "name"},
+                "AgentCaptureV4 live declaration",
+            )
+            identity = (declaration["kind"], declaration["name"])
+            if (
+                identity in declaration_names
+                or declaration["kind"]
+                not in {"git", "provider", "seat-directory", "seat-file"}
+                or not Path(declaration["logical"]).is_absolute()
+                or not Path(declaration["backing"]).is_absolute()
+                or not isinstance(declaration["exists"], bool)
+            ):
+                raise BulkloadError("AgentCaptureV4 live declaration is invalid")
+            declaration_names.add(identity)
+        for root in snapshot["roots"]:
+            require_exact_keys(
+                root,
+                {
+                    "exclusions",
+                    "generation_sha256",
+                    "label",
+                    "live",
+                    "provider",
+                    "snapshot",
+                    "sqlite",
+                },
+                "live snapshot root",
+            )
+            if (
+                not Path(root["live"]).is_absolute()
+                or not Path(root["snapshot"]).is_absolute()
+            ):
+                raise BulkloadError("live snapshot root binding is not absolute")
+            if (
+                not isinstance(root["label"], str)
+                or root["provider"] not in {None, "codex", "claude", "pi"}
+                or not isinstance(root["exclusions"], list)
+                or root["exclusions"] != sorted(set(root["exclusions"]))
+                or not re.fullmatch(r"[0-9a-f]{64}", root["generation_sha256"])
+                or not isinstance(root["sqlite"], list)
+            ):
+                raise BulkloadError("live snapshot root generation is invalid")
+            for sqlite in root["sqlite"]:
+                require_exact_keys(
+                    sqlite,
+                    {"logical_sha256", "relative_path"},
+                    "live snapshot SQLite generation",
+                )
+                normalize_relative(sqlite["relative_path"])
+                if not re.fullmatch(r"[0-9a-f]{64}", sqlite["logical_sha256"]):
+                    raise BulkloadError("live snapshot SQLite generation is invalid")
+        if catalog["transport"]["hostname"] == socket.gethostname():
+            validate_snapshot_custody(snapshot)
+    elif value.get("writers_quiesced") is True:
+        if snapshot is not None:
+            raise BulkloadError("quiesced AgentCaptureV4 has live snapshot custody")
+    else:
+        raise BulkloadError("AgentCaptureV4 writer boundary is invalid")
     require_exact_keys(
         catalog["provider_policy"],
         {"default", "managed_exclusions", "portable_symlinks"},
@@ -2363,6 +4059,35 @@ def validate_agent_capture(
         raise BulkloadError("AgentCaptureV4 completeness disagrees with blockers")
 
 
+def _catalog_path_identities(catalog: dict[str, Any]) -> set[str]:
+    identities: set[str] = set()
+    for item in catalog.get("non_git", []):
+        identities.add(f"non-git:{item['relative_path']}")
+    for provider in catalog.get("providers", []):
+        for item in provider.get("items", []):
+            identities.add(
+                f"provider:{provider['name']}:{provider_item_identity(item)}"
+            )
+    for seat in catalog.get("seats", []):
+        for item in seat.get("items", []):
+            identities.add(f"seat:{seat['name']}:{item['identity']}")
+    for workspace in catalog.get("git_workspaces", []):
+        workspace_id = workspace["workspace_id"]
+        identities.add(f"git:{workspace_id}")
+        for item in workspace.get("object_files", []):
+            identities.add(f"git-object:{workspace_id}:{item['relative_path']}")
+        for worktree in workspace.get("worktrees", []):
+            worktree_path = worktree["path"]
+            identities.add(f"git-worktree:{workspace_id}:{worktree_path}")
+            for item in worktree.get("files", []):
+                identities.add(
+                    f"git-file:{workspace_id}:{worktree_path}:{item['relative_path']}"
+                )
+            if worktree.get("index", {}).get("exists"):
+                identities.add(f"git-index:{workspace_id}:{worktree_path}")
+    return identities
+
+
 def stable_capture_pair(
     first: dict[str, Any], second: dict[str, Any], *, role: str
 ) -> None:
@@ -2370,10 +4095,32 @@ def stable_capture_pair(
     validate_agent_capture(second, expected_role=role)
     if first["capture_id"] == second["capture_id"]:
         raise BulkloadError(f"{role} A/B captures reuse one capture ID")
-    if (
-        first["catalog_sha256"] != second["catalog_sha256"]
-        or first["catalog"] != second["catalog"]
-    ):
-        raise BulkloadError(f"{role} A/B captures are not byte-stable")
+    if first["writers_quiesced"] != second["writers_quiesced"]:
+        raise BulkloadError(f"{role} A/B captures use different writer boundaries")
+    if first["writers_quiesced"]:
+        if (
+            first["catalog_sha256"] != second["catalog_sha256"]
+            or first["catalog"] != second["catalog"]
+        ):
+            raise BulkloadError(f"{role} A/B captures are not byte-stable")
+    else:
+        first_snapshot = first["catalog"]["snapshot"]
+        second_snapshot = second["catalog"]["snapshot"]
+        if (
+            first_snapshot["contract_sha256"] != second_snapshot["contract_sha256"]
+            or first_snapshot["seal_sha256"] == second_snapshot["seal_sha256"]
+            or second_snapshot["base"]
+            != {
+                "seal_path": first_snapshot["seal_path"],
+                "seal_sha256": first_snapshot["seal_sha256"],
+                "snapshot_id": first_snapshot["snapshot_id"],
+            }
+        ):
+            raise BulkloadError(f"{role} A/B live snapshot contract is unstable")
+        missing = _catalog_path_identities(first["catalog"]) - _catalog_path_identities(
+            second["catalog"]
+        )
+        if missing:
+            raise BulkloadError(f"{role} A/B live snapshot loses prior custody")
     if not first["complete"] or not second["complete"]:
         raise BulkloadError(f"{role} captures contain blockers")

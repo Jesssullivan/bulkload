@@ -17,7 +17,8 @@
 
 ## Required sequence
 
-1. Briefly quiesce; capture preliminary source and destination A/B pairs.
+1. Without signaling sessions, capture preliminary source and destination A,
+   then B with the exact A seal passed through `--snapshot-base-seal`.
 2. Compile/review/accept the preliminary plan, then resume writers. If the four
    captures total more than 512 MiB, Neo first pushes its two captures to the
    private Sting evidence directory and planning runs on memory-qualified Sting.
@@ -25,10 +26,19 @@
    small prepare receipt and allowlist, then streams that authority without
    loading AgentPlanV4; on Sting materialize preseed. Every SSH connection
    originates on Neo.
-4. Quiesce again; capture fresh final A/B pairs and accept a fresh plan digest.
-5. Repeat prepare/push/materialize with `--phase final`; keep writers stopped.
+4. Capture fresh final A/base-B pairs and accept a fresh plan digest. Before
+   source B, begin an attended no-interaction interval on Neo; processes remain
+   alive and unsignaled.
+5. Repeat prepare/push/materialize with `--phase final`. Neo's push requires two
+   matching complete live epochs before and after transport. Keep the
+   no-interaction interval after the push; the transport receipt does not end it.
 6. Pass the exact capacity gates and reflink-snapshot every overwritten entry.
-7. Apply through the journal, verify, and perform attended provider acceptance.
+7. Apply through the journal and verify on Sting. Neo then pulls the exact verify
+   receipt over its outbound connection and runs `agent-verify` with
+   `--destination-verify-receipt`; only its sealed cutover-release receipt ends
+   the interval. The release is an observational cut; it does not claim
+   atomicity after interaction resumes. Then perform attended provider
+   acceptance.
 8. Retain plan, stage, journal, rollback, and receipts until disposition.
 
 ## Path authority

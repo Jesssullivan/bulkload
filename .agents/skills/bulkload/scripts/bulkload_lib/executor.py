@@ -54,6 +54,8 @@ from .scanner import (
     shell_safe_executable,
     snapshot_sqlite,
     sqlite_catalog,
+    validate_live_snapshot_generation,
+    validate_snapshot_custody,
 )
 
 
@@ -181,40 +183,91 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[str]:
     return roots
 
 
+def _catalog_source_roots(catalog: dict[str, Any]) -> list[str]:
+    snapshot = catalog.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return _catalog_roots(catalog)
+    roots = sorted({item["snapshot"] for item in snapshot["roots"]})
+    if any(not Path(value).is_absolute() for value in roots):
+        raise BulkloadError("snapshot custody roots must be absolute")
+    return roots
+
+
+def _snapshot_source_path(catalog: dict[str, Any], path: Path) -> Path:
+    snapshot = catalog.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return path
+    matches: list[tuple[int, Path, Path]] = []
+    for binding in snapshot["roots"]:
+        live = Path(binding["live"])
+        try:
+            relative = path.relative_to(live)
+        except ValueError:
+            continue
+        matches.append((len(live.parts), Path(binding["snapshot"]), relative))
+    if not matches:
+        raise BulkloadError("AgentPlanV4 source path lacks snapshot custody")
+    _, root, relative = max(matches, key=lambda item: item[0])
+    return root / relative
+
+
 def _object_path(stage_root: Path, digest: str) -> Path:
     return stage_root / "objects" / digest[:2] / digest
 
 
-def _source_path(path: str | Path, mirror: Path | None) -> Path:
+def _source_path(
+    path: str | Path, mirror: Path | None, catalog: dict[str, Any]
+) -> Path:
     source = Path(path)
     if not source.is_absolute():
         raise BulkloadError("AgentPlanV4 source path is not absolute")
+    source = _snapshot_source_path(catalog, source)
     return source if mirror is None else mirror.joinpath(*source.parts[1:])
 
 
 def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
     paths: set[str] = set()
     resolver = PlanOperationResolver(plan)
+    catalog = plan["source"]["catalog"]
+    if isinstance(catalog.get("snapshot"), dict):
+        paths.update(
+            {
+                catalog["snapshot"]["seal_path"],
+                catalog["snapshot"]["index_path"],
+            }
+        )
     for compact_operation in plan["operations"]:
         operation = resolver.materialize(compact_operation)
         source = operation["source"]
         if operation["kind"] == "git-workspace-union":
             common = Path(source["common_git_dir"]) / "objects"
             paths.update(
-                os.fspath(common / item["relative_path"])
+                os.fspath(
+                    _snapshot_source_path(catalog, common / item["relative_path"])
+                )
                 for item in source.get("object_files", [])
             )
             for worktree in source.get("worktrees", []):
                 paths.update(
-                    os.fspath(Path(worktree["path"]) / item["relative_path"])
+                    os.fspath(
+                        _snapshot_source_path(
+                            catalog, Path(worktree["path"]) / item["relative_path"]
+                        )
+                    )
                     for item in worktree.get("files", [])
                 )
                 if worktree["index"]["exists"]:
-                    paths.add(worktree["index"]["path"])
+                    paths.add(
+                        os.fspath(
+                            _snapshot_source_path(
+                                catalog, Path(worktree["index"]["path"])
+                            )
+                        )
+                    )
             continue
         path = Path(operation["source_root"]) / source["relative_path"]
-        paths.add(os.fspath(path))
-        if operation["kind"] == "sqlite-union":
+        paths.add(os.fspath(_snapshot_source_path(catalog, path)))
+        if operation["kind"] == "sqlite-union" and catalog.get("snapshot") is None:
             paths.update(
                 os.fspath(Path(os.fspath(path) + f"-{item['kind']}"))
                 for item in source.get("sidecars", [])
@@ -395,8 +448,9 @@ def _validate_prepare_receipt(
         or receipt["transport"]["destination_rsync"]
         != destination["transport"]["rsync"]
         or receipt["transport"]["source_host"] != source["transport"]["hostname"]
-        or receipt["transport"]["source_roots"] != _catalog_roots(source)
+        or receipt["transport"]["source_roots"] != _catalog_source_roots(source)
         or receipt["transport"]["source_rsync"] != source["transport"]["rsync"]
+        or receipt["transport"]["source_snapshot"] != source.get("snapshot")
         or receipt["transport"]["transport_receipt_sha256"] is not None
     ):
         raise BulkloadError("prepare receipt is detached from the accepted stage plan")
@@ -438,6 +492,11 @@ def push_agent_transport(
     )
     if socket.gethostname() != transport_authority["source_host"]:
         raise BulkloadError("transport push must run on the captured source host")
+    source_snapshot = transport_authority["source_snapshot"]
+    if isinstance(source_snapshot, dict):
+        validate_snapshot_custody(source_snapshot)
+        if phase == "final":
+            validate_live_snapshot_generation(source_snapshot)
     host = _transport_host(
         destination_ssh_host, transport_authority["destination_host"]
     )
@@ -483,6 +542,8 @@ def push_agent_transport(
         )
     if result.returncode != 0:
         raise BulkloadError("authenticated rsync quarantine push failed")
+    if isinstance(source_snapshot, dict) and phase == "final":
+        validate_live_snapshot_generation(source_snapshot)
     transport = dict(transport_authority)
     transport["mode"] = "ssh-rsync-push"
     transport["source_rsync"] = source_binding
@@ -921,6 +982,7 @@ def _sqlite_stage_entry(
     *,
     stage_root: Path,
     source_mirror: Path | None,
+    source_catalog: dict[str, Any],
     stats: dict[str, int],
 ) -> dict[str, Any]:
     temporary_root = stage_root / ".sqlite-work"
@@ -928,6 +990,7 @@ def _sqlite_stage_entry(
     source_path = _source_path(
         Path(operation["source_root"]) / operation["source"]["relative_path"],
         source_mirror,
+        source_catalog,
     )
     source_snapshot = temporary_root / f"source-{operation['operation_id']}.sqlite"
     source_snapshot.unlink(missing_ok=True)
@@ -1002,6 +1065,7 @@ def _stage_file_operation(
     source_path = _source_path(
         Path(operation["source_root"]) / operation["source"]["relative_path"],
         source_mirror,
+        plan["source"]["catalog"],
     )
     material = _materialize_file(
         stage_root=stage_root,
@@ -1047,6 +1111,7 @@ def _stage_git_operation(
         source_path = _source_path(
             Path(source["common_git_dir"]) / "objects" / record["relative_path"],
             source_mirror,
+            plan["source"]["catalog"],
         )
         target = destination_common / "objects" / record["relative_path"]
         material = _materialize_file(
@@ -1077,7 +1142,9 @@ def _stage_git_operation(
         for record in source_worktree.get("files", []):
             source_file_names.add(record["relative_path"])
             source_path = _source_path(
-                Path(source_worktree["path"]) / record["relative_path"], source_mirror
+                Path(source_worktree["path"]) / record["relative_path"],
+                source_mirror,
+                plan["source"]["catalog"],
             )
             target = destination_path / record["relative_path"]
             material = _materialize_file(
@@ -1119,7 +1186,9 @@ def _stage_git_operation(
         if index["exists"]:
             material = _materialize_file(
                 stage_root=stage_root,
-                source_path=_source_path(index["path"], source_mirror),
+                source_path=_source_path(
+                    index["path"], source_mirror, plan["source"]["catalog"]
+                ),
                 record={
                     "kind": "regular",
                     "mode": index["mode"],
@@ -1245,6 +1314,7 @@ def validate_stage_receipt(
             "source_host",
             "source_roots",
             "source_rsync",
+            "source_snapshot",
             "transport_receipt_sha256",
         },
         "AgentStageV4 transport",
@@ -1257,6 +1327,11 @@ def validate_stage_receipt(
     }:
         raise BulkloadError("AgentStageV4 transport mode is invalid")
     transport = value["transport"]
+    source_snapshot = transport["source_snapshot"]
+    if source_snapshot is not None:
+        if not isinstance(source_snapshot, dict):
+            raise BulkloadError("AgentStageV4 source snapshot is invalid")
+        require_digest(source_snapshot, "seal_sha256")
     if (
         not isinstance(transport["allowlist_size"], int)
         or isinstance(transport["allowlist_size"], bool)
@@ -1378,8 +1453,9 @@ def stage_agent_plan(
             "mode": "destination-prepare",
             "quarantine_root": os.fspath(quarantine),
             "source_host": source["hostname"],
-            "source_roots": _catalog_roots(plan["source"]["catalog"]),
+            "source_roots": _catalog_source_roots(plan["source"]["catalog"]),
             "source_rsync": source["rsync"],
+            "source_snapshot": plan["source"]["catalog"].get("snapshot"),
             "transport_receipt_sha256": None,
         }
         receipt = _transport_body(
@@ -1418,6 +1494,13 @@ def stage_agent_plan(
         if receipt["plan_sha256"] != plan["plan_sha256"]:
             raise BulkloadError("existing stage receipt belongs to a different plan")
         _verify_stage_objects(receipt["manifest"], stage_root)
+        snapshot = plan["source"]["catalog"].get("snapshot")
+        if (
+            phase == "final"
+            and transport_mode == "local"
+            and isinstance(snapshot, dict)
+        ):
+            validate_live_snapshot_generation(snapshot)
         return receipt
     if phase == "final":
         preseed_receipt_path = _stage_receipt_path(stage_root, "preseed")
@@ -1438,6 +1521,17 @@ def stage_agent_plan(
         source_mirror, transport = _materialized_transport(
             plan, phase, stage_root, prepare_receipt, transport_receipt
         )
+        snapshot = plan["source"]["catalog"].get("snapshot")
+        if isinstance(snapshot, dict):
+            metadata = {snapshot["seal_path"], snapshot["index_path"]}
+            required = {
+                Path("/") / item
+                for item in _plan_source_paths(plan)
+                if os.fspath(Path("/") / item) not in metadata
+            }
+            validate_snapshot_custody(
+                snapshot, mirror=source_mirror, required_paths=required
+            )
     else:
         source = plan["source"]["catalog"]["transport"]
         destination = plan["destination"]["catalog"]["transport"]
@@ -1450,6 +1544,11 @@ def stage_agent_plan(
             or destination_binding != destination["rsync"]
         ):
             raise BulkloadError("local rsync differs from captured authority")
+        snapshot = plan["source"]["catalog"].get("snapshot")
+        if isinstance(snapshot, dict):
+            validate_snapshot_custody(snapshot)
+            if phase == "final":
+                validate_live_snapshot_generation(snapshot)
         payload = b"".join(
             os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
         )
@@ -1462,8 +1561,9 @@ def stage_agent_plan(
             "mode": "local",
             "quarantine_root": None,
             "source_host": source["hostname"],
-            "source_roots": _catalog_roots(plan["source"]["catalog"]),
+            "source_roots": _catalog_source_roots(plan["source"]["catalog"]),
             "source_rsync": source_binding,
+            "source_snapshot": plan["source"]["catalog"].get("snapshot"),
             "transport_receipt_sha256": None,
         }
     stats = defaultdict(int)
@@ -1490,6 +1590,7 @@ def stage_agent_plan(
                             operation,
                             stage_root=stage_root,
                             source_mirror=source_mirror,
+                            source_catalog=plan["source"]["catalog"],
                             stats=stats,
                         )
                     )
@@ -1512,6 +1613,9 @@ def stage_agent_plan(
             if phase == "final":
                 raise
             stats["deferred_operations"] += 1
+    snapshot = plan["source"]["catalog"].get("snapshot")
+    if phase == "final" and transport_mode == "local" and isinstance(snapshot, dict):
+        validate_live_snapshot_generation(snapshot)
     manifest = {
         "created_at": utc_now(),
         "entries": entries,
@@ -2531,6 +2635,8 @@ def verify_agent_plan(
     plan: dict[str, Any],
     stage_receipt: dict[str, Any],
     apply_receipt: dict[str, Any],
+    *,
+    destination_verify_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_agent_plan(plan, require_ready=True)
     validate_stage_receipt(stage_receipt, require_final=True)
@@ -2546,9 +2652,58 @@ def verify_agent_plan(
         != 1
     ):
         raise BulkloadError("verify inputs do not share one plan digest")
-    manifest = _load_manifest(stage_receipt)
+    manifest = (
+        stage_receipt["manifest"]
+        if destination_verify_receipt is not None
+        else _load_manifest(stage_receipt)
+    )
     if apply_receipt.get("stage_manifest_sha256") != manifest["manifest_sha256"]:
         raise BulkloadError("apply receipt is detached from the final stage manifest")
+    if destination_verify_receipt is not None:
+        validate_verify_receipt(
+            destination_verify_receipt, required_role="destination-state"
+        )
+        if (
+            destination_verify_receipt["verified"] is not True
+            or destination_verify_receipt["failures"]
+            or destination_verify_receipt["plan_sha256"] != plan["plan_sha256"]
+            or destination_verify_receipt["apply_receipt_sha256"]
+            != apply_receipt["receipt_sha256"]
+            or destination_verify_receipt["holds"] != plan["holds"]
+            or destination_verify_receipt["observation_host"]
+            != plan["destination"]["catalog"]["transport"]["hostname"]
+        ):
+            raise BulkloadError(
+                "destination verification is detached from the cutover release"
+            )
+        source = plan["source"]["catalog"]
+        if socket.gethostname() != source["transport"]["hostname"]:
+            raise BulkloadError("cutover release must run on the captured source host")
+        snapshot = source.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise BulkloadError("cutover release requires immutable source B custody")
+        validate_snapshot_custody(snapshot)
+        validate_live_snapshot_generation(snapshot)
+        receipt = {
+            "apply_receipt_sha256": apply_receipt["receipt_sha256"],
+            "destination_verify_receipt_sha256": destination_verify_receipt[
+                "receipt_sha256"
+            ],
+            "failures": [],
+            "holds": plan["holds"],
+            "independent_fresh_observation": True,
+            "observation_host": socket.gethostname(),
+            "plan_sha256": plan["plan_sha256"],
+            "provider_runtime_acceptance_verified": False,
+            "receipt_id": new_id(),
+            "schema": AGENT_VERIFY_SCHEMA,
+            "source_snapshot_seal_sha256": snapshot["seal_sha256"],
+            "verification_role": "cutover-release",
+            "verified": True,
+            "verified_at": utc_now(),
+        }
+        seal(receipt, "receipt_sha256")
+        return receipt
     journal_path = Path(apply_receipt["journal_path"])
     journal = _read_apply_journal(journal_path)
     if (
@@ -2608,13 +2763,17 @@ def verify_agent_plan(
                 )
     receipt = {
         "apply_receipt_sha256": apply_receipt["receipt_sha256"],
+        "destination_verify_receipt_sha256": None,
         "failures": sorted(failures, key=lambda item: (item["code"], item["path"])),
         "holds": plan["holds"],
         "independent_fresh_observation": True,
+        "observation_host": socket.gethostname(),
         "plan_sha256": plan["plan_sha256"],
         "provider_runtime_acceptance_verified": False,
         "receipt_id": new_id(),
         "schema": AGENT_VERIFY_SCHEMA,
+        "source_snapshot_seal_sha256": None,
+        "verification_role": "destination-state",
         "verified": not failures,
         "verified_at": utc_now(),
     }
@@ -2625,6 +2784,67 @@ def verify_agent_plan(
         journal["updated_at"] = utc_now()
         _write_apply_journal(journal_path, journal)
     return receipt
+
+
+def validate_verify_receipt(
+    value: dict[str, Any], *, required_role: str | None = None
+) -> None:
+    require_exact_keys(
+        value,
+        {
+            "apply_receipt_sha256",
+            "destination_verify_receipt_sha256",
+            "failures",
+            "holds",
+            "independent_fresh_observation",
+            "observation_host",
+            "plan_sha256",
+            "provider_runtime_acceptance_verified",
+            "receipt_id",
+            "receipt_sha256",
+            "schema",
+            "source_snapshot_seal_sha256",
+            "verification_role",
+            "verified",
+            "verified_at",
+        },
+        "AgentVerifyV4 receipt",
+    )
+    if value.get("schema") != AGENT_VERIFY_SCHEMA:
+        raise BulkloadError("input is not an AgentVerifyV4 receipt")
+    require_digest(value, "receipt_sha256")
+    for key in ("apply_receipt_sha256", "plan_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", value.get(key, "")):
+            raise BulkloadError("AgentVerifyV4 digest binding is invalid")
+    role = value.get("verification_role")
+    if role not in {"destination-state", "cutover-release"} or (
+        required_role is not None and role != required_role
+    ):
+        raise BulkloadError("AgentVerifyV4 verification role is invalid")
+    if (
+        not isinstance(value.get("failures"), list)
+        or not isinstance(value.get("holds"), list)
+        or value.get("independent_fresh_observation") is not True
+        or value.get("provider_runtime_acceptance_verified") is not False
+        or not isinstance(value.get("observation_host"), str)
+        or not value["observation_host"]
+        or not isinstance(value.get("verified"), bool)
+        or value["verified"] != (not value["failures"])
+    ):
+        raise BulkloadError("AgentVerifyV4 receipt claim is invalid")
+    destination_digest = value["destination_verify_receipt_sha256"]
+    source_seal = value["source_snapshot_seal_sha256"]
+    if role == "destination-state":
+        if destination_digest is not None or source_seal is not None:
+            raise BulkloadError("destination verification overclaims cutover release")
+    elif (
+        not isinstance(destination_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", destination_digest)
+        or not isinstance(source_seal, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_seal)
+        or value["verified"] is not True
+    ):
+        raise BulkloadError("cutover-release receipt binding is invalid")
 
 
 def _restore_snapshot(snapshot: dict[str, Any], rollback_root: Path) -> None:

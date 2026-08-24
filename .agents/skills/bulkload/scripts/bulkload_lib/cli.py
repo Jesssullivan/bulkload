@@ -34,6 +34,7 @@ from .scanner import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
+    _catalog_path_identities,
     canonical_path_map,
     capture_agent_state,
     validate_agent_capture,
@@ -98,6 +99,18 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     roots.extend(
         Path(seat["path"]) for seat in catalog.get("seats", []) if seat.get("exists")
     )
+    snapshot = catalog.get("snapshot")
+    if isinstance(snapshot, dict):
+        roots.extend(
+            (
+                Path(snapshot["seal_path"]).parent,
+                Path(snapshot["seal_path"]),
+                Path(snapshot["index_path"]),
+            )
+        )
+        roots.extend(Path(item["snapshot"]) for item in snapshot["roots"])
+        if isinstance(snapshot.get("base"), dict):
+            roots.append(Path(snapshot["base"]["seal_path"]).parent)
     return roots
 
 
@@ -113,6 +126,8 @@ def _protect_output(arguments: argparse.Namespace) -> None:
             if path
         )
         roots.extend(path for _, path, _ in [*arguments.seat, *arguments.file_seat])
+        if arguments.snapshot_base_seal:
+            roots.append(Path(arguments.snapshot_base_seal).expanduser().parent)
     elif arguments.command == "agent-plan":
         for name in ("source_a", "source_b", "destination_a", "destination_b"):
             roots.extend(_catalog_roots(_load(getattr(arguments, name))["catalog"]))
@@ -124,6 +139,9 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         prepare = _load(arguments.prepare_receipt)
         validate_stage_receipt(prepare)
         roots.extend(Path(value) for value in prepare["transport"]["source_roots"])
+        snapshot = prepare["transport"].get("source_snapshot")
+        if isinstance(snapshot, dict):
+            roots.extend((Path(snapshot["seal_path"]), Path(snapshot["index_path"])))
         roots.extend(
             (Path(arguments.prepare_receipt), Path(arguments.transport_allowlist))
         )
@@ -180,6 +198,12 @@ def _parse_managed_exclusion(value: str) -> tuple[str, str]:
 
 def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
     home = Path(arguments.home).expanduser()
+    if not arguments.acknowledge_writers_quiesced and arguments.output == "-":
+        raise BulkloadError("live capture requires an owner-private evidence path")
+    snapshot_root = None
+    if not arguments.acknowledge_writers_quiesced:
+        output = Path(arguments.output).expanduser()
+        snapshot_root = output.parent / f".{output.name}.snapshot"
     return capture_agent_state(
         role=arguments.role,
         home=home,
@@ -194,6 +218,10 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
         seats=[*arguments.seat, *arguments.file_seat],
         path_map=canonical_path_map(arguments.path_map),
         writers_quiesced=arguments.acknowledge_writers_quiesced,
+        snapshot_root=snapshot_root,
+        snapshot_base_seal=Path(arguments.snapshot_base_seal).expanduser()
+        if arguments.snapshot_base_seal
+        else None,
         managed_exclusions=arguments.managed_exclusion,
         rsync_path=Path(arguments.rsync_path),
         max_files=arguments.max_files,
@@ -226,15 +254,43 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
         first_id = first["capture_id"]
         catalog_sha256 = first["catalog_sha256"]
         first_complete = first["complete"]
+        first_quiesced = first["writers_quiesced"]
+        first_contract = (
+            None if first_quiesced else first["catalog"]["snapshot"]["contract_sha256"]
+        )
+        first_seal = (
+            None if first_quiesced else first["catalog"]["snapshot"]["seal_sha256"]
+        )
+        first_snapshot = None if first_quiesced else first["catalog"]["snapshot"]
+        first_identities = (
+            None if first_quiesced else _catalog_path_identities(first["catalog"])
+        )
         del first
         gc.collect()
         second = _load(os.fspath(second_path))
         validate_agent_capture(second, expected_role=role)
         if (
             first_id == second["capture_id"]
-            or catalog_sha256 != second["catalog_sha256"]
             or not first_complete
             or not second["complete"]
+            or first_quiesced != second["writers_quiesced"]
+            or (first_quiesced and catalog_sha256 != second["catalog_sha256"])
+            or (
+                not first_quiesced
+                and (
+                    first_contract != second["catalog"]["snapshot"]["contract_sha256"]
+                    or first_seal == second["catalog"]["snapshot"]["seal_sha256"]
+                    or second["catalog"]["snapshot"]["base"]
+                    != {
+                        "seal_path": first_snapshot["seal_path"],
+                        "seal_sha256": first_snapshot["seal_sha256"],
+                        "snapshot_id": first_snapshot["snapshot_id"],
+                    }
+                    or not first_identities.issubset(
+                        _catalog_path_identities(second["catalog"])
+                    )
+                )
+            )
         ):
             raise BulkloadError(f"{role} A/B captures are not stable and complete")
         return second, (first_id, second["capture_id"])
@@ -307,6 +363,9 @@ def _agent_verify(arguments: argparse.Namespace) -> dict[str, Any]:
         _load(arguments.plan),
         _load(arguments.stage_receipt),
         _load(arguments.apply_receipt),
+        destination_verify_receipt=_load(arguments.destination_verify_receipt)
+        if arguments.destination_verify_receipt
+        else None,
     )
 
 
@@ -358,6 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--path-map", action="append", type=_parse_mapping, required=True
     )
     capture.add_argument("--acknowledge-writers-quiesced", action="store_true")
+    capture.add_argument("--snapshot-base-seal")
     capture.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     capture.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     capture.add_argument("--max-sqlite-rows", type=int, default=DEFAULT_MAX_SQLITE_ROWS)
@@ -413,6 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--plan", required=True)
     verify.add_argument("--stage-receipt", required=True)
     verify.add_argument("--apply-receipt", required=True)
+    verify.add_argument("--destination-verify-receipt")
     verify.add_argument("--output", required=True)
     verify.set_defaults(handler=_agent_verify)
 

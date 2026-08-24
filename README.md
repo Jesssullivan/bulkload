@@ -85,8 +85,10 @@ Install the same Bulkload closure on Neo and Sting. Resolve an explicit GNU
 rsync from each pinned dev shell; capture binds its path, hash, protocol, and
 features. Native Neo `/usr/bin/rsync` is not accepted.
 
-Capture source and destination A/B under brief quiescence with identical
-managed exclusions and source maps. The longest-prefix live mappings are:
+Capture source and destination immutable-live A/base-B pairs with identical
+managed exclusions and source maps. Do not stop or signal sessions. Pass A's
+exact `snapshot-seal.json` to B with `--snapshot-base-seal`; B reuses sealed A
+objects and contains only charged deltas. The longest-prefix live mappings are:
 
 ```text
 /Users/jess/git     -> /srv/fast-local/jess/git
@@ -126,8 +128,9 @@ RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
   /secure/evidence/destination-b.json
 ```
 
-`agent-plan` validates all four self-digested captures. Accept its exact digest
-only after review; then resume writers for preliminary preseed.
+`agent-plan` validates all four self-digested captures, each B-to-A seal
+binding, static contract equality, and absence of A-only loss. Accept its exact
+digest only after review; preliminary preseed permits continued live work.
 
 Relay the accepted preliminary plan and all receipts over connections initiated
 by Neo. Sting never needs a Neo credential or a Sting-originated connection.
@@ -195,9 +198,15 @@ bulkload agent-stage --phase preseed --transport-mode materialize \
   --output /home/jess/.bulkload-evidence/preseed-stage.json
 ```
 
-Changed-late preliminary entries are deferred. For final, quiesce again, take
-fresh source/destination A/B captures, compile and accept a fresh plan digest,
-and repeat `prepare`, Neo `push`, and Sting `materialize` with `--phase final`.
+Changed-late preliminary entries are deferred. For final, take fresh
+source/destination A/base-B captures, compile and accept a fresh plan digest,
+then begin an attended no-interaction interval before Neo source B. Processes
+remain alive. Repeat `prepare`, Neo `push`, and Sting `materialize` with
+`--phase final`; Neo proves two matching complete live epochs before and after
+transport and returns no final push receipt on drift. Keep the interval through
+apply and Sting verification. Neo pulls that exact verification receipt and
+runs `agent-verify --destination-verify-receipt`; only its sealed
+cutover-release receipt ends the interval.
 The same stage reuses verified content objects across plan digests, but every
 final operation is restaged and only the final materialized receipt is apply
 authority.
@@ -219,6 +228,22 @@ bulkload agent-verify \
   --apply-receipt /home/jess/.bulkload-evidence/apply-receipt.json \
   --output /home/jess/.bulkload-evidence/verify-receipt.json
 ```
+
+After Neo pulls that exact Sting receipt over its outbound connection, release
+the cutover on Neo without stopping any session:
+
+```bash
+bulkload agent-verify \
+  --plan /secure/evidence/final-plan.json \
+  --stage-receipt /secure/evidence/final-stage.json \
+  --apply-receipt /secure/evidence/apply-receipt.json \
+  --destination-verify-receipt /secure/evidence/verify-receipt.json \
+  --output /secure/evidence/cutover-release.json
+```
+
+This receipt is an observational release cut. It proves Neo still equals sealed
+source B after Sting verification; it does not claim future Neo writes cannot
+occur after the interaction interval ends.
 
 Use `agent-recover --strategy forward|rollback` after an interrupted journal,
 or `agent-rollback` with the exact apply receipt digest for an attended revert.

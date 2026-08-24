@@ -16,7 +16,7 @@ import threading
 import unittest
 from unittest import mock
 
-from bulkload_lib.cli import _agent_plan, build_parser
+from bulkload_lib.cli import _agent_plan, _protect_output, build_parser
 from bulkload_lib.executor import (
     _git,
     _git_worktree_state,
@@ -50,6 +50,7 @@ from bulkload_lib.scanner import (
     capture_agent_state,
     inspect_rsync,
     stable_capture_pair,
+    validate_agent_capture,
 )
 import bulkload_lib.scanner as scanner
 
@@ -329,6 +330,266 @@ class CutoverFixture:
 
 
 class SchemaAndCaptureTests(unittest.TestCase):
+    def test_live_capture_seals_immutable_snapshot_without_quiescence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            (fixture.source_home / ".claude" / "foo").mkdir()
+            (fixture.source_home / ".claude" / "foo" / "z").write_text("z")
+            (fixture.source_home / ".claude" / "foo-bar").write_text("bar")
+            capture = capture_agent_state(
+                role="source",
+                home=fixture.source_home,
+                git_root=fixture.source_git,
+                codex_root=None,
+                claude_root=None,
+                pi_root=None,
+                seats=fixture.source_seats,
+                path_map=fixture.path_map,
+                writers_quiesced=False,
+                snapshot_root=snapshot_root,
+                managed_exclusions=fixture.managed_exclusions,
+                rsync_path=fixture.rsync_path,
+                max_files=50_000,
+                max_bytes=4 * 1024**3,
+                max_sqlite_rows=100_000,
+                snapshot_reserve_bytes=0,
+            )
+            validate_agent_capture(capture, expected_role="source")
+            self.assertFalse(capture["writers_quiesced"])
+            snapshot = capture["catalog"]["snapshot"]
+            self.assertEqual(snapshot["mode"], "immutable-live")
+            self.assertEqual(snapshot["snapshot_id"], capture["capture_id"])
+            self.assertTrue(Path(snapshot["seal_path"]).is_file())
+            self.assertIn("sqlite-online-backup", snapshot["methods"])
+            extra = snapshot_root / "undeclared"
+            extra.write_text("extra")
+            with self.assertRaisesRegex(BulkloadError, "top-level"):
+                validate_agent_capture(capture, expected_role="source")
+
+    def test_live_pair_plans_from_b_and_stages_after_live_source_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            evidence = fixture.root / "evidence"
+
+            def live(role: str, name: str, base: dict | None = None) -> dict:
+                home = (
+                    fixture.source_home
+                    if role == "source"
+                    else fixture.destination_home
+                )
+                return capture_agent_state(
+                    role=role,
+                    home=home,
+                    git_root=(
+                        fixture.source_git
+                        if role == "source"
+                        else fixture.destination_git
+                    ),
+                    codex_root=None,
+                    claude_root=None,
+                    pi_root=None,
+                    seats=(
+                        fixture.source_seats
+                        if role == "source"
+                        else fixture.destination_seats
+                    ),
+                    path_map=fixture.path_map,
+                    writers_quiesced=False,
+                    snapshot_root=evidence / f"{name}.snapshot",
+                    snapshot_base_seal=Path(base["catalog"]["snapshot"]["seal_path"])
+                    if base is not None
+                    else None,
+                    managed_exclusions=fixture.managed_exclusions,
+                    rsync_path=fixture.rsync_path,
+                    max_files=50_000,
+                    max_bytes=4 * 1024**3,
+                    max_sqlite_rows=100_000,
+                    snapshot_reserve_bytes=0,
+                )
+
+            source_a = live("source", "source-a")
+            source_b = live("source", "source-b", source_a)
+            source_history = fixture.source_home / ".codex" / "history.jsonl"
+            source_history_before = source_history.read_bytes()
+            self.assertIn("base-reflink", source_b["catalog"]["snapshot"]["methods"])
+            destination_a = live("destination", "destination-a")
+            destination_b = live("destination", "destination-b", destination_a)
+            plan = compile_agent_plan(source_a, source_b, destination_a, destination_b)
+            self.assertEqual(
+                plan["source"]["catalog_sha256"], source_b["catalog_sha256"]
+            )
+            plan_path = evidence / "final-plan.json"
+            plan_path.write_bytes(canonical_bytes(plan) + b"\n")
+            protected_output = (
+                Path(source_b["catalog"]["snapshot"]["seal_path"]).parent
+                / "cutover-release.json"
+            )
+            release_arguments = build_parser().parse_args(
+                [
+                    "agent-verify",
+                    "--plan",
+                    str(plan_path),
+                    "--stage-receipt",
+                    str(evidence / "final-stage.json"),
+                    "--apply-receipt",
+                    str(evidence / "apply.json"),
+                    "--destination-verify-receipt",
+                    str(evidence / "destination-verify.json"),
+                    "--output",
+                    str(protected_output),
+                ]
+            )
+            with self.assertRaisesRegex(BulkloadError, "evidence output overlaps"):
+                _protect_output(release_arguments)
+            fake_ssh = fixture.root / "fake-ssh-live"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, shlex, sys\n"
+                "arguments=sys.argv[1:]\n"
+                "while arguments and arguments[0].startswith('-o'): arguments.pop(0)\n"
+                "if arguments and arguments[0] == '--': arguments.pop(0)\n"
+                "arguments.pop(0)\n"
+                "if len(arguments) == 1: arguments=shlex.split(arguments[0])\n"
+                "os.execv(arguments[0], arguments)\n",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            transport_stage = fixture.root / "transport-stage"
+            preseed_prepare = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=transport_stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+            )
+            preseed_transport = push_agent_transport(
+                preseed_prepare,
+                transport_stage / ".transport-allowlist-preseed.nul",
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=transport_stage,
+                destination_ssh_host=socket.gethostname(),
+                _ssh_binary=str(fake_ssh),
+            )
+            live_preseed = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=transport_stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="materialize",
+                prepare_receipt=preseed_prepare,
+                transport_receipt=preseed_transport,
+            )
+            self.assertFalse(live_preseed["ready_for_apply"])
+            prepare = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="final",
+                stage_root=transport_stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+            )
+
+            def mutate_during_push(
+                source: object, snapshot: object, **arguments: object
+            ) -> None:
+                _snapshot_allowlist_stream(source, snapshot, **arguments)
+                (fixture.source_home / ".codex" / "history.jsonl").write_text(
+                    '{"session_id":"during","text":"push"}\n', encoding="utf-8"
+                )
+
+            with mock.patch(
+                "bulkload_lib.executor._snapshot_allowlist_stream",
+                side_effect=mutate_during_push,
+            ):
+                with self.assertRaisesRegex(BulkloadError, "changed after immutable"):
+                    push_agent_transport(
+                        prepare,
+                        transport_stage / ".transport-allowlist-final.nul",
+                        accepted_plan_sha256=plan["plan_sha256"],
+                        phase="final",
+                        stage_root=transport_stage,
+                        destination_ssh_host=socket.gethostname(),
+                        _ssh_binary=str(fake_ssh),
+                    )
+            source_history.write_bytes(source_history_before)
+            final_transport = push_agent_transport(
+                prepare,
+                transport_stage / ".transport-allowlist-final.nul",
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="final",
+                stage_root=transport_stage,
+                destination_ssh_host=socket.gethostname(),
+                _ssh_binary=str(fake_ssh),
+            )
+            final = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="final",
+                stage_root=transport_stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="materialize",
+                prepare_receipt=prepare,
+                transport_receipt=final_transport,
+            )
+            applied = fixture.apply(plan, final)
+            destination_verified = verify_agent_plan(plan, final, applied)
+            self.assertTrue(destination_verified["verified"])
+            unavailable_stage = transport_stage.with_name("sting-only-stage")
+            shutil.move(transport_stage, unavailable_stage)
+            self.assertFalse(Path(final["stage_root"]).exists())
+            source_history.write_text(
+                '{"session_id":"after","text":"transport"}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(BulkloadError, "changed after immutable"):
+                verify_agent_plan(
+                    plan,
+                    final,
+                    applied,
+                    destination_verify_receipt=destination_verified,
+                )
+            source_history.write_bytes(source_history_before)
+            released = verify_agent_plan(
+                plan,
+                final,
+                applied,
+                destination_verify_receipt=destination_verified,
+            )
+            self.assertTrue(released["verified"])
+            self.assertEqual(released["verification_role"], "cutover-release")
+            self.assertEqual(
+                released["destination_verify_receipt_sha256"],
+                destination_verified["receipt_sha256"],
+            )
+            (fixture.source_home / ".codex" / "history.jsonl").write_text(
+                '{"session_id":"two","text":"live moved"}\n', encoding="utf-8"
+            )
+            preseed = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=fixture.stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+            )
+            self.assertFalse(preseed["ready_for_apply"])
+            with self.assertRaisesRegex(BulkloadError, "changed after immutable"):
+                stage_agent_plan(
+                    plan,
+                    accepted_plan_sha256=plan["plan_sha256"],
+                    phase="final",
+                    stage_root=fixture.stage,
+                    allow_accounted_copy=True,
+                    reserve_bytes=0,
+                )
+
     def test_rsync_binding_is_rehashed_on_every_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "rsync"
