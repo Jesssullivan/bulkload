@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -40,6 +41,7 @@ from .model import (
 DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
+MAX_CAPTURE_WORKSPACE_WORKERS = 3
 ZERO_OIDS = {"0" * 40, "0" * 64}
 HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
@@ -769,26 +771,93 @@ def _head_entries(worktree: Path) -> dict[str, tuple[str, str]]:
     return result
 
 
-def _git_blob_sha(repository: Path, oid: str, cache: dict[str, str]) -> str | None:
-    if oid in ZERO_OIDS:
-        return None
-    if oid in cache:
-        return cache[oid]
-    process = subprocess.Popen(
-        ["git", "-C", os.fspath(repository), "cat-file", "blob", oid],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=_git_environment(),
-    )
-    digest = hashlib.sha256()
-    assert process.stdout is not None
-    with process.stdout:
-        while chunk := process.stdout.read(1024 * 1024):
-            digest.update(chunk)
-    if process.wait() != 0:
-        raise BulkloadError("cannot inspect indexed Git blob")
-    cache[oid] = digest.hexdigest()
-    return cache[oid]
+class _GitBlobBatch:
+    """Hash indexed blobs through one persistent Git process per workspace."""
+
+    def __init__(self, repository: Path) -> None:
+        self._repository = repository
+        self._process: subprocess.Popen[bytes] | None = None
+        self._cache: dict[str, str] = {}
+
+    def __enter__(self) -> _GitBlobBatch:
+        return self
+
+    def __exit__(self, _kind: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+    def _start(self) -> subprocess.Popen[bytes]:
+        if self._process is None:
+            try:
+                self._process = subprocess.Popen(
+                    [
+                        "git",
+                        "-C",
+                        os.fspath(self._repository),
+                        "cat-file",
+                        "--batch",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=_git_environment(),
+                )
+            except OSError as error:
+                raise BulkloadError("Git is unavailable") from error
+        return self._process
+
+    def sha256(self, oid: str) -> str | None:
+        if oid in ZERO_OIDS:
+            return None
+        if not HEX_OID.fullmatch(oid):
+            raise BulkloadError("indexed Git blob has a malformed object ID")
+        if oid in self._cache:
+            return self._cache[oid]
+        process = self._start()
+        assert process.stdin is not None
+        assert process.stdout is not None
+        try:
+            process.stdin.write(oid.encode("ascii") + b"\n")
+            process.stdin.flush()
+            header = process.stdout.readline()
+            fields = header.rstrip(b"\n").split(b" ")
+            if len(fields) != 3 or fields[1] != b"blob":
+                raise BulkloadError("cannot inspect indexed Git blob")
+            resolved_oid = fields[0].decode("ascii", errors="strict")
+            size = int(fields[2])
+            if not HEX_OID.fullmatch(resolved_oid) or size < 0:
+                raise BulkloadError("cannot inspect indexed Git blob")
+            digest = hashlib.sha256()
+            remaining = size
+            while remaining:
+                chunk = process.stdout.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise BulkloadError("cannot inspect indexed Git blob")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if process.stdout.read(1) != b"\n":
+                raise BulkloadError("cannot inspect indexed Git blob")
+        except (BrokenPipeError, OSError, UnicodeDecodeError, ValueError) as error:
+            raise BulkloadError("cannot inspect indexed Git blob") from error
+        self._cache[oid] = digest.hexdigest()
+        return self._cache[oid]
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise BulkloadError("cannot close indexed Git blob inspection") from None
+        if returncode != 0:
+            raise BulkloadError("cannot close indexed Git blob inspection")
 
 
 def _capture_worktree(
@@ -799,6 +868,7 @@ def _capture_worktree(
     nested_roots: set[Path],
     max_files: int,
     max_bytes: int,
+    blob_batch: _GitBlobBatch,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     path = resolve_real(Path(worktree_record["path"]))
     git_dir = resolve_real(
@@ -853,7 +923,6 @@ def _capture_worktree(
     by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in index_entries:
         by_path[entry["path"]].append(entry)
-    blob_cache: dict[str, str] = {}
     file_map = {
         entry["relative_path"]: entry
         for entry in entries
@@ -886,7 +955,7 @@ def _capture_worktree(
         if stage_zero is not None and file_entry is not None:
             expected_kind = "symlink" if stage_zero["mode"] == "120000" else "regular"
             expected_mode = "0755" if stage_zero["mode"] == "100755" else "0644"
-            expected_sha = _git_blob_sha(path, stage_zero["oid"], blob_cache)
+            expected_sha = blob_batch.sha256(stage_zero["oid"])
             modified = (
                 file_entry["kind"] != expected_kind
                 or file_entry["sha256"] != expected_sha
@@ -1000,29 +1069,31 @@ def _capture_workspace(
     worktrees: list[dict[str, Any]] = []
     blockers: list[dict[str, str]] = []
     git_dirs: list[Path] = []
-    for record in worktree_inventory:
-        if record.get("bare"):
-            continue
-        try:
-            captured, observed_blockers = _capture_worktree(
-                record,
-                path_map=path_map,
-                role=role,
-                nested_roots=nested_roots,
-                max_files=max_files,
-                max_bytes=max_bytes,
-            )
-            worktrees.append(captured)
-            git_dirs.append(Path(captured["git_dir"]))
-            blockers.extend(observed_blockers)
-        except BulkloadError as error:
-            blockers.append(
-                {
-                    "code": "worktree-capture-failed",
-                    "path": record.get("path", "redacted"),
-                    "detail": str(error),
-                }
-            )
+    with _GitBlobBatch(representative) as blob_batch:
+        for record in worktree_inventory:
+            if record.get("bare"):
+                continue
+            try:
+                captured, observed_blockers = _capture_worktree(
+                    record,
+                    path_map=path_map,
+                    role=role,
+                    nested_roots=nested_roots,
+                    max_files=max_files,
+                    max_bytes=max_bytes,
+                    blob_batch=blob_batch,
+                )
+                worktrees.append(captured)
+                git_dirs.append(Path(captured["git_dir"]))
+                blockers.extend(observed_blockers)
+            except BulkloadError as error:
+                blockers.append(
+                    {
+                        "code": "worktree-capture-failed",
+                        "path": record.get("path", "redacted"),
+                        "detail": str(error),
+                    }
+                )
     object_format = (
         _git(representative, ["rev-parse", "--show-object-format"]).decode().strip()
     )
@@ -1892,11 +1963,19 @@ def capture_agent_state(
                         "detail": str(error),
                     }
                 )
-    workspaces: list[dict[str, Any]] = []
+    workspace_inputs = sorted(by_common.items(), key=lambda item: os.fspath(item[1]))
     nested_roots = set(discovered)
-    for common, representative in sorted(
-        by_common.items(), key=lambda item: os.fspath(item[1])
-    ):
+
+    def capture_workspace(
+        item: tuple[Path, Path],
+    ) -> tuple[
+        Path,
+        Path,
+        tuple[dict[str, Any], list[dict[str, str]]]
+        | _OpaqueGitFallback
+        | BulkloadError,
+    ]:
+        common, representative = item
         try:
             workspace, workspace_blockers = _capture_workspace(
                 representative,
@@ -1907,9 +1986,23 @@ def capture_agent_state(
                 max_files=max_files,
                 max_bytes=max_bytes,
             )
+            return common, representative, (workspace, workspace_blockers)
+        except (_OpaqueGitFallback, BulkloadError) as error:
+            return common, representative, error
+
+    workspace_workers = min(MAX_CAPTURE_WORKSPACE_WORKERS, len(workspace_inputs))
+    if workspace_workers:
+        with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
+            workspace_results = list(pool.map(capture_workspace, workspace_inputs))
+    else:
+        workspace_results = []
+    workspaces: list[dict[str, Any]] = []
+    for common, representative, result in workspace_results:
+        if isinstance(result, tuple):
+            workspace, workspace_blockers = result
             workspaces.append(workspace)
             blockers.extend(workspace_blockers)
-        except _OpaqueGitFallback:
+        elif isinstance(result, _OpaqueGitFallback):
             roots = roots_by_common[common]
             if any(common == root or root in common.parents for root in roots):
                 opaque_git_roots.update(roots)
@@ -1921,12 +2014,12 @@ def capture_agent_state(
                         "detail": "opaque Git authority is outside the captured fleet",
                     }
                 )
-        except BulkloadError as error:
+        else:
             blockers.append(
                 {
                     "code": "git-workspace-capture-failed",
                     "path": os.fspath(representative),
-                    "detail": str(error),
+                    "detail": str(result),
                 }
             )
     non_git, non_git_blockers = _walk_entries(

@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -50,6 +51,7 @@ from bulkload_lib.scanner import (
     inspect_rsync,
     stable_capture_pair,
 )
+import bulkload_lib.scanner as scanner
 
 
 def git(path: Path, *arguments: str) -> bytes:
@@ -505,6 +507,66 @@ class SchemaAndCaptureTests(unittest.TestCase):
             self.assertIn("source_ref", git_operation)
             self.assertNotIn("source", git_operation)
             self.assertNotIn("destination_before", git_operation)
+
+    def test_git_blob_hashing_uses_one_batch_process_for_linked_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            linked = fixture.source_git / "repo-linked"
+            git(fixture.source_repo, "worktree", "add", "--detach", str(linked), "HEAD")
+
+            def legacy_sha(batch, oid):
+                if oid in scanner.ZERO_OIDS:
+                    return None
+                process = subprocess.Popen(
+                    ["git", "-C", str(batch._repository), "cat-file", "blob", oid],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=scanner._git_environment(),
+                )
+                digest = hashlib.sha256()
+                assert process.stdout is not None
+                with process.stdout:
+                    while chunk := process.stdout.read(1024 * 1024):
+                        digest.update(chunk)
+                self.assertEqual(process.wait(), 0)
+                return digest.hexdigest()
+
+            with mock.patch.object(scanner._GitBlobBatch, "sha256", legacy_sha):
+                legacy_capture = fixture.capture("source")
+            with mock.patch(
+                "bulkload_lib.scanner.subprocess.Popen", wraps=subprocess.Popen
+            ) as popen:
+                capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            self.assertEqual(capture["catalog"], legacy_capture["catalog"])
+            self.assertEqual(
+                capture["catalog_sha256"], legacy_capture["catalog_sha256"]
+            )
+            batch_commands = [
+                invocation.args[0]
+                for invocation in popen.call_args_list
+                if invocation.args
+                and invocation.args[0][-2:] == ["cat-file", "--batch"]
+            ]
+            self.assertEqual(len(batch_commands), 1)
+
+    def test_independent_git_workspaces_capture_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            initialize_repository(fixture.source_git / "second-repo")
+            original = scanner._capture_workspace
+            barrier = threading.Barrier(2, timeout=10)
+
+            def synchronized(*args, **kwargs):
+                barrier.wait()
+                return original(*args, **kwargs)
+
+            with mock.patch(
+                "bulkload_lib.scanner._capture_workspace", side_effect=synchronized
+            ):
+                capture = fixture.capture("source")
+            self.assertTrue(capture["complete"], capture["catalog"]["blockers"])
+            self.assertEqual(len(capture["catalog"]["git_workspaces"]), 2)
 
     def test_invalid_git_candidate_falls_back_to_exact_non_git(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

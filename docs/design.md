@@ -55,6 +55,12 @@ All four capture IDs must differ. Writers must be operator-quiesced throughout
 each capture; this is a procedural fence, not proof that a provider process was
 stopped.
 
+Capture evaluates at most three independent common Git authorities in parallel.
+Each authority uses one persistent `git cat-file --batch` reader and one object
+digest cache shared by all of its linked worktrees; `git fsck --full` still runs
+once per common authority. Results are sorted before sealing, so scheduling does
+not affect canonical evidence bytes.
+
 Declared provider descendants default to portable-private after exact managed
 exclusions and regenerate pruning. Readable invalid Git candidates and
 workspaces whose only typed failure is alternates or `git fsck` retain exact
