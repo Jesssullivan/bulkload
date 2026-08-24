@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +22,7 @@ from .model import (
     AGENT_CAPTURE_SCHEMA,
     GIT_WORKSPACE_SCHEMA,
     BulkloadError,
+    QuiescenceRefusal,
     canonical_bytes,
     new_id,
     normalize_relative,
@@ -44,6 +46,15 @@ ZERO_OIDS = {"0" * 40, "0" * 64}
 HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+DWELL_SECONDS = 2.0
+STALE_SHM_SECONDS = 3600.0
+MAX_QUIESCENCE_WITNESSES = 65_536
+QUIESCENCE_WITNESS_LEAVES = ("history.jsonl",)
+GIT_QUIESCENCE_WITNESS_LEAVES = ("HEAD", "index")
+QUIESCENCE_REMEDIES = {
+    None: "the operator must end the writer",
+    "declared-root-unavailable": "the operator must restore this root",
+}
 GIT_OPERATION_MARKERS = {
     "BISECT_LOG": "bisect",
     "CHERRY_PICK_HEAD": "cherry-pick",
@@ -306,6 +317,213 @@ def _stable_stat(path: Path) -> tuple[int, ...]:
         info.st_size,
         info.st_mtime_ns,
         info.st_ctime_ns,
+    )
+
+
+def _sqlite_family_member(name: str) -> bool:
+    """Report whether a leaf name is a SQLite primary or one of its sidecars."""
+    primary = _sqlite_primary(name)
+    return primary is not None and primary.lower().endswith(SQLITE_SUFFIXES)
+
+
+def _excluded_probe_paths(entries: Iterable[Path]) -> frozenset[str]:
+    """Normalize reviewed managed exclusions to absolute probe paths."""
+    return frozenset(
+        os.path.abspath(os.fspath(Path(entry).expanduser())) for entry in entries
+    )
+
+
+def _quiescence_witnesses(
+    roots: Iterable[Path], *, excluded: Iterable[Path] = ()
+) -> tuple[list[Path], list[dict[str, str]]]:
+    """Collect the bounded, deterministic witness set of the quiet-window probe.
+
+    The set is every SQLite family member, every provider history journal, and
+    the Git authority files of every workspace. Only metadata is ever read. A
+    reviewed managed exclusion is never captured, so it contributes no witness.
+
+    A declared root that exists but cannot be read is a refusal, not a silent
+    skip. An unmounted backing volume otherwise reads as an empty quiet root.
+    """
+    skip = _excluded_probe_paths(excluded)
+    witnesses: set[Path] = set()
+    unavailable: list[dict[str, str]] = []
+
+    def consider(path: Path, name: str) -> None:
+        if os.fspath(path) in skip:
+            return
+        if name in QUIESCENCE_WITNESS_LEAVES or _sqlite_family_member(name):
+            witnesses.add(path)
+
+    for declared in roots:
+        root = Path(os.path.abspath(os.fspath(declared.expanduser())))
+        if os.fspath(root) in skip:
+            continue
+        try:
+            kind = stat.S_IFMT(root.stat(follow_symlinks=True).st_mode)
+        except OSError as error:
+            if not os.path.lexists(root):
+                continue
+            unavailable.append(
+                {
+                    "code": "declared-root-unavailable",
+                    "kind": "refusal",
+                    "path": os.fspath(root),
+                    "detail": (
+                        "this declared root exists but cannot be read"
+                        f" ({error.strerror or type(error).__name__});"
+                        " an absent backing volume reads as an empty quiet root"
+                    ),
+                }
+            )
+            continue
+        if kind == stat.S_IFREG:
+            consider(root, root.name)
+            continue
+        if kind != stat.S_IFDIR:
+            continue
+        for current_text, directories, names in os.walk(
+            root, topdown=True, followlinks=False, onerror=lambda _error: None
+        ):
+            current = Path(current_text)
+            if skip:
+                directories[:] = [
+                    name
+                    for name in directories
+                    if os.fspath(current / name) not in skip
+                ]
+            if ".git" in directories:
+                directories.remove(".git")
+                for leaf in GIT_QUIESCENCE_WITNESS_LEAVES:
+                    candidate = current / ".git" / leaf
+                    if os.path.lexists(candidate):
+                        witnesses.add(candidate)
+            for name in names:
+                consider(current / name, name)
+            if len(witnesses) > MAX_QUIESCENCE_WITNESSES:
+                raise BulkloadError("quiescence witness budget exceeded")
+    return sorted(witnesses, key=os.fspath), unavailable
+
+
+def _lock_residue_blockers(witnesses: Sequence[Path]) -> list[dict[str, str]]:
+    """Judge a shared-memory sidecar by its age, never a write-ahead log.
+
+    SQLite unlinks both sidecars when the last connection closes cleanly, so a
+    recent shared-memory file means a live writer, or one that died moments ago.
+    That is a refusal. An older shared-memory file is unclean-exit debris with
+    no writer left to end, so the probe records it and continues. A live
+    write-ahead log is a ratified capture input and is never a blocker.
+    """
+    now = time.time()
+    observations: list[dict[str, str]] = []
+    for path in witnesses:
+        if not os.fspath(path).endswith("-shm"):
+            continue
+        try:
+            age = now - path.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            age = 0.0
+        if age > STALE_SHM_SECONDS:
+            observations.append(
+                {
+                    "code": "stale-shm-orphan",
+                    "kind": "warning",
+                    "path": os.fspath(path),
+                    "detail": (
+                        "an unclean exit left this shared-memory sidecar; no"
+                        " writer remains to end, so the probe does not refuse"
+                    ),
+                }
+            )
+            continue
+        observations.append(
+            {
+                "code": "live-sqlite-connection",
+                "kind": "refusal",
+                "path": os.fspath(path),
+                "detail": (
+                    "an open connection, or a writer that stopped within the"
+                    " last hour, holds this state; the owner must exit cleanly"
+                    " before capture"
+                ),
+            }
+        )
+    return observations
+
+
+def _witness_sample(witnesses: Sequence[Path]) -> dict[str, tuple[int, ...] | None]:
+    sample: dict[str, tuple[int, ...] | None] = {}
+    for path in witnesses:
+        try:
+            sample[os.fspath(path)] = _stable_stat(path)
+        except OSError:
+            sample[os.fspath(path)] = None
+    return sample
+
+
+def _stillness_blockers(
+    witnesses: Sequence[Path], *, dwell_seconds: float
+) -> list[dict[str, str]]:
+    """Compare two metadata samples of the witness set across one dwell.
+
+    Observed stillness is evidence, never proof. A suspended writer is
+    maximally still and still holds every lock it took.
+    """
+    if not witnesses:
+        return []
+    first = _witness_sample(witnesses)
+    time.sleep(dwell_seconds)
+    second = _witness_sample(witnesses)
+    return [
+        {
+            "code": "witness-motion-observed",
+            "kind": "refusal",
+            "path": path,
+            "detail": "this entry changed while the capture roots were observed",
+        }
+        for path in sorted(first)
+        if first[path] != second[path]
+    ]
+
+
+def observe_quiet_window(
+    roots: Iterable[Path],
+    *,
+    dwell_seconds: float = DWELL_SECONDS,
+    excluded: Iterable[Path] = (),
+) -> list[dict[str, str]]:
+    """Observe the declared capture roots read-only and report every finding.
+
+    Each observation carries a `kind`. A `refusal` stops the command. A
+    `warning` is recorded and does not stop it. The probe reads metadata only.
+    It writes nothing. It inspects no process table, and it never asks any
+    process to change state.
+    """
+    witnesses, observations = _quiescence_witnesses(roots, excluded=excluded)
+    observations.extend(_lock_residue_blockers(witnesses))
+    observations.extend(_stillness_blockers(witnesses, dwell_seconds=dwell_seconds))
+    return sorted(observations, key=lambda item: (item["code"], item["path"]))
+
+
+def require_quiet_window(
+    roots: Iterable[Path],
+    *,
+    dwell_seconds: float = DWELL_SECONDS,
+    excluded: Iterable[Path] = (),
+) -> None:
+    """Fail closed before any capture work when a declared root is not quiet."""
+    observations = observe_quiet_window(
+        roots, dwell_seconds=dwell_seconds, excluded=excluded
+    )
+    refusals = [item for item in observations if item["kind"] == "refusal"]
+    if not refusals:
+        return
+    first = refusals[0]
+    remedy = QUIESCENCE_REMEDIES.get(first["code"], QUIESCENCE_REMEDIES[None])
+    raise QuiescenceRefusal(
+        f"{first['code']}: {first['path']}"
+        f" ({len(refusals)} observation(s); {remedy}, then re-run this command"
+        " unchanged)"
     )
 
 
@@ -1821,6 +2039,7 @@ def capture_agent_state(
     writers_quiesced: bool,
     managed_exclusions: Sequence[tuple[str, str]] = (),
     rsync_path: Path | None = None,
+    dwell_seconds: float = DWELL_SECONDS,
     max_files: int = DEFAULT_MAX_FILES,
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
@@ -1839,14 +2058,27 @@ def capture_agent_state(
         raise BulkloadError("AgentCaptureV4 requires an explicit path map")
     if rsync_path is None:
         raise BulkloadError("AgentCaptureV4 requires an explicit pinned rsync path")
-    transport = {
-        "hostname": socket.gethostname(),
-        "rsync": inspect_rsync(os.fspath(rsync_path)),
+    provider_roots = {
+        "codex": codex_root or home / ".codex",
+        "claude": claude_root or home / ".claude",
+        "pi": pi_root or home / ".pi" / "agent",
     }
     provider_policy = canonical_provider_policy(managed_exclusions)
     exclusions = defaultdict(list)
     for item in provider_policy["managed_exclusions"]:
         exclusions[item["provider"]].append(item["relative_path"])
+    require_quiet_window(
+        [git_root, *provider_roots.values(), *(seat[1] for seat in seats)],
+        dwell_seconds=dwell_seconds,
+        excluded=[
+            provider_roots[item["provider"]] / item["relative_path"]
+            for item in provider_policy["managed_exclusions"]
+        ],
+    )
+    transport = {
+        "hostname": socket.gethostname(),
+        "rsync": inspect_rsync(os.fspath(rsync_path)),
+    }
     blockers: list[dict[str, str]] = []
     discovered, discovery_blockers = _discover_git_roots(git_root)
     blockers.extend(discovery_blockers)
@@ -1990,11 +2222,6 @@ def capture_agent_state(
     for entry in non_git:
         entry["destination_relative_path"] = entry["relative_path"]
         entry["identity"] = entry["relative_path"]
-    provider_roots = {
-        "codex": codex_root or home / ".codex",
-        "claude": claude_root or home / ".claude",
-        "pi": pi_root or home / ".pi" / "agent",
-    }
     providers: list[dict[str, Any]] = []
     for provider, root in provider_roots.items():
         try:

@@ -52,6 +52,25 @@ SUPERSEDED_NAMES = {
     "private_state.py",
     "sessions.py",
 }
+FORBIDDEN_RUNTIME_PATTERNS = (
+    r"\bos\.kill\b",
+    r"\bsignal\.SIG",
+    r"\.send_signal\s*\(",
+    r"\bkillpg\s*\(",
+    r"\bpkill\b",
+    r"\bkillall\b",
+    r"\bSIGSTOP\b",
+    r"\bSIGCONT\b",
+    r"\bSIGTERM\b",
+    r"\bSIGKILL\b",
+    r"\bSIGHUP\b",
+    r"\bkill\b",
+    r"\blaunchctl\b",
+    r"\bsystemctl\b",
+    r"force[-_]quiesce",
+    r"skip[-_]quiescence",
+    r"assume[-_]quiet",
+)
 LINK = re.compile(r"\[[^]]+\]\(([^)]+)\)")
 
 
@@ -171,6 +190,11 @@ def validate(skill_root: Path, *, allow_runfiles_symlinks: bool = False) -> None
             raise SkillContractError(
                 f"superseded fail-held contract remains: {forbidden}"
             )
+    for pattern in FORBIDDEN_RUNTIME_PATTERNS:
+        if re.search(pattern, combined):
+            raise SkillContractError(
+                f"runtime must not control unowned processes: {pattern}"
+            )
 
 
 def self_test() -> None:
@@ -190,6 +214,21 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("dynamic CLI command escaped validation")
+    for sample in (
+        "os.kill(pid, 0)",
+        "parser.add_argument('--assume-quiet')",
+        'subprocess.run(["kill", "-TERM", pid])',
+        'subprocess.run(["launchctl", "bootout", label])',
+    ):
+        if not any(
+            re.search(pattern, sample) for pattern in FORBIDDEN_RUNTIME_PATTERNS
+        ):
+            raise AssertionError("process-control scanner failed")
+    if any(
+        re.search(pattern, "subprocess.run(arguments, check=False)\nskill_root = root")
+        for pattern in FORBIDDEN_RUNTIME_PATTERNS
+    ):
+        raise AssertionError("process-control scanner is overbroad")
 
 
 def main() -> int:

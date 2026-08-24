@@ -111,6 +111,20 @@ py_test(
     ],
 )
 
+py_test(
+    name = "ceremony_contract_test",
+    legacy_create_init = 0,
+    main = "tests/test_ceremony_contract.py",
+    size = "small",
+    srcs = ["tests/test_ceremony_contract.py"],
+    data = [
+        "MODULE.bazel",
+        "README.md",
+        "scripts/validate_skill.py",
+        ":skill_bundle",
+    ],
+)
+
 filegroup(
     name = "skill_bundle",
     srcs = glob([".agents/skills/bulkload/**"]),
@@ -122,6 +136,7 @@ test_suite(
     tests = [
         ":bazel_binary_smoke_test",
         ":bulkload_tests",
+        ":ceremony_contract_test",
         ":ci_contract_test",
         ":installer_test",
         ":repo_contract_test",
