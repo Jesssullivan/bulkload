@@ -2784,22 +2784,45 @@ def _remove_snapshot_published(path: Path, snapshot_id: str) -> None:
     fsync_directory(path.parent)
 
 
-def _git_live_generation(git_root: Path) -> str:
+def _live_git_authorities(git_root: Path) -> list[tuple[Path, Path]]:
     repositories, blockers = _discover_git_roots(git_root)
     if blockers:
         raise BulkloadError("Git namespace is not convergent for live snapshot")
-    authorities: dict[str, Path] = {}
+    authorities: list[tuple[Path, Path]] = []
     for repository in repositories:
-        common = resolve_real(
-            Path(
-                _git(
-                    repository,
-                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        if not _within(repository, git_root):
+            raise BulkloadError("Git worktree authority is outside live snapshot root")
+        try:
+            common = resolve_real(
+                Path(
+                    _git(
+                        repository,
+                        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    )
+                    .decode()
+                    .strip()
                 )
-                .decode()
-                .strip()
             )
-        )
+        except BulkloadError as error:
+            if (
+                str(error) == "Git inspection command failed (rev-parse)"
+                and not _gitfile_declares_authority(repository)
+            ):
+                # Canonical capture preserves this false discovery as opaque
+                # bytes. The enclosing Git root is copied in full below, so it
+                # remains inside immutable snapshot custody without becoming
+                # Git control-file authority.
+                continue
+            raise
+        if not _within(common, git_root):
+            raise BulkloadError("Git common authority is outside live snapshot root")
+        authorities.append((repository, common))
+    return authorities
+
+
+def _git_live_generation(git_root: Path) -> str:
+    authorities: dict[str, Path] = {}
+    for repository, common in _live_git_authorities(git_root):
         authorities.setdefault(os.fspath(common), repository)
     rows = []
     for common, repository in sorted(authorities.items()):
@@ -2848,25 +2871,10 @@ def _within(path: Path, root: Path) -> bool:
 
 def _git_snapshot_authorities(git_root: Path) -> tuple[list[Path], list[Path]]:
     """Bind every Git admin/worktree authority and the exact link files to rewrite."""
-    repositories, blockers = _discover_git_roots(git_root)
-    if blockers:
-        raise BulkloadError("Git namespace is not convergent for live snapshot")
+    authorities = _live_git_authorities(git_root)
+    repositories = [repository for repository, _ in authorities]
     controls: set[Path] = set()
-    for repository in repositories:
-        if not _within(repository, git_root):
-            raise BulkloadError("Git worktree authority is outside live snapshot root")
-        common = resolve_real(
-            Path(
-                _git(
-                    repository,
-                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                )
-                .decode()
-                .strip()
-            )
-        )
-        if not _within(common, git_root):
-            raise BulkloadError("Git common authority is outside live snapshot root")
+    for repository, _common in authorities:
         git_entry = repository / ".git"
         if git_entry.is_file() and _gitfile_declares_authority(repository):
             controls.add(git_entry)

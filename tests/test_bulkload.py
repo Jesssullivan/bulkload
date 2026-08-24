@@ -330,6 +330,78 @@ class CutoverFixture:
 
 
 class SchemaAndCaptureTests(unittest.TestCase):
+    def test_live_snapshot_preserves_opaque_nested_false_git_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            opaque = fixture.source_repo / ".cache" / "uv" / "archive"
+            (opaque / ".git").mkdir(parents=True)
+            (opaque / ".git" / "opaque").write_bytes(b"not Git authority\n")
+            (opaque / "payload.whl").write_bytes(b"opaque payload\n")
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            real_git = scanner._git
+
+            def reject_false_discovery(
+                path: Path, arguments: list[str], **kwargs: object
+            ) -> bytes:
+                if (
+                    tuple(Path(path).parts[-3:]) == (".cache", "uv", "archive")
+                    and arguments[0] == "rev-parse"
+                ):
+                    raise BulkloadError("Git inspection command failed (rev-parse)")
+                return real_git(path, arguments, **kwargs)
+
+            with mock.patch.object(scanner, "_git", side_effect=reject_false_discovery):
+                capture = capture_agent_state(
+                    role="source",
+                    home=fixture.source_home,
+                    git_root=fixture.source_git,
+                    codex_root=None,
+                    claude_root=None,
+                    pi_root=None,
+                    seats=fixture.source_seats,
+                    path_map=fixture.path_map,
+                    writers_quiesced=False,
+                    snapshot_root=snapshot_root,
+                    managed_exclusions=fixture.managed_exclusions,
+                    rsync_path=fixture.rsync_path,
+                    max_files=50_000,
+                    max_bytes=4 * 1024**3,
+                    max_sqlite_rows=100_000,
+                    snapshot_reserve_bytes=0,
+                )
+
+            validate_agent_capture(capture, expected_role="source")
+            preserved = (
+                snapshot_root
+                / "roots"
+                / "git"
+                / "repo"
+                / ".cache"
+                / "uv"
+                / "archive"
+                / "payload.whl"
+            )
+            self.assertEqual(preserved.read_bytes(), b"opaque payload\n")
+
+    def test_live_snapshot_refuses_failed_declared_gitfile_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            git_root = Path(temporary).resolve() / "git"
+            repository = git_root / "declared"
+            repository.mkdir(parents=True)
+            (repository / ".git").write_text(
+                "gitdir: /missing/declared-authority\n", encoding="utf-8"
+            )
+
+            for inspect in (
+                scanner._git_snapshot_authorities,
+                scanner._git_live_generation,
+            ):
+                with self.subTest(inspect=inspect.__name__):
+                    with self.assertRaisesRegex(
+                        BulkloadError, "Git inspection command failed \\(rev-parse\\)"
+                    ):
+                        inspect(git_root)
+
     def test_live_snapshot_git_authority_accepts_unborn_absent_index_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             git_root = Path(temporary).resolve() / "git"
