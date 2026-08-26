@@ -23,10 +23,15 @@ operation is read-only.
   nonportable hold. Descendants of a declared provider root default to typed
   portable-private state; special entries, unsafe typed state, and structural
   collisions stop planning.
-- Writers are briefly quiesced for each stable capture pair. They may resume
-  during preliminary preseed; final authority comes from fresh quiesced source
-  and destination captures and a fresh plan. Keep writers stopped for final
-  stage, apply, verify, rollback, and recovery. SQLite/WAL state uses the backup
+- Writers are never signaled or stopped. Each stable capture pair is taken over
+  immutable-live snapshot custody: A seals a snapshot, and B binds A's exact
+  `snapshot-seal.json` through `--snapshot-base-seal`. Preliminary writers work
+  normally through preseed. Final authority comes from fresh live A/base-B
+  captures and a fresh plan taken inside an attended no-interaction interval
+  that runs from before final source B through Neo's cutover-release receipt;
+  processes stay alive throughout. `--acknowledge-writers-quiesced` is the
+  opt-out for an already-still root and forgoes snapshot custody entirely.
+  SQLite/WAL state uses the backup
   API, composed only when schema and shared primary-key rows agree, and checked
   independently before a final receipt. Offline receipts still require a fresh
   attended provider turn before claiming runtime authentication.
@@ -39,7 +44,8 @@ operation is read-only.
   fall back to a full duplicate. Preseed writes only beneath its external stage
   root and must not mutate any live destination path.
 - Never apply a plan without an exact plan digest supplied by the operator.
-- Require two byte-stable source catalogs before creating an actionable plan.
+- Require four stable catalogs — source A/B and destination A/B, four distinct
+  capture IDs — before creating an actionable plan.
 - Treat Git refs/objects, worktree bytes, worktree administration, agent
   transcripts, generated caches, and authentication as separate state classes.
 - Do not infer worktree identity from a basename; record path, branch, HEAD,

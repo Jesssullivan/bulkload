@@ -111,7 +111,7 @@ nofollow link proofs. Translation uses logical paths; writes use backings, so
 Sting's Home Manager `.codex`, `.claude`, `.gstack`, and `git` links remain.
 AgentPlanV4 retains each catalog once; operations bind catalog identities rather
 than embedding repeated workspace or provider records.
-Capture, plan, and receipt JSON have a hard 4 GiB ceiling. When the four input
+Capture, plan, and receipt JSON have a hard 16 GiB ceiling. When the four input
 captures total more than 512 MiB, planning is destination-only: Neo pushes the
 source evidence to Sting, and Sting must expose at least four times the combined
 input size plus 2 GiB as `MemAvailable`. A and B are loaded and released

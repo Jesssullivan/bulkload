@@ -169,20 +169,27 @@ bulkload agent-stage --phase preseed --transport-mode prepare \
   --output /home/jess/.bulkload-evidence/preseed-prepare.json
 ```
 
-Neo pulls that exact receipt over its existing outbound authentication, then
-pushes the digest-bound allowlist and bytes. No destination live path changes:
+Neo pulls that exact receipt *and* the sealed allowlist `prepare` wrote beside
+the stage root, then pushes the digest-bound allowlist and bytes. `push` takes
+the prepare receipt, the allowlist, and the destination host; passing `--plan`
+or `--transport-receipt` to `push` is rejected. Preserve the allowlist's 0600
+mode on the pull. No destination live path changes:
 
 ```bash
 RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
   --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
   jess@sting:/home/jess/.bulkload-evidence/preseed-prepare.json \
   /secure/evidence/preseed-prepare.json
+RSYNC_RSH="$SSH_RSH" "$RSYNC" -a --checksum --delay-updates \
+  --no-devices --no-specials --rsync-path="$DEST_RSYNC" \
+  "jess@sting:$STAGE/.transport-allowlist-preseed.nul" \
+  /secure/evidence/.transport-allowlist-preseed.nul
 
 bulkload agent-stage --phase preseed --transport-mode push \
-  --plan /secure/evidence/preliminary-plan.json \
   --accept-plan-sha256 "$PLAN_SHA256" --stage-root "$STAGE" \
   --destination-ssh-host jess@sting \
   --prepare-receipt /secure/evidence/preseed-prepare.json \
+  --transport-allowlist /secure/evidence/.transport-allowlist-preseed.nul \
   --output /secure/evidence/preseed-push.json
 ```
 

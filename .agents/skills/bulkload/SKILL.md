@@ -115,6 +115,10 @@ Every transfer still originates on Neo.
 - the capacity formula; and
 - the exact `plan_sha256`.
 
+Every `--accept-plan-sha256` value is the **embedded** `plan_sha256` field
+inside the plan JSON — the seal over the body with that field removed. It is
+never the sha256 of the plan file itself; `sha256sum plan.json` will not match.
+
 Source bytes, Git dirt/deletions, non-Git files, portable state, and divergent
 append state overwrite with exact `destination_before` rollback custody.
 Compatible SQLite rows union; schema/shared-row/key ambiguity uses a reversible
@@ -143,8 +147,14 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode prepare \
   --output /home/jess/.bulkload-evidence/preseed-prepare.json
 ```
 
-On Neo, after pulling that exact receipt and its sibling
-`.transport-allowlist-preseed.nul` over the same Neo-originated connection:
+On Neo, after pulling that exact receipt and the sealed allowlist
+`prepare` wrote at `STAGE_ROOT/.transport-allowlist-preseed.nul` over the same
+Neo-originated connection. Preserve the allowlist's 0600 mode and exact bytes;
+push rejects any other custody. Push takes only the prepare receipt, the
+allowlist, and the destination host — `--plan` and `--transport-receipt` are
+rejected here — and must run on the host named in the captured source
+`transport.hostname`, with `--destination-ssh-host` naming exactly the captured
+destination hostname:
 
 ```bash
 scripts/bulkload.py agent-stage --phase preseed --transport-mode push \
@@ -152,7 +162,7 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode push \
   --stage-root /srv/fast-local/jess/bulkload/stage \
   --destination-ssh-host jess@sting \
   --prepare-receipt /secure/evidence/preseed-prepare.json \
-  --transport-allowlist /secure/evidence/preseed-allowlist.nul \
+  --transport-allowlist /secure/evidence/.transport-allowlist-preseed.nul \
   --output /secure/evidence/preseed-push.json
 ```
 
