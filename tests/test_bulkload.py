@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,12 +12,15 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
+import tracemalloc
 import unittest
 from unittest import mock
 
-from bulkload_lib.cli import _agent_plan, _protect_output, build_parser
+from bulkload_lib.cli import _agent_plan, _protect_output, _write, build_parser
+import bulkload_lib.cli as cli
 from bulkload_lib.executor import (
     _git,
     _git_worktree_state,
@@ -33,16 +37,27 @@ from bulkload_lib.model import (
     AGENT_CAPTURE_SCHEMA,
     AGENT_PLAN_SCHEMA,
     GIT_WORKSPACE_SCHEMA,
+    MAX_JSON_BYTES,
     BulkloadError,
+    HexRecords,
     canonical_bytes,
+    canonical_chunks,
+    canonical_length,
+    canonical_sha256,
     fsync_directory,
+    ordered_prefix_relation,
+    read_json,
     reflink_clone,
     require_capacity,
     require_digest,
     sha256_bytes,
     translate_path,
 )
-from bulkload_lib.planner import compile_agent_plan, materialize_plan_operation
+from bulkload_lib.planner import (
+    _append_relation,
+    compile_agent_plan,
+    materialize_plan_operation,
+)
 from bulkload_lib.scanner import (
     _capture_provider,
     canonical_path_map,
@@ -651,8 +666,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
     def _index_records(snapshot: dict) -> list[dict]:
         index = Path(snapshot["seal_path"]).parent / "snapshot-index.jsonl"
         return [
-            json.loads(line)
-            for line in index.read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in index.read_text(encoding="utf-8").splitlines()
         ]
 
     @staticmethod
@@ -699,9 +713,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
             # Observationally invisible: identical custody, entry for entry.
             self._assert_same_custody(memo_snapshot, plain_snapshot)
             self.assertEqual(memo_records, self._index_records(plain_snapshot))
-            self.assertTrue(
-                any(record["kind"] == "regular" for record in memo_records)
-            )
+            self.assertTrue(any(record["kind"] == "regular" for record in memo_records))
 
             # ... and it really is a memo: the un-memoized run re-reads more.
             self.assertGreater(reads[-1], memo_reads)
@@ -730,9 +742,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 rewrites.append(count)
                 return count
 
-            with mock.patch.object(
-                scanner, "_rewrite_git_snapshot_links", counting
-            ):
+            with mock.patch.object(scanner, "_rewrite_git_snapshot_links", counting):
                 capture = self._live_capture(fixture, snapshot_root)
             self.assertEqual(rewrites, [2])
 
@@ -3759,6 +3769,428 @@ class PreflightAndDiagnosticsTests(unittest.TestCase):
                 canonical_bytes(without_runtime),
                 canonical_bytes(pinned_without_runtime),
             )
+
+
+class StreamingSealTest(unittest.TestCase):
+    """The 4 GiB wall was a memory wall: sealing cost 2-3x the payload."""
+
+    # A structure that pins every part of the canonical form the seal depends
+    # on: sorted keys, minimal separators, unescaped non-ASCII, the escapes that
+    # are still mandatory, float repr, and both empty containers.
+    GOLDEN = {
+        "blockers": [],
+        "digits": [0, -1, 1000000000000000000000],
+        "empty": [],
+        "escapes": "quote:"
+        + chr(34)
+        + " back:"
+        + chr(92)
+        + " tab:"
+        + chr(9)
+        + " nul:"
+        + chr(0),
+        "nested": {"b": [{"z": None}, {"a": True}], "a": {}},
+        "numbers": [0.0, -0.0, 1.5, 1e308, 5e-324],
+        "unicode": "é ☃ \U0001f600",
+    }
+    GOLDEN_SHA256 = "69678a2cdecfa084b307eaf0845425fc8a6cf0dd61af353611e5966cfb587430"
+
+    def _seal_definition(self, value):
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def test_streaming_emitter_reproduces_the_seal_definition_byte_for_byte(self):
+        # The seal definition is json.dumps with these four options. A streaming
+        # emitter that drifted from it by one byte would silently move every
+        # recorded digest in every capture, plan and receipt, so the two are
+        # compared directly rather than trusted.
+        corpus = [
+            self.GOLDEN,
+            {},
+            [],
+            [[]],
+            {"a": {}},
+            "",
+            0,
+            -0.0,
+            True,
+            False,
+            None,
+            (1, 2, 3),
+            {"z": 1, "a": 2, "M": 3, "é": 4},
+            {"deep": {"deep": {"deep": [1, [2, [3, [4]]]]}}},
+            [chr(index) for index in range(0, 0x80)],
+            {chr(index): index for index in range(0x20, 0x30)},
+            {"floats": [1e-320, 1.7976931348623157e308, 1234567890.123456]},
+        ]
+        for index, value in enumerate(corpus):
+            with self.subTest(case=index):
+                expected = self._seal_definition(value)
+                self.assertEqual(canonical_bytes(value), expected)
+                self.assertEqual(b"".join(canonical_chunks(value)), expected)
+                self.assertEqual(canonical_length(value), len(expected))
+                self.assertEqual(
+                    canonical_sha256(value), hashlib.sha256(expected).hexdigest()
+                )
+
+        # Pinned so the emitter cannot drift even if the comparison above ever
+        # started comparing two copies of the same mistake.
+        self.assertEqual(canonical_sha256(self.GOLDEN), self.GOLDEN_SHA256)
+
+        # Fail-closed on everything json.dumps refuses, with the same message.
+        for value in (
+            float("nan"),
+            float("inf"),
+            {"x": float("-inf")},
+            {1, 2},
+            object(),
+        ):
+            with self.subTest(rejected=repr(value)[:40]):
+                with self.assertRaises(BulkloadError):
+                    canonical_bytes(value)
+                with self.assertRaises(BulkloadError):
+                    canonical_sha256(value)
+        loop: dict = {}
+        loop["self"] = loop
+        with self.assertRaises(BulkloadError):
+            canonical_sha256(loop)
+
+    def test_spilled_records_serialize_and_compare_as_the_resident_list(self):
+        digests = [
+            hashlib.sha256(str(index).encode()).hexdigest() for index in range(500)
+        ]
+        spilled = HexRecords.from_hexdigests(digests).finish()
+
+        self.assertEqual(len(spilled), len(digests))
+        self.assertEqual(list(spilled), digests)
+        self.assertEqual(spilled[0], digests[0])
+        self.assertEqual(spilled[-1], digests[-1])
+        self.assertEqual(spilled, digests)
+        self.assertEqual(digests, spilled)
+        self.assertNotEqual(spilled, digests[:10])
+
+        # The whole point: identical canonical bytes, so no digest moves.
+        self.assertEqual(
+            b"".join(spilled.canonical_chunks()), self._seal_definition(digests)
+        )
+        self.assertEqual(canonical_sha256(spilled), canonical_sha256(digests))
+        self.assertEqual(
+            canonical_sha256({"records": spilled, "size": 1}),
+            canonical_sha256({"records": digests, "size": 1}),
+        )
+        # json.dumps must fail closed on a node rather than emit a short array,
+        # which is why HexRecords is not a list subclass. canonical_bytes then
+        # hands off to the streaming emitter and still returns the same bytes.
+        with self.assertRaises(TypeError):
+            self._seal_definition({"records": spilled})
+        self.assertEqual(
+            canonical_bytes({"records": spilled}),
+            self._seal_definition({"records": digests}),
+        )
+
+        empty = HexRecords.from_hexdigests([]).finish()
+        self.assertEqual(b"".join(empty.canonical_chunks()), b"[]")
+        self.assertEqual(len(empty), 0)
+        self.assertFalse(empty)
+
+        with self.assertRaises(BulkloadError):
+            spilled.append(digests[0])
+        growing = HexRecords()
+        for bad in ("", "zz", digests[0].upper(), digests[0][:10]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(BulkloadError):
+                    growing.append(bad)
+
+    def test_append_relation_holds_all_four_relations_across_the_spill(self):
+        digests = [
+            hashlib.sha256(str(index).encode()).hexdigest() for index in range(64)
+        ]
+        cases = (
+            ("equal", digests, digests),
+            # The truncated destination: a prefix, never a divergence.
+            ("source-superset", digests, digests[:20]),
+            ("source-superset", digests, []),
+            ("destination-superset", digests[:20], digests),
+            ("divergent", digests[:20] + ["f" * 64], digests[:21]),
+            ("divergent", ["a" * 64], ["b" * 64]),
+            ("equal", [], []),
+        )
+
+        def as_operand(values, spill):
+            return (
+                HexRecords.from_hexdigests(values).finish() if spill else list(values)
+            )
+
+        for expected, source, destination in cases:
+            for source_spill in (False, True):
+                for destination_spill in (False, True):
+                    with self.subTest(
+                        expected=expected,
+                        source_spill=source_spill,
+                        destination_spill=destination_spill,
+                    ):
+                        left = as_operand(source, source_spill)
+                        right = as_operand(destination, destination_spill)
+                        self.assertEqual(ordered_prefix_relation(left, right), expected)
+                        self.assertEqual(
+                            _append_relation({"records": left}, {"records": right}),
+                            expected,
+                        )
+                        # The translated list is what a rewritten session file
+                        # compares with, and it must spill the same way.
+                        self.assertEqual(
+                            _append_relation(
+                                {"records": ["dead" * 16], "translated_records": left},
+                                {"records": right},
+                            ),
+                            expected,
+                        )
+
+    def test_capture_and_plan_are_unchanged_when_records_spill(self):
+        pin = "b" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary))
+            # Enough lines, over several session files, that spilling at a
+            # threshold of one line exercises the shared arena from the bounded
+            # classification pool rather than a single writer.
+            for home in (fixture.source_home, fixture.destination_home):
+                sessions = home / ".codex" / "sessions"
+                sessions.mkdir(parents=True, exist_ok=True)
+                for name in ("alpha", "beta", "gamma"):
+                    (sessions / f"{name}.jsonl").write_text(
+                        "".join(
+                            json.dumps({"session": name, "line": index}) + "\n"
+                            for index in range(400)
+                        ),
+                        encoding="utf-8",
+                    )
+            # A destination that is a strict prefix of the source, so the plan
+            # actually depends on the spilled prefix comparison.
+            (
+                fixture.destination_home / ".codex" / "sessions" / "alpha.jsonl"
+            ).write_text(
+                "".join(
+                    json.dumps({"session": "alpha", "line": index}) + "\n"
+                    for index in range(120)
+                ),
+                encoding="utf-8",
+            )
+
+            def capture_set(threshold):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "BULKLOAD_RUNTIME_SOURCE_SHA256": pin,
+                        "BULKLOAD_SPILL_RECORDS": str(threshold),
+                    },
+                ):
+                    return (
+                        fixture.capture("source"),
+                        fixture.capture("source"),
+                        fixture.capture("destination"),
+                        fixture.capture("destination"),
+                    )
+
+            resident = capture_set(0)
+            spilled = capture_set(1)
+            resident_source, _, resident_destination, _ = resident
+            spilled_source, _, spilled_destination, _ = spilled
+
+            def records_of(capture, name):
+                provider = next(
+                    item
+                    for item in capture["catalog"]["providers"]
+                    if item["name"] == "codex"
+                )
+                return next(
+                    item
+                    for item in provider["items"]
+                    if item["relative_path"].endswith(name)
+                )["records"]
+
+            self.assertIsInstance(records_of(resident_source, "alpha.jsonl"), list)
+            self.assertIsInstance(records_of(spilled_source, "alpha.jsonl"), HexRecords)
+            self.assertEqual(len(records_of(spilled_source, "alpha.jsonl")), 400)
+
+            # The invariant: byte-identical canonical output, identical digests.
+            for in_ram, on_disk in zip(resident, spilled):
+                self.assertEqual(
+                    canonical_bytes(in_ram["catalog"]),
+                    canonical_bytes(on_disk["catalog"]),
+                )
+                self.assertEqual(in_ram["catalog_sha256"], on_disk["catalog_sha256"])
+                validate_agent_capture(on_disk, expected_role=on_disk["role"])
+
+            resident_plan = compile_agent_plan(*resident)
+            spilled_plan = compile_agent_plan(*spilled)
+            # The prefix relation had to fire for this comparison to mean
+            # anything: a truncated destination installs its session file.
+            self.assertTrue(
+                any(
+                    operation["kind"] == "file-install"
+                    and operation["destination_path"].endswith("alpha.jsonl")
+                    for operation in resident_plan["operations"]
+                )
+            )
+            for key in ("blockers", "capacity", "holds", "operations", "ready"):
+                with self.subTest(key=key):
+                    self.assertEqual(resident_plan[key], spilled_plan[key])
+            self.assertEqual(
+                canonical_bytes(resident_plan["source"]["catalog"]),
+                canonical_bytes(spilled_plan["source"]["catalog"]),
+            )
+
+    def test_record_spill_bounds_resident_memory_over_a_large_corpus(self):
+        # ``tracemalloc`` is the instrument this claim deserves: it attributes
+        # allocations to the call rather than sampling a whole process, so the
+        # figures below are the record lists themselves and repeat exactly.
+        lines = int(os.environ.get("BULKLOAD_TEST_CORPUS_LINES", "100000"))
+        half = lines // 2
+        with tempfile.TemporaryDirectory() as temporary:
+
+            def write_corpus(name, count):
+                path = Path(temporary) / name
+                with path.open("w", encoding="utf-8") as stream:
+                    for index in range(count):
+                        stream.write(
+                            json.dumps(
+                                {"index": index, "payload": "x" * 64, "session": "big"}
+                            )
+                            + "\n"
+                        )
+                return path
+
+            corpora = {
+                lines: write_corpus("history.jsonl", lines),
+                half: write_corpus("half.jsonl", half),
+            }
+
+            def measure(threshold, count):
+                with mock.patch.dict(
+                    os.environ, {"BULKLOAD_SPILL_RECORDS": str(threshold)}
+                ):
+                    tracemalloc.start()
+                    try:
+                        records = scanner._jsonl_records(corpora[count])
+                        retained, peak = tracemalloc.get_traced_memory()
+                    finally:
+                        tracemalloc.stop()
+                self.assertEqual(len(records["records"]), count)
+                self.assertEqual(
+                    isinstance(records["records"], HexRecords), bool(threshold)
+                )
+                return records, retained, peak
+
+            resident, resident_retained, _ = measure(0, lines)
+            spilled, spilled_retained, spilled_peak = measure(4096, lines)
+            _, resident_half_retained, _ = measure(0, half)
+            _, spilled_half_retained, spilled_half_peak = measure(4096, half)
+
+            # Same evidence out of both paths, which is the whole licence for
+            # moving the records off the heap.
+            for field in ("records_sha256", "translated_sha256", "sha256"):
+                with self.subTest(field=field):
+                    self.assertEqual(resident[field], spilled[field])
+
+            # Resident, the two lists cost a 64-character str plus a list slot
+            # per line -- measured at about 226 bytes a line -- and doubling the
+            # corpus doubles them. Spilled, the digests are in the arena and the
+            # flush buffer is released by ``finish``, so what the call retains
+            # stops tracking the corpus altogether.
+            self.assertGreater(resident_retained, lines * 150)
+            self.assertGreater(resident_retained - resident_half_retained, half * 150)
+            self.assertLess(spilled_retained, 1024**2)
+            self.assertLess(abs(spilled_retained - spilled_half_retained), 64 * 1024)
+            # Even the transient high-water is flat: it is the flush buffers and
+            # one line at a time, never the corpus.
+            self.assertLess(spilled_peak, 8 * 1024**2)
+            self.assertLess(abs(spilled_peak - spilled_half_peak), 1024**2)
+
+    def test_write_and_read_json_round_trip_at_the_lifted_boundary(self):
+        # The wall moved because sealing and writing no longer cost multiples of
+        # the payload; what a destination can parse is gated separately.
+        self.assertGreater(MAX_JSON_BYTES, 4 * 1024**3)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "evidence.json"
+            document = {
+                "catalog": self.GOLDEN,
+                "records": [
+                    hashlib.sha256(str(i).encode()).hexdigest() for i in range(64)
+                ],
+                "schema": AGENT_CAPTURE_SCHEMA,
+            }
+            _write(str(target), document)
+            self.assertEqual(
+                target.read_bytes(), self._seal_definition(document) + b"\n"
+            )
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(read_json(target), document)
+
+            # A spilled node round-trips to the same file and reads back as the
+            # plain list the planner will compare.
+            spilled_target = root / "spilled.json"
+            spilled_document = dict(
+                document,
+                records=HexRecords.from_hexdigests(document["records"]).finish(),
+            )
+            _write(str(spilled_target), spilled_document)
+            self.assertEqual(spilled_target.read_bytes(), target.read_bytes())
+            self.assertEqual(read_json(spilled_target), document)
+
+            # The bound fails closed while the payload is still private: no
+            # durable file is left behind by an over-large write.
+            refused = root / "refused.json"
+            with mock.patch.object(cli, "MAX_PUBLIC_JSON_BYTES", 32):
+                with self.assertRaises(BulkloadError) as raised:
+                    _write(str(refused), document)
+            self.assertIn("bounded read contract", str(raised.exception))
+            self.assertFalse(refused.exists())
+            self.assertEqual(
+                [entry.name for entry in root.iterdir() if entry.name.startswith(".")],
+                [],
+            )
+
+            # read_json enforces its own bound before it allocates, and rejects
+            # a file that grew out from under the stat it was bounded by.
+            # Standard output cannot be un-written, so the bound is still
+            # checked before the first byte is emitted.
+            stream = io.BytesIO()
+            with mock.patch.object(cli, "MAX_PUBLIC_JSON_BYTES", 32):
+                with mock.patch.object(sys, "stdout", mock.Mock(buffer=stream)):
+                    with self.assertRaises(BulkloadError):
+                        _write("-", document)
+            self.assertEqual(stream.getvalue(), b"")
+            with mock.patch.object(sys, "stdout", mock.Mock(buffer=stream)):
+                _write("-", document)
+            self.assertEqual(stream.getvalue(), self._seal_definition(document) + b"\n")
+
+            with self.assertRaises(BulkloadError):
+                read_json(target, max_bytes=8)
+            size = target.stat().st_size
+
+            grew = root / "grew.json"
+            grew.write_bytes(target.read_bytes())
+            real_stat = Path.stat
+
+            def small_stat(self, *arguments, **keywords):
+                info = real_stat(self, *arguments, **keywords)
+                if self == grew:
+                    return os.stat_result(
+                        tuple(info)[:6] + (size - 16,) + tuple(info)[7:]
+                    )
+                return info
+
+            with mock.patch.object(Path, "stat", small_stat):
+                with self.assertRaises(BulkloadError) as raised:
+                    read_json(grew)
+            self.assertIn("grew while it was read", str(raised.exception))
 
 
 if __name__ == "__main__":

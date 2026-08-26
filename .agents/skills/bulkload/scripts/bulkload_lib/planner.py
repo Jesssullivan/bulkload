@@ -10,6 +10,7 @@ from .model import (
     BulkloadError,
     canonical_bytes,
     new_id,
+    ordered_prefix_relation,
     require_digest,
     require_exact_keys,
     runtime_source_digest,
@@ -475,15 +476,17 @@ def _items_by_identity(
 
 
 def _append_relation(source: dict[str, Any], destination: dict[str, Any]) -> str:
-    source_records = source.get("translated_records", source["records"])
-    destination_records = destination["records"]
-    if source_records == destination_records:
-        return "equal"
-    if destination_records == source_records[: len(destination_records)]:
-        return "source-superset"
-    if source_records == destination_records[: len(source_records)]:
-        return "destination-superset"
-    return "divergent"
+    """Classify one session file's append-only history against its destination.
+
+    The relation is the append-only semantics of the whole design, so it is
+    stated once, over ordered iteration rather than slicing: slicing a record
+    list to compare prefixes copied up to a whole file's worth of digests per
+    comparison, and cannot reach a list that has been spilled to disk.
+    """
+    return ordered_prefix_relation(
+        source.get("translated_records", source["records"]),
+        destination["records"],
+    )
 
 
 def _plan_providers(

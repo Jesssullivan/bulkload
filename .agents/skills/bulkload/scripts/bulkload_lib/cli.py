@@ -25,8 +25,9 @@ from .model import (
     BulkloadError,
     MAX_JSON_BYTES,
     assert_no_overlap,
-    atomic_write,
-    canonical_bytes,
+    atomic_write_chunks,
+    canonical_length,
+    canonical_line_chunks,
     read_json,
 )
 from .planner import compile_agent_plan_authorities
@@ -46,13 +47,27 @@ LARGE_PLAN_THRESHOLD_BYTES = 512 * 1024**2
 
 
 def _write(path: str, value: dict[str, Any]) -> None:
-    payload = canonical_bytes(value) + b"\n"
-    if len(payload) > MAX_PUBLIC_JSON_BYTES:
-        raise BulkloadError("public JSON output exceeds the bounded read contract")
+    """Publish sealed evidence without ever holding it whole.
+
+    A file lands through the atomic temporary, which enforces the bound while
+    the payload is still private: an oversized capture fails closed with nothing
+    durable left behind. Standard output cannot be un-written, so it keeps the
+    stricter check-then-emit order by counting the canonical bytes first -- a
+    pass that allocates nothing -- rather than buffering them to measure.
+    """
     if path == "-":
-        sys.stdout.buffer.write(payload)
-    else:
-        atomic_write(Path(path), payload, mode=0o600)
+        if canonical_length(value) + 1 > MAX_PUBLIC_JSON_BYTES:
+            raise BulkloadError("public JSON output exceeds the bounded read contract")
+        for chunk in canonical_line_chunks(value):
+            sys.stdout.buffer.write(chunk)
+        return
+    atomic_write_chunks(
+        Path(path),
+        canonical_line_chunks(value),
+        0o600,
+        max_bytes=MAX_PUBLIC_JSON_BYTES,
+        bound_error="public JSON output exceeds the bounded read contract",
+    )
 
 
 def _load(path: str) -> dict[str, Any]:

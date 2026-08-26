@@ -23,10 +23,12 @@ from .model import (
     AGENT_CAPTURE_SCHEMA,
     GIT_WORKSPACE_SCHEMA,
     BulkloadError,
+    HexRecords,
     MAX_JSON_BYTES,
     assert_no_overlap,
     atomic_write_json,
     canonical_bytes,
+    canonical_sha256,
     durable_makedirs,
     ensure_safe_target,
     fsync_directory,
@@ -43,6 +45,7 @@ from .model import (
     sha256_bytes,
     sha256_file,
     sha256_symlink,
+    spill_record_threshold,
     translate_path,
     utc_now,
 )
@@ -1517,7 +1520,7 @@ def _sqlite_catalog_from_snapshot(path: Path, *, max_rows: int) -> dict[str, Any
                     "primary_key": pk_columns,
                     "row_count": len(rows),
                     "rows": rows,
-                    "rows_sha256": sha256_bytes(canonical_bytes(rows)),
+                    "rows_sha256": canonical_sha256(rows),
                 }
             )
         foreign_keys: list[dict[str, Any]] = []
@@ -1553,7 +1556,7 @@ def _sqlite_catalog_from_snapshot(path: Path, *, max_rows: int) -> dict[str, Any
             "unsupported_schema": sorted(unsupported),
             "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
         }
-        catalog["logical_sha256"] = sha256_bytes(canonical_bytes(catalog))
+        catalog["logical_sha256"] = canonical_sha256(catalog)
         return catalog
     except sqlite3.Error as error:
         raise BulkloadError("cannot inspect SQLite state") from error
@@ -1599,8 +1602,19 @@ def sqlite_catalog(
 def _jsonl_records(
     path: Path, *, replacements: Sequence[tuple[bytes, bytes]] = ()
 ) -> dict[str, Any]:
-    hashes: list[str] = []
-    transformed_hashes: list[str] = []
+    """Digest one append-only session file line by line.
+
+    The two per-line lists are the dominant resident term of a whole capture:
+    one 64-character ``str`` and one list slot for every line of every session
+    file, which on a multi-GiB corpus outweighs the serialized catalog several
+    times over. Past ``spill_record_threshold`` lines both lists move to the
+    shared spill arena, where each digest costs its 32 raw bytes on disk and
+    nothing resident. The catalog is byte-identical either way -- a spilled list
+    serializes to the same JSON array -- so no recorded digest moves.
+    """
+    threshold = spill_record_threshold()
+    hashes: list[str] | HexRecords = []
+    transformed_hashes: list[str] | HexRecords = []
     hasher = hashlib.sha256()
     transformed_hasher = hashlib.sha256()
     try:
@@ -1625,15 +1639,22 @@ def _jsonl_records(
                     raise _UnportableAppendRewrite(
                         "path rewriting produced invalid JSONL"
                     ) from error
+                if threshold and isinstance(hashes, list) and len(hashes) >= threshold:
+                    hashes = HexRecords.from_hexdigests(hashes)
+                    transformed_hashes = HexRecords.from_hexdigests(transformed_hashes)
                 hashes.append(sha256_bytes(line))
                 transformed_hashes.append(sha256_bytes(transformed))
                 hasher.update(line)
                 transformed_hasher.update(transformed)
     except OSError as error:
         raise BulkloadError(f"cannot read append-only state {path}") from error
+    if isinstance(hashes, HexRecords):
+        hashes.finish()
+    if isinstance(transformed_hashes, HexRecords):
+        transformed_hashes.finish()
     return {
         "records": hashes,
-        "records_sha256": sha256_bytes(canonical_bytes(hashes)),
+        "records_sha256": canonical_sha256(hashes),
         "sha256": hasher.hexdigest(),
         "translated_records": transformed_hashes,
         "translated_sha256": transformed_hasher.hexdigest(),
@@ -4188,7 +4209,7 @@ def _capture_live_snapshot(
             "index_entries": index_entries,
             "index_path": os.fspath(index_path),
             "index_sha256": index_sha256,
-            "inventory_sha256": sha256_bytes(canonical_bytes(catalog)),
+            "inventory_sha256": canonical_sha256(catalog),
             "max_sqlite_rows": max_sqlite_rows,
             "methods": dict(sorted(methods.items())),
             "mode": LIVE_SNAPSHOT_MODE,
@@ -4210,7 +4231,7 @@ def _capture_live_snapshot(
         captured.update(
             {
                 "capture_id": snapshot_id,
-                "catalog_sha256": sha256_bytes(canonical_bytes(catalog)),
+                "catalog_sha256": canonical_sha256(catalog),
                 "observed_at": utc_now(),
                 "writers_quiesced": False,
             }
@@ -4642,7 +4663,7 @@ def capture_agent_state(
     capture = {
         "capture_id": capture_id,
         "catalog": catalog,
-        "catalog_sha256": sha256_bytes(canonical_bytes(catalog)),
+        "catalog_sha256": canonical_sha256(catalog),
         "complete": not blockers,
         "hostname": socket.gethostname(),
         "observed_at": utc_now(),
@@ -4699,7 +4720,7 @@ def validate_agent_capture(
         },
         "AgentCaptureV4 catalog",
     )
-    if value.get("catalog_sha256") != sha256_bytes(canonical_bytes(catalog)):
+    if value.get("catalog_sha256") != canonical_sha256(catalog):
         raise BulkloadError("AgentCaptureV4 catalog digest mismatch")
     snapshot = catalog["snapshot"]
     if value.get("writers_quiesced") is False:
@@ -4753,7 +4774,7 @@ def validate_agent_capture(
             or snapshot["snapshot_id"] != value["capture_id"]
             or snapshot["contract_sha256"] != _snapshot_contract(catalog)
             or snapshot["inventory_sha256"]
-            != sha256_bytes(canonical_bytes({**catalog, "snapshot": None}))
+            != canonical_sha256({**catalog, "snapshot": None})
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot["git_generation_sha256"])
             or not isinstance(snapshot["index_entries"], int)
             or isinstance(snapshot["index_entries"], bool)
