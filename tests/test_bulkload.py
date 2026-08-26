@@ -2849,6 +2849,192 @@ class PreflightAndDiagnosticsTests(unittest.TestCase):
             self.assertIn("exact regular file", str(caught.exception))
             self.assertIn(os.fspath(seat_root), str(caught.exception))
 
+    _KEEP = object()
+
+    def _refuse_live_capture(
+        self,
+        fixture: CutoverFixture,
+        *,
+        name: str,
+        path_map: object = _KEEP,
+        rsync_path: object = _KEEP,
+    ) -> BulkloadError:
+        """Refuse one live capture and prove the refusal was byte-free.
+
+        Byte-freeness cannot be measured from the filesystem alone: the
+        ``except BaseException`` arm of ``_capture_live_snapshot`` deletes any
+        partial custody directory on the way out, so a late refusal would
+        leave the same empty parent as an early one. The spies close that
+        hole -- ``_copy_live_tree`` never runs, and ``_remove_snapshot_partial``
+        is never asked to clean up, which is only true when
+        ``durable_makedirs(partial)`` was never reached.
+        """
+        custody = fixture.root / "evidence"
+        custody.mkdir(parents=True, exist_ok=True)
+        snapshot_root = custody / f"{name}.snapshot"
+        copy_spy = mock.Mock(wraps=scanner._copy_live_tree)
+        remove_spy = mock.Mock(wraps=scanner._remove_snapshot_partial)
+        with mock.patch.object(scanner, "_copy_live_tree", copy_spy):
+            with mock.patch.object(scanner, "_remove_snapshot_partial", remove_spy):
+                with self.assertRaises(BulkloadError) as caught:
+                    capture_agent_state(
+                        role="source",
+                        home=fixture.source_home,
+                        git_root=fixture.source_git,
+                        codex_root=None,
+                        claude_root=None,
+                        pi_root=None,
+                        seats=fixture.source_seats,
+                        path_map=(
+                            fixture.path_map if path_map is self._KEEP else path_map
+                        ),
+                        writers_quiesced=False,
+                        snapshot_root=snapshot_root,
+                        managed_exclusions=fixture.managed_exclusions,
+                        rsync_path=(
+                            fixture.rsync_path
+                            if rsync_path is self._KEEP
+                            else rsync_path
+                        ),
+                        max_files=50_000,
+                        max_bytes=4 * 1024**3,
+                        max_sqlite_rows=100_000,
+                        snapshot_reserve_bytes=0,
+                    )
+        # No payload was copied and no partial custody directory was cleaned up.
+        self.assertEqual(copy_spy.call_count, 0)
+        self.assertEqual(remove_spy.call_count, 0)
+        # Nothing survives in custody either: no snapshot, no partial, no bytes.
+        self.assertFalse(snapshot_root.exists())
+        self.assertEqual(
+            sorted(
+                item.name
+                for item in custody.iterdir()
+                if item.name.startswith(f".{snapshot_root.name}.partial-")
+            ),
+            [],
+        )
+        self.assertEqual(sorted(item.name for item in custody.iterdir()), [])
+        self.assertEqual(
+            sum(
+                item.stat().st_size
+                for item in custody.rglob("*")
+                if item.is_file() and not item.is_symlink()
+            ),
+            0,
+        )
+        return caught.exception
+
+    def test_live_refusals_are_byte_free(self) -> None:
+        """The three live-mode refusals fire above the first byte written.
+
+        Before S1's live half these predicates lived only in the nested
+        quiesced ``capture_agent_state``, which runs after ``_copy_live_tree``
+        has already copied every root: the RESUME audit measured a bogus rsync
+        pin costing two full tree copies and 847,151 payload bytes written and
+        then discarded.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+
+            # (a) A bogus rsync pin: refused before any tree is copied.
+            bogus = self._refuse_live_capture(
+                fixture, name="bogus-rsync", rsync_path=Path("/bin/echo")
+            )
+            self.assertIn("required GNU transport features", str(bogus))
+
+            # (a') A missing rsync pin is the same refusal, equally byte-free.
+            missing = self._refuse_live_capture(
+                fixture, name="absent-rsync", rsync_path=None
+            )
+            self.assertIn("explicit pinned rsync path", str(missing))
+
+            # (b) An empty path map.
+            empty = self._refuse_live_capture(fixture, name="empty-map", path_map=[])
+            self.assertIn("explicit path map", str(empty))
+
+            # (b') An unmapped root. The message now names the live root the
+            # operator declared; before the hoist it fired inside the nested
+            # capture and named a path under the partial custody directory.
+            unrelated = fixture.root / "elsewhere"
+            unmapped = self._refuse_live_capture(
+                fixture,
+                name="unmapped-root",
+                path_map=canonical_path_map(
+                    [(str(unrelated / "source"), str(unrelated / "destination"))]
+                ),
+            )
+            self.assertIn("outside the approved path map", str(unmapped))
+            self.assertIn(os.fspath(fixture.source_git), str(unmapped))
+            self.assertNotIn(".partial-", str(unmapped))
+
+    def test_live_capture_binds_transport_once_without_moving_the_seal(self) -> None:
+        """``inspect_rsync`` runs once per capture and the seal is unmoved.
+
+        Hoisting the rsync check without binding its value would ADD a TOCTOU
+        window: an rsync collected or upgraded between the preflight and the
+        nested capture would change ``catalog['transport']``, which
+        ``_snapshot_contract`` seals into ``contract_sha256`` and which
+        ``stable_capture_pair`` and ``cli._agent_plan`` compare across the A/B
+        pair. ``BULKLOAD_RUNTIME_SOURCE_SHA256`` is pinned so the only
+        source-derived catalog member is held constant.
+        """
+        pin = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            evidence = fixture.root / "evidence"
+            real_inspect = scanner.inspect_rsync
+
+            def live(name: str) -> dict:
+                return capture_agent_state(
+                    role="source",
+                    home=fixture.source_home,
+                    git_root=fixture.source_git,
+                    codex_root=None,
+                    claude_root=None,
+                    pi_root=None,
+                    seats=fixture.source_seats,
+                    path_map=fixture.path_map,
+                    writers_quiesced=False,
+                    snapshot_root=evidence / f"{name}.snapshot",
+                    managed_exclusions=fixture.managed_exclusions,
+                    rsync_path=fixture.rsync_path,
+                    max_files=50_000,
+                    max_bytes=4 * 1024**3,
+                    max_sqlite_rows=100_000,
+                    snapshot_reserve_bytes=0,
+                )
+
+            spy = mock.Mock(wraps=real_inspect)
+            with mock.patch.dict(os.environ, {"BULKLOAD_RUNTIME_SOURCE_SHA256": pin}):
+                with mock.patch.object(scanner, "inspect_rsync", spy):
+                    first = live("transport-a")
+                second = live("transport-b")
+
+            # The invariant: derived exactly once per capture, not once per
+            # frame that happens to need it.
+            self.assertEqual(spy.call_count, 1)
+            validate_agent_capture(first, expected_role="source")
+            self.assertEqual(first["catalog"]["runtime_source_sha256"], pin)
+
+            # The bound value is byte-identical to what the nested quiesced
+            # capture would have derived on its own, so the seal did not move.
+            self.assertEqual(
+                first["catalog"]["transport"],
+                {
+                    "hostname": socket.gethostname(),
+                    "rsync": real_inspect(os.fspath(fixture.rsync_path)),
+                },
+            )
+            self.assertEqual(
+                first["catalog"]["snapshot"]["contract_sha256"],
+                scanner._snapshot_contract(first["catalog"]),
+            )
+            self.assertEqual(
+                first["catalog"]["snapshot"]["contract_sha256"],
+                second["catalog"]["snapshot"]["contract_sha256"],
+            )
+
     def test_fail_fast_message_edits_do_not_move_catalog_sha256(self) -> None:
         """Pin Finding A and the runtime-source seal that qualifies it.
 

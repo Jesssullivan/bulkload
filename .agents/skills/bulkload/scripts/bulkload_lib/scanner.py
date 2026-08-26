@@ -3154,6 +3154,36 @@ def _capture_live_snapshot(
     if snapshot_root.exists() or snapshot_root.is_symlink() or partial.exists():
         raise BulkloadError("live snapshot custody path already exists")
     git_logical, git_backing, git_link, _ = _declared_root(git_root, allow_absent=False)
+    # Preflight (live half of S1). The nested quiesced ``capture_agent_state``
+    # below refuses an empty path map, a missing rsync pin and an unmapped
+    # root -- but that call happens only *after* ``_copy_live_tree`` has
+    # already copied every declared root into custody, so a pin typo costs a
+    # full duplicate tree copy that is then discarded. Every input those three
+    # refusals read is already determined here, so run them before the first
+    # byte is written and keep refusal byte-free: no partial custody
+    # directory, no payload. The nested refusals stay where they are; these
+    # are an earlier, cheaper copy of the same predicates.
+    if not path_map:
+        raise BulkloadError("AgentCaptureV4 requires an explicit path map")
+    if rsync_path is None:
+        raise BulkloadError("AgentCaptureV4 requires an explicit pinned rsync path")
+    _probe_root_bindings(
+        role=role,
+        git_logical_root=git_logical,
+        home=resolve_real(home),
+        path_map=path_map,
+    )
+    # Bind the transport exactly once, here, and thread the resulting value
+    # into the nested capture. Hoisting the check without binding the value
+    # would ADD a TOCTOU window: an rsync collected or upgraded between this
+    # preflight and the nested capture would silently change
+    # ``catalog['transport']``, which ``_snapshot_contract`` seals into
+    # ``contract_sha256`` and which ``stable_capture_pair`` and
+    # ``cli._agent_plan`` compare across the A/B pair.
+    bound_transport = {
+        "hostname": socket.gethostname(),
+        "rsync": inspect_rsync(os.fspath(rsync_path)),
+    }
     provider_arguments = {
         "codex": codex_root or home / ".codex",
         "claude": claude_root or home / ".claude",
@@ -3413,6 +3443,7 @@ def _capture_live_snapshot(
             max_files=max_files,
             max_bytes=max_bytes,
             max_sqlite_rows=max_sqlite_rows,
+            _bound_transport=bound_transport,
         )
         catalog = captured["catalog"]
         _rewrite_catalog_to_live(
@@ -3544,6 +3575,7 @@ def capture_agent_state(
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
     snapshot_reserve_bytes: int = SNAPSHOT_RESERVE_BYTES,
+    _bound_transport: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if role not in {"source", "destination"}:
         raise BulkloadError("capture role must be source or destination")
@@ -3588,10 +3620,19 @@ def capture_agent_state(
     _probe_root_bindings(
         role=role, git_logical_root=git_logical_root, home=home, path_map=path_map
     )
-    transport = {
-        "hostname": socket.gethostname(),
-        "rsync": inspect_rsync(os.fspath(rsync_path)),
-    }
+    # ``_bound_transport`` is private to the live path: ``_capture_live_snapshot``
+    # derives the transport in its hoisted preflight and threads the exact
+    # value here, so ``inspect_rsync`` is derived exactly once per capture and
+    # the sealed ``catalog['transport']`` cannot drift between the preflight
+    # and this catalog. A direct quiesced call still derives it here.
+    transport = (
+        _bound_transport
+        if _bound_transport is not None
+        else {
+            "hostname": socket.gethostname(),
+            "rsync": inspect_rsync(os.fspath(rsync_path)),
+        }
+    )
     provider_policy = canonical_provider_policy(managed_exclusions)
     exclusions = defaultdict(list)
     for item in provider_policy["managed_exclusions"]:
