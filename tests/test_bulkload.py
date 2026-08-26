@@ -2689,5 +2689,213 @@ os.execv(arguments[0], arguments)
                 )
 
 
+class PreflightAndDiagnosticsTests(unittest.TestCase):
+    """S1: preflight hoist plus fail-fast-only path naming."""
+
+    def test_unmapped_root_is_detected_before_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            unrelated = Path(temporary).resolve() / "elsewhere"
+            unmapped = canonical_path_map(
+                [(str(unrelated / "source"), str(unrelated / "destination"))]
+            )
+
+            def refuse(*_arguments: object, **_keywords: object) -> None:
+                raise AssertionError("enumeration ran before the preflight probe")
+
+            # Negative: an unmapped root must abort before git discovery.
+            with mock.patch.object(scanner, "_discover_git_roots", refuse):
+                with self.assertRaises(BulkloadError) as caught:
+                    capture_agent_state(
+                        role="source",
+                        home=fixture.source_home,
+                        git_root=fixture.source_git,
+                        codex_root=None,
+                        claude_root=None,
+                        pi_root=None,
+                        seats=[],
+                        path_map=unmapped,
+                        writers_quiesced=True,
+                        managed_exclusions=[],
+                        rsync_path=fixture.rsync_path,
+                    )
+            self.assertIn("outside the approved path map", str(caught.exception))
+
+            # Positive control: a mapped root still reaches enumeration, so the
+            # assertion above is about ordering rather than an unrelated abort.
+            with mock.patch.object(scanner, "_discover_git_roots", refuse):
+                with self.assertRaises(AssertionError):
+                    capture_agent_state(
+                        role="source",
+                        home=fixture.source_home,
+                        git_root=fixture.source_git,
+                        codex_root=None,
+                        claude_root=None,
+                        pi_root=None,
+                        seats=[],
+                        path_map=fixture.path_map,
+                        writers_quiesced=True,
+                        managed_exclusions=[],
+                        rsync_path=fixture.rsync_path,
+                    )
+
+    def test_declared_root_errors_name_the_offending_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+
+            absent = root / "absent"
+            with self.assertRaises(BulkloadError) as caught:
+                scanner._declared_root(absent, allow_absent=False)
+            self.assertIn(os.fspath(absent), str(caught.exception))
+
+            directory = root / "directory"
+            directory.mkdir()
+
+            multi_entry = root / "multi-entry"
+            os.symlink(directory, multi_entry)
+            forged = (1, 2, stat.S_IFLNK, 0o777, 2, 10, 0, 0)
+            with mock.patch.object(scanner, "_stable_stat", return_value=forged):
+                with self.assertRaises(BulkloadError) as caught:
+                    scanner._declared_root(multi_entry, allow_absent=False)
+            self.assertIn("multiple directory entries", str(caught.exception))
+            self.assertIn(os.fspath(multi_entry), str(caught.exception))
+
+            broken = root / "broken"
+            os.symlink(root / "no-such-target", broken)
+            with self.assertRaises(BulkloadError) as caught:
+                scanner._declared_root(broken, allow_absent=False)
+            self.assertIn("broken or unreadable", str(caught.exception))
+            self.assertIn(os.fspath(broken), str(caught.exception))
+
+            chained = root / "chained"
+            os.symlink(multi_entry, chained)
+            with self.assertRaises(BulkloadError) as caught:
+                scanner._declared_root(chained, allow_absent=False)
+            self.assertIn("multi-link symlink chain", str(caught.exception))
+            self.assertIn(os.fspath(chained), str(caught.exception))
+
+            regular = root / "regular.txt"
+            regular.write_text("payload\n", encoding="utf-8")
+            file_link = root / "file-link"
+            os.symlink(regular, file_link)
+            with self.assertRaises(BulkloadError) as caught:
+                scanner._declared_root(file_link, allow_absent=False)
+            self.assertIn("does not name a directory", str(caught.exception))
+            self.assertIn(os.fspath(file_link), str(caught.exception))
+
+            with self.assertRaises(BulkloadError) as caught:
+                scanner._declared_root(regular, allow_absent=False)
+            self.assertIn(
+                "neither a directory nor a directory link", str(caught.exception)
+            )
+            self.assertIn(os.fspath(regular), str(caught.exception))
+
+            stable = (1, 2, stat.S_IFDIR, 0o755, 2, 64, 0, 0)
+            moved = (1, 2, stat.S_IFDIR, 0o755, 2, 64, 1, 0)
+            with mock.patch.object(
+                scanner, "_stable_stat", side_effect=[stable, moved]
+            ):
+                with self.assertRaises(BulkloadError) as caught:
+                    scanner._declared_root(directory, allow_absent=False)
+            self.assertIn("changed during capture", str(caught.exception))
+            self.assertIn(os.fspath(directory), str(caught.exception))
+
+    def test_seat_errors_name_the_offending_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            seat_root = fixture.source_home / "seat"
+            seat_root.mkdir()
+
+            def capture_seat(name: str, root: Path, *, root_kind: str) -> None:
+                scanner._capture_seat(
+                    name,
+                    root,
+                    root_kind=root_kind,
+                    role="source",
+                    path_map=fixture.path_map,
+                    home=fixture.source_home,
+                    max_files=50_000,
+                    max_bytes=4 * 1024**3,
+                )
+
+            with self.assertRaises(BulkloadError) as caught:
+                capture_seat("Invalid Name", seat_root, root_kind="directory")
+            self.assertIn(os.fspath(seat_root), str(caught.exception))
+
+            with self.assertRaises(BulkloadError) as caught:
+                capture_seat("seat", seat_root, root_kind="socket")
+            self.assertIn("directory or file", str(caught.exception))
+            self.assertIn(os.fspath(seat_root), str(caught.exception))
+
+            with self.assertRaises(BulkloadError) as caught:
+                capture_seat("seat", fixture.source_home, root_kind="directory")
+            self.assertIn("declared home root", str(caught.exception))
+            self.assertIn(os.fspath(fixture.source_home), str(caught.exception))
+
+            with self.assertRaises(BulkloadError) as caught:
+                capture_seat("seat", seat_root, root_kind="file")
+            self.assertIn("exact regular file", str(caught.exception))
+            self.assertIn(os.fspath(seat_root), str(caught.exception))
+
+    def test_fail_fast_message_edits_do_not_move_catalog_sha256(self) -> None:
+        """Pin Finding A and the runtime-source seal that qualifies it.
+
+        Finding A: catalog blockers carry ``detail: str(error)`` and the
+        catalog digest seals them, so a message edit is only content-inert
+        when the edited raise can never become a blocker detail.
+
+        Qualifier verified while landing S1: ``catalog['runtime_source_sha256']``
+        hashes the runtime source files themselves, so *any* source edit moves
+        ``catalog_sha256`` by construction. Content-inertness is therefore
+        asserted with that one field held constant, which is exactly what
+        ``BULKLOAD_RUNTIME_SOURCE_SHA256`` pins.
+        """
+        pin = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            first = fixture.capture("source")
+            self.assertEqual(first["catalog"]["blockers"], [])
+            self.assertTrue(first["complete"])
+            self.assertEqual(
+                first["catalog_sha256"],
+                sha256_bytes(canonical_bytes(first["catalog"])),
+            )
+
+            # No S1-edited message text reaches the sealed catalog bytes.
+            sealed = canonical_bytes(first["catalog"])
+            for phrase in (
+                b"declared root",
+                b"mutable-seat",
+                b"file seat",
+                b"filesystem capture budget",
+            ):
+                self.assertNotIn(phrase, sealed)
+
+            # Deterministic across captures of the same quiesced tree.
+            second = fixture.capture("source")
+            self.assertEqual(first["catalog_sha256"], second["catalog_sha256"])
+
+            # ``runtime_source_sha256`` is the only source-derived catalog
+            # member: pinning it leaves every other sealed field untouched, so
+            # a pinned-runtime digest is comparable across source edits.
+            with mock.patch.dict(os.environ, {"BULKLOAD_RUNTIME_SOURCE_SHA256": pin}):
+                pinned = fixture.capture("source")
+            self.assertEqual(pinned["catalog"]["runtime_source_sha256"], pin)
+            without_runtime = {
+                key: value
+                for key, value in first["catalog"].items()
+                if key != "runtime_source_sha256"
+            }
+            pinned_without_runtime = {
+                key: value
+                for key, value in pinned["catalog"].items()
+                if key != "runtime_source_sha256"
+            }
+            self.assertEqual(
+                canonical_bytes(without_runtime),
+                canonical_bytes(pinned_without_runtime),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -338,19 +338,27 @@ def _declared_root(
     proof = None
     if kind == stat.S_IFLNK:
         if before[4] != 1:
-            raise BulkloadError("declared root symlink has multiple directory entries")
+            raise BulkloadError(
+                "declared root symlink has multiple directory entries: "
+                f"{os.fspath(logical)}"
+            )
         try:
             target = Path(os.readlink(logical))
             immediate = target if target.is_absolute() else logical.parent / target
             immediate_info = immediate.lstat()
         except OSError as error:
             raise BulkloadError(
-                "declared root symlink is broken or unreadable"
+                f"declared root symlink is broken or unreadable: {os.fspath(logical)}"
             ) from error
         if stat.S_ISLNK(immediate_info.st_mode):
-            raise BulkloadError("declared root contains a multi-link symlink chain")
+            raise BulkloadError(
+                f"declared root contains a multi-link symlink chain: "
+                f"{os.fspath(logical)}"
+            )
         if not stat.S_ISDIR(immediate_info.st_mode):
-            raise BulkloadError("declared root symlink does not name a directory")
+            raise BulkloadError(
+                f"declared root symlink does not name a directory: {os.fspath(logical)}"
+            )
         backing = resolve_real(immediate)
         proof = {
             "kind": "symlink",
@@ -361,9 +369,14 @@ def _declared_root(
     elif kind == stat.S_IFDIR:
         backing = resolve_real(logical)
     else:
-        raise BulkloadError("declared root is neither a directory nor a directory link")
+        raise BulkloadError(
+            "declared root is neither a directory nor a directory link: "
+            f"{os.fspath(logical)}"
+        )
     if _stable_stat(logical) != before:
-        raise BulkloadError("declared root changed during capture")
+        raise BulkloadError(
+            f"declared root changed during capture: {os.fspath(logical)}"
+        )
     return logical, backing, proof, True
 
 
@@ -1804,7 +1817,7 @@ def _capture_seat(
     max_bytes: int,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
-        raise BulkloadError(f"invalid mutable-seat name: {name!r}")
+        raise BulkloadError(f"invalid mutable-seat name: {name!r}: {os.fspath(root)}")
     if root_kind == "file":
         logical = Path(os.path.abspath(os.fspath(root.expanduser())))
         destination = (
@@ -1826,13 +1839,17 @@ def _capture_seat(
                 "root_link": None,
             }, []
         if before[2] != stat.S_IFREG:
-            raise BulkloadError("file seat is not an exact regular file")
+            raise BulkloadError(
+                f"file seat {name!r} is not an exact regular file: {os.fspath(logical)}"
+            )
         backing = resolve_real(logical)
         record = _file_record(backing, backing.name, classification="mutable-seat")
         record["destination_relative_path"] = record["relative_path"]
         record["identity"] = record["relative_path"]
         if _stable_stat(logical) != before:
-            raise BulkloadError("file seat changed during capture")
+            raise BulkloadError(
+                f"file seat {name!r} changed during capture: {os.fspath(logical)}"
+            )
         return {
             "destination_path": destination,
             "exists": True,
@@ -1844,12 +1861,18 @@ def _capture_seat(
             "root_link": None,
         }, []
     if root_kind != "directory":
-        raise BulkloadError("mutable-seat kind must be directory or file")
+        raise BulkloadError(
+            f"mutable-seat {name!r} kind must be directory or file, got "
+            f"{root_kind!r}: {os.fspath(root)}"
+        )
     logical_root, backing_root, root_link, exists = _declared_root(
         root, allow_absent=True
     )
     if logical_root == home or backing_root == home:
-        raise BulkloadError("mutable-seat directory may not be the declared home root")
+        raise BulkloadError(
+            f"mutable-seat {name!r} directory may not be the declared home root: "
+            f"{os.fspath(logical_root)}"
+        )
     if not exists:
         return {
             "destination_path": os.fspath(logical_root)
@@ -3417,6 +3440,23 @@ def _snapshot_path(path: Path, roots: Sequence[dict[str, str]], *, label: str) -
     raise BulkloadError(f"live snapshot has no root binding for {path}")
 
 
+def _probe_root_bindings(
+    *, role: str, git_logical_root: Path, home: Path, path_map: list[dict[str, str]]
+) -> None:
+    """Fail fast when the declared roots cannot be mapped to the destination.
+
+    This is a pure predicate: it depends only on ``role``, ``git_logical_root``,
+    ``home`` and ``path_map``, all of which are known before enumeration begins.
+    It produces no value — the authoritative translation stays at the
+    ``root_bindings`` assignment later in :func:`capture_agent_state` — so an
+    unmapped root surfaces in milliseconds instead of after a full walk.
+    """
+    if role == "destination":
+        return
+    translate_path(git_logical_root, path_map)
+    translate_path(home, path_map)
+
+
 def capture_agent_state(
     *,
     role: str,
@@ -3474,6 +3514,12 @@ def capture_agent_state(
         raise BulkloadError("AgentCaptureV4 requires an explicit path map")
     if rsync_path is None:
         raise BulkloadError("AgentCaptureV4 requires an explicit pinned rsync path")
+    # Preflight: the root bindings are fully determined here, so refuse an
+    # unmapped root before paying for git discovery, the workspace pool, the
+    # filesystem walk, providers and seats.
+    _probe_root_bindings(
+        role=role, git_logical_root=git_logical_root, home=home, path_map=path_map
+    )
     transport = {
         "hostname": socket.gethostname(),
         "rsync": inspect_rsync(os.fspath(rsync_path)),
@@ -3642,8 +3688,13 @@ def capture_agent_state(
                 ).as_posix()
             non_git.append(entry)
     non_git.sort(key=lambda item: (item["relative_path"], item["kind"]))
-    if len(non_git) > max_files or sum(item["size"] for item in non_git) > max_bytes:
-        raise BulkloadError("filesystem capture budget exceeded")
+    charged_non_git_bytes = sum(item["size"] for item in non_git)
+    if len(non_git) > max_files or charged_non_git_bytes > max_bytes:
+        raise BulkloadError(
+            f"filesystem capture budget exceeded under {os.fspath(git_root)}: "
+            f"{len(non_git)} files (max {max_files}), "
+            f"{charged_non_git_bytes} bytes (max {max_bytes})"
+        )
     for entry in non_git:
         entry["destination_relative_path"] = entry["relative_path"]
         entry["identity"] = entry["relative_path"]
