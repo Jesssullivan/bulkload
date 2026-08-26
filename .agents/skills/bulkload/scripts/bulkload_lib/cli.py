@@ -57,7 +57,9 @@ def _write(path: str, value: dict[str, Any]) -> None:
     """
     if path == "-":
         if canonical_length(value) + 1 > MAX_PUBLIC_JSON_BYTES:
-            raise BulkloadError("public JSON output exceeds the bounded read contract")
+            raise BulkloadError(
+                "public JSON output exceeds the bounded read contract: standard output"
+            )
         for chunk in canonical_line_chunks(value):
             sys.stdout.buffer.write(chunk)
         return
@@ -66,18 +68,24 @@ def _write(path: str, value: dict[str, Any]) -> None:
         canonical_line_chunks(value),
         0o600,
         max_bytes=MAX_PUBLIC_JSON_BYTES,
-        bound_error="public JSON output exceeds the bounded read contract",
+        bound_error=(f"public JSON output exceeds the bounded read contract: {path}"),
     )
 
 
 def _load(path: str) -> dict[str, Any]:
     candidate = Path(path).expanduser()
     size = candidate.stat(follow_symlinks=False).st_size
-    _require_large_evidence_memory(size)
+    _require_large_evidence_memory(size, subject=os.fspath(candidate))
     return read_json(candidate)
 
 
-def _available_linux_memory() -> int:
+def _available_linux_memory(subject: str) -> int:
+    """Read the Linux memory reserve, naming what needed it when there is none.
+
+    The reserve is only ever published by /proc/meminfo. A host without it --
+    macOS included -- cannot qualify, so the refusal has to say which input
+    provoked the gate or the operator cannot tell what to shrink or move.
+    """
     try:
         fields = {
             line.split(":", 1)[0]: int(line.split()[1]) * 1024
@@ -87,17 +95,22 @@ def _available_linux_memory() -> int:
         return fields["MemAvailable"]
     except (FileNotFoundError, KeyError, OSError, UnicodeDecodeError, ValueError):
         raise BulkloadError(
-            "large Bulkload evidence requires the memory-qualified destination"
+            "large Bulkload evidence requires the memory-qualified destination: "
+            f"{subject} needs a Linux host reporting MemAvailable"
         ) from None
 
 
-def _require_large_evidence_memory(size: int, *, multiplier: int = 4) -> None:
+def _require_large_evidence_memory(
+    size: int, *, subject: str, multiplier: int = 4
+) -> None:
     if size <= LARGE_PLAN_THRESHOLD_BYTES:
         return
     required = size * multiplier + 2 * 1024**3
-    if _available_linux_memory() < required:
+    available = _available_linux_memory(subject)
+    if available < required:
         raise BulkloadError(
-            "destination memory is below the bounded Bulkload evidence gate"
+            "destination memory is below the bounded Bulkload evidence gate: "
+            f"{subject} needs {required} bytes MemAvailable, found {available}"
         )
 
 
@@ -148,8 +161,17 @@ def _protect_output(arguments: argparse.Namespace) -> None:
             roots.extend(_catalog_roots(_load(getattr(arguments, name))["catalog"]))
     elif arguments.command == "agent-stage" and arguments.transport_mode == "push":
         if not arguments.prepare_receipt or not arguments.transport_allowlist:
+            missing = " and ".join(
+                flag
+                for flag, value in (
+                    ("--prepare-receipt", arguments.prepare_receipt),
+                    ("--transport-allowlist", arguments.transport_allowlist),
+                )
+                if not value
+            )
             raise BulkloadError(
-                "transport push requires a prepare receipt and sealed allowlist"
+                "transport push requires a prepare receipt and sealed allowlist: "
+                f"missing {missing}"
             )
         prepare = _load(arguments.prepare_receipt)
         validate_stage_receipt(prepare)
@@ -214,7 +236,10 @@ def _parse_managed_exclusion(value: str) -> tuple[str, str]:
 def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
     home = Path(arguments.home).expanduser()
     if not arguments.acknowledge_writers_quiesced and arguments.output == "-":
-        raise BulkloadError("live capture requires an owner-private evidence path")
+        raise BulkloadError(
+            "live capture requires an owner-private evidence path: "
+            "--output - is standard output"
+        )
     snapshot_root = None
     if not arguments.acknowledge_writers_quiesced:
         output = Path(arguments.output).expanduser()
@@ -251,14 +276,22 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
         for name in ("source_a", "source_b", "destination_a", "destination_b")
     ]
     sizes = [path.stat(follow_symlinks=False).st_size for path in paths]
-    if any(size > MAX_JSON_BYTES for size in sizes):
-        raise BulkloadError("AgentCaptureV4 exceeds the bounded JSON contract")
+    oversized = [
+        os.fspath(path) for path, size in zip(paths, sizes) if size > MAX_JSON_BYTES
+    ]
+    if oversized:
+        raise BulkloadError(
+            f"AgentCaptureV4 exceeds the bounded JSON contract: {', '.join(oversized)}"
+        )
     total = sum(sizes)
     if total > LARGE_PLAN_THRESHOLD_BYTES:
         required = total * 4 + 2 * 1024**3
-        if _available_linux_memory() < required:
+        available = _available_linux_memory("the four-capture set")
+        if available < required:
             raise BulkloadError(
-                "destination memory is below the bounded AgentPlanV4 planning gate"
+                "destination memory is below the bounded AgentPlanV4 planning gate: "
+                f"the four-capture set totals {total} bytes and needs {required} "
+                f"bytes MemAvailable, found {available}"
             )
 
     def stable_authority(
@@ -322,15 +355,35 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
 
 def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.transport_mode == "push":
-        if (
-            arguments.plan is not None
-            or arguments.prepare_receipt is None
-            or arguments.transport_allowlist is None
-            or arguments.destination_ssh_host is None
-            or arguments.transport_receipt is not None
-        ):
+        forbidden = [
+            flag
+            for flag, value in (
+                ("--plan", arguments.plan),
+                ("--transport-receipt", arguments.transport_receipt),
+            )
+            if value is not None
+        ]
+        absent = [
+            flag
+            for flag, value in (
+                ("--prepare-receipt", arguments.prepare_receipt),
+                ("--transport-allowlist", arguments.transport_allowlist),
+                ("--destination-ssh-host", arguments.destination_ssh_host),
+            )
+            if value is None
+        ]
+        if forbidden or absent:
+            detail = "; ".join(
+                part
+                for part in (
+                    f"rejects {', '.join(forbidden)}" if forbidden else "",
+                    f"missing {', '.join(absent)}" if absent else "",
+                )
+                if part
+            )
             raise BulkloadError(
-                "transport push requires only prepare receipt, allowlist, and destination host"
+                "transport push requires only prepare receipt, allowlist, and "
+                f"destination host: {detail}"
             )
         return push_agent_transport(
             _load(arguments.prepare_receipt),
@@ -341,8 +394,13 @@ def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
             destination_ssh_host=arguments.destination_ssh_host,
         )
     if arguments.plan is None or arguments.transport_allowlist is not None:
+        detail = (
+            "missing --plan"
+            if arguments.plan is None
+            else f"rejects --transport-allowlist {arguments.transport_allowlist}"
+        )
         raise BulkloadError(
-            "plan staging requires a plan and forbids a transport allowlist"
+            f"plan staging requires a plan and forbids a transport allowlist: {detail}"
         )
     return stage_agent_plan(
         _load(arguments.plan),

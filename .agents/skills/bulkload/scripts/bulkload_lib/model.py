@@ -826,12 +826,18 @@ def require_capacity(
     path: Path, *, charged_bytes: int, reserve_bytes: int
 ) -> dict[str, int]:
     if charged_bytes < 0 or reserve_bytes < 0:
-        raise BulkloadError("capacity charges must be non-negative")
+        raise BulkloadError(
+            f"capacity charges must be non-negative: {os.fspath(path)} charged "
+            f"{charged_bytes}, reserve {reserve_bytes}"
+        )
     observed = capacity_observation(path)
     required = charged_bytes + reserve_bytes
     if observed["available_bytes"] < required:
         raise BulkloadError(
-            "capacity gate failed: exact charged bytes plus reserve exceed available bytes"
+            "capacity gate failed: exact charged bytes plus reserve exceed "
+            f"available bytes: {os.fspath(path)} needs {required} bytes "
+            f"({charged_bytes} charged plus {reserve_bytes} reserve), "
+            f"found {observed['available_bytes']}"
         )
     return {
         **observed,

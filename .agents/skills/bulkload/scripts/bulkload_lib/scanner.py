@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -180,16 +180,16 @@ class _CaptureBudgetExceeded(BulkloadError):
 
 def shell_safe_executable(raw_path: str, label: str) -> str:
     if not os.path.isabs(raw_path):
-        raise BulkloadError(f"{label} path must be explicit and absolute")
+        raise BulkloadError(f"{label} path must be explicit and absolute: {raw_path}")
     path = os.path.realpath(os.path.abspath(raw_path))
     if not SAFE_EXECUTABLE_PATH.fullmatch(path):
-        raise BulkloadError(f"{label} path is not canonical and shell-safe")
+        raise BulkloadError(f"{label} path is not canonical and shell-safe: {path}")
     try:
         info = Path(path).stat(follow_symlinks=False)
     except OSError as error:
-        raise BulkloadError(f"{label} executable is unavailable") from error
+        raise BulkloadError(f"{label} executable is unavailable: {path}") from error
     if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
-        raise BulkloadError(f"{label} is not a regular executable")
+        raise BulkloadError(f"{label} is not a regular executable: {path}")
     return path
 
 
@@ -212,7 +212,9 @@ def inspect_rsync(raw_path: str) -> dict[str, Any]:
             check=False,
         )
     except OSError as error:
-        raise BulkloadError("pinned GNU rsync executable is unavailable") from error
+        raise BulkloadError(
+            f"pinned GNU rsync executable is unavailable: {path}"
+        ) from error
     match = re.search(rb"protocol version (\d+)", version.stdout)
     if (
         version.returncode != 0
@@ -223,7 +225,9 @@ def inspect_rsync(raw_path: str) -> dict[str, Any]:
         or b"--files-from" not in help_result.stdout
         or b"--ignore-missing-args" not in help_result.stdout
     ):
-        raise BulkloadError("pinned rsync lacks the required GNU transport features")
+        raise BulkloadError(
+            f"pinned rsync lacks the required GNU transport features: {path}"
+        )
     return {
         "features": [
             "checksum",
@@ -249,14 +253,23 @@ def canonical_provider_policy(
         parts = PurePosixPath(relative).parts
         if parts[0] not in MANAGED_EXCLUSION_NAMESPACES[provider]:
             raise BulkloadError(
-                "managed exclusion is outside the provider's source-managed namespaces"
+                "managed exclusion is outside the provider's source-managed "
+                f"namespaces: {provider}:{relative}"
             )
         exclusions.append({"provider": provider, "relative_path": relative})
     exclusions.sort(key=lambda item: (item["provider"], item["relative_path"]))
     if len({(item["provider"], item["relative_path"]) for item in exclusions}) != len(
         exclusions
     ):
-        raise BulkloadError("duplicate managed exclusion")
+        counts = Counter(
+            (item["provider"], item["relative_path"]) for item in exclusions
+        )
+        repeated = sorted(
+            f"{provider}:{relative}"
+            for (provider, relative), count in counts.items()
+            if count > 1
+        )
+        raise BulkloadError(f"duplicate managed exclusion: {', '.join(repeated)}")
     for index, first in enumerate(exclusions):
         first_parts = PurePosixPath(first["relative_path"]).parts
         for second in exclusions[index + 1 :]:
@@ -267,7 +280,11 @@ def canonical_provider_policy(
                 first_parts == second_parts[: len(first_parts)]
                 or second_parts == first_parts[: len(second_parts)]
             ):
-                raise BulkloadError("managed exclusions overlap ambiguously")
+                raise BulkloadError(
+                    "managed exclusions overlap ambiguously: "
+                    f"{first['provider']}:{first['relative_path']} and "
+                    f"{second['provider']}:{second['relative_path']}"
+                )
     return {
         "default": "declared-root-portable-private",
         "managed_exclusions": exclusions,
@@ -3784,7 +3801,10 @@ def _capture_live_snapshot(
                 seat_bindings[name] = (logical, logical, None, False)
                 continue
             if not stat.S_ISREG(info.st_mode):
-                raise BulkloadError("file seat is not an exact regular file")
+                raise BulkloadError(
+                    f"file seat is not an exact regular file: {name}="
+                    f"{os.fspath(logical)}"
+                )
             seat_bindings[name] = (logical, resolve_real(logical), None, True)
         else:
             seat_bindings[name] = _declared_root(path, allow_absent=True)

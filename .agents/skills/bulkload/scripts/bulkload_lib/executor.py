@@ -78,7 +78,9 @@ def _remote_safe_stage_root(path: Path) -> Path:
     if not REMOTE_STAGE_ROOT.fullmatch(value) or any(
         component in {".", ".."} for component in value.split("/")
     ):
-        raise BulkloadError("stage root is not a canonical remote-safe absolute path")
+        raise BulkloadError(
+            f"stage root is not a canonical remote-safe absolute path: {value}"
+        )
     return Path(value)
 
 
