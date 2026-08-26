@@ -2878,6 +2878,52 @@ def _snapshot_partial_root(snapshot_root: Path) -> Path:
     )
 
 
+def _require_owned_resume_custody(partial: Path) -> None:
+    """Refuse a partial this capture cannot prove is its own.
+
+    The partial's name is a pure function of the destination path
+    (:func:`_snapshot_partial_root`), because every Git payload digest is a
+    function of that name. That determinism is load-bearing, and it is also an
+    invitation: anyone who can create entries in the parent directory can
+    pre-create the partial, seed it with checkpoints over payload of their
+    choosing, and have the next capture adopt it, re-prove it against the
+    attacker's own recorded digests, and publish it as sealed custody.
+
+    So resume state is trusted only where this uid owns the partial and its
+    checkpoint directory at exactly 0700, and the parent grants no user but its
+    owner the right to replace them. Anything else is refused loudly, before
+    the first byte is written, and left exactly as it stands: a directory this
+    capture cannot prove it owns is not a directory it may delete.
+    """
+    uid = os.geteuid()
+    parent = partial.parent
+    parent_mode = stat.S_IMODE(parent.stat(follow_symlinks=False).st_mode)
+    if parent_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise BulkloadError(
+            f"resume custody parent is {parent_mode:04o}, writable beyond its "
+            f"owner: {os.fspath(parent)}"
+        )
+    for path in (partial, partial / SNAPSHOT_CHECKPOINT_DIRECTORY):
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            # No checkpoint directory: nothing here can be adopted, so there is
+            # nothing here to trust.
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise BulkloadError(f"resume custody is not a directory: {os.fspath(path)}")
+        if info.st_uid != uid:
+            raise BulkloadError(
+                f"resume custody is owned by uid {info.st_uid}, not {uid}: "
+                f"{os.fspath(path)}"
+            )
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != 0o700:
+            raise BulkloadError(
+                f"resume custody is {mode:04o}, not 0700: {os.fspath(path)}"
+            )
+
+
 def _snapshot_checkpoint_stage(label: str) -> str:
     """The one stage at which ``label``'s payload bytes are final.
 
@@ -3814,8 +3860,11 @@ def _capture_live_snapshot(
         raise BulkloadError("live snapshot custody path already exists")
     if partial.is_symlink() or (partial.exists() and not partial.is_dir()):
         raise BulkloadError("live snapshot custody path already exists")
-    # A surviving partial is this lineage's resume state, not a collision.
+    # A surviving partial is this lineage's resume state, not a collision --
+    # but only when this capture can prove the partial is its own to resume.
     resuming = partial.is_dir()
+    if resuming:
+        _require_owned_resume_custody(partial)
     git_logical, git_backing, git_link, _ = _declared_root(git_root, allow_absent=False)
     # Preflight (live half of S1). The nested quiesced ``capture_agent_state``
     # below refuses an empty path map, a missing rsync pin and an unmapped

@@ -811,6 +811,63 @@ class SchemaAndCaptureTests(unittest.TestCase):
             cold = self._live_capture(fixture, snapshot_root, max_sqlite_rows=50_000)
             self._assert_same_custody(resumed_snapshot, cold["catalog"]["snapshot"])
 
+    def test_live_capture_refuses_resume_custody_it_does_not_own(self) -> None:
+        """The partial name is deterministic, so its ownership must be proved.
+
+        Anyone who can create entries beside the destination can create the
+        partial under its one derivable name and seed it with checkpoints. A
+        capture that adopts such a partial re-proves the attacker's payload
+        against the attacker's own digests and publishes it as custody.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            checkpoints = partial / scanner.SNAPSHOT_CHECKPOINT_DIRECTORY
+            parent = snapshot_root.parent
+            sealed = scanner._snapshot_checkpoint_labels(partial)
+            self.assertEqual(
+                sealed, {"git", "provider-claude", "provider-codex", "provider-pi"}
+            )
+
+            def refuses(subject: Path) -> None:
+                with self.assertRaises(BulkloadError) as caught:
+                    self._live_capture(fixture, snapshot_root)
+                self.assertIn("resume custody", str(caught.exception))
+                self.assertIn(os.fspath(subject), str(caught.exception))
+                # Refused, never repossessed: what this capture cannot prove it
+                # owns, it also does not delete.
+                self.assertTrue(partial.is_dir())
+                self.assertEqual(scanner._snapshot_checkpoint_labels(partial), sealed)
+                self.assertFalse(snapshot_root.exists())
+
+            for mode in (0o750, 0o770, 0o701):
+                partial.chmod(mode)
+                refuses(partial)
+            partial.chmod(0o700)
+
+            for mode in (0o770, 0o707):
+                checkpoints.chmod(mode)
+                refuses(checkpoints)
+            checkpoints.chmod(0o700)
+
+            original = stat.S_IMODE(parent.stat().st_mode)
+            for mode in (0o775, 0o707):
+                parent.chmod(mode)
+                refuses(parent)
+            parent.chmod(original)
+
+            with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+                refuses(partial)
+
+            # The guard costs an honest resume nothing.
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            self.assertEqual(copied.call_count, 0)
+
     @staticmethod
     def _index_records(snapshot: dict) -> list[dict]:
         index = Path(snapshot["seal_path"]).parent / "snapshot-index.jsonl"
