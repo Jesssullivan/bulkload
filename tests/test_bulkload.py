@@ -136,6 +136,11 @@ def create_bag_database(path: Path, values: list[str]) -> None:
         connection.close()
 
 
+def blockers_with(capture: dict, code: str) -> list[dict]:
+    """Every catalog blocker carrying ``code``, in sealed (sorted) order."""
+    return [item for item in capture["catalog"]["blockers"] if item["code"] == code]
+
+
 def ref_inventory(path: Path) -> bytes:
     return git(path, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)")
 
@@ -1859,19 +1864,26 @@ class TransactionTests(unittest.TestCase):
             self.assertEqual(
                 (fixture.destination_home / ".bash_history").read_text(), "history\n"
             )
-            with self.assertRaisesRegex(BulkloadError, "home root"):
-                capture_agent_state(
-                    role="source",
-                    home=fixture.source_home,
-                    git_root=fixture.source_git,
-                    codex_root=None,
-                    claude_root=None,
-                    pi_root=None,
-                    seats=[("whole-home", fixture.source_home)],
-                    path_map=fixture.path_map,
-                    writers_quiesced=True,
-                    rsync_path=fixture.rsync_path,
-                )
+            # A refused seat is batched into a blocker rather than aborting the
+            # whole capture, and an incomplete capture never reaches planning.
+            refused = capture_agent_state(
+                role="source",
+                home=fixture.source_home,
+                git_root=fixture.source_git,
+                codex_root=None,
+                claude_root=None,
+                pi_root=None,
+                seats=[("whole-home", fixture.source_home)],
+                path_map=fixture.path_map,
+                writers_quiesced=True,
+                rsync_path=fixture.rsync_path,
+            )
+            self.assertFalse(refused["complete"])
+            self.assertEqual(refused["catalog"]["seats"], [])
+            refusals = blockers_with(refused, "seat-capture-failed")
+            self.assertEqual(len(refusals), 1)
+            self.assertEqual(refusals[0]["path"], "whole-home")
+            self.assertIn("home root", refusals[0]["detail"])
 
     def test_ssh_quarantine_crash_and_live_preseed_final_delta(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -108,6 +108,32 @@ class _MalformedAppendState(BulkloadError):
     """Stable append state whose records cannot be typed safely."""
 
 
+class _UnportableAppendRewrite(BulkloadError):
+    """Append state whose rewritten bytes no longer re-parse as JSONL."""
+
+
+class _CaptureBudgetExceeded(BulkloadError):
+    """A filesystem walk hit its declared file or byte budget.
+
+    The partial walk is carried on the exception so a caller that batches this
+    into a blocker can retain the entries already collected instead of throwing
+    the whole enumeration away.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        root: Path,
+        entries: list[dict[str, Any]] | None = None,
+        blockers: list[dict[str, str]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.root = root
+        self.entries: list[dict[str, Any]] = [] if entries is None else entries
+        self.blockers: list[dict[str, str]] = [] if blockers is None else blockers
+
+
 def shell_safe_executable(raw_path: str, label: str) -> str:
     if not os.path.isabs(raw_path):
         raise BulkloadError(f"{label} path must be explicit and absolute")
@@ -429,6 +455,22 @@ def _file_record(path: Path, relative: str, *, classification: str) -> dict[str,
     }
 
 
+def _budget_detail(
+    root: Path,
+    *,
+    files: int,
+    charged_bytes: int,
+    max_files: int,
+    max_bytes: int,
+) -> str:
+    """Name the root and the counts reached when a capture budget is spent."""
+    return (
+        f"filesystem capture budget exceeded under {os.fspath(root)}: "
+        f"{files} files (max {max_files}), "
+        f"{charged_bytes} bytes (max {max_bytes})"
+    )
+
+
 def _walk_entries(
     root: Path,
     *,
@@ -515,7 +557,19 @@ def _walk_entries(
                     }
                 )
             if len(entries) > max_files or charged_bytes > max_bytes:
-                raise BulkloadError("filesystem capture budget exceeded")
+                entries.sort(key=lambda item: (item["relative_path"], item["kind"]))
+                raise _CaptureBudgetExceeded(
+                    _budget_detail(
+                        root,
+                        files=len(entries),
+                        charged_bytes=charged_bytes,
+                        max_files=max_files,
+                        max_bytes=max_bytes,
+                    ),
+                    root=root,
+                    entries=entries,
+                    blockers=blockers,
+                )
     entries.sort(key=lambda item: (item["relative_path"], item["kind"]))
     return entries, blockers
 
@@ -1379,7 +1433,7 @@ def _jsonl_records(
                 try:
                     json.loads(transformed)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise BulkloadError(
+                    raise _UnportableAppendRewrite(
                         "path rewriting produced invalid JSONL"
                     ) from error
                 hashes.append(sha256_bytes(line))
@@ -1758,6 +1812,20 @@ def _capture_provider(
                     if classification.endswith("rewrite")
                     else (),
                 )
+            except _UnportableAppendRewrite as error:
+                # One unrewritable session file costs one item, not the whole
+                # provider: record it as a per-item blocker and keep the bytes
+                # verbatim instead of escaping to the provider-level wrapper.
+                blockers.append(
+                    {
+                        "code": "unportable-path-rewrite-state",
+                        "path": f"{provider}:{relative}",
+                        "detail": str(error),
+                    }
+                )
+                record = _file_record(path, relative, classification="portable-private")
+                record.pop("destination_relative_path", None)
+                record.pop("identity", None)
             except _MalformedAppendState:
                 record = _file_record(path, relative, classification="portable-private")
                 record.pop("destination_relative_path", None)
@@ -3632,13 +3700,24 @@ def capture_agent_state(
                     "detail": str(result),
                 }
             )
-    non_git, non_git_blockers = _walk_entries(
-        git_root,
-        classification="non-git",
-        excluded_roots=discovered,
-        max_files=max_files,
-        max_bytes=max_bytes,
-    )
+    try:
+        non_git, non_git_blockers = _walk_entries(
+            git_root,
+            classification="non-git",
+            excluded_roots=discovered,
+            max_files=max_files,
+            max_bytes=max_bytes,
+        )
+    except _CaptureBudgetExceeded as error:
+        non_git = error.entries
+        non_git_blockers = [
+            *error.blockers,
+            {
+                "code": "capture-budget-exceeded",
+                "path": os.fspath(error.root),
+                "detail": str(error),
+            },
+        ]
     blockers.extend(non_git_blockers)
     outer_opaque_roots: list[Path] = []
     for root in sorted(
@@ -3667,19 +3746,30 @@ def capture_agent_state(
                     }
                 )
                 continue
-        opaque_entries, opaque_blockers = _walk_entries(
-            opaque_root,
-            classification="non-git",
-            excluded_roots={
-                candidate
-                for candidate in discovered
-                if candidate != opaque_root
-                and candidate not in opaque_git_roots
-                and opaque_root in candidate.parents
-            },
-            max_files=max_files,
-            max_bytes=max_bytes,
-        )
+        try:
+            opaque_entries, opaque_blockers = _walk_entries(
+                opaque_root,
+                classification="non-git",
+                excluded_roots={
+                    candidate
+                    for candidate in discovered
+                    if candidate != opaque_root
+                    and candidate not in opaque_git_roots
+                    and opaque_root in candidate.parents
+                },
+                max_files=max_files,
+                max_bytes=max_bytes,
+            )
+        except _CaptureBudgetExceeded as error:
+            opaque_entries = error.entries
+            opaque_blockers = [
+                *error.blockers,
+                {
+                    "code": "capture-budget-exceeded",
+                    "path": os.fspath(error.root),
+                    "detail": str(error),
+                },
+            ]
         blockers.extend(opaque_blockers)
         for entry in opaque_entries:
             if prefix.parts:
@@ -3690,11 +3780,26 @@ def capture_agent_state(
     non_git.sort(key=lambda item: (item["relative_path"], item["kind"]))
     charged_non_git_bytes = sum(item["size"] for item in non_git)
     if len(non_git) > max_files or charged_non_git_bytes > max_bytes:
-        raise BulkloadError(
-            f"filesystem capture budget exceeded under {os.fspath(git_root)}: "
-            f"{len(non_git)} files (max {max_files}), "
-            f"{charged_non_git_bytes} bytes (max {max_bytes})"
-        )
+        # The aggregate overrun is the same defect the walk already reports for
+        # this root; record it once and keep what was collected.
+        if not any(
+            item["code"] == "capture-budget-exceeded"
+            and item.get("path") == os.fspath(git_root)
+            for item in blockers
+        ):
+            blockers.append(
+                {
+                    "code": "capture-budget-exceeded",
+                    "path": os.fspath(git_root),
+                    "detail": _budget_detail(
+                        git_root,
+                        files=len(non_git),
+                        charged_bytes=charged_non_git_bytes,
+                        max_files=max_files,
+                        max_bytes=max_bytes,
+                    ),
+                }
+            )
     for entry in non_git:
         entry["destination_relative_path"] = entry["relative_path"]
         entry["identity"] = entry["relative_path"]
@@ -3730,16 +3835,26 @@ def capture_agent_state(
     for declaration in seats:
         name, root = declaration[:2]
         root_kind = declaration[2] if len(declaration) == 3 else "directory"
-        captured, seat_blockers = _capture_seat(
-            name,
-            root,
-            root_kind=root_kind,
-            role=role,
-            path_map=path_map,
-            home=home,
-            max_files=max_files,
-            max_bytes=max_bytes,
-        )
+        try:
+            captured, seat_blockers = _capture_seat(
+                name,
+                root,
+                root_kind=root_kind,
+                role=role,
+                path_map=path_map,
+                home=home,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            )
+        except BulkloadError as error:
+            blockers.append(
+                {
+                    "code": "seat-capture-failed",
+                    "path": name,
+                    "detail": str(error),
+                }
+            )
+            continue
         seat_records.append(captured)
         blockers.extend(seat_blockers)
     try:
