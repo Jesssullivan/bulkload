@@ -90,5 +90,5 @@ custody retained, perform fresh attended checks for each provider:
 6. confirm no provider rewrote or rejected the migrated database family.
 
 Record those acceptance results outside Bulkload's offline receipt. If a
-provider rejects state, stop it again and use `agent-rollback` or the journaled
-recovery path; never hand-edit its database.
+provider rejects state, stop that provider and use `agent-rollback` or the
+journaled recovery path; never hand-edit its database.

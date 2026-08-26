@@ -118,6 +118,16 @@ input size plus 2 GiB as `MemAvailable`. A and B are loaded and released
 sequentially; equal catalog digests bind the stable body without retaining four
 decoded manifests at once.
 
+The 512 MiB memory gate is not confined to planning. Every Bulkload subcommand
+applies it to every JSON input it reads. Any single input file over 512 MiB
+requires a host whose `/proc/meminfo` reports at least four times that file's
+size plus 2 GiB as `MemAvailable`. The reserve is read only from
+`/proc/meminfo`, so an over-512 MiB input on a host without it — macOS Neo
+included — fails closed rather than proceeding unmeasured. This governs Neo's
+own cutover-release step: that command loads the final plan, so a final plan
+above 512 MiB cannot be released from macOS Neo. Keep the final plan under the
+threshold, or run the release from a Linux host that reports the reserve.
+
 ## Agent state
 
 Provider roots are explicit and typed. Both roles bind one component-bounded

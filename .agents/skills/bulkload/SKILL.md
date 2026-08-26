@@ -107,6 +107,13 @@ the destination captures. The command fails closed unless Linux reports the
 required memory reserve; do not raise the bound, add swap, or reuse captures.
 Every transfer still originates on Neo.
 
+The same gate applies to every JSON input of every subcommand, not just
+`agent-plan`. Any single input file over 512 MiB requires a host whose
+`/proc/meminfo` reports four times that file's size plus 2 GiB as
+`MemAvailable`. macOS has no `/proc/meminfo`, so an over-512 MiB input fails
+closed on Neo. Neo's cutover-release step loads the final plan, so keep the
+final plan under 512 MiB or run the release from a Linux host.
+
 - `ready` and every blocker;
 - known `holds`, especially Claude auth;
 - every Git ref/recovery action and worktree target;

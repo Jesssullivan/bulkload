@@ -22,6 +22,11 @@
 2. Compile/review/accept the preliminary plan, then resume writers. If the four
    captures total more than 512 MiB, Neo first pushes its two captures to the
    private Sting evidence directory and planning runs on memory-qualified Sting.
+   The gate is per input file and applies to every subcommand: any JSON input
+   over 512 MiB requires `/proc/meminfo` to report four times that file's size
+   plus 2 GiB as `MemAvailable`. macOS has no `/proc/meminfo`, so such an input
+   fails closed on Neo — including the final plan that Neo's cutover-release
+   step must load.
 3. On Sting prepare the private stage and sealed NUL allowlist; Neo pulls the
    small prepare receipt and allowlist, then streams that authority without
    loading AgentPlanV4; on Sting materialize preseed. Every SSH connection
