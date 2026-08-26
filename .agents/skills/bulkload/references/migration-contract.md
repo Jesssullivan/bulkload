@@ -59,10 +59,12 @@ For Neo to Sting the contract includes:
 ```
 
 A broader `/Users/jess` map may coexist; it cannot override the exact Git map.
-Logical provider/install paths drive translation; nofollow-proven physical
-backings drive reads and writes. Sting's `.codex`, `.claude`, `.gstack`, and
-`git` Home Manager links are never replaced. Every linked worktree and declared
-agent/seat root must translate; unmapped state blocks.
+Logical provider/install paths drive translation.
+Nofollow-proven physical backings drive reads and writes.
+Sting's `.codex`, `.claude`, `.gstack`, and `git` Home Manager links are never
+replaced.
+Every linked worktree and declared agent/seat root must translate; unmapped
+state blocks.
 
 ## Divergence rules
 
@@ -83,10 +85,10 @@ No blocker may coexist with operations in a ready plan.
 
 ## Capacity and reflinks
 
-The stage and rollback root must be outside live paths. On Sting they must use
-the reflink-capable `/srv/fast-local` XFS authority. Every selected clone is
-required and rehashed. Failure stops; Bulkload never silently copies the whole
-file.
+Keep the stage and rollback root outside live paths.
+On Sting, use the reflink-capable `/srv/fast-local` XFS authority.
+Every selected clone is required and rehashed.
+Failure stops; Bulkload never silently copies the whole file.
 
 The plan and receipts separate:
 
@@ -100,10 +102,12 @@ The gate is `available >= incoming + compose + overwritten + reserve`. A full
 destination rollback duplicate is forbidden.
 
 Destination `prepare` creates mode-0700 stage/quarantine, writes a mode-0600
-plan-derived allowlist, and gates capacity. Neo `push` validates and streams
-that sealed allowlist plus captured GNU-rsync evidence without decoding the plan;
+plan-derived allowlist, and gates capacity.
+Neo `push` validates and streams that sealed allowlist plus captured GNU-rsync
+evidence without decoding the plan.
 Sting `materialize` requires chained prepare/push receipt digests and gates
-again. Plans and receipts use exact owner-private paths and travel only over
+again.
+Plans and receipts use exact owner-private paths and travel only over
 Neo-initiated strict SSH; no Sting-originated credential exists.
 
 ## Journal states
@@ -115,16 +119,19 @@ preparing-rollback -> rollback-sealed -> applied -> verified
                                       \-> rolled-back
 ```
 
-Mutation progress is fsynced after each entry. Recovery validates the plan,
-stage manifest, transaction ID, and existing journal before continuing forward
-or restoring. A completed operation returns the stored exact receipt on repeat.
+Mutation progress is fsynced after each entry.
+Recovery validates the plan, stage manifest, transaction ID, and existing
+journal before continuing forward or restoring.
+A completed operation returns the stored exact receipt on repeat.
 
 ## Receipt truth
 
 Receipts may claim only offline state facts: artifact digests, exact paths and
 modes, ref/index/object observations, SQLite logical catalogs, holds, capacity,
-rollback custody, and transaction state. They never include provider payloads
-and always retain `provider_runtime_acceptance_verified=false` where relevant.
+rollback custody, and transaction state.
+They never include provider payloads.
+They always retain `provider_runtime_acceptance_verified=false` where relevant.
 
-Fresh attended Codex, Claude, and Pi actions establish runtime authentication,
-picker visibility, resume/dialog continuity, and new-session persistence.
+Only fresh attended Codex, Claude, and Pi actions establish runtime
+authentication, picker visibility, resume/dialog continuity, and new-session
+persistence.

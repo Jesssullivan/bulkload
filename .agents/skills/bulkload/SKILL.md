@@ -7,38 +7,55 @@ description: Capture, plan, stage, apply, verify, roll back, and recover a typed
 
 Use Bulkload for a reviewed machine cutover that must retain a `~/git` fleet,
 linked worktrees, exact index/dirt state, non-Git fleet content, Codex, Claude,
-Pi, or declared mutable-seat state. The supported runtime is Python 3.11 or
-newer, Git, SQLite, and a filesystem with verified reflinks for live rollback.
+Pi, or declared mutable-seat state.
+
+Required runtime: Python 3.11 or newer, Git, SQLite, and a filesystem with
+verified reflinks for live rollback.
 
 Read [the migration contract](references/migration-contract.md) and
 [agent-state guide](references/agent-context.md) before creating a plan.
 
 ## Keep the boundary explicit
 
-1. Keep Codex, Claude, Pi, Emacs, and terminal sessions alive. Capture A into
-   immutable custody, then capture B with A's explicit `snapshot-seal.json` as
-   its base. For final, begin a no-interaction interval before source B and keep
-   it through Sting verification and Neo's cutover-release verification;
-   Bulkload proves two matching live epochs before and after transport, then
-   two more after destination verification, and never signals a session.
-2. Declare the source and destination home/Git maps. The longest source prefix
-   wins, so map `/Users/jess/git` explicitly to
-   `/srv/fast-local/jess/git` in addition to any broader home map.
-3. Declare every directory seat and regular-file singleton. A whole-home seat
-   is invalid; an absent optional file is captured as such.
-4. Keep evidence, stage, journal, and rollback roots outside every live root.
-5. Never put credential values, SQLite rows, raw symlink targets, or
-   unsanitized remote URLs in output or chat.
-6. Never invoke a terminal multiplexer, TCFS runtime, Home Manager, deploy,
-   activation, browser migration, or credential rotation from this workflow.
+Keep Codex, Claude, Pi, Emacs, and terminal sessions alive.
+Capture A into immutable custody.
+Capture B with A's explicit `snapshot-seal.json` as its base.
+For final, begin a no-interaction interval before source B.
+Hold that interval through Sting verification and Neo's cutover-release
+verification.
 
-`AgentCaptureV4` knows Codex, Claude, Pi, and mutable-seat state. Ordinary
-descendants of a declared provider root default to byte-exact portable-private
-state. Exact managed exclusions and regenerate trees are pruned first; unsafe
-special entries, typed-state ambiguity, and structural collisions block. Codex
-and Pi auth are typed source-authority operations. Claude
-auth is nonportable: preserve it as a hold and authenticate on the destination
-attended. Offline receipts do not prove provider acceptance.
+Bulkload proves two matching live epochs before and after transport, then two
+more after destination verification. It never signals a session.
+
+Declare the source and destination home/Git maps.
+The longest source prefix wins, so map `/Users/jess/git` explicitly to
+`/srv/fast-local/jess/git` in addition to any broader home map.
+
+Declare every directory seat and regular-file singleton.
+A whole-home seat is invalid.
+An absent optional file is captured as such.
+
+Keep evidence, stage, journal, and rollback roots outside every live root.
+
+Never put credential values, SQLite rows, raw symlink targets, or unsanitized
+remote URLs in output or chat.
+
+Never invoke a terminal multiplexer, TCFS runtime, Home Manager, deploy,
+activation, browser migration, or credential rotation from this workflow.
+
+## What AgentCaptureV4 types
+
+`AgentCaptureV4` knows Codex, Claude, Pi, and mutable-seat state.
+
+Ordinary descendants of a declared provider root default to byte-exact
+portable-private state.
+Exact managed exclusions and regenerate trees are pruned first.
+Unsafe special entries, typed-state ambiguity, and structural collisions block.
+
+Codex and Pi auth are typed source-authority operations.
+Claude auth is nonportable: preserve it as a hold and authenticate on the
+destination attended.
+Offline receipts do not prove provider acceptance.
 
 ## Capture twice per role
 
@@ -59,32 +76,41 @@ scripts/bulkload.py agent-capture \
 
 Repeat into `source-b.json` with
 `--snapshot-base-seal /secure/evidence/.source-a.json.snapshot/snapshot-seal.json`.
-On the destination,
-use `--role destination`, the live destination `--home` and `--git-root`, and
-the same source-to-destination path maps. Repeat into two destination files.
+
+On the destination, use `--role destination`, the live destination `--home` and
+`--git-root`, and the same source-to-destination path maps. Repeat into two
+destination files.
+
 Use exact provider-specific maps for `.codex`, `.claude`, and `.gstack` backing
-paths in addition to the home/Git maps. Root translation uses the logical path;
-reads/writes use the nofollow-proven physical backing, so Home Manager links are
-never replaced. Obtain `--rsync-path` from the pinned flake shell; capture binds
-its absolute path, hash, protocol, and features. Add identical reviewed
-`--managed-exclusion PROVIDER:RELATIVE` values on both roles. Add directory
-state with `--seat NAME=/absolute/path` and singleton history with
-`--file-seat NAME=/absolute/file`.
+paths in addition to the home/Git maps.
+Root translation uses the logical path; reads and writes use the nofollow-proven
+physical backing, so Home Manager links are never replaced.
+
+Obtain `--rsync-path` from the pinned flake shell. Capture binds its absolute
+path, hash, protocol, and features.
+Add identical reviewed `--managed-exclusion PROVIDER:RELATIVE` values on both
+roles.
+Add directory state with `--seat NAME=/absolute/path`.
+Add singleton history with `--file-seat NAME=/absolute/file`.
 
 Before `agent-plan`, Neo pulls destination A/B into the owner-private evidence
-paths above through its outbound strict-SSH connection. Use the exact source
-rsync binding from source capture and the immutable Nix-store rsync path passed
-to destination capture. Sting never opens a connection or holds a Neo
-credential; the accepted four-capture plan subsequently binds both tools.
+paths above through its outbound strict-SSH connection.
+Use the exact source rsync binding from source capture and the immutable
+Nix-store rsync path passed to destination capture.
+Sting never opens a connection or holds a Neo credential; the accepted
+four-capture plan subsequently binds both tools.
 
-Capture records hashes and typed metadata only. SQLite capture uses the backup
-API and includes committed WAL state. Readable invalid Git candidates and
-alternates/fsck-only repositories retain exact non-Git bytes; malformed stable
-append JSONL retains exact portable-private bytes. Scan failures, unsafe schema
-or Git authority, non-runtime special entries, active Git operations,
-unsupported typed state, and budget overruns remain incomplete. Unknown-named
-files inside a declared provider root are known portable-private bytes; only
-explicitly typed Claude path-bearing text rewrites.
+Capture records hashes and typed metadata only.
+SQLite capture uses the backup API and includes committed WAL state.
+Readable invalid Git candidates and alternates/fsck-only repositories retain
+exact non-Git bytes.
+Malformed stable append JSONL retains exact portable-private bytes.
+Unknown-named files inside a declared provider root are known portable-private
+bytes; only explicitly typed Claude path-bearing text rewrites.
+
+These remain incomplete: scan failures, unsafe schema or Git authority,
+non-runtime special entries, active Git operations, unsupported typed state, and
+budget overruns.
 
 ## Compile and review
 
@@ -99,20 +125,8 @@ scripts/bulkload.py agent-plan \
 
 Planning requires four unique capture IDs, identical static contracts, B's
 exact A-seal binding, and no A-only identity lost from B. B is plan authority.
+
 Review:
-
-For a four-capture set larger than 512 MiB, push both source captures from Neo
-to the private Sting evidence directory and run `agent-plan` on Sting beside
-the destination captures. The command fails closed unless Linux reports the
-required memory reserve; do not raise the bound, add swap, or reuse captures.
-Every transfer still originates on Neo.
-
-The same gate applies to every JSON input of every subcommand, not just
-`agent-plan`. Any single input file over 512 MiB requires a host whose
-`/proc/meminfo` reports four times that file's size plus 2 GiB as
-`MemAvailable`. macOS has no `/proc/meminfo`, so an over-512 MiB input fails
-closed on Neo. Neo's cutover-release step loads the final plan, so keep the
-final plan under 512 MiB or run the release from a Linux host.
 
 - `ready` and every blocker;
 - known `holds`, especially Claude auth;
@@ -122,27 +136,49 @@ final plan under 512 MiB or run the release from a Linux host.
 - the capacity formula; and
 - the exact `plan_sha256`.
 
-Every `--accept-plan-sha256` value is the **embedded** `plan_sha256` field
-inside the plan JSON — the seal over the body with that field removed. It is
-never the sha256 of the plan file itself; `sha256sum plan.json` will not match.
+Every `--accept-plan-sha256` value is the embedded `plan_sha256` field inside
+the plan JSON — the seal over the body with that field removed. It is never the
+sha256 of the plan file itself; `sha256sum plan.json` will not match.
+
+### Memory gate
+
+For a four-capture set larger than 512 MiB, push both source captures from Neo
+to the private Sting evidence directory and run `agent-plan` on Sting beside
+the destination captures.
+Do not raise the bound, add swap, or reuse captures.
+Every transfer still originates on Neo.
+
+The gate applies to every JSON input of every subcommand, not just `agent-plan`.
+Any single input file over 512 MiB requires a host whose `/proc/meminfo` reports
+four times that file's size plus 2 GiB as `MemAvailable`.
+macOS has no `/proc/meminfo`, so an over-512 MiB input fails closed on Neo.
+Neo's cutover-release step loads the final plan, so keep the final plan under
+512 MiB or run the release from a Linux host.
+
+### What the plan does to divergence
 
 Source bytes, Git dirt/deletions, non-Git files, portable state, and divergent
 append state overwrite with exact `destination_before` rollback custody.
 Compatible SQLite rows union; schema/shared-row/key ambiguity uses a reversible
-source snapshot. Destination ref divergence is retained at a deterministic
-`refs/bulkload/recovery/destination/*` ref before update. Destination-only
-union members remain.
+source snapshot.
+Destination ref divergence is retained at a deterministic
+`refs/bulkload/recovery/destination/*` ref before update.
+Destination-only union members remain.
 
 ## Preseed without touching live state
 
 The stage protocol is destination `prepare`, source `push`, destination
-`materialize`. Install the same closure on both hosts. Keep the accepted plan
-on Sting, with the source and destination GNU rsync paths and hashes bound in
-that plan; rehash the source executable before transport, require the destination's
-immutable Nix-store path, and let destination `prepare` rehash it locally. Use
-`--checksum --delay-updates`, strict SSH, and exact owner-private paths. Every
-connection originates on Neo: Neo may pull destination A/B captures and the
-prepare receipt over that connection, but Sting never authenticates to Neo.
+`materialize`. Install the same closure on both hosts.
+
+Keep the accepted plan on Sting, with the source and destination GNU rsync paths
+and hashes bound in that plan.
+Rehash the source executable before transport.
+Require the destination's immutable Nix-store path, and let destination
+`prepare` rehash it locally.
+Use `--checksum --delay-updates`, strict SSH, and exact owner-private paths.
+
+Every connection originates on Neo: Neo may pull destination A/B captures and
+the prepare receipt over that connection, but Sting never authenticates to Neo.
 
 On Sting:
 
@@ -154,14 +190,16 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode prepare \
   --output /home/jess/.bulkload-evidence/preseed-prepare.json
 ```
 
-On Neo, after pulling that exact receipt and the sealed allowlist
-`prepare` wrote at `STAGE_ROOT/.transport-allowlist-preseed.nul` over the same
-Neo-originated connection. Preserve the allowlist's 0600 mode and exact bytes;
-push rejects any other custody. Push takes only the prepare receipt, the
-allowlist, and the destination host — `--plan` and `--transport-receipt` are
-rejected here — and must run on the host named in the captured source
-`transport.hostname`, with `--destination-ssh-host` naming exactly the captured
-destination hostname:
+On Neo, first pull that exact receipt and the sealed allowlist `prepare` wrote
+at `STAGE_ROOT/.transport-allowlist-preseed.nul`, over the same Neo-originated
+connection.
+Preserve the allowlist's 0600 mode and exact bytes; push rejects any other
+custody.
+
+Push takes only the prepare receipt, the allowlist, and the destination host.
+`--plan` and `--transport-receipt` are rejected here.
+Run push on the host named in the captured source `transport.hostname`.
+Pass `--destination-ssh-host` naming exactly the captured destination hostname.
 
 ```bash
 scripts/bulkload.py agent-stage --phase preseed --transport-mode push \
@@ -186,14 +224,17 @@ scripts/bulkload.py agent-stage --phase preseed --transport-mode materialize \
   --output /home/jess/.bulkload-evidence/preseed-stage.json
 ```
 
-`prepare` creates the absent owner-private stage/quarantine, writes and seals the
-plan-derived NUL allowlist, and gates capacity. Push streams only that sealed
-allowlist through compatible captured GNU rsync; it does not load the multi-GiB
-plan on Neo. Materialize revalidates the plan, allowlist authority, chained
-receipts, and every byte. Changed-late
-preliminary entries defer rather than gain apply authority. A failed reflink is
-a hard stop. `--allow-accounted-copy` covers only charged incoming/transformed
-bytes, never a hidden full rollback copy.
+`prepare` creates the absent owner-private stage/quarantine, writes and seals
+the plan-derived NUL allowlist, and gates capacity.
+`push` streams only that sealed allowlist through compatible captured GNU rsync;
+it does not load the multi-GiB plan on Neo.
+`materialize` revalidates the plan, allowlist authority, chained receipts, and
+every byte.
+
+Changed-late preliminary entries defer rather than gain apply authority.
+A failed reflink is a hard stop.
+`--allow-accounted-copy` covers only charged incoming/transformed bytes, never a
+hidden full rollback copy.
 
 The capacity contract is:
 
@@ -206,15 +247,20 @@ XFS authority beneath `/srv/fast-local`.
 
 ## Seal the final stage
 
-Keep sessions alive, begin the attended no-interaction interval, take fresh
-source/destination A/base-B captures, compile and accept a fresh plan, then
-repeat all three modes with `--phase final`. Final may reuse
-verified preseed content objects across a different plan digest, but restages
-every final-plan operation and binds only that fresh plan. It rechecks source
-bytes and destination SQLite and writes no live path. Only the materialized
-final receipt has `ready_for_apply=true`. Compatible SQLite rows union; unsafe
-schema/shared-key cases stage the source snapshot. Every result passes integrity,
-foreign-key, and fresh logical-catalog checks.
+Keep sessions alive.
+Begin the attended no-interaction interval.
+Take fresh source/destination A/base-B captures.
+Compile and accept a fresh plan.
+Repeat all three modes with `--phase final`.
+
+Final may reuse verified preseed content objects across a different plan digest,
+but it restages every final-plan operation and binds only that fresh plan.
+It rechecks source bytes and destination SQLite, and writes no live path.
+Only the materialized final receipt has `ready_for_apply=true`.
+
+Compatible SQLite rows union; unsafe schema/shared-key cases stage the source
+snapshot.
+Every result passes integrity, foreign-key, and fresh logical-catalog checks.
 
 ## Apply
 
@@ -228,16 +274,18 @@ scripts/bulkload.py agent-apply \
   --output /home/jess/.bulkload-evidence/apply-receipt.json
 ```
 
-Apply first revalidates destination preconditions. Before its first live
-mutation it snapshots every exact overwritten entry with a required reflink,
-records absent targets and transaction-created parents, seals rollback, and
-persists the journal.
+Apply first revalidates destination preconditions.
+Before its first live mutation it snapshots every exact overwritten entry with a
+required reflink, records absent targets and transaction-created parents, seals
+rollback, and persists the journal.
+
 File changes use a same-directory reflink temporary, rename, file fsync, and
-directory fsync. Git objects are additive; refs and worktree topology use Git.
+directory fsync.
+Git objects are additive; refs and worktree topology use Git.
 Every mutation advances the durable journal.
 
-Re-running a completed apply returns the exact stored receipt. Do not edit a
-plan, stage manifest, journal, or receipt by hand.
+Re-running a completed apply returns the exact stored receipt.
+Do not edit a plan, stage manifest, journal, or receipt by hand.
 
 ## Verify
 
@@ -249,11 +297,13 @@ scripts/bulkload.py agent-verify \
   --output /home/jess/.bulkload-evidence/verify-receipt.json
 ```
 
-Verification freshly reads file bytes/modes, exact indexes, refs, worktrees,
-Git object integrity, SQLite logical state, removed sidecars, and holds. Require
-`verified=true` and `failures=[]`. Neo then pulls that exact receipt over its
-existing outbound strict-SSH connection and, while the no-interaction interval
-continues, emits the cutover-release receipt:
+Verification freshly reads file bytes/modes, exact indexes, refs, worktrees, Git
+object integrity, SQLite logical state, removed sidecars, and holds.
+Require `verified=true` and `failures=[]`.
+
+Neo then pulls that exact receipt over its existing outbound strict-SSH
+connection and, while the no-interaction interval continues, emits the
+cutover-release receipt:
 
 ```bash
 scripts/bulkload.py agent-verify \
@@ -265,11 +315,14 @@ scripts/bulkload.py agent-verify \
 ```
 
 Release requires the exact successful Sting verify/apply/plan identity and two
-matching current Neo generations equal to immutable source B. Only then may
-interaction resume on Sting; this is an observational cut at the release
-receipt, not a claim that future Neo writes are impossible. Then perform fresh
-attended provider picker, resume/dialog, and authentication checks; these remain
-outside the offline receipt.
+matching current Neo generations equal to immutable source B.
+Only then may interaction resume on Sting.
+
+This is an observational cut at the release receipt, not a claim that future Neo
+writes are impossible.
+
+Then perform fresh attended provider picker, resume/dialog, and authentication
+checks. These remain outside the offline receipt.
 
 ## Roll back or recover
 
@@ -293,6 +346,6 @@ scripts/bulkload.py agent-recover \
   --output /home/jess/.bulkload-evidence/recovery-receipt.json
 ```
 
-Use `--strategy rollback` to restore the sealed snapshot instead. Both paths
-are idempotent and remain bound to the same transaction. Never improvise file
-copies or delete a journal after a crash.
+Use `--strategy rollback` to restore the sealed snapshot instead.
+Both paths are idempotent and remain bound to the same transaction.
+Never improvise file copies or delete a journal after a crash.
