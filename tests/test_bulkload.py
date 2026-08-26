@@ -485,24 +485,45 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 validate_agent_capture(capture, expected_role="source")
 
     @staticmethod
-    def _live_capture(fixture: CutoverFixture, snapshot_root: Path) -> dict:
+    def _live_capture(
+        fixture: CutoverFixture, snapshot_root: Path, **overrides: object
+    ) -> dict:
         return capture_agent_state(
-            role="source",
-            home=fixture.source_home,
-            git_root=fixture.source_git,
-            codex_root=None,
-            claude_root=None,
-            pi_root=None,
-            seats=fixture.source_seats,
-            path_map=fixture.path_map,
-            writers_quiesced=False,
-            snapshot_root=snapshot_root,
-            managed_exclusions=fixture.managed_exclusions,
-            rsync_path=fixture.rsync_path,
-            max_files=50_000,
-            max_bytes=4 * 1024**3,
-            max_sqlite_rows=100_000,
-            snapshot_reserve_bytes=0,
+            **{
+                "role": "source",
+                "home": fixture.source_home,
+                "git_root": fixture.source_git,
+                "codex_root": None,
+                "claude_root": None,
+                "pi_root": None,
+                "seats": fixture.source_seats,
+                "path_map": fixture.path_map,
+                "writers_quiesced": False,
+                "snapshot_root": snapshot_root,
+                "managed_exclusions": fixture.managed_exclusions,
+                "rsync_path": fixture.rsync_path,
+                "max_files": 50_000,
+                "max_bytes": 4 * 1024**3,
+                "max_sqlite_rows": 100_000,
+                "snapshot_reserve_bytes": 0,
+                **overrides,
+            }
+        )
+
+    @staticmethod
+    def _adoption(checkpoint: dict) -> dict:
+        """The adoption arguments the checkpoint's own honest run would pass."""
+        return dict(
+            exclusions=checkpoint["exclusions"],
+            label=checkpoint["label"],
+            lineage={
+                field: checkpoint[field]
+                for field in scanner.SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS
+            },
+            live=Path(checkpoint["live"]),
+            live_census_sha256=checkpoint["live_census_sha256"],
+            provider=checkpoint["provider"],
+            root=Path(checkpoint["snapshot"]),
         )
 
     def _crash_live_capture(
@@ -602,14 +623,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
                     partial, "provider-codex"
                 ).read_bytes()
             )
-            adoption = dict(
-                exclusions=checkpoint["exclusions"],
-                label=checkpoint["label"],
-                live=Path(checkpoint["live"]),
-                live_census_sha256=checkpoint["live_census_sha256"],
-                provider=checkpoint["provider"],
-                root=Path(checkpoint["snapshot"]),
-            )
+            adoption = self._adoption(checkpoint)
             self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
             # ``snapshot_sqlite`` writes at the final name, so a crash can leave
             # a structurally plausible tree holding a truncated backup.
@@ -634,14 +648,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
             path = scanner._snapshot_checkpoint_path(partial, "git")
             sealed = json.loads(path.read_bytes())
             self.assertEqual(sealed["stage"], "git-links-rewritten")
-            adoption = dict(
-                exclusions=sealed["exclusions"],
-                label=sealed["label"],
-                live=Path(sealed["live"]),
-                live_census_sha256=sealed["live_census_sha256"],
-                provider=sealed["provider"],
-                root=Path(sealed["snapshot"]),
-            )
+            adoption = self._adoption(sealed)
             self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
             # The same payload, claimed at copy time instead of after the link
             # rewrite: the digests are real but the stage is a lie.
@@ -725,6 +732,84 @@ class SchemaAndCaptureTests(unittest.TestCase):
             )
             cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
             self._assert_same_custody(resumed_snapshot, cold_snapshot)
+
+    def test_live_capture_resume_refuses_a_checkpoint_from_another_lineage(
+        self,
+    ) -> None:
+        """A checkpoint may only be adopted into the run it was copied under.
+
+        The published seal states one runtime closure, one base and one SQLite
+        row budget over every root in it. A checkpoint that carries different
+        ones is a claim about a run that never happened, so it is refused and
+        the root is re-copied.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            path = scanner._snapshot_checkpoint_path(partial, "provider-codex")
+            sealed = json.loads(path.read_bytes())
+            self.assertEqual(
+                sealed["runtime_source_sha256"], scanner.runtime_source_digest()
+            )
+            self.assertIsNone(sealed["base"])
+            self.assertEqual(sealed["max_sqlite_rows"], 100_000)
+            adoption = self._adoption(sealed)
+            self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
+            forgeries = {
+                "base": {
+                    "seal_path": os.fspath(snapshot_root / "snapshot-seal.json"),
+                    "seal_sha256": "b" * 64,
+                    "snapshot_id": "forged",
+                },
+                "max_sqlite_rows": sealed["max_sqlite_rows"] - 1,
+                "runtime_source_sha256": "a" * 64,
+            }
+            self.assertEqual(
+                set(forgeries), set(scanner.SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS)
+            )
+            for field, forged in forgeries.items():
+                tampered = {
+                    key: value
+                    for key, value in sealed.items()
+                    if key != "checkpoint_sha256"
+                }
+                tampered[field] = forged
+                scanner.atomic_write_json(
+                    path, scanner.seal(tampered, "checkpoint_sha256")
+                )
+                # The payload is untouched and the seal recomputes: only the
+                # lineage refuses it.
+                self.assertIsNone(
+                    scanner._resume_snapshot_root(partial, **adoption), msg=field
+                )
+            scanner.atomic_write_json(path, sealed)
+            self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
+
+    def test_live_capture_resume_refuses_a_changed_sqlite_row_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            self.assertEqual(
+                scanner._snapshot_checkpoint_labels(partial),
+                {"git", "provider-claude", "provider-codex", "provider-pi"},
+            )
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(
+                    fixture, snapshot_root, max_sqlite_rows=50_000
+                )
+            validate_agent_capture(resumed, expected_role="source")
+            resumed_snapshot = resumed["catalog"]["snapshot"]
+            # Every sqlite payload under the old budget is re-copied under the
+            # declared one, so the seal's row budget is the budget that ran.
+            self.assertEqual(copied.call_count, 4)
+            self.assertEqual(resumed_snapshot["max_sqlite_rows"], 50_000)
+            shutil.rmtree(snapshot_root)
+            cold = self._live_capture(fixture, snapshot_root, max_sqlite_rows=50_000)
+            self._assert_same_custody(resumed_snapshot, cold["catalog"]["snapshot"])
 
     @staticmethod
     def _index_records(snapshot: dict) -> list[dict]:

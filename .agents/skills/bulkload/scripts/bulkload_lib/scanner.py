@@ -68,6 +68,18 @@ SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 SNAPSHOT_CHECKPOINT_DIRECTORY = "snapshot-checkpoints"
 SNAPSHOT_CHECKPOINT_STAGE_COPIED = "copied"
 SNAPSHOT_CHECKPOINT_STAGE_GIT_LINKED = "git-links-rewritten"
+# What a checkpoint must claim about the run that sealed it, beyond the root it
+# describes. A resumed capture publishes one seal over adopted and re-copied
+# roots alike, so every input that seal states must be identical across the
+# attempts that contributed to it: the pinned runtime closure that did the
+# copying, the base snapshot the copies were differenced against, and the
+# SQLite row budget every sqlite payload was captured under. A checkpoint that
+# claims a different one is a claim about a run that never happened.
+SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS = (
+    "base",
+    "max_sqlite_rows",
+    "runtime_source_sha256",
+)
 SNAPSHOT_CHECKPOINT_FIELDS = frozenset(
     {
         "checkpoint_sha256",
@@ -82,6 +94,7 @@ SNAPSHOT_CHECKPOINT_FIELDS = frozenset(
         "provider",
         "snapshot",
         "stage",
+        *SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS,
     }
 )
 SNAPSHOT_INDEX_RECORD_FIELDS = frozenset(
@@ -3014,6 +3027,7 @@ def _seal_snapshot_checkpoint(
     *,
     exclusions: Sequence[str],
     label: str,
+    lineage: dict[str, Any],
     live: Path,
     live_census_sha256: str,
     ledger: dict[str, dict[str, int | str]],
@@ -3028,13 +3042,22 @@ def _seal_snapshot_checkpoint(
     under the whole of ``_stable_stat``, not the path-set fence. It is the only
     thing that makes this checkpoint a claim about the live bytes rather than
     about the inodes that held them.
+
+    ``lineage`` carries :data:`SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS` — the run
+    identity this root was copied under — so that a later attempt cannot fold
+    this root into a seal stating a runtime, a base or a row budget that never
+    produced it.
     """
     if stage != _snapshot_checkpoint_stage(label):
         raise BulkloadError("snapshot checkpoint stage does not match its root")
+    require_exact_keys(
+        lineage, SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS, "snapshot checkpoint lineage"
+    )
     _fsync_snapshot_root(root)
     entries, namespace_sha256, count = _snapshot_root_records(root, ledger)
     checkpoint = seal(
         {
+            **lineage,
             "count": count,
             "entries": entries,
             "exclusions": list(exclusions),
@@ -3059,6 +3082,7 @@ def _resume_snapshot_root(
     *,
     exclusions: Sequence[str],
     label: str,
+    lineage: dict[str, Any],
     live: Path,
     live_census_sha256: str,
     provider: str | None,
@@ -3076,6 +3100,12 @@ def _resume_snapshot_root(
     root as it stands now. Comparing the path-set fence instead would adopt a
     stale copy of any file rewritten in place between the crash and the
     resume, because that digest does not read size, mtime_ns or ctime_ns.
+
+    ``lineage`` is this attempt's :data:`SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS`.
+    The checkpoint's own copy must equal it field for field: the seal this
+    attempt publishes states one runtime closure, one base and one SQLite row
+    budget over every root in it, so a root copied under different ones is
+    re-copied rather than adopted into a claim it cannot support.
     """
     try:
         checkpoint = read_json(_snapshot_checkpoint_path(partial, label))
@@ -3083,11 +3113,15 @@ def _resume_snapshot_root(
             checkpoint, SNAPSHOT_CHECKPOINT_FIELDS, "snapshot checkpoint"
         )
         require_digest(checkpoint, "checkpoint_sha256")
+        require_exact_keys(
+            lineage, SNAPSHOT_CHECKPOINT_LINEAGE_FIELDS, "snapshot checkpoint lineage"
+        )
     except BulkloadError:
         return None
     methods = checkpoint["methods"]
     if (
-        checkpoint["label"] != label
+        any(checkpoint[field] != lineage[field] for field in lineage)
+        or checkpoint["label"] != label
         or checkpoint["live"] != os.fspath(live)
         or checkpoint["provider"] != provider
         or checkpoint["exclusions"] != list(exclusions)
@@ -3954,6 +3988,7 @@ def _capture_live_snapshot(
             if entry is not None:
                 entry.pop("sha256", None)
 
+    base_identity: dict[str, str] | None = None
     base_snapshot: dict[str, Any] | None = None
     base_paths: list[Path | None] = [None] * len(roots)
     base_records: list[dict[str, dict[str, Any]]] = [{} for _ in roots]
@@ -3962,6 +3997,13 @@ def _capture_live_snapshot(
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
         base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
+        # The one identity of the base lineage: sealed here, restated in the
+        # published seal below, and bound into every checkpoint in between.
+        base_identity = {
+            "seal_path": base_snapshot["seal_path"],
+            "seal_sha256": base_snapshot["seal_sha256"],
+            "snapshot_id": base_snapshot["snapshot_id"],
+        }
         records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for (label, relative), record in base_index.items():
             records_by_label[label][relative] = record
@@ -3984,6 +4026,11 @@ def _capture_live_snapshot(
                 raise BulkloadError("snapshot base root contract differs")
             base_paths[index] = Path(base_root["snapshot"])
             base_records[index] = records_by_label[root["label"]]
+    checkpoint_lineage: dict[str, Any] = {
+        "base": base_identity,
+        "max_sqlite_rows": max_sqlite_rows,
+        "runtime_source_sha256": runtime_source_digest(),
+    }
     methods: dict[str, int] = defaultdict(int)
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
     durable_makedirs(snapshot_root.parent)
@@ -4043,6 +4090,7 @@ def _capture_live_snapshot(
                     partial,
                     exclusions=excluded,
                     label=label,
+                    lineage=checkpoint_lineage,
                     live=live,
                     live_census_sha256=censuses[index].freshness_sha256,
                     provider=provider,
@@ -4088,6 +4136,7 @@ def _capture_live_snapshot(
                     partial,
                     exclusions=excluded,
                     label=label,
+                    lineage=checkpoint_lineage,
                     live=live,
                     live_census_sha256=censuses[index].freshness_sha256,
                     ledger=observed_ledger,
@@ -4113,6 +4162,7 @@ def _capture_live_snapshot(
                 partial,
                 exclusions=descriptors[git_index][3],
                 label="git",
+                lineage=checkpoint_lineage,
                 live=descriptors[git_index][1],
                 live_census_sha256=censuses[git_index].freshness_sha256,
                 ledger=transfer_ledgers[git_index],
@@ -4230,13 +4280,7 @@ def _capture_live_snapshot(
         )
         index_path = snapshot_root / "snapshot-index.jsonl"
         snapshot = {
-            "base": None
-            if base_snapshot is None
-            else {
-                "seal_path": base_snapshot["seal_path"],
-                "seal_sha256": base_snapshot["seal_sha256"],
-                "snapshot_id": base_snapshot["snapshot_id"],
-            },
+            "base": base_identity,
             "capacity": capacity,
             "contract_sha256": _snapshot_contract(catalog),
             "declarations": declarations,
