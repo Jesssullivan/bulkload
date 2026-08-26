@@ -705,7 +705,14 @@ def _read_oid_lines(path: Path) -> set[str]:
 
 def _recovery_anchors(
     repository: Path, common_dir: Path, git_dirs: Sequence[Path]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Enumerate reachable recovery anchors, batching the unreachable ones.
+
+    Recovery anchors are diagnostic-only: a reflog or pseudo-ref pointing at an
+    object Git can no longer resolve costs that one anchor, not the whole
+    workspace. The missing OID and the sources that named it are batched into a
+    ``missing-recovery-anchor`` blocker and enumeration continues.
+    """
     sources: dict[str, set[str]] = defaultdict(set)
     roots = [common_dir, *git_dirs]
     for authority in roots:
@@ -724,6 +731,7 @@ def _recovery_anchors(
                 for oid in _read_oid_lines(path):
                     sources[oid].add(name)
     result: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
     for oid in sorted(sources):
         # The type query distinguishes a missing object without exposing its
         # data in diagnostics or in the capture.
@@ -731,14 +739,32 @@ def _recovery_anchors(
         if not object_type:
             if sources[oid] == {"FETCH_HEAD"}:
                 continue
-            raise BulkloadError("a Git recovery anchor object is missing")
+            named_sources = ", ".join(sorted(sources[oid]))
+            blockers.append(
+                {
+                    "code": "missing-recovery-anchor",
+                    "path": os.fspath(repository),
+                    "detail": (
+                        "a Git recovery anchor object is missing: "
+                        f"{oid} named by {named_sources}"
+                    ),
+                }
+            )
+            continue
         result.append({"oid": oid, "sources": sorted(sources[oid])})
-    return result
+    return result, blockers
 
 
 def _object_files(
     common_dir: Path, *, max_files: int, max_bytes: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Enumerate the object store, batching entries it cannot carry.
+
+    A special entry under ``objects/`` costs that one path, not the refs and
+    anchors already computed for the workspace; a spent budget carries the
+    partial enumeration out on ``_CaptureBudgetExceeded`` so the caller can
+    batch it the same way ``_walk_entries`` is batched.
+    """
     objects = common_dir / "objects"
     if not objects.is_dir():
         raise BulkloadError("Git object directory is missing")
@@ -755,6 +781,7 @@ def _object_files(
         if alternate_info.st_size:
             raise _OpaqueGitFallback("Git alternates require opaque byte custody")
     records: list[dict[str, Any]] = []
+    blockers: list[dict[str, str]] = []
     charged = 0
     for current, directories, files in os.walk(objects, followlinks=False):
         directories[:] = sorted(directories)
@@ -763,7 +790,16 @@ def _object_files(
             relative = path.relative_to(objects).as_posix()
             info = path.stat(follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode):
-                raise BulkloadError("Git object storage contains a special entry")
+                blockers.append(
+                    {
+                        "code": "unsupported-git-object",
+                        "path": os.fspath(path),
+                        "detail": (
+                            f"Git object storage contains a special entry: {relative}"
+                        ),
+                    }
+                )
+                continue
             # commit-graph and multi-pack-index are regenerated; all object and
             # pack payloads remain additive transport authority.
             if relative in {"info/commit-graph", "pack/multi-pack-index"}:
@@ -772,8 +808,23 @@ def _object_files(
             records.append(record)
             charged += record["size"]
             if len(records) > max_files or charged > max_bytes:
-                raise BulkloadError("Git object capture budget exceeded")
-    return sorted(records, key=lambda item: item["relative_path"])
+                records.sort(key=lambda item: item["relative_path"])
+                raise _CaptureBudgetExceeded(
+                    _budget_detail(
+                        objects,
+                        files=len(records),
+                        charged_bytes=charged,
+                        max_files=max_files,
+                        max_bytes=max_bytes,
+                    ),
+                    root=objects,
+                    entries=records,
+                    blockers=blockers,
+                )
+    return (
+        sorted(records, key=lambda item: item["relative_path"]),
+        blockers,
+    )
 
 
 def _index_entries(worktree: Path) -> list[dict[str, Any]]:
@@ -884,11 +935,27 @@ class _GitBlobBatch:
                 raise BulkloadError("Git is unavailable") from error
         return self._process
 
+    def _drain(self, process: subprocess.Popen[bytes], size: int) -> None:
+        """Consume a payload this batch refuses so the stream stays in sync.
+
+        A non-blob answer still carries ``size`` bytes and a terminator. Reading
+        them keeps every remaining path in the worktree answerable instead of
+        turning one refused object into a desynchronised batch.
+        """
+        assert process.stdout is not None
+        remaining = size
+        while remaining:
+            chunk = process.stdout.read(min(1024 * 1024, remaining))
+            if not chunk:
+                return
+            remaining -= len(chunk)
+        process.stdout.read(1)
+
     def sha256(self, oid: str) -> str | None:
         if oid in ZERO_OIDS:
             return None
         if not HEX_OID.fullmatch(oid):
-            raise BulkloadError("indexed Git blob has a malformed object ID")
+            raise BulkloadError(f"indexed Git blob has a malformed object ID: {oid!r}")
         if oid in self._cache:
             return self._cache[oid]
         process = self._start()
@@ -899,24 +966,48 @@ class _GitBlobBatch:
             process.stdin.flush()
             header = process.stdout.readline()
             fields = header.rstrip(b"\n").split(b" ")
-            if len(fields) != 3 or fields[1] != b"blob":
-                raise BulkloadError("cannot inspect indexed Git blob")
+            if len(fields) != 3:
+                # ``<oid> missing`` and every other short answer carries no
+                # payload, so the stream is already aligned for the next path.
+                raise BulkloadError(
+                    f"cannot inspect indexed Git blob {oid}: "
+                    f"malformed cat-file header {header!r}"
+                )
+            if fields[1] != b"blob":
+                try:
+                    self._drain(process, int(fields[2]))
+                except ValueError:
+                    pass
+                raise BulkloadError(
+                    f"cannot inspect indexed Git blob {oid}: "
+                    f"object is {fields[1]!r}, not a blob"
+                )
             resolved_oid = fields[0].decode("ascii", errors="strict")
             size = int(fields[2])
             if not HEX_OID.fullmatch(resolved_oid) or size < 0:
-                raise BulkloadError("cannot inspect indexed Git blob")
+                self._drain(process, max(size, 0))
+                raise BulkloadError(
+                    f"cannot inspect indexed Git blob {oid}: "
+                    f"malformed cat-file header {header!r}"
+                )
             digest = hashlib.sha256()
             remaining = size
             while remaining:
                 chunk = process.stdout.read(min(1024 * 1024, remaining))
                 if not chunk:
-                    raise BulkloadError("cannot inspect indexed Git blob")
+                    raise BulkloadError(
+                        f"cannot inspect indexed Git blob {oid}: truncated payload"
+                    )
                 digest.update(chunk)
                 remaining -= len(chunk)
             if process.stdout.read(1) != b"\n":
-                raise BulkloadError("cannot inspect indexed Git blob")
+                raise BulkloadError(
+                    f"cannot inspect indexed Git blob {oid}: unterminated payload"
+                )
         except (BrokenPipeError, OSError, UnicodeDecodeError, ValueError) as error:
-            raise BulkloadError("cannot inspect indexed Git blob") from error
+            raise BulkloadError(
+                f"cannot inspect indexed Git blob {oid}: {error}"
+            ) from error
         self._cache[oid] = digest.hexdigest()
         return self._cache[oid]
 
@@ -1034,12 +1125,29 @@ def _capture_worktree(
         if stage_zero is not None and file_entry is not None:
             expected_kind = "symlink" if stage_zero["mode"] == "120000" else "regular"
             expected_mode = "0755" if stage_zero["mode"] == "100755" else "0644"
-            expected_sha = blob_batch.sha256(stage_zero["oid"])
-            modified = (
-                file_entry["kind"] != expected_kind
-                or file_entry["sha256"] != expected_sha
-                or (expected_kind == "regular" and file_entry["mode"] != expected_mode)
-            )
+            try:
+                expected_sha = blob_batch.sha256(stage_zero["oid"])
+            except BulkloadError as error:
+                # One uninspectable blob degrades one file's verdict. Letting it
+                # escape would collapse every other path's status in this
+                # worktree into a single workspace-level failure.
+                blockers.append(
+                    {
+                        "code": "blob-inspection-failed",
+                        "path": f"{os.fspath(path)}:{relative}",
+                        "detail": f"{stage_zero['oid']}: {error}",
+                    }
+                )
+                modified = True
+            else:
+                modified = (
+                    file_entry["kind"] != expected_kind
+                    or file_entry["sha256"] != expected_sha
+                    or (
+                        expected_kind == "regular"
+                        and file_entry["mode"] != expected_mode
+                    )
+                )
         untracked = not tracked and file_entry is not None
         status = {
             "conflicted": conflicted,
@@ -1177,17 +1285,31 @@ def _capture_workspace(
         _git(representative, ["rev-parse", "--show-object-format"]).decode().strip()
     )
     refs = _parse_refs(representative)
-    recovery = _recovery_anchors(representative, common_dir, git_dirs)
+    recovery, recovery_blockers = _recovery_anchors(
+        representative, common_dir, git_dirs
+    )
+    blockers.extend(recovery_blockers)
     try:
-        object_files = _object_files(
+        object_files, object_blockers = _object_files(
             common_dir, max_files=max_files, max_bytes=max_bytes
         )
+    except _CaptureBudgetExceeded as error:
+        object_files = error.entries
+        object_blockers = [
+            *error.blockers,
+            {
+                "code": "capture-budget-exceeded",
+                "path": os.fspath(error.root),
+                "detail": str(error),
+            },
+        ]
     except _OpaqueGitFallback:
         if blockers:
             raise BulkloadError(
                 "Git workspace has blockers in addition to opaque-only state"
             ) from None
         raise
+    blockers.extend(object_blockers)
     try:
         _git(representative, ["fsck", "--full", "--no-dangling"])
     except BulkloadError as error:
@@ -1602,6 +1724,7 @@ def _capture_provider(
     files: list[tuple[str, Path]] = []
     blockers: list[dict[str, str]] = []
     charged = 0
+    budget_blocker: dict[str, str] | None = None
 
     def unreadable(error: OSError) -> None:
         blockers.append(
@@ -1610,6 +1733,26 @@ def _capture_provider(
                 "path": os.fspath(error.filename or root),
             }
         )
+
+    def spend_budget(relative: str) -> None:
+        """Batch the overrun and name the entry that spent it.
+
+        The walk stops here, but every entry already walked for this provider
+        stays in ``files``: an overrun costs the tail of one provider's state,
+        never the whole provider.
+        """
+        nonlocal budget_blocker
+        budget_blocker = {
+            "code": "capture-budget-exceeded",
+            "path": f"{provider}:{relative}",
+            "detail": _budget_detail(
+                root,
+                files=len(files),
+                charged_bytes=charged,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            ),
+        }
 
     for current, directories, names in os.walk(
         root, topdown=True, followlinks=False, onerror=unreadable
@@ -1641,7 +1784,11 @@ def _capture_provider(
             files.append((relative, path))
             retained_directories.append(name)
             if len(files) > max_files:
-                raise BulkloadError(f"{provider} state capture budget exceeded")
+                spend_budget(relative)
+                break
+        if budget_blocker is not None:
+            directories[:] = []
+            break
         directories[:] = retained_directories
         for name in sorted(names):
             path = Path(current) / name
@@ -1669,7 +1816,13 @@ def _capture_provider(
             files.append((relative, path))
             charged += info.st_size
             if len(files) > max_files or charged > max_bytes:
-                raise BulkloadError(f"{provider} state capture budget exceeded")
+                spend_budget(relative)
+                break
+        if budget_blocker is not None:
+            directories[:] = []
+            break
+    if budget_blocker is not None:
+        blockers.append(budget_blocker)
     sqlite_paths: dict[str, Path] = {}
     for relative, path in files:
         primary = (

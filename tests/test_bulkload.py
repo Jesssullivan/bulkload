@@ -1064,13 +1064,34 @@ class SchemaAndCaptureTests(unittest.TestCase):
             anchors = capture["catalog"]["git_workspaces"][0]["recovery_anchors"]
             self.assertNotIn(missing, {item["oid"] for item in anchors})
 
+            reachable = {item["oid"] for item in anchors}
+            self.assertTrue(reachable)
+
+            # A missing pseudo-ref anchor is diagnostic-only: it costs exactly
+            # one batched blocker naming the OID and its source, and the rest of
+            # the workspace — refs, objects, the reachable anchors — survives.
             (git_dir / "FETCH_HEAD").unlink()
             (git_dir / "ORIG_HEAD").write_text(missing + "\n", encoding="ascii")
             blocked_pseudo = fixture.capture("source")
             self.assertFalse(blocked_pseudo["complete"])
-            self.assertIn(
-                "a Git recovery anchor object is missing",
-                {item.get("detail") for item in blocked_pseudo["catalog"]["blockers"]},
+            pseudo = blockers_with(blocked_pseudo, "missing-recovery-anchor")
+            self.assertEqual(len(pseudo), 1)
+            self.assertEqual(pseudo[0]["path"], str(fixture.source_repo.resolve()))
+            self.assertIn(missing, pseudo[0]["detail"])
+            self.assertIn("ORIG_HEAD", pseudo[0]["detail"])
+            self.assertEqual(
+                blockers_with(blocked_pseudo, "git-workspace-capture-failed"), []
+            )
+            surviving = blocked_pseudo["catalog"]["git_workspaces"][0]
+            self.assertEqual(
+                {item["oid"] for item in surviving["recovery_anchors"]}, reachable
+            )
+            self.assertEqual(
+                {item["name"] for item in surviving["refs"]},
+                {
+                    item["name"]
+                    for item in capture["catalog"]["git_workspaces"][0]["refs"]
+                },
             )
 
             (git_dir / "ORIG_HEAD").unlink()
@@ -1080,10 +1101,166 @@ class SchemaAndCaptureTests(unittest.TestCase):
             )
             blocked_reflog = fixture.capture("source")
             self.assertFalse(blocked_reflog["complete"])
-            self.assertIn(
-                "a Git recovery anchor object is missing",
-                {item.get("detail") for item in blocked_reflog["catalog"]["blockers"]},
+            reflog = blockers_with(blocked_reflog, "missing-recovery-anchor")
+            self.assertEqual(len(reflog), 1)
+            self.assertIn(missing, reflog[0]["detail"])
+            self.assertIn("logs/missing-anchor", reflog[0]["detail"])
+            self.assertEqual(
+                {
+                    item["oid"]
+                    for item in blocked_reflog["catalog"]["git_workspaces"][0][
+                        "recovery_anchors"
+                    ]
+                },
+                reachable,
             )
+
+    def test_special_object_entry_costs_one_path_not_the_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            objects = fixture.source_repo / ".git" / "objects"
+            baseline = fixture.capture("source")
+            self.assertTrue(baseline["complete"], baseline["catalog"]["blockers"])
+            carried = {
+                item["relative_path"]
+                for item in baseline["catalog"]["git_workspaces"][0]["object_files"]
+            }
+            self.assertTrue(carried)
+
+            special = objects / "info" / "special-entry"
+            special.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(special)
+
+            capture = fixture.capture("source")
+            self.assertFalse(capture["complete"])
+            refusals = blockers_with(capture, "unsupported-git-object")
+            self.assertEqual(len(refusals), 1)
+            self.assertEqual(refusals[0]["path"], os.fspath(special))
+            self.assertIn("info/special-entry", refusals[0]["detail"])
+            self.assertEqual(blockers_with(capture, "git-workspace-capture-failed"), [])
+
+            # Refs and every other object payload keep travelling.
+            workspace = capture["catalog"]["git_workspaces"][0]
+            self.assertEqual(
+                {item["relative_path"] for item in workspace["object_files"]}, carried
+            )
+            self.assertEqual(
+                {item["name"] for item in workspace["refs"]},
+                {
+                    item["name"]
+                    for item in baseline["catalog"]["git_workspaces"][0]["refs"]
+                },
+            )
+
+    def test_object_budget_overrun_carries_the_objects_already_walked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            common = Path(
+                git(
+                    fixture.source_repo,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+                .decode()
+                .strip()
+            )
+            objects = common / "objects"
+
+            # The raise itself carries the partial enumeration out.
+            with self.assertRaises(scanner._CaptureBudgetExceeded) as caught:
+                scanner._object_files(common, max_files=1, max_bytes=4 * 1024**3)
+            self.assertEqual(caught.exception.root, objects)
+            self.assertEqual(len(caught.exception.entries), 2)
+            self.assertIn(os.fspath(objects), str(caught.exception))
+
+            # And the workspace caller batches it into one named blocker.
+            real_object_files = scanner._object_files
+
+            def tight_budget(common_dir: Path, **arguments: object) -> object:
+                return real_object_files(
+                    common_dir,
+                    max_files=1,
+                    max_bytes=arguments["max_bytes"],
+                )
+
+            with mock.patch.object(scanner, "_object_files", side_effect=tight_budget):
+                capture = fixture.capture("source")
+            self.assertFalse(capture["complete"])
+            overruns = blockers_with(capture, "capture-budget-exceeded")
+            self.assertEqual(len(overruns), 1)
+            self.assertEqual(overruns[0]["path"], os.fspath(objects))
+            self.assertIn("2 files (max 1)", overruns[0]["detail"])
+            self.assertEqual(blockers_with(capture, "git-workspace-capture-failed"), [])
+            workspace = capture["catalog"]["git_workspaces"][0]
+            self.assertEqual(len(workspace["object_files"]), 2)
+            self.assertTrue(workspace["refs"])
+            self.assertTrue(workspace["worktrees"])
+
+    def test_uninspectable_blob_degrades_one_file_not_the_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            clean = fixture.source_repo / "clean.txt"
+            clean.write_text("clean\n", encoding="utf-8")
+            git(fixture.source_repo, "add", "clean.txt")
+            git(fixture.source_repo, "commit", "-m", "clean")
+            stage_line = (
+                git(fixture.source_repo, "ls-files", "--stage", "clean.txt")
+                .decode()
+                .split()
+            )
+            clean_oid = stage_line[1]
+
+            baseline = fixture.capture("source")
+            self.assertTrue(baseline["complete"], baseline["catalog"]["blockers"])
+            baseline_worktree = baseline["catalog"]["git_workspaces"][0]["worktrees"][0]
+            baseline_status = {
+                item["relative_path"]: item["status"]
+                for item in baseline_worktree["files"]
+                if "status" in item
+            }
+            self.assertFalse(baseline_status["clean.txt"]["modified"])
+            self.assertTrue(baseline_status["tracked.txt"]["modified"])
+
+            real_sha256 = scanner._GitBlobBatch.sha256
+
+            def refuse_clean_blob(batch: object, oid: str) -> str | None:
+                if oid == clean_oid:
+                    raise BulkloadError("simulated cat-file protocol failure")
+                return real_sha256(batch, oid)
+
+            with mock.patch.object(scanner._GitBlobBatch, "sha256", refuse_clean_blob):
+                capture = fixture.capture("source")
+
+            self.assertFalse(capture["complete"])
+            refusals = blockers_with(capture, "blob-inspection-failed")
+            self.assertEqual(len(refusals), 1)
+            self.assertEqual(
+                refusals[0]["path"],
+                f"{os.fspath(fixture.source_repo.resolve())}:clean.txt",
+            )
+            self.assertTrue(refusals[0]["detail"].startswith(f"{clean_oid}: "))
+            self.assertEqual(blockers_with(capture, "git-workspace-capture-failed"), [])
+
+            # Only that one file's verdict degrades; every sibling keeps its
+            # status instead of collapsing into a workspace-level failure.
+            worktree = capture["catalog"]["git_workspaces"][0]["worktrees"][0]
+            status = {
+                item["relative_path"]: item["status"]
+                for item in worktree["files"]
+                if "status" in item
+            }
+            self.assertEqual(set(status), set(baseline_status))
+            self.assertTrue(status["clean.txt"]["modified"])
+            for relative, observed in status.items():
+                if relative == "clean.txt":
+                    continue
+                self.assertEqual(observed, baseline_status[relative])
+            dirt = {item["path"] for item in worktree["dirt"]}
+            self.assertIn("clean.txt", dirt)
+            self.assertIn("tracked.txt", dirt)
+            self.assertIn("deleted.txt", dirt)
+            self.assertIn("untracked.txt", dirt)
 
     def test_capture_pair_rejects_motion_and_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1150,6 +1327,71 @@ class SchemaAndCaptureTests(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_provider_budget_overrun_keeps_the_state_already_walked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "claude"
+            root.mkdir()
+            for index in range(6):
+                (root / f"note-{index}.txt").write_text(
+                    f"note {index}\n", encoding="utf-8"
+                )
+
+            provider, blockers = _capture_provider(
+                "claude",
+                root,
+                role="source",
+                path_map=canonical_path_map([(os.fspath(root.parent), "/destination")]),
+                exclusions=(),
+                max_files=2,
+                max_bytes=4 * 1024**3,
+                max_sqlite_rows=10,
+            )
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["code"], "capture-budget-exceeded")
+            self.assertEqual(blockers[0]["path"], "claude:note-2.txt")
+            self.assertIn("filesystem capture budget exceeded", blockers[0]["detail"])
+            self.assertTrue(provider["exists"])
+            self.assertEqual(
+                [item["relative_path"] for item in provider["items"]],
+                ["note-0.txt", "note-1.txt", "note-2.txt"],
+            )
+
+    def test_provider_budget_overrun_is_one_capture_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            codex = fixture.source_home / ".codex"
+            for index in range(3):
+                (codex / f"note-{index}.txt").write_text(
+                    f"note {index}\n", encoding="utf-8"
+                )
+            real_capture_provider = scanner._capture_provider
+
+            def tight_budget(provider: str, provider_root: Path, **arguments: object):
+                return real_capture_provider(
+                    provider,
+                    provider_root,
+                    **{**arguments, "max_files": 2},
+                )
+
+            with mock.patch.object(
+                scanner, "_capture_provider", side_effect=tight_budget
+            ):
+                capture = fixture.capture("source")
+
+            self.assertFalse(capture["complete"])
+            overruns = blockers_with(capture, "capture-budget-exceeded")
+            self.assertEqual(len(overruns), 1)
+            self.assertTrue(overruns[0]["path"].startswith("codex:"))
+            self.assertIn("3 files (max 2)", overruns[0]["detail"])
+            self.assertEqual(blockers_with(capture, "provider-capture-failed"), [])
+
+            # The overrun costs the tail of one provider, not the provider and
+            # not its siblings.
+            providers = {item["name"]: item for item in capture["catalog"]["providers"]}
+            self.assertEqual(set(providers), {"claude", "codex", "pi"})
+            self.assertEqual(len(providers["codex"]["items"]), 3)
+            self.assertTrue(capture["catalog"]["git_workspaces"])
 
     def test_provider_regenerate_symlinks_are_pruned_before_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
