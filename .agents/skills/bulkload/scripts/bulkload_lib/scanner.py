@@ -54,6 +54,39 @@ DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
+SNAPSHOT_CHECKPOINT_DIRECTORY = "snapshot-checkpoints"
+SNAPSHOT_CHECKPOINT_STAGE_COPIED = "copied"
+SNAPSHOT_CHECKPOINT_STAGE_GIT_LINKED = "git-links-rewritten"
+SNAPSHOT_CHECKPOINT_FIELDS = frozenset(
+    {
+        "checkpoint_sha256",
+        "count",
+        "entries",
+        "exclusions",
+        "label",
+        "live",
+        "live_census_sha256",
+        "methods",
+        "namespace_sha256",
+        "provider",
+        "snapshot",
+        "stage",
+    }
+)
+SNAPSHOT_INDEX_RECORD_FIELDS = frozenset(
+    {
+        "destination_device",
+        "kind",
+        "method",
+        "mode",
+        "relative_path",
+        "root_index",
+        "sha256",
+        "size",
+        "source_device",
+    }
+)
+SNAPSHOT_LABEL = re.compile(r"^[a-z][a-z0-9_-]{0,79}$")
 ZERO_OIDS = {"0" * 40, "0" * 64}
 HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
@@ -2691,6 +2724,298 @@ def _snapshot_namespace(root: Path) -> list[tuple[str, Path]]:
     return sorted(observed)
 
 
+def _snapshot_partial_root(snapshot_root: Path) -> Path:
+    """The lineage-stable working directory for one capture destination.
+
+    ``_rewrite_git_snapshot_links`` writes this directory's absolute path INTO
+    payload bytes ("gitdir: <partial>/roots/git/..."), so every Git payload
+    digest is a function of the partial name. Deriving it from ``snapshot_root``
+    alone -- never from a per-attempt id -- is what lets a crashed attempt, its
+    resume and a cold run all produce the same bytes.
+    """
+    absolute = Path(os.path.abspath(os.fspath(snapshot_root)))
+    return absolute.parent / (
+        f".{absolute.name}.partial-"
+        f"{sha256_bytes(canonical_bytes(os.fspath(absolute)))[:32]}"
+    )
+
+
+def _snapshot_checkpoint_stage(label: str) -> str:
+    """The one stage at which ``label``'s payload bytes are final.
+
+    Every root is final as soon as :func:`_copy_live_tree` has written it --
+    except ``git``, whose already-copied bytes are still mutated afterwards by
+    :func:`_rewrite_git_snapshot_links`. A checkpoint recorded at copy time for
+    ``git`` therefore records digests the seal will contradict, so it carries
+    the wrong stage and is refused on resume.
+    """
+    return (
+        SNAPSHOT_CHECKPOINT_STAGE_GIT_LINKED
+        if label == "git"
+        else SNAPSHOT_CHECKPOINT_STAGE_COPIED
+    )
+
+
+def _fsync_file(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_snapshot_root(root: Path) -> None:
+    """Persist one captured root whole: files first, then directories bottom-up.
+
+    Not every payload write is atomic on its own -- ``snapshot_sqlite`` writes
+    at the final name and ``os.symlink`` leaves the parent unsynced -- so a
+    checkpoint may only be recorded once the entire subtree is durable.
+    """
+    info = root.stat(follow_symlinks=False)
+    if stat.S_ISREG(info.st_mode):
+        _fsync_file(root)
+        fsync_directory(root.parent)
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        raise BulkloadError(f"snapshot root is not a regular file or directory: {root}")
+    directories: list[Path] = []
+    for current, subdirectories, files in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        directories.append(current_path)
+        subdirectories[:] = sorted(subdirectories)
+        for name in sorted(files):
+            child = current_path / name
+            if stat.S_ISREG(child.stat(follow_symlinks=False).st_mode):
+                _fsync_file(child)
+    for path in reversed(directories):
+        fsync_directory(path)
+    fsync_directory(root.parent)
+
+
+def _snapshot_root_records(
+    root: Path, ledger: dict[str, dict[str, int | str]]
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Index every payload entry of one root and digest its namespace."""
+    records: list[dict[str, Any]] = []
+    namespace = hashlib.sha256()
+    for relative, payload_path in _snapshot_namespace(root):
+        try:
+            transfer = ledger[relative]
+        except KeyError as error:
+            raise BulkloadError(
+                "snapshot payload lacks per-entry transfer custody"
+            ) from error
+        records.append(
+            _snapshot_index_record(
+                payload_path, root_index=0, relative=relative, transfer=transfer
+            )
+        )
+        namespace.update(canonical_bytes(relative) + b"\0")
+    return records, namespace.hexdigest(), len(records)
+
+
+def _reprove_snapshot_root(
+    root: Path, checkpoint: dict[str, Any]
+) -> dict[str, dict[str, int | str]]:
+    """Re-prove one adopted root against its payload bytes.
+
+    This is :func:`validate_snapshot_custody`'s proof at root granularity, in
+    the same two independent phases: every recorded entry is recomputed with
+    :func:`_snapshot_index_record` and must match on kind, mode, size and
+    sha256 exactly, and then :func:`_snapshot_namespace` is walked on its own
+    and must reproduce the recorded namespace digest and count. Filesystem
+    presence is never proof of completion -- the checkpoint is a claim, the
+    bytes are the evidence -- so this is the only thing that catches a
+    truncated SQLite backup or a symlink a crash never persisted.
+    """
+    by_relative: dict[str, dict[str, Any]] = {}
+    entries = checkpoint["entries"]
+    if not isinstance(entries, list):
+        raise BulkloadError("snapshot checkpoint entries are malformed")
+    for record in entries:
+        require_exact_keys(
+            record, SNAPSHOT_INDEX_RECORD_FIELDS, "snapshot checkpoint entry"
+        )
+        relative = record["relative_path"]
+        if not isinstance(relative, str) or relative in by_relative:
+            raise BulkloadError("snapshot checkpoint entry identity is invalid")
+        if relative != ".":
+            normalize_relative(relative)
+            ensure_safe_target(root, relative)
+        by_relative[relative] = record
+    ledger: dict[str, dict[str, int | str]] = {}
+    namespace = hashlib.sha256()
+    count = 0
+    for relative, payload_path in _snapshot_namespace(root):
+        record = by_relative.get(relative)
+        if record is None:
+            raise BulkloadError("snapshot checkpoint namespace differs from payload")
+        transfer = {
+            "destination_device": record["destination_device"],
+            "method": record["method"],
+            "source_device": record["source_device"],
+        }
+        observed = _snapshot_index_record(
+            payload_path,
+            root_index=record["root_index"],
+            relative=relative,
+            transfer=transfer,
+        )
+        if observed != record:
+            raise BulkloadError("snapshot checkpoint payload differs from its record")
+        ledger[relative] = transfer
+        namespace.update(canonical_bytes(relative) + b"\0")
+        count += 1
+    if (
+        count != len(by_relative)
+        or count != checkpoint["count"]
+        or namespace.hexdigest() != checkpoint["namespace_sha256"]
+    ):
+        raise BulkloadError("snapshot checkpoint namespace digest or count differs")
+    return ledger
+
+
+def _snapshot_checkpoint_path(partial: Path, label: str) -> Path:
+    if not SNAPSHOT_LABEL.match(label):
+        raise BulkloadError("snapshot checkpoint label is invalid")
+    return partial / SNAPSHOT_CHECKPOINT_DIRECTORY / f"{label}.json"
+
+
+def _seal_snapshot_checkpoint(
+    partial: Path,
+    *,
+    exclusions: Sequence[str],
+    label: str,
+    live: Path,
+    live_census_sha256: str,
+    ledger: dict[str, dict[str, int | str]],
+    methods: dict[str, int],
+    provider: str | None,
+    root: Path,
+    stage: str,
+) -> None:
+    """Seal exactly one root, and only after its whole subtree is durable."""
+    if stage != _snapshot_checkpoint_stage(label):
+        raise BulkloadError("snapshot checkpoint stage does not match its root")
+    _fsync_snapshot_root(root)
+    entries, namespace_sha256, count = _snapshot_root_records(root, ledger)
+    checkpoint = seal(
+        {
+            "count": count,
+            "entries": entries,
+            "exclusions": list(exclusions),
+            "label": label,
+            "live": os.fspath(live),
+            "live_census_sha256": live_census_sha256,
+            "methods": dict(sorted(methods.items())),
+            "namespace_sha256": namespace_sha256,
+            "provider": provider,
+            "snapshot": os.fspath(root),
+            "stage": stage,
+        },
+        "checkpoint_sha256",
+    )
+    path = _snapshot_checkpoint_path(partial, label)
+    durable_makedirs(path.parent)
+    atomic_write_json(path, checkpoint)
+
+
+def _resume_snapshot_root(
+    partial: Path,
+    *,
+    exclusions: Sequence[str],
+    label: str,
+    live: Path,
+    live_census_sha256: str,
+    provider: str | None,
+    root: Path,
+) -> tuple[dict[str, int], dict[str, dict[str, int | str]]] | None:
+    """Adopt one root only as a whole sealed unit re-proved byte for byte.
+
+    Returns the checkpointed methods and per-entry transfer ledger when the
+    root may be adopted, or ``None`` when the caller must discard and re-copy
+    it whole. Every refusal is silent and forward-progressing: an unreadable,
+    stale, wrong-stage or byte-contradicted checkpoint simply means the root
+    was never completed.
+    """
+    try:
+        checkpoint = read_json(_snapshot_checkpoint_path(partial, label))
+        require_exact_keys(
+            checkpoint, SNAPSHOT_CHECKPOINT_FIELDS, "snapshot checkpoint"
+        )
+        require_digest(checkpoint, "checkpoint_sha256")
+    except BulkloadError:
+        return None
+    methods = checkpoint["methods"]
+    if (
+        checkpoint["label"] != label
+        or checkpoint["live"] != os.fspath(live)
+        or checkpoint["provider"] != provider
+        or checkpoint["exclusions"] != list(exclusions)
+        or checkpoint["snapshot"] != os.fspath(root)
+        or checkpoint["stage"] != _snapshot_checkpoint_stage(label)
+        or checkpoint["live_census_sha256"] != live_census_sha256
+        or not isinstance(methods, dict)
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            for key, value in methods.items()
+        )
+    ):
+        return None
+    try:
+        ledger = _reprove_snapshot_root(root, checkpoint)
+    except (BulkloadError, OSError):
+        return None
+    return dict(methods), ledger
+
+
+def _discard_snapshot_root(partial: Path, root: Path, *, label: str) -> None:
+    """Drop an unproved root whole; a resumed capture never merges into one."""
+    if not _within(root, partial) or root == partial:
+        raise BulkloadError("refusing snapshot root cleanup outside capture custody")
+    _snapshot_checkpoint_path(partial, label).unlink(missing_ok=True)
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        root.unlink()
+    elif root.is_dir():
+        shutil.rmtree(root)
+    else:
+        return
+    fsync_directory(root.parent)
+
+
+def _snapshot_checkpoint_labels(partial: Path) -> set[str]:
+    directory = partial / SNAPSHOT_CHECKPOINT_DIRECTORY
+    try:
+        return {
+            item.name.removesuffix(".json")
+            for item in directory.iterdir()
+            if item.is_file() and item.name.endswith(".json")
+        }
+    except OSError:
+        return set()
+
+
+def _clear_snapshot_checkpoints(partial: Path) -> None:
+    """Drop the resume ledger so published custody holds only sealed evidence."""
+    directory = partial / SNAPSHOT_CHECKPOINT_DIRECTORY
+    if directory.is_symlink():
+        raise BulkloadError("snapshot checkpoint custody is not a directory")
+    if directory.is_dir():
+        shutil.rmtree(directory)
+        fsync_directory(partial)
+
+
+def _capture_crash_fence(label: str, sealed: int) -> None:
+    raw = os.environ.get("BULKLOAD_TEST_CRASH_CAPTURE_AFTER_ROOT")
+    if raw is not None and raw.isdecimal() and sealed >= int(raw):
+        raise BulkloadError(f"injected crash after live capture root boundary: {label}")
+
+
 def _write_snapshot_index(
     path: Path,
     roots: Sequence[dict[str, str]],
@@ -3159,8 +3484,14 @@ def _git_snapshot_authorities(git_root: Path) -> tuple[list[Path], list[Path]]:
 
 def _rewrite_git_snapshot_links(
     controls: Sequence[Path], roots: Sequence[dict[str, str]]
-) -> None:
-    """Rewrite only parsed Git control files, never same-named user files."""
+) -> int:
+    """Rewrite only parsed Git control files, never same-named user files.
+
+    Returns the number of control files whose bytes actually changed, so a
+    resumed capture can prove that an adopted Git root was already sealed
+    after this rewrite rather than before it.
+    """
+    rewritten = 0
     for live_path in controls:
         path = _snapshot_path(live_path, roots, label="snapshot")
         try:
@@ -3184,14 +3515,16 @@ def _rewrite_git_snapshot_links(
             declared if declared.is_absolute() else live_path.parent / declared
         )
         snapshot_target = _snapshot_path(live_target, roots, label="snapshot")
-        rewritten = prefix + os.fsencode(snapshot_target) + newline
-        if rewritten == payload:
+        replacement = prefix + os.fsencode(snapshot_target) + newline
+        if replacement == payload:
             continue
         with path.open("wb", buffering=0) as stream:
-            stream.write(rewritten)
+            stream.write(replacement)
             os.fsync(stream.fileno())
         os.chmod(path, 0o600)
         fsync_directory(path.parent)
+        rewritten += 1
+    return rewritten
 
 
 def _rewrite_catalog_to_live(
@@ -3303,9 +3636,16 @@ def _capture_live_snapshot(
 ) -> dict[str, Any]:
     snapshot_id = new_id()
     snapshot_root = Path(os.path.abspath(os.fspath(snapshot_root)))
-    partial = snapshot_root.parent / f".{snapshot_root.name}.partial-{snapshot_id}"
-    if snapshot_root.exists() or snapshot_root.is_symlink() or partial.exists():
+    # Lineage-stable partial name: a per-attempt ``snapshot_id`` suffix made
+    # every checkpointed Git digest a function of the attempt, so no resume
+    # could ever reuse one. See :func:`_snapshot_partial_root`.
+    partial = _snapshot_partial_root(snapshot_root)
+    if snapshot_root.exists() or snapshot_root.is_symlink():
         raise BulkloadError("live snapshot custody path already exists")
+    if partial.is_symlink() or (partial.exists() and not partial.is_dir()):
+        raise BulkloadError("live snapshot custody path already exists")
+    # A surviving partial is this lineage's resume state, not a collision.
+    resuming = partial.is_dir()
     git_logical, git_backing, git_link, _ = _declared_root(git_root, allow_absent=False)
     # Preflight (live half of S1). The nested quiesced ``capture_agent_state``
     # below refuses an empty path map, a missing rsync pin and an unmapped
@@ -3505,30 +3845,82 @@ def _capture_live_snapshot(
         reserve_bytes=snapshot_reserve_bytes,
     )
     published = False
+    sealed_roots = 0
+    adopted_labels: set[str] = set()
+    root_methods: list[dict[str, int]] = []
+    git_index = next(
+        index for index, item in enumerate(descriptors) if item[0] == "git"
+    )
     try:
         durable_makedirs(partial)
         git_generation = _git_live_generation(git_backing)
         git_tree_generation = _tree_generation(
             git_backing, provider=None, exclusions=()
         )
-        for index, (_, live, provider, excluded) in enumerate(descriptors):
+        for index, (label, live, provider, excluded) in enumerate(descriptors):
             work_target = Path(work_roots[index]["snapshot"])
-            observed_methods, observed_ledger = _copy_live_tree(
-                live,
-                work_target,
-                provider=provider,
-                exclusions=excluded,
-                max_sqlite_rows=max_sqlite_rows,
-                base=base_paths[index],
-                base_records=base_records[index],
+            adopted = (
+                _resume_snapshot_root(
+                    partial,
+                    exclusions=excluded,
+                    label=label,
+                    live=live,
+                    live_census_sha256=censuses[index][0],
+                    provider=provider,
+                    root=work_target,
+                )
+                if resuming
+                else None
             )
+            if adopted is not None:
+                observed_methods, observed_ledger = adopted
+                adopted_labels.add(label)
+            else:
+                # Never merge into a root that was not sealed: a crash mid-walk
+                # leaves a structurally plausible tree, and ``_copy_live_tree``
+                # prunes its walk so it cannot tell "never visited" from
+                # "visited and legitimately empty". Drop it whole, re-copy it
+                # whole.
+                _discard_snapshot_root(partial, work_target, label=label)
+                observed_methods, observed_ledger = _copy_live_tree(
+                    live,
+                    work_target,
+                    provider=provider,
+                    exclusions=excluded,
+                    max_sqlite_rows=max_sqlite_rows,
+                    base=base_paths[index],
+                    base_records=base_records[index],
+                )
+                after = _tree_census(live, provider=provider, exclusions=excluded)
+                if censuses[index][0] != after[0]:
+                    raise BulkloadError(f"live snapshot path set changed: {live}")
             transfer_ledgers.append(observed_ledger)
+            root_methods.append(observed_methods)
             for method, count in observed_methods.items():
                 methods[method] += count
-            after = _tree_census(live, provider=provider, exclusions=excluded)
-            if censuses[index][0] != after[0]:
-                raise BulkloadError(f"live snapshot path set changed: {live}")
-        _rewrite_git_snapshot_links(git_controls, work_roots)
+            if label == "git":
+                # The Git root's bytes are not final here: the link rewrite
+                # below mutates the already-copied payload, so its checkpoint
+                # is sealed after that rewrite and never at copy time.
+                continue
+            if adopted is None:
+                _seal_snapshot_checkpoint(
+                    partial,
+                    exclusions=excluded,
+                    label=label,
+                    live=live,
+                    live_census_sha256=censuses[index][0],
+                    ledger=observed_ledger,
+                    methods=observed_methods,
+                    provider=provider,
+                    root=work_target,
+                    stage=SNAPSHOT_CHECKPOINT_STAGE_COPIED,
+                )
+            sealed_roots += 1
+            _capture_crash_fence(label, sealed_roots)
+        rewritten = _rewrite_git_snapshot_links(git_controls, work_roots)
+        if "git" in adopted_labels and rewritten:
+            raise BulkloadError("resumed Git snapshot link rewrite is not idempotent")
         if _git_live_generation(git_backing) != git_generation:
             raise BulkloadError("Git authority changed during live snapshot")
         if (
@@ -3536,6 +3928,21 @@ def _capture_live_snapshot(
             != git_tree_generation
         ):
             raise BulkloadError("Git bytes changed during live snapshot")
+        if "git" not in adopted_labels:
+            _seal_snapshot_checkpoint(
+                partial,
+                exclusions=descriptors[git_index][3],
+                label="git",
+                live=descriptors[git_index][1],
+                live_census_sha256=censuses[git_index][0],
+                ledger=transfer_ledgers[git_index],
+                methods=root_methods[git_index],
+                provider=descriptors[git_index][2],
+                root=Path(work_roots[git_index]["snapshot"]),
+                stage=SNAPSHOT_CHECKPOINT_STAGE_GIT_LINKED,
+            )
+        sealed_roots += 1
+        _capture_crash_fence("git", sealed_roots)
         for index, (_, _, provider, excluded) in enumerate(descriptors):
             roots[index]["generation_sha256"] = (
                 git_tree_generation
@@ -3660,6 +4067,7 @@ def _capture_live_snapshot(
         require_digest(snapshot, "seal_sha256")
         if partial_seal.read_bytes() != canonical_bytes(snapshot) + b"\n":
             raise BulkloadError("live snapshot seal bytes did not persist")
+        _clear_snapshot_checkpoints(partial)
         os.replace(partial, snapshot_root)
         published = True
         fsync_directory(snapshot_root.parent)
@@ -3675,7 +4083,12 @@ def _capture_live_snapshot(
         return seal(captured, "capture_sha256")
     except BaseException:
         if partial.exists() and not partial.is_symlink():
-            _remove_snapshot_partial(partial)
+            # Resumable custody: a partial holding at least one sealed root is
+            # this lineage's resume state and survives the failure. Only a
+            # partial that proved nothing is removed, so a failed capture still
+            # leaves no unprovable orphan behind.
+            if not _snapshot_checkpoint_labels(partial):
+                _remove_snapshot_partial(partial)
         elif published and snapshot_root.exists() and not snapshot_root.is_symlink():
             _remove_snapshot_published(snapshot_root, snapshot_id)
         raise

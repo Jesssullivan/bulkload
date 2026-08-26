@@ -469,6 +469,184 @@ class SchemaAndCaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(BulkloadError, "top-level"):
                 validate_agent_capture(capture, expected_role="source")
 
+    @staticmethod
+    def _live_capture(fixture: CutoverFixture, snapshot_root: Path) -> dict:
+        return capture_agent_state(
+            role="source",
+            home=fixture.source_home,
+            git_root=fixture.source_git,
+            codex_root=None,
+            claude_root=None,
+            pi_root=None,
+            seats=fixture.source_seats,
+            path_map=fixture.path_map,
+            writers_quiesced=False,
+            snapshot_root=snapshot_root,
+            managed_exclusions=fixture.managed_exclusions,
+            rsync_path=fixture.rsync_path,
+            max_files=50_000,
+            max_bytes=4 * 1024**3,
+            max_sqlite_rows=100_000,
+            snapshot_reserve_bytes=0,
+        )
+
+    def _crash_live_capture(
+        self, fixture: CutoverFixture, snapshot_root: Path, boundary: str
+    ) -> Path:
+        """Crash a live capture at a root boundary and keep the resume lineage."""
+        with mock.patch.dict(
+            os.environ, {"BULKLOAD_TEST_CRASH_CAPTURE_AFTER_ROOT": boundary}
+        ):
+            with self.assertRaisesRegex(BulkloadError, "live capture root boundary"):
+                self._live_capture(fixture, snapshot_root)
+        partial = scanner._snapshot_partial_root(snapshot_root)
+        self.assertTrue(partial.is_dir())
+        self.assertFalse(snapshot_root.exists())
+        return partial
+
+    def _cold_live_capture(
+        self, fixture: CutoverFixture, snapshot_root: Path
+    ) -> tuple[dict, int]:
+        shutil.rmtree(snapshot_root)
+        with mock.patch.object(
+            scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+        ) as copied:
+            capture = self._live_capture(fixture, snapshot_root)
+        return capture["catalog"]["snapshot"], copied.call_count
+
+    def _assert_same_custody(self, resumed: dict, cold: dict) -> None:
+        self.assertEqual(resumed["index_sha256"], cold["index_sha256"])
+        self.assertEqual(resumed["index_entries"], cold["index_entries"])
+        self.assertEqual(resumed["inventory_sha256"], cold["inventory_sha256"])
+        self.assertEqual(resumed["contract_sha256"], cold["contract_sha256"])
+        self.assertEqual(resumed["methods"], cold["methods"])
+        self.assertEqual(
+            [root["generation_sha256"] for root in resumed["roots"]],
+            [root["generation_sha256"] for root in cold["roots"]],
+        )
+
+    def test_live_capture_resume_adopts_only_whole_sealed_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "1")
+            # Exactly one root was sealed; the Git root was copied first but is
+            # not final until the link rewrite, so it carries no checkpoint.
+            self.assertEqual(
+                scanner._snapshot_checkpoint_labels(partial), {"provider-codex"}
+            )
+            self.assertTrue((partial / "roots" / "git").is_dir())
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            resumed_snapshot = resumed["catalog"]["snapshot"]
+            resumed_copies = copied.call_count
+            self.assertFalse(partial.exists())
+            self.assertEqual(
+                {item.name for item in snapshot_root.iterdir()},
+                {"roots", "snapshot-index.jsonl", "snapshot-seal.json"},
+            )
+            cold_snapshot, cold_copies = self._cold_live_capture(fixture, snapshot_root)
+            # The sealed root was adopted, every unsealed root re-copied whole.
+            self.assertEqual(cold_copies, 4)
+            self.assertEqual(resumed_copies, 3)
+            self._assert_same_custody(resumed_snapshot, cold_snapshot)
+
+    def test_live_capture_resume_adopts_every_root_without_rewriting_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            self.assertEqual(
+                scanner._snapshot_checkpoint_labels(partial),
+                {"git", "provider-claude", "provider-codex", "provider-pi"},
+            )
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            # Every root was re-proved and adopted, and the Git link rewrite was
+            # a proven no-op over the adopted payload.
+            self.assertEqual(copied.call_count, 0)
+            cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
+            self._assert_same_custody(resumed["catalog"]["snapshot"], cold_snapshot)
+
+    def test_live_capture_resume_refuses_a_truncated_sqlite_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "1")
+            payload = partial / "roots" / "provider-codex" / "state.sqlite"
+            intact = payload.read_bytes()
+            self.assertGreater(len(intact), 0)
+            checkpoint = json.loads(
+                scanner._snapshot_checkpoint_path(
+                    partial, "provider-codex"
+                ).read_bytes()
+            )
+            adoption = dict(
+                exclusions=checkpoint["exclusions"],
+                label=checkpoint["label"],
+                live=Path(checkpoint["live"]),
+                live_census_sha256=checkpoint["live_census_sha256"],
+                provider=checkpoint["provider"],
+                root=Path(checkpoint["snapshot"]),
+            )
+            self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
+            # ``snapshot_sqlite`` writes at the final name, so a crash can leave
+            # a structurally plausible tree holding a truncated backup.
+            payload.write_bytes(intact[: len(intact) // 2])
+            self.assertIsNone(scanner._resume_snapshot_root(partial, **adoption))
+            resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            self.assertEqual(
+                (
+                    snapshot_root / "roots" / "provider-codex" / "state.sqlite"
+                ).read_bytes(),
+                intact,
+            )
+            cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
+            self._assert_same_custody(resumed["catalog"]["snapshot"], cold_snapshot)
+
+    def test_live_capture_resume_refuses_a_precopy_git_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            path = scanner._snapshot_checkpoint_path(partial, "git")
+            sealed = json.loads(path.read_bytes())
+            self.assertEqual(sealed["stage"], "git-links-rewritten")
+            adoption = dict(
+                exclusions=sealed["exclusions"],
+                label=sealed["label"],
+                live=Path(sealed["live"]),
+                live_census_sha256=sealed["live_census_sha256"],
+                provider=sealed["provider"],
+                root=Path(sealed["snapshot"]),
+            )
+            self.assertIsNotNone(scanner._resume_snapshot_root(partial, **adoption))
+            # The same payload, claimed at copy time instead of after the link
+            # rewrite: the digests are real but the stage is a lie.
+            tampered = {
+                key: value
+                for key, value in sealed.items()
+                if key != "checkpoint_sha256"
+            }
+            tampered["stage"] = scanner.SNAPSHOT_CHECKPOINT_STAGE_COPIED
+            scanner.atomic_write_json(path, scanner.seal(tampered, "checkpoint_sha256"))
+            self.assertIsNone(scanner._resume_snapshot_root(partial, **adoption))
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            self.assertEqual(copied.call_count, 1)
+            cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
+            self._assert_same_custody(resumed["catalog"]["snapshot"], cold_snapshot)
+
     def test_live_pair_plans_from_b_and_stages_after_live_source_moves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
