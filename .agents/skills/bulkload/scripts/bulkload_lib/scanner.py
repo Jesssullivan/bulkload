@@ -16,7 +16,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from .model import (
@@ -52,6 +52,13 @@ DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
+MAX_CAPTURE_FILE_WORKERS = 3
+MAX_SNAPSHOT_ROOT_WORKERS = 3
+# Reuse the digest ``reflink_clone`` already proved over the copied bytes
+# instead of re-reading every payload at index time. Purely an optimisation:
+# with this false every recorded digest is recomputed from the sealed bytes
+# and the catalog must be byte-identical either way.
+COPY_DIGEST_MEMO_ENABLED = True
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 SNAPSHOT_CHECKPOINT_DIRECTORY = "snapshot-checkpoints"
@@ -366,6 +373,33 @@ def _decode_path(payload: bytes, label: str) -> str:
         raise BulkloadError(f"{label} is not portable UTF-8") from error
     normalize_relative(value)
     return value
+
+
+_Item = TypeVar("_Item")
+_Result = TypeVar("_Result")
+
+
+def _ordered_parallel_map(
+    work: Callable[[_Item], _Result],
+    items: Sequence[_Item],
+    *,
+    workers: int,
+) -> list[_Result]:
+    """Run ``work`` over independent ``items`` and return results in input order.
+
+    This is the pattern already proved for workspace capture: a bounded pool,
+    an order-preserving :meth:`ThreadPoolExecutor.map`, and results merged by
+    the caller in input order. Because the iteration is ordered, the first
+    failure a caller observes is the first failing *input*, exactly as in the
+    serial loop -- parallelism must never reorder a digest, a record or a
+    blocker. ``workers <= 1`` runs the plain serial loop so a determinism test
+    can compare the two directly.
+    """
+    bounded = min(workers, len(items))
+    if bounded <= 1:
+        return [work(item) for item in items]
+    with ThreadPoolExecutor(max_workers=bounded) as pool:
+        return list(pool.map(work, items))
 
 
 def _stable_stat(path: Path) -> tuple[int, ...]:
@@ -1865,14 +1899,25 @@ def _capture_provider(
         )
         if primary is not None and not relative.lower().endswith(SQLITE_SIDECARS):
             sqlite_paths[primary] = path
-    items: list[dict[str, Any]] = []
     replacements = [
         (os.fsencode(entry["source"]), os.fsencode(entry["destination"]))
         for entry in sorted(
             path_map, key=lambda item: len(item["source"]), reverse=True
         )
     ]
-    for relative, path in files:
+
+    def classify_file(
+        item: tuple[str, Path],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Classify exactly one provider file, batching its own defects.
+
+        Files are independent: nothing here reads another file's result,
+        and both returned lists are merged by the caller in input order,
+        so a bounded pool is indistinguishable from the serial walk.
+        """
+        relative, path = item
+        item_records: list[dict[str, Any]] = []
+        item_blockers: list[dict[str, Any]] = []
         classification = _provider_classification(provider, relative)
         file_type = stat.S_IFMT(path.stat(follow_symlinks=False).st_mode)
         is_symlink = file_type == stat.S_IFLNK
@@ -1902,26 +1947,26 @@ def _capture_provider(
                 }
                 and not archived_session_link
             ):
-                blockers.append(
+                item_blockers.append(
                     {"code": "typed-agent-symlink", "path": f"{provider}:{relative}"}
                 )
-                continue
+                return item_records, item_blockers
             classification = "portable-symlink"
         primary = _sqlite_primary(relative.lower())
         if classification == "sqlite":
             if relative.lower().endswith(SQLITE_SIDECARS):
-                continue
+                return item_records, item_blockers
             try:
                 logical = sqlite_catalog(path, max_rows=max_sqlite_rows)
             except BulkloadError as error:
-                blockers.append(
+                item_blockers.append(
                     {
                         "code": "sqlite-capture-failed",
                         "path": f"{provider}:{relative}",
                         "detail": str(error),
                     }
                 )
-                continue
+                return item_records, item_blockers
             sidecars = []
             for suffix in SQLITE_SIDECARS:
                 sidecar = Path(os.fspath(path) + suffix)
@@ -1934,13 +1979,13 @@ def _capture_provider(
                         }
                     )
             if logical["unsupported_schema"]:
-                blockers.append(
+                item_blockers.append(
                     {
                         "code": "unsupported-sqlite-schema",
                         "path": f"{provider}:{relative}",
                     }
                 )
-            items.append(
+            item_records.append(
                 {
                     "classification": "sqlite",
                     "logical": logical,
@@ -1951,22 +1996,22 @@ def _capture_provider(
                     + sum(item["size"] for item in sidecars),
                 }
             )
-            continue
+            return item_records, item_blockers
         if classification == "sqlite" and primary is not None:
             # An orphan sidecar is unknown rather than silently omitted.
             if primary not in sqlite_paths:
-                blockers.append(
+                item_blockers.append(
                     {"code": "orphan-sqlite-sidecar", "path": f"{provider}:{relative}"}
                 )
-            continue
+            return item_records, item_blockers
         if classification == "unknown":
-            blockers.append(
+            item_blockers.append(
                 {"code": "unknown-agent-state", "path": f"{provider}:{relative}"}
             )
         if classification in {"portable-auth", "nonportable-auth"} and (
             stat.S_IMODE(path.stat().st_mode) & 0o077
         ):
-            blockers.append(
+            item_blockers.append(
                 {"code": "insecure-auth-mode", "path": f"{provider}:{relative}"}
             )
         record = _file_record(path, relative, classification=classification)
@@ -2002,7 +2047,7 @@ def _capture_provider(
                 # One unrewritable session file costs one item, not the whole
                 # provider: record it as a per-item blocker and keep the bytes
                 # verbatim instead of escaping to the provider-level wrapper.
-                blockers.append(
+                item_blockers.append(
                     {
                         "code": "unportable-path-rewrite-state",
                         "path": f"{provider}:{relative}",
@@ -2029,7 +2074,7 @@ def _capture_provider(
                 else:
                     transformed.decode("utf-8", errors="strict")
             except (UnicodeDecodeError, json.JSONDecodeError):
-                blockers.append(
+                item_blockers.append(
                     {
                         "code": "unportable-path-rewrite-state",
                         "path": f"{provider}:{relative}",
@@ -2037,7 +2082,15 @@ def _capture_provider(
                 )
             record["translated_sha256"] = sha256_bytes(transformed)
             record["translated_size"] = len(transformed)
-        items.append(record)
+        item_records.append(record)
+        return item_records, item_blockers
+
+    items: list[dict[str, Any]] = []
+    for item_records, item_blockers in _ordered_parallel_map(
+        classify_file, files, workers=MAX_CAPTURE_FILE_WORKERS
+    ):
+        items.extend(item_records)
+        blockers.extend(item_blockers)
     return (
         {
             "destination_path": destination_root,
@@ -2373,7 +2426,15 @@ def _copy_live_regular(
     *,
     base: Path | None = None,
     base_record: dict[str, Any] | None = None,
-) -> str:
+) -> tuple[str, str | None]:
+    """Copy one live regular file, returning ``(method, digest)``.
+
+    ``digest`` is the sha256 ``reflink_clone`` already verified over the bytes
+    now at ``destination`` -- proof, not a claim, so the index need not re-read
+    the payload. It is ``None`` for the streamed fallback, whose bytes are
+    never hashed here, and the caller must drop it for any path a later stage
+    rewrites.
+    """
     durable_makedirs(destination.parent)
     if _base_regular_reusable(source, base, mode, base_record):
         before = _stable_stat(source)
@@ -2384,7 +2445,7 @@ def _copy_live_regular(
         if _stable_stat(source) != before:
             destination.unlink(missing_ok=True)
             raise BulkloadError(f"live file changed during base clone: {source}")
-        return f"base-{result['method']}"
+        return f"base-{result['method']}", result["sha256"]
     source_info = source.stat(follow_symlinks=False)
     if source_info.st_dev == destination.parent.stat().st_dev:
         for _ in range(3):
@@ -2396,7 +2457,7 @@ def _copy_live_regular(
                     raise
                 break
             if _stable_stat(source) == before:
-                return result["method"]
+                return result["method"], result["sha256"]
             destination.unlink(missing_ok=True)
         else:
             raise BulkloadError(f"live file did not converge for snapshot: {source}")
@@ -2439,7 +2500,9 @@ def _copy_live_regular(
             os.chmod(temporary, mode)
             os.replace(temporary, destination)
             fsync_directory(destination.parent)
-            return "capacity-accounted-copy"
+            # Streamed bytes were never digested, so there is nothing proved to
+            # memoize: the index re-reads this payload like it always has.
+            return "capacity-accounted-copy", None
         except BaseException:
             try:
                 os.close(descriptor)
@@ -2463,18 +2526,27 @@ def _copy_live_tree(
     methods: dict[str, int] = defaultdict(int)
     ledger: dict[str, dict[str, int | str]] = {}
 
-    def record(relative: str, method: str, live: Path, target: Path) -> None:
+    def record(
+        relative: str,
+        method: str,
+        live: Path,
+        target: Path,
+        digest: str | None = None,
+    ) -> None:
         source_info = live.stat(follow_symlinks=False)
         destination_info = target.stat(follow_symlinks=False)
-        ledger[relative] = {
+        entry: dict[str, int | str] = {
             "destination_device": destination_info.st_dev,
             "method": method,
             "source_device": source_info.st_dev,
         }
+        if digest is not None and COPY_DIGEST_MEMO_ENABLED:
+            entry["sha256"] = digest
+        ledger[relative] = entry
 
     source_info = source.stat(follow_symlinks=False)
     if stat.S_ISREG(source_info.st_mode):
-        method = _copy_live_regular(
+        method, digest = _copy_live_regular(
             source,
             destination,
             stat.S_IMODE(source_info.st_mode),
@@ -2487,6 +2559,7 @@ def _copy_live_tree(
             method,
             base if method.startswith("base-") and base is not None else source,
             destination,
+            digest,
         )
         return dict(methods), ledger
     if not stat.S_ISDIR(source_info.st_mode):
@@ -2571,7 +2644,7 @@ def _copy_live_tree(
                 methods["sqlite-online-backup"] += 1
                 record(relative, "sqlite-online-backup", child, target)
             else:
-                method = _copy_live_regular(
+                method, digest = _copy_live_regular(
                     child,
                     target,
                     stat.S_IMODE(info.st_mode),
@@ -2586,6 +2659,7 @@ def _copy_live_tree(
                     if method.startswith("base-") and base_target is not None
                     else child,
                     target,
+                    digest,
                 )
     return dict(methods), ledger
 
@@ -2597,12 +2671,21 @@ def _snapshot_index_record(
     relative: str,
     transfer: dict[str, int | str],
 ) -> dict[str, Any]:
+    """Index one sealed payload entry.
+
+    ``transfer`` may carry a ``sha256`` the copy already proved over exactly
+    these bytes; it is used verbatim when present. Every producer of that memo
+    must drop it the moment a later stage rewrites the payload -- the re-proof
+    paths (:func:`_reprove_snapshot_root`, :func:`validate_snapshot_custody`)
+    deliberately rebuild ``transfer`` without it and re-read the bytes.
+    """
     info = path.stat(follow_symlinks=False)
     mode = f"{stat.S_IMODE(info.st_mode):04o}"
     if stat.S_ISREG(info.st_mode):
         kind = "regular"
         size = info.st_size
-        digest = sha256_file(path)
+        memo = transfer.get("sha256")
+        digest = memo if isinstance(memo, str) else sha256_file(path)
     elif stat.S_ISLNK(info.st_mode):
         kind = "symlink"
         size = len(os.fsencode(os.readlink(path)))
@@ -3792,6 +3875,29 @@ def _capture_live_snapshot(
         }
         for binding in roots
     ]
+    # HARD INVALIDATION. ``_rewrite_git_snapshot_links`` mutates already-copied
+    # Git control payloads *after* the copies, so a digest proved at copy time
+    # would contradict the sealed bytes. Every rewritable path loses its memo
+    # the instant its root's ledger exists -- before any checkpoint is sealed
+    # from that ledger and long before the index is written.
+    rewritable_relatives: list[set[str]] = [set() for _ in work_roots]
+    for control in git_controls:
+        for index, binding in enumerate(work_roots):
+            try:
+                relative = control.relative_to(Path(binding["live"]))
+            except ValueError:
+                continue
+            rewritable_relatives[index].add(relative.as_posix())
+            break
+
+    def drop_rewritable_memos(
+        index: int, ledger: dict[str, dict[str, int | str]]
+    ) -> None:
+        for relative in rewritable_relatives[index]:
+            entry = ledger.get(relative)
+            if entry is not None:
+                entry.pop("sha256", None)
+
     base_snapshot: dict[str, Any] | None = None
     base_paths: list[Path | None] = [None] * len(roots)
     base_records: list[dict[str, dict[str, Any]]] = [{} for _ in roots]
@@ -3824,20 +3930,37 @@ def _capture_live_snapshot(
             base_records[index] = records_by_label[root["label"]]
     methods: dict[str, int] = defaultdict(int)
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
-    censuses: list[tuple[str, int]] = []
     durable_makedirs(snapshot_root.parent)
-    for _, live, provider, excluded in descriptors:
-        observed = _tree_census(live, provider=provider, exclusions=excluded)
-        censuses.append(observed)
-    charged_bytes = sum(
-        _snapshot_delta_charge(
+
+    def census_of(
+        descriptor: tuple[str, Path, str | None, Sequence[str]],
+    ) -> tuple[str, int]:
+        _, live, provider, excluded = descriptor
+        return _tree_census(live, provider=provider, exclusions=excluded)
+
+    def delta_charge_of(index: int) -> int:
+        _, live, provider, excluded = descriptors[index]
+        return _snapshot_delta_charge(
             live,
             base_paths[index],
             provider=provider,
             exclusions=excluded,
             base_records=base_records[index],
         )
-        for index, (_, live, provider, excluded) in enumerate(descriptors)
+
+    # Census A. Roots are disjoint (``live snapshot roots overlap or alias``
+    # was already refused above), so each pass is independent per root and the
+    # pool only overlaps their I/O -- the ordered result list is the same list
+    # the serial loop built.
+    censuses: list[tuple[str, int]] = _ordered_parallel_map(
+        census_of, descriptors, workers=MAX_SNAPSHOT_ROOT_WORKERS
+    )
+    charged_bytes = sum(
+        _ordered_parallel_map(
+            delta_charge_of,
+            range(len(descriptors)),
+            workers=MAX_SNAPSHOT_ROOT_WORKERS,
+        )
     )
     capacity = require_capacity(
         snapshot_root.parent,
@@ -3894,6 +4017,7 @@ def _capture_live_snapshot(
                 after = _tree_census(live, provider=provider, exclusions=excluded)
                 if censuses[index][0] != after[0]:
                     raise BulkloadError(f"live snapshot path set changed: {live}")
+            drop_rewritable_memos(index, observed_ledger)
             transfer_ledgers.append(observed_ledger)
             root_methods.append(observed_methods)
             for method, count in observed_methods.items():
@@ -3943,16 +4067,27 @@ def _capture_live_snapshot(
             )
         sealed_roots += 1
         _capture_crash_fence("git", sealed_roots)
-        for index, (_, _, provider, excluded) in enumerate(descriptors):
-            roots[index]["generation_sha256"] = (
-                git_tree_generation
-                if roots[index]["label"] == "git"
-                else _tree_generation(
-                    Path(work_roots[index]["snapshot"]),
-                    provider=provider,
-                    exclusions=excluded,
-                )
+
+        def generation_of(index: int) -> str:
+            _, _, provider, excluded = descriptors[index]
+            if roots[index]["label"] == "git":
+                return git_tree_generation
+            return _tree_generation(
+                Path(work_roots[index]["snapshot"]),
+                provider=provider,
+                exclusions=excluded,
             )
+
+        # One re-read per sealed root over disjoint payloads; the pool only
+        # overlaps their I/O and the ordered results land on the same roots.
+        for index, generation in enumerate(
+            _ordered_parallel_map(
+                generation_of,
+                range(len(descriptors)),
+                workers=MAX_SNAPSHOT_ROOT_WORKERS,
+            )
+        ):
+            roots[index]["generation_sha256"] = generation
         augmented_map = canonical_path_map(
             [
                 *[(item["source"], item["destination"]) for item in path_map],
@@ -4275,12 +4410,9 @@ def capture_agent_state(
         except (_OpaqueGitFallback, BulkloadError) as error:
             return common, representative, error
 
-    workspace_workers = min(MAX_CAPTURE_WORKSPACE_WORKERS, len(workspace_inputs))
-    if workspace_workers:
-        with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
-            workspace_results = list(pool.map(capture_workspace, workspace_inputs))
-    else:
-        workspace_results = []
+    workspace_results = _ordered_parallel_map(
+        capture_workspace, workspace_inputs, workers=MAX_CAPTURE_WORKSPACE_WORKERS
+    )
     workspaces: list[dict[str, Any]] = []
     for common, representative, result in workspace_results:
         if isinstance(result, tuple):

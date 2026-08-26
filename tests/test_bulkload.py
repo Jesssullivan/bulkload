@@ -647,6 +647,252 @@ class SchemaAndCaptureTests(unittest.TestCase):
             cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
             self._assert_same_custody(resumed["catalog"]["snapshot"], cold_snapshot)
 
+    @staticmethod
+    def _index_records(snapshot: dict) -> list[dict]:
+        index = Path(snapshot["seal_path"]).parent / "snapshot-index.jsonl"
+        return [
+            json.loads(line)
+            for line in index.read_text(encoding="utf-8").splitlines()
+        ]
+
+    @staticmethod
+    def _payload_path(snapshot: dict, record: dict) -> Path:
+        root = Path(snapshot["roots"][record["root_index"]]["snapshot"])
+        relative = record["relative_path"]
+        return root if relative == "." else root / relative
+
+    def test_copy_digest_memo_is_observationally_invisible(self) -> None:
+        """S4a: reusing the copy's proved digest must not move one sealed byte.
+
+        ``reflink_clone`` already verifies a sha256 over the bytes it wrote, so
+        re-reading the whole payload at index time is redundant work, not extra
+        assurance. The invariant is that turning the memo off changes only how
+        many times the payload is read -- never the index, the per-entry
+        digests, the methods or the generation digests.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot_root = fixture.root / "memo.snapshot"
+            reads: list[int] = []
+            real_sha256_file = scanner.sha256_file
+
+            def counted(path: Path) -> str:
+                reads[-1] += 1
+                return real_sha256_file(path)
+
+            reads.append(0)
+            with mock.patch.object(scanner, "sha256_file", counted):
+                memoized = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(memoized, expected_role="source")
+            memo_snapshot = memoized["catalog"]["snapshot"]
+            memo_records = self._index_records(memo_snapshot)
+            memo_reads = reads[-1]
+
+            shutil.rmtree(snapshot_root)
+            reads.append(0)
+            with mock.patch.object(scanner, "COPY_DIGEST_MEMO_ENABLED", False):
+                with mock.patch.object(scanner, "sha256_file", counted):
+                    plain = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(plain, expected_role="source")
+            plain_snapshot = plain["catalog"]["snapshot"]
+
+            # Observationally invisible: identical custody, entry for entry.
+            self._assert_same_custody(memo_snapshot, plain_snapshot)
+            self.assertEqual(memo_records, self._index_records(plain_snapshot))
+            self.assertTrue(
+                any(record["kind"] == "regular" for record in memo_records)
+            )
+
+            # ... and it really is a memo: the un-memoized run re-reads more.
+            self.assertGreater(reads[-1], memo_reads)
+
+    def test_rewritten_git_link_digest_is_the_post_rewrite_digest(self) -> None:
+        """S4a hard invalidation: the rewrite happens AFTER the copy.
+
+        ``_rewrite_git_snapshot_links`` mutates already-copied Git control
+        payloads, so a digest proved at copy time describes bytes that no
+        longer exist. Dropping the memo for every rewritable path is the whole
+        safety argument; without it this test fails twice over -- once on the
+        explicit per-entry comparison, and again inside
+        ``validate_agent_capture`` as "snapshot payload differs from sealed
+        index".
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            worktree = fixture.source_git / "linked"
+            git(fixture.source_repo, "worktree", "add", "--detach", str(worktree))
+            snapshot_root = fixture.root / "git-link.snapshot"
+            rewrites: list[int] = []
+            real_rewrite = scanner._rewrite_git_snapshot_links
+
+            def counting(controls, roots):
+                count = real_rewrite(controls, roots)
+                rewrites.append(count)
+                return count
+
+            with mock.patch.object(
+                scanner, "_rewrite_git_snapshot_links", counting
+            ):
+                capture = self._live_capture(fixture, snapshot_root)
+            self.assertEqual(rewrites, [2])
+
+            snapshot = capture["catalog"]["snapshot"]
+            expected_links = {"linked/.git", "repo/.git/worktrees/linked/gitdir"}
+            observed_links: set[str] = set()
+            regular = 0
+            for record in self._index_records(snapshot):
+                if record["kind"] != "regular":
+                    continue
+                regular += 1
+                payload = self._payload_path(snapshot, record).read_bytes()
+                # Every sealed digest describes the bytes actually on disk.
+                self.assertEqual(record["sha256"], sha256_bytes(payload))
+                if record["relative_path"] in expected_links:
+                    observed_links.add(record["relative_path"])
+                    live = fixture.source_git / record["relative_path"]
+                    # The rewrite moved these bytes, so a copy-time memo would
+                    # have sealed the pre-rewrite digest.
+                    self.assertNotEqual(payload, live.read_bytes())
+                    # Rewritten to the capture's own lineage-stable custody.
+                    self.assertIn(b"/roots/git/", payload)
+            self.assertEqual(observed_links, expected_links)
+            self.assertGreater(regular, len(expected_links))
+            validate_agent_capture(capture, expected_role="source")
+
+    def test_bounded_workers_are_indistinguishable_from_the_serial_walk(self) -> None:
+        """S4b determinism: workers=1 and workers=N seal the same bytes.
+
+        Parallelism is admissible here only because every unit is independent
+        and every result is merged in input order. ``BULKLOAD_RUNTIME_SOURCE_SHA256``
+        is pinned so the only source-derived catalog member is held constant
+        and the comparison is over the whole quiesced catalog, blockers
+        included -- blocker ORDER is sealed, so a pool that reordered them
+        would move ``catalog_sha256``.
+        """
+        pin = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            git(
+                fixture.source_repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(fixture.source_git / "linked"),
+            )
+            # Several independent provider files, three of which are blockers,
+            # so both the item list and the blocker list are order-sensitive.
+            sessions = fixture.source_home / ".codex" / "sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            for name in ("one", "two", "three", "four"):
+                (sessions / f"{name}.jsonl").write_text(
+                    json.dumps({"session": name}) + "\n", encoding="utf-8"
+                )
+            for name in ("alpha", "beta", "gamma"):
+                os.symlink("../history.jsonl", sessions / f"{name}.jsonl")
+
+            def with_workers(workers: int):
+                return mock.patch.multiple(
+                    scanner,
+                    MAX_CAPTURE_FILE_WORKERS=workers,
+                    MAX_CAPTURE_WORKSPACE_WORKERS=workers,
+                    MAX_SNAPSHOT_ROOT_WORKERS=workers,
+                )
+
+            with mock.patch.dict(os.environ, {"BULKLOAD_RUNTIME_SOURCE_SHA256": pin}):
+                with with_workers(1):
+                    serial = fixture.capture("source")
+                with with_workers(8):
+                    parallel = fixture.capture("source")
+
+            self.assertEqual(serial["catalog"]["runtime_source_sha256"], pin)
+            self.assertNotEqual(serial["catalog"]["blockers"], [])
+            self.assertEqual(
+                serial["catalog"]["blockers"], parallel["catalog"]["blockers"]
+            )
+            self.assertEqual(
+                canonical_bytes(serial["catalog"]),
+                canonical_bytes(parallel["catalog"]),
+            )
+            self.assertEqual(serial["catalog_sha256"], parallel["catalog_sha256"])
+
+            # The live-snapshot passes (census A, delta charge, generation) are
+            # per-root and must seal identically too.
+            snapshot_root = fixture.root / "workers.snapshot"
+            with with_workers(1):
+                serial_live = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(serial_live, expected_role="source")
+            serial_snapshot = serial_live["catalog"]["snapshot"]
+            serial_records = self._index_records(serial_snapshot)
+            shutil.rmtree(snapshot_root)
+            with with_workers(8):
+                parallel_live = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(parallel_live, expected_role="source")
+            parallel_snapshot = parallel_live["catalog"]["snapshot"]
+            self._assert_same_custody(serial_snapshot, parallel_snapshot)
+            self.assertEqual(serial_records, self._index_records(parallel_snapshot))
+
+    def test_one_jsonl_defect_costs_one_item_under_a_pool(self) -> None:
+        """S4b composes with S2: a worker's failure stays that worker's file.
+
+        The per-file unit owns its own defect list, so an unrewritable or
+        malformed session costs exactly one item and one blocker regardless of
+        which worker picked it up -- and the surviving files keep their
+        append-only records.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            sessions = fixture.source_home / ".codex" / "sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            for name in ("alpha", "gamma"):
+                (sessions / f"{name}.jsonl").write_text(
+                    json.dumps({"session": name}) + "\n", encoding="utf-8"
+                )
+            # A genuinely truncated final record: no mock, no blocker, just a
+            # downgrade to verbatim bytes.
+            (sessions / "beta.jsonl").write_text(
+                json.dumps({"session": "beta"}), encoding="utf-8"
+            )
+            real_records = scanner._jsonl_records
+
+            def failing(path: Path, *, replacements=()):
+                if path.name == "delta.jsonl":
+                    raise scanner._UnportableAppendRewrite(
+                        "path rewriting produced invalid JSONL"
+                    )
+                return real_records(path, replacements=replacements)
+
+            (sessions / "delta.jsonl").write_text(
+                json.dumps({"session": "delta"}) + "\n", encoding="utf-8"
+            )
+            with mock.patch.object(scanner, "MAX_CAPTURE_FILE_WORKERS", 4):
+                with mock.patch.object(scanner, "_jsonl_records", failing):
+                    capture = fixture.capture("source")
+
+            blockers = [
+                blocker
+                for blocker in capture["catalog"]["blockers"]
+                if blocker["code"] == "unportable-path-rewrite-state"
+            ]
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["path"], "codex:sessions/delta.jsonl")
+
+            provider = next(
+                item
+                for item in capture["catalog"]["providers"]
+                if item["name"] == "codex"
+            )
+            items = {item["relative_path"]: item for item in provider["items"]}
+            for name in ("beta", "delta"):
+                self.assertEqual(
+                    items[f"sessions/{name}.jsonl"]["classification"],
+                    "portable-private",
+                )
+                self.assertNotIn("records", items[f"sessions/{name}.jsonl"])
+            for name in ("alpha", "gamma"):
+                surviving = items[f"sessions/{name}.jsonl"]
+                self.assertEqual(surviving["classification"], "append-jsonl")
+                self.assertEqual(len(surviving["records"]), 1)
+
     def test_live_pair_plans_from_b_and_stages_after_live_source_moves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
