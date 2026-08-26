@@ -662,6 +662,70 @@ class SchemaAndCaptureTests(unittest.TestCase):
             cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
             self._assert_same_custody(resumed["catalog"]["snapshot"], cold_snapshot)
 
+    def test_live_capture_resume_refuses_a_root_rewritten_under_the_partial(
+        self,
+    ) -> None:
+        """The adoption key must read the bytes, not the inode that held them.
+
+        Both mutations below are invisible to ``(dev, ino, IFMT, IMODE,
+        nlink)``: an append reuses the inode, and an ``O_TRUNC`` rewrite back
+        to the identical size reuses the inode and the size. A checkpoint keyed
+        on that tuple adopts a copy of bytes that no longer exist.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            rewritten = fixture.source_home / ".claude" / "notes.txt"
+            rewritten.write_text("first\n", encoding="utf-8")
+            appended = fixture.source_home / ".codex" / "history.jsonl"
+            snapshot_root = fixture.root / "evidence" / "source-a.snapshot"
+            partial = self._crash_live_capture(fixture, snapshot_root, "4")
+            self.assertEqual(
+                scanner._snapshot_checkpoint_labels(partial),
+                {"git", "provider-claude", "provider-codex", "provider-pi"},
+            )
+
+            before_append = scanner._stable_stat(appended)
+            with appended.open("ab") as stream:
+                stream.write(b'{"session_id":"two","text":"appended"}\n')
+            before_rewrite = scanner._stable_stat(rewritten)
+            descriptor = os.open(rewritten, os.O_WRONLY | os.O_TRUNC)
+            try:
+                self.assertEqual(os.write(descriptor, b"second"), 6)
+            finally:
+                os.close(descriptor)
+
+            # The old adoption authority cannot see either write.
+            for path, before in (
+                (appended, before_append),
+                (rewritten, before_rewrite),
+            ):
+                after = scanner._stable_stat(path)
+                self.assertEqual(before[:5], after[:5], msg=os.fspath(path))
+                self.assertNotEqual(before, after, msg=os.fspath(path))
+            self.assertEqual(before_rewrite[5], scanner._stable_stat(rewritten)[5])
+
+            with mock.patch.object(
+                scanner, "_copy_live_tree", wraps=scanner._copy_live_tree
+            ) as copied:
+                resumed = self._live_capture(fixture, snapshot_root)
+            validate_agent_capture(resumed, expected_role="source")
+            # Exactly the two rewritten roots were re-copied; git and the empty
+            # pi root were still adopted.
+            self.assertEqual(copied.call_count, 2)
+            resumed_snapshot = resumed["catalog"]["snapshot"]
+            self.assertEqual(
+                (snapshot_root / "roots" / "provider-claude" / "notes.txt").read_bytes(),
+                b"second",
+            )
+            self.assertEqual(
+                (
+                    snapshot_root / "roots" / "provider-codex" / "history.jsonl"
+                ).read_bytes(),
+                appended.read_bytes(),
+            )
+            cold_snapshot, _ = self._cold_live_capture(fixture, snapshot_root)
+            self._assert_same_custody(resumed_snapshot, cold_snapshot)
+
     @staticmethod
     def _index_records(snapshot: dict) -> list[dict]:
         index = Path(snapshot["seal_path"]).parent / "snapshot-index.jsonl"

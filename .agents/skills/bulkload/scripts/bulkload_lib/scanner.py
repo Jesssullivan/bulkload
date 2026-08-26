@@ -16,7 +16,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
-from typing import Any, Callable, Iterable, Sequence, TypeVar
+from typing import Any, Callable, Iterable, NamedTuple, Sequence, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from .model import (
@@ -2297,6 +2297,32 @@ def _snapshot_contract(catalog: dict[str, Any]) -> str:
     )
 
 
+class _Census(NamedTuple):
+    """One walk, two digests, from the same two stats per entry.
+
+    ``path_set_sha256`` is the fence that says the path set and the per-entry
+    identity did not move across a copy. At ``content=False`` its per-entry
+    authority is ``_stable_stat`` fields 0-4 — dev, ino, IFMT, IMODE, nlink —
+    so it is blind, by construction, to any rewrite that keeps the inode.
+
+    ``freshness_sha256`` is the same walk under the whole of ``_stable_stat``:
+    size, mtime_ns and ctime_ns included. ``observe`` already calls
+    ``_stable_stat`` twice per entry, so the second digest costs no syscall,
+    only a second hash update over bytes already in hand.
+
+    A checkpoint binds ``freshness_sha256``, never ``path_set_sha256``. An
+    append in place and an ``O_TRUNC`` rewrite back to the identical size both
+    leave fields 0-4 untouched, so an adoption keyed on the fence would hand a
+    resumed capture a copy of live bytes that no longer exist. The fence keeps
+    its own job — it is the mid-copy stability check, where a widened authority
+    would fail every capture of a root that is legitimately being appended to.
+    """
+
+    path_set_sha256: str
+    charged_bytes: int
+    freshness_sha256: str
+
+
 def _tree_census(
     root: Path,
     *,
@@ -2304,8 +2330,9 @@ def _tree_census(
     exclusions: Sequence[str],
     content: bool = False,
     portable: bool = False,
-) -> tuple[str, int]:
+) -> _Census:
     digest = hashlib.sha256()
+    freshness = hashlib.sha256()
     charged_bytes = 0
 
     def observe(path: Path, relative: str) -> tuple[str, int]:
@@ -2353,12 +2380,15 @@ def _tree_census(
         digest.update(
             canonical_bytes([relative, kind, authority, content_digest]) + b"\0"
         )
+        freshness.update(
+            canonical_bytes([relative, kind, list(before), content_digest]) + b"\0"
+        )
         return kind, size
 
     root_info = root.stat(follow_symlinks=False)
     if stat.S_ISREG(root_info.st_mode):
         _, charged_bytes = observe(root, ".")
-        return digest.hexdigest(), charged_bytes
+        return _Census(digest.hexdigest(), charged_bytes, freshness.hexdigest())
     if not stat.S_ISDIR(root_info.st_mode):
         raise BulkloadError(f"snapshot root is not a regular file or directory: {root}")
     observe(root, ".")
@@ -2392,7 +2422,7 @@ def _tree_census(
                 continue
             _, size = observe(child, relative)
             charged_bytes += size
-    return digest.hexdigest(), charged_bytes
+    return _Census(digest.hexdigest(), charged_bytes, freshness.hexdigest())
 
 
 def _tree_generation(
@@ -2404,7 +2434,7 @@ def _tree_generation(
         exclusions=exclusions,
         content=True,
         portable=True,
-    )[0]
+    ).path_set_sha256
 
 
 def _base_regular_reusable(
@@ -2992,7 +3022,13 @@ def _seal_snapshot_checkpoint(
     root: Path,
     stage: str,
 ) -> None:
-    """Seal exactly one root, and only after its whole subtree is durable."""
+    """Seal exactly one root, and only after its whole subtree is durable.
+
+    ``live_census_sha256`` is ``_Census.freshness_sha256`` — the live walk
+    under the whole of ``_stable_stat``, not the path-set fence. It is the only
+    thing that makes this checkpoint a claim about the live bytes rather than
+    about the inodes that held them.
+    """
     if stage != _snapshot_checkpoint_stage(label):
         raise BulkloadError("snapshot checkpoint stage does not match its root")
     _fsync_snapshot_root(root)
@@ -3035,6 +3071,11 @@ def _resume_snapshot_root(
     it whole. Every refusal is silent and forward-progressing: an unreadable,
     stale, wrong-stage or byte-contradicted checkpoint simply means the root
     was never completed.
+
+    ``live_census_sha256`` must be ``_Census.freshness_sha256`` of the live
+    root as it stands now. Comparing the path-set fence instead would adopt a
+    stale copy of any file rewritten in place between the crash and the
+    resume, because that digest does not read size, mtime_ns or ctime_ns.
     """
     try:
         checkpoint = read_json(_snapshot_checkpoint_path(partial, label))
@@ -3949,7 +3990,7 @@ def _capture_live_snapshot(
 
     def census_of(
         descriptor: tuple[str, Path, str | None, Sequence[str]],
-    ) -> tuple[str, int]:
+    ) -> _Census:
         _, live, provider, excluded = descriptor
         return _tree_census(live, provider=provider, exclusions=excluded)
 
@@ -3967,7 +4008,7 @@ def _capture_live_snapshot(
     # was already refused above), so each pass is independent per root and the
     # pool only overlaps their I/O -- the ordered result list is the same list
     # the serial loop built.
-    censuses: list[tuple[str, int]] = _ordered_parallel_map(
+    censuses: list[_Census] = _ordered_parallel_map(
         census_of, descriptors, workers=MAX_SNAPSHOT_ROOT_WORKERS
     )
     charged_bytes = sum(
@@ -4003,7 +4044,7 @@ def _capture_live_snapshot(
                     exclusions=excluded,
                     label=label,
                     live=live,
-                    live_census_sha256=censuses[index][0],
+                    live_census_sha256=censuses[index].freshness_sha256,
                     provider=provider,
                     root=work_target,
                 )
@@ -4030,7 +4071,7 @@ def _capture_live_snapshot(
                     base_records=base_records[index],
                 )
                 after = _tree_census(live, provider=provider, exclusions=excluded)
-                if censuses[index][0] != after[0]:
+                if censuses[index].path_set_sha256 != after.path_set_sha256:
                     raise BulkloadError(f"live snapshot path set changed: {live}")
             drop_rewritable_memos(index, observed_ledger)
             transfer_ledgers.append(observed_ledger)
@@ -4048,7 +4089,7 @@ def _capture_live_snapshot(
                     exclusions=excluded,
                     label=label,
                     live=live,
-                    live_census_sha256=censuses[index][0],
+                    live_census_sha256=censuses[index].freshness_sha256,
                     ledger=observed_ledger,
                     methods=observed_methods,
                     provider=provider,
@@ -4073,7 +4114,7 @@ def _capture_live_snapshot(
                 exclusions=descriptors[git_index][3],
                 label="git",
                 live=descriptors[git_index][1],
-                live_census_sha256=censuses[git_index][0],
+                live_census_sha256=censuses[git_index].freshness_sha256,
                 ledger=transfer_ledgers[git_index],
                 methods=root_methods[git_index],
                 provider=descriptors[git_index][2],
