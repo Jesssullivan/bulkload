@@ -190,17 +190,6 @@ def _recovery_ref(destination_path: str, ref_name: str, oid: str) -> str:
     return f"refs/bulkload/recovery/destination/{token}"
 
 
-def _worktree_at(workspace: dict[str, Any], path: str) -> dict[str, Any] | None:
-    return next(
-        (
-            worktree
-            for worktree in workspace.get("worktrees", [])
-            if worktree["path"] == path
-        ),
-        None,
-    )
-
-
 def _destination_worktree_at(
     workspaces: Iterable[dict[str, Any]], path: str
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:

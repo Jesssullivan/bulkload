@@ -50,6 +50,30 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+def git_environment() -> dict[str, str]:
+    """Scrub inherited Git configuration so every subprocess reads the same way.
+
+    Both the read side (scanner) and the mutate side (executor) must invoke Git
+    under exactly this environment; keeping one definition here is what makes
+    that identity checkable rather than coincidental.
+    """
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
 class CanonicalNode:
     """A value that emits its own canonical JSON bytes without materializing them.
 

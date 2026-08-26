@@ -32,6 +32,7 @@ from .model import (
     durable_makedirs,
     ensure_safe_target,
     fsync_directory,
+    git_environment as _git_environment,
     new_id,
     normalize_relative,
     reflink_clone,
@@ -303,6 +304,19 @@ def _is_regenerate_namespace(provider: str, relative: str) -> bool:
     return provider == "pi" and parts[:1] in {("cache",), ("logs",), ("tmp",)}
 
 
+def _is_pruned(provider: str | None, relative: str, exclusions: Sequence[str]) -> bool:
+    """The one prune rule every provider walk applies to a discovered entry.
+
+    Census, copy, delta-charge, and provider capture must agree exactly on what
+    they skip, or a snapshot charges for bytes it never copies. Rootless walks
+    (provider is None) prune nothing.
+    """
+    return provider is not None and (
+        _is_excluded(relative, exclusions)
+        or _is_regenerate_namespace(provider, relative)
+    )
+
+
 def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen_sources: set[str] = set()
@@ -323,24 +337,6 @@ def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str
     # what allows /Users/jess to map to a destination home while the more
     # specific /Users/jess/git maps to Sting's XFS-backed fast-local root.
     return result
-
-
-def _git_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "LC_ALL": "C",
-        }
-    )
-    return environment
 
 
 def _git(
@@ -1849,9 +1845,7 @@ def _capture_provider(
         for name in sorted(directories):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -1881,9 +1875,7 @@ def _capture_provider(
         for name in sorted(names):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -2359,10 +2351,7 @@ def _tree_census(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             kind, _ = observe(child, relative)
             if kind == "directory":
@@ -2376,10 +2365,7 @@ def _tree_census(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
@@ -2597,10 +2583,7 @@ def _copy_live_tree(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             info = child.stat(follow_symlinks=False)
             target = target_parent / name
@@ -2631,10 +2614,7 @@ def _copy_live_tree(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             if any(name.lower().endswith(suffix) for suffix in SQLITE_SIDECARS):
                 primary_name = _sqlite_primary(name.lower())
@@ -2757,10 +2737,7 @@ def _snapshot_delta_charge(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             if stat.S_ISDIR(child.stat(follow_symlinks=False).st_mode):
                 retained.append(name)
@@ -2773,10 +2750,7 @@ def _snapshot_delta_charge(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
