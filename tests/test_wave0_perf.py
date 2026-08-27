@@ -232,5 +232,97 @@ class IdenticalLineShortCircuitTests(unittest.TestCase):
                 _jsonl_records(path)
 
 
+class DeferredAppendDigestTests(unittest.TestCase):
+    """W0-3: the discarded whole-file hash on append-jsonl files."""
+
+    @staticmethod
+    def provider_records(fixture: CutoverFixture, role: str) -> dict:
+        capture = fixture.capture(role)
+        providers = {
+            provider["name"]: provider for provider in capture["catalog"]["providers"]
+        }
+        return {
+            item["relative_path"]: item
+            for item in providers["codex"]["items"]
+            if item["kind"] == "regular"
+        }
+
+    def test_append_jsonl_record_keeps_its_exact_digest_and_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            payload = fixture.source_home / ".codex" / "history.jsonl"
+            records = self.provider_records(fixture, "source")
+            record = records["history.jsonl"]
+            self.assertEqual(record["classification"], "append-jsonl")
+            self.assertEqual(
+                record["sha256"],
+                hashlib.sha256(payload.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(record["size"], payload.stat().st_size)
+            self.assertEqual(record["sha256"], record["translated_sha256"])
+
+    def test_append_jsonl_payload_is_read_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            payload = fixture.source_home / ".codex" / "history.jsonl"
+            real = scanner.sha256_file
+            hashed: list[str] = []
+
+            def counted(path):
+                hashed.append(str(path))
+                return real(path)
+
+            with mock.patch.object(scanner, "sha256_file", side_effect=counted):
+                self.provider_records(fixture, "source")
+            self.assertNotIn(str(payload), hashed)
+
+    def test_malformed_append_state_still_carries_a_full_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            payload = fixture.source_home / ".codex" / "history.jsonl"
+            # No trailing newline: _jsonl_records rejects it and the record is
+            # rebuilt as portable-private, which must still hash the bytes.
+            payload.write_bytes(b'{"session_id":"one","text":"source"}')
+            record = self.provider_records(fixture, "source")["history.jsonl"]
+            self.assertEqual(record["classification"], "portable-private")
+            self.assertEqual(
+                record["sha256"],
+                hashlib.sha256(payload.read_bytes()).hexdigest(),
+            )
+            self.assertNotIn("records", record)
+
+    def test_a_deferred_digest_can_never_reach_a_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            with mock.patch.object(
+                scanner, "_jsonl_records", return_value={"records": []}
+            ):
+                capture = fixture.capture("source")
+            # The guard fails the provider closed rather than emitting a
+            # record whose digest was deferred and never restored.
+            self.assertFalse(capture["complete"])
+            self.assertEqual(
+                [
+                    blocker["code"]
+                    for blocker in capture["catalog"]["blockers"]
+                    if "lost its digest" in blocker.get("detail", "")
+                ],
+                ["provider-capture-failed"],
+            )
+            self.assertNotIn(
+                "codex",
+                {provider["name"] for provider in capture["catalog"]["providers"]},
+            )
+
+    def test_non_append_records_still_hash_in_file_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            auth = fixture.source_home / ".codex" / "auth.json"
+            record = self.provider_records(fixture, "source")["auth.json"]
+            self.assertEqual(
+                record["sha256"], hashlib.sha256(auth.read_bytes()).hexdigest()
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
