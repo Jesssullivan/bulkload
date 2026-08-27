@@ -52,6 +52,7 @@ DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
+SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
@@ -2507,7 +2508,13 @@ def _write_snapshot_index(
     digest = hashlib.sha256()
     count = 0
     try:
-        with os.fdopen(descriptor, "wb", buffering=0, closefd=True) as stream:
+        # Buffered, not unbuffered: the index is ~1-2 M records of a few
+        # hundred bytes each per leg, and buffering=0 turned every record into
+        # its own write(2). Durability is unchanged — the explicit flush() plus
+        # os.fsync() below, and the directory fsync after, are what make the
+        # index durable, not the absence of a userspace buffer.
+        stream = os.fdopen(descriptor, "wb", SNAPSHOT_INDEX_BUFFER_BYTES, closefd=True)
+        with stream:
             for root_index, (binding, ledger) in enumerate(zip(roots, ledgers)):
                 root = Path(binding["snapshot"])
                 for relative, payload_path in _snapshot_namespace(root):

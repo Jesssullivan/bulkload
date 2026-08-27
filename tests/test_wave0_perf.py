@@ -425,5 +425,67 @@ class TransportChecksumTests(unittest.TestCase):
             _agent_stage(arguments)
 
 
+class SnapshotIndexWriterTests(unittest.TestCase):
+    """W0-5 rider: the index writer is buffered but still durable."""
+
+    def test_index_writer_is_buffered_and_still_fsyncs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            real_fdopen = scanner.os.fdopen
+            buffering: list[object] = []
+            synced: list[int] = []
+
+            def recording_fdopen(descriptor, mode="r", *args, **keywords):
+                if mode == "wb":
+                    buffering.append(args[0] if args else keywords.get("buffering"))
+                return real_fdopen(descriptor, mode, *args, **keywords)
+
+            real_fsync = scanner.os.fsync
+
+            def recording_fsync(descriptor):
+                synced.append(descriptor)
+                return real_fsync(descriptor)
+
+            with (
+                mock.patch.object(scanner.os, "fdopen", side_effect=recording_fdopen),
+                mock.patch.object(scanner.os, "fsync", side_effect=recording_fsync),
+            ):
+                capture = live_capture(fixture, "source-a")
+
+            self.assertNotIn(0, buffering)
+            self.assertIn(scanner.SNAPSHOT_INDEX_BUFFER_BYTES, buffering)
+            self.assertTrue(synced)
+            # The seal still describes the bytes that landed on disk.
+            snapshot = capture["catalog"]["snapshot"]
+            index = Path(snapshot["index_path"])
+            self.assertEqual(
+                hashlib.sha256(index.read_bytes()).hexdigest(),
+                snapshot["index_sha256"],
+            )
+            self.assertEqual(
+                len(index.read_bytes().splitlines()), snapshot["index_entries"]
+            )
+            validate_agent_capture(capture, expected_role="source")
+
+    def test_a_partial_index_write_is_never_published(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            real = scanner._snapshot_index_record
+            seen: list[str] = []
+
+            def failing(path, **keywords):
+                seen.append(str(path))
+                if len(seen) > 3:
+                    raise BulkloadError("synthetic index-write failure")
+                return real(path, **keywords)
+
+            with mock.patch.object(
+                scanner, "_snapshot_index_record", side_effect=failing
+            ):
+                with self.assertRaises(BulkloadError):
+                    live_capture(fixture, "source-a")
+            self.assertFalse((fixture.root / "evidence" / "source-a.snapshot").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
