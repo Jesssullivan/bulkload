@@ -20,6 +20,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -167,6 +168,128 @@ class BaseRecordMapTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"BULKLOAD_SPILL_DIR": str(inside)}):
                 with self.assertRaisesRegex(BulkloadError, "spill dir is inside"):
                     scanner._base_record_spill_dir(root, Path(temporary) / "partial")
+
+    def test_lever_off_reads_no_other_spill_variable_at_all(self) -> None:
+        """X1: the off position must restore shipped behaviour *exactly*.
+
+        The lever used to be read at the `_BaseRecordMap` construction, which
+        is downstream of the refusal above — so with the lever off and
+        `BULKLOAD_SPILL_DIR` pointed inside the capture, the engine still died
+        on a refusal the shipped engine has no equivalent of. A rollback lever
+        that can still fail the capture is not a rollback lever.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "snapshot"
+            inside = root / "roots"
+            inside.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BULKLOAD_SPILL_DIR": str(inside),
+                    "BULKLOAD_SPILL_BASE_RECORDS": "0",
+                },
+            ):
+                self.assertIsNone(
+                    scanner._base_record_spill_dir(root, Path(temporary) / "partial")
+                )
+
+    def test_lever_off_ignores_a_spill_dir_inside_the_capture(self) -> None:
+        """The same counterexample end to end, through a real chained capture."""
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            first = live_capture(fixture, "source-a")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "BULKLOAD_SPILL_BASE_RECORDS": "0",
+                    "BULKLOAD_SPILL_DIR": str(
+                        fixture.root / "evidence" / "source-b.snapshot"
+                    ),
+                },
+            ):
+                chained = live_capture(fixture, "source-b", base=first)
+            self.assertIn("capture_sha256", chained)
+
+    def test_an_unusable_spill_dir_fails_closed(self) -> None:
+        """`validate_snapshot_custody` promises `BulkloadError` on every refusal.
+
+        The arena is constructed outside that promise's `try`, so an unwritable
+        or full spill volume escaped as a raw `OSError` — past the fail-closed
+        fence, and past `_capture_live_snapshot`'s `finally: base_index.close()`,
+        which never saw an instance to close.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "no-such-volume"
+            with self.assertRaisesRegex(BulkloadError, "arena cannot be opened"):
+                scanner._BaseRecordMap(["git"], spill_dir=missing)
+
+    def test_a_spill_volume_that_fills_refuses_rather_than_truncates(self) -> None:
+        """A short write must never become a silently truncated arena."""
+        with tempfile.TemporaryDirectory() as temporary:
+            store = scanner._BaseRecordMap(["git"], spill_dir=Path(temporary))
+            try:
+                with mock.patch.object(
+                    store._arena, "write", side_effect=OSError(28, "No space left")
+                ):
+                    with self.assertRaisesRegex(
+                        BulkloadError, "arena cannot be written"
+                    ):
+                        store.append(0, "a", index_line(0, "a"))
+                with mock.patch.object(
+                    store._arena, "flush", side_effect=OSError(28, "No space left")
+                ):
+                    with self.assertRaisesRegex(
+                        BulkloadError, "arena cannot be written"
+                    ):
+                        store.seal()
+            finally:
+                store.close()
+
+    def test_close_never_raises_and_never_masks_the_real_failure(self) -> None:
+        """`close()` runs from `finally` and from `seal`'s error path.
+
+        Flushing a dirty buffer to the volume that just refused the write would
+        raise a second time and hide whatever the capture actually died of.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            store = scanner._BaseRecordMap(["git"], spill_dir=Path(temporary))
+            released = store._arena.close
+
+            def close_then_fail() -> None:
+                released()  # really release the descriptor, then fail like ENOSPC
+                raise OSError(28, "No space left")
+
+            with mock.patch.object(store._arena, "close", close_then_fail):
+                store.close()
+            self.assertFalse(store.spilled)
+
+    def test_the_memory_backed_mount_parse_picks_the_longest_mount(self) -> None:
+        """A tmpfs under a disk-backed parent still has to be reported.
+
+        Parsed as a pure function of the `/proc/self/mountinfo` text so this
+        runs on darwin, where the file does not exist and the check no-ops.
+        """
+        mountinfo = "\n".join(
+            (
+                "21 1 0:20 / / rw,relatime - apfs /dev/disk3s1 rw",
+                "22 21 0:21 / /tmp rw,relatime - tmpfs tmpfs rw",
+                "23 21 0:22 / /tmp/durable rw - ext4 /dev/sdb1 rw",
+                "24 21 0:23 / /var/spill\\040dir rw - ramfs ramfs rw",
+            )
+        )
+        for candidate, expected in (
+            ("/var/tmp", False),
+            ("/tmp", True),
+            ("/tmp/runs/a", True),
+            ("/tmp/durable", False),
+            ("/tmp/durable/runs", False),
+            ("/var/spill dir/x", True),
+            ("/nowhere", False),
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertIs(
+                    scanner._memory_backed_mount(Path(candidate), mountinfo), expected
+                )
 
     def test_the_lever_is_off_only_for_the_documented_spellings(self) -> None:
         for value, expected in (
@@ -683,12 +806,73 @@ class WitnessEpochTests(unittest.TestCase):
                 ):
                     with contextlib.redirect_stderr(stream):
                         capture = live_capture(fixture, "source-a")
+            # The exception *class* is part of the line now: a real divergence
+            # (`BulkloadError`) and a live-tree race (`FileNotFoundError`) are
+            # different findings and a measurement lap has to tell them apart.
             self.assertIn(
-                "bulkload-witness divergence=live generation", stream.getvalue()
+                "bulkload-witness divergence=BulkloadError: live generation",
+                stream.getvalue(),
             )
             self.assertIn("capture_sha256", capture)
             # The real fence is untouched and still refuses.
             real(capture["catalog"]["snapshot"], passes=1)
+
+    def test_witness_survives_a_live_root_that_vanishes(self) -> None:
+        """The refuter's counterexample, mocked nowhere.
+
+        `except BulkloadError` was too narrow. The fence walks the *live* tree
+        and `_tree_census` reaches `root.stat()` and `sha256_file()` unwrapped,
+        so a root that an external tool removes between the seal and the
+        witness raises a bare `FileNotFoundError`. That escaped into
+        `_capture_live_snapshot`'s `except BaseException`, which removes the
+        partial and re-raises: an off-by-default observation that changes no
+        digest could destroy a capture that had already sealed.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            live = Path(snapshot["roots"][0]["live"])
+            shutil.rmtree(live)
+            self.assertFalse(live.exists())
+
+            # The fence itself still raises, and raises something that is not
+            # a BulkloadError — otherwise this test proves nothing.
+            with self.assertRaises(OSError):
+                scanner.validate_live_snapshot_generation(snapshot, passes=1)
+
+            stream = io.StringIO()
+            with mock.patch.dict(os.environ, {"BULKLOAD_WITNESS_EPOCH": "1"}):
+                with contextlib.redirect_stderr(stream):
+                    scanner._witness_epoch(snapshot)
+            self.assertIn(
+                "bulkload-witness divergence=FileNotFoundError", stream.getvalue()
+            )
+
+    def test_only_the_operator_can_stop_a_capture_through_the_witness(self) -> None:
+        """`Exception` is broad on purpose; `BaseException` is not swallowed."""
+        for raised, escapes in (
+            (BulkloadError("divergence"), False),
+            (FileNotFoundError("live root vanished"), False),
+            (MemoryError(), False),
+            (KeyboardInterrupt(), True),
+            (SystemExit(1), True),
+        ):
+            with self.subTest(raised=type(raised).__name__):
+
+                def boom(snapshot, *, passes=2, error=raised):
+                    raise error
+
+                with mock.patch.dict(os.environ, {"BULKLOAD_WITNESS_EPOCH": "1"}):
+                    with mock.patch.object(
+                        scanner, "validate_live_snapshot_generation", boom
+                    ):
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            if escapes:
+                                with self.assertRaises(type(raised)):
+                                    scanner._witness_epoch({})
+                            else:
+                                scanner._witness_epoch({})
 
     def test_the_witness_is_the_fence_the_engine_already_owns(self) -> None:
         """Pins the KILL-1 correction.

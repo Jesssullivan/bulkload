@@ -5,7 +5,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import hashlib
 import heapq
 import json
@@ -2585,6 +2585,9 @@ def _bounded_sorted(entries: Iterable[str]) -> Iterable[str]:
     except ValueError:
         chunk_size = NAMESPACE_SORT_CHUNK
     spill_dir = os.environ.get("BULKLOAD_SPILL_DIR") or None
+    # Same env var, same hazard: runs on tmpfs relieve nothing. Warned once
+    # per process per directory, so this costs one dict lookup per call.
+    _warn_memory_backed_spill(Path(spill_dir or tempfile.gettempdir()))
     chunk: list[str] = []
     runs: list[Any] = []
     try:
@@ -2670,8 +2673,67 @@ def _write_snapshot_index(
     return digest.hexdigest(), count
 
 
-def _base_record_spill_dir(snapshot_root: Path, partial: Path) -> Path:
-    """Where the base-record arena lives, refusing to land inside the capture.
+MEMORY_BACKED_FILESYSTEMS = frozenset({"ramfs", "tmpfs"})
+_WARNED_SPILL_DIRS: set[str] = set()
+
+
+def _memory_backed_mount(candidate: Path, mountinfo: str) -> bool:
+    """Whether `candidate`'s longest containing mount is RAM-backed.
+
+    `/proc/self/mountinfo` lines are `<fields> - <fstype> <source> <opts>`, and
+    field 5 is the mount point. The longest matching mount point wins, so a
+    tmpfs mounted *under* a disk-backed parent is still reported.
+    """
+    kind = ""
+    best = -1
+    for entry in mountinfo.splitlines():
+        head, separator, tail = entry.partition(" - ")
+        fields = head.split()
+        rest = tail.split()
+        if not separator or len(fields) < 5 or not rest:
+            continue
+        point = fields[4].replace("\\040", " ").replace("\\011", "\t")
+        if len(point) > best and _within(candidate, Path(point)):
+            best, kind = len(point), rest[0]
+    return kind in MEMORY_BACKED_FILESYSTEMS
+
+
+def _warn_memory_backed_spill(candidate: Path) -> None:
+    """Say so, once, when a spill target cannot actually relieve memory.
+
+    A spill dir on tmpfs/ramfs — the default `/tmp` on most Linux hosts — makes
+    both W2-1 and W2-2 write their "spilled" bytes straight back into RAM. The
+    slices then do nothing while still reporting success, which is the one
+    outcome a memory wave must never produce silently.
+
+    This warns rather than refuses on purpose. Refusing would fail the
+    *default* configuration of every Linux host, which is a worse regression
+    than an inert slice; and the ceremony host is darwin, which has no tmpfs
+    and whose `TMPDIR` (`/var/folders/...`) is APFS. Detection is Linux-only —
+    `statvfs` carries no filesystem type — so on darwin this is a no-op and the
+    warning never fires.
+    """
+    key = os.fspath(candidate)
+    if key in _WARNED_SPILL_DIRS:
+        return
+    # Marked before the read, not after, so a host without `/proc` (darwin)
+    # attempts it once per directory rather than once per call.
+    _WARNED_SPILL_DIRS.add(key)
+    try:
+        backed = _memory_backed_mount(
+            candidate, Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        )
+    except OSError:
+        return
+    if backed:
+        sys.stderr.write(
+            f"bulkload-spill warning=memory-backed dir={key} effect=no-memory-relief\n"
+        )
+        sys.stderr.flush()
+
+
+def _base_record_spill_dir(snapshot_root: Path, partial: Path) -> Path | None:
+    """Where the base-record arena lives, or `None` when the lever is off.
 
     The arena is unlinked the instant it is created, so it can never enter a
     census; the refusal below is defence in depth against a `BULKLOAD_SPILL_DIR`
@@ -2679,12 +2741,23 @@ def _base_record_spill_dir(snapshot_root: Path, partial: Path) -> Path:
     direction is checked — the containing direction is the normal case, since
     `TMPDIR` legitimately contains the capture in every test and on every host
     whose stage root is a temporary directory.
+
+    The lever is read *first*, ahead of every other env read, because X1 wants
+    the off position to restore shipped behaviour exactly and the shipped
+    engine never looks at `BULKLOAD_SPILL_DIR` at all. Consulting the lever
+    downstream of the refusal — which is where it used to sit, at the
+    `_BaseRecordMap` construction — meant the off position could still kill a
+    capture with an error the shipped engine has no equivalent of. The
+    counterexample is `test_lever_off_ignores_a_spill_dir_inside_the_capture`.
     """
+    if not _env_lever("BULKLOAD_SPILL_BASE_RECORDS"):
+        return None
     spill_dir = Path(os.environ.get("BULKLOAD_SPILL_DIR") or tempfile.gettempdir())
     candidate = Path(os.path.abspath(os.fspath(spill_dir.expanduser())))
     for root in (snapshot_root, partial):
         if _within(candidate, Path(os.path.abspath(os.fspath(root)))):
             raise BulkloadError("base record spill dir is inside the live snapshot")
+    _warn_memory_backed_spill(candidate)
     return spill_dir
 
 
@@ -2736,7 +2809,15 @@ class _BaseRecordMap:
     The arena is complete and read-only *before* `require_capacity` runs, and
     never grows afterwards, so its blocks are already missing from the
     `statvfs` the capacity gate reads. That discharges the prior round's
-    spill-arena MUSTFIX by construction rather than by an estimate.
+    spill-arena MUSTFIX by construction rather than by an estimate — but only
+    when the spill dir shares the capture's filesystem. When it does not (an
+    operator points `BULKLOAD_SPILL_DIR` at another volume, or `TMPDIR` is the
+    boot volume while the capture is on an external disk) nothing charges the
+    arena against the volume that actually holds it. What that leaves is a
+    fail-*closed* refusal rather than an unnoticed overrun: every path that
+    touches the arena converts `OSError` to `BulkloadError`, so a spill volume
+    that fills refuses the capture and tears down the partial, exactly as a
+    full capture volume already does.
     """
 
     def __init__(self, labels: Sequence[str], *, spill_dir: Path | None) -> None:
@@ -2750,12 +2831,26 @@ class _BaseRecordMap:
         self._fd = -1
         self._offset = 0
         if spill_dir is not None:
-            descriptor, path = tempfile.mkstemp(
-                prefix="bulkload-base-records-", dir=os.fspath(spill_dir)
-            )
-            os.unlink(path)
+            # `validate_snapshot_custody` promises a `BulkloadError` on every
+            # refusal, and it is constructed outside that promise's `try`. An
+            # unwritable or full spill volume used to escape as a raw `OSError`
+            # — past the fail-closed fence, and past `_capture_live_snapshot`'s
+            # `finally: base_index.close()`, which never saw an instance to
+            # close. Counterexample: `test_an_unusable_spill_dir_fails_closed`.
+            descriptor = -1
+            try:
+                descriptor, path = tempfile.mkstemp(
+                    prefix="bulkload-base-records-", dir=os.fspath(spill_dir)
+                )
+                os.unlink(path)
+                self._arena = os.fdopen(descriptor, "wb", SNAPSHOT_INDEX_BUFFER_BYTES)
+            except OSError as error:
+                if descriptor >= 0 and self._arena is None:
+                    os.close(descriptor)
+                raise BulkloadError(
+                    f"base record spill arena cannot be opened: {error}"
+                ) from error
             self._fd = descriptor
-            self._arena = os.fdopen(descriptor, "wb", SNAPSHOT_INDEX_BUFFER_BYTES)
 
     @property
     def spilled(self) -> bool:
@@ -2772,13 +2867,25 @@ class _BaseRecordMap:
         if self._arena is None:
             self._resident.append(json.loads(line))
         else:
-            self._arena.write(line)
+            # Buffered, so a full spill volume surfaces here or in `seal`.
+            try:
+                self._arena.write(line)
+            except OSError as error:
+                raise BulkloadError(
+                    f"base record spill arena cannot be written: {error}"
+                ) from error
         self._offset += len(line)
         self._record_offsets.append(self._offset)
 
     def seal(self) -> None:
         if self._arena is not None:
-            self._arena.flush()
+            try:
+                self._arena.flush()
+            except OSError as error:
+                self.close()
+                raise BulkloadError(
+                    f"base record spill arena cannot be written: {error}"
+                ) from error
 
     def probe(self, low: int, high: int, relative: str) -> dict[str, Any] | None:
         wanted = relative.encode("utf-8", "surrogatepass")
@@ -2799,7 +2906,12 @@ class _BaseRecordMap:
         if self._arena is None:
             return self._resident[index]
         start = self._record_offsets[index]
-        line = os.pread(self._fd, self._record_offsets[index + 1] - start, start)
+        try:
+            line = os.pread(self._fd, self._record_offsets[index + 1] - start, start)
+        except OSError as error:
+            raise BulkloadError(
+                f"base record spill arena cannot be read: {error}"
+            ) from error
         return json.loads(line)
 
     def by_label(self, label: str) -> _RootRecords:
@@ -2812,9 +2924,16 @@ class _BaseRecordMap:
         return _RootRecords(self, 0, 0)
 
     def close(self) -> None:
+        # Called from `finally` on the failure path, and by `seal` after a
+        # write error, so it must never raise: `close()` flushes, and flushing
+        # a dirty buffer to the volume that just refused the write would raise
+        # a second time and mask whatever the capture actually died of. The
+        # arena is unlinked and its bytes are worthless once the capture is
+        # failing, so dropping them is the correct loss.
         arena, self._arena = self._arena, None
         if arena is not None:
-            arena.close()
+            with suppress(OSError):
+                arena.close()
         self._fd = -1
 
     def __len__(self) -> int:
@@ -2930,9 +3049,7 @@ def validate_snapshot_custody(
     seen: set[Path] = set()
     collected = _BaseRecordMap(
         [item["label"] for item in snapshot["roots"]],
-        spill_dir=spill_dir
-        if collect_records and _env_lever("BULKLOAD_SPILL_BASE_RECORDS")
-        else None,
+        spill_dir=spill_dir if collect_records else None,
     )
     digest = hashlib.sha256()
     namespace_digest = hashlib.sha256()
@@ -3858,7 +3975,7 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
     Wave 3 wants to delete the chained B leg and lean on a single capture's
     own during-copy proof instead. That trade rests entirely on what a live
     witness costs on the real corpus, and nobody has ever measured it. This
-    runs one, off by default, and it can never fail a capture.
+    runs one, off by default, and no outcome of it can fail a capture.
 
     Two things the design that asked for this got wrong, and why this is not
     what it specified:
@@ -3884,6 +4001,19 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
     `passes=1` is the documented exception, not a shortcut: an observation is
     strictly dominated by all six real fence sites, which still run at full
     strength on every path.
+
+    The `except` below is deliberately `Exception` and not `BulkloadError`.
+    The fence walks the *live* tree, and a live tree can move underneath it in
+    ways it never converts: `_tree_census` reaches `root.stat()` and
+    `sha256_file()` unwrapped, so a root that an external tool removes between
+    the seal and this call raises a bare `FileNotFoundError`. That escaped into
+    `_capture_live_snapshot`'s `except BaseException`, which tears down the
+    partial and re-raises — i.e. an observation that is off by default and
+    changes no digest could destroy a capture that had already sealed. The
+    counterexample is `test_witness_survives_a_live_root_that_vanishes`.
+
+    `BaseException` still propagates: `KeyboardInterrupt` and `SystemExit` are
+    the operator's, not a divergence, and the capture must die on them.
     """
     if os.environ.get("BULKLOAD_WITNESS_EPOCH", "").strip().lower() not in {
         "1",
@@ -3895,11 +4025,12 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
     with phase_timing("witness"):
         try:
             validate_live_snapshot_generation(snapshot, passes=1)
-        except BulkloadError as error:
-            sys.stderr.write(f"bulkload-witness divergence={error}\n")
-        else:
-            sys.stderr.write("bulkload-witness divergence=none\n")
-        sys.stderr.flush()
+            divergence = "none"
+        except Exception as error:  # noqa: BLE001 — an observation may not fail a capture
+            divergence = f"{type(error).__name__}: {error}"
+        with suppress(Exception):
+            sys.stderr.write(f"bulkload-witness divergence={divergence}\n")
+            sys.stderr.flush()
 
 
 def _snapshot_path(path: Path, roots: Sequence[dict[str, str]], *, label: str) -> Path:
