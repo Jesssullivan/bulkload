@@ -3126,9 +3126,22 @@ def validate_snapshot_custody(
                             },
                         )
                         if observed != record:
-                            raise BulkloadError(
-                                "snapshot payload differs from sealed index"
-                            )
+                            # Symlink permission bits are not portable across
+                            # kernels: darwin lstat reports the link's real
+                            # bits (default 0755) while linux fixes every
+                            # symlink at 0777 and offers no lchmod. The link
+                            # stays bound by kind, size, and the target-path
+                            # digest; only the mode field is exempt, and only
+                            # when both sides agree the entry is a symlink.
+                            if not (
+                                observed.get("kind") == "symlink"
+                                and record.get("kind") == "symlink"
+                                and {**observed, "mode": None}
+                                == {**record, "mode": None}
+                            ):
+                                raise BulkloadError(
+                                    "snapshot payload differs from sealed index"
+                                )
                     seen.add(original_path)
                 count += 1
     except OSError as error:
