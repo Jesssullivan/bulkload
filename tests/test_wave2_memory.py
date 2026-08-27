@@ -18,7 +18,8 @@ import ast
 import json
 import os
 from pathlib import Path
-import resource
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -360,96 +361,156 @@ class SnapshotNamespaceTests(unittest.TestCase):
                     )
 
 
-def peak_rss_bytes() -> int:
-    """Darwin reports ru_maxrss in bytes; Linux in kibibytes."""
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return peak if os.uname().sysname == "Darwin" else peak * 1024
+PEAK_PROBE = """
+import json, os, resource, sys, tempfile
+from pathlib import Path
+from bulkload_lib import scanner
+from bulkload_lib.model import canonical_bytes
 
 
-class BaseRecordResidencyTests(unittest.TestCase):
-    """W2-1's whole point: the map must not grow with the corpus."""
+def peak():
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return value if os.uname().sysname == "Darwin" else value * 1024
 
-    ENTRIES = 120_000
 
-    def build(self, spill_dir: Path | None) -> tuple[int, scanner._BaseRecordMap]:
-        before = peak_rss_bytes()
-        store = scanner._BaseRecordMap(["provider-codex"], spill_dir=spill_dir)
-        for index in range(self.ENTRIES):
-            relative = f"sessions/2026/08/rollout-{index:012d}.jsonl"
-            store.append(0, relative, index_line(0, relative))
-        store.seal()
-        return peak_rss_bytes() - before, store
+def line(index, relative):
+    return canonical_bytes({
+        "destination_device": 1, "kind": "regular", "method": "copy",
+        "mode": "0600", "relative_path": relative, "root_index": 0,
+        "sha256": f"{index:064x}", "size": 4096, "source_device": 1}) + b"\\n"
 
-    def test_the_spilled_map_costs_far_less_than_the_resident_one(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            spilled_cost, spilled = self.build(Path(temporary))
-            try:
-                view = spilled.by_label("provider-codex")
-                # Not a no-op store: it still answers.
-                self.assertEqual(
-                    view.get("sessions/2026/08/rollout-000000099999.jsonl")["sha256"],
-                    f"{0:064x}",
-                )
-                resident_cost, resident = self.build(None)
-                resident.close()
-            finally:
-                spilled.close()
-        # The resident map holds one parsed dict per entry (~690 B measured on
-        # the real corpus); the spilled map holds the key blob and two offset
-        # arrays only. The budget is deliberately loose — this asserts the
-        # asymptote, not a particular allocator.
-        budget = 128 * self.ENTRIES
-        self.assertLess(
-            spilled_cost,
-            budget,
-            f"spilled peak grew {spilled_cost} B for {self.ENTRIES} entries "
-            f"(budget {budget} B); resident cost was {resident_cost} B",
+
+def relative_at(index):
+    return f"sessions/2026/08/23/rollout-2026-08-23T04-11-{index:012d}.jsonl"
+
+
+def base_records(count, spilled):
+    with tempfile.TemporaryDirectory() as temporary:
+        before = peak()
+        store = scanner._BaseRecordMap(
+            ["provider-codex"], spill_dir=Path(temporary) if spilled else None
         )
-        self.assertLess(spilled_cost, resident_cost)
+        for index in range(count):
+            store.append(0, relative_at(index), line(index, relative_at(index)))
+        store.seal()
+        view = store.by_label("provider-codex")
+        for index in range(0, count, max(1, count // 500)):
+            assert view.get(relative_at(index))["sha256"] == f"{index:064x}"
+        after = peak()
+        store.close()
+    return after - before
 
 
-class NamespaceResidencyTests(unittest.TestCase):
-    """W2-2's whole point: the walk must not grow with the namespace."""
+def namespace(root, bounded):
+    before = peak()
+    if bounded:
+        os.environ["BULKLOAD_NAMESPACE_CHUNK"] = "4096"
+        seen = 0
+        previous = None
+        for relative, _ in scanner._snapshot_namespace(root):
+            assert previous is None or previous < relative
+            previous = relative
+            seen += 1
+    else:
+        observed = [(".", root)]
+        for current, directories, files in os.walk(
+            root, topdown=True, followlinks=False
+        ):
+            directories[:] = sorted(directories)
+            current_path = Path(current)
+            observed.extend(
+                ((current_path / n).relative_to(root).as_posix(), current_path / n)
+                for n in directories
+            )
+            observed.extend(
+                ((current_path / n).relative_to(root).as_posix(), current_path / n)
+                for n in sorted(files)
+            )
+        listed = sorted(observed)
+        seen = len(listed)
+    after = peak()
+    return after - before, seen
 
-    PER_DIR = 400
-    DIRS = 60
 
-    def tree(self, root: Path) -> int:
-        entries = 1
-        for index in range(self.DIRS):
-            directory = root / f"sessions/2026/08/{index:05d}"
-            directory.mkdir(parents=True)
-            entries += 1 + len(directory.relative_to(root).parts) - 1
-            for item in range(self.PER_DIR):
-                (directory / f"rollout-{index:05d}-{item:06d}.jsonl").write_bytes(b"x")
-                entries += 1
-        return entries
+WHICH, SUBJECT, VARIANT = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+if WHICH == "base-records":
+    count = int(SUBJECT)
+    print(json.dumps({"bytes": base_records(count, VARIANT), "entries": count}))
+else:
+    grew, seen = namespace(Path(SUBJECT), VARIANT)
+    print(json.dumps({"bytes": grew, "entries": seen}))
+"""
 
-    def test_the_bounded_walk_costs_far_less_than_the_list(self) -> None:
+
+def probe(which: str, subject: str, variant: bool) -> dict[str, int]:
+    """Measure peak RSS in a fresh interpreter.
+
+    `ru_maxrss` is a process-wide high-water mark, so measuring a delta inside
+    the test runner reports whatever the *suite* peaked at, not what this
+    structure cost — and reports zero once some earlier test has peaked higher.
+    A child process is the only honest reading.
+    """
+    root = Path(scanner.__file__).parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c", PEAK_PROBE, which, subject, "1" if variant else "0"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.fspath(root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+class ResidencyTests(unittest.TestCase):
+    """The point of the whole wave: neither structure may grow with the corpus.
+
+    Both budgets are per-entry and deliberately loose. They assert the
+    asymptote — that the bounded form is O(1)-ish per entry where the old one
+    was O(record) — not a particular allocator's constant.
+    """
+
+    BASE_RECORDS = 200_000
+    NAMESPACE = 40_000
+
+    def test_the_base_record_map_no_longer_holds_the_records(self) -> None:
+        spilled = probe("base-records", str(self.BASE_RECORDS), True)
+        resident = probe("base-records", str(self.BASE_RECORDS), False)
+        budget = 128 * self.BASE_RECORDS
+        self.assertLess(
+            spilled["bytes"],
+            budget,
+            f"spilled peak grew {spilled['bytes']} B for {self.BASE_RECORDS} "
+            f"entries (budget {budget} B); resident grew {resident['bytes']} B",
+        )
+        self.assertLess(spilled["bytes"] * 2, resident["bytes"])
+
+    def test_the_namespace_walk_no_longer_holds_the_namespace(self) -> None:
+        # The tree is built here, not in the probe: creating 40 k files peaks
+        # higher than walking them, and ru_maxrss would report that instead.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "root"
-            root.mkdir()
-            self.tree(root)
-            with mock.patch.dict(os.environ, {"BULKLOAD_NAMESPACE_CHUNK": "2048"}):
-                before = peak_rss_bytes()
-                bounded = 0
-                previous = None
-                for relative, _ in scanner._snapshot_namespace(root):
-                    self.assertTrue(previous is None or previous < relative)
-                    previous = relative
-                    bounded += 1
-                bounded_cost = peak_rss_bytes() - before
-            before = peak_rss_bytes()
-            listed = reference_snapshot_namespace(root)
-            listed_cost = peak_rss_bytes() - before
-        self.assertEqual(bounded, len(listed))
-        budget = 64 * bounded
+            per_directory = 400
+            for group in range(self.NAMESPACE // per_directory):
+                directory = root / f"sessions/2026/08/{group:05d}"
+                directory.mkdir(parents=True)
+                for item in range(per_directory):
+                    name = f"rollout-{group:05d}-{item:06d}.jsonl"
+                    (directory / name).write_bytes(b"x")
+            bounded = probe("namespace", os.fspath(root), True)
+            listed = probe("namespace", os.fspath(root), False)
+        self.assertEqual(bounded["entries"], listed["entries"])
+        budget = 64 * bounded["entries"]
         self.assertLess(
-            bounded_cost,
+            bounded["bytes"],
             budget,
-            f"bounded walk grew {bounded_cost} B for {bounded} entries "
-            f"(budget {budget} B); the list cost {listed_cost} B",
+            f"bounded walk grew {bounded['bytes']} B for {bounded['entries']} "
+            f"entries (budget {budget} B); the list grew {listed['bytes']} B",
         )
+        self.assertLess(bounded["bytes"] * 2, listed["bytes"])
 
 
 class ReductivePurgeTests(unittest.TestCase):

@@ -36,6 +36,7 @@ from bulkload_lib.model import (
     BulkloadError,
     canonical_bytes,
     fsync_directory,
+    git_environment,
     reflink_clone,
     require_capacity,
     require_digest,
@@ -906,7 +907,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
                     ["git", "-C", str(batch._repository), "cat-file", "blob", oid],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    env=scanner._git_environment(),
+                    env=git_environment(),
                 )
                 digest = hashlib.sha256()
                 assert process.stdout is not None
