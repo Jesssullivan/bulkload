@@ -3819,6 +3819,7 @@ def _capture_live_snapshot(
         }
         seal_path = snapshot_root / "snapshot-seal.json"
         snapshot = seal({**snapshot, "seal_path": os.fspath(seal_path)}, "seal_sha256")
+        _witness_epoch(snapshot)
         partial_seal = partial / "snapshot-seal.json"
         atomic_write_json(partial_seal, snapshot)
         require_digest(snapshot, "seal_sha256")
@@ -3846,6 +3847,56 @@ def _capture_live_snapshot(
     finally:
         if base_index is not None:
             base_index.close()
+
+
+def _witness_epoch(snapshot: dict[str, Any]) -> None:
+    """W2-5. Re-derive the live epoch at capture time and only report on it.
+
+    Wave 3 wants to delete the chained B leg and lean on a single capture's
+    own during-copy proof instead. That trade rests entirely on what a live
+    witness costs on the real corpus, and nobody has ever measured it. This
+    runs one, off by default, and it can never fail a capture.
+
+    Two things the design that asked for this got wrong, and why this is not
+    what it specified:
+
+    * It proposed upgrading the post-copy `_tree_census` to `content=True` and
+      comparing that to the sealed generation. Those two digests are taken over
+      structurally different tuples — the census emits the full stat tuple
+      including `st_dev`, `st_ino` and the timestamps, while `_tree_generation`
+      emits `[IFMT, IMODE, size]` plus a content digest — so they can never be
+      equal, for any tree, ever. The only correct witness is a third walk:
+      `_tree_generation` over the live tree. "The walk is already paid" is
+      therefore false; this costs a whole extra content pass.
+    * `_tree_generation` sets `content_digest=None` and drops `size` for a live
+      sqlite primary, so a witness built from it alone is blind to every byte
+      of provider sqlite. `validate_live_snapshot_generation` covers that hole
+      by folding `sqlite_catalog(...)["logical_sha256"]` per declared sqlite.
+
+    Both corrections land on the same conclusion: the correct witness is the
+    fence the engine already owns. So this calls it rather than building a
+    second, weaker one — which also means the cost it measures is the real
+    cost of the thing Wave 3 would have to run.
+
+    `passes=1` is the documented exception, not a shortcut: an observation is
+    strictly dominated by all six real fence sites, which still run at full
+    strength on every path.
+    """
+    if os.environ.get("BULKLOAD_WITNESS_EPOCH", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    with phase_timing("witness"):
+        try:
+            validate_live_snapshot_generation(snapshot, passes=1)
+        except BulkloadError as error:
+            sys.stderr.write(f"bulkload-witness divergence={error}\n")
+        else:
+            sys.stderr.write("bulkload-witness divergence=none\n")
+        sys.stderr.flush()
 
 
 def _snapshot_path(path: Path, roots: Sequence[dict[str, str]], *, label: str) -> Path:
