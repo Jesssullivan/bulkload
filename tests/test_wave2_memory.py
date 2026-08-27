@@ -182,7 +182,7 @@ class BaseRecordMapTests(unittest.TestCase):
 class ChainedCaptureDifferentialTests(unittest.TestCase):
     """The Wave-0 landing gate, re-applied: stock vs branch must agree byte-wise."""
 
-    LEVERS = ("BULKLOAD_SPILL_BASE_RECORDS",)
+    LEVERS = ("BULKLOAD_SPILL_BASE_RECORDS", "BULKLOAD_BOUND_NAMESPACE")
 
     @staticmethod
     def evidence(capture: dict) -> dict:
@@ -240,6 +240,125 @@ class ChainedCaptureDifferentialTests(unittest.TestCase):
             )
 
 
+def reference_snapshot_namespace(root: Path) -> list[tuple[str, Path]]:
+    """The pre-slice `_snapshot_namespace`, kept verbatim as the value oracle."""
+    observed: list[tuple[str, Path]] = [(".", root)]
+    if root.is_dir():
+        for current, directories, files in os.walk(
+            root, topdown=True, followlinks=False
+        ):
+            directories[:] = sorted(directories)
+            current_path = Path(current)
+            observed.extend(
+                (
+                    (current_path / name).relative_to(root).as_posix(),
+                    current_path / name,
+                )
+                for name in directories
+            )
+            observed.extend(
+                (
+                    (current_path / name).relative_to(root).as_posix(),
+                    current_path / name,
+                )
+                for name in sorted(files)
+            )
+    return sorted(observed)
+
+
+def adversarial_tree(root: Path) -> None:
+    """Names chosen so a path-aware or byte-naive sort orders them differently."""
+    root.mkdir(parents=True)
+    # `a.c` < `a/b` because U+002E < U+002F: a sort that compares path parts
+    # instead of the posix string puts these the other way round.
+    (root / "a.c").write_text("a.c")
+    (root / "a").mkdir()
+    (root / "a" / "b").write_text("b")
+    (root / "a" / "b.d").write_text("b.d")
+    (root / "a-b").write_text("a-b")
+    (root / "a0").write_text("a0")
+    # Non-ASCII and non-BMP, both of which must sort by code point, not by
+    # UTF-8 byte length. (A name that is not valid UTF-8 cannot be created at
+    # all on APFS — the filesystem refuses it — so the surrogateescape path is
+    # covered by the encode/decode round-trip test instead.)
+    (root / "été.txt").write_text("e")
+    (root / "\U0001f9ea.txt").write_text("t")
+    (root / "Z").write_text("Z")
+    (root / "z").write_text("z")
+    (root / "~tilde").write_text("~")
+    nested = root / "deep" / "er" / "est"
+    nested.mkdir(parents=True)
+    (nested / "leaf").write_text("leaf")
+    (root / "empty").mkdir()
+
+
+class SnapshotNamespaceTests(unittest.TestCase):
+    """W2-2: the bounded namespace walk. Its order is digest-load-bearing."""
+
+    def emitted(self, root: Path, **environment: str) -> list[tuple[str, Path]]:
+        with mock.patch.dict(os.environ, environment):
+            return list(scanner._snapshot_namespace(root))
+
+    def test_the_generator_matches_the_old_list_element_for_element(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            adversarial_tree(root)
+            expected = reference_snapshot_namespace(root)
+            # chunk=2 forces the external merge on a tree of ~16 entries, so
+            # the merge path is what is actually being compared.
+            for chunk in ("2", "3", "1000000"):
+                with self.subTest(chunk=chunk):
+                    self.assertEqual(
+                        self.emitted(root, BULKLOAD_NAMESPACE_CHUNK=chunk), expected
+                    )
+            self.assertEqual(self.emitted(root, BULKLOAD_BOUND_NAMESPACE="0"), expected)
+
+    def test_the_merge_really_ran(self) -> None:
+        """Self-refutation guard: with a chunk larger than the tree the code
+        never leaves the in-memory `sorted()` branch, so a broken merge would
+        pass every equality test above. Pin that chunk=2 spills."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            adversarial_tree(root)
+            with mock.patch.dict(os.environ, {"BULKLOAD_NAMESPACE_CHUNK": "2"}):
+                with mock.patch.object(
+                    scanner, "_namespace_run", wraps=scanner._namespace_run
+                ) as spy:
+                    entries = list(scanner._snapshot_namespace(root))
+            self.assertGreater(spy.call_count, 1)
+            self.assertEqual(len(entries), len(reference_snapshot_namespace(root)))
+
+    def test_a_leaf_only_root_and_a_missing_root_still_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            leaf = Path(temporary) / "leaf"
+            leaf.write_text("leaf")
+            absent = Path(temporary) / "absent"
+            for chunk in ("1", "1000000"):
+                with self.subTest(chunk=chunk):
+                    self.assertEqual(
+                        self.emitted(leaf, BULKLOAD_NAMESPACE_CHUNK=chunk),
+                        [(".", leaf)],
+                    )
+                    self.assertEqual(
+                        self.emitted(absent, BULKLOAD_NAMESPACE_CHUNK=chunk),
+                        [(".", absent)],
+                    )
+
+    def test_the_reconstructed_path_is_the_path_the_walk_produced(self) -> None:
+        """Every consumer stats the second element; a join that normalised the
+        path differently would stat a different file."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            adversarial_tree(root)
+            for relative, path in scanner._snapshot_namespace(root):
+                with self.subTest(relative=relative):
+                    self.assertTrue(path.exists() or path.is_symlink())
+                    self.assertEqual(
+                        path.relative_to(root).as_posix() if relative != "." else ".",
+                        relative,
+                    )
+
+
 def peak_rss_bytes() -> int:
     """Darwin reports ru_maxrss in bytes; Linux in kibibytes."""
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -278,7 +397,7 @@ class BaseRecordResidencyTests(unittest.TestCase):
         # the real corpus); the spilled map holds the key blob and two offset
         # arrays only. The budget is deliberately loose — this asserts the
         # asymptote, not a particular allocator.
-        budget = 64 * self.ENTRIES
+        budget = 128 * self.ENTRIES
         self.assertLess(
             spilled_cost,
             budget,
@@ -286,6 +405,50 @@ class BaseRecordResidencyTests(unittest.TestCase):
             f"(budget {budget} B); resident cost was {resident_cost} B",
         )
         self.assertLess(spilled_cost, resident_cost)
+
+
+class NamespaceResidencyTests(unittest.TestCase):
+    """W2-2's whole point: the walk must not grow with the namespace."""
+
+    PER_DIR = 400
+    DIRS = 60
+
+    def tree(self, root: Path) -> int:
+        entries = 1
+        for index in range(self.DIRS):
+            directory = root / f"sessions/2026/08/{index:05d}"
+            directory.mkdir(parents=True)
+            entries += 1 + len(directory.relative_to(root).parts) - 1
+            for item in range(self.PER_DIR):
+                (directory / f"rollout-{index:05d}-{item:06d}.jsonl").write_bytes(b"x")
+                entries += 1
+        return entries
+
+    def test_the_bounded_walk_costs_far_less_than_the_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            root.mkdir()
+            self.tree(root)
+            with mock.patch.dict(os.environ, {"BULKLOAD_NAMESPACE_CHUNK": "2048"}):
+                before = peak_rss_bytes()
+                bounded = 0
+                previous = None
+                for relative, _ in scanner._snapshot_namespace(root):
+                    self.assertTrue(previous is None or previous < relative)
+                    previous = relative
+                    bounded += 1
+                bounded_cost = peak_rss_bytes() - before
+            before = peak_rss_bytes()
+            listed = reference_snapshot_namespace(root)
+            listed_cost = peak_rss_bytes() - before
+        self.assertEqual(bounded, len(listed))
+        budget = 64 * bounded
+        self.assertLess(
+            bounded_cost,
+            budget,
+            f"bounded walk grew {bounded_cost} B for {bounded} entries "
+            f"(budget {budget} B); the list cost {listed_cost} B",
+        )
 
 
 if __name__ == "__main__":

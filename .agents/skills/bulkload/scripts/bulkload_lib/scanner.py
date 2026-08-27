@@ -7,6 +7,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -59,6 +60,12 @@ MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
 BASE_CUSTODY_MODES = ("full", "sealed")
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
+# Chosen to minimise resident bytes: one chunk of N strings costs ~130 B each
+# while the merge costs one read block per run, so the total is smallest near
+# sqrt(entries * block / 130). At 65_536 a 1.8 M-entry root holds ~8.5 MB of
+# chunk and ~7 MB of merge blocks instead of ~1 GB of list.
+NAMESPACE_SORT_CHUNK = 65_536
+NAMESPACE_RUN_BLOCK_BYTES = 256 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
@@ -2527,29 +2534,108 @@ def _snapshot_delta_charge(
     return charged
 
 
-def _snapshot_namespace(root: Path) -> list[tuple[str, Path]]:
-    observed: list[tuple[str, Path]] = [(".", root)]
+def _namespace_entries(root: Path) -> Iterable[str]:
+    """Every relative in the root's namespace, in walk order, one at a time."""
+    yield "."
     if root.is_dir():
         for current, directories, files in os.walk(
             root, topdown=True, followlinks=False
         ):
+            # The global sort below subsumes this, but a deterministic descent
+            # keeps two walks of the same tree racing the same way.
             directories[:] = sorted(directories)
             current_path = Path(current)
-            observed.extend(
-                (
-                    (current_path / name).relative_to(root).as_posix(),
-                    current_path / name,
-                )
-                for name in directories
-            )
-            observed.extend(
-                (
-                    (current_path / name).relative_to(root).as_posix(),
-                    current_path / name,
-                )
-                for name in sorted(files)
-            )
-    return sorted(observed)
+            for name in directories:
+                yield (current_path / name).relative_to(root).as_posix()
+            for name in sorted(files):
+                yield (current_path / name).relative_to(root).as_posix()
+
+
+def _namespace_run(values: list[str], spill_dir: str | None) -> Any:
+    """One sorted run, NUL-delimited, in a file that has no name."""
+    handle = tempfile.TemporaryFile(  # noqa: SIM115 — closed by the merge's finally
+        dir=spill_dir, buffering=NAMESPACE_RUN_BLOCK_BYTES
+    )
+    handle.write(b"\0".join(item.encode("utf-8", "surrogatepass") for item in values))
+    handle.seek(0)
+    return handle
+
+
+def _read_namespace_run(handle: Any) -> Iterable[str]:
+    """Decode one run without ever holding more than a block of it."""
+    pending = b""
+    while True:
+        block = handle.read(NAMESPACE_RUN_BLOCK_BYTES)
+        if not block:
+            break
+        pending += block
+        parts = pending.split(b"\0")
+        pending = parts.pop()
+        for part in parts:
+            yield part.decode("utf-8", "surrogatepass")
+    if pending:
+        yield pending.decode("utf-8", "surrogatepass")
+
+
+def _sorted_relatives(root: Path) -> Iterable[str]:
+    """`sorted()` over the namespace without a list of the namespace.
+
+    W2-2. `_snapshot_namespace` materialised the whole namespace as a list of
+    `(str, Path)` — 528-603 B per entry measured, ~1 GB on the 109 G corpus,
+    and it was built twice: once to write the index and once to re-derive the
+    namespace digest during custody validation.
+
+    Nothing needs the list. Both callers consume it in order, so this sorts
+    bounded runs and merges them. The comparison stays a Python `str`
+    comparison end to end — runs are only *stored* as UTF-8 under
+    `surrogatepass`, and every value is decoded back to `str` before it
+    reaches `heapq.merge` — so the order is exactly the `sorted(observed)`
+    order the index and `namespace_digest` were sealed in. That order is
+    digest-load-bearing, which is why the landing gate is `index_sha256`
+    equality across the lever rather than a spot check.
+
+    A namespace that fits in one chunk never touches the disk and is the
+    identical in-memory `sorted()` it always was.
+    """
+    if not _env_lever("BULKLOAD_BOUND_NAMESPACE"):
+        yield from sorted(_namespace_entries(root))
+        return
+    try:
+        chunk_size = max(1, int(os.environ.get("BULKLOAD_NAMESPACE_CHUNK", "")))
+    except ValueError:
+        chunk_size = NAMESPACE_SORT_CHUNK
+    spill_dir = os.environ.get("BULKLOAD_SPILL_DIR") or None
+    chunk: list[str] = []
+    runs: list[Any] = []
+    try:
+        for relative in _namespace_entries(root):
+            chunk.append(relative)
+            if len(chunk) >= chunk_size:
+                chunk.sort()
+                runs.append(_namespace_run(chunk, spill_dir))
+                chunk = []
+        chunk.sort()
+        if not runs:
+            yield from chunk
+            return
+        if chunk:
+            runs.append(_namespace_run(chunk, spill_dir))
+        chunk = []
+        yield from heapq.merge(*(_read_namespace_run(run) for run in runs))
+    finally:
+        for run in runs:
+            run.close()
+
+
+def _snapshot_namespace(root: Path) -> Iterable[tuple[str, Path]]:
+    """The sealed namespace, in sealed order, one entry at a time.
+
+    `root / relative` reconstructs exactly the `current_path / name` the old
+    list carried: `relative` is that path's `relative_to(root).as_posix()`, so
+    the join round-trips.
+    """
+    for relative in _sorted_relatives(root):
+        yield relative, (root if relative == "." else root / relative)
 
 
 def _write_snapshot_index(
