@@ -129,7 +129,10 @@ The stage protocol is destination `prepare`, source `push`, destination
 on Sting, with the source and destination GNU rsync paths and hashes bound in
 that plan; rehash the source executable before transport, require the destination's
 immutable Nix-store path, and let destination `prepare` rehash it locally. Use
-`--checksum --delay-updates`, strict SSH, and exact owner-private paths. Every
+`--delay-updates`, strict SSH, and exact owner-private paths. The push relies on
+rsync's size+mtime quick check because the destination independently re-derives
+every transported digest before those bytes gain apply authority; pass
+`--transport-checksum` only to make the transport itself fail earlier. Every
 connection originates on Neo: Neo may pull destination A/B captures and the
 prepare receipt over that connection, but Sting never authenticates to Neo.
 

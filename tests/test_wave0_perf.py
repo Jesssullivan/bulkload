@@ -11,10 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from unittest import mock
 
+from bulkload_lib.cli import _agent_stage, build_parser
+from bulkload_lib import executor
+from bulkload_lib.executor import push_agent_transport, stage_agent_plan
 from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
 from bulkload_lib import scanner
 from bulkload_lib.scanner import (
@@ -322,6 +326,103 @@ class DeferredAppendDigestTests(unittest.TestCase):
             self.assertEqual(
                 record["sha256"], hashlib.sha256(auth.read_bytes()).hexdigest()
             )
+
+
+FAKE_SSH = """#!/usr/bin/env python3
+import os
+import shlex
+import sys
+
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("-o"):
+    arguments.pop(0)
+if arguments and arguments[0] == "--":
+    arguments.pop(0)
+if not arguments:
+    raise SystemExit(90)
+arguments.pop(0)
+if len(arguments) == 1:
+    arguments = shlex.split(arguments[0])
+os.execv(arguments[0], arguments)
+"""
+
+
+class TransportChecksumTests(unittest.TestCase):
+    """W0-4: rsync --checksum is opt-in, not the transport default."""
+
+    def push_argv(self, *, transport_checksum: bool) -> list[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            plan = fixture.plan()
+            fake_ssh = fixture.root / "fake-ssh"
+            fake_ssh.write_text(FAKE_SSH, encoding="utf-8")
+            fake_ssh.chmod(0o700)
+            prepare = stage_agent_plan(
+                plan,
+                accepted_plan_sha256=plan["plan_sha256"],
+                phase="preseed",
+                stage_root=fixture.stage,
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+            )
+            recorded: list[list[str]] = []
+            real = executor.subprocess.run
+
+            def recording(argv, **keywords):
+                recorded.append([str(item) for item in argv])
+                return real(argv, **keywords)
+
+            with mock.patch.object(executor.subprocess, "run", side_effect=recording):
+                push_agent_transport(
+                    prepare,
+                    fixture.stage / ".transport-allowlist-preseed.nul",
+                    accepted_plan_sha256=plan["plan_sha256"],
+                    phase="preseed",
+                    stage_root=fixture.stage,
+                    destination_ssh_host=socket.gethostname(),
+                    transport_checksum=transport_checksum,
+                    _ssh_binary=str(fake_ssh),
+                )
+            payload = [argv for argv in recorded if "--files-from=-" in argv]
+            self.assertEqual(len(payload), 1)
+            return payload[0]
+
+    def test_payload_push_omits_checksum_by_default(self) -> None:
+        argv = self.push_argv(transport_checksum=False)
+        self.assertNotIn("--checksum", argv)
+        self.assertIn("--delay-updates", argv)
+        self.assertIn("-a", argv)
+
+    def test_transport_checksum_flag_restores_the_whole_file_pass(self) -> None:
+        argv = self.push_argv(transport_checksum=True)
+        self.assertIn("--checksum", argv)
+        self.assertLess(argv.index("--checksum"), argv.index("--delay-updates"))
+
+    def test_parser_default_is_off_and_the_flag_is_push_only(self) -> None:
+        base = [
+            "agent-stage",
+            "--phase",
+            "preseed",
+            "--accept-plan-sha256",
+            "0" * 64,
+            "--stage-root",
+            "/tmp/stage",
+            "--output",
+            "-",
+        ]
+        parser = build_parser()
+        self.assertFalse(parser.parse_args(base).transport_checksum)
+        self.assertTrue(
+            parser.parse_args([*base, "--transport-checksum"]).transport_checksum
+        )
+        arguments = parser.parse_args(
+            [*base, "--transport-checksum", "--plan", "/tmp/plan.json"]
+        )
+        with self.assertRaisesRegex(
+            BulkloadError, "transport checksum applies only to the push transport"
+        ):
+            _agent_stage(arguments)
 
 
 if __name__ == "__main__":
