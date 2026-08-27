@@ -94,7 +94,9 @@ def _pin_sources(root: Path) -> dict[str, tuple[Path, bytes, bool]]:
             + "}"
         ).encode()
     ).hexdigest()
-    os.environ["BULKLOAD_RUNTIME_SOURCE_SHA256"] = closure
+    # Honor an externally pinned closure (operator break-glass for a
+    # verify-side engine fix mid-ceremony); otherwise bind the computed one.
+    os.environ.setdefault("BULKLOAD_RUNTIME_SOURCE_SHA256", closure)
     return modules
 
 
