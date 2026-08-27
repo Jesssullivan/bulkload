@@ -59,6 +59,10 @@ scripts/bulkload.py agent-capture \
 
 Repeat into `source-b.json` with
 `--snapshot-base-seal /secure/evidence/.source-a.json.snapshot/snapshot-seal.json`.
+That base is admitted with `--base-custody full` by default, which re-hashes
+every byte of A while capturing B. `--base-custody sealed` admits it on A's
+already-verified seal digest, index digest, and namespace digest instead, and
+still re-derives the git root and every SQLite payload byte for byte.
 On the destination,
 use `--role destination`, the live destination `--home` and `--git-root`, and
 the same source-to-destination path maps. Repeat into two destination files.

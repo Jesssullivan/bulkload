@@ -56,6 +56,7 @@ DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
+BASE_CUSTODY_MODES = ("full", "sealed")
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
@@ -2608,8 +2609,21 @@ def validate_snapshot_custody(
     mirror: Path | None = None,
     required_paths: set[Path] | None = None,
     collect_records: bool = False,
+    payload_custody: str = "full",
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Reopen a seal/index and either all payloads or an explicit stage subset."""
+    """Reopen a seal/index and either all payloads or an explicit stage subset.
+
+    `payload_custody` narrows only the per-payload re-derivation, and only for
+    an already-sealed base. It is a separate knob from `required_paths`, which
+    also disables the snapshot root's 0o700 check, the top-level namespace
+    check, the declared-roots equality and the namespace digest — the
+    anti-planting perimeter. Under "sealed" that whole perimeter stays on, and
+    so does the read-back of the index file itself.
+    """
+    if payload_custody not in BASE_CUSTODY_MODES:
+        raise BulkloadError("snapshot payload custody mode is unsupported")
+    if payload_custody != "full" and required_paths is not None:
+        raise BulkloadError("sealed payload custody cannot subset required paths")
 
     def actual(raw: str) -> Path:
         path = Path(raw)
@@ -2650,6 +2664,24 @@ def validate_snapshot_custody(
         if required_paths is None
         else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
     )
+    # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
+    # not from the snapshot copy, so nothing anywhere ever compares the git
+    # snapshot copy's bytes to the live git tree. This re-derivation is the only
+    # thing that holds the git payload to its seal, and it runs under every
+    # custody mode. SQLite payloads are always re-derived too: a seal cannot
+    # carry WAL-blind freshness.
+    always_roots: set[int] = set()
+    always_relatives: dict[int, set[str]] = {}
+    for root_index, root in enumerate(snapshot["roots"]):
+        if root["label"] == "git":
+            always_roots.add(root_index)
+            continue
+        relatives: set[str] = set()
+        for entry in root["sqlite"]:
+            relative_path = entry["relative_path"]
+            relatives.add(relative_path)
+            relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
+        always_relatives[root_index] = relatives
     seen: set[Path] = set()
     collected: dict[tuple[str, str], dict[str, Any]] = {}
     digest = hashlib.sha256()
@@ -2713,20 +2745,25 @@ def validate_snapshot_custody(
                         record
                     )
                 if required is None or original_path in required:
-                    observed = _snapshot_index_record(
-                        path,
-                        root_index=root_index,
-                        relative=relative,
-                        transfer={
-                            "destination_device": record["destination_device"],
-                            "method": record["method"],
-                            "source_device": record["source_device"],
-                        },
-                    )
-                    if observed != record:
-                        raise BulkloadError(
-                            "snapshot payload differs from sealed index"
+                    if (
+                        payload_custody == "full"
+                        or root_index in always_roots
+                        or relative in always_relatives.get(root_index, frozenset())
+                    ):
+                        observed = _snapshot_index_record(
+                            path,
+                            root_index=root_index,
+                            relative=relative,
+                            transfer={
+                                "destination_device": record["destination_device"],
+                                "method": record["method"],
+                                "source_device": record["source_device"],
+                            },
                         )
+                        if observed != record:
+                            raise BulkloadError(
+                                "snapshot payload differs from sealed index"
+                            )
                     seen.add(original_path)
                 count += 1
     except OSError as error:
@@ -3169,6 +3206,7 @@ def _capture_live_snapshot(
     snapshot_reserve_bytes: int,
     snapshot_base_seal: Path | None,
     jobs: int | None = None,
+    base_custody: str = "full",
 ) -> dict[str, Any]:
     snapshot_id = new_id()
     snapshot_root = Path(os.path.abspath(os.fspath(snapshot_root)))
@@ -3299,7 +3337,11 @@ def _capture_live_snapshot(
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
         with phase_timing("base-custody"):
-            base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
+            base_index = validate_snapshot_custody(
+                base_snapshot,
+                collect_records=True,
+                payload_custody=base_custody,
+            )
         records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for (label, relative), record in base_index.items():
             records_by_label[label][relative] = record
@@ -3562,11 +3604,16 @@ def capture_agent_state(
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
     snapshot_reserve_bytes: int = SNAPSHOT_RESERVE_BYTES,
     jobs: int | None = None,
+    base_custody: str = "full",
 ) -> dict[str, Any]:
     if role not in {"source", "destination"}:
         raise BulkloadError("capture role must be source or destination")
     if jobs is not None and not 1 <= jobs <= MAX_CAPTURE_JOBS:
         raise BulkloadError("capture job count is out of range")
+    if base_custody not in BASE_CUSTODY_MODES:
+        raise BulkloadError("snapshot base custody mode is unsupported")
+    if base_custody != "full" and snapshot_base_seal is None:
+        raise BulkloadError("snapshot base custody mode requires a base seal")
     if not writers_quiesced and snapshot_root is not None:
         return _capture_live_snapshot(
             role=role,
@@ -3586,6 +3633,7 @@ def capture_agent_state(
             snapshot_reserve_bytes=snapshot_reserve_bytes,
             snapshot_base_seal=snapshot_base_seal,
             jobs=jobs,
+            base_custody=base_custody,
         )
     if not writers_quiesced and snapshot_root is None:
         raise BulkloadError(
