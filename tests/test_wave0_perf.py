@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from bulkload_lib import cli
 from bulkload_lib.cli import _agent_stage, build_parser
 from bulkload_lib import executor
 from bulkload_lib.executor import push_agent_transport, stage_agent_plan
@@ -609,6 +610,62 @@ class PhaseTimingAndJobsTests(unittest.TestCase):
                 quiet["git_generation_sha256"], loud["git_generation_sha256"]
             )
             self.assertEqual(quiet["index_sha256"], loud["index_sha256"])
+
+
+class EvidenceMemoryGateTests(unittest.TestCase):
+    """S6': the release step must not hard-abort where memory is unmeasurable."""
+
+    LARGE = cli.LARGE_PLAN_THRESHOLD_BYTES + 1
+
+    def test_small_evidence_never_probes_memory(self) -> None:
+        with mock.patch.object(cli, "_available_memory") as probe:
+            cli._require_large_evidence_memory(cli.LARGE_PLAN_THRESHOLD_BYTES)
+        probe.assert_not_called()
+
+    def test_unmeasurable_memory_does_not_abort(self) -> None:
+        with (
+            mock.patch.object(cli, "_proc_meminfo_available", return_value=None),
+            mock.patch.object(cli, "_sysconf_available", return_value=None),
+        ):
+            self.assertIsNone(cli._available_memory())
+            cli._require_large_evidence_memory(self.LARGE)
+
+    def test_absent_proc_meminfo_reports_unmeasurable(self) -> None:
+        if Path("/proc/meminfo").exists():
+            self.skipTest("/proc/meminfo exists on this host")
+        self.assertIsNone(cli._proc_meminfo_available())
+
+    def test_a_real_shortfall_still_aborts(self) -> None:
+        with mock.patch.object(cli, "_available_memory", return_value=1):
+            with self.assertRaisesRegex(
+                BulkloadError, "below the bounded Bulkload evidence gate"
+            ):
+                cli._require_large_evidence_memory(self.LARGE)
+
+    def test_the_multiplier_is_still_four(self) -> None:
+        size = self.LARGE
+        with mock.patch.object(
+            cli, "_available_memory", return_value=size * 4 + 2 * 1024**3
+        ):
+            cli._require_large_evidence_memory(size)
+        with mock.patch.object(
+            cli, "_available_memory", return_value=size * 4 + 2 * 1024**3 - 1
+        ):
+            with self.assertRaises(BulkloadError):
+                cli._require_large_evidence_memory(size)
+
+    def test_the_planning_gate_shares_the_portable_probe(self) -> None:
+        with mock.patch.object(cli, "_available_memory", return_value=1):
+            with self.assertRaisesRegex(
+                BulkloadError, "below the bounded AgentPlanV4 planning gate"
+            ):
+                cli._require_large_evidence_memory(
+                    self.LARGE,
+                    message=(
+                        "destination memory is below the bounded AgentPlanV4 "
+                        "planning gate"
+                    ),
+                )
 
 
 if __name__ == "__main__":

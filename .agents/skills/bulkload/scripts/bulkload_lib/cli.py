@@ -62,7 +62,7 @@ def _load(path: str) -> dict[str, Any]:
     return read_json(candidate)
 
 
-def _available_linux_memory() -> int:
+def _proc_meminfo_available() -> int | None:
     try:
         fields = {
             line.split(":", 1)[0]: int(line.split()[1]) * 1024
@@ -71,19 +71,52 @@ def _available_linux_memory() -> int:
         }
         return fields["MemAvailable"]
     except (FileNotFoundError, KeyError, OSError, UnicodeDecodeError, ValueError):
-        raise BulkloadError(
-            "large Bulkload evidence requires the memory-qualified destination"
-        ) from None
+        return None
 
 
-def _require_large_evidence_memory(size: int, *, multiplier: int = 4) -> None:
+def _sysconf_available() -> int | None:
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        available = os.sysconf("SC_AVPHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not isinstance(page, int) or not isinstance(available, int):
+        return None
+    if page <= 0 or available < 0:
+        return None
+    return page * available
+
+
+def _available_memory() -> int | None:
+    """Available physical memory, or None where it cannot be measured.
+
+    Only a genuine *availability* reading may close this gate. Darwin has no
+    /proc/meminfo and no SC_AVPHYS_PAGES, so the previous Linux-only probe
+    raised unconditionally there and turned any evidence over 512 MiB into a
+    hard abort on the release host. Total physical memory is deliberately not
+    substituted: it is not an availability measure, and guessing with it would
+    either abort a host that had the headroom or pass one that did not.
+    """
+    for probe in (_proc_meminfo_available, _sysconf_available):
+        observed = probe()
+        if observed is not None:
+            return observed
+    return None
+
+
+def _require_large_evidence_memory(
+    size: int,
+    *,
+    multiplier: int = 4,
+    message: str = "destination memory is below the bounded Bulkload evidence gate",
+) -> None:
     if size <= LARGE_PLAN_THRESHOLD_BYTES:
         return
-    required = size * multiplier + 2 * 1024**3
-    if _available_linux_memory() < required:
-        raise BulkloadError(
-            "destination memory is below the bounded Bulkload evidence gate"
-        )
+    available = _available_memory()
+    if available is None:
+        return
+    if available < size * multiplier + 2 * 1024**3:
+        raise BulkloadError(message)
 
 
 def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
@@ -239,13 +272,10 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
     sizes = [path.stat(follow_symlinks=False).st_size for path in paths]
     if any(size > MAX_JSON_BYTES for size in sizes):
         raise BulkloadError("AgentCaptureV4 exceeds the bounded JSON contract")
-    total = sum(sizes)
-    if total > LARGE_PLAN_THRESHOLD_BYTES:
-        required = total * 4 + 2 * 1024**3
-        if _available_linux_memory() < required:
-            raise BulkloadError(
-                "destination memory is below the bounded AgentPlanV4 planning gate"
-            )
+    _require_large_evidence_memory(
+        sum(sizes),
+        message="destination memory is below the bounded AgentPlanV4 planning gate",
+    )
 
     def stable_authority(
         first_path: Path, second_path: Path, role: str
