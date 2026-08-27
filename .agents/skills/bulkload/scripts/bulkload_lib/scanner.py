@@ -1344,9 +1344,14 @@ def _jsonl_records(
     path: Path, *, replacements: Sequence[tuple[bytes, bytes]] = ()
 ) -> dict[str, Any]:
     hashes: list[str] = []
-    transformed_hashes: list[str] = []
     hasher = hashlib.sha256()
-    transformed_hasher = hashlib.sha256()
+    # While every transformed line is byte-identical to its original, the
+    # translated stream *is* the original stream: no second parse, no second
+    # per-line hash and no second list of 64-character digests. Both lazily
+    # fork on the first line a replacement actually rewrites, so a partially
+    # rewritten file still produces exactly the values it produced before.
+    transformed_hashes: list[str] | None = None
+    transformed_hasher: Any = None
     try:
         with path.open("rb") as stream:
             for line in stream:
@@ -1363,12 +1368,26 @@ def _jsonl_records(
                 transformed = line
                 for source, destination in replacements:
                     transformed = transformed.replace(source, destination)
+                if transformed == line:
+                    # The rewrite is a no-op on this line, so the second
+                    # json.loads would re-parse bytes that just parsed and the
+                    # second sha256 would re-hash bytes that just hashed.
+                    digest = sha256_bytes(line)
+                    hashes.append(digest)
+                    hasher.update(line)
+                    if transformed_hashes is not None:
+                        transformed_hashes.append(digest)
+                        transformed_hasher.update(line)
+                    continue
                 try:
                     json.loads(transformed)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise BulkloadError(
                         "path rewriting produced invalid JSONL"
                     ) from error
+                if transformed_hashes is None:
+                    transformed_hashes = list(hashes)
+                    transformed_hasher = hasher.copy()
                 hashes.append(sha256_bytes(line))
                 transformed_hashes.append(sha256_bytes(transformed))
                 hasher.update(line)
@@ -1379,8 +1398,14 @@ def _jsonl_records(
         "records": hashes,
         "records_sha256": sha256_bytes(canonical_bytes(hashes)),
         "sha256": hasher.hexdigest(),
-        "translated_records": transformed_hashes,
-        "translated_sha256": transformed_hasher.hexdigest(),
+        "translated_records": hashes
+        if transformed_hashes is None
+        else (transformed_hashes),
+        "translated_sha256": (
+            hasher.hexdigest()
+            if transformed_hasher is None
+            else transformed_hasher.hexdigest()
+        ),
     }
 
 
