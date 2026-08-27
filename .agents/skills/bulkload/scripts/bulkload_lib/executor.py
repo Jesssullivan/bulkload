@@ -32,6 +32,7 @@ from .model import (
     canonical_bytes,
     durable_makedirs,
     fsync_directory,
+    git_environment,
     new_id,
     read_json,
     reflink_clone,
@@ -127,31 +128,13 @@ def _read_apply_journal(path: Path) -> dict[str, Any]:
     return journal
 
 
-def _git_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "LC_ALL": "C",
-        }
-    )
-    return environment
-
-
 def _git(repository: Path, arguments: Sequence[str], *, check: bool = True) -> bytes:
     result = subprocess.run(
         ["git", "-C", os.fspath(repository), *arguments],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=_git_environment(),
+        env=git_environment(),
     )
     if check and result.returncode != 0:
         raise BulkloadError(
@@ -1813,7 +1796,7 @@ def _ensure_git_workspace(
             ["git", *arguments],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=git_environment(),
         )
         if result.returncode != 0:
             raise BulkloadError("cannot initialize destination Git workspace")

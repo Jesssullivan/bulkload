@@ -14,6 +14,7 @@ Each slice here carries two kinds of test:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from bulkload_lib import scanner
+from bulkload_lib import model, scanner
 from bulkload_lib.model import BulkloadError, canonical_bytes
 
 from test_bulkload import CutoverFixture
@@ -449,6 +450,110 @@ class NamespaceResidencyTests(unittest.TestCase):
             f"bounded walk grew {bounded_cost} B for {bounded} entries "
             f"(budget {budget} B); the list cost {listed_cost} B",
         )
+
+
+class ReductivePurgeTests(unittest.TestCase):
+    """W2-4: the pure-LOC purge. Zero minutes, zero bytes, zero behaviour."""
+
+    LIB = Path(scanner.__file__).parent
+
+    def private_defs(self) -> dict[str, str]:
+        modules = sorted(self.LIB.glob("*.py"))
+        defined: dict[str, str] = {}
+        used: set[str] = set()
+        for module in modules:
+            tree = ast.parse(module.read_text())
+            for node in tree.body:
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ) and node.name.startswith("_"):
+                    if not node.name.startswith("__"):
+                        defined[node.name] = module.name
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    used.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    used.add(node.attr)
+                elif isinstance(node, ast.ImportFrom):
+                    used.update(alias.name for alias in node.names)
+        return {name: where for name, where in defined.items() if name not in used}
+
+    def test_no_private_helper_in_the_engine_is_unreferenced(self) -> None:
+        """The guard that found `_worktree_at`, kept so it finds the next one.
+
+        Deleting a function because it "looks unused" is how a fence goes
+        missing. This is the check that has to be green *before* a deletion,
+        and it is the check that would have gone red if `_worktree_at` had
+        still had a caller.
+        """
+        self.assertEqual(self.private_defs(), {})
+
+    def test_the_prune_rule_has_exactly_one_definition(self) -> None:
+        source = "".join((self.LIB / "scanner.py").read_text().split())
+        # `_is_excluded` and `_is_regenerate_namespace` are now reached only
+        # through `_is_pruned` and through their own definitions.
+        self.assertEqual(source.count("_is_excluded("), 2)
+        self.assertEqual(source.count("_is_regenerate_namespace("), 2)
+        self.assertEqual(source.count("_is_pruned("), 9)
+
+    def test_the_two_capture_provider_sites_keep_their_unguarded_form(self) -> None:
+        """The asymmetry the collapse must not erase.
+
+        Six sites guard the prune with `provider is not None`; the two inside
+        `_capture_provider` do not. Folding the guard into `_is_pruned` would
+        change `_capture_provider` for a None provider, so the call sites keep
+        the difference.
+        """
+        # Whitespace-normalised so a reformat cannot silently pass this.
+        source = "".join((self.LIB / "scanner.py").read_text().split())
+        self.assertEqual(
+            source.count("ifproviderisnotNoneand_is_pruned(provider,relative,"), 6
+        )
+        self.assertEqual(source.count("if_is_pruned(provider,relative,"), 2)
+
+    def test_git_environment_is_defined_once(self) -> None:
+        for name in ("scanner.py", "executor.py"):
+            with self.subTest(module=name):
+                self.assertNotIn("def _git_environment", (self.LIB / name).read_text())
+        self.assertEqual(
+            model.git_environment(),
+            {
+                **{
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("GIT_")
+                    and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+                },
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "LC_ALL": "C",
+            },
+        )
+
+    def test_the_purge_left_every_sealed_digest_alone(self) -> None:
+        """A prune-rule collapse changes which entries a census visits, so it
+        changes `generation_sha256` and `index_sha256` if it is wrong. The
+        fixture carries an excluded path, a regenerate namespace, a live-sqlite
+        primary with its sidecars, a symlink and a nested tree — every prune
+        rule at once, including the sqlite-sidecar skip that is deliberately
+        *not* folded into `_is_pruned`."""
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            labels = {root["label"] for root in snapshot["roots"]}
+            self.assertIn("git", labels)
+            # Nothing pruned may appear in the sealed index.
+            index = Path(snapshot["index_path"]).read_text().splitlines()
+            self.assertEqual(len(index), snapshot["index_entries"])
+            for line in index:
+                record = json.loads(line)
+                self.assertNotIn(".tmp", Path(record["relative_path"]).parts)
+            # And the fence that reads it back still passes.
+            scanner.validate_snapshot_custody(snapshot)
+            scanner.validate_live_snapshot_generation(snapshot, passes=1)
 
 
 if __name__ == "__main__":

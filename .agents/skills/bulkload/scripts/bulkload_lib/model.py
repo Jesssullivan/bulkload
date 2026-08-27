@@ -310,6 +310,29 @@ def translate_path(path: str | Path, path_map: Iterable[dict[str, str]]) -> str:
     return os.fspath(destination / relative)
 
 
+def git_environment() -> dict[str, str]:
+    """One git invocation environment for both the scanner and the executor.
+
+    It was spelled out byte-identically in each; a second copy of a subprocess
+    environment is a place for the two to drift apart silently.
+    """
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
 def assert_no_overlap(path: Path, protected: Iterable[Path], label: str) -> None:
     candidate = Path(os.path.realpath(os.path.abspath(os.fspath(path.expanduser()))))
     for raw in protected:
