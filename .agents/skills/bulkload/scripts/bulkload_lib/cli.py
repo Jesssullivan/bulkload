@@ -324,7 +324,10 @@ def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
             phase=arguments.phase,
             stage_root=Path(arguments.stage_root),
             destination_ssh_host=arguments.destination_ssh_host,
+            transport_checksum=arguments.transport_checksum,
         )
+    if arguments.transport_checksum:
+        raise BulkloadError("transport checksum applies only to the push transport")
     if arguments.plan is None or arguments.transport_allowlist is not None:
         raise BulkloadError(
             "plan staging requires a plan and forbids a transport allowlist"
@@ -449,6 +452,15 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--prepare-receipt")
     stage.add_argument("--transport-allowlist")
     stage.add_argument("--transport-receipt")
+    stage.add_argument(
+        "--transport-checksum",
+        action="store_true",
+        help=(
+            "push with rsync --checksum. The destination re-derives every "
+            "transported digest regardless; this only makes the transport "
+            "itself fail earlier, at the cost of a second full read."
+        ),
+    )
     stage.add_argument(
         "--capacity-reserve-bytes", type=int, default=DEFAULT_CAPACITY_RESERVE_BYTES
     )

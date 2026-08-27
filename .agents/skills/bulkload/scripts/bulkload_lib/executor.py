@@ -468,6 +468,7 @@ def push_agent_transport(
     phase: str,
     stage_root: Path,
     destination_ssh_host: str,
+    transport_checksum: bool = False,
     _ssh_binary: str | None = None,
 ) -> dict[str, Any]:
     validate_stage_receipt(prepare_receipt)
@@ -519,13 +520,22 @@ def push_agent_transport(
             expected_size=transport_authority["allowlist_size"],
             expected_sha256=transport_authority["allowlist_sha256"],
         )
+        # The payload push does not carry the custody proof. Every transported
+        # byte is re-derived on the destination before it can gain apply
+        # authority: validate_snapshot_custody re-hashes the transported index
+        # and every required payload out of the quarantine mirror, reflink_clone
+        # and _publish_object re-verify each staged object, and agent-verify
+        # re-hashes the whole sealed stage. rsync's own whole-file checksum pass
+        # is therefore a second full read of the corpus that proves nothing the
+        # destination does not prove independently. --transport-checksum
+        # restores it for an operator who wants the transport to fail earlier.
         result = subprocess.run(
             [
                 source_binding["path"],
                 "-a",
                 "--from0",
                 "--files-from=-",
-                "--checksum",
+                *(("--checksum",) if transport_checksum else ()),
                 "--delay-updates",
                 "--ignore-missing-args",
                 "--no-devices",
