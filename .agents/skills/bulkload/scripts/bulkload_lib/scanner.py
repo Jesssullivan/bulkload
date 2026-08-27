@@ -385,13 +385,26 @@ def _portable_symlink(root: Path, path: Path) -> bool:
     return _portable_symlink_destination(root, path) is not None
 
 
-def _file_record(path: Path, relative: str, *, classification: str) -> dict[str, Any]:
+def _file_record(
+    path: Path,
+    relative: str,
+    *,
+    classification: str,
+    deferred_digest: bool = False,
+) -> dict[str, Any]:
+    """Describe one captured entry.
+
+    `deferred_digest` is only ever set by a caller that overwrites `sha256`
+    from a second, authoritative read of the same bytes. It suppresses the
+    whole-file hash here so those bytes are read once instead of twice; every
+    other field, including the `_stable_stat` fence, is unaffected.
+    """
     normalized = normalize_relative(relative)
     before = _stable_stat(path)
     file_type = before[2]
     mode = f"{before[3]:04o}"
     if file_type == stat.S_IFREG:
-        digest = sha256_file(path)
+        digest = None if deferred_digest else sha256_file(path)
         size = before[5]
         kind = "regular"
     elif file_type == stat.S_IFLNK:
@@ -1741,12 +1754,19 @@ def _capture_provider(
             blockers.append(
                 {"code": "insecure-auth-mode", "path": f"{provider}:{relative}"}
             )
-        record = _file_record(path, relative, classification=classification)
-        identity = (
-            _session_identity(relative, path)
-            if classification.startswith("append-jsonl")
-            else relative
+        append_jsonl = classification.startswith("append-jsonl")
+        # Both arms of the append-jsonl branch below replace `sha256`: the
+        # normal one from _jsonl_records' own streaming hash of the same
+        # bytes, the _MalformedAppendState one by rebuilding the record from
+        # scratch. Hashing the whole file here as well was a second full read
+        # of the entire session corpus whose result was always discarded.
+        record = _file_record(
+            path,
+            relative,
+            classification=classification,
+            deferred_digest=append_jsonl,
         )
+        identity = _session_identity(relative, path) if append_jsonl else relative
         destination_relative = relative
         if classification.endswith("rewrite"):
             destination_relative = relative
@@ -1762,7 +1782,7 @@ def _capture_provider(
             record["destination_relative_path"] = destination_relative
         if identity != relative:
             record["identity"] = identity
-        if classification.startswith("append-jsonl"):
+        if append_jsonl:
             try:
                 append_records = _jsonl_records(
                     path,
@@ -1776,6 +1796,8 @@ def _capture_provider(
                 record.pop("identity", None)
             else:
                 record.update(append_records)
+            if record["kind"] == "regular" and record["sha256"] is None:
+                raise BulkloadError(f"append-only state lost its digest: {path}")
         elif classification.endswith("rewrite") and record["kind"] == "regular":
             payload = path.read_bytes()
             transformed = payload
