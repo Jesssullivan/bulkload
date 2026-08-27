@@ -61,12 +61,15 @@ MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
 BASE_CUSTODY_MODES = ("full", "sealed")
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
-# Chosen to minimise resident bytes: one chunk of N strings costs ~130 B each
-# while the merge costs one read block per run, so the total is smallest near
-# sqrt(entries * block / 130). At 65_536 a 1.8 M-entry root holds ~8.5 MB of
-# chunk and ~7 MB of merge blocks instead of ~1 GB of list.
+# Chosen to minimise resident bytes. One chunk of N strings costs ~130 B each;
+# the merge then costs one read block per run, and a block costs twice its size
+# because the reader splits it before yielding. So the total is smallest near
+# sqrt(entries * 2 * block / 130). At 65_536 and a 64 KiB block a 1.8 M-entry
+# root holds ~8.5 MB of chunk and ~7 MB of merge blocks instead of ~1 GB of
+# list. Undersizing the chunk is the expensive mistake, not oversizing it: it
+# trades one linear term for a quadratic one in the run count.
 NAMESPACE_SORT_CHUNK = 65_536
-NAMESPACE_RUN_BLOCK_BYTES = 256 * 1024
+NAMESPACE_RUN_BLOCK_BYTES = 64 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
@@ -2554,13 +2557,13 @@ def _read_namespace_run(handle: Any) -> Iterable[str]:
         yield pending.decode("utf-8", "surrogatepass")
 
 
-def _sorted_relatives(root: Path) -> Iterable[str]:
-    """`sorted()` over the namespace without a list of the namespace.
+def _bounded_sorted(entries: Iterable[str]) -> Iterable[str]:
+    """`sorted()` over a stream without a list of the stream.
 
     W2-2. `_snapshot_namespace` materialised the whole namespace as a list of
-    `(str, Path)` — 528-603 B per entry measured, ~1 GB on the 109 G corpus,
-    and it was built twice: once to write the index and once to re-derive the
-    namespace digest during custody validation.
+    `(str, Path)` — 206 B per entry measured, and roughly 0.9 GB on the 109 G
+    corpus. It was built twice per leg: once to write the snapshot index and
+    once to re-derive the namespace digest during custody validation.
 
     Nothing needs the list. Both callers consume it in order, so this sorts
     bounded runs and merges them. The comparison stays a Python `str`
@@ -2571,11 +2574,11 @@ def _sorted_relatives(root: Path) -> Iterable[str]:
     digest-load-bearing, which is why the landing gate is `index_sha256`
     equality across the lever rather than a spot check.
 
-    A namespace that fits in one chunk never touches the disk and is the
+    A stream that fits in one chunk never touches the disk and is the
     identical in-memory `sorted()` it always was.
     """
     if not _env_lever("BULKLOAD_BOUND_NAMESPACE"):
-        yield from sorted(_namespace_entries(root))
+        yield from sorted(entries)
         return
     try:
         chunk_size = max(1, int(os.environ.get("BULKLOAD_NAMESPACE_CHUNK", "")))
@@ -2585,7 +2588,7 @@ def _sorted_relatives(root: Path) -> Iterable[str]:
     chunk: list[str] = []
     runs: list[Any] = []
     try:
-        for relative in _namespace_entries(root):
+        for relative in entries:
             chunk.append(relative)
             if len(chunk) >= chunk_size:
                 chunk.sort()
@@ -2611,7 +2614,7 @@ def _snapshot_namespace(root: Path) -> Iterable[tuple[str, Path]]:
     list carried: `relative` is that path's `relative_to(root).as_posix()`, so
     the join round-trips.
     """
-    for relative in _sorted_relatives(root):
+    for relative in _bounded_sorted(_namespace_entries(root)):
         yield relative, (root if relative == "." else root / relative)
 
 
