@@ -15,6 +15,8 @@ Each slice here carries two kinds of test:
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -615,6 +617,81 @@ class ReductivePurgeTests(unittest.TestCase):
             # And the fence that reads it back still passes.
             scanner.validate_snapshot_custody(snapshot)
             scanner.validate_live_snapshot_generation(snapshot, passes=1)
+
+
+class WitnessEpochTests(unittest.TestCase):
+    """W2-5: observation-only, default off, and it can never fail a capture."""
+
+    def capture(self, temporary: Path, **environment: str) -> tuple[dict, str]:
+        fixture = CutoverFixture(temporary, sqlite_union=True)
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, environment):
+            with contextlib.redirect_stderr(stream):
+                capture = live_capture(fixture, "source-a")
+        return capture, stream.getvalue()
+
+    def test_it_is_off_unless_asked_for(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _, noise = self.capture(Path(temporary))
+        self.assertNotIn("bulkload-witness", noise)
+
+    def test_it_reports_and_seals_identically_when_asked_for(self) -> None:
+        with tempfile.TemporaryDirectory() as off:
+            quiet, _ = self.capture(Path(off))
+        with tempfile.TemporaryDirectory() as on:
+            loud, noise = self.capture(Path(on), BULKLOAD_WITNESS_EPOCH="1")
+        self.assertIn("bulkload-witness divergence=none", noise)
+        # Observation only: it must not touch a single sealed byte.
+        self.assertEqual(
+            ChainedCaptureDifferentialTests.evidence(quiet).keys(),
+            ChainedCaptureDifferentialTests.evidence(loud).keys(),
+        )
+        self.assertEqual(
+            quiet["catalog"]["snapshot"]["index_entries"],
+            loud["catalog"]["snapshot"]["index_entries"],
+        )
+
+    def test_a_divergent_live_tree_is_reported_and_never_raises(self) -> None:
+        """The whole contract: it observes, it does not fence.
+
+        A live write after the copy makes the real fence raise. The witness
+        must print that and let the capture finish, or a measurement lap would
+        become an outage.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            stream = io.StringIO()
+            real = scanner.validate_live_snapshot_generation
+
+            def diverge(snapshot, *, passes=2):
+                raise BulkloadError("live generation differs after snapshot")
+
+            with mock.patch.dict(os.environ, {"BULKLOAD_WITNESS_EPOCH": "1"}):
+                with mock.patch.object(
+                    scanner, "validate_live_snapshot_generation", diverge
+                ):
+                    with contextlib.redirect_stderr(stream):
+                        capture = live_capture(fixture, "source-a")
+            self.assertIn(
+                "bulkload-witness divergence=live generation", stream.getvalue()
+            )
+            self.assertIn("capture_sha256", capture)
+            # The real fence is untouched and still refuses.
+            real(capture["catalog"]["snapshot"], passes=1)
+
+    def test_the_witness_is_the_fence_the_engine_already_owns(self) -> None:
+        """Pins the KILL-1 correction.
+
+        The design asked for a `content=True` `_tree_census` compared to the
+        sealed generation. Those digests are over different tuples and can
+        never be equal, so the witness has to be the live-generation fence —
+        which also folds `sqlite_catalog` and so is not blind to sqlite.
+        """
+        source = "".join((Path(scanner.__file__)).read_text().split())
+        body = source[source.index("def_witness_epoch(") :]
+        body = body[: body.index("def_snapshot_path(")]
+        self.assertIn("validate_live_snapshot_generation(snapshot,passes=1)", body)
+        self.assertNotIn("_tree_census(", body)
 
 
 if __name__ == "__main__":
