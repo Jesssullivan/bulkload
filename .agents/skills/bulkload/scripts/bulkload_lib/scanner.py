@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -15,7 +16,9 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -52,6 +55,7 @@ DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
+MAX_CAPTURE_JOBS = 64
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
@@ -255,6 +259,57 @@ def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str
     # what allows /Users/jess to map to a destination home while the more
     # specific /Users/jess/git maps to Sting's XFS-backed fast-local root.
     return result
+
+
+class _PhaseSample:
+    """Counters a timed phase fills in while it runs."""
+
+    __slots__ = ("bytes", "files")
+
+    def __init__(self) -> None:
+        self.bytes: int | None = None
+        self.files: int | None = None
+
+
+@contextmanager
+def phase_timing(phase: str, root: str = "-") -> Iterable[_PhaseSample]:
+    """Emit one stderr timing line per phase when BULKLOAD_PHASE_TIMING=1.
+
+    Timing is diagnostic only: it never reaches an artifact, never changes a
+    digest, and is off unless the operator asks for it. The counters are read
+    at exit, so a phase sets them inside the block.
+    """
+    sample = _PhaseSample()
+    if os.environ.get("BULKLOAD_PHASE_TIMING") != "1":
+        yield sample
+        return
+    started = time.monotonic()
+    try:
+        yield sample
+    finally:
+        sys.stderr.write(
+            "bulkload-phase"
+            f" phase={phase}"
+            f" root={root}"
+            f" seconds={time.monotonic() - started:.3f}"
+            f" files={'-' if sample.files is None else sample.files}"
+            f" bytes={'-' if sample.bytes is None else sample.bytes}"
+            "\n"
+        )
+        sys.stderr.flush()
+
+
+def workspace_worker_count(jobs: int | None, pending: int) -> int:
+    """Resolve the Git-workspace pool size; `None` keeps the shipped default.
+
+    `git fsck --full` is memory-hungry per repository, so raising this above
+    the shipped 3 is an explicit operator decision on a host with the headroom
+    to pay for it, never an automatic function of CPU count.
+    """
+    resolved = MAX_CAPTURE_WORKSPACE_WORKERS if jobs is None else jobs
+    if not 1 <= resolved <= MAX_CAPTURE_JOBS:
+        raise BulkloadError("capture job count is out of range")
+    return min(resolved, pending)
 
 
 def _git_environment() -> dict[str, str]:
@@ -2798,8 +2853,9 @@ def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
     # compares it to the sealed expectation. A second back-to-back epoch can
     # only disagree in a case the first has already failed, so it bought two
     # extra full-corpus content passes per final phase and no extra proof.
-    if epoch() != expected:
-        raise BulkloadError("live source changed after immutable snapshot B")
+    with phase_timing("validate"):
+        if epoch() != expected:
+            raise BulkloadError("live source changed after immutable snapshot B")
 
 
 def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:
@@ -3112,6 +3168,7 @@ def _capture_live_snapshot(
     snapshot_root: Path,
     snapshot_reserve_bytes: int,
     snapshot_base_seal: Path | None,
+    jobs: int | None = None,
 ) -> dict[str, Any]:
     snapshot_id = new_id()
     snapshot_root = Path(os.path.abspath(os.fspath(snapshot_root)))
@@ -3241,7 +3298,8 @@ def _capture_live_snapshot(
         base_snapshot = read_json(snapshot_base_seal)
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
-        base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
+        with phase_timing("base-custody"):
+            base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
         records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for (label, relative), record in base_index.items():
             records_by_label[label][relative] = record
@@ -3268,19 +3326,23 @@ def _capture_live_snapshot(
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
     censuses: list[tuple[str, int]] = []
     durable_makedirs(snapshot_root.parent)
-    for _, live, provider, excluded in descriptors:
-        observed = _tree_census(live, provider=provider, exclusions=excluded)
+    for label, live, provider, excluded in descriptors:
+        with phase_timing("census", label) as sample:
+            observed = _tree_census(live, provider=provider, exclusions=excluded)
+            sample.files = observed[1]
         censuses.append(observed)
-    charged_bytes = sum(
-        _snapshot_delta_charge(
-            live,
-            base_paths[index],
-            provider=provider,
-            exclusions=excluded,
-            base_records=base_records[index],
-        )
-        for index, (_, live, provider, excluded) in enumerate(descriptors)
-    )
+    charged_bytes = 0
+    for index, (label, live, provider, excluded) in enumerate(descriptors):
+        with phase_timing("charge", label) as sample:
+            charge = _snapshot_delta_charge(
+                live,
+                base_paths[index],
+                provider=provider,
+                exclusions=excluded,
+                base_records=base_records[index],
+            )
+            sample.bytes = charge
+        charged_bytes += charge
     capacity = require_capacity(
         snapshot_root.parent,
         charged_bytes=charged_bytes,
@@ -3293,17 +3355,19 @@ def _capture_live_snapshot(
         git_tree_generation = _tree_generation(
             git_backing, provider=None, exclusions=()
         )
-        for index, (_, live, provider, excluded) in enumerate(descriptors):
+        for index, (label, live, provider, excluded) in enumerate(descriptors):
             work_target = Path(work_roots[index]["snapshot"])
-            observed_methods, observed_ledger = _copy_live_tree(
-                live,
-                work_target,
-                provider=provider,
-                exclusions=excluded,
-                max_sqlite_rows=max_sqlite_rows,
-                base=base_paths[index],
-                base_records=base_records[index],
-            )
+            with phase_timing("copy", label) as sample:
+                observed_methods, observed_ledger = _copy_live_tree(
+                    live,
+                    work_target,
+                    provider=provider,
+                    exclusions=excluded,
+                    max_sqlite_rows=max_sqlite_rows,
+                    base=base_paths[index],
+                    base_records=base_records[index],
+                )
+                sample.files = len(observed_ledger)
             transfer_ledgers.append(observed_ledger)
             for method, count in observed_methods.items():
                 methods[method] += count
@@ -3318,16 +3382,17 @@ def _capture_live_snapshot(
             != git_tree_generation
         ):
             raise BulkloadError("Git bytes changed during live snapshot")
-        for index, (_, _, provider, excluded) in enumerate(descriptors):
-            roots[index]["generation_sha256"] = (
-                git_tree_generation
-                if roots[index]["label"] == "git"
-                else _tree_generation(
-                    Path(work_roots[index]["snapshot"]),
-                    provider=provider,
-                    exclusions=excluded,
+        for index, (label, _, provider, excluded) in enumerate(descriptors):
+            with phase_timing("digest", label):
+                roots[index]["generation_sha256"] = (
+                    git_tree_generation
+                    if roots[index]["label"] == "git"
+                    else _tree_generation(
+                        Path(work_roots[index]["snapshot"]),
+                        provider=provider,
+                        exclusions=excluded,
+                    )
                 )
-            )
         augmented_map = canonical_path_map(
             [
                 *[(item["source"], item["destination"]) for item in path_map],
@@ -3351,34 +3416,36 @@ def _capture_live_snapshot(
             binding = seat_bindings[name]
             snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
             snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
-        captured = capture_agent_state(
-            role=role,
-            home=home,
-            git_root=_snapshot_path(git_backing, work_roots, label="snapshot"),
-            codex_root=_snapshot_path(
-                provider_bindings["codex"][1], work_roots, label="snapshot"
+        with phase_timing("catalog"):
+            captured = capture_agent_state(
+                role=role,
+                home=home,
+                git_root=_snapshot_path(git_backing, work_roots, label="snapshot"),
+                codex_root=_snapshot_path(
+                    provider_bindings["codex"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["codex"][3]
+                else provider_bindings["codex"][0],
+                claude_root=_snapshot_path(
+                    provider_bindings["claude"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["claude"][3]
+                else provider_bindings["claude"][0],
+                pi_root=_snapshot_path(
+                    provider_bindings["pi"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["pi"][3]
+                else provider_bindings["pi"][0],
+                seats=snapshot_seats,
+                path_map=augmented_map,
+                writers_quiesced=True,
+                managed_exclusions=managed_exclusions,
+                rsync_path=rsync_path,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_sqlite_rows=max_sqlite_rows,
+                jobs=jobs,
             )
-            if provider_bindings["codex"][3]
-            else provider_bindings["codex"][0],
-            claude_root=_snapshot_path(
-                provider_bindings["claude"][1], work_roots, label="snapshot"
-            )
-            if provider_bindings["claude"][3]
-            else provider_bindings["claude"][0],
-            pi_root=_snapshot_path(
-                provider_bindings["pi"][1], work_roots, label="snapshot"
-            )
-            if provider_bindings["pi"][3]
-            else provider_bindings["pi"][0],
-            seats=snapshot_seats,
-            path_map=augmented_map,
-            writers_quiesced=True,
-            managed_exclusions=managed_exclusions,
-            rsync_path=rsync_path,
-            max_files=max_files,
-            max_bytes=max_bytes,
-            max_sqlite_rows=max_sqlite_rows,
-        )
         catalog = captured["catalog"]
         _rewrite_catalog_to_live(
             catalog,
@@ -3408,9 +3475,11 @@ def _capture_live_snapshot(
                 if item["classification"] == "sqlite"
             ]
         partial_index = partial / "snapshot-index.jsonl"
-        index_sha256, index_entries = _write_snapshot_index(
-            partial_index, work_roots, transfer_ledgers
-        )
+        with phase_timing("seal") as sample:
+            index_sha256, index_entries = _write_snapshot_index(
+                partial_index, work_roots, transfer_ledgers
+            )
+            sample.files = index_entries
         index_path = snapshot_root / "snapshot-index.jsonl"
         snapshot = {
             "base": None
@@ -3492,9 +3561,12 @@ def capture_agent_state(
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
     snapshot_reserve_bytes: int = SNAPSHOT_RESERVE_BYTES,
+    jobs: int | None = None,
 ) -> dict[str, Any]:
     if role not in {"source", "destination"}:
         raise BulkloadError("capture role must be source or destination")
+    if jobs is not None and not 1 <= jobs <= MAX_CAPTURE_JOBS:
+        raise BulkloadError("capture job count is out of range")
     if not writers_quiesced and snapshot_root is not None:
         return _capture_live_snapshot(
             role=role,
@@ -3513,6 +3585,7 @@ def capture_agent_state(
             snapshot_root=snapshot_root,
             snapshot_reserve_bytes=snapshot_reserve_bytes,
             snapshot_base_seal=snapshot_base_seal,
+            jobs=jobs,
         )
     if not writers_quiesced and snapshot_root is None:
         raise BulkloadError(
@@ -3610,7 +3683,7 @@ def capture_agent_state(
         except (_OpaqueGitFallback, BulkloadError) as error:
             return common, representative, error
 
-    workspace_workers = min(MAX_CAPTURE_WORKSPACE_WORKERS, len(workspace_inputs))
+    workspace_workers = workspace_worker_count(jobs, len(workspace_inputs))
     if workspace_workers:
         with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
             workspace_results = list(pool.map(capture_workspace, workspace_inputs))

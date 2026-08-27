@@ -227,6 +227,7 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
         max_files=arguments.max_files,
         max_bytes=arguments.max_bytes,
         max_sqlite_rows=arguments.max_sqlite_rows,
+        jobs=arguments.jobs,
     )
 
 
@@ -424,6 +425,15 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     capture.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     capture.add_argument("--max-sqlite-rows", type=int, default=DEFAULT_MAX_SQLITE_ROWS)
+    capture.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "Git-workspace capture workers. Omit to keep the shipped default "
+            "of 3; raise it only on a host with the memory headroom for that "
+            "many concurrent `git fsck --full` runs."
+        ),
+    )
     capture.add_argument("--output", required=True)
     capture.set_defaults(handler=_agent_capture)
 
