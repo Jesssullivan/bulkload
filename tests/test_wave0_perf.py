@@ -668,5 +668,261 @@ class EvidenceMemoryGateTests(unittest.TestCase):
                 )
 
 
+def flip_byte(path: Path, offset: int = 0) -> None:
+    """Change one byte in place without changing the file's size."""
+    payload = bytearray(path.read_bytes())
+    payload[offset] = payload[offset] ^ 0x01
+    mode = path.stat().st_mode
+    path.chmod(0o600)
+    path.write_bytes(bytes(payload))
+    path.chmod(mode & 0o777)
+
+
+class BaseCustodyTests(unittest.TestCase):
+    """S8' (II-S3): --base-custody=sealed, with the X3 git carve-out."""
+
+    @staticmethod
+    def base_snapshot(capture: dict) -> dict:
+        return capture["catalog"]["snapshot"]
+
+    @staticmethod
+    def payload(snapshot: dict, label: str, relative: str) -> Path:
+        root = next(item for item in snapshot["roots"] if item["label"] == label)
+        return Path(root["snapshot"]) / relative
+
+    def test_sealed_returns_the_identical_record_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            self.assertEqual(
+                scanner.validate_snapshot_custody(snapshot, collect_records=True),
+                scanner.validate_snapshot_custody(
+                    snapshot, collect_records=True, payload_custody="sealed"
+                ),
+            )
+
+    def test_sealed_refuses_a_tampered_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            flip_byte(Path(snapshot["seal_path"]), 8)
+            with self.assertRaisesRegex(BulkloadError, "custody seal or index"):
+                scanner.validate_snapshot_custody(
+                    snapshot, collect_records=True, payload_custody="sealed"
+                )
+
+    def test_sealed_refuses_a_tampered_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            index = Path(snapshot["index_path"])
+            flip_byte(index, len(index.read_bytes()) // 2)
+            with self.assertRaisesRegex(BulkloadError, "custody seal or index"):
+                scanner.validate_snapshot_custody(
+                    snapshot, collect_records=True, payload_custody="sealed"
+                )
+
+    def test_sealed_always_re_verifies_the_git_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            flip_byte(self.payload(snapshot, "git", "repo/tracked.txt"))
+            for mode in ("full", "sealed"):
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(
+                        BulkloadError, "snapshot payload differs from sealed index"
+                    ):
+                        scanner.validate_snapshot_custody(
+                            snapshot, collect_records=True, payload_custody=mode
+                        )
+
+    def test_sealed_always_re_verifies_sqlite_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            codex = next(
+                root for root in snapshot["roots"] if root["label"] == "provider-codex"
+            )
+            self.assertTrue(codex["sqlite"])
+            relative = codex["sqlite"][0]["relative_path"]
+            flip_byte(self.payload(snapshot, "provider-codex", relative), 32)
+            for mode in ("full", "sealed"):
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(
+                        BulkloadError, "snapshot payload differs from sealed index"
+                    ):
+                        scanner.validate_snapshot_custody(
+                            snapshot, collect_records=True, payload_custody=mode
+                        )
+
+    def test_sealed_elides_only_ordinary_provider_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            target = self.payload(snapshot, "provider-codex", "history.jsonl")
+            flip_byte(target, 2)
+            with self.assertRaisesRegex(
+                BulkloadError, "snapshot payload differs from sealed index"
+            ):
+                scanner.validate_snapshot_custody(snapshot, collect_records=True)
+            # sealed trades exactly this re-read away, and nothing else: the
+            # namespace, count, mode and index digests are all still enforced.
+            scanner.validate_snapshot_custody(
+                snapshot, collect_records=True, payload_custody="sealed"
+            )
+
+    def test_sealed_still_enforces_the_anti_planting_perimeter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            planted = Path(snapshot["seal_path"]).parent / "undeclared"
+            planted.write_text("planted", encoding="utf-8")
+            with self.assertRaisesRegex(BulkloadError, "top-level namespace"):
+                scanner.validate_snapshot_custody(
+                    snapshot, collect_records=True, payload_custody="sealed"
+                )
+            planted.unlink()
+            extra = self.payload(snapshot, "provider-codex", "planted.json")
+            extra.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(BulkloadError, "index count or digest"):
+                scanner.validate_snapshot_custody(
+                    snapshot, collect_records=True, payload_custody="sealed"
+                )
+
+    def test_sealed_reads_fewer_payloads_than_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+
+            def count(mode: str) -> list[str]:
+                seen: list[str] = []
+                real = scanner._snapshot_index_record
+
+                def counted(path, **keywords):
+                    seen.append(str(path))
+                    return real(path, **keywords)
+
+                with mock.patch.object(
+                    scanner, "_snapshot_index_record", side_effect=counted
+                ):
+                    scanner.validate_snapshot_custody(
+                        snapshot, collect_records=True, payload_custody=mode
+                    )
+                return seen
+
+            full = count("full")
+            sealed = count("sealed")
+            self.assertLess(len(sealed), len(full))
+            git_root = next(
+                item["snapshot"] for item in snapshot["roots"] if item["label"] == "git"
+            )
+            self.assertEqual(
+                [path for path in full if path.startswith(git_root)],
+                [path for path in sealed if path.startswith(git_root)],
+            )
+
+    def test_sealed_cannot_be_combined_with_required_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            with self.assertRaisesRegex(BulkloadError, "cannot subset required paths"):
+                scanner.validate_snapshot_custody(
+                    snapshot,
+                    required_paths={Path(snapshot["index_path"])},
+                    payload_custody="sealed",
+                )
+
+    def test_unsupported_custody_mode_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            snapshot = self.base_snapshot(live_capture(fixture, "source-a"))
+            with self.assertRaisesRegex(
+                BulkloadError, "payload custody mode is unsupported"
+            ):
+                scanner.validate_snapshot_custody(snapshot, payload_custody="stat")
+
+    def test_chained_capture_under_sealed_matches_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            first = live_capture(fixture, "source-a")
+            chained_full = live_capture(fixture, "source-b", base=first)
+            validate_agent_capture(chained_full, expected_role="source")
+            chained_sealed = capture_agent_state(
+                role="source",
+                home=fixture.source_home,
+                git_root=fixture.source_git,
+                codex_root=None,
+                claude_root=None,
+                pi_root=None,
+                seats=fixture.source_seats,
+                path_map=fixture.path_map,
+                writers_quiesced=False,
+                snapshot_root=fixture.root / "evidence" / "source-c.snapshot",
+                snapshot_base_seal=Path(self.base_snapshot(first)["seal_path"]),
+                managed_exclusions=fixture.managed_exclusions,
+                rsync_path=fixture.rsync_path,
+                max_files=50_000,
+                max_bytes=4 * 1024**3,
+                max_sqlite_rows=100_000,
+                snapshot_reserve_bytes=0,
+                base_custody="sealed",
+            )
+            validate_agent_capture(chained_sealed, expected_role="source")
+            full = self.base_snapshot(chained_full)
+            sealed = self.base_snapshot(chained_sealed)
+            self.assertEqual(full["index_sha256"], sealed["index_sha256"])
+            self.assertEqual(
+                [root["generation_sha256"] for root in full["roots"]],
+                [root["generation_sha256"] for root in sealed["roots"]],
+            )
+            self.assertIn("base-reflink", sealed["methods"])
+
+    def test_base_custody_requires_a_base_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            with self.assertRaisesRegex(
+                BulkloadError, "base custody mode requires a base seal"
+            ):
+                capture_agent_state(
+                    role="source",
+                    home=fixture.source_home,
+                    git_root=fixture.source_git,
+                    codex_root=None,
+                    claude_root=None,
+                    pi_root=None,
+                    seats=fixture.source_seats,
+                    path_map=fixture.path_map,
+                    writers_quiesced=False,
+                    snapshot_root=fixture.root / "evidence" / "orphan.snapshot",
+                    managed_exclusions=fixture.managed_exclusions,
+                    rsync_path=fixture.rsync_path,
+                    snapshot_reserve_bytes=0,
+                    base_custody="sealed",
+                )
+
+    def test_parser_base_custody_defaults_to_full(self) -> None:
+        base = [
+            "agent-capture",
+            "--role",
+            "source",
+            "--home",
+            "/home",
+            "--git-root",
+            "/home/git",
+            "--rsync-path",
+            "/usr/bin/rsync",
+            "--path-map",
+            "/a=/b",
+            "--output",
+            "/tmp/out.json",
+        ]
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(base).base_custody, "full")
+        self.assertEqual(
+            parser.parse_args([*base, "--base-custody", "sealed"]).base_custody,
+            "sealed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

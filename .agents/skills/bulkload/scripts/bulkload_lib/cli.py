@@ -261,6 +261,7 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
         max_bytes=arguments.max_bytes,
         max_sqlite_rows=arguments.max_sqlite_rows,
         jobs=arguments.jobs,
+        base_custody=arguments.base_custody,
     )
 
 
@@ -452,6 +453,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--acknowledge-writers-quiesced", action="store_true")
     capture.add_argument("--snapshot-base-seal")
+    capture.add_argument(
+        "--base-custody",
+        choices=("full", "sealed"),
+        default="full",
+        help=(
+            "how the named base seal's payloads are admitted. full re-hashes "
+            "every byte of the base (today's behaviour). sealed trusts the "
+            "base seal's verified index digest and namespace digest instead, "
+            "except the git root and every SQLite payload, which are always "
+            "re-derived."
+        ),
+    )
     capture.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     capture.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     capture.add_argument("--max-sqlite-rows", type=int, default=DEFAULT_MAX_SQLITE_ROWS)
