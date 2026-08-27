@@ -2801,8 +2801,21 @@ def validate_snapshot_custody(
     return collected
 
 
-def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
-    """Fence final transport against any source mutation after snapshot B."""
+def validate_live_snapshot_generation(
+    snapshot: dict[str, Any], *, passes: int = 2
+) -> None:
+    """Fence final transport against any source mutation after snapshot B.
+
+    `passes` is the number of full-corpus re-derivations. It defaults to 2
+    because a single pass is not atomic: `epoch()` walks the roots in order,
+    so a write that lands after its own path has been digested but before the
+    pass ends is invisible to that pass and only visible to the next. The
+    second pass is therefore a wider straggler window, not a redundant read.
+    Only a fence that is strictly dominated by a later full-strength fence
+    over the same snapshot may ask for `passes=1`.
+    """
+    if not isinstance(passes, int) or isinstance(passes, bool) or passes < 1:
+        raise BulkloadError("live generation fence requires at least one pass")
     expected_rows = []
     for root in snapshot["roots"]:
         expected_rows.append(
@@ -2886,13 +2899,16 @@ def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
             )
         )
 
-    # One epoch is the whole fence: it re-derives the live generation and
-    # compares it to the sealed expectation. A second back-to-back epoch can
-    # only disagree in a case the first has already failed, so it bought two
-    # extra full-corpus content passes per final phase and no extra proof.
+    # Each epoch re-derives the live generation and compares it to the sealed
+    # expectation. Two passes are the default because the walk is sequential
+    # and therefore not atomic: `first == expected` with `second != expected`
+    # is reachable whenever a straggler write lands mid-walk, behind the
+    # cursor. The only term that was genuinely dead in the original fence is
+    # `first != second`, which the other two comparisons already imply.
     with phase_timing("validate"):
-        if epoch() != expected:
-            raise BulkloadError("live source changed after immutable snapshot B")
+        for _ in range(passes):
+            if epoch() != expected:
+                raise BulkloadError("live source changed after immutable snapshot B")
 
 
 def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:

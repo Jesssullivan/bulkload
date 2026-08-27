@@ -24,6 +24,7 @@ from bulkload_lib.cli import _agent_stage, build_parser
 from bulkload_lib import executor
 from bulkload_lib.executor import push_agent_transport, stage_agent_plan
 from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
+from bulkload_lib.planner import compile_agent_plan
 from bulkload_lib import scanner
 from bulkload_lib.scanner import (
     _jsonl_records,
@@ -95,9 +96,14 @@ def live_capture(
 
 
 class SingleEpochFenceTests(unittest.TestCase):
-    """W0-1: the second back-to-back epoch() was redundant, not a fence."""
+    """W0-1: the fence keeps both passes; only a dominated site drops one.
 
-    def test_single_epoch_still_fails_on_a_real_post_seal_divergence(self) -> None:
+    The walk inside the fence is sequential, so one pass is not atomic. These
+    tests pin the straggler window the second pass carries, and pin that the
+    only site allowed to give it up is recovered by a later full fence.
+    """
+
+    def test_fence_fails_on_a_real_post_seal_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
             capture = live_capture(fixture, "source-a")
@@ -107,8 +113,7 @@ class SingleEpochFenceTests(unittest.TestCase):
             # The sealed snapshot still matches the untouched live tree.
             validate_live_snapshot_generation(snapshot)
 
-            # Mutating a live payload byte after the seal must still abort,
-            # with one epoch exactly as it did with two.
+            # Mutating a live payload byte after the seal must still abort.
             tracked = fixture.source_repo / "untracked.txt"
             tracked.write_bytes(b"mutated after the immutable seal\n")
             with self.assertRaisesRegex(
@@ -116,7 +121,7 @@ class SingleEpochFenceTests(unittest.TestCase):
             ):
                 validate_live_snapshot_generation(snapshot)
 
-    def test_same_size_mutation_is_still_caught_by_the_single_epoch(self) -> None:
+    def test_same_size_mutation_is_still_caught(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
             history = fixture.source_home / ".codex" / "history.jsonl"
@@ -132,7 +137,56 @@ class SingleEpochFenceTests(unittest.TestCase):
             ):
                 validate_live_snapshot_generation(snapshot)
 
-    def test_validate_runs_exactly_one_generation_pass_per_root(self) -> None:
+    @staticmethod
+    def straggler_behind_the_cursor(victim: Path):
+        """Land a write immediately after the first root is digested.
+
+        That is the exact window a single pass cannot see: the walk has
+        already moved past the victim's root, so the pass in flight reports
+        the pre-write generation and only the *next* pass diverges.
+        """
+        real = scanner._tree_generation
+        state = {"digested": 0}
+
+        def hooked(root, **keywords):
+            result = real(root, **keywords)
+            state["digested"] += 1
+            if state["digested"] == 1:
+                victim.write_bytes(b"straggler written behind the walk cursor\n")
+            return result
+
+        return mock.patch.object(scanner, "_tree_generation", side_effect=hooked)
+
+    def test_default_fence_catches_a_straggler_written_behind_the_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            victim = Path(snapshot["roots"][0]["live"]) / "straggler.txt"
+            with self.straggler_behind_the_cursor(victim):
+                with self.assertRaisesRegex(
+                    BulkloadError, "live source changed after immutable snapshot B"
+                ):
+                    validate_live_snapshot_generation(snapshot)
+
+    def test_a_dominated_single_pass_is_recovered_by_the_next_full_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            victim = Path(snapshot["roots"][0]["live"]) / "straggler.txt"
+            with self.straggler_behind_the_cursor(victim):
+                # The dominated pre-push fence genuinely misses this write.
+                # That is the cost of `passes=1`, stated rather than hidden.
+                validate_live_snapshot_generation(snapshot, passes=1)
+                # The full-strength fence that follows it still aborts, which
+                # is the whole reason the pre-push site may give up a pass.
+                with self.assertRaisesRegex(
+                    BulkloadError, "live source changed after immutable snapshot B"
+                ):
+                    validate_live_snapshot_generation(snapshot)
+
+    def test_pass_count_is_two_by_default_and_one_when_dominated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=True)
             capture = live_capture(fixture, "source-a")
@@ -146,7 +200,20 @@ class SingleEpochFenceTests(unittest.TestCase):
 
             with mock.patch.object(scanner, "_tree_generation", side_effect=counted):
                 validate_live_snapshot_generation(snapshot)
+            self.assertEqual(len(calls), 2 * len(snapshot["roots"]))
+            calls.clear()
+            with mock.patch.object(scanner, "_tree_generation", side_effect=counted):
+                validate_live_snapshot_generation(snapshot, passes=1)
             self.assertEqual(len(calls), len(snapshot["roots"]))
+
+    def test_the_fence_cannot_be_reduced_to_no_passes(self) -> None:
+        # The guard runs before the snapshot is read, so a would-be caller
+        # cannot disable the fence outright by asking for zero passes.
+        for rejected in (0, -1, True, 1.5, "2", None):
+            with self.assertRaisesRegex(
+                BulkloadError, "live generation fence requires at least one pass"
+            ):
+                validate_live_snapshot_generation({}, passes=rejected)
 
 
 class IdenticalLineShortCircuitTests(unittest.TestCase):
@@ -922,6 +989,87 @@ class BaseCustodyTests(unittest.TestCase):
             parser.parse_args([*base, "--base-custody", "sealed"]).base_custody,
             "sealed",
         )
+
+
+class DominatedFenceWiringTests(unittest.TestCase):
+    """W0-1: exactly one call site is allowed to drop a pass."""
+
+    def test_push_fences_once_before_the_push_and_at_full_strength_after(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            # The fence only exists on a live (non-quiesced) capture, so this
+            # needs the chained live plan, not CutoverFixture.plan().
+            source_a = live_capture(fixture, "source-a")
+            source_b = live_capture(fixture, "source-b", base=source_a)
+            destination_a = live_capture(fixture, "dest-a", role="destination")
+            destination_b = live_capture(
+                fixture, "dest-b", role="destination", base=destination_a
+            )
+            plan = compile_agent_plan(source_a, source_b, destination_a, destination_b)
+            fake_ssh = fixture.root / "fake-ssh"
+            fake_ssh.write_text(FAKE_SSH, encoding="utf-8")
+            fake_ssh.chmod(0o700)
+            stage = fixture.root / "transport-stage"
+            common = {
+                "accepted_plan_sha256": plan["plan_sha256"],
+                "stage_root": stage,
+            }
+            preseed_prepare = stage_agent_plan(
+                plan,
+                phase="preseed",
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+                **common,
+            )
+            preseed_transport = push_agent_transport(
+                preseed_prepare,
+                stage / ".transport-allowlist-preseed.nul",
+                phase="preseed",
+                destination_ssh_host=socket.gethostname(),
+                _ssh_binary=str(fake_ssh),
+                **common,
+            )
+            stage_agent_plan(
+                plan,
+                phase="preseed",
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="materialize",
+                prepare_receipt=preseed_prepare,
+                transport_receipt=preseed_transport,
+                **common,
+            )
+            prepare = stage_agent_plan(
+                plan,
+                phase="final",
+                allow_accounted_copy=True,
+                reserve_bytes=0,
+                transport_mode="prepare",
+                **common,
+            )
+
+            real = executor.validate_live_snapshot_generation
+            recorded: list[int] = []
+
+            def recording(snapshot, *, passes=2):
+                recorded.append(passes)
+                return real(snapshot, passes=passes)
+
+            with mock.patch.object(
+                executor, "validate_live_snapshot_generation", side_effect=recording
+            ):
+                push_agent_transport(
+                    prepare,
+                    stage / ".transport-allowlist-final.nul",
+                    phase="final",
+                    destination_ssh_host=socket.gethostname(),
+                    _ssh_binary=str(fake_ssh),
+                    **common,
+                )
+            # Pre-push is dominated and may run one pass; post-push is the
+            # last fence before the receipt exists and keeps both.
+            self.assertEqual(recorded, [1, 2])
 
 
 if __name__ == "__main__":

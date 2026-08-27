@@ -497,7 +497,15 @@ def push_agent_transport(
     if isinstance(source_snapshot, dict):
         validate_snapshot_custody(source_snapshot)
         if phase == "final":
-            validate_live_snapshot_generation(source_snapshot)
+            # One pass here, and only here. This fence is strictly dominated
+            # by the full-strength fence below, which re-runs over the same
+            # snapshot under the same `phase == "final"` condition after the
+            # push. Nothing in between confers authority: the payload lands in
+            # the destination *quarantine*, and the transport receipt that
+            # grants downstream authority is built after the second fence. A
+            # straggler that hides behind this pass's walk cursor is still
+            # caught there before anything can act on it.
+            validate_live_snapshot_generation(source_snapshot, passes=1)
     host = _transport_host(
         destination_ssh_host, transport_authority["destination_host"]
     )
