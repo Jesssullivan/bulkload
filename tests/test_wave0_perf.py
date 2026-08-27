@@ -8,8 +8,11 @@ removing a fence.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -485,6 +488,127 @@ class SnapshotIndexWriterTests(unittest.TestCase):
                 with self.assertRaises(BulkloadError):
                     live_capture(fixture, "source-a")
             self.assertFalse((fixture.root / "evidence" / "source-a.snapshot").exists())
+
+
+class PhaseTimingAndJobsTests(unittest.TestCase):
+    """S5' (PH-S0): stderr-only phase timing and --jobs plumbing."""
+
+    def test_default_job_count_is_the_shipped_constant(self) -> None:
+        self.assertEqual(scanner.MAX_CAPTURE_WORKSPACE_WORKERS, 3)
+        self.assertEqual(scanner.workspace_worker_count(None, 10), 3)
+        self.assertEqual(scanner.workspace_worker_count(None, 2), 2)
+        self.assertEqual(scanner.workspace_worker_count(None, 0), 0)
+
+    def test_explicit_job_count_is_bounded_by_pending_work(self) -> None:
+        self.assertEqual(scanner.workspace_worker_count(1, 10), 1)
+        self.assertEqual(scanner.workspace_worker_count(8, 10), 8)
+        self.assertEqual(scanner.workspace_worker_count(8, 2), 2)
+
+    def test_out_of_range_job_counts_are_refused(self) -> None:
+        for jobs in (0, -1, scanner.MAX_CAPTURE_JOBS + 1):
+            with self.subTest(jobs=jobs):
+                with self.assertRaisesRegex(
+                    BulkloadError, "capture job count is out of range"
+                ):
+                    scanner.workspace_worker_count(jobs, 10)
+
+    def test_capture_refuses_an_out_of_range_job_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            with self.assertRaisesRegex(
+                BulkloadError, "capture job count is out of range"
+            ):
+                capture_agent_state(
+                    role="source",
+                    home=fixture.source_home,
+                    git_root=fixture.source_git,
+                    codex_root=None,
+                    claude_root=None,
+                    pi_root=None,
+                    seats=fixture.source_seats,
+                    path_map=fixture.path_map,
+                    writers_quiesced=True,
+                    rsync_path=fixture.rsync_path,
+                    jobs=0,
+                )
+
+    def test_parser_jobs_default_is_unset(self) -> None:
+        base = [
+            "agent-capture",
+            "--role",
+            "source",
+            "--home",
+            "/home",
+            "--git-root",
+            "/home/git",
+            "--rsync-path",
+            "/usr/bin/rsync",
+            "--path-map",
+            "/a=/b",
+            "--output",
+            "/tmp/out.json",
+        ]
+        parser = build_parser()
+        self.assertIsNone(parser.parse_args(base).jobs)
+        self.assertEqual(parser.parse_args([*base, "--jobs", "8"]).jobs, 8)
+
+    def test_timing_is_silent_unless_the_operator_asks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            stream = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("BULKLOAD_PHASE_TIMING", None)
+                with contextlib.redirect_stderr(stream):
+                    capture = live_capture(fixture, "source-a")
+            self.assertEqual(stream.getvalue(), "")
+            validate_agent_capture(capture, expected_role="source")
+
+    def test_timing_emits_one_stderr_line_per_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            stream = io.StringIO()
+            with mock.patch.dict(os.environ, {"BULKLOAD_PHASE_TIMING": "1"}):
+                with contextlib.redirect_stderr(stream):
+                    capture = live_capture(fixture, "source-a")
+            lines = [
+                line
+                for line in stream.getvalue().splitlines()
+                if line.startswith("bulkload-phase ")
+            ]
+            self.assertTrue(lines)
+            phases = {
+                dict(field.split("=", 1) for field in line.split(" ")[1:])["phase"]
+                for line in lines
+            }
+            self.assertLessEqual(
+                {"census", "charge", "copy", "digest", "catalog", "seal"}, phases
+            )
+            for line in lines:
+                fields = dict(field.split("=", 1) for field in line.split(" ")[1:])
+                self.assertEqual(
+                    sorted(fields), ["bytes", "files", "phase", "root", "seconds"]
+                )
+                float(fields["seconds"])
+            # Timing is diagnostic only: it never reaches an artifact.
+            self.assertNotIn(b"bulkload-phase", canonical_bytes(capture))
+            validate_agent_capture(capture, expected_role="source")
+
+    def test_timing_does_not_change_the_sealed_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            quiet = live_capture(fixture, "quiet")["catalog"]["snapshot"]
+            stream = io.StringIO()
+            with mock.patch.dict(os.environ, {"BULKLOAD_PHASE_TIMING": "1"}):
+                with contextlib.redirect_stderr(stream):
+                    loud = live_capture(fixture, "loud")["catalog"]["snapshot"]
+            self.assertEqual(
+                [root["generation_sha256"] for root in quiet["roots"]],
+                [root["generation_sha256"] for root in loud["roots"]],
+            )
+            self.assertEqual(
+                quiet["git_generation_sha256"], loud["git_generation_sha256"]
+            )
+            self.assertEqual(quiet["index_sha256"], loud["index_sha256"])
 
 
 if __name__ == "__main__":
