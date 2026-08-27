@@ -24,7 +24,6 @@ from bulkload_lib.cli import _agent_stage, build_parser
 from bulkload_lib import executor
 from bulkload_lib.executor import push_agent_transport, stage_agent_plan
 from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
-from bulkload_lib.planner import compile_agent_plan
 from bulkload_lib import scanner
 from bulkload_lib.scanner import (
     _jsonl_records,
@@ -33,7 +32,7 @@ from bulkload_lib.scanner import (
     validate_live_snapshot_generation,
 )
 
-from test_bulkload import CutoverFixture
+from test_bulkload import CutoverFixture, compile_agent_plan
 
 
 def reference_jsonl_records(path: Path, *, replacements=()) -> dict:

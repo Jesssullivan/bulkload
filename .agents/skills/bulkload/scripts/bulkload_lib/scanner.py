@@ -35,6 +35,7 @@ from .model import (
     durable_makedirs,
     ensure_safe_target,
     fsync_directory,
+    git_environment,
     new_id,
     normalize_relative,
     reflink_clone,
@@ -248,6 +249,22 @@ def _is_regenerate_namespace(provider: str, relative: str) -> bool:
     return provider == "pi" and parts[:1] in {("cache",), ("logs",), ("tmp",)}
 
 
+def _is_pruned(provider: str | None, relative: str, exclusions: Sequence[str]) -> bool:
+    """The one prune rule: a managed exclusion or a regenerate namespace.
+
+    This predicate decides which paths a census, a copy and a charge all agree
+    not to see, so it fixes `generation_sha256` and `index_sha256`. It used to
+    be spelled out at eight call sites, and *not* identically: the six sites in
+    the census, the copy and the charge guard it with `provider is not None`,
+    while the two inside `_capture_provider` do not. That asymmetry is
+    preserved at the call sites rather than folded in here, because folding it
+    in would change `_capture_provider`'s behaviour for a None provider.
+    """
+    return _is_excluded(relative, exclusions) or _is_regenerate_namespace(
+        provider, relative
+    )
+
+
 def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen_sources: set[str] = set()
@@ -321,24 +338,6 @@ def workspace_worker_count(jobs: int | None, pending: int) -> int:
     return min(resolved, pending)
 
 
-def _git_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "LC_ALL": "C",
-        }
-    )
-    return environment
-
-
 def _git(
     repository: Path,
     arguments: Sequence[str],
@@ -353,7 +352,7 @@ def _git(
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=git_environment(),
         )
     except OSError as error:
         raise BulkloadError("Git is unavailable") from error
@@ -889,7 +888,7 @@ class _GitBlobBatch:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    env=_git_environment(),
+                    env=git_environment(),
                 )
             except OSError as error:
                 raise BulkloadError("Git is unavailable") from error
@@ -1654,9 +1653,7 @@ def _capture_provider(
         for name in sorted(directories):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -1682,9 +1679,7 @@ def _capture_provider(
         for name in sorted(names):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -2120,10 +2115,7 @@ def _tree_census(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             kind, _ = observe(child, relative)
             if kind == "directory":
@@ -2137,10 +2129,7 @@ def _tree_census(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
@@ -2338,10 +2327,7 @@ def _copy_live_tree(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             info = child.stat(follow_symlinks=False)
             target = target_parent / name
@@ -2372,10 +2358,7 @@ def _copy_live_tree(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if any(name.lower().endswith(suffix) for suffix in SQLITE_SIDECARS):
                 primary_name = _sqlite_primary(name.lower())
@@ -2488,10 +2471,7 @@ def _snapshot_delta_charge(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if stat.S_ISDIR(child.stat(follow_symlinks=False).st_mode):
                 retained.append(name)
@@ -2504,10 +2484,7 @@ def _snapshot_delta_charge(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
