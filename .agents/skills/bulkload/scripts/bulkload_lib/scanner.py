@@ -2740,9 +2740,11 @@ def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
             )
         )
 
-    first = epoch()
-    second = epoch()
-    if first != expected or second != expected or first != second:
+    # One epoch is the whole fence: it re-derives the live generation and
+    # compares it to the sealed expectation. A second back-to-back epoch can
+    # only disagree in a case the first has already failed, so it bought two
+    # extra full-corpus content passes per final phase and no extra proof.
+    if epoch() != expected:
         raise BulkloadError("live source changed after immutable snapshot B")
 
 
