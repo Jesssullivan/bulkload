@@ -2970,7 +2970,7 @@ def validate_snapshot_custody(
     snapshot: dict[str, Any],
     *,
     mirror: Path | None = None,
-    required_paths: set[Path] | None = None,
+    required_paths: Iterable[str | Path] | None = None,
     collect_records: bool = False,
     payload_custody: str = "full",
     spill_dir: Path | None = None,
@@ -3023,10 +3023,18 @@ def validate_snapshot_custody(
     for root in actual_roots:
         if not _within(root, seal_path.parent):
             raise BulkloadError("live snapshot payload escapes custody root")
+    # The fence compares identities. `Path` carried them at the cost of a
+    # `PurePath.__hash__` -- a `str()` rebuild -- on every one of the ~1.5 M
+    # membership tests the sting cutover index drives, so hold both sides as
+    # `os.fspath` strings. `Path.__eq__` is `str` equality on exactly this
+    # normal form, so the set is the same set.
     required = (
         None
         if required_paths is None
-        else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
+        else frozenset(
+            os.fspath(Path(os.path.abspath(os.fspath(path))))
+            for path in required_paths
+        )
     )
     # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
     # not from the snapshot copy, so nothing anywhere ever compares the git
@@ -3046,7 +3054,7 @@ def validate_snapshot_custody(
             relatives.add(relative_path)
             relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
         always_relatives[root_index] = relatives
-    seen: set[Path] = set()
+    seen: set[str] = set()
     collected = _BaseRecordMap(
         [item["label"] for item in snapshot["roots"]],
         spill_dir=spill_dir if collect_records else None,
@@ -3095,12 +3103,12 @@ def validate_snapshot_custody(
                     raise BulkloadError("snapshot payload index identity is invalid")
                 if relative == ".":
                     path = actual_roots[root_index]
-                    original_path = original_roots[root_index]
+                    original_path = os.fspath(original_roots[root_index])
                 else:
                     normalize_relative(relative)
                     path = ensure_safe_target(actual_roots[root_index], relative)
-                    original_path = ensure_safe_target(
-                        original_roots[root_index], relative
+                    original_path = os.fspath(
+                        ensure_safe_target(original_roots[root_index], relative)
                     )
                 key = (root_index, relative)
                 if previous is not None and key <= previous:

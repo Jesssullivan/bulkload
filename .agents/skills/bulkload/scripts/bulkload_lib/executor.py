@@ -1640,11 +1640,18 @@ def stage_agent_plan(
         snapshot = plan["source"]["catalog"].get("snapshot")
         if isinstance(snapshot, dict):
             metadata = {snapshot["seal_path"], snapshot["index_path"]}
-            required = {
-                Path("/") / item
-                for item in _plan_source_paths(plan)
-                if os.fspath(Path("/") / item) not in metadata
-            }
+            # `os.fspath(Path("/") / item)` twice per entry over ~1.5 M
+            # entries, then a set whose every membership test paid for a
+            # `PurePath.__hash__`. The custody fence compares identities, not
+            # `Path` objects, so carry the identities as strings.
+            required = frozenset(
+                path
+                for path in (
+                    _canonical_absolute(f"/{item}")
+                    for item in _plan_source_paths(plan)
+                )
+                if path not in metadata
+            )
             validate_snapshot_custody(
                 snapshot, mirror=source_mirror, required_paths=required
             )
