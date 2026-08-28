@@ -271,55 +271,55 @@ def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
     return result
 
 
-def _plan_source_paths_uncached(plan: dict[str, Any]) -> list[str]:
-    paths: set[str] = set()
-    resolver = PlanOperationResolver(plan)
-    catalog = plan["source"]["catalog"]
-    if isinstance(catalog.get("snapshot"), dict):
-        paths.update(
-            {
-                catalog["snapshot"]["seal_path"],
-                catalog["snapshot"]["index_path"],
-            }
-        )
-    for compact_operation in plan["operations"]:
-        operation = resolver.materialize(compact_operation)
-        source = operation["source"]
-        if operation["kind"] == "git-workspace-union":
-            common = Path(source["common_git_dir"]) / "objects"
-            paths.update(
-                os.fspath(
-                    _snapshot_source_path(catalog, common / item["relative_path"])
-                )
-                for item in source.get("object_files", [])
-            )
-            for worktree in source.get("worktrees", []):
-                paths.update(
-                    os.fspath(
-                        _snapshot_source_path(
-                            catalog, Path(worktree["path"]) / item["relative_path"]
-                        )
-                    )
-                    for item in worktree.get("files", [])
-                )
-                if worktree["index"]["exists"]:
-                    paths.add(
-                        os.fspath(
-                            _snapshot_source_path(
-                                catalog, Path(worktree["index"]["path"])
-                            )
-                        )
-                    )
-            continue
-        path = Path(operation["source_root"]) / source["relative_path"]
-        paths.add(os.fspath(_snapshot_source_path(catalog, path)))
-        if operation["kind"] == "sqlite-union" and catalog.get("snapshot") is None:
-            paths.update(
-                os.fspath(Path(os.fspath(path) + f"-{item['kind']}"))
-                for item in source.get("sidecars", [])
-            )
+def _canonical_absolute(path: str) -> str:
+    """`os.fspath(Path(path))` without building a `Path` in the common case.
+
+    `PurePosixPath` normalisation drops empty and `.` components and strips a
+    trailing separator; `..` survives. A string that already has none of those
+    is therefore its own normal form, and that is every path a sealed catalog
+    carries. Anything else falls back to the `Path` round trip, so the two
+    forms are the same function.
+    """
+    if (
+        path.startswith("/")
+        and not path.startswith("//")
+        and "//" not in path
+        and not path.endswith("/")
+        and "/./" not in path
+        and not path.endswith("/.")
+    ):
+        return path
+    return os.fspath(Path(path))
+
+
+def _join_absolute(root: str, relative: str) -> str:
+    """`os.fspath(Path(root) / relative)`; an absolute `relative` still wins."""
+    if relative.startswith("/"):
+        return _canonical_absolute(relative)
+    if not root:
+        return _canonical_absolute(relative)
+    if root.endswith("/"):
+        # `/` and the POSIX `//` root already carry their separator.
+        return _canonical_absolute(f"{root}{relative}")
+    return _canonical_absolute(f"{root}/{relative}")
+
+
+def _allowlist_relatives(paths: set[str]) -> list[str]:
+    """Sort the custody paths and strip the root, refusing a non-canonical one."""
     result = []
     for raw in sorted(paths):
+        if (
+            raw.startswith("/")
+            and not raw.startswith("//")
+            and "//" not in raw
+            and not raw.endswith("/")
+            and "/./" not in raw
+            and not raw.endswith("/.")
+            and "/../" not in raw
+            and not raw.endswith("/..")
+        ):
+            result.append(raw[1:])
+            continue
         path = Path(raw)
         if not path.is_absolute() or any(
             part in {"", ".", ".."} for part in path.parts
@@ -327,6 +327,58 @@ def _plan_source_paths_uncached(plan: dict[str, Any]) -> list[str]:
             raise BulkloadError("transport allowlist contains a non-canonical path")
         result.append(path.relative_to("/").as_posix())
     return result
+
+
+def _plan_source_paths_uncached(plan: dict[str, Any]) -> list[str]:
+    # Every join, custody translation and canonicality check below used to
+    # build `Path` objects — ~19 per operation, ~40 M on the sting cutover
+    # plan, all of it single-threaded before a payload byte is read. The
+    # values are POSIX path strings either way, so keep them strings and let
+    # `_canonical_absolute` fall back to `Path` only for the shapes that are
+    # not already their own normal form.
+    paths: set[str] = set()
+    resolver = PlanOperationResolver(plan)
+    catalog = plan["source"]["catalog"]
+    snapshot = catalog.get("snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else None
+    if snapshot is not None:
+        paths.update({snapshot["seal_path"], snapshot["index_path"]})
+
+    def custody(path: str) -> str:
+        return path if snapshot is None else _snapshot_custody_str(snapshot, path)
+
+    for compact_operation in plan["operations"]:
+        operation = resolver.materialize(compact_operation)
+        source = operation["source"]
+        if operation["kind"] == "git-workspace-union":
+            common = _join_absolute(
+                _canonical_absolute(source["common_git_dir"]), "objects"
+            )
+            paths.update(
+                custody(_join_absolute(common, item["relative_path"]))
+                for item in source.get("object_files", [])
+            )
+            for worktree in source.get("worktrees", []):
+                root = _canonical_absolute(worktree["path"])
+                paths.update(
+                    custody(_join_absolute(root, item["relative_path"]))
+                    for item in worktree.get("files", [])
+                )
+                if worktree["index"]["exists"]:
+                    paths.add(
+                        custody(_canonical_absolute(worktree["index"]["path"]))
+                    )
+            continue
+        path = _join_absolute(
+            _canonical_absolute(operation["source_root"]), source["relative_path"]
+        )
+        paths.add(custody(path))
+        if operation["kind"] == "sqlite-union" and snapshot is None:
+            paths.update(
+                _canonical_absolute(f"{path}-{item['kind']}")
+                for item in source.get("sidecars", [])
+            )
+    return _allowlist_relatives(paths)
 
 
 def _transport_environment(ssh_path: str) -> dict[str, str]:
