@@ -33,6 +33,7 @@ from .model import (
     atomic_write_json,
     canonical_bytes,
     durable_makedirs,
+    _ensure_safe_target,
     ensure_safe_target,
     fsync_directory,
     git_environment,
@@ -3018,6 +3019,14 @@ def validate_snapshot_custody(
         raise BulkloadError("live snapshot custody seal or index differs")
     actual_roots = [actual(item["snapshot"]) for item in snapshot["roots"]]
     original_roots = [Path(item["snapshot"]) for item in snapshot["roots"]]
+    # `ensure_safe_target` re-derives both of these per index record, and the
+    # index is ~1.5 M records on the sting cutover.
+    absolute_actual_roots = [
+        Path(os.path.abspath(os.fspath(root))) for root in actual_roots
+    ]
+    absolute_original_roots = [
+        Path(os.path.abspath(os.fspath(root))) for root in original_roots
+    ]
     if len({os.fspath(path) for path in actual_roots}) != len(actual_roots):
         raise BulkloadError("live snapshot custody roots are not unique")
     for root in actual_roots:
@@ -3105,10 +3114,18 @@ def validate_snapshot_custody(
                     path = actual_roots[root_index]
                     original_path = os.fspath(original_roots[root_index])
                 else:
-                    normalize_relative(relative)
-                    path = ensure_safe_target(actual_roots[root_index], relative)
+                    # One normalisation per record, not three: the explicit
+                    # call plus one inside each `ensure_safe_target`.
+                    normalized = normalize_relative(relative)
+                    path = _ensure_safe_target(
+                        absolute_actual_roots[root_index], normalized
+                    )
                     original_path = os.fspath(
-                        ensure_safe_target(original_roots[root_index], relative)
+                        path
+                        if mirror is None
+                        else _ensure_safe_target(
+                            absolute_original_roots[root_index], normalized
+                        )
                     )
                 key = (root_index, relative)
                 if previous is not None and key <= previous:

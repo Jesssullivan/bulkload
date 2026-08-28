@@ -350,9 +350,15 @@ def assert_no_overlap(path: Path, protected: Iterable[Path], label: str) -> None
         raise BulkloadError(f"{label} contains live root {root}")
 
 
-def ensure_safe_target(root: Path, relative: str) -> Path:
-    normalized = normalize_relative(relative)
-    root = Path(os.path.abspath(os.fspath(root)))
+def _ensure_safe_target(root: Path, normalized: str) -> Path:
+    """`ensure_safe_target` with the root already absolute and the relative
+    already normalised.
+
+    Split out for the callers that walk a sealed index: they have already
+    normalised the relative once, and `normalize_relative` runs a per-character
+    `unicodedata.category` scan, so paying for it again per root is the single
+    largest cost in the custody walk.
+    """
     current = root
     for component in PurePosixPath(normalized).parts[:-1]:
         current /= component
@@ -365,6 +371,12 @@ def ensure_safe_target(root: Path, relative: str) -> Path:
                 f"destination ancestry is not a real directory: {current}"
             )
     return root / normalized
+
+
+def ensure_safe_target(root: Path, relative: str) -> Path:
+    return _ensure_safe_target(
+        Path(os.path.abspath(os.fspath(root))), normalize_relative(relative)
+    )
 
 
 def capacity_observation(path: Path) -> dict[str, int]:
