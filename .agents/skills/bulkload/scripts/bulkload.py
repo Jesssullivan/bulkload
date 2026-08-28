@@ -94,9 +94,15 @@ def _pin_sources(root: Path) -> dict[str, tuple[Path, bytes, bool]]:
             + "}"
         ).encode()
     ).hexdigest()
-    # Honor an externally pinned closure (operator break-glass for a
-    # verify-side engine fix mid-ceremony); otherwise bind the computed one.
-    os.environ.setdefault("BULKLOAD_RUNTIME_SOURCE_SHA256", closure)
+    # BULKLOAD_RUNTIME_SOURCE_PIN is the operator break-glass for a
+    # verify-side engine fix mid-ceremony: when set, the launcher presents the
+    # pinned closure instead of the computed one. The distinct variable name
+    # keeps the launcher's own trust channel (BULKLOAD_RUNTIME_SOURCE_SHA256,
+    # always overwritten below) from leaking a stale value across launcher
+    # invocations inside one process tree — the defect a setdefault had.
+    os.environ["BULKLOAD_RUNTIME_SOURCE_SHA256"] = os.environ.get(
+        "BULKLOAD_RUNTIME_SOURCE_PIN", closure
+    )
     return modules
 
 
