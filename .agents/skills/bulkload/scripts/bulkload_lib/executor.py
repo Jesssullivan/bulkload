@@ -176,22 +176,66 @@ def _catalog_source_roots(catalog: dict[str, Any]) -> list[str]:
     return roots
 
 
+_SNAPSHOT_PREFIX_CACHE: dict[str, dict[str, list[tuple[str, str, str, str]]]] = {}
+
+
+def _snapshot_prefixes(
+    snapshot: dict[str, Any],
+) -> dict[str, list[tuple[str, str, str, str]]]:
+    """The (live root, live prefix, snapshot root, join stem) table, once.
+
+    The binding table is a pure function of the sealed snapshot, but the
+    `Path.relative_to` form rebuilt two `Path` objects per binding per lookup
+    — five bindings times ~2.2 M source paths is ~22 M `Path` constructions
+    before a payload byte is read. Derive the table once per `seal_sha256`
+    and match with plain `str` prefixes.
+
+    Deepest-first with a stable sort reproduces `max(matches, key=depth)`
+    exactly: that picked the deepest match, and the first one in root order
+    among equal depths. The table is bucketed by POSIX root marker because
+    `PurePosixPath("//net/x").relative_to("/")` raises — a `//` path is *not*
+    under `/` — so a plain string prefix would over-match there.
+    """
+    key = snapshot.get("seal_sha256")
+    if isinstance(key, str):
+        cached = _SNAPSHOT_PREFIX_CACHE.get(key)
+        if cached is not None:
+            return cached
+    bindings = sorted(
+        snapshot["roots"],
+        key=lambda binding: -len(Path(binding["live"]).parts),
+    )
+    table: dict[str, list[tuple[str, str, str, str]]] = {"/": [], "//": []}
+    for binding in bindings:
+        live = os.fspath(Path(binding["live"]))
+        root = os.fspath(Path(binding["snapshot"]))
+        entry = (
+            live,
+            live if live.endswith("/") else live + "/",
+            root,
+            root[:-1] if root.endswith("/") else root,
+        )
+        table["//" if live.startswith("//") else "/"].append(entry)
+    if isinstance(key, str):
+        _SNAPSHOT_PREFIX_CACHE[key] = table
+    return table
+
+
+def _snapshot_custody_str(snapshot: dict[str, Any], path: str) -> str:
+    marker = "//" if path.startswith("//") else "/"
+    for live, prefix, root, stem in _snapshot_prefixes(snapshot)[marker]:
+        if path == live:
+            return root
+        if path.startswith(prefix):
+            return f"{stem}/{path[len(prefix):]}"
+    raise BulkloadError("AgentPlanV4 source path lacks snapshot custody")
+
+
 def _snapshot_source_path(catalog: dict[str, Any], path: Path) -> Path:
     snapshot = catalog.get("snapshot")
     if not isinstance(snapshot, dict):
         return path
-    matches: list[tuple[int, Path, Path]] = []
-    for binding in snapshot["roots"]:
-        live = Path(binding["live"])
-        try:
-            relative = path.relative_to(live)
-        except ValueError:
-            continue
-        matches.append((len(live.parts), Path(binding["snapshot"]), relative))
-    if not matches:
-        raise BulkloadError("AgentPlanV4 source path lacks snapshot custody")
-    _, root, relative = max(matches, key=lambda item: item[0])
-    return root / relative
+    return Path(_snapshot_custody_str(snapshot, os.fspath(path)))
 
 
 def _object_path(stage_root: Path, digest: str) -> Path:
