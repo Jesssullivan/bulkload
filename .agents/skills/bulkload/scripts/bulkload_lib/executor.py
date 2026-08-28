@@ -208,7 +208,26 @@ def _source_path(
     return source if mirror is None else mirror.joinpath(*source.parts[1:])
 
 
+_PLAN_SOURCE_PATHS_CACHE: dict[str, list[str]] = {}
+
+
 def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
+    # Pure function of an immutable, digest-bound plan. The materialize path
+    # asks for it three times (prepare-receipt validation, allowlist
+    # re-derivation, the required-path set) and the final phase asks again;
+    # each call resolves every operation (~2.2 M on the sting cutover plan),
+    # single-threaded, before a payload byte is touched. Memoize per plan
+    # digest; callers receive a copy so the cached list stays untouched.
+    key = plan.get("plan_sha256")
+    if isinstance(key, str) and key in _PLAN_SOURCE_PATHS_CACHE:
+        return list(_PLAN_SOURCE_PATHS_CACHE[key])
+    result = _plan_source_paths_uncached(plan)
+    if isinstance(key, str):
+        _PLAN_SOURCE_PATHS_CACHE[key] = list(result)
+    return result
+
+
+def _plan_source_paths_uncached(plan: dict[str, Any]) -> list[str]:
     paths: set[str] = set()
     resolver = PlanOperationResolver(plan)
     catalog = plan["source"]["catalog"]
