@@ -60,6 +60,20 @@ DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
 BASE_CUSTODY_MODES = ("full", "sealed")
+
+
+def _custody_identity(path: "str | Path") -> str:
+    """Identity for the required/seen comparison in validate_snapshot_custody.
+
+    The sealed index spells every relative path as the SOURCE filesystem
+    reported it; the plan spells git worktree paths as git's pointer files
+    recorded them. On a case-insensitive source (APFS default) those are one
+    directory entry that can differ only by case, so the two spellings name
+    the same sealed bytes. Folding case here restores the source's identity
+    on a case-sensitive destination; it never changes which bytes are hashed
+    or which digest is compared.
+    """
+    return os.fspath(path).casefold()
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 # Chosen to minimise resident bytes. One chunk of N strings costs ~130 B each;
 # the merge then costs one read block per run, and a block costs twice its size
@@ -3026,7 +3040,10 @@ def validate_snapshot_custody(
     required = (
         None
         if required_paths is None
-        else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
+        else {
+            _custody_identity(Path(os.path.abspath(os.fspath(path))))
+            for path in required_paths
+        }
     )
     # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
     # not from the snapshot copy, so nothing anywhere ever compares the git
@@ -3046,7 +3063,7 @@ def validate_snapshot_custody(
             relatives.add(relative_path)
             relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
         always_relatives[root_index] = relatives
-    seen: set[Path] = set()
+    seen: set[str] = set()
     collected = _BaseRecordMap(
         [item["label"] for item in snapshot["roots"]],
         spill_dir=spill_dir if collect_records else None,
@@ -3109,7 +3126,7 @@ def validate_snapshot_custody(
                 namespace_digest.update(canonical_bytes(list(key)) + b"\0")
                 if collect_records:
                     collected.append(root_index, relative, line)
-                if required is None or original_path in required:
+                if required is None or _custody_identity(original_path) in required:
                     if (
                         payload_custody == "full"
                         or root_index in always_roots
@@ -3142,7 +3159,7 @@ def validate_snapshot_custody(
                                 raise BulkloadError(
                                     "snapshot payload differs from sealed index"
                                 )
-                    seen.add(original_path)
+                    seen.add(_custody_identity(original_path))
                 count += 1
     except OSError as error:
         collected.close()
