@@ -474,12 +474,18 @@ def reflink_clone(
             raise BulkloadError("reflink verification digest mismatch")
         os.replace(temporary, destination)
         fsync_directory(destination.parent)
+        # `os.replace` carries the hashed inode through to `destination`, so
+        # this identity names the exact bytes `observed` was derived from. A
+        # publisher that republishes *this* inode does not have to read the
+        # payload a second time to know its digest.
+        published = destination.stat()
         return {
             "method": "reflink",
             "bytes": source_info.st_size,
             "sha256": observed,
             "source_device": source_info.st_dev,
-            "destination_device": destination.stat().st_dev,
+            "destination_device": published.st_dev,
+            "destination_inode": published.st_ino,
         }
     except (OSError, BulkloadError) as error:
         temporary.unlink(missing_ok=True)
@@ -522,10 +528,13 @@ def accounted_copy(
             raise BulkloadError("capacity-accounted copy digest mismatch")
         os.replace(temporary, destination)
         fsync_directory(destination.parent)
+        published = destination.stat()
         return {
             "method": "capacity-accounted-copy",
             "bytes": source.stat().st_size,
             "sha256": observed,
+            "destination_device": published.st_dev,
+            "destination_inode": published.st_ino,
         }
     except BaseException:
         try:

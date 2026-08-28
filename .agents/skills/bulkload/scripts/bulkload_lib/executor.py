@@ -827,8 +827,28 @@ def _rewrite_payload(source: Path, path_map: list[dict[str, str]]) -> bytes:
     return result
 
 
-def _publish_object(temporary: Path, target: Path, digest: str, size: int) -> bool:
-    """Publish by an O_EXCL hard-link; never replace an existing object."""
+def _publish_object(
+    temporary: Path,
+    target: Path,
+    digest: str,
+    size: int,
+    *,
+    verified: tuple[int, int] | None = None,
+) -> bool:
+    """Publish by an O_EXCL hard-link; never replace an existing object.
+
+    `verified` is the `(st_dev, st_ino)` of the inode whose bytes the caller
+    has just hashed against `digest`. `os.link` publishes that same inode --
+    one inode, one set of bytes -- so when the target carries that identity
+    the object is already content-verified and re-reading it is a second full
+    pass over the payload for nothing.
+
+    Exactly one content verification per object either way. Every other
+    outcome still re-derives the digest from the target: an unverified
+    caller, a target that already existed (`FileExistsError`, so the bytes
+    there are somebody else's), or a link that did not land on the identity
+    the caller vouched for.
+    """
     try:
         os.link(temporary, target, follow_symlinks=False)
         fsync_directory(target.parent)
@@ -841,13 +861,19 @@ def _publish_object(temporary: Path, target: Path, digest: str, size: int) -> bo
         info = target.stat(follow_symlinks=False)
     except FileNotFoundError as error:
         raise BulkloadError("content-addressed object publication failed") from error
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_size != size
-        or sha256_file(target) != digest
-    ):
+    if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+        raise BulkloadError("stage content-addressed object is corrupt")
+    republished = (
+        created and verified is not None and verified == (info.st_dev, info.st_ino)
+    )
+    if not republished and sha256_file(target) != digest:
         raise BulkloadError("stage content-addressed object is corrupt")
     return created
+
+
+def _clone_identity(result: dict[str, Any]) -> tuple[int, int]:
+    """The inode `reflink_clone`/`accounted_copy` verified, for publication."""
+    return (result["destination_device"], result["destination_inode"])
 
 
 def _object_temporary(target: Path) -> Path:
@@ -940,13 +966,19 @@ def _materialize_file(
             and (sha256_file(destination_candidate) == digest)
         ):
             temporary = _object_temporary(target)
-            reflink_clone(
+            clone = reflink_clone(
                 destination_candidate,
                 temporary,
                 expected_sha256=digest,
                 mode=mode,
             )
-            _publish_object(temporary, target, digest, record["size"])
+            _publish_object(
+                temporary,
+                target,
+                digest,
+                record["size"],
+                verified=_clone_identity(clone),
+            )
             stats["destination_reflink_bytes"] += record["size"]
             return {
                 "blob_sha256": digest,
@@ -956,8 +988,14 @@ def _materialize_file(
             }
     temporary = _object_temporary(target)
     try:
-        reflink_clone(source_path, temporary, expected_sha256=digest, mode=mode)
-        _publish_object(temporary, target, digest, record["size"])
+        clone = reflink_clone(source_path, temporary, expected_sha256=digest, mode=mode)
+        _publish_object(
+            temporary,
+            target,
+            digest,
+            record["size"],
+            verified=_clone_identity(clone),
+        )
         stats["source_reflink_bytes"] += record["size"]
     except BulkloadError as clone_error:
         temporary.unlink(missing_ok=True)
@@ -969,13 +1007,19 @@ def _materialize_file(
             raise clone_error
         temporary = _object_temporary(target)
         try:
-            accounted_copy(
+            copied = accounted_copy(
                 source_path,
                 temporary,
                 expected_sha256=digest,
                 mode=mode,
             )
-            _publish_object(temporary, target, digest, record["size"])
+            _publish_object(
+                temporary,
+                target,
+                digest,
+                record["size"],
+                verified=_clone_identity(copied),
+            )
         except BulkloadError as copy_error:
             temporary.unlink(missing_ok=True)
             try:
@@ -1172,8 +1216,14 @@ def _sqlite_stage_entry(
     target = _object_path(stage_root, digest)
     if not target.exists():
         temporary = _object_temporary(target)
-        reflink_clone(composed, temporary, expected_sha256=digest, mode=0o600)
-        _publish_object(temporary, target, digest, composed.stat().st_size)
+        clone = reflink_clone(composed, temporary, expected_sha256=digest, mode=0o600)
+        _publish_object(
+            temporary,
+            target,
+            digest,
+            composed.stat().st_size,
+            verified=_clone_identity(clone),
+        )
         stats["sqlite_compose_bytes"] += composed.stat().st_size
     source_snapshot.unlink(missing_ok=True)
     if destination_snapshot is not None:
