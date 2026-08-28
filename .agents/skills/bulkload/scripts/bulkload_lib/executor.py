@@ -253,6 +253,29 @@ def _source_path(
 
 
 _PLAN_SOURCE_PATHS_CACHE: dict[str, list[str]] = {}
+_PLAN_RESOLVER_CACHE: tuple[str, PlanOperationResolver] | None = None
+
+
+def _plan_resolver(plan: dict[str, Any]) -> PlanOperationResolver:
+    """One reference index per plan digest, not one per pass.
+
+    `PlanOperationResolver.__init__` indexes *both* catalogs; the allowlist
+    derivation and the staging loop each built their own, so a materialize
+    pass indexed the 2.1 GB source catalog twice. The index is a pure
+    function of the digest-bound plan, so keep exactly one -- a single slot,
+    so a second plan releases the first plan's catalogs instead of pinning
+    them.
+    """
+    global _PLAN_RESOLVER_CACHE
+    key = plan.get("plan_sha256")
+    if not isinstance(key, str):
+        return PlanOperationResolver(plan)
+    cached = _PLAN_RESOLVER_CACHE
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    resolver = PlanOperationResolver(plan)
+    _PLAN_RESOLVER_CACHE = (key, resolver)
+    return resolver
 
 
 def _plan_source_paths(plan: dict[str, Any]) -> list[str]:
@@ -337,7 +360,7 @@ def _plan_source_paths_uncached(plan: dict[str, Any]) -> list[str]:
     # `_canonical_absolute` fall back to `Path` only for the shapes that are
     # not already their own normal form.
     paths: set[str] = set()
-    resolver = PlanOperationResolver(plan)
+    resolver = _plan_resolver(plan)
     catalog = plan["source"]["catalog"]
     snapshot = catalog.get("snapshot")
     snapshot = snapshot if isinstance(snapshot, dict) else None
@@ -1691,7 +1714,7 @@ def stage_agent_plan(
         }
     stats = defaultdict(int)
     entries: list[dict[str, Any]] = []
-    resolver = PlanOperationResolver(plan)
+    resolver = _plan_resolver(plan)
     for compact_operation in plan["operations"]:
         operation = resolver.materialize(compact_operation)
         try:
