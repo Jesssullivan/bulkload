@@ -3185,10 +3185,104 @@ def validate_snapshot_custody(
     return collected
 
 
+BREAK_GLASS_NOTE_ENV = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE"
+BREAK_GLASS_EXPECT_ENV = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_EXPECT"
+
+
+def _break_glass_root_observation(root: dict[str, Any]) -> dict[str, Any]:
+    """One live root, read for metadata only, for the break-glass record.
+
+    `expected` is re-derived from the sealed snapshot alone, so a deviation
+    record carrying only `expected` says nothing whatever about the tree that
+    was not fenced -- it can neither support nor refute the "the roots are
+    frozen" precondition the break-glass rests on. This walks the live root
+    with `lstat` and no content read, which is orders of magnitude below one
+    fence pass, and reports what it saw:
+
+    * `mtime_ceiling_ns` -- the highest `st_mtime_ns`/`st_ctime_ns` in the
+      root. A later reader can compare it to the seal time, and a second
+      break-glass line can be compared to the first.
+    * `entries`, `dev`, `ino` -- the shape and identity of the root.
+    * `pruned_leaves` -- how many entries the provider prune rules removed.
+      This is the #24 signature: a root with `pruned_leaves == 0` cannot be
+      affected by the defect the break-glass exists for, so a record whose
+      roots are all zero is evidence it was opened for something else.
+
+    It never raises. It is the record of a bypass, not a second fence.
+    """
+    live = Path(root["live"])
+    provider = root.get("provider")
+    exclusions = root.get("exclusions", ())
+    row: dict[str, Any] = {
+        "dev": None,
+        "entries": 0,
+        "exists": False,
+        "ino": None,
+        "label": root.get("label"),
+        "live": os.fspath(live),
+        "mtime_ceiling_ns": None,
+        "pruned_leaves": 0,
+        "unreadable": 0,
+    }
+    try:
+        info = live.lstat()
+    except OSError:
+        row["unreadable"] = 1
+        return row
+    row["exists"] = True
+    row["dev"] = info.st_dev
+    row["ino"] = info.st_ino
+    row["entries"] = 1
+    ceiling = max(info.st_mtime_ns, info.st_ctime_ns)
+    if stat.S_ISDIR(info.st_mode):
+        for current, directories, files in os.walk(
+            live, topdown=True, followlinks=False
+        ):
+            current_path = Path(current)
+            retained: list[str] = []
+            children: list[Path] = []
+            for name in sorted(directories):
+                child = current_path / name
+                relative = child.relative_to(live).as_posix()
+                if provider is not None and _is_pruned(provider, relative, exclusions):
+                    row["pruned_leaves"] += 1
+                    continue
+                retained.append(name)
+                children.append(child)
+            directories[:] = retained
+            for name in sorted(files):
+                child = current_path / name
+                relative = child.relative_to(live).as_posix()
+                if provider is not None and _is_pruned(provider, relative, exclusions):
+                    row["pruned_leaves"] += 1
+                    continue
+                children.append(child)
+            for child in children:
+                try:
+                    child_info = child.lstat()
+                except OSError:
+                    row["unreadable"] += 1
+                    continue
+                row["entries"] += 1
+                ceiling = max(ceiling, child_info.st_mtime_ns, child_info.st_ctime_ns)
+    row["mtime_ceiling_ns"] = ceiling
+    return row
+
+
 def validate_live_snapshot_generation(
-    snapshot: dict[str, Any], *, passes: int = 2
-) -> None:
+    snapshot: dict[str, Any],
+    *,
+    passes: int = 2,
+    allow_break_glass: bool = True,
+) -> bool:
     """Fence final transport against any source mutation after snapshot B.
+
+    Returns True when the live census actually ran and matched, and False when
+    the disclosed break-glass below skipped it. The return value is the whole
+    contract for a caller that seals an attestation over this observation:
+    such a caller must either refuse the break-glass with
+    `allow_break_glass=False` or carry the False into what it seals. A caller
+    that discards the return is asserting the fence is advisory for it.
 
     `passes` is the number of full-corpus re-derivations. It defaults to 2
     because a single pass is not atomic: `epoch()` walks the roots in order,
@@ -3198,11 +3292,29 @@ def validate_live_snapshot_generation(
     Only a fence that is strictly dominated by a later full-strength fence
     over the same snapshot may ask for `passes=1`.
 
-    `BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE=<path>` is a disclosed operator
-    break-glass for Jesssullivan/bulkload#24: it skips the census entirely and
-    appends one JSON deviation record to `<path>`. It removes the fence, so it
-    is only defensible while the roots are independently known to be frozen,
-    and it retires with #24.
+    Break-glass, for Jesssullivan/bulkload#24. Two variables, both required:
+
+    * `BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE=<path>` -- where the deviation
+      record is appended.
+    * `BULKLOAD_BREAK_GLASS_LIVE_FENCE_EXPECT=<64-hex>` -- the sealed
+      expectation this glass is being opened for. It must equal the `expected`
+      computed here or the call is a hard `BulkloadError`, so an export left
+      in a shell profile, a launchd/systemd unit, a tmux environment or a CI
+      job cannot silently disable a *later* fence over a *different* snapshot.
+      The refusal prints the value to set.
+
+    Callers are process-wide otherwise: `_transport_environment` forwards the
+    environment to children, so both variables reach every subprocess. The
+    skip is for the whole snapshot, not for the affected roots alone --
+    scoping it per root would need a per-root epoch, which is exactly the
+    full-content cost the skip is buying back, so that waits for the #24 fix.
+
+    The fence runs at seven sites, not only in the final phase: five under
+    `phase == "final"` in the stage and push paths, once in `verify_agent_plan`
+    at the cutover release (gated on the destination receipt, not on a phase),
+    and once in `_witness_epoch`. The cutover release passes
+    `allow_break_glass=False`, because it seals `independent_fresh_observation`
+    over this call and a break-glass there would make that receipt a lie.
     """
     if not isinstance(passes, int) or isinstance(passes, bool) or passes < 1:
         raise BulkloadError("live generation fence requires at least one pass")
@@ -3297,36 +3409,58 @@ def validate_live_snapshot_generation(
     # never pass for such a root (Jesssullivan/bulkload#24). Each pass is a
     # full-content read of every root, so computing an epoch only to record a
     # mismatch the issue already explains is cost, not evidence: record the
-    # skip and return before the census. Absent the variable, and once #24
-    # lands, behaviour below is unchanged.
-    note = os.environ.get("BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE")
+    # skip and return before the census. What is recorded is not the skip
+    # alone -- `expected` is a function of the snapshot and observes nothing,
+    # so a metadata-only reading of every live root goes in beside it. Absent
+    # the variables, and once #24 lands, behaviour below is unchanged.
+    note = os.environ.get(BREAK_GLASS_NOTE_ENV, "").strip()
     if note:
-        with open(note, "a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "break_glass": "live-fence-skipped",
-                        "expected": expected,
-                        "passes_requested": passes,
-                        "reason": (
-                            "seal censuses the snapshot copy, fence censuses "
-                            "the live root (bulkload#24)"
-                        ),
-                        "snapshot_id": snapshot.get("snapshot_id"),
-                        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
+        if not allow_break_glass:
+            raise BulkloadError(
+                "live-fence break-glass is refused at this call site: the "
+                "cutover release seals independent_fresh_observation over "
+                "this fence and cannot attest to an observation it skipped"
             )
+        if os.environ.get(BREAK_GLASS_EXPECT_ENV, "").strip().lower() != expected:
+            raise BulkloadError(
+                "live-fence break-glass is not bound to this snapshot: set "
+                f"{BREAK_GLASS_EXPECT_ENV}={expected} to open it here"
+            )
+        observation = [
+            _break_glass_root_observation(root) for root in snapshot["roots"]
+        ]
+        record = {
+            "break_glass": "live-fence-skipped",
+            "expected": expected,
+            "observation": observation,
+            "passes_requested": passes,
+            "reason": (
+                "seal censuses the snapshot copy, fence censuses "
+                "the live root (bulkload#24)"
+            ),
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            with open(note, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as error:
+            # The only non-BulkloadError exit this function had, and it fired
+            # mid-transport. A break-glass whose record cannot be written is
+            # an undisclosed bypass, so it fails closed like everything else.
+            raise BulkloadError(
+                f"live-fence break-glass cannot write its deviation record: {note}"
+            ) from error
+        pruned = sum(row["pruned_leaves"] for row in observation)
         print(
             "bulkload: BREAK-GLASS live fence skipped "
-            f"(expected {expected[:12]}, {passes} pass(es) not computed); "
+            f"(expected {expected[:12]}, {passes} pass(es) not computed, "
+            f"{len(observation)} root(s) observed, {pruned} pruned leaf/leaves); "
             f"deviation recorded at {note}",
             file=sys.stderr,
             flush=True,
         )
-        return
+        return False
 
     # Each epoch re-derives the live generation and compares it to the sealed
     # expectation. Two passes are the default because the walk is sequential
@@ -3338,6 +3472,7 @@ def validate_live_snapshot_generation(
         for _ in range(passes):
             if epoch() != expected:
                 raise BulkloadError("live source changed after immutable snapshot B")
+    return True
 
 
 def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:
@@ -4057,8 +4192,12 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
     cost of the thing Wave 3 would have to run.
 
     `passes=1` is the documented exception, not a shortcut: an observation is
-    strictly dominated by all six real fence sites, which still run at full
-    strength on every path.
+    strictly dominated by the six real fence sites, which run at full strength
+    on every path where the #24 break-glass is not open. Where it *is* open
+    none of them run, this one included, and a witness that printed
+    `divergence=none` for a census it never took would corrupt the Wave 3
+    cost/trade measurement it exists to produce. So the skip is reported as
+    `unobserved`, which is neither divergence nor its absence.
 
     The `except` below is deliberately `Exception` and not `BulkloadError`.
     The fence walks the *live* tree, and a live tree can move underneath it in
@@ -4082,8 +4221,8 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
         return
     with phase_timing("witness"):
         try:
-            validate_live_snapshot_generation(snapshot, passes=1)
-            divergence = "none"
+            observed = validate_live_snapshot_generation(snapshot, passes=1)
+            divergence = "none" if observed else "unobserved: live-fence break-glass"
         except Exception as error:  # noqa: BLE001 — an observation may not fail a capture
             divergence = f"{type(error).__name__}: {error}"
         with suppress(Exception):

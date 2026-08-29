@@ -2684,7 +2684,15 @@ def verify_agent_plan(
         if not isinstance(snapshot, dict):
             raise BulkloadError("cutover release requires immutable source B custody")
         validate_snapshot_custody(snapshot)
-        validate_live_snapshot_generation(snapshot)
+        # `allow_break_glass=False`, and only here. This site is not gated on
+        # a phase -- it runs whenever a destination receipt is presented --
+        # and the receipt built immediately below seals
+        # `independent_fresh_observation: True` and `verified: True`, which
+        # `validate_verify_receipt` then *requires*. Under the #24 break-glass
+        # that observation would not have happened, and the sealed receipt
+        # would be byte-identical to an honest one. So the bypass is refused
+        # at the one site that would launder it into a clean cutover.
+        validate_live_snapshot_generation(snapshot, allow_break_glass=False)
         receipt = {
             "apply_receipt_sha256": apply_receipt["receipt_sha256"],
             "destination_verify_receipt_sha256": destination_verify_receipt[
