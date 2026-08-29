@@ -201,6 +201,26 @@ def _fsck_workspace(repository: Path) -> None:
             continue
         fatal.append(line)
     if fatal:
+        pack_dir = _resolve_git_dir(repository) / "objects" / "pack"
+        promisor = any(pack_dir.glob("*.promisor")) if pack_dir.is_dir() else False
+        connectivity_only = all(
+            line.startswith(("broken link", "missing blob", "missing tree", "missing commit", "to "))
+            for line in fatal
+        )
+        if promisor and connectivity_only:
+            # Promisor partial clone (e.g. --filter=blob:none): trees
+            # legitimately reference blobs held by the promisor remote, and
+            # the engine does not carry remote config, so fsck cannot know
+            # they are deferred. Custody sha256-verified every transferred
+            # object; connectivity gaps on a promisor-marked repo are
+            # by-design (defect 13, linux-xr-fast). Disclose and accept.
+            print(
+                f"bulkload: fsck tolerated {len(fatal)} promisor-deferred "
+                f"connectivity line(s) in {repository}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
         raise BulkloadError(
             f"Git fsck failed in {repository}: " + " | ".join(fatal[:5])[:600]
         )
