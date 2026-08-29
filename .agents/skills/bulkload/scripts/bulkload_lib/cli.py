@@ -10,7 +10,7 @@ import socket
 import sqlite3
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from . import __version__
 from .executor import (
@@ -42,6 +42,7 @@ from .scanner import (
     capture_agent_state,
     configure_progress,
     emit_progress,
+    unaccounted_seconds,
     validate_agent_capture,
 )
 
@@ -152,9 +153,12 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def _protect_output(arguments: argparse.Namespace) -> None:
-    if arguments.output == "-":
-        return
+def _evidence_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Every root this verb must not write beside its evidence.
+
+    Reads the verb's evidence to get there, which for `agent-plan` means four
+    multi-gigabyte captures, so callers compute it once and share the result.
+    """
     roots: list[Path] = []
     if arguments.command == "agent-capture":
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
@@ -197,7 +201,19 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         )
     if hasattr(arguments, "stage_root"):
         roots.append(Path(arguments.stage_root))
-    assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    return roots
+
+
+def _protect_output(arguments: argparse.Namespace, protected: Sequence[Path]) -> None:
+    """Refuse an evidence output that lands in a root this verb owns.
+
+    Takes the roots rather than deriving them, because the same derivation
+    also guards `--progress-log` and for `agent-plan` it costs four
+    multi-gigabyte reads.
+    """
+    if arguments.output == "-":
+        return
+    assert_no_overlap(Path(arguments.output), protected, "evidence output")
 
 
 def _parse_mapping(value: str) -> tuple[str, str]:
@@ -483,7 +499,73 @@ def _cheap_protected_roots(arguments: argparse.Namespace) -> list[Path]:
     return roots
 
 
-def _open_progress_log(arguments: argparse.Namespace) -> Any:
+# One telemetry line is ~120 bytes and only the run banner is written before
+# activation, so this bound is three orders of magnitude of headroom against a
+# sink that never opens.
+MAX_BUFFERED_PROGRESS_LINES = 1024
+
+
+class _DeferredProgressLog:
+    """A `--progress-log` that does not exist until it is proven safe.
+
+    The advertised refusal — "it must not live under any live, stage, or
+    snapshot root" — held for `agent-capture` alone, because that is the one
+    verb whose roots are all readable straight off the flags. `agent-apply`'s
+    destination roots live inside the plan, and the file was created `O_CREAT`
+    before the plan was read, so `--progress-log <path under the destination
+    home>` planted a file in the destination live tree that the apply journal
+    does not record and `agent-rollback` therefore does not remove.
+
+    Opening the file earlier cannot fix that; opening it later can. Lines are
+    buffered from the first banner until `activate` has cleared the candidate
+    against the complete per-verb root set, and only then is the file created.
+    A verb that refuses before activation leaves nothing behind at all — the
+    refusal is still printed on stderr, which is the sink that is always
+    there.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._buffer: list[str] = []
+        self._stream: Any = None
+
+    def activate(self, protected: Iterable[Path]) -> None:
+        assert_no_overlap(self.path, protected, "progress log")
+        descriptor = os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        stream = os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", closefd=True)
+        for line in self._buffer:
+            stream.write(line)
+        self._buffer.clear()
+        stream.flush()
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        if self._stream is not None:
+            self._stream.write(text)
+        elif len(self._buffer) < MAX_BUFFERED_PROGRESS_LINES:
+            self._buffer.append(text)
+
+    def flush(self) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+
+    def close(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.close()
+
+
+def _open_progress_log(arguments: argparse.Namespace) -> _DeferredProgressLog | None:
+    """Bind the progress log and refuse everything the flags alone can refuse.
+
+    This is the cheap half of the guard: it runs before the first telemetry
+    line, so it may not open evidence. The complete half is
+    `_DeferredProgressLog.activate`.
+    """
     path = getattr(arguments, "progress_log", None)
     if not path:
         return None
@@ -492,12 +574,7 @@ def _open_progress_log(arguments: argparse.Namespace) -> Any:
     if output and output != "-" and Path(output).expanduser() == candidate:
         raise BulkloadError("progress log must not be the evidence output path")
     assert_no_overlap(candidate, _cheap_protected_roots(arguments), "progress log")
-    descriptor = os.open(
-        candidate,
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
-    return os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", closefd=True)
+    return _DeferredProgressLog(candidate)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -693,7 +770,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             f" host={socket.gethostname()}"
         )
         try:
-            _protect_output(arguments)
+            # One derivation, two guards. The evidence output and the progress
+            # log are both writes this verb makes outside its own contract,
+            # and both must clear the same roots. Computing it here also
+            # means the progress log clears the roots that only the evidence
+            # names — the destination home in an apply plan, the source roots
+            # in a stage prepare receipt — which the flag-only check cannot
+            # see.
+            protected: list[Path] = []
+            if log is not None or arguments.output != "-":
+                protected = _evidence_protected_roots(arguments)
+            if log is not None:
+                log.activate([*protected, *_cheap_protected_roots(arguments)])
+            _protect_output(arguments, protected)
             result = arguments.handler(arguments)
             _write(arguments.output, result)
         except (BulkloadError, OSError, sqlite3.Error) as error:
@@ -704,15 +793,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = 0
         return 0
     finally:
+        elapsed = time.monotonic() - started
+        # Lane F's ask: name the hole rather than let the next one hide. If
+        # the timed phases do not cover 90% of the run, say how much they
+        # missed instead of leaving it to be inferred from a wall clock.
+        unaccounted = unaccounted_seconds(elapsed)
+        if unaccounted is not None:
+            emit_progress(
+                "bulkload-phase"
+                " phase=UNACCOUNTED"
+                " root=-"
+                f" seconds={unaccounted:.3f}"
+                " files=-"
+                " bytes=-"
+            )
         emit_progress(
             "bulkload-run"
             " event=end"
             f" verb={arguments.command}"
-            f" seconds={time.monotonic() - started:.3f}"
+            f" seconds={elapsed:.3f}"
             f" status={status}"
             f" exit={'-' if code is None else code}"
         )
-        configure_progress(stderr=not arguments.quiet, log_stream=None)
+        # `interval=None` means "keep", so the process-global heartbeat has to
+        # be restored by name or a caller's tuning outlives its own run.
+        configure_progress(
+            stderr=not arguments.quiet,
+            interval=DEFAULT_HEARTBEAT_SECONDS,
+            log_stream=None,
+        )
         if log is not None:
             try:
                 log.close()

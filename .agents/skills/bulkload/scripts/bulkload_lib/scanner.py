@@ -297,6 +297,8 @@ _PROGRESS_STDERR = True
 _PROGRESS_LOG: Any = None
 _PROGRESS_INTERVAL = DEFAULT_HEARTBEAT_SECONDS
 _PROGRESS_PHASES = threading.local()
+_PROGRESS_ACCOUNTED = 0.0
+_PROGRESS_ACCOUNT_LOCK = threading.Lock()
 
 
 def configure_progress(
@@ -313,12 +315,43 @@ def configure_progress(
     guarded so a broken sink cannot fail a cutover.
     """
     global _PROGRESS_STDERR, _PROGRESS_LOG, _PROGRESS_INTERVAL
+    reset_phase_accounting()
     if interval is not None:
         if not 0 < float(interval) <= MAX_HEARTBEAT_SECONDS:
             raise BulkloadError("progress heartbeat interval is out of range")
         _PROGRESS_INTERVAL = float(interval)
     _PROGRESS_STDERR = bool(stderr)
     _PROGRESS_LOG = log_stream
+
+
+def reset_phase_accounting() -> None:
+    """Forget the phase seconds accumulated so far. One run, one budget."""
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED = 0.0
+
+
+def _account_phase(seconds: float) -> None:
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED += seconds
+
+
+def unaccounted_seconds(elapsed: float, *, threshold: float = 0.9) -> float | None:
+    """Seconds of a run that no phase claimed, when that is worth saying.
+
+    Lane F asked for this by name: name the holes the instrumentation does
+    not cover, or the next hidden hole stays invisible. The profile lane
+    spent a day inferring a 29-minute gap that the engine could have printed.
+    Returns `None` when nothing was timed (there is no budget to compare
+    against) or when the timed phases already account for `threshold` of the
+    wall clock.
+    """
+    with _PROGRESS_ACCOUNT_LOCK:
+        accounted = _PROGRESS_ACCOUNTED
+    if elapsed <= 0 or accounted <= 0 or accounted >= elapsed * threshold:
+        return None
+    return elapsed - accounted
 
 
 def progress_enabled() -> bool:
@@ -339,22 +372,38 @@ def progress_enabled() -> bool:
 
 
 def emit_progress(line: str) -> None:
-    """Write one telemetry line to every bound sink. Never raises."""
+    """Write one telemetry line to every bound sink. Never raises.
+
+    "Never raises" is load-bearing and was not true of the first cut. This
+    runs inside `phase_timing`'s `finally` and inside `cli.main`'s `finally`,
+    so anything that escapes here replaces an in-flight refusal with a
+    telemetry error and destroys the error path. The measured case: run any
+    verb with fd 2 closed (`2>&-`) and CPython sets `sys.stderr` to `None`,
+    at which point `sys.stderr.write` raises `AttributeError` — which is
+    neither `OSError` nor `ValueError`, and which `cli.main`'s
+    `except (BulkloadError, OSError, sqlite3.Error)` does not catch either.
+    A missing input then exited 1 with no message at all instead of naming
+    the file. Hence the `None` guard and the deliberately blind excepts: a
+    diagnostic sink may never decide the outcome of a cutover.
+    """
     if not progress_enabled():
         return
     text = line if line.endswith("\n") else line + "\n"
-    if _PROGRESS_STDERR:
+    # Bind once: `sys.stderr` is process-global and another thread may swap or
+    # close it between the guard and the write.
+    stream = sys.stderr if _PROGRESS_STDERR else None
+    if stream is not None:
         try:
-            sys.stderr.write(text)
-            sys.stderr.flush()
-        except (OSError, ValueError):
+            stream.write(text)
+            stream.flush()
+        except Exception:
             pass
     log = _PROGRESS_LOG
     if log is not None:
         try:
             log.write(text)
             log.flush()
-        except (OSError, ValueError):
+        except Exception:
             pass
 
 
@@ -379,6 +428,7 @@ class _PhaseSample:
         "unit",
         "phase",
         "root",
+        "_advanced",
         "_started",
         "_last",
     )
@@ -393,18 +443,30 @@ class _PhaseSample:
         self.bytes: int | None = None
         self.files: int | None = None
         self.done = 0
-        self.observed_bytes = 0
+        # `None` until something measures bytes, because a measured zero and
+        # an unmeasured field must not print the same character. `-` means
+        # "cannot measure" everywhere in this format.
+        self.observed_bytes: int | None = None
         self.total = total
         self.unit = unit
         self.phase = phase
         self.root = root
+        # Distinguishes "advanced zero times" from "advanced, and the count
+        # is zero", which `done or None` could not.
+        self._advanced = False
         self._started = time.monotonic()
         self._last = self._started
 
-    def advance(self, count: int = 1, *, observed: int = 0) -> None:
-        """Count `count` more units of work and heartbeat if a tick is due."""
+    def advance(self, count: int = 1, *, observed: int | None = None) -> None:
+        """Count `count` more units of work and heartbeat if a tick is due.
+
+        `observed=None` means this caller does not measure bytes at all;
+        `observed=0` means it measured and the answer was zero.
+        """
         self.done += count
-        self.observed_bytes += observed
+        self._advanced = True
+        if observed is not None:
+            self.observed_bytes = (self.observed_bytes or 0) + observed
         self.heartbeat()
 
     def heartbeat(self, *, force: bool = False) -> None:
@@ -422,7 +484,7 @@ class _PhaseSample:
             f" unit={self.unit}"
             f" done={self.done}"
             f" total={'-' if self.total is None else self.total}"
-            f" bytes={self.observed_bytes}"
+            f" bytes={'-' if self.observed_bytes is None else self.observed_bytes}"
             f" rate={rate}"
             f" eta={eta}"
         )
@@ -436,7 +498,7 @@ def _phase_stack() -> list[_PhaseSample]:
     return stack
 
 
-def progress_tick(count: int = 1, *, observed: int = 0) -> None:
+def progress_tick(count: int = 1, *, observed: int | None = None) -> None:
     """Advance the innermost timed phase on this thread, if there is one.
 
     Deep walk helpers use this instead of threading a sample through every
@@ -447,6 +509,18 @@ def progress_tick(count: int = 1, *, observed: int = 0) -> None:
     if not stack:
         return
     stack[-1].advance(count, observed=observed)
+
+
+def progress_total(total: int) -> None:
+    """Bind the innermost timed phase's denominator once it is known.
+
+    The count of work a phase will do is often discovered inside the phase
+    (the workspace inventory, for example). Without this the heartbeat can
+    only print elapsed time; with it, `total`, `rate` and `eta` are real.
+    """
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if stack:
+        stack[-1].total = total
 
 
 def _heartbeat_watchdog(sample: _PhaseSample, stop: threading.Event) -> None:
@@ -497,17 +571,22 @@ def phase_timing(
             ticker.join(timeout=5.0)
         if stack and stack[-1] is sample:
             stack.pop()
-        files = sample.files if sample.files is not None else (sample.done or None)
-        observed = (
-            sample.bytes
-            if sample.bytes is not None
-            else (sample.observed_bytes or None)
+        elapsed = time.monotonic() - started
+        if not stack:
+            # Only outermost phases are summed, so a nested phase cannot be
+            # counted twice against the run's wall clock.
+            _account_phase(elapsed)
+        files = (
+            sample.files
+            if sample.files is not None
+            else (sample.done if sample._advanced else None)
         )
+        observed = sample.bytes if sample.bytes is not None else sample.observed_bytes
         emit_progress(
             "bulkload-phase"
             f" phase={phase}"
             f" root={root}"
-            f" seconds={time.monotonic() - started:.3f}"
+            f" seconds={elapsed:.3f}"
             f" files={'-' if files is None else files}"
             f" bytes={'-' if observed is None else observed}"
         )
@@ -2696,6 +2775,7 @@ def _snapshot_delta_charge(
                 and _provider_classification(provider, relative) == "sqlite"
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
             elif not _base_regular_reusable(
                 child,
                 base_path,
@@ -2703,6 +2783,11 @@ def _snapshot_delta_charge(
                 (base_records or {}).get(relative),
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
+            else:
+                # Reused from the base: examined, charged nothing. `bytes=0`
+                # is the measurement, not the absence of one.
+                progress_tick(observed=0)
     return charged
 
 
@@ -3503,7 +3588,7 @@ def validate_live_snapshot_generation(
     # is reachable whenever a straggler write lands mid-walk, behind the
     # cursor. The only term that was genuinely dead in the original fence is
     # `first != second`, which the other two comparisons already imply.
-    with phase_timing("validate", unit="entries"):
+    with phase_timing("validate", unit="entries", watchdog=True):
         for _ in range(passes):
             if epoch() != expected:
                 raise BulkloadError("live source changed after immutable snapshot B")
@@ -3952,6 +4037,9 @@ def _capture_live_snapshot(
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
         spill_dir = _base_record_spill_dir(snapshot_root, partial)
+        # No watchdog: this encloses `custody-base`, which carries the real
+        # denominator and ticks per record. Two heartbeat streams for the same
+        # 940 s of work, one of them permanently at `done=0`, reads as stalled.
         with phase_timing("base-custody", unit="records"):
             base_index = validate_snapshot_custody(
                 base_snapshot,
@@ -3999,7 +4087,7 @@ def _capture_live_snapshot(
         censuses.append(observed)
     charged_bytes = 0
     for index, (label, live, provider, excluded) in enumerate(descriptors):
-        with phase_timing("charge", label, unit="entries") as sample:
+        with phase_timing("charge", label, unit="entries", watchdog=True) as sample:
             charge = _snapshot_delta_charge(
                 live,
                 base_paths[index],
@@ -4087,7 +4175,7 @@ def _capture_live_snapshot(
             binding = seat_bindings[name]
             snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
             snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
-        with phase_timing("catalog"):
+        with phase_timing("catalog", unit="workspaces", watchdog=True):
             captured = capture_agent_state(
                 role=role,
                 home=home,
@@ -4146,7 +4234,7 @@ def _capture_live_snapshot(
                 if item["classification"] == "sqlite"
             ]
         partial_index = partial / "snapshot-index.jsonl"
-        with phase_timing("seal") as sample:
+        with phase_timing("seal", watchdog=True) as sample:
             index_sha256, index_entries = _write_snapshot_index(
                 partial_index, work_roots, transfer_ledgers
             )
@@ -4429,11 +4517,21 @@ def capture_agent_state(
             return common, representative, error
 
     workspace_workers = workspace_worker_count(jobs, len(workspace_inputs))
+    progress_total(len(workspace_inputs))
+    workspace_results: list[
+        tuple[
+            Path,
+            Path,
+            tuple[dict[str, Any], list[dict[str, str]]]
+            | _OpaqueGitFallback
+            | BulkloadError,
+        ]
+    ] = []
     if workspace_workers:
         with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
-            workspace_results = list(pool.map(capture_workspace, workspace_inputs))
-    else:
-        workspace_results = []
+            for outcome in pool.map(capture_workspace, workspace_inputs):
+                workspace_results.append(outcome)
+                progress_tick()
     workspaces: list[dict[str, Any]] = []
     for common, representative, result in workspace_results:
         if isinstance(result, tuple):

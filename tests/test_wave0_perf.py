@@ -9,6 +9,7 @@ removing a fence.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import io
@@ -1247,7 +1248,68 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                 self.assertEqual(runs[1]["exit"], "0")
                 self.assertTrue(self._lines(text, "bulkload-phase"))
 
+    @staticmethod
+    def _stub_catalog(home: Path, git_root: Path) -> dict[str, object]:
+        """The least evidence `_evidence_protected_roots` needs to name roots."""
+        return {
+            "catalog": {
+                "root_bindings": {
+                    "home": str(home),
+                    "git_root": str(git_root),
+                },
+                "providers": [],
+                "seats": [],
+            }
+        }
+
     def test_a_refusing_verb_still_closes_its_own_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log_path = root / "progress.log"
+            # Readable evidence, so the root set is known and the log is
+            # created; the refusal then happens inside the verb.
+            captures = []
+            for name in "abcd":
+                path = root / f"{name}.json"
+                path.write_bytes(
+                    canonical_bytes(
+                        self._stub_catalog(root / "home", root / "home" / "git")
+                    )
+                    + b"\n"
+                )
+                captures.append(str(path))
+            stream = io.StringIO()
+            with contextlib.redirect_stderr(stream):
+                code = cli.main(
+                    [
+                        "agent-plan",
+                        "--source-a",
+                        captures[0],
+                        "--source-b",
+                        captures[1],
+                        "--destination-a",
+                        captures[2],
+                        "--destination-b",
+                        captures[3],
+                        "--output",
+                        str(root / "plan.json"),
+                        "--progress-log",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 1)
+            runs = self._lines(log_path.read_text(encoding="utf-8"), "bulkload-run")
+            self.assertEqual([item["event"] for item in runs], ["start", "end"])
+            self.assertEqual(runs[1]["status"], "fail")
+            self.assertEqual(runs[1]["exit"], "1")
+
+    def test_unreadable_evidence_plants_nothing_and_still_names_the_file(self) -> None:
+        """The log is created only once the complete root set has cleared it.
+
+        A verb that cannot read the evidence naming its roots has not proven
+        the log is safe to create, so it does not create it. stderr is the
+        sink that is always there, and it still carries the refusal.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             log_path = root / "progress.log"
@@ -1271,10 +1333,246 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 1)
-            runs = self._lines(log_path.read_text(encoding="utf-8"), "bulkload-run")
+            self.assertFalse(log_path.exists())
+            self.assertIn("missing-a.json", stream.getvalue())
+            runs = self._lines(stream.getvalue(), "bulkload-run")
             self.assertEqual([item["event"] for item in runs], ["start", "end"])
             self.assertEqual(runs[1]["status"], "fail")
-            self.assertEqual(runs[1]["exit"], "1")
+
+    def test_a_progress_log_may_not_land_in_a_root_only_the_plan_names(self) -> None:
+        """The refusal has to hold on the verb that mutates the destination.
+
+        `_cheap_protected_roots` reads flags only, and `agent-apply` carries
+        none of the root flags — so before this the protected set for apply
+        was `--rollback-root` alone and a `--progress-log` under the
+        destination home was created, unjournalled, in the live tree that
+        `agent-rollback` restores.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination_home = root / "destination-home"
+            (destination_home / "git").mkdir(parents=True)
+            plan_path = root / "plan.json"
+            plan_path.write_bytes(
+                canonical_bytes(
+                    {
+                        "source": self._stub_catalog(
+                            root / "source-home", root / "source-home" / "git"
+                        ),
+                        "destination": self._stub_catalog(
+                            destination_home, destination_home / "git"
+                        ),
+                    }
+                )
+                + b"\n"
+            )
+            log_path = destination_home / "progress.log"
+            arguments = build_parser().parse_args(
+                [
+                    "agent-apply",
+                    "--plan",
+                    str(plan_path),
+                    "--stage-receipt",
+                    str(root / "stage.json"),
+                    "--accept-plan-sha256",
+                    "0" * 64,
+                    "--journal",
+                    str(root / "journal.json"),
+                    "--rollback-root",
+                    str(root / "rollback"),
+                    "--output",
+                    str(root / "apply.json"),
+                    "--progress-log",
+                    str(log_path),
+                ]
+            )
+            # The regression, pinned: the flag-only set cannot see it.
+            self.assertNotIn(destination_home, cli._cheap_protected_roots(arguments))
+            stream = io.StringIO()
+            with contextlib.redirect_stderr(stream):
+                code = cli.main(
+                    [
+                        "agent-apply",
+                        "--plan",
+                        str(plan_path),
+                        "--stage-receipt",
+                        str(root / "stage.json"),
+                        "--accept-plan-sha256",
+                        "0" * 64,
+                        "--journal",
+                        str(root / "journal.json"),
+                        "--rollback-root",
+                        str(root / "rollback"),
+                        "--output",
+                        str(root / "apply.json"),
+                        "--progress-log",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("progress log overlaps live root", stream.getvalue())
+            self.assertFalse(log_path.exists())
+
+    def test_a_closed_stderr_cannot_kill_a_verb(self) -> None:
+        """Telemetry may never decide the outcome of a cutover.
+
+        With fd 2 closed CPython sets `sys.stderr` to `None`, and
+        `sys.stderr.write` then raises `AttributeError` — outside the
+        `(OSError, ValueError)` the first cut guarded, and outside
+        `cli.main`'s `(BulkloadError, OSError, sqlite3.Error)` as well. The
+        measured effect was a verb that exited 1 with no message at all
+        instead of naming the file it could not open.
+        """
+        scanner.configure_progress(stderr=True, interval=1.0)
+        with mock.patch.object(scanner.sys, "stderr", None):
+            scanner.emit_progress("bulkload-run event=start verb=probe")
+
+        class Hostile:
+            def write(self, text: str) -> None:
+                raise AttributeError("sink is gone")
+
+            def flush(self) -> None:
+                raise AttributeError("sink is gone")
+
+        scanner.configure_progress(stderr=False, log_stream=Hostile())
+        self.addCleanup(scanner.configure_progress, stderr=True, log_stream=None)
+        scanner.emit_progress("bulkload-run event=start verb=probe")
+        with scanner.phase_timing("fake") as sample:
+            sample.advance()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scanner.configure_progress(stderr=True, log_stream=None)
+            captured = io.StringIO()
+            with mock.patch.object(cli.sys, "stderr", None):
+                with contextlib.redirect_stdout(captured):
+                    code = cli.main(
+                        [
+                            "agent-plan",
+                            "--source-a",
+                            str(root / "missing-a.json"),
+                            "--source-b",
+                            str(root / "missing-b.json"),
+                            "--destination-a",
+                            str(root / "missing-c.json"),
+                            "--destination-b",
+                            str(root / "missing-d.json"),
+                            "--output",
+                            str(root / "plan.json"),
+                        ]
+                    )
+            self.assertEqual(code, 1)
+            self.assertIn("bulkload: FAIL:", captured.getvalue())
+            self.assertIn("missing-a.json", captured.getvalue())
+
+    def test_a_measured_zero_is_not_an_unmeasured_field(self) -> None:
+        """`-` means "cannot measure". A zero that was measured prints `0`."""
+        scanner.configure_progress(stderr=True, interval=3600.0)
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            with scanner.phase_timing("counted") as sample:
+                sample.advance(3, observed=0)
+            with scanner.phase_timing("untouched"):
+                pass
+            with scanner.phase_timing("byteless") as sample:
+                sample.advance()
+        exits = {
+            fields["phase"]: fields
+            for fields in self._lines(stream.getvalue(), "bulkload-phase")
+        }
+        # Advanced three units, measured zero bytes.
+        self.assertEqual(exits["counted"]["files"], "3")
+        self.assertEqual(exits["counted"]["bytes"], "0")
+        # Never advanced: nothing was measured either way.
+        self.assertEqual(exits["untouched"]["files"], "-")
+        self.assertEqual(exits["untouched"]["bytes"], "-")
+        # Advanced without ever measuring bytes.
+        self.assertEqual(exits["byteless"]["files"], "1")
+        self.assertEqual(exits["byteless"]["bytes"], "-")
+
+    def test_the_run_names_the_seconds_no_phase_claimed(self) -> None:
+        """Lane F: print the hole, do not leave it to be inferred."""
+        scanner.reset_phase_accounting()
+        # Nothing timed at all: there is no budget to compare against.
+        self.assertIsNone(scanner.unaccounted_seconds(10.0))
+        with scanner.phase_timing("fake"):
+            time.sleep(0.02)
+        # A phase that covers its run reports no hole...
+        self.assertIsNone(scanner.unaccounted_seconds(0.02))
+        # ...and one that covers a fraction of it names the remainder.
+        gap = scanner.unaccounted_seconds(10.0)
+        self.assertIsNotNone(gap)
+        self.assertGreater(gap, 9.0)
+        # A nested phase is not charged twice against the same wall clock.
+        scanner.reset_phase_accounting()
+        with scanner.phase_timing("outer"):
+            with scanner.phase_timing("inner"):
+                time.sleep(0.05)
+        self.assertLess(scanner.unaccounted_seconds(10.0), 10.0 - 0.05)
+        self.assertGreater(scanner.unaccounted_seconds(10.0), 10.0 - 0.10)
+
+    def test_the_longest_measured_phases_heartbeat_while_they_run(self) -> None:
+        """The lane's headline complaint: a 37-minute catalog printed one line.
+
+        `catalog` (2,216 s measured), `charge` (479 s) and `validate` block in
+        calls that could not advance a counter, so a watchdog has to.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            stream = io.StringIO()
+            scanner.configure_progress(stderr=True, interval=0.02)
+            with contextlib.redirect_stderr(stream):
+                capture = live_capture(fixture, "source-a")
+            validate_agent_capture(capture, expected_role="source")
+            text = stream.getvalue()
+            # The measured defect, gone: the phase narrates itself while it
+            # runs instead of printing one line 37 minutes later.
+            self.assertIn("bulkload-progress phase=catalog ", text)
+            # And it counts real work rather than only elapsed time.
+            catalog = [
+                fields
+                for fields in self._lines(text, "bulkload-phase")
+                if fields["phase"] == "catalog"
+            ]
+            self.assertEqual(len(catalog), 1)
+            self.assertNotEqual(catalog[0]["files"], "-")
+            # `charge` walks the corpus and now reports its position too.
+            charge = [
+                fields
+                for fields in self._lines(text, "bulkload-phase")
+                if fields["phase"] == "charge" and fields["root"] == "git"
+            ]
+            self.assertTrue(charge)
+            self.assertGreater(int(charge[0]["files"]), 0)
+
+    def test_every_phase_that_can_block_carries_a_watchdog(self) -> None:
+        """Structural, because a fixture phase is too fast to time out.
+
+        These are the phases measured in the 2026-08-27 ceremony logs that
+        block inside one call: catalog 2,216 s, seal 810 s, charge 479 s, and
+        the pre/post live-epoch walks in validate. `base-custody` (940 s) is
+        excluded on purpose: it encloses `custody-base`, which already ticks
+        per record against a real total.
+        """
+        required = {"catalog", "charge", "validate", "seal"}
+        source = Path(scanner.__file__).read_text(encoding="utf-8")
+        observed = set()
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", getattr(node.func, "attr", None))
+            if name != "phase_timing" or not node.args:
+                continue
+            first = node.args[0]
+            if not isinstance(first, ast.Constant) or first.value not in required:
+                continue
+            watchdog = [
+                keyword.value for keyword in node.keywords if keyword.arg == "watchdog"
+            ]
+            self.assertTrue(watchdog, first.value)
+            self.assertIs(watchdog[0].value, True, first.value)
+            observed.add(first.value)
+        self.assertEqual(observed, required)
 
     def test_a_progress_log_may_not_land_inside_a_live_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
