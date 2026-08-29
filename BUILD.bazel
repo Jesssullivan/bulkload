@@ -50,6 +50,20 @@ py_test(
 )
 
 py_test(
+    name = "wave2_memory_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_wave2_memory.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_wave0_perf.py",
+        "tests/test_wave2_memory.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "bazel_binary_smoke_test",
     legacy_create_init = 0,
     main = "tests/test_bazel_binary_smoke.py",
@@ -141,5 +155,6 @@ test_suite(
         ":runtime_bootstrap_tests",
         ":skill_contract_test",
         ":wave0_perf_tests",
+        ":wave2_memory_tests",
     ],
 )

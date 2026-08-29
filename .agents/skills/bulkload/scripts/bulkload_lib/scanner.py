@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from array import array
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -33,6 +35,7 @@ from .model import (
     durable_makedirs,
     ensure_safe_target,
     fsync_directory,
+    git_environment,
     new_id,
     normalize_relative,
     reflink_clone,
@@ -58,6 +61,15 @@ MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
 BASE_CUSTODY_MODES = ("full", "sealed")
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
+# Chosen to minimise resident bytes. One chunk of N strings costs ~130 B each;
+# the merge then costs one read block per run, and a block costs twice its size
+# because the reader splits it before yielding. So the total is smallest near
+# sqrt(entries * 2 * block / 130). At 65_536 and a 64 KiB block a 1.8 M-entry
+# root holds ~8.5 MB of chunk and ~7 MB of merge blocks instead of ~1 GB of
+# list. Undersizing the chunk is the expensive mistake, not oversizing it: it
+# trades one linear term for a quadratic one in the run count.
+NAMESPACE_SORT_CHUNK = 65_536
+NAMESPACE_RUN_BLOCK_BYTES = 64 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
@@ -240,6 +252,22 @@ def _is_regenerate_namespace(provider: str, relative: str) -> bool:
     return provider == "pi" and parts[:1] in {("cache",), ("logs",), ("tmp",)}
 
 
+def _is_pruned(provider: str | None, relative: str, exclusions: Sequence[str]) -> bool:
+    """The one prune rule: a managed exclusion or a regenerate namespace.
+
+    This predicate decides which paths a census, a copy and a charge all agree
+    not to see, so it fixes `generation_sha256` and `index_sha256`. It used to
+    be spelled out at eight call sites, and *not* identically: the six sites in
+    the census, the copy and the charge guard it with `provider is not None`,
+    while the two inside `_capture_provider` do not. That asymmetry is
+    preserved at the call sites rather than folded in here, because folding it
+    in would change `_capture_provider`'s behaviour for a None provider.
+    """
+    return _is_excluded(relative, exclusions) or _is_regenerate_namespace(
+        provider, relative
+    )
+
+
 def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen_sources: set[str] = set()
@@ -313,24 +341,6 @@ def workspace_worker_count(jobs: int | None, pending: int) -> int:
     return min(resolved, pending)
 
 
-def _git_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "LC_ALL": "C",
-        }
-    )
-    return environment
-
-
 def _git(
     repository: Path,
     arguments: Sequence[str],
@@ -345,7 +355,7 @@ def _git(
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=git_environment(),
         )
     except OSError as error:
         raise BulkloadError("Git is unavailable") from error
@@ -881,7 +891,7 @@ class _GitBlobBatch:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    env=_git_environment(),
+                    env=git_environment(),
                 )
             except OSError as error:
                 raise BulkloadError("Git is unavailable") from error
@@ -1646,9 +1656,7 @@ def _capture_provider(
         for name in sorted(directories):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -1674,9 +1682,7 @@ def _capture_provider(
         for name in sorted(names):
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
-            if _is_excluded(relative, exclusions) or _is_regenerate_namespace(
-                provider, relative
-            ):
+            if _is_pruned(provider, relative, exclusions):
                 continue
             try:
                 info = path.stat(follow_symlinks=False)
@@ -2112,10 +2118,7 @@ def _tree_census(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             kind, _ = observe(child, relative)
             if kind == "directory":
@@ -2129,10 +2132,7 @@ def _tree_census(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(root).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
@@ -2285,7 +2285,7 @@ def _copy_live_tree(
     exclusions: Sequence[str],
     max_sqlite_rows: int,
     base: Path | None = None,
-    base_records: dict[str, dict[str, Any]] | None = None,
+    base_records: _RootRecords | dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, int], dict[str, dict[str, int | str]]]:
     methods: dict[str, int] = defaultdict(int)
     ledger: dict[str, dict[str, int | str]] = {}
@@ -2330,10 +2330,7 @@ def _copy_live_tree(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             info = child.stat(follow_symlinks=False)
             target = target_parent / name
@@ -2364,10 +2361,7 @@ def _copy_live_tree(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if any(name.lower().endswith(suffix) for suffix in SQLITE_SIDECARS):
                 primary_name = _sqlite_primary(name.lower())
@@ -2459,7 +2453,7 @@ def _snapshot_delta_charge(
     *,
     provider: str | None,
     exclusions: Sequence[str],
-    base_records: dict[str, dict[str, Any]] | None = None,
+    base_records: _RootRecords | dict[str, dict[str, Any]] | None = None,
 ) -> int:
     info = source.stat(follow_symlinks=False)
     if stat.S_ISREG(info.st_mode):
@@ -2480,10 +2474,7 @@ def _snapshot_delta_charge(
         for name in sorted(directories):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if stat.S_ISDIR(child.stat(follow_symlinks=False).st_mode):
                 retained.append(name)
@@ -2496,10 +2487,7 @@ def _snapshot_delta_charge(
         for name in sorted(files):
             child = current_path / name
             relative = child.relative_to(source).as_posix()
-            if provider is not None and (
-                _is_excluded(relative, exclusions)
-                or _is_regenerate_namespace(provider, relative)
-            ):
+            if provider is not None and _is_pruned(provider, relative, exclusions):
                 continue
             if (
                 provider is not None
@@ -2526,29 +2514,111 @@ def _snapshot_delta_charge(
     return charged
 
 
-def _snapshot_namespace(root: Path) -> list[tuple[str, Path]]:
-    observed: list[tuple[str, Path]] = [(".", root)]
+def _namespace_entries(root: Path) -> Iterable[str]:
+    """Every relative in the root's namespace, in walk order, one at a time."""
+    yield "."
     if root.is_dir():
         for current, directories, files in os.walk(
             root, topdown=True, followlinks=False
         ):
+            # The global sort below subsumes this, but a deterministic descent
+            # keeps two walks of the same tree racing the same way.
             directories[:] = sorted(directories)
             current_path = Path(current)
-            observed.extend(
-                (
-                    (current_path / name).relative_to(root).as_posix(),
-                    current_path / name,
-                )
-                for name in directories
-            )
-            observed.extend(
-                (
-                    (current_path / name).relative_to(root).as_posix(),
-                    current_path / name,
-                )
-                for name in sorted(files)
-            )
-    return sorted(observed)
+            for name in directories:
+                yield (current_path / name).relative_to(root).as_posix()
+            for name in sorted(files):
+                yield (current_path / name).relative_to(root).as_posix()
+
+
+def _namespace_run(values: list[str], spill_dir: str | None) -> Any:
+    """One sorted run, NUL-delimited, in a file that has no name."""
+    handle = tempfile.TemporaryFile(  # noqa: SIM115 — closed by the merge's finally
+        dir=spill_dir, buffering=NAMESPACE_RUN_BLOCK_BYTES
+    )
+    handle.write(b"\0".join(item.encode("utf-8", "surrogatepass") for item in values))
+    handle.seek(0)
+    return handle
+
+
+def _read_namespace_run(handle: Any) -> Iterable[str]:
+    """Decode one run without ever holding more than a block of it."""
+    pending = b""
+    while True:
+        block = handle.read(NAMESPACE_RUN_BLOCK_BYTES)
+        if not block:
+            break
+        pending += block
+        parts = pending.split(b"\0")
+        pending = parts.pop()
+        for part in parts:
+            yield part.decode("utf-8", "surrogatepass")
+    if pending:
+        yield pending.decode("utf-8", "surrogatepass")
+
+
+def _bounded_sorted(entries: Iterable[str]) -> Iterable[str]:
+    """`sorted()` over a stream without a list of the stream.
+
+    W2-2. `_snapshot_namespace` materialised the whole namespace as a list of
+    `(str, Path)` — 206 B per entry measured, and roughly 0.9 GB on the 109 G
+    corpus. It was built twice per leg: once to write the snapshot index and
+    once to re-derive the namespace digest during custody validation.
+
+    Nothing needs the list. Both callers consume it in order, so this sorts
+    bounded runs and merges them. The comparison stays a Python `str`
+    comparison end to end — runs are only *stored* as UTF-8 under
+    `surrogatepass`, and every value is decoded back to `str` before it
+    reaches `heapq.merge` — so the order is exactly the `sorted(observed)`
+    order the index and `namespace_digest` were sealed in. That order is
+    digest-load-bearing, which is why the landing gate is `index_sha256`
+    equality across the lever rather than a spot check.
+
+    A stream that fits in one chunk never touches the disk and is the
+    identical in-memory `sorted()` it always was.
+    """
+    if not _env_lever("BULKLOAD_BOUND_NAMESPACE"):
+        yield from sorted(entries)
+        return
+    try:
+        chunk_size = max(1, int(os.environ.get("BULKLOAD_NAMESPACE_CHUNK", "")))
+    except ValueError:
+        chunk_size = NAMESPACE_SORT_CHUNK
+    spill_dir = os.environ.get("BULKLOAD_SPILL_DIR") or None
+    # Same env var, same hazard: runs on tmpfs relieve nothing. Warned once
+    # per process per directory, so this costs one dict lookup per call.
+    _warn_memory_backed_spill(Path(spill_dir or tempfile.gettempdir()))
+    chunk: list[str] = []
+    runs: list[Any] = []
+    try:
+        for relative in entries:
+            chunk.append(relative)
+            if len(chunk) >= chunk_size:
+                chunk.sort()
+                runs.append(_namespace_run(chunk, spill_dir))
+                chunk = []
+        chunk.sort()
+        if not runs:
+            yield from chunk
+            return
+        if chunk:
+            runs.append(_namespace_run(chunk, spill_dir))
+        chunk = []
+        yield from heapq.merge(*(_read_namespace_run(run) for run in runs))
+    finally:
+        for run in runs:
+            run.close()
+
+
+def _snapshot_namespace(root: Path) -> Iterable[tuple[str, Path]]:
+    """The sealed namespace, in sealed order, one entry at a time.
+
+    `root / relative` reconstructs exactly the `current_path / name` the old
+    list carried: `relative` is that path's `relative_to(root).as_posix()`, so
+    the join round-trips.
+    """
+    for relative in _bounded_sorted(_namespace_entries(root)):
+        yield relative, (root if relative == "." else root / relative)
 
 
 def _write_snapshot_index(
@@ -2603,6 +2673,299 @@ def _write_snapshot_index(
     return digest.hexdigest(), count
 
 
+MEMORY_BACKED_FILESYSTEMS = frozenset({"ramfs", "tmpfs"})
+_WARNED_SPILL_DIRS: set[str] = set()
+
+
+def _memory_backed_mount(candidate: Path, mountinfo: str) -> bool:
+    """Whether `candidate`'s longest containing mount is RAM-backed.
+
+    `/proc/self/mountinfo` lines are `<fields> - <fstype> <source> <opts>`, and
+    field 5 is the mount point. The longest matching mount point wins, so a
+    tmpfs mounted *under* a disk-backed parent is still reported.
+    """
+    kind = ""
+    best = -1
+    for entry in mountinfo.splitlines():
+        head, separator, tail = entry.partition(" - ")
+        fields = head.split()
+        rest = tail.split()
+        if not separator or len(fields) < 5 or not rest:
+            continue
+        point = fields[4].replace("\\040", " ").replace("\\011", "\t")
+        if len(point) > best and _within(candidate, Path(point)):
+            best, kind = len(point), rest[0]
+    return kind in MEMORY_BACKED_FILESYSTEMS
+
+
+def _warn_memory_backed_spill(candidate: Path) -> None:
+    """Say so, once, when a spill target cannot actually relieve memory.
+
+    A spill dir on tmpfs/ramfs — the default `/tmp` on most Linux hosts — makes
+    both W2-1 and W2-2 write their "spilled" bytes straight back into RAM. The
+    slices then do nothing while still reporting success, which is the one
+    outcome a memory wave must never produce silently.
+
+    This warns rather than refuses on purpose. Refusing would fail the
+    *default* configuration of every Linux host, which is a worse regression
+    than an inert slice; and the ceremony host is darwin, which has no tmpfs
+    and whose `TMPDIR` (`/var/folders/...`) is APFS. Detection is Linux-only —
+    `statvfs` carries no filesystem type — so on darwin this is a no-op and the
+    warning never fires.
+    """
+    key = os.fspath(candidate)
+    if key in _WARNED_SPILL_DIRS:
+        return
+    # Marked before the read, not after, so a host without `/proc` (darwin)
+    # attempts it once per directory rather than once per call.
+    _WARNED_SPILL_DIRS.add(key)
+    try:
+        backed = _memory_backed_mount(
+            candidate, Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        )
+    except OSError:
+        return
+    if backed:
+        sys.stderr.write(
+            f"bulkload-spill warning=memory-backed dir={key} effect=no-memory-relief\n"
+        )
+        sys.stderr.flush()
+
+
+def _base_record_spill_dir(snapshot_root: Path, partial: Path) -> Path | None:
+    """Where the base-record arena lives, or `None` when the lever is off.
+
+    The arena is unlinked the instant it is created, so it can never enter a
+    census; the refusal below is defence in depth against a `BULKLOAD_SPILL_DIR`
+    that names the capture itself. Only the "spill dir inside the capture"
+    direction is checked — the containing direction is the normal case, since
+    `TMPDIR` legitimately contains the capture in every test and on every host
+    whose stage root is a temporary directory.
+
+    The lever is read *first*, ahead of every other env read, because X1 wants
+    the off position to restore shipped behaviour exactly and the shipped
+    engine never looks at `BULKLOAD_SPILL_DIR` at all. Consulting the lever
+    downstream of the refusal — which is where it used to sit, at the
+    `_BaseRecordMap` construction — meant the off position could still kill a
+    capture with an error the shipped engine has no equivalent of. The
+    counterexample is `test_lever_off_ignores_a_spill_dir_inside_the_capture`.
+    """
+    if not _env_lever("BULKLOAD_SPILL_BASE_RECORDS"):
+        return None
+    spill_dir = Path(os.environ.get("BULKLOAD_SPILL_DIR") or tempfile.gettempdir())
+    candidate = Path(os.path.abspath(os.fspath(spill_dir.expanduser())))
+    for root in (snapshot_root, partial):
+        if _within(candidate, Path(os.path.abspath(os.fspath(root)))):
+            raise BulkloadError("base record spill dir is inside the live snapshot")
+    _warn_memory_backed_spill(candidate)
+    return spill_dir
+
+
+def _env_lever(name: str) -> bool:
+    """One env-var rollback lever, default on. The only class X1 respects."""
+    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+class _RootRecords:
+    """One root's `relative -> sealed base index record` view."""
+
+    __slots__ = ("_owner", "_low", "_high")
+
+    def __init__(self, owner: _BaseRecordMap, low: int, high: int) -> None:
+        self._owner = owner
+        self._low = low
+        self._high = high
+
+    def __len__(self) -> int:
+        return self._high - self._low
+
+    def get(self, relative: str) -> dict[str, Any] | None:
+        return self._owner.probe(self._low, self._high, relative)
+
+
+class _BaseRecordMap:
+    """`(label, relative) -> base index record`, keys resident, records spilled.
+
+    W2-1. `validate_snapshot_custody(collect_records=True)` used to hand back a
+    live dict of every base index record, which the caller then re-indexed into
+    a second `records_by_label` dict; both stayed pinned across the whole
+    `_copy_live_tree` phase. On the 109 G corpus that is 1.28 GB of record
+    dicts plus 0.18 GB of extra slots, and it is the residency that puts the
+    chained leg over an 8 GiB host.
+
+    Here the record bytes go to an arena that is `mkstemp`ed and immediately
+    unlinked, and only the sorted key blob (~111 MB) and two offset arrays
+    (16 B/entry) stay resident. Lookup is a binary search over the offset
+    array followed by one `pread` and one `json.loads` of the same line the
+    validator already checked, so `get()` returns a dict equal to the one the
+    resident map returned.
+
+    Append order is the index file's own strictly increasing
+    `(root_index, relative)` order, which `validate_snapshot_custody` enforces
+    before calling us, so nothing here ever sorts. Keys are compared as UTF-8
+    (`surrogatepass`); UTF-8 is order-preserving over the whole code-point
+    range, so byte order is exactly the `str` order the index was sealed in.
+
+    The arena is complete and read-only *before* `require_capacity` runs, and
+    never grows afterwards, so its blocks are already missing from the
+    `statvfs` the capacity gate reads. That discharges the prior round's
+    spill-arena MUSTFIX by construction rather than by an estimate — but only
+    when the spill dir shares the capture's filesystem. When it does not (an
+    operator points `BULKLOAD_SPILL_DIR` at another volume, or `TMPDIR` is the
+    boot volume while the capture is on an external disk) nothing charges the
+    arena against the volume that actually holds it. What that leaves is a
+    fail-*closed* refusal rather than an unnoticed overrun: every path that
+    touches the arena converts `OSError` to `BulkloadError`, so a spill volume
+    that fills refuses the capture and tears down the partial, exactly as a
+    full capture volume already does.
+    """
+
+    def __init__(self, labels: Sequence[str], *, spill_dir: Path | None) -> None:
+        self._labels = list(labels)
+        self._keys = bytearray()
+        self._key_offsets = array("Q", [0])
+        self._record_offsets = array("Q", [0])
+        self._ranges: list[list[int]] = [[0, 0] for _ in self._labels]
+        self._resident: list[dict[str, Any]] = []
+        self._arena: Any = None
+        self._fd = -1
+        self._offset = 0
+        if spill_dir is not None:
+            # `validate_snapshot_custody` promises a `BulkloadError` on every
+            # refusal, and it is constructed outside that promise's `try`. An
+            # unwritable or full spill volume used to escape as a raw `OSError`
+            # — past the fail-closed fence, and past `_capture_live_snapshot`'s
+            # `finally: base_index.close()`, which never saw an instance to
+            # close. Counterexample: `test_an_unusable_spill_dir_fails_closed`.
+            descriptor = -1
+            try:
+                descriptor, path = tempfile.mkstemp(
+                    prefix="bulkload-base-records-", dir=os.fspath(spill_dir)
+                )
+                os.unlink(path)
+                self._arena = os.fdopen(descriptor, "wb", SNAPSHOT_INDEX_BUFFER_BYTES)
+            except OSError as error:
+                if descriptor >= 0 and self._arena is None:
+                    os.close(descriptor)
+                raise BulkloadError(
+                    f"base record spill arena cannot be opened: {error}"
+                ) from error
+            self._fd = descriptor
+
+    @property
+    def spilled(self) -> bool:
+        return self._arena is not None
+
+    def append(self, root_index: int, relative: str, line: bytes) -> None:
+        index = len(self._key_offsets) - 1
+        span = self._ranges[root_index]
+        if span[1] == span[0]:
+            span[0] = index
+        span[1] = index + 1
+        self._keys += relative.encode("utf-8", "surrogatepass")
+        self._key_offsets.append(len(self._keys))
+        if self._arena is None:
+            self._resident.append(json.loads(line))
+        else:
+            # Buffered, so a full spill volume surfaces here or in `seal`.
+            try:
+                self._arena.write(line)
+            except OSError as error:
+                raise BulkloadError(
+                    f"base record spill arena cannot be written: {error}"
+                ) from error
+        self._offset += len(line)
+        self._record_offsets.append(self._offset)
+
+    def seal(self) -> None:
+        if self._arena is not None:
+            try:
+                self._arena.flush()
+            except OSError as error:
+                self.close()
+                raise BulkloadError(
+                    f"base record spill arena cannot be written: {error}"
+                ) from error
+
+    def probe(self, low: int, high: int, relative: str) -> dict[str, Any] | None:
+        wanted = relative.encode("utf-8", "surrogatepass")
+        offsets = self._key_offsets
+        keys = self._keys
+        while low < high:
+            middle = (low + high) // 2
+            found = bytes(keys[offsets[middle] : offsets[middle + 1]])
+            if found == wanted:
+                return self._record(middle)
+            if found < wanted:
+                low = middle + 1
+            else:
+                high = middle
+        return None
+
+    def _record(self, index: int) -> dict[str, Any]:
+        if self._arena is None:
+            return self._resident[index]
+        start = self._record_offsets[index]
+        try:
+            line = os.pread(self._fd, self._record_offsets[index + 1] - start, start)
+        except OSError as error:
+            raise BulkloadError(
+                f"base record spill arena cannot be read: {error}"
+            ) from error
+        return json.loads(line)
+
+    def by_label(self, label: str) -> _RootRecords:
+        # A duplicate label is refused a few lines downstream of our only
+        # caller; until then the last root wins, exactly as the old
+        # `records_by_label[label][relative] = record` overwrite did.
+        for index in range(len(self._labels) - 1, -1, -1):
+            if self._labels[index] == label:
+                return _RootRecords(self, *self._ranges[index])
+        return _RootRecords(self, 0, 0)
+
+    def close(self) -> None:
+        # Called from `finally` on the failure path, and by `seal` after a
+        # write error, so it must never raise: `close()` flushes, and flushing
+        # a dirty buffer to the volume that just refused the write would raise
+        # a second time and mask whatever the capture actually died of. The
+        # arena is unlinked and its bytes are worthless once the capture is
+        # failing, so dropping them is the correct loss.
+        arena, self._arena = self._arena, None
+        if arena is not None:
+            with suppress(OSError):
+                arena.close()
+        self._fd = -1
+
+    def __len__(self) -> int:
+        return len(self._key_offsets) - 1
+
+    def __iter__(self) -> Iterable[tuple[str, str]]:
+        for root_index, (low, high) in enumerate(self._ranges):
+            for index in range(low, high):
+                relative = bytes(
+                    self._keys[self._key_offsets[index] : self._key_offsets[index + 1]]
+                ).decode("utf-8", "surrogatepass")
+                yield self._labels[root_index], relative
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _BaseRecordMap):
+            return NotImplemented
+        return self.materialize() == other.materialize()
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def materialize(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """The old return shape. Test and comparison surface only."""
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for root_index, (low, high) in enumerate(self._ranges):
+            for index in range(low, high):
+                relative = bytes(
+                    self._keys[self._key_offsets[index] : self._key_offsets[index + 1]]
+                ).decode("utf-8", "surrogatepass")
+                result[self._labels[root_index], relative] = self._record(index)
+        return result
+
+
 def validate_snapshot_custody(
     snapshot: dict[str, Any],
     *,
@@ -2610,7 +2973,8 @@ def validate_snapshot_custody(
     required_paths: set[Path] | None = None,
     collect_records: bool = False,
     payload_custody: str = "full",
-) -> dict[tuple[str, str], dict[str, Any]]:
+    spill_dir: Path | None = None,
+) -> _BaseRecordMap:
     """Reopen a seal/index and either all payloads or an explicit stage subset.
 
     `payload_custody` narrows only the per-payload re-derivation, and only for
@@ -2683,7 +3047,10 @@ def validate_snapshot_custody(
             relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
         always_relatives[root_index] = relatives
     seen: set[Path] = set()
-    collected: dict[tuple[str, str], dict[str, Any]] = {}
+    collected = _BaseRecordMap(
+        [item["label"] for item in snapshot["roots"]],
+        spill_dir=spill_dir if collect_records else None,
+    )
     digest = hashlib.sha256()
     namespace_digest = hashlib.sha256()
     count = 0
@@ -2741,9 +3108,7 @@ def validate_snapshot_custody(
                 previous = key
                 namespace_digest.update(canonical_bytes(list(key)) + b"\0")
                 if collect_records:
-                    collected[(snapshot["roots"][root_index]["label"], relative)] = (
-                        record
-                    )
+                    collected.append(root_index, relative, line)
                 if required is None or original_path in required:
                     if (
                         payload_custody == "full"
@@ -2767,7 +3132,11 @@ def validate_snapshot_custody(
                     seen.add(original_path)
                 count += 1
     except OSError as error:
+        collected.close()
         raise BulkloadError("snapshot payload index cannot be read") from error
+    except BaseException:
+        collected.close()
+        raise
     observed_namespace = hashlib.sha256()
     observed_count = 0
     if required is None:
@@ -2797,7 +3166,9 @@ def validate_snapshot_custody(
             or observed_namespace.hexdigest() != namespace_digest.hexdigest()
         )
     ):
+        collected.close()
         raise BulkloadError("snapshot payload index count or digest differs")
+    collected.seal()
     return collected
 
 
@@ -3347,39 +3718,44 @@ def _capture_live_snapshot(
     ]
     base_snapshot: dict[str, Any] | None = None
     base_paths: list[Path | None] = [None] * len(roots)
-    base_records: list[dict[str, dict[str, Any]]] = [{} for _ in roots]
+    base_records: list[Any] = [{} for _ in roots]
+    base_index: _BaseRecordMap | None = None
     if snapshot_base_seal is not None:
         base_snapshot = read_json(snapshot_base_seal)
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
+        spill_dir = _base_record_spill_dir(snapshot_root, partial)
         with phase_timing("base-custody"):
             base_index = validate_snapshot_custody(
                 base_snapshot,
                 collect_records=True,
                 payload_custody=base_custody,
+                spill_dir=spill_dir,
             )
-        records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-        for (label, relative), record in base_index.items():
-            records_by_label[label][relative] = record
-        del base_index
-        base_root = Path(base_snapshot["seal_path"]).parent
-        assert_no_overlap(snapshot_root, [base_root], "live snapshot root")
-        assert_no_overlap(partial, [base_root], "live snapshot partial root")
-        base_by_label = {item["label"]: item for item in base_snapshot["roots"]}
-        if len(base_by_label) != len(base_snapshot["roots"]):
-            raise BulkloadError("snapshot base root labels are not unique")
-        for index, root in enumerate(roots):
-            try:
-                base_root = base_by_label[root["label"]]
-            except KeyError as error:
-                raise BulkloadError("snapshot base lacks a required root") from error
-            if any(
-                base_root[key] != root[key]
-                for key in ("live", "provider", "exclusions")
-            ):
-                raise BulkloadError("snapshot base root contract differs")
-            base_paths[index] = Path(base_root["snapshot"])
-            base_records[index] = records_by_label[root["label"]]
+        try:
+            base_root = Path(base_snapshot["seal_path"]).parent
+            assert_no_overlap(snapshot_root, [base_root], "live snapshot root")
+            assert_no_overlap(partial, [base_root], "live snapshot partial root")
+            base_by_label = {item["label"]: item for item in base_snapshot["roots"]}
+            if len(base_by_label) != len(base_snapshot["roots"]):
+                raise BulkloadError("snapshot base root labels are not unique")
+            for index, root in enumerate(roots):
+                try:
+                    base_root = base_by_label[root["label"]]
+                except KeyError as error:
+                    raise BulkloadError(
+                        "snapshot base lacks a required root"
+                    ) from error
+                if any(
+                    base_root[key] != root[key]
+                    for key in ("live", "provider", "exclusions")
+                ):
+                    raise BulkloadError("snapshot base root contract differs")
+                base_paths[index] = Path(base_root["snapshot"])
+                base_records[index] = base_index.by_label(root["label"])
+        except BaseException:
+            base_index.close()
+            raise
     methods: dict[str, int] = defaultdict(int)
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
     censuses: list[tuple[str, int]] = []
@@ -3563,6 +3939,7 @@ def _capture_live_snapshot(
         }
         seal_path = snapshot_root / "snapshot-seal.json"
         snapshot = seal({**snapshot, "seal_path": os.fspath(seal_path)}, "seal_sha256")
+        _witness_epoch(snapshot)
         partial_seal = partial / "snapshot-seal.json"
         atomic_write_json(partial_seal, snapshot)
         require_digest(snapshot, "seal_sha256")
@@ -3587,6 +3964,73 @@ def _capture_live_snapshot(
         elif published and snapshot_root.exists() and not snapshot_root.is_symlink():
             _remove_snapshot_published(snapshot_root, snapshot_id)
         raise
+    finally:
+        if base_index is not None:
+            base_index.close()
+
+
+def _witness_epoch(snapshot: dict[str, Any]) -> None:
+    """W2-5. Re-derive the live epoch at capture time and only report on it.
+
+    Wave 3 wants to delete the chained B leg and lean on a single capture's
+    own during-copy proof instead. That trade rests entirely on what a live
+    witness costs on the real corpus, and nobody has ever measured it. This
+    runs one, off by default, and no outcome of it can fail a capture.
+
+    Two things the design that asked for this got wrong, and why this is not
+    what it specified:
+
+    * It proposed upgrading the post-copy `_tree_census` to `content=True` and
+      comparing that to the sealed generation. Those two digests are taken over
+      structurally different tuples — the census emits the full stat tuple
+      including `st_dev`, `st_ino` and the timestamps, while `_tree_generation`
+      emits `[IFMT, IMODE, size]` plus a content digest — so they can never be
+      equal, for any tree, ever. The only correct witness is a third walk:
+      `_tree_generation` over the live tree. "The walk is already paid" is
+      therefore false; this costs a whole extra content pass.
+    * `_tree_generation` sets `content_digest=None` and drops `size` for a live
+      sqlite primary, so a witness built from it alone is blind to every byte
+      of provider sqlite. `validate_live_snapshot_generation` covers that hole
+      by folding `sqlite_catalog(...)["logical_sha256"]` per declared sqlite.
+
+    Both corrections land on the same conclusion: the correct witness is the
+    fence the engine already owns. So this calls it rather than building a
+    second, weaker one — which also means the cost it measures is the real
+    cost of the thing Wave 3 would have to run.
+
+    `passes=1` is the documented exception, not a shortcut: an observation is
+    strictly dominated by all six real fence sites, which still run at full
+    strength on every path.
+
+    The `except` below is deliberately `Exception` and not `BulkloadError`.
+    The fence walks the *live* tree, and a live tree can move underneath it in
+    ways it never converts: `_tree_census` reaches `root.stat()` and
+    `sha256_file()` unwrapped, so a root that an external tool removes between
+    the seal and this call raises a bare `FileNotFoundError`. That escaped into
+    `_capture_live_snapshot`'s `except BaseException`, which tears down the
+    partial and re-raises — i.e. an observation that is off by default and
+    changes no digest could destroy a capture that had already sealed. The
+    counterexample is `test_witness_survives_a_live_root_that_vanishes`.
+
+    `BaseException` still propagates: `KeyboardInterrupt` and `SystemExit` are
+    the operator's, not a divergence, and the capture must die on them.
+    """
+    if os.environ.get("BULKLOAD_WITNESS_EPOCH", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    with phase_timing("witness"):
+        try:
+            validate_live_snapshot_generation(snapshot, passes=1)
+            divergence = "none"
+        except Exception as error:  # noqa: BLE001 — an observation may not fail a capture
+            divergence = f"{type(error).__name__}: {error}"
+        with suppress(Exception):
+            sys.stderr.write(f"bulkload-witness divergence={divergence}\n")
+            sys.stderr.flush()
 
 
 def _snapshot_path(path: Path, roots: Sequence[dict[str, str]], *, label: str) -> Path:

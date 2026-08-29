@@ -36,13 +36,17 @@ from bulkload_lib.model import (
     BulkloadError,
     canonical_bytes,
     fsync_directory,
+    git_environment,
     reflink_clone,
     require_capacity,
     require_digest,
     sha256_bytes,
     translate_path,
 )
-from bulkload_lib.planner import compile_agent_plan, materialize_plan_operation
+from bulkload_lib.planner import (
+    compile_agent_plan_authorities,
+    materialize_plan_operation,
+)
 from bulkload_lib.scanner import (
     _capture_provider,
     canonical_path_map,
@@ -192,6 +196,30 @@ def add_linked_worktree(repository: Path, root: Path, *, locked: bool = False) -
     if locked:
         git(repository, "worktree", "lock", str(target))
     return target
+
+
+def compile_agent_plan(
+    source_a: dict,
+    source_b: dict,
+    destination_a: dict,
+    destination_b: dict,
+) -> dict:
+    """Validate both live pairs, then compile — the two-capture test driver.
+
+    This lived in `planner.py` with no production caller: `cli.py` reaches
+    `compile_agent_plan_authorities` directly. It is test scaffolding, so it
+    lives with the tests now. The engine behaviour it exercises —
+    `stable_capture_pair` on each role, then the authorities compile — is
+    unchanged, and every existing call site is the pin.
+    """
+    stable_capture_pair(source_a, source_b, role="source")
+    stable_capture_pair(destination_a, destination_b, role="destination")
+    return compile_agent_plan_authorities(
+        source_b,
+        (source_a["capture_id"], source_b["capture_id"]),
+        destination_b,
+        (destination_a["capture_id"], destination_b["capture_id"]),
+    )
 
 
 class CutoverFixture:
@@ -879,7 +907,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
                     ["git", "-C", str(batch._repository), "cat-file", "blob", oid],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    env=scanner._git_environment(),
+                    env=git_environment(),
                 )
                 digest = hashlib.sha256()
                 assert process.stdout is not None

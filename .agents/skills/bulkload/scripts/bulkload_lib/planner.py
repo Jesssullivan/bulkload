@@ -21,7 +21,6 @@ from .scanner import (
     expand_provider_item,
     provider_item_destination,
     provider_item_identity,
-    stable_capture_pair,
     validate_agent_capture,
 )
 
@@ -187,17 +186,6 @@ def _recovery_ref(destination_path: str, ref_name: str, oid: str) -> str:
         canonical_bytes({"destination": destination_path, "oid": oid, "ref": ref_name})
     )[:24]
     return f"refs/bulkload/recovery/destination/{token}"
-
-
-def _worktree_at(workspace: dict[str, Any], path: str) -> dict[str, Any] | None:
-    return next(
-        (
-            worktree
-            for worktree in workspace.get("worktrees", [])
-            if worktree["path"] == path
-        ),
-        None,
-    )
 
 
 def _destination_worktree_at(
@@ -878,22 +866,6 @@ def compile_agent_plan_authorities(
         },
     }
     return seal(plan, "plan_sha256")
-
-
-def compile_agent_plan(
-    source_a: dict[str, Any],
-    source_b: dict[str, Any],
-    destination_a: dict[str, Any],
-    destination_b: dict[str, Any],
-) -> dict[str, Any]:
-    stable_capture_pair(source_a, source_b, role="source")
-    stable_capture_pair(destination_a, destination_b, role="destination")
-    return compile_agent_plan_authorities(
-        source_b,
-        (source_a["capture_id"], source_b["capture_id"]),
-        destination_b,
-        (destination_a["capture_id"], destination_b["capture_id"]),
-    )
 
 
 def validate_agent_plan(value: dict[str, Any], *, require_ready: bool = False) -> None:
