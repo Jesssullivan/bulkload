@@ -163,6 +163,10 @@ _FSCK_BENIGN_MSGIDS = (
     "badDateOverflow",
     "zeroPaddedDate",
     "extraHeaderEntry",
+    # A blob:none partial clone defers .gitattributes blobs like any other;
+    # fsck's complaint that it cannot READ one is promisor-deferred
+    # connectivity in disguise, not object damage (defect 13, run-12).
+    "gitattributesMissing",
 )
 
 
