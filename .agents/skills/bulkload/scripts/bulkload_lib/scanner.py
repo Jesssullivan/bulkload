@@ -1348,7 +1348,7 @@ def _jsonl_records(
     hasher = hashlib.sha256()
     transformed_hasher = hashlib.sha256()
     try:
-        with path.open("rb", buffering=0) as stream:
+        with path.open("rb") as stream:
             for line in stream:
                 if not line.endswith(b"\n"):
                     raise _MalformedAppendState(
@@ -2548,7 +2548,7 @@ def validate_snapshot_custody(
     count = 0
     previous: tuple[int, str] | None = None
     try:
-        with index_path.open("rb", buffering=0) as stream:
+        with index_path.open("rb") as stream:
             for line in stream:
                 if not line.endswith(b"\n") or len(line) > 64 * 1024:
                     raise BulkloadError("snapshot payload index line is malformed")
