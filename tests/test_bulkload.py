@@ -22,6 +22,8 @@ from bulkload_lib.executor import (
     _git_worktree_state,
     _rollback_steps,
     _snapshot_allowlist_stream,
+    _StageSourceChanged,
+    _verify_record,
     apply_agent_plan,
     push_agent_transport,
     recover_agent_apply,
@@ -41,6 +43,7 @@ from bulkload_lib.model import (
     require_capacity,
     require_digest,
     sha256_bytes,
+    sha256_symlink,
     translate_path,
 )
 from bulkload_lib.planner import (
@@ -2714,6 +2717,55 @@ os.execv(arguments[0], arguments)
             with self.assertRaisesRegex(BulkloadError, "capacity gate failed"):
                 require_capacity(
                     Path(temporary), charged_bytes=total + 1, reserve_bytes=0
+                )
+
+    def test_staged_symlink_mode_is_exempt_across_kernels(self) -> None:
+        """A staged symlink verifies on target bytes, never on mode.
+
+        darwin lstat reports the creating umask's bits while Linux fixes every
+        symlink at 0777 and has no lchmod, so a recorded mode can never be
+        reproduced on the other kernel. The exemption is narrow: it does not
+        reach a regular file, and it does not weaken the target-bytes identity.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            link = root / "link"
+            os.symlink("target.txt", link)
+            live_mode = stat.S_IMODE(link.stat(follow_symlinks=False).st_mode)
+            # The mode the *other* kernel would have recorded for this link.
+            foreign_mode = 0o755 if live_mode == 0o777 else 0o777
+            self.assertNotEqual(live_mode, foreign_mode)
+            record = {
+                "kind": "symlink",
+                "sha256": sha256_symlink(link),
+                "mode": f"{foreign_mode:04o}",
+                "size": len(os.fsencode(os.readlink(link))),
+            }
+            _verify_record(link, record)
+
+            # The target bytes still bind the link.
+            link.unlink()
+            os.symlink("other.txt", link)
+            with self.assertRaisesRegex(
+                _StageSourceChanged, "symbolic link changed before staging"
+            ):
+                _verify_record(link, record)
+
+            # A regular file's mode is still enforced.
+            regular = root / "regular.txt"
+            regular.write_bytes(b"content")
+            os.chmod(regular, 0o600)
+            with self.assertRaisesRegex(
+                _StageSourceChanged, "state mode changed before staging"
+            ):
+                _verify_record(
+                    regular,
+                    {
+                        "kind": "regular",
+                        "sha256": sha256_bytes(b"content"),
+                        "mode": "0644",
+                        "size": 7,
+                    },
                 )
 
 
