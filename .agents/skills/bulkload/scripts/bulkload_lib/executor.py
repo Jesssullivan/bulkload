@@ -124,6 +124,7 @@ def _read_apply_journal(path: Path) -> dict[str, Any]:
         "capacity",
         "created_git_objects",
         "created_git_roots",
+        "git_entries_done",
         "created_worktrees",
         "git_prepared",
         "git_refs_after",
@@ -2223,6 +2224,13 @@ def _apply_git_entry(
     journal: dict[str, Any],
     journal_path: Path,
 ) -> None:
+    done = journal.get("git_entries_done", [])
+    if entry["destination_path"] in done:
+        # This workspace fully completed (objects, refs, worktrees, fsck) in
+        # an earlier lap; re-verifying every prior entry cost ~60 min per
+        # resume (the kernel tree's fsck alone is ~25 min). Trust the
+        # journal's durable completion marker and move on.
+        return Path(entry["destination_path"])
     primary = _ensure_git_workspace(entry, journal, journal_path)
     common = Path(
         _git(primary, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -2411,6 +2419,7 @@ def _apply_git_entry(
                 destination_shallow.write_bytes(graft.read_bytes())
                 fsync_directory(destination_shallow.parent)
     _fsck_workspace(primary)
+    journal.setdefault("git_entries_done", []).append(entry["destination_path"])
 
 
 def _collect_mutations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
