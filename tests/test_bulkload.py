@@ -18,12 +18,16 @@ from unittest import mock
 
 from bulkload_lib.cli import _agent_plan, _protect_output, build_parser
 from bulkload_lib.executor import (
+    _atomic_install_blob,
+    _current_record,
     _git,
     _git_worktree_state,
     _rollback_steps,
+    _same_record,
     _snapshot_allowlist_stream,
     _StageSourceChanged,
     _verify_record,
+    _write_object_bytes,
     apply_agent_plan,
     push_agent_transport,
     recover_agent_apply,
@@ -47,6 +51,7 @@ from bulkload_lib.model import (
     translate_path,
 )
 from bulkload_lib.planner import (
+    _fingerprint,
     compile_agent_plan_authorities,
     materialize_plan_operation,
 )
@@ -2767,6 +2772,154 @@ os.execv(arguments[0], arguments)
                         "size": 7,
                     },
                 )
+
+    def test_staged_symlink_without_a_mode_still_refuses(self) -> None:
+        """The exemption drops the comparison, never the required field.
+
+        A record that declares no mode must still fail closed here rather than
+        slip through and reach _materialize_file's record["mode"] as a bare
+        KeyError instead of a protocol refusal.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary).resolve() / "link"
+            os.symlink("target.txt", link)
+            with self.assertRaisesRegex(
+                _StageSourceChanged, "state mode changed before staging"
+            ):
+                _verify_record(
+                    link,
+                    {
+                        "kind": "symlink",
+                        "sha256": sha256_symlink(link),
+                        "size": len(os.fsencode(os.readlink(link))),
+                    },
+                )
+
+    def test_installed_symlink_verifies_against_a_foreign_recorded_mode(self) -> None:
+        """The destination gates must accept the other kernel's symlink mode.
+
+        _materialize_file carries the source record's mode into the manifest
+        entry verbatim, and _atomic_install_blob installs a link with a bare
+        os.symlink and never chmods it, so on a cross-kernel lane the live
+        destination mode is *always* the destination kernel's and *never* the
+        entry's. Both destination gates compare through _same_record: the file
+        branch of verify_agent_apply, which emits "file-verification-failed",
+        and the Git worktree file loop, which emits "git-worktree-byte-
+        mismatch". This exercises the real install -> observe -> compare
+        round-trip; it is red without the _same_record exemption.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            destination = root / "destination"
+            destination.mkdir()
+
+            payload = os.fsencode("target.txt")
+            digest = sha256_bytes(payload)
+            _write_object_bytes(stage_root, digest, payload, 0o600)
+
+            probe = root / "probe"
+            os.symlink("target.txt", probe)
+            live_mode = stat.S_IMODE(probe.stat(follow_symlinks=False).st_mode)
+            # The mode the *other* kernel would have recorded for this link.
+            foreign_mode = 0o755 if live_mode == 0o777 else 0o777
+            self.assertNotEqual(live_mode, foreign_mode)
+
+            entry = {
+                "blob_sha256": digest,
+                "kind": "symlink",
+                "mode": f"{foreign_mode:04o}",
+                "payload_kind": "symlink",
+                "size": len(payload),
+            }
+            target = destination / "link"
+            after = _atomic_install_blob(stage_root, entry, target)
+
+            # The installed link really does carry the destination kernel's
+            # mode, not the entry's — otherwise this test proves nothing.
+            self.assertEqual(after["kind"], "symlink")
+            self.assertNotEqual(after["mode"], entry["mode"])
+
+            expected = {
+                "kind": entry["payload_kind"],
+                "mode": entry["mode"],
+                "sha256": entry["blob_sha256"],
+                "size": entry["size"],
+            }
+            # verify_agent_apply's file branch.
+            self.assertTrue(_same_record(_current_record(target), expected))
+            # The Git worktree file loop builds the same shape from "kind".
+            self.assertTrue(
+                _same_record(
+                    _current_record(target),
+                    {
+                        "kind": entry["kind"],
+                        "mode": entry["mode"],
+                        "sha256": entry["blob_sha256"],
+                        "size": entry["size"],
+                    },
+                )
+            )
+
+            # The target bytes still bind the link.
+            retargeted = destination / "retargeted"
+            os.symlink("elsewhere.txt", retargeted)
+            self.assertFalse(_same_record(_current_record(retargeted), expected))
+
+            # A regular file's mode is still compared.
+            regular = destination / "regular.txt"
+            regular.write_bytes(b"content")
+            os.chmod(regular, 0o600)
+            self.assertFalse(
+                _same_record(
+                    _current_record(regular),
+                    {
+                        "kind": "regular",
+                        "mode": "0644",
+                        "sha256": sha256_bytes(b"content"),
+                        "size": 7,
+                    },
+                )
+            )
+            # A kind flip is still caught: the exemption is two-sided.
+            self.assertFalse(
+                _same_record(
+                    _current_record(regular),
+                    {
+                        "kind": "symlink",
+                        "mode": "0644",
+                        "sha256": sha256_bytes(b"content"),
+                        "size": 7,
+                    },
+                )
+            )
+
+    def test_planner_fingerprint_converges_on_cross_kernel_symlinks(self) -> None:
+        """A byte-identical symlink must not be re-planned every run.
+
+        _fingerprint drives every source-vs-destination install decision in the
+        planner. Including a symlink's mode would mark all ~16.9k links drifted
+        on every cross-kernel run, so the lane could never reach a no-op even
+        with the destination verify gates fixed.
+        """
+        digest = sha256_bytes(os.fsencode("target.txt"))
+        source = {"kind": "symlink", "mode": "0755", "sha256": digest, "size": 10}
+        destination = {**source, "mode": "0777"}
+        self.assertEqual(_fingerprint(source), _fingerprint(destination))
+
+        # Target bytes and size still drive a re-plan.
+        self.assertNotEqual(
+            _fingerprint(source),
+            _fingerprint({**source, "sha256": sha256_bytes(b"elsewhere.txt")}),
+        )
+        self.assertNotEqual(_fingerprint(source), _fingerprint({**source, "size": 14}))
+
+        # A regular file's mode drift is still a re-plan.
+        regular = {"kind": "regular", "mode": "0644", "sha256": digest, "size": 10}
+        self.assertNotEqual(
+            _fingerprint(regular), _fingerprint({**regular, "mode": "0600"})
+        )
 
 
 if __name__ == "__main__":
