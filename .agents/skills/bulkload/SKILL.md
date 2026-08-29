@@ -286,3 +286,31 @@ scripts/bulkload.py agent-recover \
 Use `--strategy rollback` to restore the sealed snapshot instead. Both paths
 are idempotent and remain bound to the same transaction. Never improvise file
 copies or delete a journal after a crash.
+
+## Read a refusal instead of guessing
+
+Every verb accepts `--failure-output PATH`. When the verb refuses, the same
+single line goes to stderr as before, and a structured record is written to
+that path:
+
+```bash
+scripts/bulkload.py agent-stage \
+  --phase final --accept-plan-sha256 PLAN_SHA256 \
+  --stage-root /srv/fast-local/jess/bulkload/stage \
+  --output /srv/fast-local/jess/bulkload/final-stage.json \
+  --failure-output /srv/fast-local/jess/bulkload/final-stage.failure.json
+```
+
+The record is `{schema, code, phase, root, label, field, expected, observed,
+count, sample, remedy, message, command, version}`. `sample` holds at most 20
+offending paths or fields. `code` is stable: branch on it, not on the message.
+Codes that name a whole condition family end without a suffix; a code with a
+suffix names the exact condition, e.g. `CUSTODY_REQUIRED_NOT_SEEN` (the stage
+asked for paths the sealed index does not carry — a path-identity or selection
+fault, which no re-capture fixes) versus `CUSTODY_INDEX_DIGEST` (the index
+bytes moved). A refusal site that has not been converted yet still writes a
+record, with code `UNCLASSIFIED`.
+
+`--failure-output` must be a real path, must differ from `--output`, and is
+written 0600. A failure-record write that cannot happen prints one `WARN` line
+and never replaces the refusal itself.

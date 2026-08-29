@@ -64,6 +64,20 @@ py_test(
 )
 
 py_test(
+    name = "refusal_record_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_refusal_records.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_refusal_records.py",
+        "tests/test_wave0_perf.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "bazel_binary_smoke_test",
     legacy_create_init = 0,
     main = "tests/test_bazel_binary_smoke.py",
@@ -151,6 +165,7 @@ test_suite(
         ":bulkload_tests",
         ":ci_contract_test",
         ":installer_test",
+        ":refusal_record_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",
         ":skill_contract_test",

@@ -38,6 +38,9 @@ APPROVED_SCHEMA_IDS = {
     "dev.tinyland.bulkload.agent-stage-receipt.v4",
     "dev.tinyland.bulkload.agent-verify-receipt.v4",
     "dev.tinyland.bulkload.git-workspace.v2",
+    # The refusal record is a public artifact like any receipt: an agent
+    # reads it, branches on its `code`, and must be able to pin its shape.
+    "dev.tinyland.bulkload.refusal.v1",
 }
 SUPERSEDED_NAMES = {
     "private_apply.py",

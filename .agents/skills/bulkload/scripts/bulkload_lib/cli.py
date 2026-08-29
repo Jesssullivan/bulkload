@@ -24,10 +24,12 @@ from .executor import (
 from .model import (
     BulkloadError,
     MAX_JSON_BYTES,
+    UNCLASSIFIED_REFUSAL_CODE,
     assert_no_overlap,
     atomic_write,
     canonical_bytes,
     read_json,
+    refusal_record,
 )
 from .planner import compile_agent_plan_authorities
 from .scanner import (
@@ -193,6 +195,17 @@ def _protect_output(arguments: argparse.Namespace) -> None:
     if hasattr(arguments, "stage_root"):
         roots.append(Path(arguments.stage_root))
     assert_no_overlap(Path(arguments.output), roots, "evidence output")
+
+
+def _protect_failure_output(arguments: argparse.Namespace) -> None:
+    """Refuse a failure path that could damage the evidence it explains."""
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    if path == "-":
+        raise BulkloadError("failure output must be a path; stdout carries evidence")
+    if arguments.output != "-" and Path(path) == Path(arguments.output):
+        raise BulkloadError("failure output must differ from the evidence output")
 
 
 def _parse_mapping(value: str) -> tuple[str, str]:
@@ -428,9 +441,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
+    # Every verb accepts --failure-output. It is declared on a parent parser
+    # so the flag reads naturally after the verb and still lands on one
+    # namespace attribute that main() can consult without knowing the verb.
+    refusal = argparse.ArgumentParser(add_help=False)
+    refusal.add_argument(
+        "--failure-output",
+        metavar="PATH",
+        help=(
+            "write a structured refusal record (JSON) here when the verb "
+            "refuses; the same single line always goes to stderr"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    capture = commands.add_parser("agent-capture", help="write AgentCaptureV4 evidence")
+    capture = commands.add_parser(
+        "agent-capture",
+        parents=[refusal],
+        help="write AgentCaptureV4 evidence",
+    )
     capture.add_argument("--role", choices=("source", "destination"), required=True)
     capture.add_argument("--home", required=True)
     capture.add_argument("--git-root", required=True)
@@ -480,7 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--output", required=True)
     capture.set_defaults(handler=_agent_capture)
 
-    plan = commands.add_parser("agent-plan", help="compile an exact four-capture union")
+    plan = commands.add_parser(
+        "agent-plan",
+        parents=[refusal],
+        help="compile an exact four-capture union",
+    )
     plan.add_argument("--source-a", required=True)
     plan.add_argument("--source-b", required=True)
     plan.add_argument("--destination-a", required=True)
@@ -489,7 +522,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=_agent_plan)
 
     stage = commands.add_parser(
-        "agent-stage", help="materialize preseed or final stage"
+        "agent-stage",
+        parents=[refusal],
+        help="materialize preseed or final stage",
     )
     stage.add_argument("--phase", choices=("preseed", "final"), required=True)
     stage.add_argument("--plan")
@@ -520,7 +555,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--output", required=True)
     stage.set_defaults(handler=_agent_stage)
 
-    apply = commands.add_parser("agent-apply", help="apply a sealed final stage")
+    apply = commands.add_parser(
+        "agent-apply",
+        parents=[refusal],
+        help="apply a sealed final stage",
+    )
     apply.add_argument("--plan", required=True)
     apply.add_argument("--stage-receipt", required=True)
     apply.add_argument("--accept-plan-sha256", required=True)
@@ -533,7 +572,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply.set_defaults(handler=_agent_apply)
 
     verify = commands.add_parser(
-        "agent-verify", help="independently verify final state"
+        "agent-verify",
+        parents=[refusal],
+        help="independently verify final state",
     )
     verify.add_argument("--plan", required=True)
     verify.add_argument("--stage-receipt", required=True)
@@ -543,7 +584,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.set_defaults(handler=_agent_verify)
 
     rollback = commands.add_parser(
-        "agent-rollback", help="restore exact overwritten state"
+        "agent-rollback",
+        parents=[refusal],
+        help="restore exact overwritten state",
     )
     rollback.add_argument("--apply-receipt", required=True)
     rollback.add_argument("--accept-receipt-sha256", required=True)
@@ -551,7 +594,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.set_defaults(handler=_agent_rollback)
 
     recover = commands.add_parser(
-        "agent-recover", help="resume or roll back an interrupted apply"
+        "agent-recover",
+        parents=[refusal],
+        help="resume or roll back an interrupted apply",
     )
     recover.add_argument("--plan", required=True)
     recover.add_argument("--stage-receipt", required=True)
@@ -562,14 +607,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failure_record(
+    arguments: argparse.Namespace, error: BaseException
+) -> dict[str, Any]:
+    """The structured record for one refusal, converted or not.
+
+    A site that has not been converted yet still produces a record — with code
+    UNCLASSIFIED and the raised sentence as its message — so a caller can read
+    `--failure-output` unconditionally instead of scraping stderr and can tell
+    "this refusal has no diagnosis yet" apart from "no refusal happened".
+    """
+    record = getattr(error, "refusal", None)
+    if not isinstance(record, dict):
+        record = refusal_record(
+            code=UNCLASSIFIED_REFUSAL_CODE,
+            phase=getattr(arguments, "command", None) or "unknown",
+            remedy=(
+                "This refusal site does not carry a structured diagnosis yet; "
+                "read the message and the verb's inputs."
+            ),
+            message=str(error),
+            observed=type(error).__name__,
+        )
+    return {
+        **record,
+        "command": getattr(arguments, "command", None),
+        "version": __version__,
+    }
+
+
+def _emit_failure(arguments: argparse.Namespace, record: dict[str, Any]) -> None:
+    """Write the refusal record, and never let that write mask the refusal."""
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    try:
+        atomic_write(Path(path), canonical_bytes(record) + b"\n", mode=0o600)
+    except (BulkloadError, OSError) as error:
+        print(f"bulkload: WARN: cannot write failure record: {error}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     try:
+        _protect_failure_output(arguments)
         _protect_output(arguments)
         result = arguments.handler(arguments)
         _write(arguments.output, result)
     except (BulkloadError, OSError, sqlite3.Error) as error:
+        _emit_failure(arguments, _failure_record(arguments, error))
         print(f"bulkload: FAIL: {error}", file=sys.stderr)
         return 1
     return 0
