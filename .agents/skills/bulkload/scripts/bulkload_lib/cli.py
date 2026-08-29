@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import os
 from pathlib import Path
 import sqlite3
 import sys
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from . import __version__
 from .executor import (
@@ -28,6 +29,7 @@ from .model import (
     assert_no_overlap,
     atomic_write,
     canonical_bytes,
+    path_identity,
     read_json,
     refusal_record,
 )
@@ -149,9 +151,8 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def _protect_output(arguments: argparse.Namespace) -> None:
-    if arguments.output == "-":
-        return
+def _protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Every live root this verb reads, which no output of ours may enter."""
     roots: list[Path] = []
     if arguments.command == "agent-capture":
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
@@ -194,7 +195,63 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         )
     if hasattr(arguments, "stage_root"):
         roots.append(Path(arguments.stage_root))
-    assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    return roots
+
+
+@contextlib.contextmanager
+def _disarmed_on_refusal(arguments: argparse.Namespace) -> Iterator[None]:
+    """Drop the failure path before re-raising a refusal that is about it.
+
+    `main` writes the refusal record inside the handler for the very refusal
+    these guards raise. Without this, a guard that refuses a failure path
+    performs, one frame later, exactly the write it just refused.
+    """
+    try:
+        yield
+    except BaseException:
+        arguments.failure_output = None
+        raise
+
+
+def _protect_output(arguments: argparse.Namespace) -> None:
+    """Keep both output channels out of every live root the verb reads.
+
+    `--failure-output` is a write channel like `--output`, and `atomic_write`
+    creates the whole parent tree, so an unguarded refusal path plants
+    directories and a file inside a root a capture is walking — the exact
+    shape that refuses the capture with "live snapshot path set changed".
+    """
+    failure_output = getattr(arguments, "failure_output", None)
+    if arguments.output == "-" and not failure_output:
+        return
+    roots = _protected_roots(arguments)
+    if arguments.output != "-":
+        assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    if failure_output:
+        with _disarmed_on_refusal(arguments):
+            assert_no_overlap(
+                Path(failure_output), roots, "failure output", fold_case=True
+            )
+
+
+# Every argument that names a file the verb reads or seals. A refusal record
+# is small and always writable, so pointing it at one of these silently
+# replaces a sealed input with a 400-byte JSON object.
+ARTIFACT_ARGUMENTS = (
+    "source_a",
+    "source_b",
+    "destination_a",
+    "destination_b",
+    "plan",
+    "stage_receipt",
+    "prepare_receipt",
+    "transport_allowlist",
+    "transport_receipt",
+    "apply_receipt",
+    "destination_verify_receipt",
+    "journal",
+    "snapshot_base_seal",
+)
 
 
 def _protect_failure_output(arguments: argparse.Namespace) -> None:
@@ -202,10 +259,23 @@ def _protect_failure_output(arguments: argparse.Namespace) -> None:
     path = getattr(arguments, "failure_output", None)
     if not path:
         return
-    if path == "-":
-        raise BulkloadError("failure output must be a path; stdout carries evidence")
-    if arguments.output != "-" and Path(path) == Path(arguments.output):
-        raise BulkloadError("failure output must differ from the evidence output")
+    with _disarmed_on_refusal(arguments):
+        if path == "-":
+            raise BulkloadError(
+                "failure output must be a path; stdout carries evidence"
+            )
+        identity = path_identity(path, fold_case=True)
+        if arguments.output != "-" and identity == path_identity(
+            arguments.output, fold_case=True
+        ):
+            raise BulkloadError("failure output must differ from the evidence output")
+        for name in ARTIFACT_ARGUMENTS:
+            value = getattr(arguments, name, None)
+            if value and identity == path_identity(value, fold_case=True):
+                flag = name.replace("_", "-")
+                raise BulkloadError(
+                    f"failure output must differ from the --{flag} artifact: {value}"
+                )
 
 
 def _parse_mapping(value: str) -> tuple[str, str]:
@@ -450,7 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "write a structured refusal record (JSON) here when the verb "
-            "refuses; the same single line always goes to stderr"
+            "refuses; the stderr line comes first either way. Must not be "
+            "--output, an input artifact, or inside any live root"
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -612,10 +683,16 @@ def _failure_record(
 ) -> dict[str, Any]:
     """The structured record for one refusal, converted or not.
 
-    A site that has not been converted yet still produces a record — with code
-    UNCLASSIFIED and the raised sentence as its message — so a caller can read
-    `--failure-output` unconditionally instead of scraping stderr and can tell
-    "this refusal has no diagnosis yet" apart from "no refusal happened".
+    A refusal site that has not been converted yet still produces a record —
+    with code UNCLASSIFIED and the raised sentence as its message — so a
+    caller reading `--failure-output` can tell "this refusal has no diagnosis
+    yet" apart from "no refusal happened".
+
+    The channel covers what `main` catches: `BulkloadError`, `OSError` and
+    `sqlite3.Error`. A defect in the engine itself still escapes as a
+    traceback with no record and no `bulkload: FAIL:` line — widening that
+    catch is T3's `BaseException` classify, not this change. Until then a
+    caller must still treat "no record" as possible and read the exit status.
     """
     record = getattr(error, "refusal", None)
     if not isinstance(record, dict):
@@ -636,15 +713,25 @@ def _failure_record(
     }
 
 
-def _emit_failure(arguments: argparse.Namespace, record: dict[str, Any]) -> None:
-    """Write the refusal record, and never let that write mask the refusal."""
+def _emit_failure(arguments: argparse.Namespace, error: BaseException) -> None:
+    """Write the refusal record, and never let that write mask the refusal.
+
+    Building the record and writing it both happen inside the guard: a bad
+    value in the record is as capable of raising as a bad path is, and either
+    one must cost a WARN line, not the diagnosis. The catch is `Exception`,
+    not `(BulkloadError, OSError)`, because `Path.expanduser()` alone raises
+    `RuntimeError` for an unresolvable `~user`.
+    """
     path = getattr(arguments, "failure_output", None)
     if not path:
         return
     try:
+        record = _failure_record(arguments, error)
         atomic_write(Path(path), canonical_bytes(record) + b"\n", mode=0o600)
-    except (BulkloadError, OSError) as error:
-        print(f"bulkload: WARN: cannot write failure record: {error}", file=sys.stderr)
+    except Exception as failure:  # noqa: BLE001 - the refusal outranks its record
+        print(
+            f"bulkload: WARN: cannot write failure record: {failure}", file=sys.stderr
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -656,7 +743,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = arguments.handler(arguments)
         _write(arguments.output, result)
     except (BulkloadError, OSError, sqlite3.Error) as error:
-        _emit_failure(arguments, _failure_record(arguments, error))
+        # The refusal is the deliverable; the record is a convenience. Print
+        # first so no failure of the record write can cost the operator the
+        # one line that names what refused.
         print(f"bulkload: FAIL: {error}", file=sys.stderr)
+        _emit_failure(arguments, error)
         return 1
     return 0

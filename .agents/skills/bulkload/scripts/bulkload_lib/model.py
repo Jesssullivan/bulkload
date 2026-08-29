@@ -568,21 +568,50 @@ def git_environment() -> dict[str, str]:
     return environment
 
 
-def assert_no_overlap(path: Path, protected: Iterable[Path], label: str) -> None:
-    candidate = Path(os.path.realpath(os.path.abspath(os.fspath(path.expanduser()))))
+def path_identity(path: str | Path, *, fold_case: bool = False) -> Path:
+    """One comparable spelling for two path arguments.
+
+    `~/a`, `a/../a` and an absolute `a` are three spellings of one directory
+    entry, and on the case-insensitive APFS volume this ceremony runs on so is
+    `A`. A bare `Path(x) == Path(y)` at a call site sees four distinct paths;
+    every overlap and collision guard needs to see one. `fold_case` is opt-in
+    because folding is the safe direction only for a guard that refuses: on a
+    case-sensitive destination it can refuse two genuinely distinct names,
+    which costs an operator one renamed argument, while not folding on a
+    case-insensitive source silently writes over the file the guard exists to
+    protect.
+
+    A path that cannot be expanded at all refuses here, the same way
+    `resolve_real` refuses one that cannot be resolved. `Path.expanduser()`
+    raises `RuntimeError` for an unknown `~user`, which no caller of a guard
+    catches; a guard must refuse, not crash.
+    """
+    try:
+        expanded = os.fspath(Path(path).expanduser())
+    except (OSError, RuntimeError) as error:
+        raise BulkloadError(f"cannot expand path {path!r}") from error
+    resolved = os.path.realpath(os.path.abspath(expanded))
+    return Path(resolved.casefold() if fold_case else resolved)
+
+
+def assert_no_overlap(
+    path: Path, protected: Iterable[Path], label: str, *, fold_case: bool = False
+) -> None:
+    candidate = path_identity(path, fold_case=fold_case)
     for raw in protected:
-        root = Path(os.path.realpath(os.path.abspath(os.fspath(raw.expanduser()))))
+        named = path_identity(raw)
+        root = path_identity(raw, fold_case=fold_case)
         try:
             candidate.relative_to(root)
         except ValueError:
             pass
         else:
-            raise BulkloadError(f"{label} overlaps live root {root}")
+            raise BulkloadError(f"{label} overlaps live root {named}")
         try:
             root.relative_to(candidate)
         except ValueError:
             continue
-        raise BulkloadError(f"{label} contains live root {root}")
+        raise BulkloadError(f"{label} contains live root {named}")
 
 
 def ensure_safe_target(root: Path, relative: str) -> Path:

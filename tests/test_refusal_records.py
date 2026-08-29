@@ -9,6 +9,8 @@ guards over an additive channel.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -28,6 +30,7 @@ from bulkload_lib.model import (
     BulkloadError,
     canonical_bytes,
     first_mismatch,
+    path_identity,
     refusal_check,
     refusal_eq,
     refusal_json,
@@ -327,26 +330,6 @@ class FailureOutputTests(unittest.TestCase):
             self.assertEqual(record["schema"], REFUSAL_SCHEMA)
             self.assertTrue(record["message"])
 
-    def test_the_failure_path_cannot_collide_with_the_evidence_path(self) -> None:
-        parser = cli.build_parser()
-        for failure in ("-", "out.json"):
-            arguments = parser.parse_args(
-                [
-                    "agent-rollback",
-                    "--apply-receipt",
-                    "a",
-                    "--accept-receipt-sha256",
-                    "x",
-                    "--output",
-                    "out.json",
-                    "--failure-output",
-                    failure,
-                ]
-            )
-            with self.subTest(failure=failure):
-                with self.assertRaises(BulkloadError):
-                    cli._protect_failure_output(arguments)
-
     def test_an_unwritable_failure_path_does_not_mask_the_refusal(self) -> None:
         arguments = cli.build_parser().parse_args(
             [
@@ -361,10 +344,261 @@ class FailureOutputTests(unittest.TestCase):
                 "/proc/definitely/not/writable/failure.json",
             ]
         )
-        cli._emit_failure(
-            arguments,
-            cli._failure_record(arguments, BulkloadError("original refusal")),
+        cli._emit_failure(arguments, BulkloadError("original refusal"))
+
+
+class PathIdentityTests(unittest.TestCase):
+    """Two spellings of one directory entry must compare equal."""
+
+    def test_expansion_traversal_and_case_all_normalise(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = path_identity(root / "ev" / "out.json", fold_case=True)
+            for spelling in (
+                root / "ev" / "OUT.json",
+                root / "ev" / ".." / "ev" / "out.json",
+                Path(os.path.relpath(root / "ev" / "out.json", os.getcwd())),
+            ):
+                with self.subTest(spelling=os.fspath(spelling)):
+                    self.assertEqual(path_identity(spelling, fold_case=True), base)
+
+    def test_case_is_only_folded_when_asked(self) -> None:
+        self.assertNotEqual(
+            path_identity("/tmp/OUT.json"), path_identity("/tmp/out.json")
         )
+
+    def test_a_path_that_cannot_expand_refuses_instead_of_crashing(self) -> None:
+        with self.assertRaises(BulkloadError):
+            path_identity("~nosuchuser0987/failure.json")
+
+
+class FailureOutputWriteChannelTests(unittest.TestCase):
+    """`--failure-output` is a write channel, fenced through `main`.
+
+    Every test here drives the shipped entry point with real argv. A guard
+    exercised by calling it directly cannot see what its caller does with the
+    refusal it raised, and this channel's damage lived exactly there: the
+    handler that catches a refusal is the handler that writes the record.
+    """
+
+    def run_main(self, argv: list[str]) -> tuple[int, str]:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = cli.main(argv)
+        return code, stderr.getvalue()
+
+    def capture_argv(self, root: Path, *extra: str) -> list[str]:
+        return [
+            "agent-capture",
+            "--role",
+            "source",
+            "--home",
+            os.fspath(root / "home"),
+            "--git-root",
+            os.fspath(root / "git"),
+            "--rsync-path",
+            os.fspath(root / "absent-rsync"),
+            "--path-map",
+            f"{root / 'git'}={root / 'dgit'}",
+            *extra,
+        ]
+
+    def test_a_colliding_failure_path_never_overwrites_the_evidence(self) -> None:
+        """The guard refuses the write; it must not then perform it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "ev").mkdir()
+            evidence = root / "ev" / "out.json"
+            for spelling in (
+                os.fspath(evidence),
+                os.fspath(root / "ev" / "OUT.json"),
+                os.fspath(root / "ev" / ".." / "ev" / "out.json"),
+            ):
+                with self.subTest(failure_output=spelling):
+                    evidence.write_bytes(b"EVIDENCE\n")
+                    code, stderr = self.run_main(
+                        self.capture_argv(
+                            root,
+                            "--output",
+                            os.fspath(evidence),
+                            "--failure-output",
+                            spelling,
+                        )
+                    )
+                    self.assertEqual(code, 1)
+                    self.assertIn("must differ from the evidence output", stderr)
+                    self.assertEqual(evidence.read_bytes(), b"EVIDENCE\n")
+
+    def test_a_colliding_failure_path_never_overwrites_an_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "ev").mkdir()
+            plan = root / "ev" / "plan.json"
+            plan.write_bytes(b"PLAN\n")
+            code, stderr = self.run_main(
+                [
+                    "agent-apply",
+                    "--plan",
+                    os.fspath(plan),
+                    "--stage-receipt",
+                    os.fspath(root / "ev" / "stage.json"),
+                    "--accept-plan-sha256",
+                    "0" * 64,
+                    "--journal",
+                    os.fspath(root / "ev" / "journal.json"),
+                    "--rollback-root",
+                    os.fspath(root / "rb"),
+                    "--output",
+                    os.fspath(root / "ev" / "apply.json"),
+                    "--failure-output",
+                    os.fspath(root / "ev" / "PLAN.json"),
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("must differ from the --plan artifact", stderr)
+            self.assertEqual(plan.read_bytes(), b"PLAN\n")
+
+    def test_stdout_is_still_refused_and_disarmed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            code, stderr = self.run_main(
+                self.capture_argv(
+                    root,
+                    "--output",
+                    os.fspath(root / "out.json"),
+                    "--failure-output",
+                    "-",
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("stdout carries evidence", stderr)
+
+    def test_the_failure_path_may_not_land_inside_a_live_root(self) -> None:
+        """`atomic_write` builds the parent tree, so this plants files."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for label in ("home", "git"):
+                live = root / label
+                live.mkdir()
+                planted = live / ".config" / "bulkload" / "deep" / "REFUSAL.json"
+                with self.subTest(root=label):
+                    code, stderr = self.run_main(
+                        self.capture_argv(
+                            root,
+                            "--output",
+                            os.fspath(root / "out.json"),
+                            "--failure-output",
+                            os.fspath(planted),
+                        )
+                    )
+                    self.assertEqual(code, 1)
+                    self.assertIn("failure output overlaps live root", stderr)
+                    self.assertEqual(sorted(live.iterdir()), [])
+
+    def test_a_case_variant_of_a_live_root_is_still_inside_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "home").mkdir()
+            (root / "git").mkdir()
+            code, stderr = self.run_main(
+                self.capture_argv(
+                    root,
+                    "--output",
+                    os.fspath(root / "out.json"),
+                    "--failure-output",
+                    os.fspath(root / "HOME" / "REFUSAL.json"),
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("failure output overlaps live root", stderr)
+            self.assertEqual(sorted((root / "home").iterdir()), [])
+
+    def test_the_stage_root_is_protected_from_the_failure_path_too(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            stage = root / "stage"
+            stage.mkdir()
+            code, stderr = self.run_main(
+                [
+                    "agent-stage",
+                    "--phase",
+                    "final",
+                    "--accept-plan-sha256",
+                    "0" * 64,
+                    "--stage-root",
+                    os.fspath(stage),
+                    "--output",
+                    os.fspath(root / "stage-receipt.json"),
+                    "--failure-output",
+                    os.fspath(stage / "REFUSAL.json"),
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("failure output overlaps live root", stderr)
+            self.assertEqual(sorted(stage.iterdir()), [])
+
+    def test_a_record_write_raising_anything_cannot_cost_the_refusal(self) -> None:
+        """`Path.expanduser()` alone raises `RuntimeError`, not `OSError`."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            argv = self.capture_argv(
+                root,
+                "--output",
+                os.fspath(root / "out.json"),
+                "--failure-output",
+                os.fspath(root / "failure.json"),
+            )
+            for raised in (RuntimeError("boom"), MemoryError(), ValueError("bad")):
+                with self.subTest(raised=type(raised).__name__):
+                    with mock.patch.object(
+                        cli, "_protect_output", side_effect=BulkloadError("the refusal")
+                    ):
+                        with mock.patch.object(cli, "atomic_write", side_effect=raised):
+                            code, stderr = self.run_main(argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn("bulkload: FAIL: the refusal", stderr)
+                    self.assertIn("WARN: cannot write failure record", stderr)
+                    self.assertLess(
+                        stderr.index("FAIL:"), stderr.index("WARN:"), stderr
+                    )
+
+    def test_an_unexpandable_failure_path_refuses_instead_of_tracebacking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            code, stderr = self.run_main(
+                self.capture_argv(
+                    root,
+                    "--output",
+                    os.fspath(root / "out.json"),
+                    "--failure-output",
+                    "~nosuchuser0987/failure.json",
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("cannot expand path", stderr)
+
+    def test_a_lawful_failure_path_beside_the_evidence_still_works(self) -> None:
+        """The fence must refuse the hazards, not the documented usage."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "home").mkdir()
+            (root / "git").mkdir()
+            (root / "ev").mkdir()
+            failure = root / "ev" / "out.failure.json"
+            code, stderr = self.run_main(
+                self.capture_argv(
+                    root,
+                    "--output",
+                    os.fspath(root / "ev" / "out.json"),
+                    "--failure-output",
+                    os.fspath(failure),
+                )
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("bulkload: FAIL:", stderr)
+            record = json.loads(failure.read_text(encoding="utf-8"))
+            self.assertEqual(record["command"], "agent-capture")
+            self.assertEqual(stat.S_IMODE(failure.stat().st_mode), 0o600)
 
 
 class LiveGenerationRefusalTests(unittest.TestCase):

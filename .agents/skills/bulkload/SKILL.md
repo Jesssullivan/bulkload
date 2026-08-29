@@ -290,7 +290,7 @@ copies or delete a journal after a crash.
 ## Read a refusal instead of guessing
 
 Every verb accepts `--failure-output PATH`. When the verb refuses, the same
-single line goes to stderr as before, and a structured record is written to
+single line goes to stderr first, and then a structured record is written to
 that path:
 
 ```bash
@@ -311,6 +311,20 @@ fault, which no re-capture fixes) versus `CUSTODY_INDEX_DIGEST` (the index
 bytes moved). A refusal site that has not been converted yet still writes a
 record, with code `UNCLASSIFIED`.
 
-`--failure-output` must be a real path, must differ from `--output`, and is
-written 0600. A failure-record write that cannot happen prints one `WARN` line
-and never replaces the refusal itself.
+`--failure-output` is a write channel, so it is fenced like `--output`: it must
+be a real path, it must not resolve to `--output` or to any artifact the verb
+reads (`--plan`, `--stage-receipt`, `--prepare-receipt`, `--transport-allowlist`,
+`--apply-receipt`, `--journal`, `--snapshot-base-seal`, the four `agent-plan`
+captures), and it must not land inside any live root — the record's write
+creates its whole parent tree, and a new directory under `--home` mid-capture
+refuses that capture with "live snapshot path set changed". Those comparisons
+resolve `~`, `..` and symlinks and fold case, because the source volume is
+case-insensitive APFS. The record is written 0600. A record write that cannot
+happen prints one `WARN` line after the `FAIL` line and never replaces it.
+
+**The limit, stated plainly.** The record covers refusals: `BulkloadError`,
+`OSError`, `sqlite3.Error`. A defect in the engine itself — e.g. a plan whose
+JSON parses but has the wrong schema, which reaches a bare subscript — still
+exits 1 with a Python traceback, no `FAIL` line and no record. Read the exit
+status; do not treat a missing record as success. Classifying that class is
+the separate exit-code work, not part of this channel.
