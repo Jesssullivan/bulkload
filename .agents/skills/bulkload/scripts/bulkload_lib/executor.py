@@ -1878,10 +1878,15 @@ def _same_record(
 ) -> bool:
     if current is None or expected is None:
         return current is expected
+    keys = ("kind", "mode", "sha256", "size")
+    if expected.get("kind") == "symlink" or current.get("kind") == "symlink":
+        # Symlink permission bits are not portable across kernels (Linux
+        # fixes them at 0777, darwin records the creating umask); identity is
+        # kind + target bytes. Mirrors the custody (c81de89) and staging
+        # (_verify_record) exemptions so post-apply verification agrees.
+        keys = ("kind", "sha256", "size")
     return all(
-        current.get(key) == expected.get(key)
-        for key in ("kind", "mode", "sha256", "size")
-        if key in expected
+        current.get(key) == expected.get(key) for key in keys if key in expected
     )
 
 
