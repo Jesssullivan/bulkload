@@ -6,6 +6,7 @@ from collections import defaultdict
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import re
 import shutil
@@ -1907,6 +1908,32 @@ def _snapshot_target(target: Path, rollback_root: Path) -> tuple[dict[str, Any],
             ):
                 raise BulkloadError("existing rollback snapshot is not exact")
         else:
+            durable_makedirs(snapshot.parent)
+            if target.stat(follow_symlinks=False).st_dev != snapshot.parent.stat().st_dev:
+                # A reflink cannot cross filesystems, so a destination root on a
+                # different device than the rollback root (2026-08-29: /home vs
+                # /srv/fast-local on sting) is impossible by construction, not
+                # a failed clone. The exact-overwrite capacity gate already
+                # charged these bytes; take a verified, accounted full copy and
+                # record the method so the deviation is on the receipt.
+                clone = accounted_copy(
+                    target,
+                    snapshot,
+                    expected_sha256=before["sha256"],
+                    mode=int(before["mode"], 8),
+                )
+                print(
+                    "bulkload: rollback snapshot crossed filesystems; "
+                    f"verified accounted copy for {target} ({clone['bytes']} bytes)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return {
+                    "before": before,
+                    "method": clone["method"],
+                    "snapshot": os.fspath(snapshot.relative_to(rollback_root)),
+                    "target": os.fspath(target),
+                }, before["size"]
             reflink_clone(
                 target,
                 snapshot,
