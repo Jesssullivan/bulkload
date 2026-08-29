@@ -468,6 +468,7 @@ def push_agent_transport(
     phase: str,
     stage_root: Path,
     destination_ssh_host: str,
+    transport_checksum: bool = False,
     _ssh_binary: str | None = None,
 ) -> dict[str, Any]:
     validate_stage_receipt(prepare_receipt)
@@ -496,7 +497,15 @@ def push_agent_transport(
     if isinstance(source_snapshot, dict):
         validate_snapshot_custody(source_snapshot)
         if phase == "final":
-            validate_live_snapshot_generation(source_snapshot)
+            # One pass here, and only here. This fence is strictly dominated
+            # by the full-strength fence below, which re-runs over the same
+            # snapshot under the same `phase == "final"` condition after the
+            # push. Nothing in between confers authority: the payload lands in
+            # the destination *quarantine*, and the transport receipt that
+            # grants downstream authority is built after the second fence. A
+            # straggler that hides behind this pass's walk cursor is still
+            # caught there before anything can act on it.
+            validate_live_snapshot_generation(source_snapshot, passes=1)
     host = _transport_host(
         destination_ssh_host, transport_authority["destination_host"]
     )
@@ -519,13 +528,22 @@ def push_agent_transport(
             expected_size=transport_authority["allowlist_size"],
             expected_sha256=transport_authority["allowlist_sha256"],
         )
+        # The payload push does not carry the custody proof. Every transported
+        # byte is re-derived on the destination before it can gain apply
+        # authority: validate_snapshot_custody re-hashes the transported index
+        # and every required payload out of the quarantine mirror, reflink_clone
+        # and _publish_object re-verify each staged object, and agent-verify
+        # re-hashes the whole sealed stage. rsync's own whole-file checksum pass
+        # is therefore a second full read of the corpus that proves nothing the
+        # destination does not prove independently. --transport-checksum
+        # restores it for an operator who wants the transport to fail earlier.
         result = subprocess.run(
             [
                 source_binding["path"],
                 "-a",
                 "--from0",
                 "--files-from=-",
-                "--checksum",
+                *(("--checksum",) if transport_checksum else ()),
                 "--delay-updates",
                 "--ignore-missing-args",
                 "--no-devices",

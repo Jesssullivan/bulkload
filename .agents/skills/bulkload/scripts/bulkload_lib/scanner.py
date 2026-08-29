@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -15,7 +16,9 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -52,6 +55,9 @@ DEFAULT_MAX_FILES = 2_000_000
 DEFAULT_MAX_BYTES = 4 * 1024**4
 DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
+MAX_CAPTURE_JOBS = 64
+BASE_CUSTODY_MODES = ("full", "sealed")
+SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 LIVE_SNAPSHOT_MODE = "immutable-live"
 SNAPSHOT_RESERVE_BYTES = 10 * 1024**3
 ZERO_OIDS = {"0" * 40, "0" * 64}
@@ -256,6 +262,57 @@ def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str
     return result
 
 
+class _PhaseSample:
+    """Counters a timed phase fills in while it runs."""
+
+    __slots__ = ("bytes", "files")
+
+    def __init__(self) -> None:
+        self.bytes: int | None = None
+        self.files: int | None = None
+
+
+@contextmanager
+def phase_timing(phase: str, root: str = "-") -> Iterable[_PhaseSample]:
+    """Emit one stderr timing line per phase when BULKLOAD_PHASE_TIMING=1.
+
+    Timing is diagnostic only: it never reaches an artifact, never changes a
+    digest, and is off unless the operator asks for it. The counters are read
+    at exit, so a phase sets them inside the block.
+    """
+    sample = _PhaseSample()
+    if os.environ.get("BULKLOAD_PHASE_TIMING") != "1":
+        yield sample
+        return
+    started = time.monotonic()
+    try:
+        yield sample
+    finally:
+        sys.stderr.write(
+            "bulkload-phase"
+            f" phase={phase}"
+            f" root={root}"
+            f" seconds={time.monotonic() - started:.3f}"
+            f" files={'-' if sample.files is None else sample.files}"
+            f" bytes={'-' if sample.bytes is None else sample.bytes}"
+            "\n"
+        )
+        sys.stderr.flush()
+
+
+def workspace_worker_count(jobs: int | None, pending: int) -> int:
+    """Resolve the Git-workspace pool size; `None` keeps the shipped default.
+
+    `git fsck --full` is memory-hungry per repository, so raising this above
+    the shipped 3 is an explicit operator decision on a host with the headroom
+    to pay for it, never an automatic function of CPU count.
+    """
+    resolved = MAX_CAPTURE_WORKSPACE_WORKERS if jobs is None else jobs
+    if not 1 <= resolved <= MAX_CAPTURE_JOBS:
+        raise BulkloadError("capture job count is out of range")
+    return min(resolved, pending)
+
+
 def _git_environment() -> dict[str, str]:
     environment = {
         key: value
@@ -385,13 +442,26 @@ def _portable_symlink(root: Path, path: Path) -> bool:
     return _portable_symlink_destination(root, path) is not None
 
 
-def _file_record(path: Path, relative: str, *, classification: str) -> dict[str, Any]:
+def _file_record(
+    path: Path,
+    relative: str,
+    *,
+    classification: str,
+    deferred_digest: bool = False,
+) -> dict[str, Any]:
+    """Describe one captured entry.
+
+    `deferred_digest` is only ever set by a caller that overwrites `sha256`
+    from a second, authoritative read of the same bytes. It suppresses the
+    whole-file hash here so those bytes are read once instead of twice; every
+    other field, including the `_stable_stat` fence, is unaffected.
+    """
     normalized = normalize_relative(relative)
     before = _stable_stat(path)
     file_type = before[2]
     mode = f"{before[3]:04o}"
     if file_type == stat.S_IFREG:
-        digest = sha256_file(path)
+        digest = None if deferred_digest else sha256_file(path)
         size = before[5]
         kind = "regular"
     elif file_type == stat.S_IFLNK:
@@ -1344,9 +1414,14 @@ def _jsonl_records(
     path: Path, *, replacements: Sequence[tuple[bytes, bytes]] = ()
 ) -> dict[str, Any]:
     hashes: list[str] = []
-    transformed_hashes: list[str] = []
     hasher = hashlib.sha256()
-    transformed_hasher = hashlib.sha256()
+    # While every transformed line is byte-identical to its original, the
+    # translated stream *is* the original stream: no second parse, no second
+    # per-line hash and no second list of 64-character digests. Both lazily
+    # fork on the first line a replacement actually rewrites, so a partially
+    # rewritten file still produces exactly the values it produced before.
+    transformed_hashes: list[str] | None = None
+    transformed_hasher: Any = None
     try:
         with path.open("rb") as stream:
             for line in stream:
@@ -1363,12 +1438,26 @@ def _jsonl_records(
                 transformed = line
                 for source, destination in replacements:
                     transformed = transformed.replace(source, destination)
+                if transformed == line:
+                    # The rewrite is a no-op on this line, so the second
+                    # json.loads would re-parse bytes that just parsed and the
+                    # second sha256 would re-hash bytes that just hashed.
+                    digest = sha256_bytes(line)
+                    hashes.append(digest)
+                    hasher.update(line)
+                    if transformed_hashes is not None:
+                        transformed_hashes.append(digest)
+                        transformed_hasher.update(line)
+                    continue
                 try:
                     json.loads(transformed)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise BulkloadError(
                         "path rewriting produced invalid JSONL"
                     ) from error
+                if transformed_hashes is None:
+                    transformed_hashes = list(hashes)
+                    transformed_hasher = hasher.copy()
                 hashes.append(sha256_bytes(line))
                 transformed_hashes.append(sha256_bytes(transformed))
                 hasher.update(line)
@@ -1379,8 +1468,14 @@ def _jsonl_records(
         "records": hashes,
         "records_sha256": sha256_bytes(canonical_bytes(hashes)),
         "sha256": hasher.hexdigest(),
-        "translated_records": transformed_hashes,
-        "translated_sha256": transformed_hasher.hexdigest(),
+        "translated_records": hashes
+        if transformed_hashes is None
+        else (transformed_hashes),
+        "translated_sha256": (
+            hasher.hexdigest()
+            if transformed_hasher is None
+            else transformed_hasher.hexdigest()
+        ),
     }
 
 
@@ -1716,12 +1811,19 @@ def _capture_provider(
             blockers.append(
                 {"code": "insecure-auth-mode", "path": f"{provider}:{relative}"}
             )
-        record = _file_record(path, relative, classification=classification)
-        identity = (
-            _session_identity(relative, path)
-            if classification.startswith("append-jsonl")
-            else relative
+        append_jsonl = classification.startswith("append-jsonl")
+        # Both arms of the append-jsonl branch below replace `sha256`: the
+        # normal one from _jsonl_records' own streaming hash of the same
+        # bytes, the _MalformedAppendState one by rebuilding the record from
+        # scratch. Hashing the whole file here as well was a second full read
+        # of the entire session corpus whose result was always discarded.
+        record = _file_record(
+            path,
+            relative,
+            classification=classification,
+            deferred_digest=append_jsonl,
         )
+        identity = _session_identity(relative, path) if append_jsonl else relative
         destination_relative = relative
         if classification.endswith("rewrite"):
             destination_relative = relative
@@ -1737,7 +1839,7 @@ def _capture_provider(
             record["destination_relative_path"] = destination_relative
         if identity != relative:
             record["identity"] = identity
-        if classification.startswith("append-jsonl"):
+        if append_jsonl:
             try:
                 append_records = _jsonl_records(
                     path,
@@ -1751,6 +1853,8 @@ def _capture_provider(
                 record.pop("identity", None)
             else:
                 record.update(append_records)
+            if record["kind"] == "regular" and record["sha256"] is None:
+                raise BulkloadError(f"append-only state lost its digest: {path}")
         elif classification.endswith("rewrite") and record["kind"] == "regular":
             payload = path.read_bytes()
             transformed = payload
@@ -2460,7 +2564,13 @@ def _write_snapshot_index(
     digest = hashlib.sha256()
     count = 0
     try:
-        with os.fdopen(descriptor, "wb", buffering=0, closefd=True) as stream:
+        # Buffered, not unbuffered: the index is ~1-2 M records of a few
+        # hundred bytes each per leg, and buffering=0 turned every record into
+        # its own write(2). Durability is unchanged — the explicit flush() plus
+        # os.fsync() below, and the directory fsync after, are what make the
+        # index durable, not the absence of a userspace buffer.
+        stream = os.fdopen(descriptor, "wb", SNAPSHOT_INDEX_BUFFER_BYTES, closefd=True)
+        with stream:
             for root_index, (binding, ledger) in enumerate(zip(roots, ledgers)):
                 root = Path(binding["snapshot"])
                 for relative, payload_path in _snapshot_namespace(root):
@@ -2499,8 +2609,21 @@ def validate_snapshot_custody(
     mirror: Path | None = None,
     required_paths: set[Path] | None = None,
     collect_records: bool = False,
+    payload_custody: str = "full",
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Reopen a seal/index and either all payloads or an explicit stage subset."""
+    """Reopen a seal/index and either all payloads or an explicit stage subset.
+
+    `payload_custody` narrows only the per-payload re-derivation, and only for
+    an already-sealed base. It is a separate knob from `required_paths`, which
+    also disables the snapshot root's 0o700 check, the top-level namespace
+    check, the declared-roots equality and the namespace digest — the
+    anti-planting perimeter. Under "sealed" that whole perimeter stays on, and
+    so does the read-back of the index file itself.
+    """
+    if payload_custody not in BASE_CUSTODY_MODES:
+        raise BulkloadError("snapshot payload custody mode is unsupported")
+    if payload_custody != "full" and required_paths is not None:
+        raise BulkloadError("sealed payload custody cannot subset required paths")
 
     def actual(raw: str) -> Path:
         path = Path(raw)
@@ -2541,6 +2664,24 @@ def validate_snapshot_custody(
         if required_paths is None
         else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
     )
+    # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
+    # not from the snapshot copy, so nothing anywhere ever compares the git
+    # snapshot copy's bytes to the live git tree. This re-derivation is the only
+    # thing that holds the git payload to its seal, and it runs under every
+    # custody mode. SQLite payloads are always re-derived too: a seal cannot
+    # carry WAL-blind freshness.
+    always_roots: set[int] = set()
+    always_relatives: dict[int, set[str]] = {}
+    for root_index, root in enumerate(snapshot["roots"]):
+        if root["label"] == "git":
+            always_roots.add(root_index)
+            continue
+        relatives: set[str] = set()
+        for entry in root["sqlite"]:
+            relative_path = entry["relative_path"]
+            relatives.add(relative_path)
+            relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
+        always_relatives[root_index] = relatives
     seen: set[Path] = set()
     collected: dict[tuple[str, str], dict[str, Any]] = {}
     digest = hashlib.sha256()
@@ -2604,20 +2745,25 @@ def validate_snapshot_custody(
                         record
                     )
                 if required is None or original_path in required:
-                    observed = _snapshot_index_record(
-                        path,
-                        root_index=root_index,
-                        relative=relative,
-                        transfer={
-                            "destination_device": record["destination_device"],
-                            "method": record["method"],
-                            "source_device": record["source_device"],
-                        },
-                    )
-                    if observed != record:
-                        raise BulkloadError(
-                            "snapshot payload differs from sealed index"
+                    if (
+                        payload_custody == "full"
+                        or root_index in always_roots
+                        or relative in always_relatives.get(root_index, frozenset())
+                    ):
+                        observed = _snapshot_index_record(
+                            path,
+                            root_index=root_index,
+                            relative=relative,
+                            transfer={
+                                "destination_device": record["destination_device"],
+                                "method": record["method"],
+                                "source_device": record["source_device"],
+                            },
                         )
+                        if observed != record:
+                            raise BulkloadError(
+                                "snapshot payload differs from sealed index"
+                            )
                     seen.add(original_path)
                 count += 1
     except OSError as error:
@@ -2655,8 +2801,21 @@ def validate_snapshot_custody(
     return collected
 
 
-def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
-    """Fence final transport against any source mutation after snapshot B."""
+def validate_live_snapshot_generation(
+    snapshot: dict[str, Any], *, passes: int = 2
+) -> None:
+    """Fence final transport against any source mutation after snapshot B.
+
+    `passes` is the number of full-corpus re-derivations. It defaults to 2
+    because a single pass is not atomic: `epoch()` walks the roots in order,
+    so a write that lands after its own path has been digested but before the
+    pass ends is invisible to that pass and only visible to the next. The
+    second pass is therefore a wider straggler window, not a redundant read.
+    Only a fence that is strictly dominated by a later full-strength fence
+    over the same snapshot may ask for `passes=1`.
+    """
+    if not isinstance(passes, int) or isinstance(passes, bool) or passes < 1:
+        raise BulkloadError("live generation fence requires at least one pass")
     expected_rows = []
     for root in snapshot["roots"]:
         expected_rows.append(
@@ -2740,10 +2899,16 @@ def validate_live_snapshot_generation(snapshot: dict[str, Any]) -> None:
             )
         )
 
-    first = epoch()
-    second = epoch()
-    if first != expected or second != expected or first != second:
-        raise BulkloadError("live source changed after immutable snapshot B")
+    # Each epoch re-derives the live generation and compares it to the sealed
+    # expectation. Two passes are the default because the walk is sequential
+    # and therefore not atomic: `first == expected` with `second != expected`
+    # is reachable whenever a straggler write lands mid-walk, behind the
+    # cursor. The only term that was genuinely dead in the original fence is
+    # `first != second`, which the other two comparisons already imply.
+    with phase_timing("validate"):
+        for _ in range(passes):
+            if epoch() != expected:
+                raise BulkloadError("live source changed after immutable snapshot B")
 
 
 def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:
@@ -3056,6 +3221,8 @@ def _capture_live_snapshot(
     snapshot_root: Path,
     snapshot_reserve_bytes: int,
     snapshot_base_seal: Path | None,
+    jobs: int | None = None,
+    base_custody: str = "full",
 ) -> dict[str, Any]:
     snapshot_id = new_id()
     snapshot_root = Path(os.path.abspath(os.fspath(snapshot_root)))
@@ -3185,7 +3352,12 @@ def _capture_live_snapshot(
         base_snapshot = read_json(snapshot_base_seal)
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
-        base_index = validate_snapshot_custody(base_snapshot, collect_records=True)
+        with phase_timing("base-custody"):
+            base_index = validate_snapshot_custody(
+                base_snapshot,
+                collect_records=True,
+                payload_custody=base_custody,
+            )
         records_by_label: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for (label, relative), record in base_index.items():
             records_by_label[label][relative] = record
@@ -3212,19 +3384,23 @@ def _capture_live_snapshot(
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
     censuses: list[tuple[str, int]] = []
     durable_makedirs(snapshot_root.parent)
-    for _, live, provider, excluded in descriptors:
-        observed = _tree_census(live, provider=provider, exclusions=excluded)
+    for label, live, provider, excluded in descriptors:
+        with phase_timing("census", label) as sample:
+            observed = _tree_census(live, provider=provider, exclusions=excluded)
+            sample.files = observed[1]
         censuses.append(observed)
-    charged_bytes = sum(
-        _snapshot_delta_charge(
-            live,
-            base_paths[index],
-            provider=provider,
-            exclusions=excluded,
-            base_records=base_records[index],
-        )
-        for index, (_, live, provider, excluded) in enumerate(descriptors)
-    )
+    charged_bytes = 0
+    for index, (label, live, provider, excluded) in enumerate(descriptors):
+        with phase_timing("charge", label) as sample:
+            charge = _snapshot_delta_charge(
+                live,
+                base_paths[index],
+                provider=provider,
+                exclusions=excluded,
+                base_records=base_records[index],
+            )
+            sample.bytes = charge
+        charged_bytes += charge
     capacity = require_capacity(
         snapshot_root.parent,
         charged_bytes=charged_bytes,
@@ -3237,17 +3413,19 @@ def _capture_live_snapshot(
         git_tree_generation = _tree_generation(
             git_backing, provider=None, exclusions=()
         )
-        for index, (_, live, provider, excluded) in enumerate(descriptors):
+        for index, (label, live, provider, excluded) in enumerate(descriptors):
             work_target = Path(work_roots[index]["snapshot"])
-            observed_methods, observed_ledger = _copy_live_tree(
-                live,
-                work_target,
-                provider=provider,
-                exclusions=excluded,
-                max_sqlite_rows=max_sqlite_rows,
-                base=base_paths[index],
-                base_records=base_records[index],
-            )
+            with phase_timing("copy", label) as sample:
+                observed_methods, observed_ledger = _copy_live_tree(
+                    live,
+                    work_target,
+                    provider=provider,
+                    exclusions=excluded,
+                    max_sqlite_rows=max_sqlite_rows,
+                    base=base_paths[index],
+                    base_records=base_records[index],
+                )
+                sample.files = len(observed_ledger)
             transfer_ledgers.append(observed_ledger)
             for method, count in observed_methods.items():
                 methods[method] += count
@@ -3262,16 +3440,17 @@ def _capture_live_snapshot(
             != git_tree_generation
         ):
             raise BulkloadError("Git bytes changed during live snapshot")
-        for index, (_, _, provider, excluded) in enumerate(descriptors):
-            roots[index]["generation_sha256"] = (
-                git_tree_generation
-                if roots[index]["label"] == "git"
-                else _tree_generation(
-                    Path(work_roots[index]["snapshot"]),
-                    provider=provider,
-                    exclusions=excluded,
+        for index, (label, _, provider, excluded) in enumerate(descriptors):
+            with phase_timing("digest", label):
+                roots[index]["generation_sha256"] = (
+                    git_tree_generation
+                    if roots[index]["label"] == "git"
+                    else _tree_generation(
+                        Path(work_roots[index]["snapshot"]),
+                        provider=provider,
+                        exclusions=excluded,
+                    )
                 )
-            )
         augmented_map = canonical_path_map(
             [
                 *[(item["source"], item["destination"]) for item in path_map],
@@ -3295,34 +3474,36 @@ def _capture_live_snapshot(
             binding = seat_bindings[name]
             snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
             snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
-        captured = capture_agent_state(
-            role=role,
-            home=home,
-            git_root=_snapshot_path(git_backing, work_roots, label="snapshot"),
-            codex_root=_snapshot_path(
-                provider_bindings["codex"][1], work_roots, label="snapshot"
+        with phase_timing("catalog"):
+            captured = capture_agent_state(
+                role=role,
+                home=home,
+                git_root=_snapshot_path(git_backing, work_roots, label="snapshot"),
+                codex_root=_snapshot_path(
+                    provider_bindings["codex"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["codex"][3]
+                else provider_bindings["codex"][0],
+                claude_root=_snapshot_path(
+                    provider_bindings["claude"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["claude"][3]
+                else provider_bindings["claude"][0],
+                pi_root=_snapshot_path(
+                    provider_bindings["pi"][1], work_roots, label="snapshot"
+                )
+                if provider_bindings["pi"][3]
+                else provider_bindings["pi"][0],
+                seats=snapshot_seats,
+                path_map=augmented_map,
+                writers_quiesced=True,
+                managed_exclusions=managed_exclusions,
+                rsync_path=rsync_path,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_sqlite_rows=max_sqlite_rows,
+                jobs=jobs,
             )
-            if provider_bindings["codex"][3]
-            else provider_bindings["codex"][0],
-            claude_root=_snapshot_path(
-                provider_bindings["claude"][1], work_roots, label="snapshot"
-            )
-            if provider_bindings["claude"][3]
-            else provider_bindings["claude"][0],
-            pi_root=_snapshot_path(
-                provider_bindings["pi"][1], work_roots, label="snapshot"
-            )
-            if provider_bindings["pi"][3]
-            else provider_bindings["pi"][0],
-            seats=snapshot_seats,
-            path_map=augmented_map,
-            writers_quiesced=True,
-            managed_exclusions=managed_exclusions,
-            rsync_path=rsync_path,
-            max_files=max_files,
-            max_bytes=max_bytes,
-            max_sqlite_rows=max_sqlite_rows,
-        )
         catalog = captured["catalog"]
         _rewrite_catalog_to_live(
             catalog,
@@ -3352,9 +3533,11 @@ def _capture_live_snapshot(
                 if item["classification"] == "sqlite"
             ]
         partial_index = partial / "snapshot-index.jsonl"
-        index_sha256, index_entries = _write_snapshot_index(
-            partial_index, work_roots, transfer_ledgers
-        )
+        with phase_timing("seal") as sample:
+            index_sha256, index_entries = _write_snapshot_index(
+                partial_index, work_roots, transfer_ledgers
+            )
+            sample.files = index_entries
         index_path = snapshot_root / "snapshot-index.jsonl"
         snapshot = {
             "base": None
@@ -3436,9 +3619,17 @@ def capture_agent_state(
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_sqlite_rows: int = DEFAULT_MAX_SQLITE_ROWS,
     snapshot_reserve_bytes: int = SNAPSHOT_RESERVE_BYTES,
+    jobs: int | None = None,
+    base_custody: str = "full",
 ) -> dict[str, Any]:
     if role not in {"source", "destination"}:
         raise BulkloadError("capture role must be source or destination")
+    if jobs is not None and not 1 <= jobs <= MAX_CAPTURE_JOBS:
+        raise BulkloadError("capture job count is out of range")
+    if base_custody not in BASE_CUSTODY_MODES:
+        raise BulkloadError("snapshot base custody mode is unsupported")
+    if base_custody != "full" and snapshot_base_seal is None:
+        raise BulkloadError("snapshot base custody mode requires a base seal")
     if not writers_quiesced and snapshot_root is not None:
         return _capture_live_snapshot(
             role=role,
@@ -3457,6 +3648,8 @@ def capture_agent_state(
             snapshot_root=snapshot_root,
             snapshot_reserve_bytes=snapshot_reserve_bytes,
             snapshot_base_seal=snapshot_base_seal,
+            jobs=jobs,
+            base_custody=base_custody,
         )
     if not writers_quiesced and snapshot_root is None:
         raise BulkloadError(
@@ -3554,7 +3747,7 @@ def capture_agent_state(
         except (_OpaqueGitFallback, BulkloadError) as error:
             return common, representative, error
 
-    workspace_workers = min(MAX_CAPTURE_WORKSPACE_WORKERS, len(workspace_inputs))
+    workspace_workers = workspace_worker_count(jobs, len(workspace_inputs))
     if workspace_workers:
         with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
             workspace_results = list(pool.map(capture_workspace, workspace_inputs))

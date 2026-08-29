@@ -62,7 +62,7 @@ def _load(path: str) -> dict[str, Any]:
     return read_json(candidate)
 
 
-def _available_linux_memory() -> int:
+def _proc_meminfo_available() -> int | None:
     try:
         fields = {
             line.split(":", 1)[0]: int(line.split()[1]) * 1024
@@ -71,19 +71,52 @@ def _available_linux_memory() -> int:
         }
         return fields["MemAvailable"]
     except (FileNotFoundError, KeyError, OSError, UnicodeDecodeError, ValueError):
-        raise BulkloadError(
-            "large Bulkload evidence requires the memory-qualified destination"
-        ) from None
+        return None
 
 
-def _require_large_evidence_memory(size: int, *, multiplier: int = 4) -> None:
+def _sysconf_available() -> int | None:
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        available = os.sysconf("SC_AVPHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not isinstance(page, int) or not isinstance(available, int):
+        return None
+    if page <= 0 or available < 0:
+        return None
+    return page * available
+
+
+def _available_memory() -> int | None:
+    """Available physical memory, or None where it cannot be measured.
+
+    Only a genuine *availability* reading may close this gate. Darwin has no
+    /proc/meminfo and no SC_AVPHYS_PAGES, so the previous Linux-only probe
+    raised unconditionally there and turned any evidence over 512 MiB into a
+    hard abort on the release host. Total physical memory is deliberately not
+    substituted: it is not an availability measure, and guessing with it would
+    either abort a host that had the headroom or pass one that did not.
+    """
+    for probe in (_proc_meminfo_available, _sysconf_available):
+        observed = probe()
+        if observed is not None:
+            return observed
+    return None
+
+
+def _require_large_evidence_memory(
+    size: int,
+    *,
+    multiplier: int = 4,
+    message: str = "destination memory is below the bounded Bulkload evidence gate",
+) -> None:
     if size <= LARGE_PLAN_THRESHOLD_BYTES:
         return
-    required = size * multiplier + 2 * 1024**3
-    if _available_linux_memory() < required:
-        raise BulkloadError(
-            "destination memory is below the bounded Bulkload evidence gate"
-        )
+    available = _available_memory()
+    if available is None:
+        return
+    if available < size * multiplier + 2 * 1024**3:
+        raise BulkloadError(message)
 
 
 def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
@@ -227,6 +260,8 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
         max_files=arguments.max_files,
         max_bytes=arguments.max_bytes,
         max_sqlite_rows=arguments.max_sqlite_rows,
+        jobs=arguments.jobs,
+        base_custody=arguments.base_custody,
     )
 
 
@@ -238,13 +273,10 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
     sizes = [path.stat(follow_symlinks=False).st_size for path in paths]
     if any(size > MAX_JSON_BYTES for size in sizes):
         raise BulkloadError("AgentCaptureV4 exceeds the bounded JSON contract")
-    total = sum(sizes)
-    if total > LARGE_PLAN_THRESHOLD_BYTES:
-        required = total * 4 + 2 * 1024**3
-        if _available_linux_memory() < required:
-            raise BulkloadError(
-                "destination memory is below the bounded AgentPlanV4 planning gate"
-            )
+    _require_large_evidence_memory(
+        sum(sizes),
+        message="destination memory is below the bounded AgentPlanV4 planning gate",
+    )
 
     def stable_authority(
         first_path: Path, second_path: Path, role: str
@@ -324,7 +356,10 @@ def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
             phase=arguments.phase,
             stage_root=Path(arguments.stage_root),
             destination_ssh_host=arguments.destination_ssh_host,
+            transport_checksum=arguments.transport_checksum,
         )
+    if arguments.transport_checksum:
+        raise BulkloadError("transport checksum applies only to the push transport")
     if arguments.plan is None or arguments.transport_allowlist is not None:
         raise BulkloadError(
             "plan staging requires a plan and forbids a transport allowlist"
@@ -418,9 +453,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--acknowledge-writers-quiesced", action="store_true")
     capture.add_argument("--snapshot-base-seal")
+    capture.add_argument(
+        "--base-custody",
+        choices=("full", "sealed"),
+        default="full",
+        help=(
+            "how the named base seal's payloads are admitted. full re-hashes "
+            "every byte of the base (today's behaviour). sealed trusts the "
+            "base seal's verified index digest and namespace digest instead, "
+            "except the git root and every SQLite payload, which are always "
+            "re-derived."
+        ),
+    )
     capture.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     capture.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     capture.add_argument("--max-sqlite-rows", type=int, default=DEFAULT_MAX_SQLITE_ROWS)
+    capture.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "Git-workspace capture workers. Omit to keep the shipped default "
+            "of 3; raise it only on a host with the memory headroom for that "
+            "many concurrent `git fsck --full` runs."
+        ),
+    )
     capture.add_argument("--output", required=True)
     capture.set_defaults(handler=_agent_capture)
 
@@ -449,6 +505,15 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--prepare-receipt")
     stage.add_argument("--transport-allowlist")
     stage.add_argument("--transport-receipt")
+    stage.add_argument(
+        "--transport-checksum",
+        action="store_true",
+        help=(
+            "push with rsync --checksum. The destination re-derives every "
+            "transported digest regardless; this only makes the transport "
+            "itself fail earlier, at the cost of a second full read."
+        ),
+    )
     stage.add_argument(
         "--capacity-reserve-bytes", type=int, default=DEFAULT_CAPACITY_RESERVE_BYTES
     )
