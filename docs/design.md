@@ -17,8 +17,18 @@ fresh final capture/plan -> agent-stage final
 
 `doctor` is the read-only preflight for both roles: it reports the contract
 and cross-kernel defects that are discoverable before capture reads a byte,
-writes its report, and exits non-zero when a check fails. It mutates nothing
-on either host.
+writes its report, and exits non-zero when a check fails. It writes nothing
+inside a declared root and signals no process on either host; the only bytes
+it writes anywhere are its own report and, under
+`BULKLOAD_BOUND_NAMESPACE`, the run files `_bounded_sorted` spills to
+`BULKLOAD_SPILL_DIR`. Every peer probe is a simple read-only command.
+
+Every check carries an explicit status, so an absent verdict is never mistaken
+for a clean one: `pass`, `warn`, `fail`, plus `partial` when the walk stopped
+at `--max-entries` before the check could see the whole namespace and
+`skipped` when the check needed a peer that did not answer. Only `fail` sets
+`ok` to false, and a truncated walk fails `scan-complete` rather than
+reporting a partial namespace as green.
 
 Capture, plan, stage, and verify do not mutate live destination paths. Apply is
 the only forward live mutation. Every operation is bound to an exact plan

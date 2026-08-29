@@ -691,20 +691,23 @@ class ReductivePurgeTests(unittest.TestCase):
         # through `_is_pruned` and through their own definitions.
         self.assertEqual(source.count("_is_excluded("), 2)
         self.assertEqual(source.count("_is_regenerate_namespace("), 2)
-        self.assertEqual(source.count("_is_pruned("), 9)
+        # One definition plus nine call sites: the eight the census, copy,
+        # charge and `_capture_provider` hold, and the doctor's walk, which
+        # exists so the preflight names exactly the namespace capture reads.
+        self.assertEqual(source.count("_is_pruned("), 10)
 
     def test_the_two_capture_provider_sites_keep_their_unguarded_form(self) -> None:
         """The asymmetry the collapse must not erase.
 
-        Six sites guard the prune with `provider is not None`; the two inside
-        `_capture_provider` do not. Folding the guard into `_is_pruned` would
-        change `_capture_provider` for a None provider, so the call sites keep
-        the difference.
+        Seven sites guard the prune with `provider is not None`; the two
+        inside `_capture_provider` do not. Folding the guard into `_is_pruned`
+        would change `_capture_provider` for a None provider, so the call
+        sites keep the difference.
         """
         # Whitespace-normalised so a reformat cannot silently pass this.
         source = "".join((self.LIB / "scanner.py").read_text().split())
         self.assertEqual(
-            source.count("ifproviderisnotNoneand_is_pruned(provider,relative,"), 6
+            source.count("ifproviderisnotNoneand_is_pruned(provider,relative,"), 7
         )
         self.assertEqual(source.count("if_is_pruned(provider,relative,"), 2)
 

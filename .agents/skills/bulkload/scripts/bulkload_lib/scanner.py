@@ -80,10 +80,37 @@ SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 DOCTOR_REPORT_SCHEMA = "dev.tinyland.bulkload.doctor-report.v1"
 DOCTOR_MAX_FINDINGS = 10_000
-DOCTOR_STATUSES = ("pass", "warn", "fail")
-DEFAULT_PEER_UNAME = "/usr/bin/uname"
+# A check whose remedy is "no action" names a sample, not a population. The
+# ceremony holds 16,900 symlinks; naming every one of them produces a
+# multi-megabyte artifact the operator is told to review and cannot.
+DOCTOR_SAMPLE_FINDINGS = 20
+# `partial` and `skipped` exist so that a check the run could not evaluate is
+# never spelled `pass`. A truncated walk or an unreachable peer degrades the
+# checks that depend on it to one of these, and `ok` still turns only on
+# `fail`, so a preflight that could not answer never reads as green.
+DOCTOR_STATUSES = ("pass", "partial", "skipped", "warn", "fail")
+# Resolved through `--peer-env-path` rather than assumed at an absolute path:
+# a NixOS peer ships /usr/bin/env and nothing else under /usr/bin, so
+# `/usr/bin/uname` exits 127 on a reachable, correctly configured host.
+DEFAULT_PEER_UNAME = "uname"
 DEFAULT_PEER_ENV = "/usr/bin/env"
 DEFAULT_PEER_TIMEOUT_SECONDS = 20.0
+# PATH_MAX as each kernel enforces it. A path map may lengthen every path in
+# a root at once (/Users/jess -> /srv/fast-local/jess/bulkload/...), so the
+# ceiling that matters is the destination kernel's, not this host's.
+PATH_LENGTH_CEILINGS = {"darwin": 1024, "linux": 4096}
+# Everything the engine refuses to record. `_file_record` raises on any of
+# these (scanner.py:514) and `_capture_provider` records `special-agent-state`
+# for them; a socket under ~/.claude, ~/.codex or ~/.pi/agent is the single
+# most likely instance on a live agent host.
+_SPECIAL_ENTRY_KINDS = {
+    stat.S_IFSOCK: "socket",
+    stat.S_IFIFO: "fifo",
+    stat.S_IFBLK: "block-device",
+    stat.S_IFCHR: "character-device",
+    getattr(stat, "S_IFDOOR", 0o150000): "door",
+    getattr(stat, "S_IFWHT", 0o160000): "whiteout",
+}
 # Linux fixes every symlink at 0777 and has no lchmod; darwin reports the
 # link's own bits. Any other mode is therefore a darwin spelling.
 LINUX_SYMLINK_MODE = "0777"
@@ -4845,24 +4872,64 @@ def _doctor_check(
     expected: Any = None,
     observed: Any = None,
     findings: Sequence[dict[str, Any]] | None = None,
+    finding_total: int | None = None,
     max_findings: int = DOCTOR_MAX_FINDINGS,
 ) -> dict[str, Any]:
     """One typed check: what was expected, what was observed, and every
-    offending path the operator has to settle before capture."""
+    offending path the operator has to settle before capture.
+
+    `finding_total` is how many offending paths the run actually saw, which
+    is not `len(findings)` when the collector itself was bounded. It is
+    carried separately so `finding_count` never under-reports a path that
+    was dropped before it reached this list.
+    """
     if status not in DOCTOR_STATUSES:
         raise BulkloadError(f"doctor check status is unsupported: {status}")
     items = list(findings or [])
+    named = items[:max_findings]
+    total = len(items) if finding_total is None else max(finding_total, len(items))
     return {
         "code": code,
         "expected": expected,
-        "finding_count": len(items),
-        "findings": items[:max_findings],
+        "finding_count": total,
+        "findings": named,
         "observed": observed,
         "remedy": remedy,
         "status": status,
         "summary": summary,
-        "truncated": len(items) > max_findings,
+        "truncated": total > len(named),
     }
+
+
+def _is_sha256(value: str) -> bool:
+    """The exact acceptance `model.runtime_source_digest` applies."""
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+class _DoctorFindings:
+    """A findings list that stops growing but never stops counting.
+
+    `--max-findings` used to bound serialization only: every collector held
+    the whole population in RAM and the cap was applied at the end. At the
+    ceremony's 16,900 symlinks that is a multi-megabyte report of no-action
+    findings, which is the same 'physically unreviewable artifact' defect the
+    review names elsewhere. Bounding the collector keeps the count exact and
+    the report readable.
+    """
+
+    __slots__ = ("items", "limit", "total")
+
+    def __init__(self, limit: int) -> None:
+        self.items: list[dict[str, Any]] = []
+        self.limit = limit
+        self.total = 0
+
+    def add(self, item: dict[str, Any]) -> None:
+        self.total += 1
+        if len(self.items) < self.limit:
+            self.items.append(item)
 
 
 def _doctor_true_component(parent: Path, name: str) -> str | None:
@@ -4951,19 +5018,82 @@ class _DoctorScan:
     __slots__ = (
         "complete",
         "entries",
-        "orphan_sidecars",
+        "long_paths",
+        "sqlite_orphans",
+        "sqlite_shadowed",
+        "sqlite_untyped",
+        "special_entries",
         "symlinks",
         "unportable_symlinks",
         "unreadable",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_findings: int) -> None:
         self.complete = True
         self.entries = 0
-        self.orphan_sidecars: list[dict[str, Any]] = []
+        self.long_paths = _DoctorFindings(max_findings)
+        self.sqlite_orphans = _DoctorFindings(max_findings)
+        self.sqlite_shadowed = _DoctorFindings(max_findings)
+        self.sqlite_untyped = _DoctorFindings(max_findings)
+        self.special_entries = _DoctorFindings(max_findings)
         self.symlinks = 0
-        self.unportable_symlinks: list[dict[str, Any]] = []
-        self.unreadable: list[dict[str, Any]] = []
+        self.unportable_symlinks = _DoctorFindings(
+            min(max_findings, DOCTOR_SAMPLE_FINDINGS)
+        )
+        self.unreadable = _DoctorFindings(max_findings)
+
+
+def _doctor_sidecar_tier(
+    root: dict[str, Any], *, name: str, relative: str, path: str
+) -> dict[str, Any] | None:
+    """Which of the engine's three sidecar behaviours this entry will meet.
+
+    Measured against the engine, not guessed:
+
+    * a provider root classifies every path (`_provider_classification`) and,
+      when the verdict is `sqlite` and the name ends in a sidecar suffix,
+      **drops the file silently** (`_capture_provider`, scanner.py:1837) while
+      `_tree_census` still charges it (scanner.py:2213-2217);
+    * a seat and the git fleet pass `provider=None`, so no sidecar rule fires
+      at all and the file is carried as ordinary content.
+
+    The blocking tier is therefore exactly one thing: a sidecar whose primary
+    is spelled like a database (`.db`/`.sqlite`/`.sqlite3`) and is absent from
+    a provider root. A file that merely ends in `-journal` is the nixpkgs
+    source class and is reported under its own code.
+    """
+    lowered = name.lower()
+    suffix = next((item for item in SQLITE_SIDECARS if lowered.endswith(item)), None)
+    if suffix is None:
+        return None
+    primary = path[: -len(suffix)]
+    primary_exists = os.path.lexists(primary)
+    database_primary = lowered[: -len(suffix)].endswith(SQLITE_SUFFIXES)
+    provider = root.get("provider")
+    if provider is not None:
+        # The fail tier is gated on the engine's own verdict, never on the
+        # root being typed: `_provider_classification` is what decides that a
+        # path is SQLite at all.
+        if _provider_classification(provider, relative) != "sqlite":
+            return None
+        if not database_primary:
+            tier = "shadowed"
+        elif not primary_exists:
+            tier = "orphan"
+        else:
+            return None
+    elif not primary_exists:
+        tier = "untyped"
+    else:
+        return None
+    return {
+        "kind": suffix[1:],
+        "missing_primary": None if tier == "shadowed" else primary,
+        "path": path,
+        "root": root["label"],
+        "tier": tier,
+        "typed": provider is not None,
+    }
 
 
 def _doctor_record_entry(
@@ -4971,35 +5101,66 @@ def _doctor_record_entry(
     root: dict[str, Any],
     *,
     name: str,
+    relative: str,
     path: str,
+    destination: str,
     mode: int | None,
     collect_symlink_modes: bool,
+    path_ceiling: int | None,
 ) -> None:
-    """Fold one entry into the symlink-mode and sqlite-sidecar collectors."""
+    """Fold one entry into every path-shaped collector at once."""
     if mode is not None and stat.S_ISLNK(mode):
         scan.symlinks += 1
         if collect_symlink_modes:
             spelled = f"{stat.S_IMODE(mode):04o}"
             if spelled != LINUX_SYMLINK_MODE:
-                scan.unportable_symlinks.append(
+                scan.unportable_symlinks.add(
                     {"mode": spelled, "path": path, "root": root["label"]}
                 )
-    lowered = name.lower()
-    for suffix in SQLITE_SIDECARS:
-        if not lowered.endswith(suffix):
-            continue
-        primary = path[: -len(suffix)]
-        if not os.path.lexists(primary):
-            scan.orphan_sidecars.append(
+    if mode is not None and not (
+        stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)
+    ):
+        kind = _SPECIAL_ENTRY_KINDS.get(stat.S_IFMT(mode), "special")
+        # A seat is the one root that survives a socket: `_capture_seat`
+        # passes skip_sockets=True (scanner.py:2059), so the socket is
+        # dropped rather than refused. Everything else reaches `_file_record`
+        # (scanner.py:514) or `_capture_provider` (scanner.py:1751, 1777) and
+        # becomes a blocker, which `stable_capture_pair` turns into
+        # "captures contain blockers" (scanner.py:4862).
+        dropped = kind == "socket" and root.get("special_policy") == "skip-sockets"
+        scan.special_entries.add(
+            {
+                "engine": (
+                    "dropped from the capture without a blocker"
+                    if dropped
+                    else "refused as a capture blocker"
+                ),
+                "kind": kind,
+                "path": path,
+                "root": root["label"],
+                "blocking": not dropped,
+            }
+        )
+    if path_ceiling is not None:
+        length = len(os.fsencode(destination))
+        if length > path_ceiling:
+            scan.long_paths.add(
                 {
-                    "kind": suffix[1:],
-                    "missing_primary": primary,
+                    "ceiling": path_ceiling,
+                    "destination": destination,
+                    "length": length,
                     "path": path,
                     "root": root["label"],
-                    "typed": bool(root.get("typed_sqlite")),
                 }
             )
-        break
+    sidecar = _doctor_sidecar_tier(root, name=name, relative=relative, path=path)
+    if sidecar is None:
+        return
+    {
+        "orphan": scan.sqlite_orphans,
+        "shadowed": scan.sqlite_shadowed,
+        "untyped": scan.sqlite_untyped,
+    }[sidecar["tier"]].add(sidecar)
 
 
 def _doctor_walk(
@@ -5007,17 +5168,22 @@ def _doctor_walk(
     root: dict[str, Any],
     *,
     boundaries: frozenset[str],
+    exclusions: Sequence[str],
     max_entries: int,
     collect_symlink_modes: bool,
+    path_ceiling: int | None,
 ) -> Iterable[str]:
     """Yield one `identity NUL source-path` line per namespace entry.
 
     The walk prunes every *other* declared root, so a nested root is keyed
     under its own path map and never counted twice — which is how capture
-    treats it, since each root is walked by its own `_walk_entries` call.
+    treats it, since each root is walked by its own `_walk_entries` call. It
+    also applies capture's own prune rule inside a provider root
+    (`_is_pruned`), so the doctor never names a path capture will not read.
     """
     base = Path(root["walk_path"])
     destination = root.get("destination")
+    provider = root.get("provider")
     yield f"{path_identity(destination or base)}\0{os.fspath(base)}"
     if root["kind"] == "file":
         return
@@ -5028,7 +5194,7 @@ def _doctor_walk(
             with os.scandir(current) as handle:
                 children = sorted(handle, key=lambda entry: entry.name)
         except OSError as error:
-            scan.unreadable.append(
+            scan.unreadable.add(
                 {
                     "path": os.fspath(current),
                     "reason": str(error),
@@ -5039,11 +5205,13 @@ def _doctor_walk(
         for entry in children:
             if entry.path in boundaries:
                 continue
+            relative = Path(entry.path).relative_to(base).as_posix()
+            if provider is not None and _is_pruned(provider, relative, exclusions):
+                continue
             scan.entries += 1
             if scan.entries > max_entries:
                 scan.complete = False
                 return
-            relative = Path(entry.path).relative_to(base).as_posix()
             spelling = (
                 os.path.join(destination, relative)
                 if destination is not None
@@ -5053,7 +5221,7 @@ def _doctor_walk(
             try:
                 mode = entry.stat(follow_symlinks=False).st_mode
             except OSError as error:
-                scan.unreadable.append(
+                scan.unreadable.add(
                     {"path": entry.path, "reason": str(error), "root": root["label"]}
                 )
                 continue
@@ -5061,9 +5229,12 @@ def _doctor_walk(
                 scan,
                 root,
                 name=entry.name,
+                relative=relative,
                 path=entry.path,
+                destination=spelling,
                 mode=mode,
                 collect_symlink_modes=collect_symlink_modes,
+                path_ceiling=path_ceiling,
             )
             if stat.S_ISDIR(mode):
                 stack.append(Path(entry.path))
@@ -5080,20 +5251,40 @@ def _doctor_collisions(
     """
     groups: list[dict[str, Any]] = []
     key: str | None = None
-    spellings: list[str] = []
+    spellings: set[str] = set()
+    members = 0
 
     def flush() -> None:
-        if key is not None and len(set(spellings)) > 1:
-            groups.append({"identity": key, "paths": sorted(set(spellings))})
+        if key is None or members < 2:
+            return
+        if len(spellings) < 2 and len(spellings) < max_findings:
+            # One identity reached by one spelling more than once is not a
+            # collision. Below the cap that judgement is exact; at the cap the
+            # group is reported precisely because members were dropped.
+            return
+        # `--max-findings` caps how many members of a group are *named*; the
+        # member count is exact, so a dropped path is marked at the site it
+        # was dropped rather than silently vanishing from a group whose whole
+        # purpose is to name every offending path.
+        groups.append(
+            {
+                "identity": key,
+                "member_count": members,
+                "paths": sorted(spellings),
+                "truncated": members > len(spellings),
+            }
+        )
 
     for line in lines:
         identity, _, source = line.partition("\0")
         if identity != key:
             flush()
             key = identity
-            spellings = []
-        if len(spellings) <= max_findings:
-            spellings.append(source)
+            spellings = set()
+            members = 0
+        members += 1
+        if len(spellings) < max_findings:
+            spellings.add(source)
     flush()
     return groups
 
@@ -5142,10 +5333,10 @@ def _doctor_pointer_records(repository: Path) -> list[tuple[str, Path, str]]:
 
 def _doctor_git_pointers(
     git_root: Path, *, max_findings: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[_DoctorFindings, _DoctorFindings]:
     """Pointer spellings against the directory entries, and dangling targets."""
-    spelling: list[dict[str, Any]] = []
-    dangling: list[dict[str, Any]] = []
+    spelling = _DoctorFindings(max_findings)
+    dangling = _DoctorFindings(max_findings)
     repositories, _ = _discover_git_roots(git_root)
     for repository in repositories:
         for kind, source, recorded in _doctor_pointer_records(repository):
@@ -5156,20 +5347,17 @@ def _doctor_git_pointers(
                 candidate = Path(os.path.normpath(source.parent / candidate))
             observed = _doctor_true_spelling(candidate)
             if observed is None:
-                if len(dangling) <= max_findings:
-                    dangling.append(
-                        {
-                            "kind": kind,
-                            "pointer": os.fspath(source),
-                            "recorded": os.fspath(candidate),
-                            "repository": os.fspath(repository),
-                        }
-                    )
+                dangling.add(
+                    {
+                        "kind": kind,
+                        "pointer": os.fspath(source),
+                        "recorded": os.fspath(candidate),
+                        "repository": os.fspath(repository),
+                    }
+                )
                 continue
-            if os.fspath(observed) != os.fspath(candidate) and (
-                len(spelling) <= max_findings
-            ):
-                spelling.append(
+            if os.fspath(observed) != os.fspath(candidate):
+                spelling.add(
                     {
                         "kind": kind,
                         "observed": os.fspath(observed),
@@ -5452,7 +5640,14 @@ def _doctor_peer(
     Every probe is a simple command: nothing is written, started, or signaled
     on the peer.
     """
-    platform_probe = _peer_probe(ssh_path, host, [uname_path, "-s"], timeout=timeout)
+    # The kernel is read *through* env, not from an assumed absolute path:
+    # NixOS ships /usr/bin/env and nothing else under /usr/bin, so probing
+    # /usr/bin/uname directly reports a reachable, correctly configured peer
+    # as unreachable and silently downgrades every check that needs its
+    # kernel.
+    platform_probe = _peer_probe(
+        ssh_path, host, [env_path, uname_path, "-s"], timeout=timeout
+    )
     environment_probe = _peer_probe(ssh_path, host, [env_path], timeout=timeout)
     # A POSIX login shell expands this to the token; fish and the csh family
     # cannot parse `${name-default}` at all and fail the command outright.
@@ -5466,6 +5661,13 @@ def _doctor_peer(
     for line in environment_probe["stdout"].splitlines():
         if line.startswith("SHELL="):
             login_shell = line[len("SHELL=") :].strip()
+    # `SHELL=` is the only line this probe exists to read. The rest of the
+    # peer's environment is dropped here rather than sealed into a report
+    # that is written to --output, reviewed, and copied between hosts.
+    environment_probe = {
+        "error": environment_probe["error"],
+        "status": environment_probe["status"],
+    }
     peer: dict[str, Any] = {
         "engine_version": None,
         "login_shell": login_shell,
@@ -5519,11 +5721,22 @@ def _doctor_runtime(
         measured = None
     pin = os.environ.get("BULKLOAD_RUNTIME_SOURCE_PIN")
     channel = os.environ.get("BULKLOAD_RUNTIME_SOURCE_SHA256")
-    malformed = pin is not None and (
-        len(pin) != 64 or any(character not in "0123456789abcdef" for character in pin)
+    malformed = pin is not None and not _is_sha256(pin)
+    # BULKLOAD_RUNTIME_SOURCE_SHA256 is the load-bearing variable, not the
+    # pin: bulkload.py:103-104 writes it from PIN-or-closure and
+    # model.runtime_source_digest (model.py:88-95) reads it, raising on the
+    # first digest-bearing call when it is malformed. Validating only the pin
+    # greenlights a host where every real verb dies instantly.
+    channel_malformed = channel is not None and not _is_sha256(channel)
+    presented = (
+        channel if (channel and not malformed and not channel_malformed) else measured
     )
-    presented = channel if (channel and not malformed) else measured
     runtime = {
+        "channel": (
+            "malformed"
+            if channel_malformed
+            else ("present" if channel else "absent")
+        ),
         "measured_sha256": measured,
         "peer_sha256": peer_digest,
         "pin": "malformed" if malformed else ("active" if pin else "absent"),
@@ -5531,6 +5744,44 @@ def _doctor_runtime(
     }
     findings: list[dict[str, Any]] = []
     status = "pass"
+    if channel_malformed:
+        status = "fail"
+        findings.append(
+            {
+                "expected": "64 lowercase hex characters",
+                "observed": len(channel or ""),
+                "reason": (
+                    "BULKLOAD_RUNTIME_SOURCE_SHA256 is malformed; "
+                    "model.py:88-95 raises 'pinned runtime source digest is "
+                    "malformed' at the first digest-bearing call"
+                ),
+                "variable": "BULKLOAD_RUNTIME_SOURCE_SHA256",
+            }
+        )
+    elif (
+        channel
+        and measured
+        and channel != measured
+        and not (pin and not malformed and pin == channel)
+    ):
+        # The launcher hashes exactly RUNTIME_SOURCE_NAMES (bulkload.py:17-24
+        # against model.py:30-37), so under the launcher the channel equals
+        # the measurement unless a pin explains the difference. Anything else
+        # is a digest the operator would hand the peer as
+        # --peer-runtime-source-sha256, propagating the drift to both roles.
+        status = "fail"
+        findings.append(
+            {
+                "expected": measured,
+                "observed": channel,
+                "reason": (
+                    "BULKLOAD_RUNTIME_SOURCE_SHA256 presents a closure these "
+                    "files do not hash to, and no pin accounts for it; every "
+                    "receipt and the peer digest would carry it"
+                ),
+                "variable": "BULKLOAD_RUNTIME_SOURCE_SHA256",
+            }
+        )
     if malformed:
         status = "fail"
         findings.append(
@@ -5538,14 +5789,14 @@ def _doctor_runtime(
                 "expected": "64 lowercase hex characters",
                 "observed": len(pin or ""),
                 "reason": (
-                    "BULKLOAD_RUNTIME_SOURCE_PIN is malformed; model.py:88-96 "
+                    "BULKLOAD_RUNTIME_SOURCE_PIN is malformed; model.py:88-95 "
                     "refuses it at the first digest-bearing call"
                 ),
                 "variable": "BULKLOAD_RUNTIME_SOURCE_PIN",
             }
         )
     elif pin and measured and pin != measured:
-        status = "warn"
+        status = "fail" if status == "fail" else "warn"
         findings.append(
             {
                 "expected": measured,
@@ -5618,6 +5869,9 @@ def _doctor_declared_roots(
             "label": "git",
             "map": True,
             "path": os.fspath(git_root),
+            # `_walk_entries` is called for the fleet without skip_sockets
+            # (scanner.py:4316), so every special entry becomes a blocker.
+            "special_policy": "refuse",
             "walk": True,
         },
     ]
@@ -5632,7 +5886,10 @@ def _doctor_declared_roots(
                 "label": f"provider:{name}",
                 "map": True,
                 "path": os.fspath(provider_root),
-                "typed_sqlite": True,
+                # The provider name capture classifies this root under; it is
+                # what makes `_provider_classification` answerable here.
+                "provider": name,
+                "special_policy": "refuse",
                 "walk": True,
             }
         )
@@ -5643,7 +5900,9 @@ def _doctor_declared_roots(
                 "label": f"seat:{name}",
                 "map": True,
                 "path": os.fspath(seat_path),
-                "typed_sqlite": True,
+                # `_capture_seat` walks with skip_sockets=True and no provider,
+                # so a socket is dropped silently and no sidecar rule fires.
+                "special_policy": "skip-sockets",
                 "walk": True,
             }
         )
@@ -5713,6 +5972,7 @@ def run_doctor(
     capture_output: Path,
     snapshot_base_seal: Path | None,
     engine_version: str,
+    managed_exclusions: Sequence[tuple[str, str]] = (),
     peer_ssh_host: str | None = None,
     peer_bulkload: str | None = None,
     peer_runtime_source_sha256: str | None = None,
@@ -5817,7 +6077,9 @@ def run_doctor(
                 "peer-reachable",
                 "pass" if peer["reachable"] else "fail",
                 summary="the peer answers the transport's own SSH option vector",
-                expected=f"{peer_uname_path} -s over BatchMode SSH",
+                expected=(
+                    f"{peer_env_path} {peer_uname_path} -s over BatchMode SSH"
+                ),
                 observed=peer["probes"]["platform"]["error"] or peer["platform"],
                 findings=[]
                 if peer["reachable"]
@@ -5832,8 +6094,10 @@ def run_doctor(
                 max_findings=max_findings,
                 remedy=(
                     "authenticate non-interactively (BatchMode=yes, "
-                    "StrictHostKeyChecking=yes) before the transport needs it, "
-                    "or correct --peer-uname-path for this peer."
+                    "StrictHostKeyChecking=yes) before the transport needs "
+                    "it. The kernel probe runs through --peer-env-path so a "
+                    "NixOS peer, which ships no /usr/bin/uname, answers it; "
+                    "--peer-uname overrides the command if that is wrong."
                 ),
             )
         )
@@ -5845,7 +6109,11 @@ def run_doctor(
         checks.append(
             _doctor_check(
                 "peer-login-shell",
-                "warn" if shell_defect else "pass",
+                # An unreachable peer answered nothing, so this is unevaluated
+                # rather than clean.
+                "skipped"
+                if not peer["reachable"]
+                else ("warn" if shell_defect else "pass"),
                 summary="the peer's login shell accepts the transport's command shapes",
                 expected="a POSIX login shell, or every remote step piped to bash -s",
                 observed=peer["login_shell"] or "unknown",
@@ -5878,7 +6146,9 @@ def run_doctor(
             checks.append(
                 _doctor_check(
                     "peer-engine-version",
-                    "pass" if matched else "fail",
+                    "skipped"
+                    if not peer["reachable"]
+                    else ("pass" if matched else "fail"),
                     summary="both roles present one engine version",
                     expected=expected_version,
                     observed=peer["engine_version"],
@@ -5911,8 +6181,21 @@ def run_doctor(
     peer_kind = peer["platform"] if peer else None
     cross_kernel = bool(peer_kind) and peer_kind != local_kind
     case_identity = _doctor_case_sensitivity(home)
+    # What the *destination* does with two spellings is the only thing that
+    # decides whether a collision group is a defect. On the destination role
+    # the map is identity, so the question does not arise here at all.
+    destination_identity = (
+        case_identity
+        if role == "destination"
+        else (peer["path_identity"] if peer else None)
+    )
+    destination_kind = local_kind if role == "destination" else peer_kind
+    path_ceiling = PATH_LENGTH_CEILINGS.get(destination_kind or local_kind)
+    exclusions: dict[str, list[str]] = defaultdict(list)
+    for item in canonical_provider_policy(managed_exclusions)["managed_exclusions"]:
+        exclusions[item["provider"]].append(item["relative_path"])
 
-    scan = _DoctorScan()
+    scan = _DoctorScan(max_findings=max_findings)
     walkable = [
         root
         for root in declared
@@ -5933,64 +6216,167 @@ def run_doctor(
                 scan,
                 root,
                 boundaries=boundaries - {root["walk_path"]},
+                exclusions=exclusions[root.get("provider") or ""],
                 max_entries=max_entries,
                 collect_symlink_modes=cross_kernel,
+                path_ceiling=path_ceiling,
             )
 
     collisions = _doctor_collisions(
         _bounded_sorted(stream()), max_findings=max_findings
     )
+
+    def path_shaped(status: str) -> str:
+        """A path-shaped verdict a truncated walk did not earn.
+
+        `pass` here would mean 'the walk saw no defect'; after truncation it
+        only means 'the walk stopped'. `DEFAULT_MAX_FILES` is 2,000,000 and
+        the ceremony's own custody loop ran over 1,781,044 index entries, so
+        this is one lap's growth away, not a synthetic case.
+        """
+        return "partial" if (status == "pass" and not scan.complete) else status
+
+    checks.append(
+        _doctor_check(
+            "scan-complete",
+            "pass" if scan.complete else "fail",
+            summary="the namespace walk finished inside its budget",
+            expected=f"at most {max_entries} entries",
+            observed=(
+                f"{scan.entries} entries"
+                if scan.complete
+                else f"{scan.entries} entries and still walking"
+            ),
+            findings=[]
+            if scan.complete
+            else [
+                {
+                    "expected": max_entries,
+                    "observed": scan.entries,
+                    "reason": (
+                        "the walk stopped at --max-entries, so every "
+                        "path-shaped check below is partial and none of them "
+                        "may be read as green"
+                    ),
+                }
+            ],
+            max_findings=max_findings,
+            remedy=(
+                "raise --max-entries and re-run. A truncated walk refuses "
+                "rather than reporting a partial namespace as clean."
+            ),
+        )
+    )
+    if not collisions:
+        collision_status = "pass"
+    elif destination_identity == "case-insensitive":
+        collision_status = "fail"
+    else:
+        # Byte-exact or unknown: two spellings that fold together still land
+        # on two destination paths, so naming them is all this check may do.
+        collision_status = "warn"
     checks.append(
         _doctor_check(
             "case-fold-collision",
-            "pass" if not collisions else "fail",
+            path_shaped(collision_status),
             summary="no two declared paths collapse onto one destination identity",
             expected="one destination identity per source path",
             observed=(
                 f"{len(collisions)} collision groups over {scan.entries} entries"
+                f", destination path identity "
+                f"{destination_identity or 'unknown'}"
                 + ("" if scan.complete else " (walk stopped at --max-entries)")
             ),
             findings=collisions,
             max_findings=max_findings,
             remedy=(
                 "rename one spelling in each group, or exclude it. A group is "
-                "a set of source paths that are one file on a folding "
-                "filesystem and several on a byte-exact one; 22,866 required "
-                "paths went missing on 2026-08-27 for one such group."
+                "a set of source paths that are distinct here and one path on "
+                "a folding destination, where the second silently overwrites "
+                "the first; it blocks only once the destination is known to "
+                "fold. It is not the git-pointer class: a recorded pointer "
+                "spelling never enters this stream, and git-pointer-spelling "
+                "is the check that names the 2026-08-27 "
+                "GloriousFlywheel.worktrees defect."
             ),
         )
     )
-    if not scan.complete:
-        checks.append(
-            _doctor_check(
-                "scan-complete",
-                "warn",
-                summary="the namespace walk finished inside its budget",
-                expected=f"at most {max_entries} entries",
-                observed=f"{scan.entries} entries and still walking",
-                max_findings=max_findings,
-                remedy=(
-                    "raise --max-entries; every path-shaped check above is "
-                    "partial until the walk completes."
-                ),
-            )
+    # `unreadable-agent-state` is a capture blocker, not an advisory: it is
+    # what `stable_capture_pair` turns into "captures contain blockers"
+    # (scanner.py:4862). Outside a provider root the fleet walk records
+    # `unreadable-filesystem-entry` and refuses the same way, so the only
+    # question is whether the path is inside a declared root at all.
+    checks.append(
+        _doctor_check(
+            "root-readable",
+            path_shaped("fail" if scan.unreadable.total else "pass"),
+            summary="every declared path is readable by this user",
+            expected="no unreadable entry inside a declared root",
+            observed=f"{scan.unreadable.total} unreadable paths",
+            findings=scan.unreadable.items,
+            finding_total=scan.unreadable.total,
+            max_findings=max_findings,
+            remedy=(
+                "settle the mode or exclude the path. Capture records each of "
+                "these as a blocker and the capture pair then refuses, hours "
+                "into the read."
+            ),
         )
-    if scan.unreadable:
-        checks.append(
-            _doctor_check(
-                "root-readable",
-                "warn",
-                summary="every declared path is readable by this user",
-                expected="no unreadable entry inside a declared root",
-                observed=f"{len(scan.unreadable)} unreadable paths",
-                findings=scan.unreadable,
-                max_findings=max_findings,
-                remedy=(
-                    "capture reads these too; settle the mode or exclude the "
-                    "path before the read that costs hours."
-                ),
-            )
+    )
+    blocking_specials = [
+        item for item in scan.special_entries.items if item["blocking"]
+    ]
+    checks.append(
+        _doctor_check(
+            "special-entry",
+            path_shaped(
+                "fail"
+                if blocking_specials
+                else ("warn" if scan.special_entries.total else "pass")
+            ),
+            summary="no socket, FIFO, or device node sits inside a declared root",
+            expected="only regular files, directories, and symlinks",
+            observed=f"{scan.special_entries.total} special entries",
+            findings=scan.special_entries.items,
+            finding_total=scan.special_entries.total,
+            max_findings=max_findings,
+            remedy=(
+                "move or exclude the entry. `_file_record` raises 'special "
+                "filesystem entry is unsupported' (scanner.py:514) and "
+                "`_capture_provider` records `special-agent-state`, either of "
+                "which refuses the capture pair; a socket under a --seat is "
+                "instead dropped from the capture without a blocker, which is "
+                "silent loss rather than a refusal."
+            ),
         )
+    )
+    checks.append(
+        _doctor_check(
+            "path-length-ceiling",
+            path_shaped(
+                "pass"
+                if not scan.long_paths.total
+                else ("fail" if destination_kind else "warn")
+            ),
+            summary="every destination path fits the destination kernel's PATH_MAX",
+            expected=(
+                f"at most {path_ceiling} bytes per destination path"
+                f" ({destination_kind or local_kind} PATH_MAX)"
+                if path_ceiling
+                else "a known destination kernel"
+            ),
+            observed=f"{scan.long_paths.total} destination paths over the ceiling",
+            findings=scan.long_paths.items,
+            finding_total=scan.long_paths.total,
+            max_findings=max_findings,
+            remedy=(
+                "shorten the destination prefix in --path-map. A map may "
+                "lengthen every path in a root at once, and the ceiling that "
+                "binds is the destination kernel's; without --peer-ssh-host "
+                "this host's ceiling stands in and the check can only warn."
+            ),
+        )
+    )
 
     spelling, dangling = _doctor_git_pointers(
         Path(next(root["walk_path"] for root in declared if root["label"] == "git")),
@@ -5999,11 +6385,12 @@ def run_doctor(
     checks.append(
         _doctor_check(
             "git-pointer-spelling",
-            "pass" if not spelling else "fail",
+            "pass" if not spelling.total else "fail",
             summary="every git pointer is spelled the way its directory is",
             expected="pointer spelling == on-disk spelling",
-            observed=f"{len(spelling)} pointers differ",
-            findings=spelling,
+            observed=f"{spelling.total} pointers differ",
+            findings=spelling.items,
+            finding_total=spelling.total,
             max_findings=max_findings,
             remedy=(
                 "re-point the worktree (git worktree repair) so the recorded "
@@ -6016,11 +6403,12 @@ def run_doctor(
     checks.append(
         _doctor_check(
             "git-pointer-target",
-            "pass" if not dangling else "warn",
+            "pass" if not dangling.total else "warn",
             summary="every git pointer names a path that exists",
             expected="no dangling worktree, commondir, or alternates pointer",
-            observed=f"{len(dangling)} dangling pointers",
-            findings=dangling,
+            observed=f"{dangling.total} dangling pointers",
+            findings=dangling.items,
+            finding_total=dangling.total,
             max_findings=max_findings,
             remedy="git worktree prune, or restore the named path before capture.",
         )
@@ -6033,25 +6421,55 @@ def run_doctor(
     )
     checks.extend(_doctor_seat_shape(seats, roots=declared, max_findings=max_findings))
 
-    typed_orphans = [item for item in scan.orphan_sidecars if item["typed"]]
-    other_orphans = [item for item in scan.orphan_sidecars if not item["typed"]]
+    orphan_total = scan.sqlite_orphans.total + scan.sqlite_untyped.total
     checks.append(
         _doctor_check(
             "sqlite-sidecar-orphan",
-            "fail" if typed_orphans else ("warn" if other_orphans else "pass"),
+            path_shaped(
+                "fail"
+                if scan.sqlite_orphans.total
+                else ("warn" if scan.sqlite_untyped.total else "pass")
+            ),
             summary="no -wal/-shm/-journal sidecar outlives its database",
             expected="every sqlite sidecar has its primary beside it",
             observed=(
-                f"{len(typed_orphans)} orphans in typed roots, "
-                f"{len(other_orphans)} elsewhere"
+                f"{scan.sqlite_orphans.total} orphans a provider root "
+                f"classifies as sqlite, {scan.sqlite_untyped.total} elsewhere"
             ),
-            findings=typed_orphans + other_orphans,
+            findings=scan.sqlite_orphans.items + scan.sqlite_untyped.items,
+            finding_total=orphan_total,
             max_findings=max_findings,
             remedy=(
-                "checkpoint and clear the debris in the provider and seat "
-                "roots, where a sidecar is typed state: 13 of the ceremony's "
-                "20 laps were sidecar sweeps. Elsewhere a -journal file is "
-                "often ordinary source and needs nothing."
+                "checkpoint and clear the debris. The fail tier is exactly "
+                "what `_provider_classification` calls sqlite inside a "
+                "provider root with a `.db`/`.sqlite`/`.sqlite3` primary "
+                "missing; 13 of the ceremony's 20 laps were sidecar sweeps. "
+                "A seat and the git fleet pass provider=None, so a sidecar "
+                "there is ordinary content and only warns."
+            ),
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "sqlite-sidecar-shadowed",
+            path_shaped("warn" if scan.sqlite_shadowed.total else "pass"),
+            summary=(
+                "no ordinary provider file is shadowed by the sqlite sidecar rule"
+            ),
+            expected="no -wal/-shm/-journal name whose primary is not a database",
+            observed=f"{scan.sqlite_shadowed.total} shadowed provider files",
+            findings=scan.sqlite_shadowed.items,
+            finding_total=scan.sqlite_shadowed.total,
+            max_findings=max_findings,
+            remedy=(
+                "rename or --managed-exclusion the file, or accept the loss "
+                "deliberately. `_capture_provider` drops any provider path "
+                "classified sqlite whose name ends in a sidecar suffix "
+                "(scanner.py:1837) while `_tree_census` still charges it "
+                "(scanner.py:2213-2217), so an ordinary source file such as "
+                "`plugins/vendor/systemd-journal` is carried by the census "
+                "and absent from the items. This is silent loss, not a "
+                "refusal, which is why it warns rather than blocking."
             ),
         )
     )
@@ -6059,20 +6477,37 @@ def run_doctor(
     checks.append(
         _doctor_check(
             "symlink-mode-portability",
-            "warn" if (cross_kernel and scan.unportable_symlinks) else "pass",
+            # No peer kernel is not agreement: a probe that failed leaves this
+            # unevaluated, and `pass` would report the peer-unreachable run as
+            # having compared two kernels.
+            "skipped"
+            if peer_kind is None
+            else path_shaped(
+                "warn" if (cross_kernel and scan.unportable_symlinks.total) else "pass"
+            ),
             summary="symlink permission bits do not bind across kernels",
             expected=(
                 f"{local_kind} and {peer_kind} agree on symlink mode"
                 if cross_kernel
-                else "one kernel on both roles"
+                else (
+                    "one kernel on both roles"
+                    if peer_kind
+                    else "a peer kernel to compare against"
+                )
             ),
             observed=(
-                f"{len(scan.unportable_symlinks)} of {scan.symlinks} symlinks "
-                f"carry a mode other than {LINUX_SYMLINK_MODE}"
+                f"{scan.unportable_symlinks.total} of {scan.symlinks} symlinks "
+                f"carry a mode other than {LINUX_SYMLINK_MODE}; "
+                f"at most {DOCTOR_SAMPLE_FINDINGS} are named"
                 if cross_kernel
-                else f"{scan.symlinks} symlinks, no peer kernel to compare"
+                else (
+                    f"{scan.symlinks} symlinks, one kernel on both roles"
+                    if peer_kind
+                    else f"{scan.symlinks} symlinks, no peer kernel to compare"
+                )
             ),
-            findings=scan.unportable_symlinks if cross_kernel else [],
+            findings=scan.unportable_symlinks.items if cross_kernel else [],
+            finding_total=scan.unportable_symlinks.total if cross_kernel else 0,
             max_findings=max_findings,
             remedy=(
                 "no action while the exemption stands: mode is exempt from "
@@ -6084,30 +6519,45 @@ def run_doctor(
         )
     )
 
+    peer_identity = peer["path_identity"] if peer else None
+    # The probe and the local measurement spell the same property two ways
+    # ("case-sensitive" from a live directory, "byte-exact" from a declared
+    # kernel default), so they are compared in one vocabulary.
+    local_identity = "byte-exact" if case_identity == "case-sensitive" else case_identity
     identity_split = bool(
-        case_identity == "case-insensitive"
-        and peer
-        and peer["path_identity"] == "byte-exact"
+        peer_identity is not None
+        and local_identity in {"byte-exact", "case-insensitive"}
+        and peer_identity != local_identity
     )
     checks.append(
         _doctor_check(
             "path-identity-pair",
-            "warn" if identity_split else "pass",
+            # Unknown is not agreement. This check is a fact about the pair,
+            # not a defect a rename settles, so the blocking consequence stays
+            # where the offending paths are: case-fold-collision when the
+            # destination folds, git-pointer-spelling when this host does.
+            "skipped"
+            if peer_identity is None and role == "source"
+            else ("warn" if identity_split else "pass"),
             summary="the two roles agree on what makes two paths one path",
             expected="one declared path identity across the pair",
             observed={
-                "peer": peer["path_identity"] if peer else None,
+                "peer": peer_identity,
                 "role": case_identity,
             },
             findings=[
                 {
-                    "peer": peer["ssh_host"],
-                    "peer_identity": peer["path_identity"],
-                    "reason": (
-                        "this host folds case and the peer does not: every "
-                        "case-fold-collision group above is a destination "
-                        "divergence, not a cosmetic one"
+                    "consequence": (
+                        "the destination folds what this host distinguishes: "
+                        "every case-fold-collision group is an overwrite"
+                        if peer_identity == "case-insensitive"
+                        else "this host folds what the destination "
+                        "distinguishes: a recorded spelling may name a real "
+                        "file here and no file there (git-pointer-spelling)"
                     ),
+                    "peer": peer["ssh_host"],
+                    "peer_identity": peer_identity,
+                    "reason": "the two roles do not agree on path identity",
                     "role_identity": case_identity,
                 }
             ]
@@ -6115,9 +6565,9 @@ def run_doctor(
             else [],
             max_findings=max_findings,
             remedy=(
-                "treat case-fold-collision as a blocker on this pair, and "
                 "declare the identity in the contract instead of discovering "
-                "it after a full custody read."
+                "it after a full custody read, and settle every path named by "
+                "case-fold-collision and git-pointer-spelling first."
             ),
         )
     )
@@ -6146,6 +6596,13 @@ def run_doctor(
             }
             for root in declared
         ],
+        "destination": {
+            # What the fail tiers were gated on, recorded so a green report
+            # says which questions it was able to answer.
+            "path_identity": destination_identity,
+            "path_length_ceiling": path_ceiling,
+            "platform": destination_kind,
+        },
         "doctor_id": new_id(),
         "engine_version": engine_version,
         "generated_at": utc_now(),

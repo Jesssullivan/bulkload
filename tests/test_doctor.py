@@ -11,15 +11,22 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import sys
 import tempfile
 import unittest
 
 from bulkload_lib.cli import build_parser, main
-from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
+from bulkload_lib.model import (
+    BulkloadError,
+    canonical_bytes,
+    runtime_source_digest,
+    sha256_bytes,
+)
 from bulkload_lib.scanner import (
     DOCTOR_REPORT_SCHEMA,
+    _capture_provider,
     NON_POSIX_LOGIN_SHELLS,
     SSH_OPTIONS,
     canonical_path_map,
@@ -30,13 +37,21 @@ from bulkload_lib.scanner import (
 
 STUB_SSH = """#!/bin/sh
 # Stub peer: answers the doctor's probes without a network or a host.
+# The kernel probe arrives as `env uname -s`, the shape a NixOS peer can
+# answer, so the stub dispatches on the argument after env.
 while [ "$1" != "--" ]; do shift; done
 shift
 host="$1"
 shift
 case "$1" in
-  */uname) echo "%(kernel)s" ;;
-  */env) printf 'PATH=/usr/bin\\nSHELL=%(shell)s\\n' ;;
+  */env)
+    shift
+    case "$1" in
+      "") printf 'PATH=/usr/bin\\nSHELL=%(shell)s\\nGH_TOKEN=ghp_stub\\n' ;;
+      uname|*/uname) echo "%(kernel)s" ;;
+      *) echo "unexpected env probe: $*" >&2; exit 127 ;;
+    esac
+    ;;
   printf) %(posix)s ;;
   */bulkload*) echo "bulkload %(version)s" ;;
   *) echo "unexpected probe: $*" >&2; exit 127 ;;
@@ -161,7 +176,9 @@ class ReportShapeTests(DoctorTreeCase):
                     "truncated",
                 ],
             )
-            self.assertIn(check["status"], ("pass", "warn", "fail"))
+            self.assertIn(
+                check["status"], ("pass", "partial", "skipped", "warn", "fail")
+            )
             self.assertTrue(check["remedy"])
 
     def test_role_and_budgets_are_validated(self) -> None:
@@ -205,15 +222,22 @@ class CaseFoldTests(DoctorTreeCase):
         other = self.root / "still-b"
         other.mkdir(parents=True)
         (other / "history.db").write_text("y")
+        mapping = canonical_path_map(
+            [
+                (os.fspath(self.home), "/home/jess"),
+                (os.fspath(seat), "/srv/still/Atuin"),
+                (os.fspath(other), "/srv/still/atuin"),
+            ]
+        )
+        seats = [("first", seat, "directory"), ("second", other, "directory")]
+        # A folding destination is what makes the group a defect: the two
+        # spellings are one file there and the second silently overwrites the
+        # first.
         report = self.doctor(
-            seats=[("first", seat, "directory"), ("second", other, "directory")],
-            path_map=canonical_path_map(
-                [
-                    (os.fspath(self.home), "/home/jess"),
-                    (os.fspath(seat), "/home/jess/state/Atuin"),
-                    (os.fspath(other), "/home/jess/state/atuin"),
-                ]
-            ),
+            seats=seats,
+            path_map=mapping,
+            peer_ssh_host="jess@peer",
+            ssh_path=_stub_ssh(self.root, kernel="Darwin"),
         )
         collision = self.check(report, "case-fold-collision")
         self.assertEqual(collision["status"], "fail")
@@ -222,14 +246,130 @@ class CaseFoldTests(DoctorTreeCase):
         self.assertIn(os.fspath(other / "history.db"), named)
         self.assertFalse(report["ok"])
 
-    def test_the_walk_budget_is_reported_not_hidden(self) -> None:
+    def test_a_byte_exact_destination_names_the_group_without_refusing(self) -> None:
+        # The same tree against a byte-exact destination. `Foo` and `foo` are
+        # two paths there, so a refusal would tell the operator to rename real
+        # files that coexist perfectly well.
+        seat = self.root / "still-a"
+        seat.mkdir(parents=True)
+        (seat / "history.db").write_text("x")
+        other = self.root / "still-b"
+        other.mkdir(parents=True)
+        (other / "history.db").write_text("y")
+        report = self.doctor(
+            seats=[("first", seat, "directory"), ("second", other, "directory")],
+            path_map=canonical_path_map(
+                [
+                    (os.fspath(self.home), "/home/jess"),
+                    (os.fspath(seat), "/srv/still/Atuin"),
+                    (os.fspath(other), "/srv/still/atuin"),
+                ]
+            ),
+            peer_ssh_host="jess@peer",
+            ssh_path=_stub_ssh(self.root, kernel="Linux"),
+        )
+        collision = self.check(report, "case-fold-collision")
+        self.assertEqual(collision["status"], "warn")
+        self.assertTrue(collision["findings"])
+        self.assertTrue(report["ok"])
+
+    def test_an_unknown_destination_identity_cannot_refuse(self) -> None:
+        # No --peer-ssh-host means the destination's path identity was never
+        # measured. The group is named; it does not block.
+        seat = self.root / "still-a"
+        seat.mkdir(parents=True)
+        (seat / "history.db").write_text("x")
+        other = self.root / "still-b"
+        other.mkdir(parents=True)
+        (other / "history.db").write_text("y")
+        report = self.doctor(
+            seats=[("first", seat, "directory"), ("second", other, "directory")],
+            path_map=canonical_path_map(
+                [
+                    (os.fspath(self.home), "/home/jess"),
+                    (os.fspath(seat), "/srv/still/Atuin"),
+                    (os.fspath(other), "/srv/still/atuin"),
+                ]
+            ),
+        )
+        self.assertEqual(
+            self.check(report, "case-fold-collision")["status"], "warn"
+        )
+        self.assertIsNone(report["destination"]["path_identity"])
+        self.assertTrue(report["ok"])
+
+    def test_the_destination_role_never_groups_its_own_tree(self) -> None:
+        # --role destination maps every root to itself, so a group here is the
+        # destination host's own siblings, never the source-vs-destination
+        # question the check exists to answer.
+        repository = self.repository("repo")
+        (repository / "Foo").write_text("x")
+        (repository / "foo").write_text("y")
+        report = self.doctor(role="destination")
+        self.assertIn(
+            self.check(report, "case-fold-collision")["status"], ("pass", "warn")
+        )
+        self.assertTrue(report["ok"])
+
+    def test_a_truncated_walk_refuses_instead_of_reporting_green(self) -> None:
+        # DEFAULT_MAX_FILES is 2,000,000 and the ceremony's custody loop ran
+        # over 1,781,044 index entries, so this is one lap's growth away. A
+        # walk that stopped early may not report the namespace as clean.
         repository = self.repository("one")
         for index in range(12):
             (repository / f"file-{index}").write_text("x")
         report = self.doctor(max_entries=4)
         self.assertFalse(report["complete"])
-        self.assertEqual(self.check(report, "scan-complete")["status"], "warn")
-        self.assertIn("still walking", self.check(report, "scan-complete")["observed"])
+        scan = self.check(report, "scan-complete")
+        self.assertEqual(scan["status"], "fail")
+        self.assertIn("still walking", scan["observed"])
+        self.assertFalse(report["ok"])
+        # Every check the walk feeds says so itself rather than reading pass.
+        for code in (
+            "case-fold-collision",
+            "root-readable",
+            "special-entry",
+            "sqlite-sidecar-orphan",
+            "sqlite-sidecar-shadowed",
+        ):
+            self.assertEqual(self.check(report, code)["status"], "partial", code)
+
+    def test_a_complete_walk_says_so(self) -> None:
+        self.repository("one")
+        report = self.doctor()
+        self.assertTrue(report["complete"])
+        self.assertEqual(self.check(report, "scan-complete")["status"], "pass")
+        self.assertTrue(report["ok"])
+
+    def test_a_dropped_member_is_marked_inside_its_own_group(self) -> None:
+        # --max-findings caps how many members of a group are named. For a
+        # verb whose title is "names every offending path", the drop has to be
+        # marked at the site it happened, not only at the check.
+        roots = []
+        for index, spelling in enumerate(("Atuin", "atuin", "ATUIN")):
+            root = self.root / f"still-{index}"
+            root.mkdir()
+            (root / "history.db").write_text("x")
+            roots.append((f"seat{index}", root, spelling))
+        report = self.doctor(
+            seats=[(name, root, "directory") for name, root, _ in roots],
+            path_map=canonical_path_map(
+                [(os.fspath(self.home), "/home/jess")]
+                + [
+                    (os.fspath(root), f"/srv/still/{spelling}")
+                    for _, root, spelling in roots
+                ]
+            ),
+            max_findings=1,
+        )
+        group = next(
+            item
+            for item in self.check(report, "case-fold-collision")["findings"]
+            if item["member_count"] > 1
+        )
+        self.assertEqual(group["member_count"], 3)
+        self.assertEqual(len(group["paths"]), 1)
+        self.assertTrue(group["truncated"])
 
 
 class GitPointerTests(DoctorTreeCase):
@@ -487,6 +627,160 @@ class SqliteSidecarTests(DoctorTreeCase):
         self.assertEqual(check["status"], "warn")
         self.assertFalse(check["findings"][0]["typed"])
 
+    def test_an_ordinary_provider_file_named_like_a_sidecar_never_refuses(self) -> None:
+        # ~/.claude is the largest provider root on this fleet and it holds
+        # vendored source. `_provider_classification` calls these sqlite, so
+        # the fail tier has to look at the primary, not at the root's type.
+        vendor = self.home / ".claude" / "plugins" / "vendor"
+        vendor.mkdir(parents=True)
+        (vendor / "systemd-journal").write_text("ordinary source")
+        (vendor / "notes-wal").write_text("ordinary source")
+        report = self.doctor()
+        self.assertEqual(
+            self.check(report, "sqlite-sidecar-orphan")["status"], "pass"
+        )
+        shadowed = self.check(report, "sqlite-sidecar-shadowed")
+        self.assertEqual(shadowed["status"], "warn")
+        self.assertEqual(shadowed["finding_count"], 2)
+        self.assertTrue(report["ok"])
+
+    def test_the_shadowed_file_is_named_because_capture_drops_it(self) -> None:
+        # Measured against the engine: `_capture_provider` drops a provider
+        # path classified sqlite whose name ends in a sidecar suffix, with no
+        # blocker, while `_tree_census` still charges it.
+        vendor = self.home / ".codex" / "vendor"
+        vendor.mkdir(parents=True)
+        target = vendor / "systemd-journal"
+        target.write_text("ordinary source")
+        captured, _ = _capture_provider(
+            provider="codex",
+            root=self.home / ".codex",
+            role="source",
+            path_map=canonical_path_map(
+                [(os.fspath(self.home / ".codex"), "/home/jess/.codex")]
+            ),
+            exclusions=[],
+            max_files=1000,
+            max_bytes=10**9,
+            max_sqlite_rows=10,
+        )
+        self.assertNotIn(
+            "vendor/systemd-journal",
+            [item["relative_path"] for item in captured["items"]],
+        )
+        self.assertEqual(captured.get("blockers", []), [])
+        finding = self.check(self.doctor(), "sqlite-sidecar-shadowed")["findings"][0]
+        self.assertEqual(finding["path"], os.fspath(target))
+        self.assertEqual(finding["tier"], "shadowed")
+
+
+class SpecialEntryTests(DoctorTreeCase):
+    def test_a_fifo_under_a_provider_root_is_a_refusal(self) -> None:
+        # `_capture_provider` records `special-agent-state` for it and
+        # `stable_capture_pair` turns that into "captures contain blockers".
+        os.mkfifo(self.home / ".claude" / "pipe")
+        report = self.doctor()
+        check = self.check(report, "special-entry")
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(check["findings"][0]["kind"], "fifo")
+        self.assertEqual(
+            check["findings"][0]["path"], os.fspath(self.home / ".claude" / "pipe")
+        )
+        self.assertTrue(check["findings"][0]["blocking"])
+        self.assertFalse(report["ok"])
+
+    def test_a_fifo_in_the_git_fleet_is_a_refusal(self) -> None:
+        repository = self.repository("repo")
+        os.mkfifo(repository / "pipe")
+        report = self.doctor()
+        self.assertEqual(self.check(report, "special-entry")["status"], "fail")
+        self.assertFalse(report["ok"])
+
+    def test_a_socket_under_a_seat_is_silent_loss_not_a_refusal(self) -> None:
+        # `_capture_seat` walks with skip_sockets=True, so the socket is
+        # dropped from the capture without a blocker.
+        seat = self.root / "state"
+        seat.mkdir()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(os.fspath(seat / "sock"))
+        report = self.doctor(
+            seats=[("state", seat, "directory")],
+            path_map=canonical_path_map(
+                [
+                    (os.fspath(self.home), "/home/jess"),
+                    (os.fspath(seat), "/srv/state"),
+                ]
+            ),
+        )
+        check = self.check(report, "special-entry")
+        self.assertEqual(check["status"], "warn")
+        self.assertEqual(check["findings"][0]["kind"], "socket")
+        self.assertFalse(check["findings"][0]["blocking"])
+        self.assertTrue(report["ok"])
+
+    def test_a_clean_tree_reports_the_check_as_passing(self) -> None:
+        self.repository("repo")
+        self.assertEqual(self.check(self.doctor(), "special-entry")["status"], "pass")
+
+
+class PathLengthTests(DoctorTreeCase):
+    def test_a_map_that_overruns_the_destination_ceiling_is_named(self) -> None:
+        repository = self.repository("repo")
+        (repository / ("x" * 200)).write_text("payload")
+        prefix = "/" + "/".join("d" * 200 for _ in range(6))
+        report = self.doctor(
+            path_map=canonical_path_map([(os.fspath(self.home), prefix)]),
+            peer_ssh_host="sting",
+            ssh_path=_stub_ssh(self.root, kernel="Darwin"),
+        )
+        check = self.check(report, "path-length-ceiling")
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(check["findings"][0]["ceiling"], 1024)
+        self.assertGreater(check["findings"][0]["length"], 1024)
+        self.assertFalse(report["ok"])
+
+    def test_an_unknown_destination_kernel_only_warns(self) -> None:
+        repository = self.repository("repo")
+        (repository / ("x" * 200)).write_text("payload")
+        prefix = "/" + "/".join("d" * 200 for _ in range(6))
+        report = self.doctor(
+            path_map=canonical_path_map([(os.fspath(self.home), prefix)])
+        )
+        self.assertEqual(self.check(report, "path-length-ceiling")["status"], "warn")
+        self.assertTrue(report["ok"])
+
+    def test_ordinary_paths_pass(self) -> None:
+        self.repository("repo")
+        self.assertEqual(
+            self.check(self.doctor(), "path-length-ceiling")["status"], "pass"
+        )
+
+
+class ManagedExclusionTests(DoctorTreeCase):
+    def test_a_pruned_provider_path_is_never_named(self) -> None:
+        # The doctor walks the namespace capture walks: a path capture prunes
+        # is not a path the operator has to settle.
+        vendor = self.home / ".codex" / "skills" / "vendor"
+        vendor.mkdir(parents=True)
+        (vendor / "history.db-wal").write_text("debris")
+        self.assertEqual(
+            self.check(self.doctor(), "sqlite-sidecar-orphan")["status"], "fail"
+        )
+        report = self.doctor(managed_exclusions=[("codex", "skills/vendor")])
+        self.assertEqual(self.check(report, "sqlite-sidecar-orphan")["status"], "pass")
+        self.assertTrue(report["ok"])
+
+    def test_a_regenerate_namespace_is_pruned_the_way_capture_prunes_it(self) -> None:
+        # `_is_pruned` folds the regenerate namespaces in too, so the doctor
+        # no longer names ~/.claude/cache, which capture never reads.
+        cache = self.home / ".claude" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "history.db-wal").write_text("debris")
+        report = self.doctor()
+        self.assertEqual(self.check(report, "sqlite-sidecar-orphan")["status"], "pass")
+        self.assertTrue(report["ok"])
+
 
 class DeclaredRootTests(DoctorTreeCase):
     def test_a_missing_git_root_is_named(self) -> None:
@@ -546,6 +840,64 @@ class RuntimeParityTests(DoctorTreeCase):
         self.assertEqual(report["runtime"]["presented_sha256"], "b" * 64)
         self.assertNotEqual(
             report["runtime"]["measured_sha256"], report["runtime"]["presented_sha256"]
+        )
+        self.assertTrue(report["ok"])
+
+    def test_a_malformed_channel_alone_fails(self) -> None:
+        # BULKLOAD_RUNTIME_SOURCE_SHA256 is the variable the launcher writes
+        # and model.runtime_source_digest reads. A preflight blind to it
+        # greenlights a host where every digest-bearing verb dies instantly.
+        self._with_environment(
+            BULKLOAD_RUNTIME_SOURCE_PIN=None,
+            BULKLOAD_RUNTIME_SOURCE_SHA256="not-a-digest",
+        )
+        report = self.doctor()
+        check = self.check(report, "runtime-source-parity")
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(report["runtime"]["channel"], "malformed")
+        self.assertEqual(
+            report["runtime"]["presented_sha256"],
+            report["runtime"]["measured_sha256"],
+        )
+        with self.assertRaises(BulkloadError):
+            runtime_source_digest()
+        self.assertFalse(report["ok"])
+
+    def test_a_well_formed_channel_that_is_not_the_closure_fails(self) -> None:
+        # Well-formed and wrong is the worse case: the operator is told to
+        # hand runtime.presented_sha256 to the peer as
+        # --peer-runtime-source-sha256, so an unvalidated channel propagates
+        # its own drift to both roles.
+        self._with_environment(
+            BULKLOAD_RUNTIME_SOURCE_PIN=None,
+            BULKLOAD_RUNTIME_SOURCE_SHA256="0" * 64,
+        )
+        report = self.doctor()
+        check = self.check(report, "runtime-source-parity")
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(
+            [item["variable"] for item in check["findings"]],
+            ["BULKLOAD_RUNTIME_SOURCE_SHA256"],
+        )
+        # presented_sha256 keeps naming what the engine will really present,
+        # because that is the value every receipt would carry; the check
+        # refuses so it is never copied to the peer.
+        self.assertEqual(report["runtime"]["presented_sha256"], "0" * 64)
+        self.assertNotEqual(
+            report["runtime"]["measured_sha256"], report["runtime"]["presented_sha256"]
+        )
+        self.assertFalse(report["ok"])
+
+    def test_a_pin_that_explains_the_channel_stays_a_warning(self) -> None:
+        # The documented break-glass: the pin and the channel agree, so the
+        # divergence is declared rather than forged.
+        self._with_environment(
+            BULKLOAD_RUNTIME_SOURCE_PIN="c" * 64,
+            BULKLOAD_RUNTIME_SOURCE_SHA256="c" * 64,
+        )
+        report = self.doctor()
+        self.assertEqual(
+            self.check(report, "runtime-source-parity")["status"], "warn"
         )
         self.assertTrue(report["ok"])
 
@@ -618,7 +970,73 @@ class PeerProbeTests(DoctorTreeCase):
         )
         check = self.check(report, "symlink-mode-portability")
         self.assertEqual(check["status"], "pass")
-        self.assertIn("no peer kernel to compare", check["observed"])
+        self.assertIn("one kernel on both roles", check["observed"])
+
+    def test_no_peer_leaves_the_cross_kernel_checks_unevaluated(self) -> None:
+        # Without a peer nothing about the other kernel was measured, so
+        # neither check may spell its verdict `pass`.
+        report = self.doctor()
+        self.assertEqual(
+            self.check(report, "symlink-mode-portability")["status"], "skipped"
+        )
+        self.assertEqual(self.check(report, "path-identity-pair")["status"], "skipped")
+        self.assertTrue(report["ok"])
+
+    def test_an_unreachable_peer_does_not_downgrade_to_pass(self) -> None:
+        # peer-reachable already refuses; the checks that needed the probe say
+        # they were skipped rather than reporting a comparison they never made.
+        script = self.root / "ssh"
+        script.write_text("#!/bin/sh\necho 'Permission denied' >&2\nexit 255\n")
+        script.chmod(0o755)
+        report = self.doctor(
+            peer_ssh_host="sting",
+            peer_bulkload="/opt/bulkload/scripts/bulkload.py",
+            ssh_path=os.fspath(script),
+        )
+        for code in (
+            "peer-login-shell",
+            "peer-engine-version",
+            "symlink-mode-portability",
+            "path-identity-pair",
+        ):
+            self.assertEqual(self.check(report, code)["status"], "skipped", code)
+
+    def test_a_nixos_peer_without_usr_bin_uname_is_still_reachable(self) -> None:
+        # NixOS ships /usr/bin/env and nothing else under /usr/bin. Probing
+        # /usr/bin/uname directly reported a reachable, correctly configured
+        # peer as unreachable and silently downgraded every check below it.
+        script = self.root / "ssh"
+        script.write_text(
+            "#!/bin/sh\n"
+            'while [ "$1" != "--" ]; do shift; done\n'
+            "shift\n"
+            "shift\n"
+            'case "$1" in\n'
+            "  /usr/bin/uname) echo 'sh: /usr/bin/uname: not found' >&2; exit 127 ;;\n"
+            "esac\n"
+            'shift\n'
+            'case "$1" in\n'
+            "  uname) echo Linux ;;\n"
+            "  '') printf 'SHELL=/bin/bash\\n' ;;\n"
+            "  *) echo bulkload-posix-ok ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+        script.chmod(0o755)
+        report = self.doctor(peer_ssh_host="sting", ssh_path=os.fspath(script))
+        self.assertEqual(self.check(report, "peer-reachable")["status"], "pass")
+        self.assertEqual(report["peer"]["platform"], "linux")
+
+    def test_the_peer_environment_is_not_sealed_into_the_report(self) -> None:
+        # The report is written to --output, reviewed, and copied between
+        # hosts. Only the parsed login shell is ever consumed.
+        report = self.doctor(
+            peer_ssh_host="sting", ssh_path=_stub_ssh(self.root, shell="/usr/bin/fish")
+        )
+        probe = report["peer"]["probes"]["environment"]
+        self.assertEqual(sorted(probe), ["error", "status"])
+        self.assertEqual(report["peer"]["login_shell"], "/usr/bin/fish")
+        self.assertNotIn("GH_TOKEN", json.dumps(report))
 
     def test_a_peer_engine_of_another_version_fails(self) -> None:
         report = self.doctor(
@@ -647,6 +1065,7 @@ class PeerProbeTests(DoctorTreeCase):
         self.assertEqual(self.check(report, "peer-reachable")["status"], "fail")
         self.assertFalse(report["peer"]["reachable"])
         self.assertEqual(self.check(report, "case-fold-collision")["status"], "pass")
+        self.assertIsNone(report["destination"]["path_identity"])
 
     def test_the_probe_uses_the_transport_option_vector(self) -> None:
         recorder = self.root / "ssh"

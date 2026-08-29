@@ -62,12 +62,24 @@ It reports: case-fold collision groups over every declared root, git worktree
 and alternates pointers whose recorded spelling differs from the directory
 entry, path-map coverage and aliasing, seat shape (`--seat` is a directory,
 `--file-seat` a regular file), orphaned SQLite `-wal`/`-shm`/`-journal`
-sidecars in typed roots, the symlink-mode and path-identity consequences of a
-darwin/linux pair, the peer's login shell (a `fish` seat cannot parse the
-POSIX command shapes; pipe remote scripts as `ssh HOST bash -s`), and
-runtime-closure parity between the two roles. Pass the peer's
-`runtime.presented_sha256` back as `--peer-runtime-source-sha256` to bind the
-pair. Every peer probe is a simple read-only command; nothing is written,
+sidecars, ordinary provider files the sidecar rule shadows, sockets and other
+special entries the capture refuses, destination paths over the destination
+kernel's `PATH_MAX`, unreadable paths, the symlink-mode and path-identity
+consequences of a darwin/linux pair, the peer's login shell (a `fish` seat
+cannot parse the POSIX command shapes; pipe remote scripts as
+`ssh HOST bash -s`), and runtime-closure parity between the two roles. Pass
+the peer's `runtime.presented_sha256` back as `--peer-runtime-source-sha256`
+to bind the pair.
+
+Pass the same `--managed-exclusion` vector the capture will get, so the
+preflight walks the namespace capture walks and never names a path capture
+prunes. Two verdicts are not clean bills: `partial` means the walk stopped at
+`--max-entries` before the check saw the whole namespace, and `skipped` means
+the check needed a peer that did not answer. `--peer-ssh-host` is what makes
+the destination's path identity and `PATH_MAX` knowable, so without it the
+case-fold and path-length checks can only warn. The kernel probe runs as
+`env uname -s` rather than `/usr/bin/uname`, which a NixOS peer does not
+ship. Every peer probe is a simple read-only command; nothing is written,
 started, or signaled on either host.
 
 ## Capture twice per role

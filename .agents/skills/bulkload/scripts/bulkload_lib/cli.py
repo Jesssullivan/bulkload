@@ -162,15 +162,20 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         return
     roots: list[Path] = []
     if arguments.command in {"agent-capture", "doctor"}:
-        roots.extend((Path(arguments.home), Path(arguments.git_root)))
+        # `_absolute` is what the handlers bind, so the guard has to expand
+        # the same way: an unexpanded `~` in --home would otherwise compare a
+        # literal "~/..." against a real path and miss the overlap.
+        roots.extend((_absolute(arguments.home), _absolute(arguments.git_root)))
         roots.extend(
-            Path(path)
+            _absolute(path)
             for path in (arguments.codex_root, arguments.claude_root, arguments.pi_root)
             if path
         )
-        roots.extend(path for _, path, _ in [*arguments.seat, *arguments.file_seat])
+        roots.extend(
+            _absolute(path) for _, path, _ in [*arguments.seat, *arguments.file_seat]
+        )
         if arguments.snapshot_base_seal:
-            roots.append(Path(arguments.snapshot_base_seal).expanduser().parent)
+            roots.append(_absolute(arguments.snapshot_base_seal).parent)
     elif arguments.command == "agent-plan":
         for name in ("source_a", "source_b", "destination_a", "destination_b"):
             roots.extend(_catalog_roots(_load(getattr(arguments, name))["catalog"]))
@@ -294,11 +299,12 @@ def _doctor(arguments: argparse.Namespace) -> dict[str, Any]:
         if arguments.snapshot_base_seal
         else None,
         engine_version=__version__,
+        managed_exclusions=arguments.managed_exclusion,
         peer_ssh_host=arguments.peer_ssh_host,
         peer_bulkload=arguments.peer_bulkload,
         peer_runtime_source_sha256=arguments.peer_runtime_source_sha256,
         ssh_path=arguments.ssh_path,
-        peer_uname_path=arguments.peer_uname_path,
+        peer_uname_path=arguments.peer_uname,
         peer_env_path=arguments.peer_env_path,
         peer_timeout_seconds=arguments.peer_timeout_seconds,
         max_entries=arguments.max_entries,
@@ -648,6 +654,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="mutable single-file seat as NAME=PATH; repeatable",
     )
     doctor.add_argument(
+        "--managed-exclusion",
+        action="append",
+        type=_parse_managed_exclusion,
+        default=[],
+        help=(
+            "PROVIDER:RELATIVE_PATH capture will prune; repeatable. Pass the "
+            "same vector agent-capture will get, so the preflight walks the "
+            "namespace capture walks and names no path capture never reads."
+        ),
+    )
+    doctor.add_argument(
         "--path-map",
         action="append",
         type=_parse_mapping,
@@ -691,9 +708,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssh-path", help="explicit ssh executable; defaults to the one on PATH"
     )
     doctor.add_argument(
-        "--peer-uname-path",
+        "--peer-uname",
         default=DEFAULT_PEER_UNAME,
-        help=f"peer uname(1) path for the kernel probe (default {DEFAULT_PEER_UNAME})",
+        help=(
+            "peer uname(1) command for the kernel probe, resolved through "
+            f"--peer-env-path (default {DEFAULT_PEER_UNAME}). An absolute "
+            "path also works; the default is a bare name so a NixOS peer, "
+            "which ships no /usr/bin/uname, answers it."
+        ),
     )
     doctor.add_argument(
         "--peer-env-path",
