@@ -797,7 +797,14 @@ def _verify_record(
             raise _StageSourceChanged(f"directory changed before staging: {path}")
     else:
         raise _StageSourceChanged("unsupported staged entry kind")
-    if f"{stat.S_IMODE(info.st_mode):04o}" != record.get("mode"):
+    if expected_kind != "symlink" and f"{stat.S_IMODE(info.st_mode):04o}" != record.get(
+        "mode"
+    ):
+        # Symlink permission bits are not portable across kernels: darwin
+        # lstat reports the creating umask's bits while Linux fixes every
+        # symlink at 0777 and has no lchmod. The custody verifier already
+        # exempts symlink mode (c81de89); a quarantined symlink's identity is
+        # its target bytes, checked above via sha256_symlink.
         raise _StageSourceChanged(f"state mode changed before staging: {path}")
 
 
