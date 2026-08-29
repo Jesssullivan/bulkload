@@ -83,7 +83,33 @@ def _remote_safe_stage_root(path: Path) -> Path:
     return Path(value)
 
 
-def _write_apply_journal(path: Path, journal: dict[str, Any]) -> None:
+_JOURNAL_WRITE_STATE: dict[str, Any] = {"count": 0, "state": None}
+
+
+def _write_apply_journal(
+    path: Path, journal: dict[str, Any], *, force: bool = False
+) -> None:
+    """Seal and durably rewrite the whole journal — throttled.
+
+    Sealing is canonical JSON + sha256 over the entire journal; at 1.7M
+    mutations + snapshots that is minutes of CPU per call, and the git phase
+    calls this per installed object. With BULKLOAD_JOURNAL_WRITE_EVERY=N
+    (default 1 = every call), only every Nth call is written, EXCEPT: any
+    call where journal["state"] changed, where an apply receipt is present,
+    or force=True — those always persist. A crash replays at most N
+    idempotent steps from the last durable boundary.
+    """
+    tracker = _JOURNAL_WRITE_STATE
+    tracker["count"] += 1
+    state = journal.get("state")
+    must = (
+        force
+        or state != tracker["state"]
+        or journal.get("apply_receipt") is not None
+    )
+    tracker["state"] = state
+    if not must and tracker["count"] % _journal_write_every() != 0:
+        return
     seal(journal, "journal_sha256")
     atomic_write_json(path, journal)
 
@@ -2495,8 +2521,9 @@ def _snapshot_all(
         snapshots.append(snapshot)
         journal["snapshot_progress"] = len(snapshots)
         journal["updated_at"] = utc_now()
-        if len(snapshots) % every == 0 or len(snapshots) == len(mutations):
-            _write_apply_journal(journal_path, journal)
+        _write_apply_journal(
+            journal_path, journal, force=len(snapshots) == len(mutations)
+        )
         raw = os.environ.get("BULKLOAD_TEST_CRASH_AFTER_SNAPSHOT")
         if raw is not None and raw.isdecimal() and len(snapshots) >= int(raw):
             raise BulkloadError("injected crash after durable rollback snapshot")
@@ -2632,8 +2659,9 @@ def _apply_mutations(
         mutation["after"] = after
         journal["progress"] = index + 1
         journal["updated_at"] = utc_now()
-        if (index + 1) % every == 0 or index + 1 == len(mutations):
-            _write_apply_journal(journal_path, journal)
+        _write_apply_journal(
+            journal_path, journal, force=index + 1 == len(mutations)
+        )
         _crash_fence(journal)
     journal["state"] = "mutations-applied"
     journal["updated_at"] = utc_now()
