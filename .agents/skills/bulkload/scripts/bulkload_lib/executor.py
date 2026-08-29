@@ -155,6 +155,63 @@ def _read_apply_journal(path: Path) -> dict[str, Any]:
     return journal
 
 
+_FSCK_BENIGN_MSGIDS = (
+    "missingTaggerEntry",
+    "badTimezone",
+    "missingSpaceBeforeDate",
+    "zeroPaddedFilemode",
+    "badDateOverflow",
+    "zeroPaddedDate",
+    "extraHeaderEntry",
+)
+
+
+def _fsck_workspace(repository: Path) -> None:
+    """fsck that distinguishes corruption from historical format artifacts.
+
+    Real-world upstream histories (the Linux kernel's 2005-era tags carry no
+    tagger line, for one) fail `git fsck` on object-FORMAT complaints that are
+    bit-identical to upstream and prove nothing about this transfer. Custody
+    already verified every object's sha256; this gate exists to catch
+    corruption — missing objects, broken links, hash mismatches — which stay
+    fatal. A nonzero fsck whose every complaint line carries a known-benign
+    msgid is tolerated and disclosed on stderr (defect 12, linux-xr-fast,
+    2026-08-29).
+    """
+    result = subprocess.run(
+        ["git", "-C", os.fspath(repository), "fsck", "--full", "--no-dangling"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    )
+    if result.returncode == 0:
+        return
+    output = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="replace")
+    fatal: list[str] = []
+    benign = 0
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("warning", "error")) and any(
+            msgid in line for msgid in _FSCK_BENIGN_MSGIDS
+        ):
+            benign += 1
+            continue
+        fatal.append(line)
+    if fatal:
+        raise BulkloadError(
+            f"Git fsck failed in {repository}: " + " | ".join(fatal[:5])[:600]
+        )
+    print(
+        f"bulkload: fsck tolerated {benign} historical format complaint(s) in "
+        f"{repository}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _git(repository: Path, arguments: Sequence[str], *, check: bool = True) -> bytes:
     result = subprocess.run(
         ["git", "-C", os.fspath(repository), *arguments],
@@ -2329,7 +2386,7 @@ def _apply_git_entry(
             if not destination_shallow.exists():
                 destination_shallow.write_bytes(graft.read_bytes())
                 fsync_directory(destination_shallow.parent)
-    _git(primary, ["fsck", "--full", "--no-dangling"])
+    _fsck_workspace(primary)
 
 
 def _collect_mutations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2949,7 +3006,7 @@ def _verify_git_entry(entry: dict[str, Any]) -> list[dict[str, str]]:
                     {"code": "git-worktree-deletion-mismatch", "path": target}
                 )
     try:
-        _git(repository, ["fsck", "--full", "--no-dangling"])
+        _fsck_workspace(repository)
     except BulkloadError:
         failures.append({"code": "git-fsck-failed", "path": os.fspath(repository)})
     return failures
@@ -3443,7 +3500,7 @@ def _execute_rollback_step(kind: str, payload: Any, rollback_root: Path) -> None
             fsync_directory(path.parent)
         return
     if kind == "git-fsck":
-        _git(Path(payload), ["fsck", "--full", "--no-dangling"])
+        _fsck_workspace(Path(payload))
         return
     if kind == "created-root":
         root = Path(payload)
