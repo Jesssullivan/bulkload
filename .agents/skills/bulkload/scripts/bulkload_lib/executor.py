@@ -164,8 +164,11 @@ def _git(repository: Path, arguments: Sequence[str], *, check: bool = True) -> b
         env=git_environment(),
     )
     if check and result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[:500]
         raise BulkloadError(
-            f"Git mutation/verification failed ({arguments[0] if arguments else 'unknown'})"
+            "Git mutation/verification failed "
+            f"({arguments[0] if arguments else 'unknown'}) in {repository}"
+            + (f": {detail}" if detail else "")
         )
     return result.stdout
 
