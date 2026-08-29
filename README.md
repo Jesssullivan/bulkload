@@ -20,6 +20,16 @@ agent-rollback
 agent-recover
 ```
 
+## Progress
+
+Every verb prints its own progress on stderr with no flags: a `bulkload-run`
+banner at both ends of the invocation, a `bulkload-progress` heartbeat every
+30 s *during* long phases with `done`/`total`/`bytes`/`rate`/`eta`, and one
+`bulkload-phase` line per phase at exit. `--progress-log PATH` duplicates the
+same lines into a file, `--heartbeat-seconds N` retunes the interval, and
+`--quiet` turns stderr telemetry off. None of it reaches an artifact or
+changes a digest.
+
 ## Safety model
 
 - Two stable captures are required for both source and destination.

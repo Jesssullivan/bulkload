@@ -219,6 +219,29 @@ receipt keeps `provider_runtime_acceptance_verified=false`; a fresh attended
 Codex/Claude/Pi action is required before claiming working authentication or
 resume continuity.
 
+## Telemetry
+
+Telemetry is default-on and diagnostic only. It is written to stderr, and to
+`--progress-log` when the operator names one; it never enters an artifact,
+never contributes to a digest, and every sink write is guarded so a broken
+sink cannot fail a cutover. Three line kinds, all `key=value` after a leading
+token:
+
+```text
+bulkload-run      event=start|end verb= version= pid= host= seconds= status= exit=
+bulkload-progress phase= root= seconds= unit= done= total= bytes= rate= eta=
+bulkload-phase    phase= root= seconds= files= bytes=
+```
+
+`bulkload-progress` is emitted *during* a phase on a fixed interval
+(`--heartbeat-seconds`, default 30), not at its exit, because the phases that
+matter run for hours. A phase that blocks in one opaque call — the rsync
+payload push — is ticked by a watchdog and reports elapsed time against the
+sealed charge instead of an invented position. `files` counts entries and
+`bytes` counts bytes; no field carries the other's value. Every line names a
+phase, a root label, and counters only: never a path, a credential, or a
+remote URL.
+
 ## Explicit boundaries
 
 Bulkload does not invoke a terminal multiplexer, TCFS runtime, Home Manager,

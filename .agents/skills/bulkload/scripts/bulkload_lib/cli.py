@@ -6,8 +6,10 @@ import argparse
 import gc
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import sys
+import time
 from typing import Any, Sequence
 
 from . import __version__
@@ -31,12 +33,15 @@ from .model import (
 )
 from .planner import compile_agent_plan_authorities
 from .scanner import (
+    DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
     _catalog_path_identities,
     canonical_path_map,
     capture_agent_state,
+    configure_progress,
+    emit_progress,
     validate_agent_capture,
 )
 
@@ -420,6 +425,81 @@ def _agent_recover(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _telemetry_parser() -> argparse.ArgumentParser:
+    """The progress flags every verb carries.
+
+    Telemetry is on by default: a verb that runs for hours must never leave a
+    zero-byte log behind. `--quiet` is the opt-out, and `--progress-log`
+    duplicates the same lines into a file an unattended agent can tail.
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress phase and heartbeat telemetry on stderr",
+    )
+    parent.add_argument(
+        "--progress-log",
+        help=(
+            "append phase and heartbeat telemetry to this file as well as "
+            "stderr. It must not live under any live, stage, or snapshot root."
+        ),
+    )
+    parent.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SECONDS,
+        help=(
+            "seconds between in-phase heartbeat lines "
+            f"(default {DEFAULT_HEARTBEAT_SECONDS:g})"
+        ),
+    )
+    return parent
+
+
+def _cheap_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Roots a progress log must not land in, read straight off the flags.
+
+    Deliberately does not open any evidence: this runs before the first
+    telemetry line, and `agent-plan`'s four captures are gigabytes each.
+    """
+    roots: list[Path] = []
+    for name in ("home", "git_root", "codex_root", "claude_root", "pi_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    for declaration in [
+        *getattr(arguments, "seat", []),
+        *getattr(arguments, "file_seat", []),
+    ]:
+        roots.append(declaration[1])
+    for name in ("stage_root", "rollback_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    seal = getattr(arguments, "snapshot_base_seal", None)
+    if seal:
+        roots.append(Path(seal).expanduser().parent)
+    return roots
+
+
+def _open_progress_log(arguments: argparse.Namespace) -> Any:
+    path = getattr(arguments, "progress_log", None)
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    output = getattr(arguments, "output", None)
+    if output and output != "-" and Path(output).expanduser() == candidate:
+        raise BulkloadError("progress log must not be the evidence output path")
+    assert_no_overlap(candidate, _cheap_protected_roots(arguments), "progress log")
+    descriptor = os.open(
+        candidate,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    return os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", closefd=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkload",
@@ -429,8 +509,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    telemetry = _telemetry_parser()
 
-    capture = commands.add_parser("agent-capture", help="write AgentCaptureV4 evidence")
+    capture = commands.add_parser(
+        "agent-capture",
+        help="write AgentCaptureV4 evidence",
+        parents=[telemetry],
+    )
     capture.add_argument("--role", choices=("source", "destination"), required=True)
     capture.add_argument("--home", required=True)
     capture.add_argument("--git-root", required=True)
@@ -480,7 +565,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--output", required=True)
     capture.set_defaults(handler=_agent_capture)
 
-    plan = commands.add_parser("agent-plan", help="compile an exact four-capture union")
+    plan = commands.add_parser(
+        "agent-plan",
+        help="compile an exact four-capture union",
+        parents=[telemetry],
+    )
     plan.add_argument("--source-a", required=True)
     plan.add_argument("--source-b", required=True)
     plan.add_argument("--destination-a", required=True)
@@ -489,7 +578,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=_agent_plan)
 
     stage = commands.add_parser(
-        "agent-stage", help="materialize preseed or final stage"
+        "agent-stage",
+        help="materialize preseed or final stage",
+        parents=[telemetry],
     )
     stage.add_argument("--phase", choices=("preseed", "final"), required=True)
     stage.add_argument("--plan")
@@ -520,7 +611,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--output", required=True)
     stage.set_defaults(handler=_agent_stage)
 
-    apply = commands.add_parser("agent-apply", help="apply a sealed final stage")
+    apply = commands.add_parser(
+        "agent-apply",
+        help="apply a sealed final stage",
+        parents=[telemetry],
+    )
     apply.add_argument("--plan", required=True)
     apply.add_argument("--stage-receipt", required=True)
     apply.add_argument("--accept-plan-sha256", required=True)
@@ -533,7 +628,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply.set_defaults(handler=_agent_apply)
 
     verify = commands.add_parser(
-        "agent-verify", help="independently verify final state"
+        "agent-verify",
+        help="independently verify final state",
+        parents=[telemetry],
     )
     verify.add_argument("--plan", required=True)
     verify.add_argument("--stage-receipt", required=True)
@@ -543,7 +640,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.set_defaults(handler=_agent_verify)
 
     rollback = commands.add_parser(
-        "agent-rollback", help="restore exact overwritten state"
+        "agent-rollback",
+        help="restore exact overwritten state",
+        parents=[telemetry],
     )
     rollback.add_argument("--apply-receipt", required=True)
     rollback.add_argument("--accept-receipt-sha256", required=True)
@@ -551,7 +650,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.set_defaults(handler=_agent_rollback)
 
     recover = commands.add_parser(
-        "agent-recover", help="resume or roll back an interrupted apply"
+        "agent-recover",
+        help="resume or roll back an interrupted apply",
+        parents=[telemetry],
     )
     recover.add_argument("--plan", required=True)
     recover.add_argument("--stage-receipt", required=True)
@@ -565,11 +666,55 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    started = time.monotonic()
+    log = None
+    status = "fail"
+    code: int | None = None
     try:
-        _protect_output(arguments)
-        result = arguments.handler(arguments)
-        _write(arguments.output, result)
-    except (BulkloadError, OSError, sqlite3.Error) as error:
-        print(f"bulkload: FAIL: {error}", file=sys.stderr)
-        return 1
-    return 0
+        try:
+            log = _open_progress_log(arguments)
+            configure_progress(
+                stderr=not arguments.quiet,
+                interval=arguments.heartbeat_seconds,
+                log_stream=log,
+            )
+        except (BulkloadError, OSError) as error:
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            code = 1
+            return 1
+        # Every verb announces itself. This line, and the closing one below,
+        # are why no invocation can leave a zero-byte log behind again.
+        emit_progress(
+            "bulkload-run"
+            " event=start"
+            f" verb={arguments.command}"
+            f" version={__version__}"
+            f" pid={os.getpid()}"
+            f" host={socket.gethostname()}"
+        )
+        try:
+            _protect_output(arguments)
+            result = arguments.handler(arguments)
+            _write(arguments.output, result)
+        except (BulkloadError, OSError, sqlite3.Error) as error:
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            code = 1
+            return 1
+        status = "ok"
+        code = 0
+        return 0
+    finally:
+        emit_progress(
+            "bulkload-run"
+            " event=end"
+            f" verb={arguments.command}"
+            f" seconds={time.monotonic() - started:.3f}"
+            f" status={status}"
+            f" exit={'-' if code is None else code}"
+        )
+        configure_progress(stderr=not arguments.quiet, log_stream=None)
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
