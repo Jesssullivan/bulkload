@@ -23,13 +23,18 @@ operation is read-only.
   nonportable hold. Descendants of a declared provider root default to typed
   portable-private state; special entries, unsafe typed state, and structural
   collisions stop planning.
-- Writers are briefly quiesced for each stable capture pair. They may resume
-  during preliminary preseed; final authority comes from fresh quiesced source
-  and destination captures and a fresh plan. Keep writers stopped for final
-  stage, apply, verify, rollback, and recovery. SQLite/WAL state uses the backup
-  API, composed only when schema and shared primary-key rows agree, and checked
-  independently before a final receipt. Offline receipts still require a fresh
-  attended provider turn before claiming runtime authentication.
+- Sessions remain alive and no process is ever signaled. A stable capture
+  pair is an immutable live-snapshot A capture plus a B capture seal-chained off
+  it (contract stability and identity superset, never catalog byte-equality on
+  a living host). Writers keep running during preliminary preseed; final
+  authority comes from an attended no-interaction interval proven by two
+  matching complete live epochs before and after transport, a fresh final
+  capture pair, and a fresh plan. Quiescence is verified read-only and refused
+  fail-closed; it is never enforced by stopping anything. SQLite/WAL state uses
+  the backup API, composed only when schema and shared primary-key rows agree,
+  and checked independently before a final receipt. Offline receipts still
+  require a fresh attended provider turn before claiming runtime
+  authentication.
 - All commands use the supported `-I -S` launcher and bind the pinned Bulkload
   application-source closure into captures and plans. This does not bind the
   Python interpreter or standard-library closure.
@@ -39,7 +44,9 @@ operation is read-only.
   fall back to a full duplicate. Preseed writes only beneath its external stage
   root and must not mutate any live destination path.
 - Never apply a plan without an exact plan digest supplied by the operator.
-- Require two byte-stable source catalogs before creating an actionable plan.
+- Require a stable source capture pair before creating an actionable plan
+  (live mode: B seal-chained off A; catalog byte-equality is only the legacy
+  `--acknowledge-writers-quiesced` shape and is unsatisfiable on a living host).
 - Treat Git refs/objects, worktree bytes, worktree administration, agent
   transcripts, generated caches, and authentication as separate state classes.
 - Do not infer worktree identity from a basename; record path, branch, HEAD,
