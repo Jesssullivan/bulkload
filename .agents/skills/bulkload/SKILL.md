@@ -59,6 +59,10 @@ scripts/bulkload.py agent-capture \
 
 Repeat into `source-b.json` with
 `--snapshot-base-seal /secure/evidence/.source-a.json.snapshot/snapshot-seal.json`.
+That base is admitted with `--base-custody full` by default, which re-hashes
+every byte of A while capturing B. `--base-custody sealed` admits it on A's
+already-verified seal digest, index digest, and namespace digest instead, and
+still re-derives the git root and every SQLite payload byte for byte.
 On the destination,
 use `--role destination`, the live destination `--home` and `--git-root`, and
 the same source-to-destination path maps. Repeat into two destination files.
@@ -129,7 +133,10 @@ The stage protocol is destination `prepare`, source `push`, destination
 on Sting, with the source and destination GNU rsync paths and hashes bound in
 that plan; rehash the source executable before transport, require the destination's
 immutable Nix-store path, and let destination `prepare` rehash it locally. Use
-`--checksum --delay-updates`, strict SSH, and exact owner-private paths. Every
+`--delay-updates`, strict SSH, and exact owner-private paths. The push relies on
+rsync's size+mtime quick check because the destination independently re-derives
+every transported digest before those bytes gain apply authority; pass
+`--transport-checksum` only to make the transport itself fail earlier. Every
 connection originates on Neo: Neo may pull destination A/B captures and the
 prepare receipt over that connection, but Sting never authenticates to Neo.
 
