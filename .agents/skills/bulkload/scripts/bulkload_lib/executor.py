@@ -2291,7 +2291,23 @@ def _apply_git_entry(
         for worktree in entry["worktrees"]
     }
     if observed_refs != intended_refs or observed_worktrees != intended_worktrees:
-        raise BulkloadError("Git preparation did not reach its intended after-state")
+        deltas: list[str] = []
+        for name in sorted(set(intended_refs) | set(observed_refs)):
+            if intended_refs.get(name) != observed_refs.get(name):
+                deltas.append(
+                    f"ref {name}: intended={intended_refs.get(name)!r} "
+                    f"observed={observed_refs.get(name)!r}"
+                )
+        for name in sorted(set(intended_worktrees) | set(observed_worktrees)):
+            if intended_worktrees.get(name) != observed_worktrees.get(name):
+                deltas.append(
+                    f"worktree {name}: intended={intended_worktrees.get(name)!r} "
+                    f"observed={observed_worktrees.get(name)!r}"
+                )
+        raise BulkloadError(
+            "Git preparation did not reach its intended after-state in "
+            f"{primary}: " + "; ".join(deltas)[:800]
+        )
     grafts_root = os.environ.get("BULKLOAD_SHALLOW_GRAFTS_DIR")
     if grafts_root:
         # Disclosed ceremony aid (defect 10): the engine carries no shallow
