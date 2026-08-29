@@ -27,14 +27,15 @@ from .executor import (
 )
 from .model import (
     EXIT_BOOTSTRAP,
-    EXIT_DESTINATION,
     EXIT_EPOCH,
     EXIT_INTERNAL,
     EXIT_INTERRUPTED,
     EXIT_OK,
     EXIT_REFUSED,
+    EXIT_STORAGE,
     EXIT_USAGE,
     BulkloadError,
+    EpochRefusal,
     MAX_JSON_BYTES,
     assert_no_overlap,
     atomic_write,
@@ -77,8 +78,9 @@ EXIT_CODES: tuple[tuple[int, str], ...] = (
         "custody, plan, or typed-invariant refusal (the general fail-closed class)",
     ),
     (
-        EXIT_DESTINATION,
-        "destination refusal: the capacity gate failed or a required reflink failed",
+        EXIT_STORAGE,
+        "storage refusal: a volume could not hold or reflink-clone what was "
+        "charged against it; the message names the path",
     ),
     (EXIT_INTERNAL, "an unexpected internal error, including malformed input evidence"),
     (
@@ -92,7 +94,10 @@ def exit_code_for(error: BaseException) -> int:
     """Classify one raised error into the documented exit-code table.
 
     Refusal classes carry their own `exit_code`. An `OSError` that reports a
-    full or over-quota filesystem is a destination refusal; every other
+    full or over-quota filesystem is a storage refusal (5) whatever volume it
+    came from -- the source host's own evidence and live-snapshot custody
+    included, since `agent-capture` has no destination at all; `failure_detail`
+    names the path so the operator knows which host to look at. Every other
     `OSError` and `sqlite3.Error` is the general refusal class. Anything else
     reached this process by surprise and is internal (6) -- that is the code
     that a malformed evidence document earns, instead of a bare traceback.
@@ -106,18 +111,11 @@ def exit_code_for(error: BaseException) -> int:
             if hasattr(errno, name)
         }
         if error.errno in full:
-            return EXIT_DESTINATION
+            return EXIT_STORAGE
         return EXIT_REFUSED
     if isinstance(error, sqlite3.Error):
         return EXIT_REFUSED
     return EXIT_INTERNAL
-
-
-def _stderr_is_tty() -> bool:
-    try:
-        return bool(sys.stderr.isatty())
-    except (AttributeError, OSError, ValueError):
-        return False
 
 
 class Progress:
@@ -148,6 +146,11 @@ class Progress:
         self._started = clock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # One lock and one write per line: the heartbeat runs on its own
+        # thread while phase lines come from the main one, and `phase_timing`
+        # writes single-shot records to the same stderr. Two writes per line
+        # (text, then newline) would let a heartbeat split another record.
+        self._lock = threading.Lock()
 
     def _emit(self, event: str, **fields: Any) -> None:
         if not self.enabled:
@@ -159,8 +162,11 @@ class Progress:
             f"elapsed={self.clock() - self._started:.1f}s",
         ]
         parts.extend(f"{key}={value}" for key, value in sorted(fields.items()))
+        line = " ".join(parts) + "\n"
         try:
-            print(" ".join(parts), file=self.stream, flush=True)
+            with self._lock:
+                self.stream.write(line)
+                self.stream.flush()
         except (OSError, ValueError):
             self.enabled = False
 
@@ -190,11 +196,44 @@ class Progress:
 
 
 def progress_enabled(arguments: argparse.Namespace) -> bool:
-    """--progress / --no-progress, defaulting to on for an interactive stderr."""
+    """--progress / --no-progress, defaulting to ON on every stderr.
+
+    Deliberately not gated on `stderr.isatty()`. The measured complaint this
+    answers is a *redirected* one -- `logs/preseed-push.log` is 0 bytes for a
+    2h32m, 84 GiB push -- i.e. exactly the non-TTY case a TTY default would
+    still leave silent. An orchestrator that needs byte-exact stderr passes
+    `--no-progress`; a heartbeat is otherwise cheaper than a hung ceremony.
+    """
     choice = getattr(arguments, "progress", None)
     if choice is None:
-        return _stderr_is_tty()
+        return True
     return bool(choice)
+
+
+def failure_detail(error: BaseException, code: int) -> str:
+    """The one-line failure message, naming the path wherever one is known.
+
+    Exit 5 is volume-neutral: the same capacity gate guards the destination
+    stage, the rollback root, and the source host's own live-snapshot custody.
+    A bare "no space left on device" would send an operator whose source disk
+    filled to the wrong machine, so an `OSError` that carries a filename says
+    which path it was.
+    """
+    detail = f"{type(error).__name__}: {error}" if code == EXIT_INTERNAL else str(error)
+    if isinstance(error, OSError):
+        named: list[str] = []
+        for name in (error.filename, error.filename2):
+            if name is None:
+                continue
+            try:
+                named.append(os.fsdecode(name))
+            except TypeError:
+                # `filename` is a file descriptor on some OSError shapes.
+                named.append(str(name))
+        missing = [name for name in named if name not in detail]
+        if missing:
+            detail = f"{detail} (path: {', '.join(missing)})"
+    return detail
 
 
 def _write(path: str, value: dict[str, Any]) -> None:
@@ -473,30 +512,39 @@ def _agent_plan(arguments: argparse.Namespace) -> dict[str, Any]:
         gc.collect()
         second = _load(os.fspath(second_path))
         validate_agent_capture(second, expected_role=role)
-        if (
-            first_id == second["capture_id"]
-            or not first_complete
-            or not second["complete"]
-            or first_quiesced != second["writers_quiesced"]
-            or (first_quiesced and catalog_sha256 != second["catalog_sha256"])
-            or (
-                not first_quiesced
-                and (
-                    first_contract != second["catalog"]["snapshot"]["contract_sha256"]
-                    or first_seal == second["catalog"]["snapshot"]["seal_sha256"]
-                    or second["catalog"]["snapshot"]["base"]
-                    != {
-                        "seal_path": first_snapshot["seal_path"],
-                        "seal_sha256": first_snapshot["seal_sha256"],
-                        "snapshot_id": first_snapshot["snapshot_id"],
-                    }
-                    or not first_identities.issubset(
-                        _catalog_path_identities(second["catalog"])
-                    )
-                )
-            )
-        ):
-            raise BulkloadError(f"{role} A/B captures are not stable and complete")
+        # Split exactly as `stable_capture_pair` (scanner.py:4751-4786) splits
+        # it, so this streaming re-implementation carries the same process
+        # status as the function it mirrors. The live host moving under an A/B
+        # pair is the retryable epoch class (3); a reused capture ID, mixed
+        # writer boundaries, or a capture that carries blockers is the operator
+        # handing over the wrong documents, which is the general refusal (4)
+        # and identical on retry.
+        if first_id == second["capture_id"]:
+            raise BulkloadError(f"{role} A/B captures reuse one capture ID")
+        if first_quiesced != second["writers_quiesced"]:
+            raise BulkloadError(f"{role} A/B captures use different writer boundaries")
+        if first_quiesced:
+            if catalog_sha256 != second["catalog_sha256"]:
+                raise EpochRefusal(f"{role} A/B captures are not byte-stable")
+        else:
+            snapshot = second["catalog"]["snapshot"]
+            if (
+                first_contract != snapshot["contract_sha256"]
+                or first_seal == snapshot["seal_sha256"]
+                or snapshot["base"]
+                != {
+                    "seal_path": first_snapshot["seal_path"],
+                    "seal_sha256": first_snapshot["seal_sha256"],
+                    "snapshot_id": first_snapshot["snapshot_id"],
+                }
+            ):
+                raise EpochRefusal(f"{role} A/B live snapshot contract is unstable")
+            if not first_identities.issubset(
+                _catalog_path_identities(second["catalog"])
+            ):
+                raise EpochRefusal(f"{role} A/B live snapshot loses prior custody")
+        if not first_complete or not second["complete"]:
+            raise BulkloadError(f"{role} captures contain blockers")
         return second, (first_id, second["capture_id"])
 
     source, source_ids = stable_authority(paths[0], paths[1], "source")
@@ -684,13 +732,6 @@ def _dry_run_capture(arguments: argparse.Namespace, report: dict[str, Any]) -> N
             _mutation("live-snapshot-custody-create", snapshot_root, mode="0700")
         )
     report["live_destination_mutations"] = 0
-    report["not_evaluated"].extend(
-        (
-            "the corpus walk, per-entry hashes, and the file/byte/row budgets",
-            "managed-exclusion namespace policy and provider typing",
-            "live-snapshot convergence and the sealed A-to-B base binding",
-        )
-    )
 
 
 def _dry_run_plan(arguments: argparse.Namespace, report: dict[str, Any]) -> None:
@@ -702,13 +743,6 @@ def _dry_run_plan(arguments: argparse.Namespace, report: dict[str, Any]) -> None
         _mutation("evidence-write", arguments.output, mode="0600")
     )
     report["live_destination_mutations"] = 0
-    report["not_evaluated"].extend(
-        (
-            "capture schema, role, and self-digest validation",
-            "A/B stability: distinct capture IDs, the B-to-A seal binding, and A-only loss",
-            "the compiled union, its blockers, and the capacity contract",
-        )
-    )
 
 
 def _dry_run_stage(arguments: argparse.Namespace, report: dict[str, Any]) -> None:
@@ -723,6 +757,7 @@ def _dry_run_stage(arguments: argparse.Namespace, report: dict[str, Any]) -> Non
     prepare_receipt = stage_root / f".prepare-receipt-{phase}.json"
     transport_receipt = stage_root / f".transport-receipt-{phase}.json"
     quarantine = stage_root / ".transport-quarantine"
+    stage_receipt = stage_root / f"receipt-{phase}.json"
     report["mutations"].append(
         _mutation("evidence-write", arguments.output, mode="0600")
     )
@@ -752,7 +787,26 @@ def _dry_run_stage(arguments: argparse.Namespace, report: dict[str, Any]) -> Non
             )
         )
     else:
-        report["mutations"].append(_mutation("stage-object-write", stage_root))
+        # local and materialize: both create the stage root, write every staged
+        # object under it, and seal `receipt-<phase>.json`
+        # (executor.py:1244-1245, :1487-1489). materialize additionally reads
+        # the two chained receipts and re-verifies the pushed quarantine
+        # (executor.py:1472-1485, :594). Naming only `stage-object-write` here
+        # under-reported both.
+        report["mutations"].extend(
+            (
+                _mutation("stage-root-create", stage_root, mode="0700"),
+                _mutation("stage-object-write", stage_root),
+                _mutation("stage-receipt-write", stage_receipt),
+            )
+        )
+        if mode == "materialize":
+            report["reads"].extend(
+                {"path": os.fspath(Path(value))}
+                for value in (arguments.prepare_receipt, arguments.transport_receipt)
+                if value
+            )
+            report["reads"].append({"path": os.fspath(quarantine)})
     report["live_destination_mutations"] = 0
     if arguments.plan is not None:
         plan = _load(arguments.plan)
@@ -764,13 +818,6 @@ def _dry_run_stage(arguments: argparse.Namespace, report: dict[str, Any]) -> Non
     report["capacity"] = [
         _capacity_note("stage-root", stage_root),
     ]
-    report["not_evaluated"].extend(
-        (
-            "the exact charged-byte capacity gate, which the executor computes",
-            "chained prepare/push receipt authority and the sealed allowlist digest",
-            "per-object staging, reflink custody, and changed-late deferral",
-        )
-    )
 
 
 def _dry_run_apply(arguments: argparse.Namespace, report: dict[str, Any]) -> None:
@@ -806,14 +853,36 @@ def _dry_run_apply(arguments: argparse.Namespace, report: dict[str, Any]) -> Non
         _capacity_note("rollback-root", Path(arguments.rollback_root)),
         _capacity_note("stage-root", Path(stage_receipt["stage_root"])),
     ]
-    report["not_evaluated"].extend(
-        (
-            "fresh destination preconditions, which apply re-reads live",
-            "the exact-overwrite capacity gate and reflink rollback custody",
-            "journal replay of a partially applied transaction",
-        )
-    )
 
+
+# Seeded into the report BEFORE any builder or fence runs, so a report that
+# refused early still names what it did not check. Appending these at the end
+# of each builder -- as the first cut did -- published
+# `"not_evaluated":[],"mutations":[]` on exactly the refusal path, a
+# machine-readable document asserting the verb mutates nothing and skipped no
+# gate when in fact it had reached neither answer.
+DRY_RUN_NOT_EVALUATED: dict[str, tuple[str, ...]] = {
+    "agent-capture": (
+        "the corpus walk, per-entry hashes, and the file/byte/row budgets",
+        "managed-exclusion namespace policy and provider typing",
+        "live-snapshot convergence and the sealed A-to-B base binding",
+    ),
+    "agent-plan": (
+        "capture schema, role, and self-digest validation",
+        "A/B stability: distinct capture IDs, the B-to-A seal binding, and A-only loss",
+        "the compiled union, its blockers, and the capacity contract",
+    ),
+    "agent-stage": (
+        "the exact charged-byte capacity gate, which the executor computes",
+        "chained prepare/push receipt authority and the sealed allowlist digest",
+        "per-object staging, reflink custody, and changed-late deferral",
+    ),
+    "agent-apply": (
+        "fresh destination preconditions, which apply re-reads live",
+        "the exact-overwrite capacity gate and reflink rollback custody",
+        "journal replay of a partially applied transaction",
+    ),
+}
 
 DRY_RUN_BUILDERS: dict[str, Callable[[argparse.Namespace, dict[str, Any]], None]] = {
     "agent-capture": _dry_run_capture,
@@ -843,15 +912,21 @@ def dry_run(arguments: argparse.Namespace) -> dict[str, Any]:
     the same functions the real verb calls, and names in `not_evaluated`
     every gate it did not reach. `exit_code` is the status the process will
     return, so a dry run is usable as a gate and not only as documentation.
+
+    `complete` is false whenever the rehearsal refused before it finished
+    enumerating. Read it before `mutations`: on a refusal the mutation list is
+    a prefix, not an inventory, and `live_destination_mutations` is a floor
+    rather than a count.
     """
     report: dict[str, Any] = {
         "capacity": [],
         "command": arguments.command,
+        "complete": True,
         "dry_run": True,
         "exit_code": EXIT_OK,
         "live_destination_mutations": 0,
         "mutations": [],
-        "not_evaluated": [],
+        "not_evaluated": list(DRY_RUN_NOT_EVALUATED[arguments.command]),
         "output": arguments.output,
         "reads": [],
         "refusals": [],
@@ -869,6 +944,7 @@ def dry_run(arguments: argparse.Namespace) -> dict[str, Any]:
             {"class": type(error).__name__, "message": str(error)}
         )
         report["exit_code"] = exit_code_for(error)
+        report["complete"] = False
     return report
 
 
@@ -904,8 +980,10 @@ def _add_common(parser: argparse.ArgumentParser, *, dry_run: bool) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "emit phase and heartbeat lines on stderr (never stdout). "
-            "Defaults to on when stderr is a terminal. Progress reports; it "
+            "emit phase and heartbeat lines on stderr (never stdout). On by "
+            "default, including into a pipe or a log file -- that is the case "
+            "a silent multi-hour verb is indistinguishable from a hung one. "
+            "Pass --no-progress for byte-exact stderr. Progress reports; it "
             "never signals a process."
         ),
     )
@@ -1276,11 +1354,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # a malformed evidence document used to escape as a bare KeyError
         # traceback with an undocumented status. It now exits 6 with one line.
         code = exit_code_for(error)
-        detail = (
-            f"{type(error).__name__}: {error}" if code == EXIT_INTERNAL else str(error)
-        )
-        print(f"bulkload: FAIL[{code}]: {detail}", file=sys.stderr)
-        if os.environ.get("BULKLOAD_TRACEBACK") == "1":
+        print(f"bulkload: FAIL[{code}]: {failure_detail(error, code)}", file=sys.stderr)
+        # 6 is the only class with no curated message: nothing in the engine
+        # meant to raise it, so the one-liner names a type and not a cause. An
+        # operator whose hour-4 ceremony dies on `KeyError: 'catalog'` cannot
+        # tell the protector from the planner from the executor, and will not
+        # re-run a multi-hour verb just to set BULKLOAD_TRACEBACK=1. The typed
+        # refusals (3/4/5) keep the one-line form, where the message is the
+        # diagnosis and a traceback would only name the raise site.
+        if code == EXIT_INTERNAL or os.environ.get("BULKLOAD_TRACEBACK") == "1":
             traceback.print_exc()
         return code
     return EXIT_OK

@@ -63,17 +63,35 @@ orchestrator can branch on them without parsing a message.
 | `0` | the verb completed and its evidence was written | continue the sequence |
 | `1` | usage error on the command line | fix the invocation; `--help` and `--version` still exit `0` |
 | `2` | the pinned launcher could not build its source closure | the install is broken or a runtime source moved under it; reinstall the skill |
-| `3` | quiescence/epoch refusal: the live source moved under the capture | retryable. No live path was mutated. Re-capture; this is the expected code on a busy host |
+| `3` | quiescence/epoch refusal: the live source moved under the capture | retryable. No live path was mutated. Re-capture. Raised at the coarse epoch fences only -- see below |
 | `4` | custody, plan, or typed-invariant refusal | the general fail-closed class. Read the message; a blind retry will refuse identically |
-| `5` | destination refusal: the capacity gate failed or a required reflink failed | free space, or the destination is not on reflink-capable storage. There is no full-copy fallback |
-| `6` | unexpected internal error, including malformed input evidence | the input is not the document it claims to be. Set `BULKLOAD_TRACEBACK=1` for the traceback |
+| `5` | storage refusal: a volume could not hold or reflink-clone what was charged against it | the message names the path. It may be the destination stage, the rollback custody root, or the **source** host's own live-snapshot custody. There is no full-copy fallback |
+| `6` | unexpected internal error, including malformed input evidence | the input is not the document it claims to be. The traceback is always printed: this is the one class with no curated message |
 | `130` | the operator interrupted the process | Bulkload never signals a process; only the operator does. Use the durable journal and `agent-recover` |
 
 `3` and `5` are narrowings of `4`, raised where the engine can prove the more
-specific cause: `3` at the live-divergence fences (a root, entry, seat, or Git
-authority that changed during capture; an A/B pair that is not stable), `5` at
-the capacity gate and at a required reflink. Any refusal that is not proven to
-be one of those exits `4`.
+specific cause. Any refusal that is not proven to be one of those exits `4`.
+
+**`3` is raised at the coarse epoch fences, not per entry.** Those fences are a
+declared root that changed during capture (`scanner.py:434`), a declared file
+seat that changed (`:1946`), a live snapshot whose census, payload, or Git
+authority moved under it (`:2095`, `:2193`-`:2278`, `:3824`-`:3832`), live
+source movement after immutable snapshot B (`:3234`, `:3296`), and an A/B pair
+that is not stable (`:4765`-`:4784`, and the streaming equivalent that
+`agent-plan` runs). A *single filesystem entry* that changes or is unsupported
+mid-walk is deliberately **not** exit `3`: the directory walk records it as a
+capture blocker and the capture finishes with `complete: false` and exit `0`
+(`scanner.py:547`, `:577`), because aborting a 1.8M-entry live capture on one
+churned file would make a live host uncapturable. `agent-plan` then refuses
+that capture with `4` ("captures contain blockers"). Per-entry churn on a busy
+host is visible in the evidence, not in the process status.
+
+**`5` is volume-neutral.** The same capacity gate guards the destination stage,
+the rollback custody root, and the source host's own live-snapshot custody --
+`agent-capture` reaches it (`scanner.py:3794`) and that verb has no destination
+at all. `ENOSPC`/`EDQUOT` from any write, including the evidence document, maps
+here too. The message therefore always names the path; read the host off the
+path rather than off the code.
 
 ## Dry run and progress
 
@@ -83,7 +101,14 @@ verb would perform, the refusals it can already reach, and -- in
 `not_evaluated` -- the gates it did not reach. It writes nothing at all: not
 the stage, not the journal, not the `--output` evidence document. Its
 `exit_code` field is the status the process returns, so a dry run is usable as
-a gate:
+a gate.
+
+**Read `complete` first.** It is `false` whenever the rehearsal refused before
+it finished enumerating. On a refusal the `mutations` list is a prefix and not
+an inventory, and `live_destination_mutations` is a floor rather than a count;
+`not_evaluated` is seeded before the first fence runs, so it names the skipped
+gates on that path too. A `complete: true` report with an empty `mutations`
+list is the only one that means "this verb mutates nothing".
 
 ```bash
 bulkload agent-apply --dry-run \
@@ -95,9 +120,17 @@ bulkload agent-apply --dry-run \
   --output /home/jess/.bulkload-evidence/apply-receipt.json
 ```
 
-`--progress` (default on when stderr is a terminal, `--no-progress` to
-suppress) writes phase and heartbeat lines to stderr, never to stdout, so
-evidence on `-` stays byte-exact. It reports; it never signals a process.
+`--progress` is **on by default**, including when stderr is a pipe or a log
+file -- a redirected multi-hour push writing zero bytes for two and a half
+hours is the case that motivated it, and a terminal-only default would have
+left exactly that case silent. It writes phase and heartbeat lines to stderr,
+never to stdout, so evidence on `-` stays byte-exact. Pass `--no-progress` when
+you need byte-exact stderr. It reports; it never signals a process.
+
+`--progress` carries liveness -- command, phase, elapsed -- and no counters.
+The channel that carries files and bytes is the separate `phase_timing` record,
+still gated behind `BULKLOAD_PHASE_TIMING=1`; set it as well when you want per
+phase counts. Making that channel default-on is a separate change.
 
 ## Development
 

@@ -25,24 +25,26 @@ from unittest import mock
 
 from bulkload_lib.cli import (
     DRY_RUN_BUILDERS,
+    DRY_RUN_NOT_EVALUATED,
     EXIT_CODES,
     Progress,
     build_parser,
     exit_code_for,
+    failure_detail,
     progress_enabled,
 )
 from bulkload_lib.model import (
     EXIT_BOOTSTRAP,
-    EXIT_DESTINATION,
     EXIT_EPOCH,
     EXIT_INTERNAL,
     EXIT_INTERRUPTED,
     EXIT_OK,
     EXIT_REFUSED,
+    EXIT_STORAGE,
     EXIT_USAGE,
     BulkloadError,
-    DestinationRefusal,
     EpochRefusal,
+    StorageRefusal,
 )
 
 from test_bulkload import CutoverFixture, compile_agent_plan, gnu_rsync_path
@@ -75,7 +77,7 @@ class ExitCodeTableTests(unittest.TestCase):
                 EXIT_BOOTSTRAP,
                 EXIT_EPOCH,
                 EXIT_REFUSED,
-                EXIT_DESTINATION,
+                EXIT_STORAGE,
                 EXIT_INTERNAL,
                 EXIT_INTERRUPTED,
             },
@@ -94,19 +96,43 @@ class ExitCodeTableTests(unittest.TestCase):
     def test_refusal_classes_carry_their_documented_code(self) -> None:
         self.assertEqual(exit_code_for(BulkloadError("custody")), EXIT_REFUSED)
         self.assertEqual(exit_code_for(EpochRefusal("moved")), EXIT_EPOCH)
-        self.assertEqual(exit_code_for(DestinationRefusal("full")), EXIT_DESTINATION)
+        self.assertEqual(exit_code_for(StorageRefusal("full")), EXIT_STORAGE)
         self.assertTrue(issubclass(EpochRefusal, BulkloadError))
-        self.assertTrue(issubclass(DestinationRefusal, BulkloadError))
+        self.assertTrue(issubclass(StorageRefusal, BulkloadError))
 
-    def test_a_full_filesystem_is_a_destination_refusal(self) -> None:
+    def test_a_full_filesystem_is_a_storage_refusal(self) -> None:
         self.assertEqual(
             exit_code_for(OSError(errno.ENOSPC, "No space left on device")),
-            EXIT_DESTINATION,
+            EXIT_STORAGE,
         )
         self.assertEqual(
             exit_code_for(OSError(errno.ENOENT, "No such file")), EXIT_REFUSED
         )
         self.assertEqual(exit_code_for(sqlite3.DatabaseError("locked")), EXIT_REFUSED)
+
+    def test_the_storage_refusal_names_the_volume_not_the_role(self) -> None:
+        """5 must not send a full *source* disk to the destination host.
+
+        `require_capacity` guards the source's own live-snapshot custody
+        (`scanner.py:3794`, inside `agent-capture`, a verb with no destination
+        at all) as well as the destination stage and the rollback root, so the
+        class, the table row, and the message are all volume-neutral and the
+        message carries the path.
+        """
+        meaning = dict(EXIT_CODES)[EXIT_STORAGE]
+        self.assertNotIn("destination", meaning)
+        self.assertIn("names the path", meaning)
+        self.assertIn("volume", StorageRefusal.__doc__ or "")
+        carried = OSError(errno.ENOSPC, "No space left on device")
+        carried.filename = "/Users/jess/.bulkload-evidence/source-a.json.snapshot"
+        named = failure_detail(carried, EXIT_STORAGE)
+        self.assertIn("/Users/jess/.bulkload-evidence/source-a.json.snapshot", named)
+        # An OSError that already spells the path is not made to say it twice.
+        spelled = failure_detail(
+            OSError(errno.ENOSPC, "No space left on device", "/srv/stage"),
+            EXIT_STORAGE,
+        )
+        self.assertEqual(spelled.count("/srv/stage"), 1)
 
     def test_an_unexpected_error_is_internal_not_a_refusal(self) -> None:
         self.assertEqual(exit_code_for(KeyError("catalog")), EXIT_INTERNAL)
@@ -218,7 +244,15 @@ class HelpSurfaceTests(unittest.TestCase):
 
 
 class InternalErrorTests(unittest.TestCase):
-    def test_malformed_evidence_exits_six_without_a_traceback(self) -> None:
+    def test_malformed_evidence_exits_six_with_its_traceback(self) -> None:
+        """6 is the one class with no curated message, so it keeps the trace.
+
+        The one-liner names a type, not a cause: `KeyError: 'catalog'` cannot
+        tell the operator whether the protector, the planner, or the executor
+        raised it, and nobody re-runs an hour-4 verb to set
+        `BULKLOAD_TRACEBACK=1`. The typed refusals (3/4/5) keep the one-line
+        form, where the message *is* the diagnosis.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bad = root / "bad.json"
@@ -237,9 +271,10 @@ class InternalErrorTests(unittest.TestCase):
                 str(root / "plan.json"),
             )
         self.assertEqual(result.returncode, EXIT_INTERNAL, result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
         self.assertIn("bulkload: FAIL[6]", result.stderr)
-        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("Traceback (most recent call last)", result.stderr)
+        self.assertIn("KeyError", result.stderr)
+        self.assertIn("cli.py", result.stderr)
 
     def test_a_missing_input_is_a_refusal_not_an_internal_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -255,6 +290,8 @@ class InternalErrorTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
         self.assertIn("bulkload: FAIL[4]", result.stderr)
+        # A typed refusal keeps the one-line form; only 6 prints a trace.
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class DryRunTests(unittest.TestCase):
@@ -294,7 +331,11 @@ class DryRunTests(unittest.TestCase):
             self.assertEqual(report["live_destination_mutations"], 0)
             kinds = {item["kind"] for item in report["mutations"]}
             self.assertEqual(kinds, {"evidence-write", "live-snapshot-custody-create"})
-            self.assertTrue(report["not_evaluated"])
+            self.assertEqual(
+                report["not_evaluated"],
+                list(DRY_RUN_NOT_EVALUATED["agent-capture"]),
+            )
+            self.assertTrue(report["complete"])
             self.assertEqual(list(evidence.iterdir()), [])
 
     def test_capture_dry_run_reaches_the_real_refusal(self) -> None:
@@ -320,6 +361,8 @@ class DryRunTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, EXIT_REFUSED, result.stdout)
             self.assertEqual(report["exit_code"], EXIT_REFUSED)
+            self.assertFalse(report["complete"])
+            self.assertTrue(report["not_evaluated"])
             self.assertEqual(len(report["refusals"]), 1)
             self.assertIn("overlaps live root", report["refusals"][0]["message"])
             self.assertFalse((home / "inside.json").exists())
@@ -346,6 +389,15 @@ class DryRunTests(unittest.TestCase):
             self.assertEqual(result.returncode, EXIT_INTERNAL, result.stderr)
             self.assertEqual(report["refusals"][0]["class"], "KeyError")
             self.assertFalse((root / "plan.json").exists())
+            # The refusal path must not publish "mutates nothing, skipped
+            # nothing". Measured before the fix: this report carried
+            # "live_destination_mutations":0,"mutations":[],"not_evaluated":[]
+            # alongside "exit_code":6.
+            self.assertFalse(report["complete"])
+            self.assertEqual(
+                report["not_evaluated"],
+                list(DRY_RUN_NOT_EVALUATED["agent-plan"]),
+            )
 
 
 class DryRunPlanBoundTests(unittest.TestCase):
@@ -435,6 +487,8 @@ class DryRunPlanBoundTests(unittest.TestCase):
             "accepted plan digest does not match",
             report["refusals"][0]["message"],
         )
+        self.assertFalse(report["complete"])
+        self.assertTrue(report["not_evaluated"])
         self.assertFalse(self.stage_root.exists())
 
     def test_stage_dry_run_refuses_a_push_without_its_receipts(self) -> None:
@@ -480,6 +534,14 @@ class DryRunPlanBoundTests(unittest.TestCase):
         # in the dry run, from `validate_stage_receipt`, before any journal.
         self.assertNotEqual(result.returncode, EXIT_OK)
         self.assertTrue(report["refusals"])
+        # apply refuses at validate_stage_receipt, before report["mutations"]
+        # is ever populated: the report must say so rather than publishing an
+        # empty mutation list as an inventory.
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["mutations"], [])
+        self.assertEqual(
+            report["not_evaluated"], list(DRY_RUN_NOT_EVALUATED["agent-apply"])
+        )
         self.assertFalse(journal.exists())
         self.assertFalse(rollback.exists())
 
@@ -522,7 +584,13 @@ class ProgressTests(unittest.TestCase):
             self.assertTrue(seen.wait(5.0))
         self.assertIn("bulkload: alive:", stream.getvalue())
 
-    def test_progress_defaults_to_an_interactive_stderr(self) -> None:
+    def test_progress_defaults_on_even_when_stderr_is_redirected(self) -> None:
+        """The measured silence is a redirected one, so a TTY default misses it.
+
+        `logs/preseed-push.log` is 0 bytes for a 2h32m / 84 GiB push. That is
+        the non-TTY case; defaulting on only for a terminal would leave the
+        exact evidence this flag answers unchanged.
+        """
         arguments = build_parser().parse_args(
             [
                 "agent-verify",
@@ -537,13 +605,51 @@ class ProgressTests(unittest.TestCase):
             ]
         )
         self.assertIsNone(arguments.progress)
-        with mock.patch("bulkload_lib.cli._stderr_is_tty", return_value=True):
-            self.assertTrue(progress_enabled(arguments))
-        with mock.patch("bulkload_lib.cli._stderr_is_tty", return_value=False):
-            self.assertFalse(progress_enabled(arguments))
+        self.assertTrue(progress_enabled(arguments))
+        arguments.progress = False
+        self.assertFalse(progress_enabled(arguments))
         arguments.progress = True
-        with mock.patch("bulkload_lib.cli._stderr_is_tty", return_value=False):
-            self.assertTrue(progress_enabled(arguments))
+        self.assertTrue(progress_enabled(arguments))
+
+    def test_a_redirected_run_still_reports_its_phases(self) -> None:
+        """Measured end to end: stderr is a pipe, and it is not silent."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bad = root / "bad.json"
+            bad.write_text(json.dumps({"not": "a capture"}), encoding="utf-8")
+            result = launch(
+                "agent-plan",
+                "--source-a",
+                str(bad),
+                "--source-b",
+                str(bad),
+                "--destination-a",
+                str(bad),
+                "--destination-b",
+                str(bad),
+                "--output",
+                str(root / "plan.json"),
+            )
+        self.assertIn("bulkload: phase:", result.stderr)
+        self.assertIn("command=agent-plan", result.stderr)
+        self.assertNotIn("bulkload:", result.stdout)
+
+    def test_no_progress_restores_byte_exact_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = launch(
+                "agent-rollback",
+                "--apply-receipt",
+                str(root / "absent.json"),
+                "--accept-receipt-sha256",
+                "0" * 64,
+                "--output",
+                str(root / "receipt.json"),
+                "--no-progress",
+            )
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertNotIn("bulkload: phase:", result.stderr)
 
     def test_progress_never_reaches_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -574,6 +680,13 @@ class ProgressTests(unittest.TestCase):
 
 
 class DryRunSurfaceTests(unittest.TestCase):
+    def test_every_dry_run_verb_declares_what_it_did_not_check(self) -> None:
+        self.assertEqual(set(DRY_RUN_NOT_EVALUATED), set(DRY_RUN_BUILDERS))
+        for command, gates in DRY_RUN_NOT_EVALUATED.items():
+            self.assertTrue(gates, command)
+            for gate in gates:
+                self.assertTrue(gate.strip(), command)
+
     def test_dry_run_is_offered_exactly_where_it_is_implemented(self) -> None:
         parser = build_parser()
         subparsers = next(
@@ -602,6 +715,169 @@ class DryRunSurfaceTests(unittest.TestCase):
             self.assertTrue(
                 any(action.dest == "progress" for action in command._actions), name
             )
+
+
+class ReachableCodeTests(unittest.TestCase):
+    """3 and 5 driven out of the real engine to a real process status.
+
+    Every other assertion about these two codes in this file calls
+    `exit_code_for()` on a synthesized exception, which proves the table and
+    nothing about the engine. A future `except BulkloadError: ... raise
+    BulkloadError(...)` anywhere in scanner or executor would collapse 3 or 5
+    into 4 with a fully green suite. These two tests fail when that happens.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temporary = tempfile.TemporaryDirectory()
+        root = Path(cls._temporary.name)
+        cls.fixture = CutoverFixture(root / "cutover")
+        cls.evidence = root / "evidence"
+        cls.evidence.mkdir()
+        cls.destination = cls.evidence / "destination-a.json"
+        cls.destination.write_text(
+            json.dumps(cls.fixture.capture("destination")), encoding="utf-8"
+        )
+        cls.destination_b = cls.evidence / "destination-b.json"
+        cls.destination_b.write_text(
+            json.dumps(cls.fixture.capture("destination")), encoding="utf-8"
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._temporary.cleanup()
+
+    def test_an_unstable_ab_pair_exits_three_from_the_real_engine(self) -> None:
+        """The live source moved between A and B, so the pair is not stable.
+
+        This is the epoch class as `stable_capture_pair` (scanner.py:4751-4786)
+        types it, reached through the streaming re-implementation `agent-plan`
+        actually runs. It exited 4 before this fix: that re-implementation
+        collapsed every sub-condition into one plain `BulkloadError`, so no
+        input to any verb could produce a 3.
+        """
+        source_a = self.evidence / "source-a.json"
+        source_a.write_text(
+            json.dumps(self.fixture.capture("source")), encoding="utf-8"
+        )
+        (self.fixture.source_repo / "tracked.txt").write_text(
+            "the host moved under the capture\n", encoding="utf-8"
+        )
+        source_b = self.evidence / "source-b.json"
+        source_b.write_text(
+            json.dumps(self.fixture.capture("source")), encoding="utf-8"
+        )
+        result = launch(
+            "agent-plan",
+            "--source-a",
+            str(source_a),
+            "--source-b",
+            str(source_b),
+            "--destination-a",
+            str(self.destination),
+            "--destination-b",
+            str(self.destination_b),
+            "--output",
+            str(self.evidence / "plan.json"),
+        )
+        self.assertEqual(result.returncode, EXIT_EPOCH, result.stderr)
+        self.assertIn("bulkload: FAIL[3]", result.stderr)
+        self.assertIn("not byte-stable", result.stderr)
+        self.assertFalse((self.evidence / "plan.json").exists())
+
+    def test_a_reused_capture_id_stays_the_general_refusal(self) -> None:
+        """The other half of the split: a wrong document is not an epoch."""
+        source = self.evidence / "same.json"
+        source.write_text(json.dumps(self.fixture.capture("source")), encoding="utf-8")
+        result = launch(
+            "agent-plan",
+            "--source-a",
+            str(source),
+            "--source-b",
+            str(source),
+            "--destination-a",
+            str(self.destination),
+            "--destination-b",
+            str(self.destination_b),
+            "--output",
+            str(self.evidence / "plan-2.json"),
+        )
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertIn("reuse one capture ID", result.stderr)
+
+    def test_the_capacity_gate_exits_five_and_names_the_volume(self) -> None:
+        """A reserve larger than the volume drives `require_capacity` for real."""
+        plan = self.fixture.plan()
+        plan_path = self.evidence / "capacity-plan.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        stage_root = Path(self._temporary.name) / "capacity-stage"
+        result = launch(
+            "agent-stage",
+            "--phase",
+            "preseed",
+            "--plan",
+            str(plan_path),
+            "--accept-plan-sha256",
+            plan["plan_sha256"],
+            "--stage-root",
+            str(stage_root),
+            "--capacity-reserve-bytes",
+            str(1 << 62),
+            "--output",
+            str(self.evidence / "capacity-receipt.json"),
+        )
+        self.assertEqual(result.returncode, EXIT_STORAGE, result.stderr)
+        self.assertIn("bulkload: FAIL[5]", result.stderr)
+        self.assertIn("capacity gate failed", result.stderr)
+        # The volume is named, so an operator knows which host to look at.
+        self.assertIn(os.path.realpath(stage_root), result.stderr)
+        self.assertFalse((self.evidence / "capacity-receipt.json").exists())
+
+
+class BlockerNotEpochTests(unittest.TestCase):
+    """Per-entry churn is a capture blocker, not exit 3 -- as documented.
+
+    `_file_record` raises `EpochRefusal` for an entry that moved and
+    `BulkloadError` for one it cannot type, and both directory-walk handlers
+    (`scanner.py:547`, `:577`) catch `BulkloadError` and record a blocker
+    instead. That downgrade is deliberate: aborting a 1.8M-entry live capture
+    on one churned file would make a busy host uncapturable. This test pins
+    the consequence the README now states -- exit `0`, `complete: false` -- so
+    the doc claim and the code cannot drift apart again.
+    """
+
+    def test_an_untypable_entry_is_a_blocker_and_the_process_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture = CutoverFixture(root / "cutover")
+            os.mkfifo(fixture.source_git / "spool.fifo")
+            evidence = root / "evidence"
+            evidence.mkdir()
+            output = evidence / "source-a.json"
+            result = launch(
+                "agent-capture",
+                "--role",
+                "source",
+                "--home",
+                str(fixture.source_home),
+                "--git-root",
+                str(fixture.source_git),
+                "--rsync-path",
+                str(gnu_rsync_path()),
+                "--path-map",
+                f"{fixture.source_home}={fixture.destination_home}",
+                "--path-map",
+                f"{fixture.source_git}={fixture.destination_git}",
+                "--acknowledge-writers-quiesced",
+                "--output",
+                str(output),
+            )
+            self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+            capture = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(capture["complete"])
+            self.assertIn("unsupported-filesystem-entry", json.dumps(capture))
+            self.assertIn("spool.fifo", json.dumps(capture))
+            self.assertNotIn("bulkload: FAIL", result.stderr)
 
 
 if __name__ == "__main__":

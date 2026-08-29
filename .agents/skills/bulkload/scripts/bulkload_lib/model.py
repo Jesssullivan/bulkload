@@ -42,7 +42,7 @@ EXIT_USAGE = 1
 EXIT_BOOTSTRAP = 2
 EXIT_EPOCH = 3
 EXIT_REFUSED = 4
-EXIT_DESTINATION = 5
+EXIT_STORAGE = 5
 EXIT_INTERNAL = 6
 EXIT_INTERRUPTED = 130
 
@@ -72,15 +72,22 @@ class EpochRefusal(BulkloadError):
     exit_code = EXIT_EPOCH
 
 
-class DestinationRefusal(BulkloadError):
-    """The destination cannot hold or clone what the plan charges.
+class StorageRefusal(BulkloadError):
+    """A storage volume cannot hold or clone what was charged against it.
 
-    Raised by the capacity gate and by a required reflink that failed. A
+    Raised by the capacity gate and by a required reflink that failed. The
+    volume is deliberately not named in the class: the same gate guards the
+    destination stage, the rollback custody root, AND the source host's own
+    live-snapshot custody (`scanner.py` `_capture_live_snapshot`), which runs
+    during `agent-capture` -- a verb that has no destination at all. Naming
+    this class after the destination would send an operator whose source disk
+    filled to the wrong machine. Every message raised here names the path, so
+    the caller reads the volume off the message and the host off the path. A
     full-copy fallback is forbidden, so this is a hard stop and not a
     degraded-mode warning.
     """
 
-    exit_code = EXIT_DESTINATION
+    exit_code = EXIT_STORAGE
 
 
 def utc_now() -> str:
@@ -429,8 +436,9 @@ def require_capacity(
     observed = capacity_observation(path)
     required = charged_bytes + reserve_bytes
     if observed["available_bytes"] < required:
-        raise DestinationRefusal(
-            "capacity gate failed: exact charged bytes plus reserve exceed available bytes"
+        raise StorageRefusal(
+            f"capacity gate failed on {path}: exact charged bytes plus reserve "
+            f"({required}) exceed available bytes ({observed['available_bytes']})"
         )
     return {
         **observed,
@@ -527,7 +535,7 @@ def reflink_clone(
         temporary.unlink(missing_ok=True)
         if isinstance(error, BulkloadError):
             raise
-        raise DestinationRefusal(
+        raise StorageRefusal(
             f"required reflink clone failed for {destination}; full-copy fallback is forbidden"
         ) from error
 
