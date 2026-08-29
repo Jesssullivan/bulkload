@@ -2186,7 +2186,15 @@ def _apply_git_entry(
         intended_worktrees[worktree["path"]] = {
             "branch": worktree["branch"],
             "detached": worktree["detached"],
-            "head": worktree["head"],
+            # An unborn worktree's HEAD is recorded by capture as the
+            # all-zeros OID, but `rev-parse --verify HEAD` (the observer)
+            # yields nothing there — normalize to None so the intent is
+            # satisfiable (defect 11, repo `demo`, 2026-08-29).
+            "head": (
+                None
+                if worktree["head"] == "0" * 40
+                else worktree["head"]
+            ),
             "locked": locked,
             "lock_reason": (
                 before["lock_reason"] if locked and before and before["locked"] else ""
