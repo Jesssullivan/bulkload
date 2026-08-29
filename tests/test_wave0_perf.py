@@ -215,6 +215,181 @@ class SingleEpochFenceTests(unittest.TestCase):
                 validate_live_snapshot_generation({}, passes=rejected)
 
 
+BREAK_GLASS = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE"
+
+
+class LiveFenceBreakGlassTests(unittest.TestCase):
+    """The disclosed break-glass for Jesssullivan/bulkload#24.
+
+    `BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE=<path>` removes the fence, so the
+    tests that matter are the two halves of that bargain: with the variable
+    set, no root is read and exactly one deviation record is written; without
+    it, nothing about the fence changes.
+    """
+
+    @staticmethod
+    def no_epoch_may_be_computed():
+        """Fail loudly if the break-glass path censuses anything at all.
+
+        A pass is a full-content read of every root, which is what #24's
+        interim is buying back. Raising here means "skipped" cannot quietly
+        decay into "computed, then ignored".
+        """
+
+        def forbidden(root, **keywords):
+            raise AssertionError(f"break-glass computed an epoch over {root}")
+
+        return mock.patch.object(scanner, "_tree_generation", side_effect=forbidden)
+
+    def test_break_glass_skips_the_census_and_records_the_deviation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+
+            # Diverge the live tree so an un-broken fence would certainly
+            # abort: the skip below is then unambiguous.
+            victim = fixture.source_repo / "untracked.txt"
+            victim.write_bytes(b"mutated after the immutable seal\n")
+
+            note = Path(temporary) / "deviations" / "live-fence.jsonl"
+            note.parent.mkdir()
+            self.assertFalse(note.exists())
+
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {BREAK_GLASS: os.fspath(note)}):
+                with self.no_epoch_may_be_computed():
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertIsNone(validate_live_snapshot_generation(snapshot))
+
+            lines = note.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(
+                sorted(record),
+                [
+                    "break_glass",
+                    "expected",
+                    "passes_requested",
+                    "reason",
+                    "snapshot_id",
+                    "ts",
+                ],
+            )
+            self.assertEqual(record["break_glass"], "live-fence-skipped")
+            self.assertEqual(record["passes_requested"], 2)
+            self.assertEqual(record["snapshot_id"], snapshot["snapshot_id"])
+            self.assertEqual(len(record["expected"]), 64)
+            int(record["expected"], 16)
+            self.assertIn("bulkload#24", record["reason"])
+            # The deviation is disclosed on the console too, not only on disk.
+            self.assertIn("BREAK-GLASS live fence skipped", stderr.getvalue())
+            self.assertIn(os.fspath(note), stderr.getvalue())
+
+            # Every bypassed fence is its own ledger line, including the
+            # dominated `passes=1` site, which records the weaker request.
+            with mock.patch.dict(os.environ, {BREAK_GLASS: os.fspath(note)}):
+                with self.no_epoch_may_be_computed():
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        validate_live_snapshot_generation(snapshot, passes=1)
+            lines = note.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[1])["passes_requested"], 1)
+            self.assertEqual(json.loads(lines[1])["expected"], record["expected"])
+
+    def test_without_the_variable_the_fence_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            note = Path(temporary) / "unwritten.jsonl"
+
+            with mock.patch.dict(os.environ):
+                os.environ.pop(BREAK_GLASS, None)
+                validate_live_snapshot_generation(snapshot)
+                fixture.source_repo.joinpath("untracked.txt").write_bytes(
+                    b"mutated after the immutable seal\n"
+                )
+                with self.assertRaisesRegex(
+                    BulkloadError, "live source changed after immutable snapshot B"
+                ):
+                    validate_live_snapshot_generation(snapshot)
+            self.assertFalse(note.exists())
+
+    def test_break_glass_cannot_defeat_the_pass_count_guard(self) -> None:
+        # The break-glass is read after the guard, so it widens no other
+        # hole: a caller still cannot ask the fence for zero passes.
+        with tempfile.TemporaryDirectory() as temporary:
+            note = Path(temporary) / "guard.jsonl"
+            with mock.patch.dict(os.environ, {BREAK_GLASS: os.fspath(note)}):
+                for rejected in (0, -1, True, 1.5, "2", None):
+                    with self.assertRaisesRegex(
+                        BulkloadError,
+                        "live generation fence requires at least one pass",
+                    ):
+                        validate_live_snapshot_generation({}, passes=rejected)
+            self.assertFalse(note.exists())
+
+
+class PrunedLeafGenerationTests(unittest.TestCase):
+    """Jesssullivan/bulkload#24: the seal and the fence census two trees.
+
+    `capture_agent_state` seals `roots[].generation_sha256` over the immutable
+    snapshot copy, which omits the pruned managed leaves, while
+    `validate_live_snapshot_generation` re-derives it over `roots[].live`.
+    `_tree_census(portable=True)` puts a directory's `st_size` into its
+    authority, so a directory holding a pruned leaf is a different census entry
+    in the two trees and the final fence can never pass for that root. Because
+    the fence only runs for the final phase, no preseed lap ever exercised it.
+
+    This is the smallest tree with that shape. It is `expectedFailure` until
+    #24 lands one of its candidate fixes -- census the live tree under the same
+    pruning at seal time, drop directory `st_size` from portable authority in
+    favour of hashing the pruned leaf names, or census the copy in the fence
+    and keep a separate named live-drift check. When any of those lands this
+    test passes, unittest reports an unexpected success, and the run fails
+    until the marker below is removed.
+    """
+
+    provider = "claude"
+    exclusions = ("state/excluded.json",)
+
+    def build(self, root: Path, *, pruned: bool) -> Path:
+        """Write the tree, with the managed leaf present only when live.
+
+        The leaf is never created in the copy rather than created and removed,
+        because a directory's `st_size` does not always shrink back.
+        """
+        root.joinpath("state").mkdir(parents=True)
+        root.joinpath("keep.txt").write_bytes(b"kept payload\n")
+        root.joinpath("state", "keep.txt").write_bytes(b"kept nested payload\n")
+        if pruned:
+            root.joinpath("state", "excluded.json").write_bytes(b'{"managed": true}\n')
+        return root
+
+    @unittest.expectedFailure
+    def test_sealed_copy_generation_equals_the_live_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            live = self.build(Path(temporary) / "live", pruned=True)
+            copy = self.build(Path(temporary) / "roots" / "claude", pruned=False)
+
+            if (
+                live.joinpath("state").stat().st_size
+                == copy.joinpath("state").stat().st_size
+            ):
+                self.skipTest(
+                    "filesystem does not encode entry count in directory st_size"
+                )
+
+            sealed = scanner._tree_generation(
+                copy, provider=self.provider, exclusions=self.exclusions
+            )
+            observed = scanner._tree_generation(
+                live, provider=self.provider, exclusions=self.exclusions
+            )
+            self.assertEqual(sealed, observed)
+
+
 class IdenticalLineShortCircuitTests(unittest.TestCase):
     """W0-2: a no-op transform must reuse the original parse and hash."""
 
