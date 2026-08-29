@@ -6,10 +6,12 @@ machine. Source-authoritative conflicts are reversible through exact destination
 rollback custody; structural ambiguity and unsafe state stop. Credentials and
 SQLite are never treated as ordinary repository files.
 
-Nine product schemas cover `AgentCaptureV4`, `GitWorkspaceV2`, plan, the five
-phase receipts, and the durable journal. They drive one consolidated surface:
+Ten product schemas cover `AgentCaptureV4`, `GitWorkspaceV2`, plan, the five
+phase receipts, the durable journal, and the preflight report. They drive one
+consolidated surface, of which only `doctor` is read-only on both hosts:
 
 ```text
+doctor
 agent-capture
 agent-plan
 agent-stage --phase preseed

@@ -40,6 +40,36 @@ and Pi auth are typed source-authority operations. Claude
 auth is nonportable: preserve it as a hold and authenticate on the destination
 attended. Offline receipts do not prove provider acceptance.
 
+## Preflight both hosts
+
+`doctor` is read-only. Run it on each role with the same contract flags the
+capture will get, before any byte moves. It names every offending path and
+exits non-zero when a check fails, having already written the report.
+
+```bash
+scripts/bulkload.py doctor \
+  --role source \
+  --home /Users/jess \
+  --git-root /Users/jess/git \
+  --path-map /Users/jess=/home/jess \
+  --path-map /Users/jess/git=/srv/fast-local/jess/git \
+  --capture-output /secure/evidence/source-a.json \
+  --peer-ssh-host jess@sting \
+  --output /secure/evidence/doctor-source.json
+```
+
+It reports: case-fold collision groups over every declared root, git worktree
+and alternates pointers whose recorded spelling differs from the directory
+entry, path-map coverage and aliasing, seat shape (`--seat` is a directory,
+`--file-seat` a regular file), orphaned SQLite `-wal`/`-shm`/`-journal`
+sidecars in typed roots, the symlink-mode and path-identity consequences of a
+darwin/linux pair, the peer's login shell (a `fish` seat cannot parse the
+POSIX command shapes; pipe remote scripts as `ssh HOST bash -s`), and
+runtime-closure parity between the two roles. Pass the peer's
+`runtime.presented_sha256` back as `--peer-runtime-source-sha256` to bind the
+pair. Every peer probe is a simple read-only command; nothing is written,
+started, or signaled on either host.
+
 ## Capture twice per role
 
 Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both

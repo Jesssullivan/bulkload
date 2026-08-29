@@ -8,11 +8,17 @@ Bulkload performs a reviewed, one-way union of a `~/git` fleet and typed agent
 state. Its public surface is exactly:
 
 ```text
+doctor (read-only, per role)
 preliminary capture/plan -> agent-stage preseed
 fresh final capture/plan -> agent-stage final
               -> agent-apply -> agent-verify
                               -> agent-rollback | agent-recover
 ```
+
+`doctor` is the read-only preflight for both roles: it reports the contract
+and cross-kernel defects that are discoverable before capture reads a byte,
+writes its report, and exits non-zero when a check fails. It mutates nothing
+on either host.
 
 Capture, plan, stage, and verify do not mutate live destination paths. Apply is
 the only forward live mutation. Every operation is bound to an exact plan
@@ -31,6 +37,7 @@ one CLI, and one Bazel test family.
 
 ## Schemas
 
+- `dev.tinyland.bulkload.doctor-report.v1`
 - `dev.tinyland.bulkload.agent-capture.v4`
 - `dev.tinyland.bulkload.git-workspace.v2`
 - `dev.tinyland.bulkload.agent-plan.v4`

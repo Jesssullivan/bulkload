@@ -27,6 +27,7 @@ PUBLIC_COMMANDS = {
     "agent-verify",
     "agent-rollback",
     "agent-recover",
+    "doctor",
 }
 APPROVED_SCHEMA_IDS = {
     "dev.tinyland.bulkload.agent-apply-receipt.v4",
@@ -37,6 +38,7 @@ APPROVED_SCHEMA_IDS = {
     "dev.tinyland.bulkload.agent-rollback-receipt.v4",
     "dev.tinyland.bulkload.agent-stage-receipt.v4",
     "dev.tinyland.bulkload.agent-verify-receipt.v4",
+    "dev.tinyland.bulkload.doctor-report.v1",
     "dev.tinyland.bulkload.git-workspace.v2",
 }
 SUPERSEDED_NAMES = {

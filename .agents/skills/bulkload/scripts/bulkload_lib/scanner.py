@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable, Sequence
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 from .model import (
@@ -44,6 +45,7 @@ from .model import (
     require_digest,
     require_exact_keys,
     resolve_real,
+    RUNTIME_SOURCE_NAMES,
     runtime_source_digest,
     seal,
     sha256_bytes,
@@ -76,6 +78,32 @@ ZERO_OIDS = {"0" * 40, "0" * 64}
 HEX_OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+DOCTOR_REPORT_SCHEMA = "dev.tinyland.bulkload.doctor-report.v1"
+DOCTOR_MAX_FINDINGS = 10_000
+DOCTOR_STATUSES = ("pass", "warn", "fail")
+DEFAULT_PEER_UNAME = "/usr/bin/uname"
+DEFAULT_PEER_ENV = "/usr/bin/env"
+DEFAULT_PEER_TIMEOUT_SECONDS = 20.0
+# Linux fixes every symlink at 0777 and has no lchmod; darwin reports the
+# link's own bits. Any other mode is therefore a darwin spelling.
+LINUX_SYMLINK_MODE = "0777"
+POSIX_PROBE_TOKEN = "bulkload-posix-ok"
+# Login shells that cannot parse POSIX parameter expansion. `ssh HOST cmd`
+# hands the command to the peer's login shell, so a fish seat breaks every
+# remote step that is not a bare simple command.
+NON_POSIX_LOGIN_SHELLS = frozenset(
+    {"csh", "elvish", "fish", "ion", "nu", "rc", "tcsh", "xonsh"}
+)
+# The transport's own SSH option vector, bound here so `doctor`'s probes and
+# `push_agent_transport`'s rsync cannot drift apart.
+SSH_OPTIONS = (
+    "-oBatchMode=yes",
+    "-oStrictHostKeyChecking=yes",
+    "-oClearAllForwardings=yes",
+)
+SSH_HOST_AUTHORITY = re.compile(
+    r"(?:(?:[a-z_][a-z0-9_-]{0,31})@)?([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)"
+)
 GIT_OPERATION_MARKERS = {
     "BISECT_LOG": "bisect",
     "CHERRY_PICK_HEAD": "cherry-pick",
@@ -4783,3 +4811,1355 @@ def stable_capture_pair(
             raise BulkloadError(f"{role} A/B live snapshot loses prior custody")
     if not first["complete"] or not second["complete"]:
         raise BulkloadError(f"{role} captures contain blockers")
+
+
+# ---------------------------------------------------------------------------
+# doctor: the read-only cross-kernel preflight
+#
+# Every check here answers a defect that was found only after bytes moved
+# during the 2026-08-25..28 ceremony and that was discoverable before any of
+# them did. The verb reads: it never writes inside a declared root, never
+# signals a process, and never mutates the peer.
+# ---------------------------------------------------------------------------
+
+
+def path_identity(value: str | Path) -> str:
+    """The cross-kernel comparison key for one path.
+
+    APFS folds case; XFS compares bytes. Two spellings that differ only by
+    case or by Unicode composition are one file on the source and two files on
+    the destination. That is the class that killed materialize twice on
+    2026-08-27 (an on-disk `gloriousflywheel.worktrees` against a git-pointer
+    `GloriousFlywheel.worktrees`), and it is why this key only ever *reports*
+    which spellings collapse and never decides custody.
+    """
+    return unicodedata.normalize("NFC", os.fspath(value)).casefold()
+
+
+def _doctor_check(
+    code: str,
+    status: str,
+    *,
+    summary: str,
+    remedy: str,
+    expected: Any = None,
+    observed: Any = None,
+    findings: Sequence[dict[str, Any]] | None = None,
+    max_findings: int = DOCTOR_MAX_FINDINGS,
+) -> dict[str, Any]:
+    """One typed check: what was expected, what was observed, and every
+    offending path the operator has to settle before capture."""
+    if status not in DOCTOR_STATUSES:
+        raise BulkloadError(f"doctor check status is unsupported: {status}")
+    items = list(findings or [])
+    return {
+        "code": code,
+        "expected": expected,
+        "finding_count": len(items),
+        "findings": items[:max_findings],
+        "observed": observed,
+        "remedy": remedy,
+        "status": status,
+        "summary": summary,
+        "truncated": len(items) > max_findings,
+    }
+
+
+def _doctor_true_component(parent: Path, name: str) -> str | None:
+    """The spelling the directory actually holds for `name`, or None."""
+    wanted = path_identity(name)
+    candidate: str | None = None
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if entry.name == name:
+                    return name
+                if candidate is None and path_identity(entry.name) == wanted:
+                    candidate = entry.name
+    except OSError:
+        return None
+    return candidate
+
+
+def _doctor_true_spelling(path: Path) -> Path | None:
+    """Resolve `path` component by component against real directory entries.
+
+    On a folding filesystem `lstat` accepts any spelling, so a recorded path
+    can name a real file and still be spelled differently from the bytes the
+    index will carry. This returns the spelling the directory holds.
+    """
+    parts = list(path.parts)
+    if not parts:
+        return None
+    current = Path(parts[0])
+    for component in parts[1:]:
+        observed = _doctor_true_component(current, component)
+        if observed is None:
+            return None
+        current = current / observed
+    return current
+
+
+def _doctor_case_sensitivity(root: Path) -> str:
+    """Probe, without writing, whether `root` distinguishes case.
+
+    One directory entry whose name has a cased character is looked up under
+    the flipped spelling: the same inode means the filesystem folds case.
+    """
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                flipped = entry.name.swapcase()
+                if flipped == entry.name:
+                    continue
+                try:
+                    original = entry.stat(follow_symlinks=False)
+                    probe = os.lstat(os.path.join(os.fspath(root), flipped))
+                except OSError:
+                    return "case-sensitive"
+                return (
+                    "case-insensitive"
+                    if (probe.st_dev, probe.st_ino)
+                    == (original.st_dev, original.st_ino)
+                    else "case-sensitive"
+                )
+    except OSError:
+        return "unknown"
+    return "unknown"
+
+
+def _doctor_root_destination(
+    root: Path, *, role: str, path_map: Sequence[dict[str, str]]
+) -> tuple[str | None, str | None]:
+    """One declared root's destination spelling, or the refusal that awaits it.
+
+    Capture translates a provider or seat root whether or not it exists
+    (`_capture_provider`, absent-root branch), so coverage is checked the
+    same way.
+    """
+    if role == "destination":
+        return os.fspath(root), None
+    try:
+        return translate_path(root, path_map), None
+    except BulkloadError as error:
+        return None, str(error)
+
+
+class _DoctorScan:
+    """State one walk fills in for every path-shaped check at once."""
+
+    __slots__ = (
+        "complete",
+        "entries",
+        "orphan_sidecars",
+        "symlinks",
+        "unportable_symlinks",
+        "unreadable",
+    )
+
+    def __init__(self) -> None:
+        self.complete = True
+        self.entries = 0
+        self.orphan_sidecars: list[dict[str, Any]] = []
+        self.symlinks = 0
+        self.unportable_symlinks: list[dict[str, Any]] = []
+        self.unreadable: list[dict[str, Any]] = []
+
+
+def _doctor_record_entry(
+    scan: _DoctorScan,
+    root: dict[str, Any],
+    *,
+    name: str,
+    path: str,
+    mode: int | None,
+    collect_symlink_modes: bool,
+) -> None:
+    """Fold one entry into the symlink-mode and sqlite-sidecar collectors."""
+    if mode is not None and stat.S_ISLNK(mode):
+        scan.symlinks += 1
+        if collect_symlink_modes:
+            spelled = f"{stat.S_IMODE(mode):04o}"
+            if spelled != LINUX_SYMLINK_MODE:
+                scan.unportable_symlinks.append(
+                    {"mode": spelled, "path": path, "root": root["label"]}
+                )
+    lowered = name.lower()
+    for suffix in SQLITE_SIDECARS:
+        if not lowered.endswith(suffix):
+            continue
+        primary = path[: -len(suffix)]
+        if not os.path.lexists(primary):
+            scan.orphan_sidecars.append(
+                {
+                    "kind": suffix[1:],
+                    "missing_primary": primary,
+                    "path": path,
+                    "root": root["label"],
+                    "typed": bool(root.get("typed_sqlite")),
+                }
+            )
+        break
+
+
+def _doctor_walk(
+    scan: _DoctorScan,
+    root: dict[str, Any],
+    *,
+    boundaries: frozenset[str],
+    max_entries: int,
+    collect_symlink_modes: bool,
+) -> Iterable[str]:
+    """Yield one `identity NUL source-path` line per namespace entry.
+
+    The walk prunes every *other* declared root, so a nested root is keyed
+    under its own path map and never counted twice — which is how capture
+    treats it, since each root is walked by its own `_walk_entries` call.
+    """
+    base = Path(root["walk_path"])
+    destination = root.get("destination")
+    yield f"{path_identity(destination or base)}\0{os.fspath(base)}"
+    if root["kind"] == "file":
+        return
+    stack = [base]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as handle:
+                children = sorted(handle, key=lambda entry: entry.name)
+        except OSError as error:
+            scan.unreadable.append(
+                {
+                    "path": os.fspath(current),
+                    "reason": str(error),
+                    "root": root["label"],
+                }
+            )
+            continue
+        for entry in children:
+            if entry.path in boundaries:
+                continue
+            scan.entries += 1
+            if scan.entries > max_entries:
+                scan.complete = False
+                return
+            relative = Path(entry.path).relative_to(base).as_posix()
+            spelling = (
+                os.path.join(destination, relative)
+                if destination is not None
+                else entry.path
+            )
+            yield f"{path_identity(spelling)}\0{entry.path}"
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as error:
+                scan.unreadable.append(
+                    {"path": entry.path, "reason": str(error), "root": root["label"]}
+                )
+                continue
+            _doctor_record_entry(
+                scan,
+                root,
+                name=entry.name,
+                path=entry.path,
+                mode=mode,
+                collect_symlink_modes=collect_symlink_modes,
+            )
+            if stat.S_ISDIR(mode):
+                stack.append(Path(entry.path))
+
+
+def _doctor_collisions(
+    lines: Iterable[str], *, max_findings: int
+) -> list[dict[str, Any]]:
+    """Adjacent-run grouping over the sorted identity stream.
+
+    Sorting first keeps this O(1) in memory beyond the sort itself, and the
+    sort is `_bounded_sorted`, so the `BULKLOAD_BOUND_NAMESPACE` lever that
+    bounds a 1.8 M-entry namespace bounds this too.
+    """
+    groups: list[dict[str, Any]] = []
+    key: str | None = None
+    spellings: list[str] = []
+
+    def flush() -> None:
+        if key is not None and len(set(spellings)) > 1:
+            groups.append({"identity": key, "paths": sorted(set(spellings))})
+
+    for line in lines:
+        identity, _, source = line.partition("\0")
+        if identity != key:
+            flush()
+            key = identity
+            spellings = []
+        if len(spellings) <= max_findings:
+            spellings.append(source)
+    flush()
+    return groups
+
+
+def _doctor_pointer_records(repository: Path) -> list[tuple[str, Path, str]]:
+    """Every recorded path in one repository's `.git` plumbing.
+
+    Read as files rather than through `git worktree list`, so the preflight
+    costs no subprocess per repository and accepts everything capture does.
+    """
+    git_entry = repository / ".git"
+    pointers: list[tuple[str, Path, str]] = []
+    try:
+        if git_entry.is_file():
+            text = git_entry.read_text(encoding="utf-8")
+            if text.startswith("gitdir:"):
+                pointers.append(("gitfile", git_entry, text[7:].strip()))
+            return pointers
+        common = git_entry / "commondir"
+        if common.is_file():
+            pointers.append(
+                ("commondir", common, common.read_text(encoding="utf-8").strip())
+            )
+        alternates = git_entry / "objects" / "info" / "alternates"
+        if alternates.is_file():
+            for line in alternates.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    pointers.append(("alternates", alternates, line.strip()))
+        worktrees = git_entry / "worktrees"
+        if worktrees.is_dir():
+            with os.scandir(worktrees) as handle:
+                for entry in sorted(handle, key=lambda item: item.name):
+                    gitdir = Path(entry.path) / "gitdir"
+                    if gitdir.is_file():
+                        pointers.append(
+                            (
+                                "worktree-gitdir",
+                                gitdir,
+                                gitdir.read_text(encoding="utf-8").strip(),
+                            )
+                        )
+    except (OSError, UnicodeDecodeError):
+        return pointers
+    return pointers
+
+
+def _doctor_git_pointers(
+    git_root: Path, *, max_findings: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pointer spellings against the directory entries, and dangling targets."""
+    spelling: list[dict[str, Any]] = []
+    dangling: list[dict[str, Any]] = []
+    repositories, _ = _discover_git_roots(git_root)
+    for repository in repositories:
+        for kind, source, recorded in _doctor_pointer_records(repository):
+            if not recorded:
+                continue
+            candidate = Path(recorded)
+            if not candidate.is_absolute():
+                candidate = Path(os.path.normpath(source.parent / candidate))
+            observed = _doctor_true_spelling(candidate)
+            if observed is None:
+                if len(dangling) <= max_findings:
+                    dangling.append(
+                        {
+                            "kind": kind,
+                            "pointer": os.fspath(source),
+                            "recorded": os.fspath(candidate),
+                            "repository": os.fspath(repository),
+                        }
+                    )
+                continue
+            if os.fspath(observed) != os.fspath(candidate) and (
+                len(spelling) <= max_findings
+            ):
+                spelling.append(
+                    {
+                        "kind": kind,
+                        "observed": os.fspath(observed),
+                        "pointer": os.fspath(source),
+                        "recorded": os.fspath(candidate),
+                        "repository": os.fspath(repository),
+                    }
+                )
+    return spelling, dangling
+
+
+def _doctor_path_map_checks(
+    roots: Sequence[dict[str, Any]],
+    *,
+    path_map: Sequence[dict[str, str]],
+    role: str,
+    max_findings: int,
+) -> list[dict[str, Any]]:
+    """Coverage — every declared root translates — and aliasing: no two maps
+    land two disjoint source subtrees on one destination."""
+    mapped = [root for root in roots if root["map"]]
+    unmapped = [
+        {
+            "label": root["label"],
+            "path": root["path"],
+            "reason": root["destination_error"],
+        }
+        for root in mapped
+        if root["destination_error"]
+    ]
+    aliases: list[dict[str, Any]] = []
+    for index, first in enumerate(path_map):
+        for second in path_map[index + 1 :]:
+            first_source = PurePosixPath(first["source"])
+            second_source = PurePosixPath(second["source"])
+            nested = (
+                first_source in second_source.parents
+                or second_source in first_source.parents
+            )
+            first_destination = PurePosixPath(first["destination"])
+            second_destination = PurePosixPath(second["destination"])
+            if first_destination == second_destination:
+                aliases.append(
+                    {
+                        "destinations": [first["destination"], second["destination"]],
+                        "reason": "two path-map sources share one destination",
+                        "sources": [first["source"], second["source"]],
+                    }
+                )
+                continue
+            overlapping = (
+                first_destination in second_destination.parents
+                or second_destination in first_destination.parents
+            )
+            if overlapping and not nested:
+                aliases.append(
+                    {
+                        "destinations": [first["destination"], second["destination"]],
+                        "reason": "disjoint sources nest on the destination",
+                        "sources": [first["source"], second["source"]],
+                    }
+                )
+    return [
+        _doctor_check(
+            "path-map-coverage",
+            "pass" if not unmapped else "fail",
+            summary="every declared root, seat, and snapshot root translates",
+            expected=f"{len(mapped)} translated roots inside the path map",
+            observed=f"{len(mapped) - len(unmapped)} of {len(mapped)} translate",
+            findings=unmapped,
+            max_findings=max_findings,
+            remedy=(
+                "add a --path-map SOURCE=DESTINATION covering each named root. "
+                "Capture records this as an unmapped-root blocker "
+                "(capture_agent_state root_bindings) only after the roots are "
+                "read, and the "
+                "planner as a root-binding divergence after that."
+            ),
+        ),
+        _doctor_check(
+            "path-map-alias",
+            ("pass" if not aliases else ("fail" if role == "source" else "warn")),
+            summary="no two path maps alias one destination subtree",
+            expected="each declared source subtree lands on its own destination",
+            observed=f"{len(aliases)} aliasing pairs",
+            findings=aliases,
+            max_findings=max_findings,
+            remedy=(
+                "give each source its own destination. Nested sources may "
+                "reparent — the longest source prefix wins "
+                "(canonical_path_map) — but disjoint sources may not collide. "
+                "On the destination role the map translates to itself, so fix "
+                "it on the source host, where it binds."
+            ),
+        ),
+    ]
+
+
+def _doctor_seat_shape(
+    seats: Sequence[tuple[str, Path, str]],
+    *,
+    roots: Sequence[dict[str, Any]],
+    max_findings: int,
+) -> list[dict[str, Any]]:
+    """The seat contract, checked in milliseconds instead of at stage time.
+
+    v4.3 died at stage on a file seat whose plan path was `<parent>/<label>`
+    while custody held the file itself (STATUS 2026-08-27T11:11:40Z). These
+    are the declaration shapes that reach that far.
+    """
+    findings: list[dict[str, Any]] = []
+    nested: list[dict[str, Any]] = []
+    seen: dict[str, Path] = {}
+    for name, path, kind in seats:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+            findings.append(
+                {
+                    "expected": "[a-z][a-z0-9_-]{0,63}",
+                    "name": name,
+                    "path": os.fspath(path),
+                    "reason": "seat name is not a legal identifier",
+                }
+            )
+        if name in seen:
+            findings.append(
+                {
+                    "expected": "one declaration per seat name",
+                    "name": name,
+                    "path": os.fspath(path),
+                    "reason": f"seat name repeats {os.fspath(seen[name])}",
+                }
+            )
+        seen[name] = path
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if kind == "file":
+            if stat.S_ISDIR(info.st_mode):
+                findings.append(
+                    {
+                        "expected": "--file-seat names a regular file",
+                        "name": name,
+                        "path": os.fspath(path),
+                        "reason": "declared file seat is a directory; use --seat",
+                    }
+                )
+            elif stat.S_ISLNK(info.st_mode):
+                findings.append(
+                    {
+                        "expected": "--file-seat names a regular file",
+                        "name": name,
+                        "path": os.fspath(path),
+                        "reason": (
+                            "declared file seat is a symlink: capture carries "
+                            "the backing file under its own parent "
+                            "(_capture_seat, file branch) while the plan writes "
+                            "the "
+                            "logical path"
+                        ),
+                    }
+                )
+            elif not stat.S_ISREG(info.st_mode):
+                findings.append(
+                    {
+                        "expected": "--file-seat names a regular file",
+                        "name": name,
+                        "path": os.fspath(path),
+                        "reason": "declared file seat is not a regular file",
+                    }
+                )
+        elif stat.S_ISREG(info.st_mode):
+            findings.append(
+                {
+                    "expected": "--seat names a directory",
+                    "name": name,
+                    "path": os.fspath(path),
+                    "reason": (
+                        "declared directory seat is a regular file; use --file-seat"
+                    ),
+                }
+            )
+        for root in roots:
+            if root["label"] == f"seat:{name}" or not root["walk"]:
+                continue
+            if Path(root["path"]) in path.parents:
+                nested.append(
+                    {
+                        "expected": "one owner per byte",
+                        "name": name,
+                        "path": os.fspath(path),
+                        "reason": f"seat is inside declared root {root['label']}",
+                    }
+                )
+    return [
+        _doctor_check(
+            "seat-path-shape",
+            "pass" if not findings else "fail",
+            summary="every declared seat has the shape its verb requires",
+            expected="--seat = directory, --file-seat = regular file, names unique",
+            observed=f"{len(findings)} shape defects across {len(seats)} seats",
+            findings=findings,
+            max_findings=max_findings,
+            remedy=(
+                "swap --seat and --file-seat to match what is on disk. Capture "
+                "refuses a non-file file seat in _capture_seat and a "
+                "non-directory declared root in _declared_root, both after the "
+                "roots have been read."
+            ),
+        ),
+        _doctor_check(
+            "seat-double-carry",
+            "pass" if not nested else "warn",
+            summary="no seat is also carried by the root that contains it",
+            expected="each declared seat outside every other declared root",
+            observed=f"{len(nested)} nested seats",
+            findings=nested,
+            max_findings=max_findings,
+            remedy=(
+                "declare the seat outside the containing root, or accept the "
+                "double carry deliberately: a provider walk does not prune a "
+                "declared seat, so those bytes are captured under two owners "
+                "and planned twice."
+            ),
+        ),
+    ]
+
+
+def _peer_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
+    }
+    environment["LC_ALL"] = "C"
+    return environment
+
+
+def _peer_probe(
+    ssh_path: str, host: str, argv: Sequence[str], *, timeout: float
+) -> dict[str, Any]:
+    """One authenticated, read-only command on the peer.
+
+    The option vector is `SSH_OPTIONS`, the same tuple the rsync transport
+    binds (`executor.push_agent_transport`), so a probe that authenticates
+    here is evidence the transport will authenticate too.
+    """
+    try:
+        completed = subprocess.run(
+            [ssh_path, *SSH_OPTIONS, "--", host, *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=_peer_environment(),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "peer probe timed out", "status": None, "stdout": ""}
+    except OSError as error:
+        return {"error": str(error), "status": None, "stdout": ""}
+    return {
+        "error": completed.stderr.decode("utf-8", "replace").strip()[:512] or None,
+        "status": completed.returncode,
+        "stdout": completed.stdout.decode("utf-8", "replace").strip()[:4096],
+    }
+
+
+def _doctor_peer(
+    *,
+    ssh_path: str,
+    host: str,
+    uname_path: str,
+    env_path: str,
+    bulkload_path: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Read the peer's kernel, login shell, POSIX acceptance, and engine.
+
+    Every probe is a simple command: nothing is written, started, or signaled
+    on the peer.
+    """
+    platform_probe = _peer_probe(ssh_path, host, [uname_path, "-s"], timeout=timeout)
+    environment_probe = _peer_probe(ssh_path, host, [env_path], timeout=timeout)
+    # A POSIX login shell expands this to the token; fish and the csh family
+    # cannot parse `${name-default}` at all and fail the command outright.
+    posix_probe = _peer_probe(
+        ssh_path,
+        host,
+        ["printf", "%s", f'"${{BULKLOAD_DOCTOR_PROBE-{POSIX_PROBE_TOKEN}}}"'],
+        timeout=timeout,
+    )
+    login_shell = None
+    for line in environment_probe["stdout"].splitlines():
+        if line.startswith("SHELL="):
+            login_shell = line[len("SHELL=") :].strip()
+    peer: dict[str, Any] = {
+        "engine_version": None,
+        "login_shell": login_shell,
+        "path_identity": None,
+        "platform": None,
+        "posix_login_shell": (
+            posix_probe["status"] == 0 and posix_probe["stdout"] == POSIX_PROBE_TOKEN
+        ),
+        "probes": {
+            "environment": environment_probe,
+            "platform": platform_probe,
+            "posix": posix_probe,
+        },
+        "reachable": platform_probe["status"] == 0,
+        "ssh_host": host,
+    }
+    if platform_probe["status"] == 0 and platform_probe["stdout"]:
+        peer["platform"] = platform_probe["stdout"].splitlines()[0].strip().lower()
+        # Declared, not measured: the doctor never writes on the peer, so its
+        # path identity is read off the kernel's default filesystem rather
+        # than probed. Linux (ext4/XFS) compares bytes; APFS ships folding.
+        peer["path_identity"] = {
+            "darwin": "case-insensitive",
+            "linux": "byte-exact",
+        }.get(peer["platform"])
+    if bulkload_path is not None:
+        version_probe = _peer_probe(
+            ssh_path, host, [bulkload_path, "--version"], timeout=timeout
+        )
+        peer["probes"]["engine"] = version_probe
+        if version_probe["status"] == 0:
+            peer["engine_version"] = version_probe["stdout"].strip()
+    return peer
+
+
+def _doctor_runtime(
+    *, peer_digest: str | None, max_findings: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Closure identity, and the pin that can silently stand in for it."""
+    root = Path(__file__).resolve().parent
+    try:
+        measured = sha256_bytes(
+            canonical_bytes(
+                {
+                    f"scripts/bulkload_lib/{name}": sha256_file((root / name).resolve())
+                    for name in RUNTIME_SOURCE_NAMES
+                }
+            )
+        )
+    except (BulkloadError, OSError):
+        measured = None
+    pin = os.environ.get("BULKLOAD_RUNTIME_SOURCE_PIN")
+    channel = os.environ.get("BULKLOAD_RUNTIME_SOURCE_SHA256")
+    malformed = pin is not None and (
+        len(pin) != 64 or any(character not in "0123456789abcdef" for character in pin)
+    )
+    presented = channel if (channel and not malformed) else measured
+    runtime = {
+        "measured_sha256": measured,
+        "peer_sha256": peer_digest,
+        "pin": "malformed" if malformed else ("active" if pin else "absent"),
+        "presented_sha256": presented,
+    }
+    findings: list[dict[str, Any]] = []
+    status = "pass"
+    if malformed:
+        status = "fail"
+        findings.append(
+            {
+                "expected": "64 lowercase hex characters",
+                "observed": len(pin or ""),
+                "reason": (
+                    "BULKLOAD_RUNTIME_SOURCE_PIN is malformed; model.py:88-96 "
+                    "refuses it at the first digest-bearing call"
+                ),
+                "variable": "BULKLOAD_RUNTIME_SOURCE_PIN",
+            }
+        )
+    elif pin and measured and pin != measured:
+        status = "warn"
+        findings.append(
+            {
+                "expected": measured,
+                "observed": pin,
+                "reason": (
+                    "an operator pin presents a closure these files do not hash "
+                    "to; every receipt will carry the pin, not the engine "
+                    "(bulkload.py:97-105)"
+                ),
+                "variable": "BULKLOAD_RUNTIME_SOURCE_PIN",
+            }
+        )
+    if peer_digest is not None and presented is not None and peer_digest != presented:
+        status = "fail"
+        findings.append(
+            {
+                "expected": presented,
+                "observed": peer_digest,
+                "reason": "the two roles are running different engine closures",
+                "variable": "--peer-runtime-source-sha256",
+            }
+        )
+    return runtime, _doctor_check(
+        "runtime-source-parity",
+        status,
+        summary="both roles run one engine closure, and no pin hides drift",
+        expected=presented,
+        observed=peer_digest if peer_digest is not None else presented,
+        findings=findings,
+        max_findings=max_findings,
+        remedy=(
+            "run `bulkload doctor` on the peer and pass its "
+            "runtime.presented_sha256 as --peer-runtime-source-sha256. Clear "
+            "BULKLOAD_RUNTIME_SOURCE_PIN unless a mid-ceremony break-glass is "
+            "in force."
+        ),
+    )
+
+
+def _doctor_declared_roots(
+    *,
+    role: str,
+    home: Path,
+    git_root: Path,
+    codex_root: Path | None,
+    claude_root: Path | None,
+    pi_root: Path | None,
+    seats: Sequence[tuple[str, Path, str]],
+    snapshot_root: Path,
+    snapshot_base_seal: Path | None,
+    path_map: Sequence[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Exactly the roots capture binds, in capture's own defaulting order.
+
+    `home` is a binding, not a walked tree (capture_agent_state's
+    provider_roots and root_bindings):
+    it names the provider defaults and the destination home, so it is checked
+    for presence and coverage but never walked.
+    """
+    declared: list[dict[str, Any]] = [
+        {
+            "kind": "directory",
+            "label": "home",
+            "map": True,
+            "path": os.fspath(home),
+            "walk": False,
+        },
+        {
+            "kind": "directory",
+            "label": "git",
+            "map": True,
+            "path": os.fspath(git_root),
+            "walk": True,
+        },
+    ]
+    for name, provider_root in (
+        ("codex", codex_root or home / ".codex"),
+        ("claude", claude_root or home / ".claude"),
+        ("pi", pi_root or home / ".pi" / "agent"),
+    ):
+        declared.append(
+            {
+                "kind": "directory",
+                "label": f"provider:{name}",
+                "map": True,
+                "path": os.fspath(provider_root),
+                "typed_sqlite": True,
+                "walk": True,
+            }
+        )
+    for name, seat_path, seat_kind in seats:
+        declared.append(
+            {
+                "kind": seat_kind,
+                "label": f"seat:{name}",
+                "map": True,
+                "path": os.fspath(seat_path),
+                "typed_sqlite": True,
+                "walk": True,
+            }
+        )
+    declared.append(
+        {
+            "kind": "directory",
+            "label": "snapshot",
+            # Capture writes the immutable snapshot under the evidence path
+            # and rewrites every snapshot path back to its live spelling
+            # (_rewrite_catalog_to_live), so the
+            # snapshot root is never translated and needs no map entry. It is
+            # still checked for overlap against every declared root.
+            "map": False,
+            "path": os.fspath(snapshot_root),
+            "walk": False,
+        }
+    )
+    if snapshot_base_seal is not None:
+        declared.append(
+            {
+                "kind": "file",
+                "label": "snapshot-base-seal",
+                "map": False,
+                "path": os.fspath(snapshot_base_seal),
+                "walk": False,
+            }
+        )
+    for root in declared:
+        candidate = Path(root["path"])
+        destination, error = (
+            _doctor_root_destination(candidate, role=role, path_map=path_map)
+            if root["map"]
+            else (None, None)
+        )
+        root["destination"] = destination
+        root["destination_error"] = error
+        root["walk_path"] = root["path"]
+        try:
+            info = candidate.lstat()
+        except OSError:
+            root["exists"] = False
+            root["link"] = False
+            continue
+        root["exists"] = True
+        root["link"] = stat.S_ISLNK(info.st_mode)
+        if root["link"]:
+            # Capture walks the backing root and translates the logical one
+            # (_declared_root).
+            try:
+                root["walk_path"] = os.fspath(resolve_real(candidate))
+            except BulkloadError:
+                root["exists"] = False
+        root["directory"] = Path(root["walk_path"]).is_dir()
+    return declared
+
+
+def run_doctor(
+    *,
+    role: str,
+    home: Path,
+    git_root: Path,
+    codex_root: Path | None,
+    claude_root: Path | None,
+    pi_root: Path | None,
+    seats: Sequence[tuple[str, Path, str]],
+    path_map: Sequence[dict[str, str]],
+    capture_output: Path,
+    snapshot_base_seal: Path | None,
+    engine_version: str,
+    peer_ssh_host: str | None = None,
+    peer_bulkload: str | None = None,
+    peer_runtime_source_sha256: str | None = None,
+    ssh_path: str | None = None,
+    peer_uname_path: str = DEFAULT_PEER_UNAME,
+    peer_env_path: str = DEFAULT_PEER_ENV,
+    peer_timeout_seconds: float = DEFAULT_PEER_TIMEOUT_SECONDS,
+    max_entries: int = DEFAULT_MAX_FILES,
+    max_findings: int = DOCTOR_MAX_FINDINGS,
+) -> dict[str, Any]:
+    """Name every path that will refuse this contract, before a byte moves."""
+    if role not in {"source", "destination"}:
+        raise BulkloadError("doctor role must be source or destination")
+    if max_entries < 1 or max_findings < 1:
+        raise BulkloadError("doctor budgets must be positive")
+    snapshot_root = capture_output.parent / f".{capture_output.name}.snapshot"
+    declared = _doctor_declared_roots(
+        role=role,
+        home=home,
+        git_root=git_root,
+        codex_root=codex_root,
+        claude_root=claude_root,
+        pi_root=pi_root,
+        seats=seats,
+        snapshot_root=snapshot_root,
+        snapshot_base_seal=snapshot_base_seal,
+        path_map=path_map,
+    )
+    checks: list[dict[str, Any]] = []
+
+    presence: list[dict[str, Any]] = []
+    for root in declared:
+        if not root["exists"]:
+            if root["label"] in {"home", "git"}:
+                presence.append(
+                    {
+                        "expected": "an existing directory",
+                        "label": root["label"],
+                        "path": root["path"],
+                        "reason": "declared root does not exist",
+                    }
+                )
+            continue
+        if root["kind"] == "directory" and not root["directory"]:
+            presence.append(
+                {
+                    "expected": "a directory, or a link naming one",
+                    "label": root["label"],
+                    "path": root["path"],
+                    "reason": "declared root is not a directory",
+                }
+            )
+        if root["label"] == "snapshot":
+            continue
+        try:
+            assert_no_overlap(
+                capture_output, [Path(root["path"])], "capture evidence output"
+            )
+        except BulkloadError as error:
+            presence.append(
+                {
+                    "expected": "evidence written outside every declared root",
+                    "label": root["label"],
+                    "path": root["path"],
+                    "reason": str(error),
+                }
+            )
+    checks.append(
+        _doctor_check(
+            "declared-root-presence",
+            "pass" if not presence else "fail",
+            summary="every declared root exists and the evidence path is outside it",
+            expected=f"{len(declared)} declared roots",
+            observed=f"{len(presence)} defects",
+            findings=presence,
+            max_findings=max_findings,
+            remedy=(
+                "create or re-declare the named root, and place the capture "
+                "--output outside every live root: cli.py:_protect_output "
+                "refuses the overlap after the arguments are parsed."
+            ),
+        )
+    )
+
+    peer: dict[str, Any] | None = None
+    if peer_ssh_host is not None:
+        if SSH_HOST_AUTHORITY.fullmatch(peer_ssh_host) is None:
+            raise BulkloadError("peer SSH authority is not a canonical [user@]host")
+        binary = ssh_path or shutil.which("ssh")
+        if binary is None:
+            raise BulkloadError("an explicit safe SSH executable is unavailable")
+        peer = _doctor_peer(
+            ssh_path=shell_safe_executable(binary, "SSH"),
+            host=peer_ssh_host,
+            uname_path=peer_uname_path,
+            env_path=peer_env_path,
+            bulkload_path=peer_bulkload,
+            timeout=peer_timeout_seconds,
+        )
+        checks.append(
+            _doctor_check(
+                "peer-reachable",
+                "pass" if peer["reachable"] else "fail",
+                summary="the peer answers the transport's own SSH option vector",
+                expected=f"{peer_uname_path} -s over BatchMode SSH",
+                observed=peer["probes"]["platform"]["error"] or peer["platform"],
+                findings=[]
+                if peer["reachable"]
+                else [
+                    {
+                        "host": peer_ssh_host,
+                        "reason": peer["probes"]["platform"]["error"]
+                        or "peer probe failed",
+                        "status": peer["probes"]["platform"]["status"],
+                    }
+                ],
+                max_findings=max_findings,
+                remedy=(
+                    "authenticate non-interactively (BatchMode=yes, "
+                    "StrictHostKeyChecking=yes) before the transport needs it, "
+                    "or correct --peer-uname-path for this peer."
+                ),
+            )
+        )
+        shell = PurePosixPath(peer["login_shell"]).name if peer["login_shell"] else None
+        non_posix = shell in NON_POSIX_LOGIN_SHELLS
+        shell_defect = peer["reachable"] and (
+            non_posix or not peer["posix_login_shell"]
+        )
+        checks.append(
+            _doctor_check(
+                "peer-login-shell",
+                "warn" if shell_defect else "pass",
+                summary="the peer's login shell accepts the transport's command shapes",
+                expected="a POSIX login shell, or every remote step piped to bash -s",
+                observed=peer["login_shell"] or "unknown",
+                findings=[
+                    {
+                        "host": peer_ssh_host,
+                        "login_shell": peer["login_shell"],
+                        "posix_expansion": peer["posix_login_shell"],
+                        "reason": (
+                            f"{shell} does not parse POSIX parameter expansion"
+                            if non_posix
+                            else "the peer rejected a POSIX parameter expansion"
+                        ),
+                    }
+                ]
+                if shell_defect
+                else [],
+                max_findings=max_findings,
+                remedy=(
+                    "keep remote steps to absolute binaries with no shell "
+                    "syntax, or pipe scripts as `ssh HOST bash -s < script`. "
+                    "rsync's own --rsync-path invocation is a simple command "
+                    "and is unaffected."
+                ),
+            )
+        )
+        if peer_bulkload is not None:
+            expected_version = f"bulkload {engine_version}"
+            matched = peer["engine_version"] == expected_version
+            checks.append(
+                _doctor_check(
+                    "peer-engine-version",
+                    "pass" if matched else "fail",
+                    summary="both roles present one engine version",
+                    expected=expected_version,
+                    observed=peer["engine_version"],
+                    findings=[]
+                    if matched
+                    else [
+                        {
+                            "expected": expected_version,
+                            "host": peer_ssh_host,
+                            "observed": peer["engine_version"],
+                            "path": peer_bulkload,
+                            "reason": "the peer presents a different engine",
+                        }
+                    ],
+                    max_findings=max_findings,
+                    remedy=(
+                        "deploy one closure to both roles: the v4 artifact "
+                        "contract is a build artifact of a single engine "
+                        "checkout, not a stable format."
+                    ),
+                )
+            )
+
+    local_platform = sys.platform
+    local_kind = (
+        "darwin"
+        if local_platform == "darwin"
+        else ("linux" if local_platform.startswith("linux") else local_platform)
+    )
+    peer_kind = peer["platform"] if peer else None
+    cross_kernel = bool(peer_kind) and peer_kind != local_kind
+    case_identity = _doctor_case_sensitivity(home)
+
+    scan = _DoctorScan()
+    walkable = [
+        root
+        for root in declared
+        if root["walk"]
+        and root["exists"]
+        and (root["directory"] or root["kind"] == "file")
+    ]
+    walked_labels = {root["label"] for root in walkable}
+    boundaries = frozenset(
+        root["walk_path"] for root in declared if root["exists"] and root["directory"]
+    )
+
+    def stream() -> Iterable[str]:
+        for root in walkable:
+            if not scan.complete:
+                return
+            yield from _doctor_walk(
+                scan,
+                root,
+                boundaries=boundaries - {root["walk_path"]},
+                max_entries=max_entries,
+                collect_symlink_modes=cross_kernel,
+            )
+
+    collisions = _doctor_collisions(
+        _bounded_sorted(stream()), max_findings=max_findings
+    )
+    checks.append(
+        _doctor_check(
+            "case-fold-collision",
+            "pass" if not collisions else "fail",
+            summary="no two declared paths collapse onto one destination identity",
+            expected="one destination identity per source path",
+            observed=(
+                f"{len(collisions)} collision groups over {scan.entries} entries"
+                + ("" if scan.complete else " (walk stopped at --max-entries)")
+            ),
+            findings=collisions,
+            max_findings=max_findings,
+            remedy=(
+                "rename one spelling in each group, or exclude it. A group is "
+                "a set of source paths that are one file on a folding "
+                "filesystem and several on a byte-exact one; 22,866 required "
+                "paths went missing on 2026-08-27 for one such group."
+            ),
+        )
+    )
+    if not scan.complete:
+        checks.append(
+            _doctor_check(
+                "scan-complete",
+                "warn",
+                summary="the namespace walk finished inside its budget",
+                expected=f"at most {max_entries} entries",
+                observed=f"{scan.entries} entries and still walking",
+                max_findings=max_findings,
+                remedy=(
+                    "raise --max-entries; every path-shaped check above is "
+                    "partial until the walk completes."
+                ),
+            )
+        )
+    if scan.unreadable:
+        checks.append(
+            _doctor_check(
+                "root-readable",
+                "warn",
+                summary="every declared path is readable by this user",
+                expected="no unreadable entry inside a declared root",
+                observed=f"{len(scan.unreadable)} unreadable paths",
+                findings=scan.unreadable,
+                max_findings=max_findings,
+                remedy=(
+                    "capture reads these too; settle the mode or exclude the "
+                    "path before the read that costs hours."
+                ),
+            )
+        )
+
+    spelling, dangling = _doctor_git_pointers(
+        Path(next(root["walk_path"] for root in declared if root["label"] == "git")),
+        max_findings=max_findings,
+    )
+    checks.append(
+        _doctor_check(
+            "git-pointer-spelling",
+            "pass" if not spelling else "fail",
+            summary="every git pointer is spelled the way its directory is",
+            expected="pointer spelling == on-disk spelling",
+            observed=f"{len(spelling)} pointers differ",
+            findings=spelling,
+            max_findings=max_findings,
+            remedy=(
+                "re-point the worktree (git worktree repair) so the recorded "
+                "path matches the directory entry. A folding filesystem "
+                "accepts both spellings; the index carries one, and the "
+                "destination cannot match the other."
+            ),
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "git-pointer-target",
+            "pass" if not dangling else "warn",
+            summary="every git pointer names a path that exists",
+            expected="no dangling worktree, commondir, or alternates pointer",
+            observed=f"{len(dangling)} dangling pointers",
+            findings=dangling,
+            max_findings=max_findings,
+            remedy="git worktree prune, or restore the named path before capture.",
+        )
+    )
+
+    checks.extend(
+        _doctor_path_map_checks(
+            declared, path_map=path_map, role=role, max_findings=max_findings
+        )
+    )
+    checks.extend(_doctor_seat_shape(seats, roots=declared, max_findings=max_findings))
+
+    typed_orphans = [item for item in scan.orphan_sidecars if item["typed"]]
+    other_orphans = [item for item in scan.orphan_sidecars if not item["typed"]]
+    checks.append(
+        _doctor_check(
+            "sqlite-sidecar-orphan",
+            "fail" if typed_orphans else ("warn" if other_orphans else "pass"),
+            summary="no -wal/-shm/-journal sidecar outlives its database",
+            expected="every sqlite sidecar has its primary beside it",
+            observed=(
+                f"{len(typed_orphans)} orphans in typed roots, "
+                f"{len(other_orphans)} elsewhere"
+            ),
+            findings=typed_orphans + other_orphans,
+            max_findings=max_findings,
+            remedy=(
+                "checkpoint and clear the debris in the provider and seat "
+                "roots, where a sidecar is typed state: 13 of the ceremony's "
+                "20 laps were sidecar sweeps. Elsewhere a -journal file is "
+                "often ordinary source and needs nothing."
+            ),
+        )
+    )
+
+    checks.append(
+        _doctor_check(
+            "symlink-mode-portability",
+            "warn" if (cross_kernel and scan.unportable_symlinks) else "pass",
+            summary="symlink permission bits do not bind across kernels",
+            expected=(
+                f"{local_kind} and {peer_kind} agree on symlink mode"
+                if cross_kernel
+                else "one kernel on both roles"
+            ),
+            observed=(
+                f"{len(scan.unportable_symlinks)} of {scan.symlinks} symlinks "
+                f"carry a mode other than {LINUX_SYMLINK_MODE}"
+                if cross_kernel
+                else f"{scan.symlinks} symlinks, no peer kernel to compare"
+            ),
+            findings=scan.unportable_symlinks if cross_kernel else [],
+            max_findings=max_findings,
+            remedy=(
+                "no action while the exemption stands: mode is exempt from "
+                "symlink payload verification in validate_snapshot_custody, "
+                "and "
+                "kind, size and target digest still bind. Without it 16,865 of "
+                "16,900 sealed links refuse on the first cross-OS run."
+            ),
+        )
+    )
+
+    identity_split = bool(
+        case_identity == "case-insensitive"
+        and peer
+        and peer["path_identity"] == "byte-exact"
+    )
+    checks.append(
+        _doctor_check(
+            "path-identity-pair",
+            "warn" if identity_split else "pass",
+            summary="the two roles agree on what makes two paths one path",
+            expected="one declared path identity across the pair",
+            observed={
+                "peer": peer["path_identity"] if peer else None,
+                "role": case_identity,
+            },
+            findings=[
+                {
+                    "peer": peer["ssh_host"],
+                    "peer_identity": peer["path_identity"],
+                    "reason": (
+                        "this host folds case and the peer does not: every "
+                        "case-fold-collision group above is a destination "
+                        "divergence, not a cosmetic one"
+                    ),
+                    "role_identity": case_identity,
+                }
+            ]
+            if identity_split and peer
+            else [],
+            max_findings=max_findings,
+            remedy=(
+                "treat case-fold-collision as a blocker on this pair, and "
+                "declare the identity in the contract instead of discovering "
+                "it after a full custody read."
+            ),
+        )
+    )
+
+    runtime, runtime_check = _doctor_runtime(
+        peer_digest=peer_runtime_source_sha256, max_findings=max_findings
+    )
+    checks.append(runtime_check)
+
+    checks.sort(key=lambda item: item["code"])
+    summary = {
+        status: sum(1 for check in checks if check["status"] == status)
+        for status in DOCTOR_STATUSES
+    }
+    report = {
+        "checks": checks,
+        "complete": scan.complete,
+        "declared_roots": [
+            {
+                "destination": root["destination"],
+                "exists": root["exists"],
+                "kind": root["kind"],
+                "label": root["label"],
+                "path": root["path"],
+                "walked": root["label"] in walked_labels,
+            }
+            for root in declared
+        ],
+        "doctor_id": new_id(),
+        "engine_version": engine_version,
+        "generated_at": utc_now(),
+        "host": {
+            "hostname": socket.gethostname(),
+            "path_identity": case_identity,
+            "platform": local_kind,
+        },
+        "ok": summary["fail"] == 0,
+        "peer": peer,
+        "role": role,
+        "runtime": runtime,
+        "schema": DOCTOR_REPORT_SCHEMA,
+        "scanned_entries": scan.entries,
+        "summary": summary,
+    }
+    return seal(report, "report_sha256")

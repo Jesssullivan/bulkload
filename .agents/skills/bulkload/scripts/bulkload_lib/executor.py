@@ -48,6 +48,8 @@ from .model import (
 from .planner import PlanOperationResolver, validate_agent_plan
 from .scanner import (
     DEFAULT_MAX_SQLITE_ROWS,
+    SSH_HOST_AUTHORITY,
+    SSH_OPTIONS,
     _quote_identifier,
     _sqlite_catalog_from_snapshot,
     _typed_sql_value,
@@ -61,11 +63,6 @@ from .scanner import (
 
 
 DEFAULT_CAPACITY_RESERVE_BYTES = 10 * 1024**3
-SSH_OPTIONS = (
-    "-oBatchMode=yes",
-    "-oStrictHostKeyChecking=yes",
-    "-oClearAllForwardings=yes",
-)
 REMOTE_STAGE_ROOT = re.compile(r"/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+")
 
 
@@ -307,10 +304,7 @@ def _probe_remote_rsync(ssh_path: str, host: str, binding: dict[str, Any]) -> No
 
 
 def _transport_host(value: str, expected: str) -> str:
-    match = re.fullmatch(
-        r"(?:(?:[a-z_][a-z0-9_-]{0,31})@)?([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)",
-        value,
-    )
+    match = SSH_HOST_AUTHORITY.fullmatch(value)
     if match is None or match.group(1) != expected:
         raise BulkloadError("SSH authority differs from captured hostname")
     return value

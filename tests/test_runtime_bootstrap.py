@@ -32,6 +32,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
             "agent-verify",
             "agent-rollback",
             "agent-recover",
+            "doctor",
         ):
             self.assertIn(command, result.stdout)
         self.assertNotIn("codex-private", result.stdout)

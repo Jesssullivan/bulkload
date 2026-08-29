@@ -34,9 +34,15 @@ from .scanner import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
+    DEFAULT_PEER_ENV,
+    DEFAULT_PEER_TIMEOUT_SECONDS,
+    DEFAULT_PEER_UNAME,
+    DOCTOR_MAX_FINDINGS,
+    DOCTOR_REPORT_SCHEMA,
     _catalog_path_identities,
     canonical_path_map,
     capture_agent_state,
+    run_doctor,
     validate_agent_capture,
 )
 
@@ -147,11 +153,15 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
+def _absolute(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(value).expanduser())))
+
+
 def _protect_output(arguments: argparse.Namespace) -> None:
     if arguments.output == "-":
         return
     roots: list[Path] = []
-    if arguments.command == "agent-capture":
+    if arguments.command in {"agent-capture", "doctor"}:
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
         roots.extend(
             Path(path)
@@ -262,6 +272,37 @@ def _agent_capture(arguments: argparse.Namespace) -> dict[str, Any]:
         max_sqlite_rows=arguments.max_sqlite_rows,
         jobs=arguments.jobs,
         base_custody=arguments.base_custody,
+    )
+
+
+def _doctor(arguments: argparse.Namespace) -> dict[str, Any]:
+    home = _absolute(arguments.home)
+    return run_doctor(
+        role=arguments.role,
+        home=home,
+        git_root=_absolute(arguments.git_root),
+        codex_root=_absolute(arguments.codex_root) if arguments.codex_root else None,
+        claude_root=_absolute(arguments.claude_root) if arguments.claude_root else None,
+        pi_root=_absolute(arguments.pi_root) if arguments.pi_root else None,
+        seats=[
+            (name, _absolute(path), kind)
+            for name, path, kind in [*arguments.seat, *arguments.file_seat]
+        ],
+        path_map=canonical_path_map(arguments.path_map),
+        capture_output=_absolute(arguments.capture_output),
+        snapshot_base_seal=_absolute(arguments.snapshot_base_seal)
+        if arguments.snapshot_base_seal
+        else None,
+        engine_version=__version__,
+        peer_ssh_host=arguments.peer_ssh_host,
+        peer_bulkload=arguments.peer_bulkload,
+        peer_runtime_source_sha256=arguments.peer_runtime_source_sha256,
+        ssh_path=arguments.ssh_path,
+        peer_uname_path=arguments.peer_uname_path,
+        peer_env_path=arguments.peer_env_path,
+        peer_timeout_seconds=arguments.peer_timeout_seconds,
+        max_entries=arguments.max_entries,
+        max_findings=arguments.max_findings,
     )
 
 
@@ -559,6 +600,130 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--strategy", choices=("forward", "rollback"), required=True)
     recover.add_argument("--output", required=True)
     recover.set_defaults(handler=_agent_recover)
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="read-only preflight: name every path that will refuse this contract",
+        description=(
+            "Read the declared contract and both hosts, and report the "
+            "cross-kernel defects that are discoverable before capture reads "
+            "a byte: case-fold collision groups, git-pointer spellings, "
+            "path-map coverage and aliasing, seat shape, orphaned SQLite "
+            "sidecars, symlink-mode portability, the peer's login shell, and "
+            "runtime-closure parity. Nothing is written inside a declared "
+            "root and no process is signaled."
+        ),
+    )
+    doctor.add_argument(
+        "--role",
+        choices=("source", "destination"),
+        required=True,
+        help="which end of the cutover this host is; run doctor on both",
+    )
+    doctor.add_argument(
+        "--home", required=True, help="declared home root, as agent-capture binds it"
+    )
+    doctor.add_argument(
+        "--git-root", required=True, help="declared Git fleet root (~/git)"
+    )
+    doctor.add_argument(
+        "--codex-root", help="Codex state root; defaults to HOME/.codex"
+    )
+    doctor.add_argument(
+        "--claude-root", help="Claude state root; defaults to HOME/.claude"
+    )
+    doctor.add_argument("--pi-root", help="Pi state root; defaults to HOME/.pi/agent")
+    doctor.add_argument(
+        "--seat",
+        action="append",
+        type=_parse_seat,
+        default=[],
+        help="mutable directory seat as NAME=PATH; repeatable",
+    )
+    doctor.add_argument(
+        "--file-seat",
+        action="append",
+        type=_parse_file_seat,
+        default=[],
+        help="mutable single-file seat as NAME=PATH; repeatable",
+    )
+    doctor.add_argument(
+        "--path-map",
+        action="append",
+        type=_parse_mapping,
+        required=True,
+        help=(
+            "SOURCE=DESTINATION translation; repeatable, longest source "
+            "prefix wins. Pass the same vector agent-capture will get."
+        ),
+    )
+    doctor.add_argument(
+        "--capture-output",
+        required=True,
+        help=(
+            "the path agent-capture --output will be given. The immutable "
+            "snapshot root is derived from it exactly as capture derives it."
+        ),
+    )
+    doctor.add_argument(
+        "--snapshot-base-seal",
+        help="the A-leg snapshot-seal.json a B capture will chain from",
+    )
+    doctor.add_argument(
+        "--peer-ssh-host",
+        help=(
+            "[user@]host of the other role. Probed read-only over the "
+            "transport's own SSH options; omit to skip every peer check."
+        ),
+    )
+    doctor.add_argument(
+        "--peer-bulkload",
+        help="absolute path to the peer's bulkload launcher, for a version probe",
+    )
+    doctor.add_argument(
+        "--peer-runtime-source-sha256",
+        help=(
+            "runtime.presented_sha256 from the peer's own doctor report; "
+            "compared against this host's engine closure"
+        ),
+    )
+    doctor.add_argument(
+        "--ssh-path", help="explicit ssh executable; defaults to the one on PATH"
+    )
+    doctor.add_argument(
+        "--peer-uname-path",
+        default=DEFAULT_PEER_UNAME,
+        help=f"peer uname(1) path for the kernel probe (default {DEFAULT_PEER_UNAME})",
+    )
+    doctor.add_argument(
+        "--peer-env-path",
+        default=DEFAULT_PEER_ENV,
+        help=f"peer env(1) path for the login-shell probe (default {DEFAULT_PEER_ENV})",
+    )
+    doctor.add_argument(
+        "--peer-timeout-seconds",
+        type=float,
+        default=DEFAULT_PEER_TIMEOUT_SECONDS,
+        help="per-probe timeout for every peer command",
+    )
+    doctor.add_argument(
+        "--max-entries",
+        type=int,
+        default=DEFAULT_MAX_FILES,
+        help="namespace budget for the walk; the report says when it is hit",
+    )
+    doctor.add_argument(
+        "--max-findings",
+        type=int,
+        default=DOCTOR_MAX_FINDINGS,
+        help="per-check cap on named paths; the report says when it truncates",
+    )
+    doctor.add_argument(
+        "--output",
+        required=True,
+        help="where to write the doctor report; - writes it to stdout",
+    )
+    doctor.set_defaults(handler=_doctor)
     return parser
 
 
@@ -571,5 +736,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write(arguments.output, result)
     except (BulkloadError, OSError, sqlite3.Error) as error:
         print(f"bulkload: FAIL: {error}", file=sys.stderr)
+        return 1
+    if result.get("schema") == DOCTOR_REPORT_SCHEMA and not result["ok"]:
+        # The report is already written: a failing preflight still hands the
+        # operator the named paths, and only then refuses. The exit alphabet
+        # stays {0 ok, 1 refused, 2 usage/bootstrap}.
+        failed = ",".join(
+            check["code"] for check in result["checks"] if check["status"] == "fail"
+        )
+        print(
+            f"bulkload: doctor: {result['summary']['fail']} checks failed: {failed}",
+            file=sys.stderr,
+        )
         return 1
     return 0

@@ -37,6 +37,15 @@ py_test(
 )
 
 py_test(
+    name = "doctor_tests",
+    legacy_create_init = 0,
+    main = "tests/test_doctor.py",
+    size = "small",
+    srcs = ["tests/test_doctor.py"],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "wave0_perf_tests",
     imports = ["tests"],
     legacy_create_init = 0,
@@ -150,6 +159,7 @@ test_suite(
         ":bazel_binary_smoke_test",
         ":bulkload_tests",
         ":ci_contract_test",
+        ":doctor_tests",
         ":installer_test",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",

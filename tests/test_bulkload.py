@@ -760,6 +760,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 "agent-verify",
                 "agent-rollback",
                 "agent-recover",
+                "doctor",
             },
         )
         push = parser.parse_args(
