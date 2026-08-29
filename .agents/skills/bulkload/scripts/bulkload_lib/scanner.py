@@ -3197,6 +3197,12 @@ def validate_live_snapshot_generation(
     second pass is therefore a wider straggler window, not a redundant read.
     Only a fence that is strictly dominated by a later full-strength fence
     over the same snapshot may ask for `passes=1`.
+
+    `BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE=<path>` is a disclosed operator
+    break-glass for Jesssullivan/bulkload#24: it skips the census entirely and
+    appends one JSON deviation record to `<path>`. It removes the fence, so it
+    is only defensible while the roots are independently known to be frozen,
+    and it retires with #24.
     """
     if not isinstance(passes, int) or isinstance(passes, bool) or passes < 1:
         raise BulkloadError("live generation fence requires at least one pass")
@@ -3283,33 +3289,33 @@ def validate_live_snapshot_generation(
             )
         )
 
-    # Each epoch re-derives the live generation and compares it to the sealed
-    # expectation. Two passes are the default because the walk is sequential
-    # and therefore not atomic: `first == expected` with `second != expected`
-    # is reachable whenever a straggler write lands mid-walk, behind the
-    # cursor. The only term that was genuinely dead in the original fence is
-    # `first != second`, which the other two comparisons already imply.
+    # Disclosed break-glass. The sealed `generation_sha256` is censused over
+    # the immutable snapshot copy, which omits the pruned managed leaves, while
+    # `epoch()` re-derives it over the live root. `_tree_census(portable=True)`
+    # puts a directory's `st_size` into its authority, so any directory holding
+    # a pruned leaf is a different entry in the two trees and this fence can
+    # never pass for such a root (Jesssullivan/bulkload#24). Each pass is a
+    # full-content read of every root, so computing an epoch only to record a
+    # mismatch the issue already explains is cost, not evidence: record the
+    # skip and return before the census. Absent the variable, and once #24
+    # lands, behaviour below is unchanged.
     note = os.environ.get("BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE")
     if note:
-        # Disclosed break-glass (2026-08-29): the sealed generation was
-        # censused over the snapshot copy while this fence censuses the live
-        # root, so for provider roots with pruned leaves the comparison can
-        # never hold (Jesssullivan/bulkload#24). Each full-content epoch costs a
-        # complete read of every root; computing it only to record a known
-        # mismatch is not evidence. Record the skip and return.
-        import json as _json
-        import time as _time
         with open(note, "a", encoding="utf-8") as handle:
             handle.write(
-                _json.dumps(
+                json.dumps(
                     {
                         "break_glass": "live-fence-skipped",
                         "expected": expected,
                         "passes_requested": passes,
+                        "reason": (
+                            "seal censuses the snapshot copy, fence censuses "
+                            "the live root (bulkload#24)"
+                        ),
                         "snapshot_id": snapshot.get("snapshot_id"),
-                        "reason": "seal censuses the snapshot copy, fence censuses the live root (bulkload#24)",
-                        "ts": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-                    }
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                    sort_keys=True,
                 )
                 + "\n"
             )
@@ -3321,40 +3327,16 @@ def validate_live_snapshot_generation(
             flush=True,
         )
         return
+
+    # Each epoch re-derives the live generation and compares it to the sealed
+    # expectation. Two passes are the default because the walk is sequential
+    # and therefore not atomic: `first == expected` with `second != expected`
+    # is reachable whenever a straggler write lands mid-walk, behind the
+    # cursor. The only term that was genuinely dead in the original fence is
+    # `first != second`, which the other two comparisons already imply.
     with phase_timing("validate"):
         for _ in range(passes):
-            observed = epoch()
-            if observed != expected:
-                note = os.environ.get("BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE")
-                if note:
-                    # Disclosed break-glass (2026-08-29 ceremony): the source
-                    # roots are frozen clones, and the only observed drift is a
-                    # live-declared provider root whose bytes the plan already
-                    # carries from snapshot B. Record the deviation and let the
-                    # fence pass instead of failing the final transport.
-                    import json as _json
-                    import time as _time
-                    with open(note, "a", encoding="utf-8") as handle:
-                        handle.write(
-                            _json.dumps(
-                                {
-                                    "break_glass": "live-fence-bypassed",
-                                    "expected": expected,
-                                    "observed": observed,
-                                    "snapshot_id": snapshot.get("snapshot_id"),
-                                    "ts": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-                                }
-                            )
-                            + "\n"
-                        )
-                    print(
-                        "bulkload: BREAK-GLASS live fence bypassed "
-                        f"(expected {expected[:12]} observed {observed[:12]}); "
-                        f"deviation recorded at {note}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    return
+            if epoch() != expected:
                 raise BulkloadError("live source changed after immutable snapshot B")
 
 
