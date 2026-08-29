@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -87,9 +88,40 @@ class RuntimeBootstrapTests(unittest.TestCase):
                 "cli.py",
                 "executor.py",
                 "model.py",
+                "mover.py",
                 "planner.py",
                 "scanner.py",
             },
+        )
+
+    def test_runtime_closure_lists_agree(self) -> None:
+        """The drift guard was in two places and only one of them was checked.
+
+        `RUNTIME_SOURCE_NAMES` (`model.py:30-38`) feeds `runtime_source_digest`
+        and therefore every pinned evidence digest; the launcher's own
+        `RUNTIME_FILES` (`bulkload.py:17-25`) decides what can be imported at
+        all; the literal above decides what may exist on disk. Three
+        restatements of one closure, and nothing compared them to each other.
+        Adding a module to one and not the others is exactly the drift the
+        review files as an open decision (BASES-20260828.md F-5).
+        """
+        from bulkload_lib.model import RUNTIME_SOURCE_NAMES
+
+        tree = ast.parse(LAUNCHER.read_text(encoding="utf-8"))
+        declared: set[str] | None = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "RUNTIME_FILES"
+            ):
+                declared = set(ast.literal_eval(node.value))
+        self.assertIsNotNone(declared, "launcher declares no RUNTIME_FILES")
+        self.assertEqual(set(RUNTIME_SOURCE_NAMES), declared)
+        self.assertEqual(
+            set(RUNTIME_SOURCE_NAMES),
+            {path.name for path in (LAUNCHER.parent / "bulkload_lib").glob("*.py")},
         )
 
 

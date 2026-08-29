@@ -140,6 +140,15 @@ every transported digest before those bytes gain apply authority; pass
 connection originates on Neo: Neo may pull destination A/B captures and the
 prepare receipt over that connection, but Sting never authenticates to Neo.
 
+`--mover` selects the payload mover for `--transport-mode push` and defaults to
+`rsync`, the shipped single-stream path. `--mover native` uses the
+content-addressed parallel mover (`--transport-streams`, default 8): one
+transfer per sha256 rather than per path, resumable by re-offering every
+object. It is a prototype, it has not been run against a live destination, and
+it does not preserve mtimes, hardlink topology, or xattrs. Read
+`docs/design/native-mover.md` before using it; §3 there records that it is a
+fleet-synchronous runtime change.
+
 On Sting:
 
 ```bash

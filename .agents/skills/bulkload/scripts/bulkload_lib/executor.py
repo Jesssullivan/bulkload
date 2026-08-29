@@ -13,8 +13,9 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
-from typing import Any, Iterable, Sequence
+from typing import IO, Any, Iterable, Iterator, Sequence
 
 from .model import (
     AGENT_APPLY_SCHEMA,
@@ -45,6 +46,7 @@ from .model import (
     sha256_symlink,
     utc_now,
 )
+from . import mover
 from .planner import PlanOperationResolver, validate_agent_plan
 from .scanner import (
     DEFAULT_MAX_SQLITE_ROWS,
@@ -443,6 +445,112 @@ def _validate_prepare_receipt(
         raise BulkloadError("prepare receipt quarantine binding is invalid")
 
 
+TRANSPORT_MOVERS = ("rsync", "native")
+
+
+def _allowlist_relatives(stream: IO[bytes]) -> Iterator[str]:
+    """Stream NUL-separated allowlist entries without holding the list in RAM.
+
+    The real allowlist is 403 MB / 1,781,044 paths (VERDICTS.md, judge §2A),
+    so this is read in blocks for the same reason the plan is: the engine's
+    memory ceiling is the thing that curated the codex root down to 22 G.
+    """
+    stream.seek(0)
+    pending = b""
+    while True:
+        block = stream.read(1024 * 1024)
+        if not block:
+            break
+        pending += block
+        *complete, pending = pending.split(b"\0")
+        for item in complete:
+            yield os.fsdecode(item)
+    if pending:
+        raise BulkloadError("transport allowlist is not NUL-terminated")
+
+
+def _push_native_transport(
+    *,
+    allowlist: IO[bytes],
+    ssh_path: str,
+    host: str,
+    quarantine: Path,
+    stage_root: Path,
+    streams: int,
+    environment: dict[str, str],
+    channel_factory: Any | None,
+) -> dict[str, Any]:
+    """Move the payload as content-addressed objects over N ssh streams.
+
+    This is the alternative to the single-stream rsync push below. It is not
+    the default and it is not yet proven against a live destination; see
+    `docs/design/native-mover.md`. It is custody-compatible by construction:
+    the quarantine is re-derived by `validate_snapshot_custody` under
+    `required_paths` (`executor.py:1533-1535`), which re-checks kind, mode,
+    size and sha256 per allowlist path and disables the namespace perimeter
+    (`scanner.py:2978-2986`) — none of the `rsync -a` metadata this mover
+    drops (mtimes, hardlink topology, xattrs) is load-bearing there.
+    """
+    with tempfile.TemporaryDirectory(prefix="bulkload-mover-spill-") as spill:
+        if channel_factory is None:
+            remote_module = os.fspath(stage_root / ".transport-mover.py")
+            expected = mover.bootstrap_receiver(
+                ssh_path, SSH_OPTIONS, host, remote_module, env=environment
+            )
+            factory = mover.ssh_channel_factory(
+                ssh_path,
+                SSH_OPTIONS,
+                host,
+                mover.receiver_argv("python3", remote_module, os.fspath(quarantine)),
+                env=environment,
+            )
+        else:
+            expected, factory = channel_factory
+        try:
+            summary = mover.push(
+                source_root=Path("/"),
+                objects=mover.plan_objects(
+                    Path("/"),
+                    _allowlist_relatives(allowlist),
+                    spill_dir=Path(spill),
+                ),
+                channel_factory=factory,
+                streams=streams,
+                expected_receiver_sha256=expected,
+                heartbeat=lambda beat: print(
+                    f"bulkload-mover stream={beat.stream} phase={beat.phase} "
+                    f"objects={beat.objects_done} skipped={beat.objects_skipped} "
+                    f"bytes={beat.bytes_sent}",
+                    file=sys.stderr,
+                    flush=True,
+                ),
+            )
+        except mover.MoverError as error:
+            raise BulkloadError(f"native quarantine push failed: {error}") from error
+    # One closing line, unconditionally. `logs/preseed-push.log` is 0 bytes for
+    # a 2h32m / 84 GiB rsync push (VERDICTS.md, judge §1); a transport that
+    # says nothing about what it moved is the loudest AX complaint in the
+    # review, and this is the cheapest place to stop repeating it.
+    print(
+        f"bulkload-mover done objects={summary.objects} "
+        f"sent={summary.objects_sent} skipped={summary.objects_skipped} "
+        f"paths={summary.paths} bytes={summary.bytes_sent} "
+        f"deduplicated={summary.bytes_deduplicated} "
+        f"streams={summary.streams} seconds={summary.seconds:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {
+        "objects": summary.objects,
+        "objects_sent": summary.objects_sent,
+        "objects_skipped": summary.objects_skipped,
+        "paths": summary.paths,
+        "bytes_sent": summary.bytes_sent,
+        "bytes_deduplicated": summary.bytes_deduplicated,
+        "streams": summary.streams,
+    }
+
+
 def push_agent_transport(
     prepare_receipt: dict[str, Any],
     allowlist_path: Path,
@@ -452,8 +560,19 @@ def push_agent_transport(
     stage_root: Path,
     destination_ssh_host: str,
     transport_checksum: bool = False,
+    transport_mover: str = "rsync",
+    transport_streams: int = mover.DEFAULT_STREAMS,
     _ssh_binary: str | None = None,
+    _channel_factory: Any | None = None,
 ) -> dict[str, Any]:
+    if transport_mover not in TRANSPORT_MOVERS:
+        raise BulkloadError("transport mover is unsupported")
+    if transport_mover == "rsync" and _channel_factory is not None:
+        raise BulkloadError(
+            "transport channel factory applies only to the native mover"
+        )
+    if transport_checksum and transport_mover != "rsync":
+        raise BulkloadError("transport checksum applies only to the rsync mover")
     validate_stage_receipt(prepare_receipt)
     stage_root = _remote_safe_stage_root(stage_root)
     transport_authority = prepare_receipt["transport"]
@@ -520,33 +639,48 @@ def push_agent_transport(
         # is therefore a second full read of the corpus that proves nothing the
         # destination does not prove independently. --transport-checksum
         # restores it for an operator who wants the transport to fail earlier.
-        result = subprocess.run(
-            [
-                source_binding["path"],
-                "-a",
-                "--from0",
-                "--files-from=-",
-                *(("--checksum",) if transport_checksum else ()),
-                "--delay-updates",
-                "--ignore-missing-args",
-                "--no-devices",
-                "--no-specials",
-                f"--rsync-path={transport_authority['destination_rsync']['path']}",
-                "/",
-                f"{host}:{quarantine}/",
-            ],
-            stdin=snapshot,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            env=_transport_environment(ssh_path),
-        )
-    if result.returncode != 0:
+        if transport_mover == "native":
+            _push_native_transport(
+                allowlist=snapshot,
+                ssh_path=ssh_path,
+                host=host,
+                quarantine=quarantine,
+                stage_root=stage_root,
+                streams=transport_streams,
+                environment=_transport_environment(ssh_path),
+                channel_factory=_channel_factory,
+            )
+            result = None
+        else:
+            result = subprocess.run(
+                [
+                    source_binding["path"],
+                    "-a",
+                    "--from0",
+                    "--files-from=-",
+                    *(("--checksum",) if transport_checksum else ()),
+                    "--delay-updates",
+                    "--ignore-missing-args",
+                    "--no-devices",
+                    "--no-specials",
+                    f"--rsync-path={transport_authority['destination_rsync']['path']}",
+                    "/",
+                    f"{host}:{quarantine}/",
+                ],
+                stdin=snapshot,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=_transport_environment(ssh_path),
+            )
+    if result is not None and result.returncode != 0:
         raise BulkloadError("authenticated rsync quarantine push failed")
     if isinstance(source_snapshot, dict) and phase == "final":
         validate_live_snapshot_generation(source_snapshot)
     transport = dict(transport_authority)
-    transport["mode"] = "ssh-rsync-push"
+    transport["mode"] = (
+        "ssh-native-push" if transport_mover == "native" else "ssh-rsync-push"
+    )
     transport["source_rsync"] = source_binding
     transport["transport_receipt_sha256"] = prepare_receipt["receipt_sha256"]
     receipt = _transport_body(
@@ -604,15 +738,22 @@ def _materialized_transport(
         os.fsencode(item) + b"\0" for item in _plan_source_paths(plan)
     )
     expected_transport = dict(prepare_receipt["transport"])
-    expected_transport["mode"] = "ssh-rsync-push"
     expected_transport["transport_receipt_sha256"] = prepare_receipt["receipt_sha256"]
+    # One receipt shape, two movers. Which one moved the bytes is recorded and
+    # bound, but it is not otherwise load-bearing here: the quarantine is
+    # re-derived from the sealed index either way a few lines below, at
+    # `validate_snapshot_custody(..., mirror=source_mirror)`.
+    accepted_transports = [
+        {**expected_transport, "mode": name}
+        for name in ("ssh-rsync-push", "ssh-native-push")
+    ]
     if (
         transport_receipt["plan_sha256"] != plan["plan_sha256"]
         or transport_receipt["phase"] != phase
         or transport_receipt["stage_root"] != os.fspath(stage_root)
         or transport_receipt["ready_for_apply"]
         or transport_receipt["manifest"]["entries"]
-        or transport_receipt["transport"] != expected_transport
+        or transport_receipt["transport"] not in accepted_transports
         or transport_receipt["transport"]["allowlist_sha256"]
         != sha256_bytes(expected_allowlist)
         or transport_receipt["transport"]["allowlist_size"] != len(expected_allowlist)
@@ -1323,6 +1464,7 @@ def validate_stage_receipt(
     if value["transport"]["mode"] not in {
         "local",
         "destination-prepare",
+        "ssh-native-push",
         "ssh-rsync-push",
         "ssh-rsync-quarantine",
     }:

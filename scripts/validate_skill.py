@@ -16,6 +16,7 @@ RUNTIME_FILES = {
     "scripts/bulkload_lib/cli.py",
     "scripts/bulkload_lib/executor.py",
     "scripts/bulkload_lib/model.py",
+    "scripts/bulkload_lib/mover.py",
     "scripts/bulkload_lib/planner.py",
     "scripts/bulkload_lib/scanner.py",
 }

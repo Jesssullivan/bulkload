@@ -30,6 +30,7 @@ AGENT_JOURNAL_SCHEMA = "dev.tinyland.bulkload.agent-journal.v4"
 RUNTIME_SOURCE_NAMES = (
     "__init__.py",
     "model.py",
+    "mover.py",
     "scanner.py",
     "planner.py",
     "executor.py",

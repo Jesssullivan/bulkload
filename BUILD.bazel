@@ -9,6 +9,7 @@ py_library(
         ".agents/skills/bulkload/scripts/bulkload_lib/cli.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/executor.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/model.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/mover.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/planner.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/scanner.py",
     ],
@@ -59,6 +60,19 @@ py_test(
         "tests/test_bulkload.py",
         "tests/test_wave0_perf.py",
         "tests/test_wave2_memory.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "mover_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_mover.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_mover.py",
     ],
     deps = [":bulkload_lib"],
 )
@@ -151,6 +165,7 @@ test_suite(
         ":bulkload_tests",
         ":ci_contract_test",
         ":installer_test",
+        ":mover_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",
         ":skill_contract_test",
