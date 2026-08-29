@@ -689,6 +689,28 @@ class SchemaAndCaptureTests(unittest.TestCase):
                     destination_verify_receipt=destination_verified,
                 )
             source_history.write_bytes(source_history_before)
+            # The #24 break-glass cannot buy this release. The receipt below
+            # seals `independent_fresh_observation: True` over that fence and
+            # `validate_verify_receipt` requires it, so a skipped observation
+            # here would be laundered into a receipt byte-identical to an
+            # honest one. The refusal fires on the note variable alone, before
+            # the snapshot binding is even looked at, so a stale export in a
+            # profile or a unit file is a hard stop rather than a quiet one.
+            break_glass_note = fixture.root / "cutover-break-glass.jsonl"
+            with mock.patch.dict(
+                os.environ,
+                {"BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE": os.fspath(break_glass_note)},
+            ):
+                with self.assertRaisesRegex(
+                    BulkloadError, "break-glass is refused at this call site"
+                ):
+                    verify_agent_plan(
+                        plan,
+                        final,
+                        applied,
+                        destination_verify_receipt=destination_verified,
+                    )
+            self.assertFalse(break_glass_note.exists())
             released = verify_agent_plan(
                 plan,
                 final,

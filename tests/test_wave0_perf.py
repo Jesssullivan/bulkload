@@ -9,13 +9,16 @@ removing a fence.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import socket
+import stat
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -213,6 +216,473 @@ class SingleEpochFenceTests(unittest.TestCase):
                 BulkloadError, "live generation fence requires at least one pass"
             ):
                 validate_live_snapshot_generation({}, passes=rejected)
+
+
+BREAK_GLASS = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE"
+BREAK_GLASS_EXPECT = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_EXPECT"
+
+
+@contextlib.contextmanager
+def no_root_may_be_read():
+    """Fail loudly if the break-glass path censuses anything at all.
+
+    A pass is a full-content read of every root, which is what #24's interim
+    is buying back. Raising here means "skipped" cannot quietly decay into
+    "computed, then ignored".
+
+    Patching `_tree_generation` alone was not enough to justify the claim:
+    `epoch()` reaches `_declared_root` for the declarations and
+    `sqlite_catalog` for a root's sqlite before it ever calls
+    `_tree_generation`, so a bypass that still walked those would have gone
+    unnoticed. All four entry points are closed here.
+    """
+
+    def forbidden(*arguments, **keywords):
+        raise AssertionError(f"break-glass read a root: {arguments!r}")
+
+    with contextlib.ExitStack() as stack:
+        for name in (
+            "_tree_generation",
+            "sqlite_catalog",
+            "_git_live_generation",
+            "_declared_root",
+        ):
+            stack.enter_context(mock.patch.object(scanner, name, side_effect=forbidden))
+        yield
+
+
+def sealed_expectation(case: unittest.TestCase, snapshot: dict) -> str:
+    """The digest this snapshot's glass must be bound to.
+
+    Taken from the refusal itself, which is the only place an operator can
+    learn it, rather than re-implemented here -- a test that recomputed the
+    fence's own derivation would pass even if the two drifted apart.
+    """
+    with mock.patch.dict(os.environ, {BREAK_GLASS: "/dev/null"}):
+        os.environ.pop(BREAK_GLASS_EXPECT, None)
+        with case.assertRaises(BulkloadError) as caught:
+            validate_live_snapshot_generation(snapshot, passes=1)
+    message = str(caught.exception)
+    case.assertIn(f"{BREAK_GLASS_EXPECT}=", message)
+    digest = message.rsplit(f"{BREAK_GLASS_EXPECT}=", 1)[1].split()[0]
+    case.assertRegex(digest, r"^[0-9a-f]{64}$")
+    return digest
+
+
+class LiveFenceBreakGlassTests(unittest.TestCase):
+    """The disclosed break-glass for Jesssullivan/bulkload#24.
+
+    The variables remove the fence, so the tests that matter are the halves of
+    that bargain: with them set no root is read and one deviation record is
+    written; the record carries an actual observation of the live roots and
+    not only the sealed expectation, which observes nothing; the glass is
+    bound to one snapshot so a stale export cannot open a later one; the
+    cutover release refuses it outright; and without them nothing about the
+    fence changes.
+    """
+
+    def open_glass(self, snapshot: dict, note: Path) -> dict:
+        return {
+            BREAK_GLASS: os.fspath(note),
+            BREAK_GLASS_EXPECT: sealed_expectation(self, snapshot),
+        }
+
+    def test_break_glass_skips_the_census_and_records_the_deviation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+
+            # Diverge the live tree so an un-broken fence would certainly
+            # abort: the skip below is then unambiguous.
+            victim = fixture.source_repo / "untracked.txt"
+            victim.write_bytes(b"mutated after the immutable seal\n")
+
+            note = Path(temporary) / "deviations" / "live-fence.jsonl"
+            note.parent.mkdir()
+            self.assertFalse(note.exists())
+            glass = self.open_glass(snapshot, note)
+
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, glass):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(stderr):
+                        # False is the whole contract for a caller that seals
+                        # over this call: the fence did not run.
+                        self.assertIs(
+                            validate_live_snapshot_generation(snapshot), False
+                        )
+
+            lines = note.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(
+                sorted(record),
+                [
+                    "break_glass",
+                    "expected",
+                    "observation",
+                    "passes_requested",
+                    "reason",
+                    "snapshot_id",
+                    "ts",
+                ],
+            )
+            self.assertEqual(record["break_glass"], "live-fence-skipped")
+            self.assertEqual(record["passes_requested"], 2)
+            self.assertEqual(record["snapshot_id"], snapshot["snapshot_id"])
+            self.assertEqual(record["expected"], glass[BREAK_GLASS_EXPECT])
+            self.assertIn("bulkload#24", record["reason"])
+            # The deviation is disclosed on the console too, not only on disk.
+            self.assertIn("BREAK-GLASS live fence skipped", stderr.getvalue())
+            self.assertIn(os.fspath(note), stderr.getvalue())
+
+            # Every bypassed fence is its own ledger line, including the
+            # dominated `passes=1` site, which records the weaker request.
+            with mock.patch.dict(os.environ, glass):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        validate_live_snapshot_generation(snapshot, passes=1)
+            lines = note.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[1])["passes_requested"], 1)
+            self.assertEqual(json.loads(lines[1])["expected"], record["expected"])
+
+    def test_the_record_observes_the_roots_it_did_not_fence(self) -> None:
+        """`expected` is a function of the snapshot; it observes nothing.
+
+        The record has to say something about the live tree or it cannot
+        support or refute the "the roots are frozen" precondition afterwards.
+        `pruned_leaves` is the #24 signature: a root with none of them cannot
+        be affected by the defect the glass exists for.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            note = Path(temporary) / "observed.jsonl"
+
+            with mock.patch.dict(os.environ, self.open_glass(snapshot, note)):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        validate_live_snapshot_generation(snapshot, passes=1)
+
+            observation = json.loads(note.read_text(encoding="utf-8"))["observation"]
+            self.assertEqual(
+                [row["live"] for row in observation],
+                [root["live"] for root in snapshot["roots"]],
+            )
+            for row in observation:
+                self.assertEqual(
+                    sorted(row),
+                    [
+                        "dev",
+                        "entries",
+                        "exists",
+                        "ino",
+                        "label",
+                        "live",
+                        "mtime_ceiling_ns",
+                        "pruned_leaves",
+                        "unreadable",
+                    ],
+                )
+                self.assertTrue(row["exists"])
+                self.assertEqual(row["unreadable"], 0)
+                self.assertGreater(row["entries"], 0)
+                self.assertIsInstance(row["mtime_ceiling_ns"], int)
+                self.assertEqual(row["ino"], Path(row["live"]).lstat().st_ino)
+
+            # It is an observation, not a re-derivation: a write after the
+            # record moves the ceiling the next record reports.
+            before = max(row["mtime_ceiling_ns"] for row in observation)
+            time.sleep(0.01)
+            fixture.source_repo.joinpath("untracked.txt").write_bytes(b"later\n")
+            with mock.patch.dict(os.environ, self.open_glass(snapshot, note)):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        validate_live_snapshot_generation(snapshot, passes=1)
+            second = json.loads(note.read_text(encoding="utf-8").splitlines()[1])
+            self.assertGreater(
+                max(row["mtime_ceiling_ns"] for row in second["observation"]), before
+            )
+
+    def test_a_stale_export_cannot_open_the_glass_for_another_snapshot(self) -> None:
+        """`_transport_environment` forwards the environment to children and
+
+        an export in a shell profile, a launchd unit or a CI job outlives the
+        run it was meant for. Binding the glass to one sealed expectation
+        turns a stale export into a hard refusal instead of a silent bypass.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            note = Path(temporary) / "stale.jsonl"
+
+            other = copy.deepcopy(snapshot)
+            other["roots"][0]["generation_sha256"] = "0" * 64
+            stale = sealed_expectation(self, other)
+            self.assertNotEqual(stale, sealed_expectation(self, snapshot))
+
+            for value in (None, "", "not-a-digest", "f" * 64, stale):
+                with self.subTest(expect=value):
+                    environment = {BREAK_GLASS: os.fspath(note)}
+                    if value is not None:
+                        environment[BREAK_GLASS_EXPECT] = value
+                    with mock.patch.dict(os.environ, environment):
+                        if value is None:
+                            os.environ.pop(BREAK_GLASS_EXPECT, None)
+                        with no_root_may_be_read():
+                            with self.assertRaisesRegex(
+                                BulkloadError,
+                                "break-glass is not bound to this snapshot",
+                            ):
+                                validate_live_snapshot_generation(snapshot, passes=1)
+            self.assertFalse(note.exists())
+
+    def test_the_cutover_release_refuses_the_glass(self) -> None:
+        """`allow_break_glass=False` is a refusal, not a quieter bypass.
+
+        The cutover release seals `independent_fresh_observation: True` over
+        this call and `validate_verify_receipt` requires it, so a skip there
+        would be laundered into a receipt byte-identical to an honest one.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            note = Path(temporary) / "refused.jsonl"
+
+            with mock.patch.dict(os.environ, self.open_glass(snapshot, note)):
+                with no_root_may_be_read():
+                    with self.assertRaisesRegex(
+                        BulkloadError, "break-glass is refused at this call site"
+                    ):
+                        validate_live_snapshot_generation(
+                            snapshot, allow_break_glass=False
+                        )
+            # Refused, and it left no record claiming otherwise.
+            self.assertFalse(note.exists())
+
+    def test_the_witness_reports_unobserved_rather_than_no_divergence(self) -> None:
+        """`_witness_epoch` is the seventh call site and it fails open.
+
+        With the glass open the fence never looks, so a witness that printed
+        `divergence=none` would report the absence of a divergence it never
+        tested for -- and the Wave 3 cost/trade measurement the witness exists
+        to produce would be silently corrupted.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            fixture.source_repo.joinpath("untracked.txt").write_bytes(
+                b"mutated after the immutable seal\n"
+            )
+            note = Path(temporary) / "witness.jsonl"
+
+            # Without the glass the witness sees the real divergence.
+            honest = io.StringIO()
+            with mock.patch.dict(os.environ, {"BULKLOAD_WITNESS_EPOCH": "1"}):
+                os.environ.pop(BREAK_GLASS, None)
+                with contextlib.redirect_stderr(honest):
+                    scanner._witness_epoch(snapshot)
+            self.assertIn(
+                "bulkload-witness divergence=BulkloadError", honest.getvalue()
+            )
+
+            environment = {"BULKLOAD_WITNESS_EPOCH": "1"}
+            environment.update(self.open_glass(snapshot, note))
+            skipped = io.StringIO()
+            with mock.patch.dict(os.environ, environment):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(skipped):
+                        scanner._witness_epoch(snapshot)
+            self.assertIn("bulkload-witness divergence=unobserved", skipped.getvalue())
+            self.assertNotIn("divergence=none", skipped.getvalue())
+
+    def test_a_record_that_cannot_be_written_fails_closed(self) -> None:
+        """The one non-BulkloadError exit this function had, mid-transport.
+
+        A break-glass whose deviation cannot be recorded is an undisclosed
+        bypass, so it is a refusal rather than a bare `OSError` escaping into
+        a transport path that converts nothing.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            unwritable = Path(temporary) / "absent-directory" / "note.jsonl"
+            a_directory = Path(temporary) / "note-is-a-directory"
+            a_directory.mkdir()
+
+            for note in (unwritable, a_directory):
+                with self.subTest(note=note.name):
+                    with mock.patch.dict(os.environ, self.open_glass(snapshot, note)):
+                        with no_root_may_be_read():
+                            with self.assertRaisesRegex(
+                                BulkloadError,
+                                "break-glass cannot write its deviation record",
+                            ):
+                                validate_live_snapshot_generation(snapshot, passes=1)
+
+    def test_without_the_variable_the_fence_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=True)
+            capture = live_capture(fixture, "source-a")
+            snapshot = capture["catalog"]["snapshot"]
+            note = Path(temporary) / "unwritten.jsonl"
+
+            with mock.patch.dict(os.environ):
+                os.environ.pop(BREAK_GLASS, None)
+                # True is the other half of the contract: the fence ran.
+                self.assertIs(validate_live_snapshot_generation(snapshot), True)
+                fixture.source_repo.joinpath("untracked.txt").write_bytes(
+                    b"mutated after the immutable seal\n"
+                )
+                with self.assertRaisesRegex(
+                    BulkloadError, "live source changed after immutable snapshot B"
+                ):
+                    validate_live_snapshot_generation(snapshot)
+            self.assertFalse(note.exists())
+
+    def test_break_glass_cannot_defeat_the_pass_count_guard(self) -> None:
+        # The break-glass is read after the guard, so it widens no other
+        # hole: a caller still cannot ask the fence for zero passes.
+        with tempfile.TemporaryDirectory() as temporary:
+            note = Path(temporary) / "guard.jsonl"
+            with mock.patch.dict(
+                os.environ,
+                {BREAK_GLASS: os.fspath(note), BREAK_GLASS_EXPECT: "0" * 64},
+            ):
+                for rejected in (0, -1, True, 1.5, "2", None):
+                    with self.assertRaisesRegex(
+                        BulkloadError,
+                        "live generation fence requires at least one pass",
+                    ):
+                        validate_live_snapshot_generation({}, passes=rejected)
+            self.assertFalse(note.exists())
+
+
+class PrunedLeafGenerationTests(unittest.TestCase):
+    """Jesssullivan/bulkload#24: the seal and the fence census two trees.
+
+    `capture_agent_state` seals `roots[].generation_sha256` over the immutable
+    snapshot copy, which omits the pruned managed leaves, while
+    `validate_live_snapshot_generation` re-derives it over `roots[].live`.
+    `_tree_census(portable=True)` puts a directory's `st_size` into its
+    authority, so a directory holding a pruned leaf is a different census entry
+    in the two trees and the final fence can never pass for that root. Because
+    the fence only runs for the final phase, no preseed lap ever exercised it.
+
+    This is the smallest tree with that shape. It is `expectedFailure` until
+    #24 lands one of its candidate fixes -- census the live tree under the same
+    pruning at seal time, drop directory `st_size` from portable authority in
+    favour of hashing the pruned leaf names, or census the copy in the fence
+    and keep a separate named live-drift check. When any of those lands this
+    test passes, unittest reports an unexpected success, and the run fails
+    until the marker below is removed.
+
+    That retirement guarantee used to be APFS-only. On APFS a directory's
+    `st_size` is its entry count; on ext4 and xfs it is block-granular (4096
+    until the directory crosses a block), so a small tree showed no
+    difference and the test called `skipTest`. A skip inside
+    `@unittest.expectedFailure` is reported as a *skip* and leaves
+    `wasSuccessful()` True (verified on CPython 3.12.14), so on a Linux runner
+    the marker could outlive the bug. `directory_size_tracks_entry_count`
+    replaces the skip: it asserts the mechanism -- the authority tuple the
+    census folds for the one directory the two trees share -- against a
+    directory `st_size` that tracks entry count on every kernel. What is under
+    test is the census, not the filesystem.
+    """
+
+    provider = "claude"
+    exclusions = ("state/excluded.json",)
+
+    def build(self, root: Path, *, pruned: bool) -> Path:
+        """Write the tree, with the managed leaf present only when live.
+
+        The leaf is never created in the copy rather than created and removed,
+        because a directory's `st_size` does not always shrink back.
+        """
+        root.joinpath("state").mkdir(parents=True)
+        root.joinpath("keep.txt").write_bytes(b"kept payload\n")
+        root.joinpath("state", "keep.txt").write_bytes(b"kept nested payload\n")
+        if pruned:
+            root.joinpath("state", "excluded.json").write_bytes(b'{"managed": true}\n')
+        return root
+
+    @staticmethod
+    @contextlib.contextmanager
+    def directory_size_tracks_entry_count():
+        """Give every kernel the APFS property #24 needs to be visible."""
+        real = scanner._stable_stat
+
+        def stable_stat(path):
+            observed = real(path)
+            if observed[2] != stat.S_IFDIR:
+                return observed
+            return observed[:5] + (len(os.listdir(path)),) + observed[6:]
+
+        with mock.patch.object(scanner, "_stable_stat", stable_stat):
+            yield
+
+    @staticmethod
+    def authority(path: Path) -> list[int]:
+        """Exactly what `_tree_census(portable=True)` folds for `path`.
+
+        `scanner.py:2095-2098`: `[IFMT, IMODE]`, plus `st_size` for anything
+        that is not a live sqlite primary -- directories included.
+        """
+        observed = scanner._stable_stat(path)
+        return [observed[2], observed[3], observed[5]]
+
+    @unittest.expectedFailure
+    def test_sealed_copy_generation_equals_the_live_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            live = self.build(Path(temporary) / "live", pruned=True)
+            sealed_tree = self.build(Path(temporary) / "roots" / "claude", pruned=False)
+
+            with self.directory_size_tracks_entry_count():
+                # The mechanism, asserted directly: the pruned leaf is absent
+                # from both censuses by name, but the directory that held it
+                # hands the two censuses different authority.
+                self.assertEqual(
+                    self.authority(live / "state"),
+                    self.authority(sealed_tree / "state"),
+                )
+                sealed = scanner._tree_generation(
+                    sealed_tree, provider=self.provider, exclusions=self.exclusions
+                )
+                observed = scanner._tree_generation(
+                    live, provider=self.provider, exclusions=self.exclusions
+                )
+                self.assertEqual(sealed, observed)
+
+    def test_the_reproducer_is_not_vacuous(self) -> None:
+        """Without the pruned leaf the two trees agree, on every kernel.
+
+        This is the control for the `expectedFailure` above: it proves the
+        divergence there comes from the pruned leaf and not from the two trees
+        merely being two directories.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            live = self.build(Path(temporary) / "live", pruned=False)
+            sealed_tree = self.build(Path(temporary) / "roots" / "claude", pruned=False)
+            with self.directory_size_tracks_entry_count():
+                self.assertEqual(
+                    self.authority(live / "state"),
+                    self.authority(sealed_tree / "state"),
+                )
+                self.assertEqual(
+                    scanner._tree_generation(
+                        sealed_tree, provider=self.provider, exclusions=self.exclusions
+                    ),
+                    scanner._tree_generation(
+                        live, provider=self.provider, exclusions=self.exclusions
+                    ),
+                )
 
 
 class IdenticalLineShortCircuitTests(unittest.TestCase):
@@ -990,63 +1460,75 @@ class BaseCustodyTests(unittest.TestCase):
         )
 
 
+def prepared_final_push(fixture: CutoverFixture) -> dict:
+    """Everything up to the final push, which two tests below both need.
+
+    The fence only exists on a live (non-quiesced) capture, so this needs the
+    chained live plan, not `CutoverFixture.plan()`.
+    """
+    source_a = live_capture(fixture, "source-a")
+    source_b = live_capture(fixture, "source-b", base=source_a)
+    destination_a = live_capture(fixture, "dest-a", role="destination")
+    destination_b = live_capture(
+        fixture, "dest-b", role="destination", base=destination_a
+    )
+    plan = compile_agent_plan(source_a, source_b, destination_a, destination_b)
+    fake_ssh = fixture.root / "fake-ssh"
+    fake_ssh.write_text(FAKE_SSH, encoding="utf-8")
+    fake_ssh.chmod(0o700)
+    stage = fixture.root / "transport-stage"
+    common = {"accepted_plan_sha256": plan["plan_sha256"], "stage_root": stage}
+    preseed_prepare = stage_agent_plan(
+        plan,
+        phase="preseed",
+        allow_accounted_copy=True,
+        reserve_bytes=0,
+        transport_mode="prepare",
+        **common,
+    )
+    preseed_transport = push_agent_transport(
+        preseed_prepare,
+        stage / ".transport-allowlist-preseed.nul",
+        phase="preseed",
+        destination_ssh_host=socket.gethostname(),
+        _ssh_binary=str(fake_ssh),
+        **common,
+    )
+    stage_agent_plan(
+        plan,
+        phase="preseed",
+        allow_accounted_copy=True,
+        reserve_bytes=0,
+        transport_mode="materialize",
+        prepare_receipt=preseed_prepare,
+        transport_receipt=preseed_transport,
+        **common,
+    )
+    prepare = stage_agent_plan(
+        plan,
+        phase="final",
+        allow_accounted_copy=True,
+        reserve_bytes=0,
+        transport_mode="prepare",
+        **common,
+    )
+    return {
+        "allowlist": stage / ".transport-allowlist-final.nul",
+        "common": common,
+        "fake_ssh": fake_ssh,
+        "plan": plan,
+        "prepare": prepare,
+        "snapshot": plan["source"]["catalog"]["snapshot"],
+    }
+
+
 class DominatedFenceWiringTests(unittest.TestCase):
     """W0-1: exactly one call site is allowed to drop a pass."""
 
     def test_push_fences_once_before_the_push_and_at_full_strength_after(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = CutoverFixture(Path(temporary), sqlite_union=False)
-            # The fence only exists on a live (non-quiesced) capture, so this
-            # needs the chained live plan, not CutoverFixture.plan().
-            source_a = live_capture(fixture, "source-a")
-            source_b = live_capture(fixture, "source-b", base=source_a)
-            destination_a = live_capture(fixture, "dest-a", role="destination")
-            destination_b = live_capture(
-                fixture, "dest-b", role="destination", base=destination_a
-            )
-            plan = compile_agent_plan(source_a, source_b, destination_a, destination_b)
-            fake_ssh = fixture.root / "fake-ssh"
-            fake_ssh.write_text(FAKE_SSH, encoding="utf-8")
-            fake_ssh.chmod(0o700)
-            stage = fixture.root / "transport-stage"
-            common = {
-                "accepted_plan_sha256": plan["plan_sha256"],
-                "stage_root": stage,
-            }
-            preseed_prepare = stage_agent_plan(
-                plan,
-                phase="preseed",
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="prepare",
-                **common,
-            )
-            preseed_transport = push_agent_transport(
-                preseed_prepare,
-                stage / ".transport-allowlist-preseed.nul",
-                phase="preseed",
-                destination_ssh_host=socket.gethostname(),
-                _ssh_binary=str(fake_ssh),
-                **common,
-            )
-            stage_agent_plan(
-                plan,
-                phase="preseed",
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="materialize",
-                prepare_receipt=preseed_prepare,
-                transport_receipt=preseed_transport,
-                **common,
-            )
-            prepare = stage_agent_plan(
-                plan,
-                phase="final",
-                allow_accounted_copy=True,
-                reserve_bytes=0,
-                transport_mode="prepare",
-                **common,
-            )
+            prepared = prepared_final_push(fixture)
 
             real = executor.validate_live_snapshot_generation
             recorded: list[int] = []
@@ -1059,16 +1541,55 @@ class DominatedFenceWiringTests(unittest.TestCase):
                 executor, "validate_live_snapshot_generation", side_effect=recording
             ):
                 push_agent_transport(
-                    prepare,
-                    stage / ".transport-allowlist-final.nul",
+                    prepared["prepare"],
+                    prepared["allowlist"],
                     phase="final",
                     destination_ssh_host=socket.gethostname(),
-                    _ssh_binary=str(fake_ssh),
-                    **common,
+                    _ssh_binary=str(prepared["fake_ssh"]),
+                    **prepared["common"],
                 )
             # Pre-push is dominated and may run one pass; post-push is the
             # last fence before the receipt exists and keeps both.
             self.assertEqual(recorded, [1, 2])
+
+    def test_break_glass_bypasses_both_push_fences_and_records_each(self) -> None:
+        """The break-glass at a real executor call site, not at the unit.
+
+        `push_agent_transport` is the only path that runs the fence twice for
+        one snapshot. Both bypasses have to appear in the ledger with their
+        own `passes_requested`, including the dominated `passes=1` site at
+        `executor.py:491`, or the record understates what was skipped.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = CutoverFixture(Path(temporary), sqlite_union=False)
+            prepared = prepared_final_push(fixture)
+            note = fixture.root / "push-deviations.jsonl"
+            expected = sealed_expectation(self, prepared["snapshot"])
+
+            environment = {
+                BREAK_GLASS: os.fspath(note),
+                BREAK_GLASS_EXPECT: expected,
+            }
+            with mock.patch.dict(os.environ, environment):
+                with no_root_may_be_read():
+                    with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                        push_agent_transport(
+                            prepared["prepare"],
+                            prepared["allowlist"],
+                            phase="final",
+                            destination_ssh_host=socket.gethostname(),
+                            _ssh_binary=str(prepared["fake_ssh"]),
+                            **prepared["common"],
+                        )
+            records = [
+                json.loads(line)
+                for line in note.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["passes_requested"] for record in records], [1, 2])
+            self.assertEqual({record["expected"] for record in records}, {expected})
+            self.assertEqual(
+                stderr.getvalue().count("BREAK-GLASS live fence skipped"), 2
+            )
 
 
 if __name__ == "__main__":

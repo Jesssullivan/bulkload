@@ -691,20 +691,24 @@ class ReductivePurgeTests(unittest.TestCase):
         # through `_is_pruned` and through their own definitions.
         self.assertEqual(source.count("_is_excluded("), 2)
         self.assertEqual(source.count("_is_regenerate_namespace("), 2)
-        self.assertEqual(source.count("_is_pruned("), 9)
+        # 9 until `_break_glass_root_observation` added two guarded sites: the
+        # #24 deviation record counts the leaves the prune removes, which is
+        # the signature that says whether the glass was opened for #24 at all.
+        self.assertEqual(source.count("_is_pruned("), 11)
 
     def test_the_two_capture_provider_sites_keep_their_unguarded_form(self) -> None:
         """The asymmetry the collapse must not erase.
 
-        Six sites guard the prune with `provider is not None`; the two inside
-        `_capture_provider` do not. Folding the guard into `_is_pruned` would
-        change `_capture_provider` for a None provider, so the call sites keep
-        the difference.
+        Eight sites guard the prune with `provider is not None` -- six in the
+        census, the copy and the charge, and two in the #24 break-glass
+        observation; the two inside `_capture_provider` do not. Folding the
+        guard into `_is_pruned` would change `_capture_provider` for a None
+        provider, so the call sites keep the difference.
         """
         # Whitespace-normalised so a reformat cannot silently pass this.
         source = "".join((self.LIB / "scanner.py").read_text().split())
         self.assertEqual(
-            source.count("ifproviderisnotNoneand_is_pruned(provider,relative,"), 6
+            source.count("ifproviderisnotNoneand_is_pruned(provider,relative,"), 8
         )
         self.assertEqual(source.count("if_is_pruned(provider,relative,"), 2)
 
