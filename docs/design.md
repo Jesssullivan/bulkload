@@ -226,3 +226,23 @@ deployment, activation, browser profile migration, or credential rotation. It
 does not mirror undeclared home state and never deletes source data. It does
 not silently resolve structural ambiguity, unsafe typed state, capacity
 shortfall, failed reflinks, or post-plan destination movement.
+
+## Exit codes and rehearsal
+
+Refusals are typed at the process boundary as well as in the receipt. `0` is
+completion; `1` a usage error; `2` a launcher bootstrap failure; `3` a
+quiescence/epoch refusal, meaning the live source moved and the verb is worth
+retrying; `4` the general custody, plan, or typed-invariant refusal; `5` a
+destination refusal from the capacity gate or a required reflink; `6` an
+unexpected internal error, including input evidence that is not the document it
+claims to be; `130` an operator interrupt. `3` and `5` are narrowings of `4`,
+raised only where the engine proved the specific cause, so a caller may branch
+on the number without parsing a message. The table is defined once, in
+`model.py`, and rendered into `--help`, README, and SKILL.md.
+
+`--dry-run` on capture, plan, stage, and apply reports the exact mutations a
+verb would perform and the refusals reachable without reading the corpus, from
+the same functions the real verb calls, and writes nothing -- including no
+evidence document. It names the gates it did not reach rather than implying it
+checked them. `--progress` reports phase and heartbeat lines on stderr only,
+and never signals a process.

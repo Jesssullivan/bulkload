@@ -40,6 +40,38 @@ and Pi auth are typed source-authority operations. Claude
 auth is nonportable: preserve it as a hold and authenticate on the destination
 attended. Offline receipts do not prove provider acceptance.
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | the verb completed and its evidence was written |
+| `1` | usage error on the command line (`--help`/`--version` still exit `0`) |
+| `2` | the pinned launcher could not build its source closure |
+| `3` | quiescence/epoch refusal: the live source moved under the capture. Retryable; no live path was mutated |
+| `4` | custody, plan, or typed-invariant refusal -- the general fail-closed class |
+| `5` | destination refusal: the capacity gate failed or a required reflink failed |
+| `6` | unexpected internal error, including malformed input evidence (`BULKLOAD_TRACEBACK=1` for the traceback) |
+| `130` | the operator interrupted the process. Bulkload never signals one |
+
+Branch on the code, not on the message. `3` and `5` are narrowings of `4`,
+raised only where the engine proved the specific cause; every other refusal is
+`4`.
+
+## Rehearse before a long verb
+
+`--dry-run` on `agent-capture`, `agent-plan`, `agent-stage`, and `agent-apply`
+prints a JSON report of the exact mutations that verb would perform, the
+refusals it already reaches -- the overlap fence, the argument shape, the
+accepted plan digest, the stage receipt -- and, in `not_evaluated`, the gates
+it did not reach. It writes nothing: not the stage, not the journal, not the
+`--output` document. Its `exit_code` field is the process status, so use it as
+a gate before a multi-hour run.
+
+`--progress` (default on for an interactive stderr, `--no-progress` to
+suppress) emits phase and heartbeat lines on stderr only. Evidence on stdout
+stays byte-exact, and a silent hour stops being indistinguishable from a hang.
+Progress reports; it never signals a session.
+
 ## Capture twice per role
 
 Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both

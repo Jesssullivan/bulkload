@@ -64,6 +64,24 @@ py_test(
 )
 
 py_test(
+    name = "exit_contract_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_exit_contract.py",
+    size = "medium",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_exit_contract.py",
+    ],
+    data = [
+        "README.md",
+        ".agents/skills/bulkload/SKILL.md",
+        ":skill_bundle",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "bazel_binary_smoke_test",
     legacy_create_init = 0,
     main = "tests/test_bazel_binary_smoke.py",
@@ -150,6 +168,7 @@ test_suite(
         ":bazel_binary_smoke_test",
         ":bulkload_tests",
         ":ci_contract_test",
+        ":exit_contract_tests",
         ":installer_test",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",

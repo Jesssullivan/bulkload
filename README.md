@@ -53,6 +53,52 @@ when schema, shared rows, or canonical primary keys conflict.
 See [the design](docs/design.md), [migration contract](.agents/skills/bulkload/references/migration-contract.md),
 and [agent-state guide](.agents/skills/bulkload/references/agent-context.md).
 
+## Exit codes
+
+Every Bulkload process returns one of these. They are claim-bearing: an
+orchestrator can branch on them without parsing a message.
+
+| Code | Meaning | What it tells the caller |
+|---|---|---|
+| `0` | the verb completed and its evidence was written | continue the sequence |
+| `1` | usage error on the command line | fix the invocation; `--help` and `--version` still exit `0` |
+| `2` | the pinned launcher could not build its source closure | the install is broken or a runtime source moved under it; reinstall the skill |
+| `3` | quiescence/epoch refusal: the live source moved under the capture | retryable. No live path was mutated. Re-capture; this is the expected code on a busy host |
+| `4` | custody, plan, or typed-invariant refusal | the general fail-closed class. Read the message; a blind retry will refuse identically |
+| `5` | destination refusal: the capacity gate failed or a required reflink failed | free space, or the destination is not on reflink-capable storage. There is no full-copy fallback |
+| `6` | unexpected internal error, including malformed input evidence | the input is not the document it claims to be. Set `BULKLOAD_TRACEBACK=1` for the traceback |
+| `130` | the operator interrupted the process | Bulkload never signals a process; only the operator does. Use the durable journal and `agent-recover` |
+
+`3` and `5` are narrowings of `4`, raised where the engine can prove the more
+specific cause: `3` at the live-divergence fences (a root, entry, seat, or Git
+authority that changed during capture; an A/B pair that is not stable), `5` at
+the capacity gate and at a required reflink. Any refusal that is not proven to
+be one of those exits `4`.
+
+## Dry run and progress
+
+`--dry-run` is available on `agent-capture`, `agent-plan`, `agent-stage`, and
+`agent-apply`. It prints a JSON report on stdout naming the exact mutations the
+verb would perform, the refusals it can already reach, and -- in
+`not_evaluated` -- the gates it did not reach. It writes nothing at all: not
+the stage, not the journal, not the `--output` evidence document. Its
+`exit_code` field is the status the process returns, so a dry run is usable as
+a gate:
+
+```bash
+bulkload agent-apply --dry-run \
+  --plan /home/jess/.bulkload-evidence/final-plan.json \
+  --stage-receipt /home/jess/.bulkload-evidence/final-stage.json \
+  --accept-plan-sha256 PLAN_SHA256 \
+  --journal /home/jess/.bulkload-evidence/apply-journal.json \
+  --rollback-root /srv/fast-local/jess/bulkload/rollback \
+  --output /home/jess/.bulkload-evidence/apply-receipt.json
+```
+
+`--progress` (default on when stderr is a terminal, `--no-progress` to
+suppress) writes phase and heartbeat lines to stderr, never to stdout, so
+evidence on `-` stays byte-exact. It reports; it never signals a process.
+
 ## Development
 
 The repository uses Bazel as the build/test source of truth and the

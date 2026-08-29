@@ -37,8 +37,50 @@ RUNTIME_SOURCE_NAMES = (
 )
 
 
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_BOOTSTRAP = 2
+EXIT_EPOCH = 3
+EXIT_REFUSED = 4
+EXIT_DESTINATION = 5
+EXIT_INTERNAL = 6
+EXIT_INTERRUPTED = 130
+
+
 class BulkloadError(RuntimeError):
-    """A fail-closed protocol, custody, or safety error."""
+    """A fail-closed protocol, custody, or safety error.
+
+    `exit_code` is the documented process status this refusal class exits
+    with. The base class is the general custody/plan refusal (4); the two
+    subclasses below narrow it where the engine can prove a more specific
+    cause. Every refusal remains a `BulkloadError`, so existing handlers and
+    tests that catch the base class are unaffected.
+    """
+
+    exit_code = EXIT_REFUSED
+
+
+class EpochRefusal(BulkloadError):
+    """The live source moved under an in-flight capture or A/B pair.
+
+    Raised only where the engine observed live divergence: an entry, root,
+    seat, or Git authority that changed during capture, a snapshot that did
+    not converge, or an A/B pair that is not stable. This is the retryable
+    class -- the inputs were not wrong, the host moved.
+    """
+
+    exit_code = EXIT_EPOCH
+
+
+class DestinationRefusal(BulkloadError):
+    """The destination cannot hold or clone what the plan charges.
+
+    Raised by the capacity gate and by a required reflink that failed. A
+    full-copy fallback is forbidden, so this is a hard stop and not a
+    degraded-mode warning.
+    """
+
+    exit_code = EXIT_DESTINATION
 
 
 def utc_now() -> str:
@@ -387,7 +429,7 @@ def require_capacity(
     observed = capacity_observation(path)
     required = charged_bytes + reserve_bytes
     if observed["available_bytes"] < required:
-        raise BulkloadError(
+        raise DestinationRefusal(
             "capacity gate failed: exact charged bytes plus reserve exceed available bytes"
         )
     return {
@@ -485,7 +527,7 @@ def reflink_clone(
         temporary.unlink(missing_ok=True)
         if isinstance(error, BulkloadError):
             raise
-        raise BulkloadError(
+        raise DestinationRefusal(
             f"required reflink clone failed for {destination}; full-copy fallback is forbidden"
         ) from error
 
