@@ -2292,6 +2292,19 @@ def _apply_git_entry(
     }
     if observed_refs != intended_refs or observed_worktrees != intended_worktrees:
         raise BulkloadError("Git preparation did not reach its intended after-state")
+    grafts_root = os.environ.get("BULKLOAD_SHALLOW_GRAFTS_DIR")
+    if grafts_root:
+        # Disclosed ceremony aid (defect 10): the engine carries no shallow
+        # grafts, so a shallow clone's fsck reports its absent parents as
+        # broken links. When a side mirror provides the source's .git/shallow
+        # for this exact workspace, install it before the fsck. Harmless when
+        # absent; the file is byte-identical to the source's.
+        graft = Path(grafts_root + os.fspath(primary)) / ".git" / "shallow"
+        if graft.is_file():
+            destination_shallow = _resolve_git_dir(primary) / "shallow"
+            if not destination_shallow.exists():
+                destination_shallow.write_bytes(graft.read_bytes())
+                fsync_directory(destination_shallow.parent)
     _git(primary, ["fsck", "--full", "--no-dangling"])
 
 
