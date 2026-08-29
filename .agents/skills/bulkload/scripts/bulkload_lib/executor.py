@@ -2429,6 +2429,23 @@ def _collect_mutations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(result.values(), key=order)
 
 
+def _journal_write_every() -> int:
+    """Journal durability cadence for the two long apply loops.
+
+    The journal is sealed (canonical JSON + sha256) and rewritten whole on
+    every write. At 1.7M mutations the journal is ~1.3 GB, so a per-mutation
+    write is O(n^2) and the verb cannot terminate. BULKLOAD_JOURNAL_WRITE_EVERY
+    = N batches the durable boundary to every N items (plus the loop end);
+    a crash then replays at most N idempotent items. Default 1 = unchanged.
+    """
+    raw = os.environ.get("BULKLOAD_JOURNAL_WRITE_EVERY", "1")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return value if value >= 1 else 1
+
+
 def _snapshot_all(
     journal: dict[str, Any],
     *,
@@ -2439,13 +2456,15 @@ def _snapshot_all(
     snapshots = journal["rollback_snapshots"]
     if len(snapshots) > len(mutations):
         raise BulkloadError("rollback snapshot progress exceeds mutation inventory")
+    every = _journal_write_every()
     for mutation in mutations[len(snapshots) :]:
         snapshot, _ = _snapshot_target(Path(mutation["target"]), rollback_root)
         snapshot["action"] = mutation["action"]
         snapshots.append(snapshot)
         journal["snapshot_progress"] = len(snapshots)
         journal["updated_at"] = utc_now()
-        _write_apply_journal(journal_path, journal)
+        if len(snapshots) % every == 0 or len(snapshots) == len(mutations):
+            _write_apply_journal(journal_path, journal)
         raw = os.environ.get("BULKLOAD_TEST_CRASH_AFTER_SNAPSHOT")
         if raw is not None and raw.isdecimal() and len(snapshots) >= int(raw):
             raise BulkloadError("injected crash after durable rollback snapshot")
@@ -2547,6 +2566,7 @@ def _apply_mutations(
                 journal["snapshot_progress"] = len(journal["rollback_snapshots"])
         _write_apply_journal(journal_path, journal)
     mutations = journal["mutations"]
+    every = _journal_write_every()
     for index in range(journal.get("progress", 0), len(mutations)):
         mutation = mutations[index]
         target = Path(mutation["target"])
@@ -2580,7 +2600,8 @@ def _apply_mutations(
         mutation["after"] = after
         journal["progress"] = index + 1
         journal["updated_at"] = utc_now()
-        _write_apply_journal(journal_path, journal)
+        if (index + 1) % every == 0 or index + 1 == len(mutations):
+            _write_apply_journal(journal_path, journal)
         _crash_fence(journal)
     journal["state"] = "mutations-applied"
     journal["updated_at"] = utc_now()
