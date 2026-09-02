@@ -9,6 +9,7 @@ py_library(
         ".agents/skills/bulkload/scripts/bulkload_lib/cli.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/executor.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/model.py",
+        ".agents/skills/bulkload/scripts/bulkload_lib/mover.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/planner.py",
         ".agents/skills/bulkload/scripts/bulkload_lib/scanner.py",
     ],
@@ -59,6 +60,19 @@ py_test(
         "tests/test_bulkload.py",
         "tests/test_wave0_perf.py",
         "tests/test_wave2_memory.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
+    name = "mover_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_mover.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_mover.py",
     ],
     deps = [":bulkload_lib"],
 )
@@ -125,6 +139,10 @@ py_test(
     size = "small",
     srcs = ["tests/test_runtime_bootstrap.py"],
     data = [":skill_bundle"],
+    # `test_runtime_closure_lists_agree` imports `RUNTIME_SOURCE_NAMES` to
+    # compare it against the launcher's own `RUNTIME_FILES`, so this target
+    # needs the library on its import path and not only in its runfiles.
+    deps = [":bulkload_lib"],
 )
 
 py_test(
@@ -199,6 +217,7 @@ test_suite(
         ":custody_source_fold_tests",
         ":exit_contract_tests",
         ":installer_test",
+        ":mover_tests",
         ":refusal_record_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",

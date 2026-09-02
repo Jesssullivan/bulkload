@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 from . import __version__
 from .executor import (
     DEFAULT_CAPACITY_RESERVE_BYTES,
+    TRANSPORT_MOVERS,
     apply_agent_plan,
     push_agent_transport,
     recover_agent_apply,
@@ -48,6 +49,7 @@ from .model import (
     read_json,
     refusal_record,
 )
+from .mover import DEFAULT_STREAMS
 from .planner import compile_agent_plan_authorities, validate_agent_plan
 from .scanner import (
     DEFAULT_HEARTBEAT_SECONDS,
@@ -677,6 +679,8 @@ def _stage_argument_refusal(arguments: argparse.Namespace) -> None:
         return
     if arguments.transport_checksum:
         raise BulkloadError("transport checksum applies only to the push transport")
+    if arguments.mover != "rsync":
+        raise BulkloadError("transport mover applies only to the push transport")
     if arguments.plan is None or arguments.transport_allowlist is not None:
         raise BulkloadError(
             "plan staging requires a plan and forbids a transport allowlist"
@@ -694,6 +698,8 @@ def _agent_stage(arguments: argparse.Namespace) -> dict[str, Any]:
             stage_root=Path(arguments.stage_root),
             destination_ssh_host=arguments.destination_ssh_host,
             transport_checksum=arguments.transport_checksum,
+            transport_mover=arguments.mover,
+            transport_streams=arguments.transport_streams,
         )
     return stage_agent_plan(
         _load(arguments.plan),
@@ -1461,6 +1467,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="the sealed NUL allowlist written by prepare; push only",
     )
     stage.add_argument("--transport-receipt", help="the push receipt; materialize only")
+    stage.add_argument(
+        "--mover",
+        choices=TRANSPORT_MOVERS,
+        default="rsync",
+        help=(
+            "Payload mover for --transport-mode push. 'rsync' is the shipped "
+            "single-stream path. 'native' is the content-addressed parallel "
+            "mover: one transfer per sha256 rather than per path, resumable "
+            "by re-offering every object, and unproven against a live "
+            "destination. See docs/design/native-mover.md."
+        ),
+    )
+    stage.add_argument(
+        "--transport-streams",
+        type=int,
+        default=DEFAULT_STREAMS,
+        help=(
+            "Parallel streams for --mover native (default: %(default)s). "
+            "Ignored by the rsync mover, which has exactly one."
+        ),
+    )
     stage.add_argument(
         "--transport-checksum",
         action="store_true",

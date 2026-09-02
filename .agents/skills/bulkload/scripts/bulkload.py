@@ -17,6 +17,7 @@ from typing import Any
 RUNTIME_FILES = (
     "__init__.py",
     "model.py",
+    "mover.py",
     "scanner.py",
     "planner.py",
     "executor.py",
