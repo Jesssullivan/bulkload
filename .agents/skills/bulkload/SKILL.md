@@ -40,6 +40,55 @@ and Pi auth are typed source-authority operations. Claude
 auth is nonportable: preserve it as a hold and authenticate on the destination
 attended. Offline receipts do not prove provider acceptance.
 
+## Watch it run
+
+Every verb narrates itself on stderr. There is nothing to turn on.
+
+- `bulkload-run event=start verb=... version=... pid=... host=...` opens each
+  invocation and `bulkload-run event=end verb=... seconds=... status=... exit=...`
+  closes it, so no invocation can leave a zero-byte log behind.
+- `bulkload-progress phase=... root=... seconds=... unit=... done=... total=...
+  bytes=... rate=... eta=...` is a heartbeat emitted *during* a long phase,
+  every 30 s by default. `rate` is `unit` per second and `eta` is seconds
+  remaining; both read `-` until the phase can measure them. The payload push
+  is opaque from the source side, so its heartbeat carries elapsed time against
+  the sealed charge rather than an invented byte position.
+- `bulkload-phase phase=... root=... seconds=... files=... bytes=...` closes
+  each phase. `files` is an entry count and `bytes` is a byte total; the named
+  phases are `base-custody` (which encloses `custody-base`), `custody*`,
+  `census`, `charge`, `generation-pre`, `copy`, `recensus`,
+  `generation-post`, `digest`, `catalog`, `seal`, `witness`, `validate`,
+  `stage`, `stage-objects`, `push`, `apply`, `verify`. Phases nest, so two
+  lines can cover the same seconds.
+- `bulkload-phase phase=UNACCOUNTED seconds=...` closes a run whose timed
+  phases covered under 90% of its wall clock, and names the remainder. It is
+  the instrument admitting where it is blind; treat it as a profiling lead,
+  not a fault.
+
+In every line `-` means "not measured". A field that was measured prints its
+value, `0` included: `bytes=0` is a measured zero and `bytes=-` is no
+measurement at all.
+
+Flags, on every verb:
+
+- `--progress-log PATH` appends the same lines to a file an unattended agent
+  can tail. It is refused if it would land under any live, stage, snapshot or
+  rollback root of the verb that is running — including the destination roots
+  that only a plan or a stage receipt names, which is why the file is not
+  created until that evidence has been read and has cleared it. A verb that
+  refuses before it can read that evidence writes the refusal to stderr and
+  creates no file at all.
+- `--heartbeat-seconds N` changes the heartbeat interval (default 30).
+- `--quiet` suppresses stderr telemetry. `BULKLOAD_PHASE_TIMING=0` does the
+  same for a caller that cannot reach the flags.
+
+Telemetry cannot fail a run. Every sink write is guarded, and a sink that has
+gone away — `2>&-` closes fd 2 and CPython then sets `sys.stderr` to `None` —
+is skipped rather than allowed to replace the verb's own refusal.
+
+Telemetry is diagnostic only: it never reaches an artifact and never changes a
+digest.
+
 ## Capture twice per role
 
 Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both
@@ -306,3 +355,45 @@ scripts/bulkload.py agent-recover \
 Use `--strategy rollback` to restore the sealed snapshot instead. Both paths
 are idempotent and remain bound to the same transaction. Never improvise file
 copies or delete a journal after a crash.
+
+## Read a refusal instead of guessing
+
+Every verb accepts `--failure-output PATH`. When the verb refuses, the same
+single line goes to stderr first, and then a structured record is written to
+that path:
+
+```bash
+scripts/bulkload.py agent-stage \
+  --phase final --accept-plan-sha256 PLAN_SHA256 \
+  --stage-root /srv/fast-local/jess/bulkload/stage \
+  --output /srv/fast-local/jess/bulkload/final-stage.json \
+  --failure-output /srv/fast-local/jess/bulkload/final-stage.failure.json
+```
+
+The record is `{schema, code, phase, root, label, field, expected, observed,
+count, sample, remedy, message, command, version}`. `sample` holds at most 20
+offending paths or fields. `code` is stable: branch on it, not on the message.
+Codes that name a whole condition family end without a suffix; a code with a
+suffix names the exact condition, e.g. `CUSTODY_REQUIRED_NOT_SEEN` (the stage
+asked for paths the sealed index does not carry — a path-identity or selection
+fault, which no re-capture fixes) versus `CUSTODY_INDEX_DIGEST` (the index
+bytes moved). A refusal site that has not been converted yet still writes a
+record, with code `UNCLASSIFIED`.
+
+`--failure-output` is a write channel, so it is fenced like `--output`: it must
+be a real path, it must not resolve to `--output` or to any artifact the verb
+reads (`--plan`, `--stage-receipt`, `--prepare-receipt`, `--transport-allowlist`,
+`--apply-receipt`, `--journal`, `--snapshot-base-seal`, the four `agent-plan`
+captures), and it must not land inside any live root — the record's write
+creates its whole parent tree, and a new directory under `--home` mid-capture
+refuses that capture with "live snapshot path set changed". Those comparisons
+resolve `~`, `..` and symlinks and fold case, because the source volume is
+case-insensitive APFS. The record is written 0600. A record write that cannot
+happen prints one `WARN` line after the `FAIL` line and never replaces it.
+
+**The limit, stated plainly.** The record covers refusals: `BulkloadError`,
+`OSError`, `sqlite3.Error`. A defect in the engine itself — e.g. a plan whose
+JSON parses but has the wrong schema, which reaches a bare subscript — still
+exits 1 with a Python traceback, no `FAIL` line and no record. Read the exit
+status; do not treat a missing record as success. Classifying that class is
+the separate exit-code work, not part of this channel.

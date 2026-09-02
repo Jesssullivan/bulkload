@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import sys
-from typing import Any, Sequence
+import time
+from typing import Any, Iterable, Iterator, Sequence
 
 from . import __version__
 from .executor import (
@@ -25,20 +28,27 @@ from .executor import (
 from .model import (
     BulkloadError,
     MAX_JSON_BYTES,
+    UNCLASSIFIED_REFUSAL_CODE,
     assert_no_overlap,
     atomic_write,
     canonical_bytes,
+    path_identity,
     read_json,
+    refusal_record,
 )
 from .mover import DEFAULT_STREAMS
 from .planner import compile_agent_plan_authorities
 from .scanner import (
+    DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
     _catalog_path_identities,
     canonical_path_map,
     capture_agent_state,
+    configure_progress,
+    emit_progress,
+    unaccounted_seconds,
     validate_agent_capture,
 )
 
@@ -149,9 +159,12 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def _protect_output(arguments: argparse.Namespace) -> None:
-    if arguments.output == "-":
-        return
+def _evidence_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Every live root this verb reads, which no output of ours may enter.
+
+    Reads the verb's evidence to get there, which for `agent-plan` means four
+    multi-gigabyte captures, so callers compute it once and share the result.
+    """
     roots: list[Path] = []
     if arguments.command == "agent-capture":
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
@@ -194,7 +207,95 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         )
     if hasattr(arguments, "stage_root"):
         roots.append(Path(arguments.stage_root))
-    assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    return roots
+
+
+@contextlib.contextmanager
+def _disarmed_on_refusal(arguments: argparse.Namespace) -> Iterator[None]:
+    """Drop the failure path before re-raising a refusal that is about it.
+
+    `main` writes the refusal record inside the handler for the very refusal
+    these guards raise. Without this, a guard that refuses a failure path
+    performs, one frame later, exactly the write it just refused.
+    """
+    try:
+        yield
+    except BaseException:
+        arguments.failure_output = None
+        raise
+
+
+def _protect_output(
+    arguments: argparse.Namespace, protected: Sequence[Path] | None = None
+) -> None:
+    """Keep both output channels out of every live root the verb reads.
+
+    `--failure-output` is a write channel like `--output`, and `atomic_write`
+    creates the whole parent tree, so an unguarded refusal path plants
+    directories and a file inside a root a capture is walking — the exact
+    shape that refuses the capture with "live snapshot path set changed".
+
+    `protected` is the shared root set when the caller already had to derive
+    it for `--progress-log`; for `agent-plan` that derivation costs four
+    multi-gigabyte reads and must not happen twice. Left at None it is
+    derived here, and only once both output channels are known to need it,
+    which keeps the cost off a verb that writes evidence to stdout alone.
+    """
+    failure_output = getattr(arguments, "failure_output", None)
+    if arguments.output == "-" and not failure_output:
+        return
+    roots = _evidence_protected_roots(arguments) if protected is None else protected
+    if arguments.output != "-":
+        assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    if failure_output:
+        with _disarmed_on_refusal(arguments):
+            assert_no_overlap(
+                Path(failure_output), roots, "failure output", fold_case=True
+            )
+
+
+# Every argument that names a file the verb reads or seals. A refusal record
+# is small and always writable, so pointing it at one of these silently
+# replaces a sealed input with a 400-byte JSON object.
+ARTIFACT_ARGUMENTS = (
+    "source_a",
+    "source_b",
+    "destination_a",
+    "destination_b",
+    "plan",
+    "stage_receipt",
+    "prepare_receipt",
+    "transport_allowlist",
+    "transport_receipt",
+    "apply_receipt",
+    "destination_verify_receipt",
+    "journal",
+    "snapshot_base_seal",
+)
+
+
+def _protect_failure_output(arguments: argparse.Namespace) -> None:
+    """Refuse a failure path that could damage the evidence it explains."""
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    with _disarmed_on_refusal(arguments):
+        if path == "-":
+            raise BulkloadError(
+                "failure output must be a path; stdout carries evidence"
+            )
+        identity = path_identity(path, fold_case=True)
+        if arguments.output != "-" and identity == path_identity(
+            arguments.output, fold_case=True
+        ):
+            raise BulkloadError("failure output must differ from the evidence output")
+        for name in ARTIFACT_ARGUMENTS:
+            value = getattr(arguments, name, None)
+            if value and identity == path_identity(value, fold_case=True):
+                flag = name.replace("_", "-")
+                raise BulkloadError(
+                    f"failure output must differ from the --{flag} artifact: {value}"
+                )
 
 
 def _parse_mapping(value: str) -> tuple[str, str]:
@@ -426,6 +527,142 @@ def _agent_recover(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _telemetry_parser() -> argparse.ArgumentParser:
+    """The progress flags every verb carries.
+
+    Telemetry is on by default: a verb that runs for hours must never leave a
+    zero-byte log behind. `--quiet` is the opt-out, and `--progress-log`
+    duplicates the same lines into a file an unattended agent can tail.
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress phase and heartbeat telemetry on stderr",
+    )
+    parent.add_argument(
+        "--progress-log",
+        help=(
+            "append phase and heartbeat telemetry to this file as well as "
+            "stderr. It must not live under any live, stage, or snapshot root."
+        ),
+    )
+    parent.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SECONDS,
+        help=(
+            "seconds between in-phase heartbeat lines "
+            f"(default {DEFAULT_HEARTBEAT_SECONDS:g})"
+        ),
+    )
+    return parent
+
+
+def _cheap_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Roots a progress log must not land in, read straight off the flags.
+
+    Deliberately does not open any evidence: this runs before the first
+    telemetry line, and `agent-plan`'s four captures are gigabytes each.
+    """
+    roots: list[Path] = []
+    for name in ("home", "git_root", "codex_root", "claude_root", "pi_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    for declaration in [
+        *getattr(arguments, "seat", []),
+        *getattr(arguments, "file_seat", []),
+    ]:
+        roots.append(declaration[1])
+    for name in ("stage_root", "rollback_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    seal = getattr(arguments, "snapshot_base_seal", None)
+    if seal:
+        roots.append(Path(seal).expanduser().parent)
+    return roots
+
+
+# One telemetry line is ~120 bytes and only the run banner is written before
+# activation, so this bound is three orders of magnitude of headroom against a
+# sink that never opens.
+MAX_BUFFERED_PROGRESS_LINES = 1024
+
+
+class _DeferredProgressLog:
+    """A `--progress-log` that does not exist until it is proven safe.
+
+    The advertised refusal — "it must not live under any live, stage, or
+    snapshot root" — held for `agent-capture` alone, because that is the one
+    verb whose roots are all readable straight off the flags. `agent-apply`'s
+    destination roots live inside the plan, and the file was created `O_CREAT`
+    before the plan was read, so `--progress-log <path under the destination
+    home>` planted a file in the destination live tree that the apply journal
+    does not record and `agent-rollback` therefore does not remove.
+
+    Opening the file earlier cannot fix that; opening it later can. Lines are
+    buffered from the first banner until `activate` has cleared the candidate
+    against the complete per-verb root set, and only then is the file created.
+    A verb that refuses before activation leaves nothing behind at all — the
+    refusal is still printed on stderr, which is the sink that is always
+    there.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._buffer: list[str] = []
+        self._stream: Any = None
+
+    def activate(self, protected: Iterable[Path]) -> None:
+        assert_no_overlap(self.path, protected, "progress log")
+        descriptor = os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        stream = os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", closefd=True)
+        for line in self._buffer:
+            stream.write(line)
+        self._buffer.clear()
+        stream.flush()
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        if self._stream is not None:
+            self._stream.write(text)
+        elif len(self._buffer) < MAX_BUFFERED_PROGRESS_LINES:
+            self._buffer.append(text)
+
+    def flush(self) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+
+    def close(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.close()
+
+
+def _open_progress_log(arguments: argparse.Namespace) -> _DeferredProgressLog | None:
+    """Bind the progress log and refuse everything the flags alone can refuse.
+
+    This is the cheap half of the guard: it runs before the first telemetry
+    line, so it may not open evidence. The complete half is
+    `_DeferredProgressLog.activate`.
+    """
+    path = getattr(arguments, "progress_log", None)
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    output = getattr(arguments, "output", None)
+    if output and output != "-" and Path(output).expanduser() == candidate:
+        raise BulkloadError("progress log must not be the evidence output path")
+    assert_no_overlap(candidate, _cheap_protected_roots(arguments), "progress log")
+    return _DeferredProgressLog(candidate)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkload",
@@ -434,9 +671,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
+    # Every verb accepts --failure-output. It is declared on a parent parser
+    # so the flag reads naturally after the verb and still lands on one
+    # namespace attribute that main() can consult without knowing the verb.
+    refusal = argparse.ArgumentParser(add_help=False)
+    refusal.add_argument(
+        "--failure-output",
+        metavar="PATH",
+        help=(
+            "write a structured refusal record (JSON) here when the verb "
+            "refuses; the stderr line comes first either way. Must not be "
+            "--output, an input artifact, or inside any live root"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
+    telemetry = _telemetry_parser()
 
-    capture = commands.add_parser("agent-capture", help="write AgentCaptureV4 evidence")
+    capture = commands.add_parser(
+        "agent-capture",
+        parents=[refusal, telemetry],
+        help="write AgentCaptureV4 evidence",
+    )
     capture.add_argument("--role", choices=("source", "destination"), required=True)
     capture.add_argument("--home", required=True)
     capture.add_argument("--git-root", required=True)
@@ -486,7 +741,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--output", required=True)
     capture.set_defaults(handler=_agent_capture)
 
-    plan = commands.add_parser("agent-plan", help="compile an exact four-capture union")
+    plan = commands.add_parser(
+        "agent-plan",
+        parents=[refusal, telemetry],
+        help="compile an exact four-capture union",
+    )
     plan.add_argument("--source-a", required=True)
     plan.add_argument("--source-b", required=True)
     plan.add_argument("--destination-a", required=True)
@@ -495,7 +754,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=_agent_plan)
 
     stage = commands.add_parser(
-        "agent-stage", help="materialize preseed or final stage"
+        "agent-stage",
+        parents=[refusal, telemetry],
+        help="materialize preseed or final stage",
     )
     stage.add_argument("--phase", choices=("preseed", "final"), required=True)
     stage.add_argument("--plan")
@@ -547,7 +808,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--output", required=True)
     stage.set_defaults(handler=_agent_stage)
 
-    apply = commands.add_parser("agent-apply", help="apply a sealed final stage")
+    apply = commands.add_parser(
+        "agent-apply",
+        parents=[refusal, telemetry],
+        help="apply a sealed final stage",
+    )
     apply.add_argument("--plan", required=True)
     apply.add_argument("--stage-receipt", required=True)
     apply.add_argument("--accept-plan-sha256", required=True)
@@ -560,7 +825,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply.set_defaults(handler=_agent_apply)
 
     verify = commands.add_parser(
-        "agent-verify", help="independently verify final state"
+        "agent-verify",
+        parents=[refusal, telemetry],
+        help="independently verify final state",
     )
     verify.add_argument("--plan", required=True)
     verify.add_argument("--stage-receipt", required=True)
@@ -570,7 +837,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.set_defaults(handler=_agent_verify)
 
     rollback = commands.add_parser(
-        "agent-rollback", help="restore exact overwritten state"
+        "agent-rollback",
+        parents=[refusal, telemetry],
+        help="restore exact overwritten state",
     )
     rollback.add_argument("--apply-receipt", required=True)
     rollback.add_argument("--accept-receipt-sha256", required=True)
@@ -578,7 +847,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.set_defaults(handler=_agent_rollback)
 
     recover = commands.add_parser(
-        "agent-recover", help="resume or roll back an interrupted apply"
+        "agent-recover",
+        parents=[refusal, telemetry],
+        help="resume or roll back an interrupted apply",
     )
     recover.add_argument("--plan", required=True)
     recover.add_argument("--stage-receipt", required=True)
@@ -589,14 +860,155 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failure_record(
+    arguments: argparse.Namespace, error: BaseException
+) -> dict[str, Any]:
+    """The structured record for one refusal, converted or not.
+
+    A refusal site that has not been converted yet still produces a record —
+    with code UNCLASSIFIED and the raised sentence as its message — so a
+    caller reading `--failure-output` can tell "this refusal has no diagnosis
+    yet" apart from "no refusal happened".
+
+    The channel covers what `main` catches: `BulkloadError`, `OSError` and
+    `sqlite3.Error`. A defect in the engine itself still escapes as a
+    traceback with no record and no `bulkload: FAIL:` line — widening that
+    catch is T3's `BaseException` classify, not this change. Until then a
+    caller must still treat "no record" as possible and read the exit status.
+    """
+    record = getattr(error, "refusal", None)
+    if not isinstance(record, dict):
+        record = refusal_record(
+            code=UNCLASSIFIED_REFUSAL_CODE,
+            phase=getattr(arguments, "command", None) or "unknown",
+            remedy=(
+                "This refusal site does not carry a structured diagnosis yet; "
+                "read the message and the verb's inputs."
+            ),
+            message=str(error),
+            observed=type(error).__name__,
+        )
+    return {
+        **record,
+        "command": getattr(arguments, "command", None),
+        "version": __version__,
+    }
+
+
+def _emit_failure(arguments: argparse.Namespace, error: BaseException) -> None:
+    """Write the refusal record, and never let that write mask the refusal.
+
+    Building the record and writing it both happen inside the guard: a bad
+    value in the record is as capable of raising as a bad path is, and either
+    one must cost a WARN line, not the diagnosis. The catch is `Exception`,
+    not `(BulkloadError, OSError)`, because `Path.expanduser()` alone raises
+    `RuntimeError` for an unresolvable `~user`.
+    """
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    try:
+        record = _failure_record(arguments, error)
+        atomic_write(Path(path), canonical_bytes(record) + b"\n", mode=0o600)
+    except Exception as failure:  # noqa: BLE001 - the refusal outranks its record
+        print(
+            f"bulkload: WARN: cannot write failure record: {failure}", file=sys.stderr
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    started = time.monotonic()
+    log = None
+    status = "fail"
+    code: int | None = None
     try:
-        _protect_output(arguments)
-        result = arguments.handler(arguments)
-        _write(arguments.output, result)
-    except (BulkloadError, OSError, sqlite3.Error) as error:
-        print(f"bulkload: FAIL: {error}", file=sys.stderr)
-        return 1
-    return 0
+        try:
+            # The flag-only half of the refusal-path guard runs before
+            # anything else, because every later handler writes the refusal
+            # record and none of them may write it to a path this rejects.
+            _protect_failure_output(arguments)
+            log = _open_progress_log(arguments)
+            configure_progress(
+                stderr=not arguments.quiet,
+                interval=arguments.heartbeat_seconds,
+                log_stream=log,
+            )
+        except (BulkloadError, OSError) as error:
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            _emit_failure(arguments, error)
+            code = 1
+            return 1
+        # Every verb announces itself. This line, and the closing one below,
+        # are why no invocation can leave a zero-byte log behind again.
+        emit_progress(
+            "bulkload-run"
+            " event=start"
+            f" verb={arguments.command}"
+            f" version={__version__}"
+            f" pid={os.getpid()}"
+            f" host={socket.gethostname()}"
+        )
+        try:
+            # One derivation, two guards. The progress log and the evidence
+            # output are both writes this verb makes outside its own
+            # contract, and both must clear the same roots. Deriving it here
+            # also means the progress log clears the roots that only the
+            # evidence names — the destination home in an apply plan, the
+            # source roots in a stage prepare receipt — which the flag-only
+            # check cannot see. With no log there is nothing to share, so
+            # `_protect_output` derives it itself, and only if it needs it.
+            protected: list[Path] | None = None
+            if log is not None:
+                protected = _evidence_protected_roots(arguments)
+                log.activate([*protected, *_cheap_protected_roots(arguments)])
+            _protect_output(arguments, protected)
+            result = arguments.handler(arguments)
+            _write(arguments.output, result)
+        except (BulkloadError, OSError, sqlite3.Error) as error:
+            # The refusal is the deliverable; the record is a convenience.
+            # Print first so no failure of the record write can cost the
+            # operator the one line that names what refused.
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            _emit_failure(arguments, error)
+            code = 1
+            return 1
+        status = "ok"
+        code = 0
+        return 0
+    finally:
+        elapsed = time.monotonic() - started
+        # Lane F's ask: name the hole rather than let the next one hide. If
+        # the timed phases do not cover 90% of the run, say how much they
+        # missed instead of leaving it to be inferred from a wall clock.
+        unaccounted = unaccounted_seconds(elapsed)
+        if unaccounted is not None:
+            emit_progress(
+                "bulkload-phase"
+                " phase=UNACCOUNTED"
+                " root=-"
+                f" seconds={unaccounted:.3f}"
+                " files=-"
+                " bytes=-"
+            )
+        emit_progress(
+            "bulkload-run"
+            " event=end"
+            f" verb={arguments.command}"
+            f" seconds={elapsed:.3f}"
+            f" status={status}"
+            f" exit={'-' if code is None else code}"
+        )
+        # `interval=None` means "keep", so the process-global heartbeat has to
+        # be restored by name or a caller's tuning outlives its own run.
+        configure_progress(
+            stderr=not arguments.quiet,
+            interval=DEFAULT_HEARTBEAT_SECONDS,
+            log_stream=None,
+        )
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass

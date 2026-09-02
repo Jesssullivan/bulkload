@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Iterable, Sequence
 import unicodedata
@@ -33,15 +34,20 @@ from .model import (
     MAX_JSON_BYTES,
     assert_no_overlap,
     atomic_write_json,
+    REFUSAL_SAMPLE_LIMIT,
     canonical_bytes,
     durable_makedirs,
     ensure_safe_target,
+    first_mismatch,
     fsync_directory,
     git_environment,
     new_id,
     normalize_relative,
     reflink_clone,
     read_json,
+    refusal_check,
+    refusal_eq,
+    refuse,
     require_capacity,
     require_digest,
     require_exact_keys,
@@ -514,42 +520,305 @@ def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str
     return result
 
 
+DEFAULT_HEARTBEAT_SECONDS = 30.0
+MAX_HEARTBEAT_SECONDS = 86400.0
+_PROGRESS_STDERR = True
+_PROGRESS_LOG: Any = None
+_PROGRESS_INTERVAL = DEFAULT_HEARTBEAT_SECONDS
+_PROGRESS_PHASES = threading.local()
+_PROGRESS_ACCOUNTED = 0.0
+_PROGRESS_ACCOUNT_LOCK = threading.Lock()
+
+
+def configure_progress(
+    *,
+    stderr: bool = True,
+    interval: float | None = None,
+    log_stream: Any = None,
+) -> None:
+    """Bind the process-wide progress sinks.
+
+    Progress is default-on to stderr: a verb that runs for two and a half
+    hours must not produce a zero-byte log. It stays diagnostic only — it
+    never reaches an artifact, never changes a digest, and every write is
+    guarded so a broken sink cannot fail a cutover.
+    """
+    global _PROGRESS_STDERR, _PROGRESS_LOG, _PROGRESS_INTERVAL
+    reset_phase_accounting()
+    if interval is not None:
+        if not 0 < float(interval) <= MAX_HEARTBEAT_SECONDS:
+            raise BulkloadError("progress heartbeat interval is out of range")
+        _PROGRESS_INTERVAL = float(interval)
+    _PROGRESS_STDERR = bool(stderr)
+    _PROGRESS_LOG = log_stream
+
+
+def reset_phase_accounting() -> None:
+    """Forget the phase seconds accumulated so far. One run, one budget."""
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED = 0.0
+
+
+def _account_phase(seconds: float) -> None:
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED += seconds
+
+
+def unaccounted_seconds(elapsed: float, *, threshold: float = 0.9) -> float | None:
+    """Seconds of a run that no phase claimed, when that is worth saying.
+
+    Lane F asked for this by name: name the holes the instrumentation does
+    not cover, or the next hidden hole stays invisible. The profile lane
+    spent a day inferring a 29-minute gap that the engine could have printed.
+    Returns `None` when nothing was timed (there is no budget to compare
+    against) or when the timed phases already account for `threshold` of the
+    wall clock.
+    """
+    with _PROGRESS_ACCOUNT_LOCK:
+        accounted = _PROGRESS_ACCOUNTED
+    if elapsed <= 0 or accounted <= 0 or accounted >= elapsed * threshold:
+        return None
+    return elapsed - accounted
+
+
+def progress_enabled() -> bool:
+    """True when at least one sink is bound and the operator has not opted out.
+
+    `BULKLOAD_PHASE_TIMING` survives only as an off switch for callers that
+    cannot reach the CLI flags; the historical "1" that used to turn timing on
+    now means what it always looked like it meant.
+    """
+    if os.environ.get("BULKLOAD_PHASE_TIMING", "").strip().lower() in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }:
+        return False
+    return bool(_PROGRESS_STDERR) or _PROGRESS_LOG is not None
+
+
+def emit_progress(line: str) -> None:
+    """Write one telemetry line to every bound sink. Never raises.
+
+    "Never raises" is load-bearing and was not true of the first cut. This
+    runs inside `phase_timing`'s `finally` and inside `cli.main`'s `finally`,
+    so anything that escapes here replaces an in-flight refusal with a
+    telemetry error and destroys the error path. The measured case: run any
+    verb with fd 2 closed (`2>&-`) and CPython sets `sys.stderr` to `None`,
+    at which point `sys.stderr.write` raises `AttributeError` — which is
+    neither `OSError` nor `ValueError`, and which `cli.main`'s
+    `except (BulkloadError, OSError, sqlite3.Error)` does not catch either.
+    A missing input then exited 1 with no message at all instead of naming
+    the file. Hence the `None` guard and the deliberately blind excepts: a
+    diagnostic sink may never decide the outcome of a cutover.
+    """
+    if not progress_enabled():
+        return
+    text = line if line.endswith("\n") else line + "\n"
+    # Bind once: `sys.stderr` is process-global and another thread may swap or
+    # close it between the guard and the write.
+    stream = sys.stderr if _PROGRESS_STDERR else None
+    if stream is not None:
+        try:
+            stream.write(text)
+            stream.flush()
+        except Exception:
+            pass
+    log = _PROGRESS_LOG
+    if log is not None:
+        try:
+            log.write(text)
+            log.flush()
+        except Exception:
+            pass
+
+
+def _rate_fields(done: int, elapsed: float, total: int | None) -> tuple[str, str]:
+    if elapsed <= 0 or done <= 0:
+        return "-", "-"
+    rate = done / elapsed
+    if total is None or total <= done:
+        return f"{rate:.1f}", "-"
+    return f"{rate:.1f}", f"{(total - done) / rate:.1f}"
+
+
 class _PhaseSample:
     """Counters a timed phase fills in while it runs."""
 
-    __slots__ = ("bytes", "files")
+    __slots__ = (
+        "bytes",
+        "files",
+        "done",
+        "observed_bytes",
+        "total",
+        "unit",
+        "phase",
+        "root",
+        "_advanced",
+        "_started",
+        "_last",
+    )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        phase: str = "-",
+        root: str = "-",
+        total: int | None = None,
+        unit: str = "files",
+    ) -> None:
         self.bytes: int | None = None
         self.files: int | None = None
+        self.done = 0
+        # `None` until something measures bytes, because a measured zero and
+        # an unmeasured field must not print the same character. `-` means
+        # "cannot measure" everywhere in this format.
+        self.observed_bytes: int | None = None
+        self.total = total
+        self.unit = unit
+        self.phase = phase
+        self.root = root
+        # Distinguishes "advanced zero times" from "advanced, and the count
+        # is zero", which `done or None` could not.
+        self._advanced = False
+        self._started = time.monotonic()
+        self._last = self._started
+
+    def advance(self, count: int = 1, *, observed: int | None = None) -> None:
+        """Count `count` more units of work and heartbeat if a tick is due.
+
+        `observed=None` means this caller does not measure bytes at all;
+        `observed=0` means it measured and the answer was zero.
+        """
+        self.done += count
+        self._advanced = True
+        if observed is not None:
+            self.observed_bytes = (self.observed_bytes or 0) + observed
+        self.heartbeat()
+
+    def heartbeat(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last < _PROGRESS_INTERVAL:
+            return
+        self._last = now
+        elapsed = now - self._started
+        rate, eta = _rate_fields(self.done, elapsed, self.total)
+        emit_progress(
+            "bulkload-progress"
+            f" phase={self.phase}"
+            f" root={self.root}"
+            f" seconds={elapsed:.3f}"
+            f" unit={self.unit}"
+            f" done={self.done}"
+            f" total={'-' if self.total is None else self.total}"
+            f" bytes={'-' if self.observed_bytes is None else self.observed_bytes}"
+            f" rate={rate}"
+            f" eta={eta}"
+        )
+
+
+def _phase_stack() -> list[_PhaseSample]:
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if stack is None:
+        stack = []
+        _PROGRESS_PHASES.stack = stack
+    return stack
+
+
+def progress_tick(count: int = 1, *, observed: int | None = None) -> None:
+    """Advance the innermost timed phase on this thread, if there is one.
+
+    Deep walk helpers use this instead of threading a sample through every
+    signature. It is a no-op outside a timed phase and on worker threads,
+    which is why it can never change a result.
+    """
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if not stack:
+        return
+    stack[-1].advance(count, observed=observed)
+
+
+def progress_total(total: int) -> None:
+    """Bind the innermost timed phase's denominator once it is known.
+
+    The count of work a phase will do is often discovered inside the phase
+    (the workspace inventory, for example). Without this the heartbeat can
+    only print elapsed time; with it, `total`, `rate` and `eta` are real.
+    """
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if stack:
+        stack[-1].total = total
+
+
+def _heartbeat_watchdog(sample: _PhaseSample, stop: threading.Event) -> None:
+    while not stop.wait(_PROGRESS_INTERVAL):
+        sample.heartbeat(force=True)
 
 
 @contextmanager
-def phase_timing(phase: str, root: str = "-") -> Iterable[_PhaseSample]:
-    """Emit one stderr timing line per phase when BULKLOAD_PHASE_TIMING=1.
+def phase_timing(
+    phase: str,
+    root: str = "-",
+    *,
+    total: int | None = None,
+    unit: str = "files",
+    watchdog: bool = False,
+) -> Iterable[_PhaseSample]:
+    """Time one phase, heartbeat while it runs, and print one line at exit.
 
-    Timing is diagnostic only: it never reaches an artifact, never changes a
-    digest, and is off unless the operator asks for it. The counters are read
-    at exit, so a phase sets them inside the block.
+    `watchdog=True` starts a daemon ticker for a phase that blocks in one
+    opaque call (the rsync payload push) and therefore cannot advance a
+    counter itself. Timing is diagnostic only: it never reaches an artifact
+    and never changes a digest.
     """
-    sample = _PhaseSample()
-    if os.environ.get("BULKLOAD_PHASE_TIMING") != "1":
+    sample = _PhaseSample(phase, root, total, unit)
+    if not progress_enabled():
         yield sample
         return
-    started = time.monotonic()
+    stack = _phase_stack()
+    stack.append(sample)
+    stop: threading.Event | None = None
+    ticker: threading.Thread | None = None
+    if watchdog:
+        stop = threading.Event()
+        ticker = threading.Thread(
+            target=_heartbeat_watchdog,
+            args=(sample, stop),
+            name="bulkload-progress",
+            daemon=True,
+        )
+        ticker.start()
+    started = sample._started
     try:
         yield sample
     finally:
-        sys.stderr.write(
+        if stop is not None:
+            stop.set()
+        if ticker is not None:
+            ticker.join(timeout=5.0)
+        if stack and stack[-1] is sample:
+            stack.pop()
+        elapsed = time.monotonic() - started
+        if not stack:
+            # Only outermost phases are summed, so a nested phase cannot be
+            # counted twice against the run's wall clock.
+            _account_phase(elapsed)
+        files = (
+            sample.files
+            if sample.files is not None
+            else (sample.done if sample._advanced else None)
+        )
+        observed = sample.bytes if sample.bytes is not None else sample.observed_bytes
+        emit_progress(
             "bulkload-phase"
             f" phase={phase}"
             f" root={root}"
-            f" seconds={time.monotonic() - started:.3f}"
-            f" files={'-' if sample.files is None else sample.files}"
-            f" bytes={'-' if sample.bytes is None else sample.bytes}"
-            "\n"
+            f" seconds={elapsed:.3f}"
+            f" files={'-' if files is None else files}"
+            f" bytes={'-' if observed is None else observed}"
         )
-        sys.stderr.flush()
 
 
 def workspace_worker_count(jobs: int | None, pending: int) -> int:
@@ -2278,11 +2547,13 @@ def _tree_census(
     exclusions: Sequence[str],
     content: bool = False,
     portable: bool = False,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     digest = hashlib.sha256()
     charged_bytes = 0
+    entries = 0
 
     def observe(path: Path, relative: str) -> tuple[str, int]:
+        nonlocal entries
         before = _stable_stat(path)
         live_sqlite = (
             provider is not None
@@ -2327,12 +2598,14 @@ def _tree_census(
         digest.update(
             canonical_bytes([relative, kind, authority, content_digest]) + b"\0"
         )
+        entries += 1
+        progress_tick(observed=size)
         return kind, size
 
     root_info = root.stat(follow_symlinks=False)
     if stat.S_ISREG(root_info.st_mode):
         _, charged_bytes = observe(root, ".")
-        return digest.hexdigest(), charged_bytes
+        return digest.hexdigest(), charged_bytes, entries
     if not stat.S_ISDIR(root_info.st_mode):
         raise BulkloadError(f"snapshot root is not a regular file or directory: {root}")
     observe(root, ".")
@@ -2366,7 +2639,7 @@ def _tree_census(
                 continue
             _, size = observe(child, relative)
             charged_bytes += size
-    return digest.hexdigest(), charged_bytes
+    return digest.hexdigest(), charged_bytes, entries
 
 
 def _tree_generation(
@@ -2522,6 +2795,9 @@ def _copy_live_tree(
             "method": method,
             "source_device": source_info.st_dev,
         }
+        progress_tick(
+            observed=source_info.st_size if stat.S_ISREG(source_info.st_mode) else 0
+        )
 
     source_info = source.stat(follow_symlinks=False)
     if stat.S_ISREG(source_info.st_mode):
@@ -2728,6 +3004,7 @@ def _snapshot_delta_charge(
                 and _provider_classification(provider, relative) == "sqlite"
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
             elif not _base_regular_reusable(
                 child,
                 base_path,
@@ -2735,6 +3012,11 @@ def _snapshot_delta_charge(
                 (base_records or {}).get(relative),
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
+            else:
+                # Reused from the base: examined, charged nothing. `bytes=0`
+                # is the measurement, not the absence of one.
+                progress_tick(observed=0)
     return charged
 
 
@@ -2884,6 +3166,7 @@ def _write_snapshot_index(
                     stream.write(payload)
                     digest.update(payload)
                     count += 1
+                    progress_tick(observed=len(payload))
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException:
@@ -3198,6 +3481,7 @@ def validate_snapshot_custody(
     collect_records: bool = False,
     payload_custody: str = "full",
     spill_dir: Path | None = None,
+    progress_phase: str = "custody",
 ) -> _BaseRecordMap:
     """Reopen a seal/index and either all payloads or an explicit stage subset.
 
@@ -3244,7 +3528,73 @@ def validate_snapshot_custody(
         or index_info.st_size > MAX_JSON_BYTES
         or sha256_file(index_path) != snapshot["index_sha256"]
     ):
-        raise BulkloadError("live snapshot custody seal or index differs")
+        raise refuse(
+            "live snapshot custody seal or index differs",
+            phase="validate-snapshot-custody",
+            root=seal_path.parent,
+            label=snapshot.get("snapshot_id"),
+            remedy=(
+                "Custody is bound to these exact bytes and modes; do not "
+                "re-seal in place. Re-derive the snapshot on the source and "
+                "re-transport, or point --mirror at the bundle that carries "
+                "the sealed index."
+            ),
+            **first_mismatch(
+                "CUSTODY_SEAL",
+                (
+                    refusal_check(
+                        "SEAL_KIND",
+                        "seal_path.kind",
+                        lambda: stat.S_ISREG(seal_info.st_mode),
+                        "regular",
+                        lambda: stat.filemode(seal_info.st_mode),
+                    ),
+                    refusal_eq(
+                        "SEAL_BYTES",
+                        "seal_path.sha256",
+                        lambda: sha256_bytes(canonical_bytes(snapshot) + b"\n"),
+                        lambda: sha256_bytes(seal_bytes),
+                    ),
+                    refusal_check(
+                        "ROOT_KIND",
+                        "snapshot_root.kind",
+                        lambda: stat.S_ISDIR(snapshot_root_info.st_mode),
+                        "directory",
+                        lambda: stat.filemode(snapshot_root_info.st_mode),
+                    ),
+                    refusal_check(
+                        "ROOT_MODE",
+                        "snapshot_root.mode",
+                        lambda: (
+                            required_paths is not None
+                            or stat.S_IMODE(snapshot_root_info.st_mode) == 0o700
+                        ),
+                        "0700",
+                        lambda: f"{stat.S_IMODE(snapshot_root_info.st_mode):04o}",
+                    ),
+                    refusal_check(
+                        "INDEX_KIND",
+                        "index_path.kind",
+                        lambda: stat.S_ISREG(index_info.st_mode),
+                        "regular",
+                        lambda: stat.filemode(index_info.st_mode),
+                    ),
+                    refusal_check(
+                        "INDEX_SIZE",
+                        "index_path.size",
+                        lambda: index_info.st_size <= MAX_JSON_BYTES,
+                        f"<={MAX_JSON_BYTES}",
+                        lambda: index_info.st_size,
+                    ),
+                    refusal_eq(
+                        "INDEX_DIGEST",
+                        "index_path.sha256",
+                        lambda: snapshot["index_sha256"],
+                        lambda: sha256_file(index_path),
+                    ),
+                ),
+            ),
+        )
     actual_roots = [actual(item["snapshot"]) for item in snapshot["roots"]]
     original_roots = [Path(item["snapshot"]) for item in snapshot["roots"]]
     if len({os.fspath(path) for path in actual_roots}) != len(actual_roots):
@@ -3260,6 +3610,18 @@ def validate_snapshot_custody(
     )
     required = (
         None if required_paths is None else _fold_required(required_paths, identity)
+    )
+    # `_fold_required` keeps only the folded keys, and a refusal has to name the
+    # path the caller actually asked for rather than its fold. `_fold_required`
+    # has already refused any fold that merges two required members, so this
+    # mapping is one-to-one wherever it exists.
+    required_exact: dict[str, str] = (
+        {}
+        if required_paths is None
+        else {
+            identity(os.path.abspath(os.fspath(path))): os.path.abspath(os.fspath(path))
+            for path in required_paths
+        }
     )
     # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
     # not from the snapshot copy, so nothing anywhere ever compares the git
@@ -3290,8 +3652,17 @@ def validate_snapshot_custody(
     namespace_digest = hashlib.sha256()
     count = 0
     previous: tuple[int, str] | None = None
+    sealed_entries = snapshot.get("index_entries")
     try:
-        with index_path.open("rb") as stream:
+        with (
+            phase_timing(
+                progress_phase,
+                "mirror" if mirror is not None else "live",
+                total=sealed_entries if isinstance(sealed_entries, int) else None,
+                unit="records",
+            ) as sample,
+            index_path.open("rb") as stream,
+        ):
             for line in stream:
                 if not line.endswith(b"\n") or len(line) > 64 * 1024:
                     raise BulkloadError("snapshot payload index line is malformed")
@@ -3377,14 +3748,51 @@ def validate_snapshot_custody(
                                 and {**observed, "mode": None}
                                 == {**record, "mode": None}
                             ):
-                                raise BulkloadError(
-                                    "snapshot payload differs from sealed index"
+                                fields = sorted(
+                                    key
+                                    for key in set(observed) | set(record)
+                                    if observed.get(key) != record.get(key)
+                                )
+                                raise refuse(
+                                    "snapshot payload differs from sealed index",
+                                    phase="validate-snapshot-custody",
+                                    root=actual_roots[root_index],
+                                    label=snapshot["roots"][root_index]["label"],
+                                    field=",".join(fields) or None,
+                                    expected={key: record.get(key) for key in fields},
+                                    observed={key: observed.get(key) for key in fields},
+                                    count=len(fields),
+                                    sample=[
+                                        {
+                                            "path": os.fspath(path),
+                                            "relative_path": relative,
+                                            "field": key,
+                                            "expected": record.get(key),
+                                            "observed": observed.get(key),
+                                        }
+                                        for key in fields
+                                    ],
+                                    remedy=(
+                                        "The payload byte or attribute moved "
+                                        "away from its seal; re-derive the "
+                                        "snapshot for this root rather than "
+                                        "re-sealing the observed state."
+                                    ),
+                                    detail=(
+                                        f"path={os.fspath(path)} "
+                                        f"fields={','.join(fields)}"
+                                    ),
+                                    code="CUSTODY_PAYLOAD_RECORD",
                                 )
                     if original_identity is not None:
                         _record_custody_identity(
                             seen, original_identity, os.fspath(original_path)
                         )
                 count += 1
+                size = record["size"]
+                sample.advance(
+                    observed=size if isinstance(size, int) and size > 0 else 0
+                )
     except OSError as error:
         collected.close()
         raise BulkloadError("snapshot payload index cannot be read") from error
@@ -3403,12 +3811,19 @@ def validate_snapshot_custody(
             item.name for item in roots_parent.iterdir()
         } != {root["label"] for root in snapshot["roots"]}:
             raise BulkloadError("live snapshot declared roots differ")
-        for root_index, root in enumerate(actual_roots):
-            for relative, _ in _snapshot_namespace(root):
-                observed_namespace.update(
-                    canonical_bytes([root_index, relative]) + b"\0"
-                )
-                observed_count += 1
+        with phase_timing(
+            f"{progress_phase}-namespace",
+            "mirror" if mirror is not None else "live",
+            total=count,
+            unit="entries",
+        ) as sample:
+            for root_index, root in enumerate(actual_roots):
+                for relative, _ in _snapshot_namespace(root):
+                    observed_namespace.update(
+                        canonical_bytes([root_index, relative]) + b"\0"
+                    )
+                    observed_count += 1
+                    sample.advance()
     if (
         count != snapshot["index_entries"]
         or digest.hexdigest() != snapshot["index_sha256"]
@@ -3420,10 +3835,130 @@ def validate_snapshot_custody(
             or observed_namespace.hexdigest() != namespace_digest.hexdigest()
         )
     ):
+        # `required` and `seen` are live sets right here. Discarding them and
+        # printing one static sentence is what cost the 2026-08-28 ceremony a
+        # 67-minute, 78 GiB custody read-back per lap; the set difference the
+        # operator then computed by hand in 53 s is free at this point.
+        diagnosis = _diagnose_custody_totals(
+            snapshot,
+            count=count,
+            digest=digest.hexdigest(),
+            required=required,
+            required_exact=required_exact,
+            seen=seen,
+            observed_count=observed_count,
+            observed_namespace=observed_namespace.hexdigest(),
+            namespace_digest=namespace_digest.hexdigest(),
+        )
         collected.close()
-        raise BulkloadError("snapshot payload index count or digest differs")
+        raise refuse(
+            "snapshot payload index count or digest differs",
+            phase="validate-snapshot-custody",
+            root=seal_path.parent,
+            label=snapshot.get("snapshot_id"),
+            remedy=(
+                "Compare the named paths against the sealed index before "
+                "re-reading the corpus: a REQUIRED_NOT_SEEN sample is a "
+                "path-identity or stage-selection fault, not a byte fault, "
+                "and no re-capture fixes it."
+            ),
+            **diagnosis,
+        )
     collected.seal()
     return collected
+
+
+def _diagnose_custody_totals(
+    snapshot: dict[str, Any],
+    *,
+    count: int,
+    digest: str,
+    required: set[str] | None,
+    required_exact: dict[str, str],
+    seen: dict[str, str],
+    observed_count: int,
+    observed_namespace: str,
+    namespace_digest: str,
+) -> dict[str, Any]:
+    """Name which of the five custody totals actually failed, with a sample.
+
+    The five conditions are distinguished because they have five different
+    remedies: a count or digest fault means the index bytes moved, a
+    REQUIRED_NOT_SEEN fault means the stage asked for paths the index does
+    not name (path identity, case folding, a missed root), and a namespace
+    fault means something was planted in or removed from the snapshot tree.
+    """
+    if count != snapshot["index_entries"]:
+        return {
+            "code": "CUSTODY_INDEX_COUNT",
+            "field": "index_entries",
+            "expected": snapshot["index_entries"],
+            "observed": count,
+            "count": count,
+            "detail": f"expected={snapshot['index_entries']} observed={count}",
+        }
+    if digest != snapshot["index_sha256"]:
+        return {
+            "code": "CUSTODY_INDEX_DIGEST",
+            "field": "index_sha256",
+            "expected": snapshot["index_sha256"],
+            "observed": digest,
+            "count": count,
+            "detail": f"expected={snapshot['index_sha256']} observed={digest}",
+        }
+    if required is not None and set(seen) != required:
+        # `seen` binds one folded custody key to the exact spelling the sealed
+        # index carried for it, so an extra key can be named as the source
+        # spelled it. A missing key was never seen at all, and the folded key
+        # -- which is the required path's own spelling whenever the seal
+        # licensed no fold -- is the only name there is for it.
+        missing = sorted(required_exact.get(key, key) for key in (required - set(seen)))
+        extra = sorted(seen[key] for key in (set(seen) - required))
+        sample = [
+            {"relation": "required-not-seen", "path": path}
+            for path in missing[:REFUSAL_SAMPLE_LIMIT]
+        ]
+        if len(sample) < REFUSAL_SAMPLE_LIMIT:
+            sample.extend(
+                {"relation": "seen-not-required", "path": path}
+                for path in extra[: REFUSAL_SAMPLE_LIMIT - len(sample)]
+            )
+        return {
+            "code": "CUSTODY_REQUIRED_NOT_SEEN",
+            "field": "required_paths",
+            "expected": len(required),
+            "observed": len(seen),
+            "count": len(missing) + len(extra),
+            "sample": sample,
+            "detail": (
+                f"required={len(required)} seen={len(seen)} "
+                f"missing={len(missing)} extra={len(extra)} "
+                f"first_missing={missing[0] if missing else None} "
+                f"first_extra={extra[0] if extra else None}"
+            ),
+        }
+    if required is None and observed_count != count:
+        return {
+            "code": "CUSTODY_NAMESPACE_COUNT",
+            "field": "namespace_entries",
+            "expected": count,
+            "observed": observed_count,
+            "count": abs(observed_count - count),
+            "detail": f"index={count} namespace={observed_count}",
+        }
+    if required is None and observed_namespace != namespace_digest:
+        return {
+            "code": "CUSTODY_NAMESPACE_DIGEST",
+            "field": "namespace_sha256",
+            "expected": namespace_digest,
+            "observed": observed_namespace,
+            "count": count,
+            "detail": f"expected={namespace_digest} observed={observed_namespace}",
+        }
+    return {
+        "code": "CUSTODY_TOTALS",
+        "detail": "no single condition reproduced under diagnosis",
+    }
 
 
 BREAK_GLASS_NOTE_ENV = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE"
@@ -3578,7 +4113,7 @@ def validate_live_snapshot_generation(
         )
     )
 
-    def epoch() -> str:
+    def epoch() -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         declarations = []
         for declaration in snapshot["declarations"]:
             logical = Path(declaration["logical"])
@@ -3605,6 +4140,7 @@ def validate_live_snapshot_generation(
             )
         rows = []
         git_generation = None
+        git_rows: list[dict[str, Any]] = []
         for root in snapshot["roots"]:
             live = Path(root["live"])
             sqlite_rows = []
@@ -3631,16 +4167,14 @@ def validate_live_snapshot_generation(
                 }
             )
             if root["label"] == "git":
-                git_generation = _git_live_generation(live)
-        return sha256_bytes(
-            canonical_bytes(
-                {
-                    "declarations": declarations,
-                    "git_generation_sha256": git_generation,
-                    "roots": rows,
-                }
-            )
-        )
+                git_rows = _git_live_authority_rows(live)
+                git_generation = sha256_bytes(canonical_bytes(git_rows))
+        observation = {
+            "declarations": declarations,
+            "git_generation_sha256": git_generation,
+            "roots": rows,
+        }
+        return sha256_bytes(canonical_bytes(observation)), observation, git_rows
 
     # Disclosed break-glass. The sealed `generation_sha256` is censused over
     # the immutable snapshot copy, which omits the pruned managed leaves, while
@@ -3709,11 +4243,208 @@ def validate_live_snapshot_generation(
     # is reachable whenever a straggler write lands mid-walk, behind the
     # cursor. The only term that was genuinely dead in the original fence is
     # `first != second`, which the other two comparisons already imply.
-    with phase_timing("validate"):
+    baseline_git_rows: list[dict[str, Any]] | None = None
+    with phase_timing("validate", unit="entries", watchdog=True):
         for _ in range(passes):
-            if epoch() != expected:
-                raise BulkloadError("live source changed after immutable snapshot B")
+            digest, observation, git_rows = epoch()
+            if digest == expected:
+                # This pass reproduced the sealed digest, so its git rows ARE
+                # the sealed rows by collision resistance. Keeping them is the
+                # only way a later straggler pass can name the worktree that
+                # moved: the seal itself carries the git authority as one
+                # aggregate hexdigest and nothing else.
+                baseline_git_rows = git_rows
+                continue
+            raise refuse(
+                "live source changed after immutable snapshot B",
+                phase="validate-live-generation",
+                remedy=(
+                    "Stop the named writer or accept its bytes, then take a "
+                    "fresh capture; the sealed snapshot cannot be re-fenced "
+                    "against a source that has already moved."
+                ),
+                **_diagnose_live_generation(
+                    snapshot,
+                    expected_rows=expected_rows,
+                    observation=observation,
+                    git_rows=git_rows,
+                    baseline_git_rows=baseline_git_rows,
+                ),
+            )
     return True
+
+
+LIVE_GENERATION_CATEGORY_CODES = {
+    "root": "LIVE_GENERATION_ROOT",
+    "sqlite": "LIVE_GENERATION_SQLITE",
+    "declaration": "LIVE_GENERATION_DECLARATION",
+    "git": "LIVE_GENERATION_GIT_AUTHORITY",
+}
+
+
+def _diagnose_live_generation(
+    snapshot: dict[str, Any],
+    *,
+    expected_rows: Sequence[dict[str, Any]],
+    observation: dict[str, Any],
+    git_rows: Sequence[dict[str, Any]],
+    baseline_git_rows: Sequence[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Say which root, seat, SQLite catalog, or git authority moved.
+
+    The sealed body the fence compares against is a single hexdigest over
+    every root generation, every SQLite logical hash, every declaration, and
+    the git authority digest. Each of those terms is *separately* sealed in
+    the same snapshot, so the comparison that produced the refusal can be
+    re-run one term at a time here at no extra cost — the walk is already
+    done, and the observation is in hand.
+    """
+    findings: list[dict[str, Any]] = []
+    categories: list[str] = []
+
+    observed_rows = observation.get("roots", [])
+    for index, expected_root in enumerate(expected_rows):
+        if index >= len(observed_rows):
+            break
+        observed_root = observed_rows[index]
+        live = snapshot["roots"][index]["live"]
+        label = expected_root["label"]
+        if expected_root["generation_sha256"] != observed_root["generation_sha256"]:
+            categories.append("root")
+            findings.append(
+                {
+                    "relation": "root-generation-changed",
+                    "label": label,
+                    "root": live,
+                    "field": "generation_sha256",
+                    "expected": expected_root["generation_sha256"],
+                    "observed": observed_root["generation_sha256"],
+                }
+            )
+        expected_sqlite = {
+            item["relative_path"]: item["logical_sha256"]
+            for item in expected_root["sqlite"]
+        }
+        observed_sqlite = {
+            item["relative_path"]: item["logical_sha256"]
+            for item in observed_root["sqlite"]
+        }
+        for relative in sorted(set(expected_sqlite) | set(observed_sqlite)):
+            if expected_sqlite.get(relative) == observed_sqlite.get(relative):
+                continue
+            categories.append("sqlite")
+            findings.append(
+                {
+                    "relation": "sqlite-logical-changed",
+                    "label": label,
+                    "root": live,
+                    "relative_path": relative,
+                    "field": "logical_sha256",
+                    "expected": expected_sqlite.get(relative),
+                    "observed": observed_sqlite.get(relative),
+                }
+            )
+
+    expected_declarations = {
+        (item["kind"], item["name"]): item for item in snapshot["declarations"]
+    }
+    observed_declarations = {
+        (item["kind"], item["name"]): item
+        for item in observation.get("declarations", [])
+    }
+    for identity in sorted(set(expected_declarations) | set(observed_declarations)):
+        before = expected_declarations.get(identity)
+        after = observed_declarations.get(identity)
+        if before == after:
+            continue
+        categories.append("declaration")
+        if before is None or after is None:
+            findings.append(
+                {
+                    "relation": "declaration-removed"
+                    if after is None
+                    else "declaration-added",
+                    "kind": identity[0],
+                    "name": identity[1],
+                }
+            )
+            continue
+        for field in ("backing", "exists", "link", "logical"):
+            if before.get(field) != after.get(field):
+                findings.append(
+                    {
+                        "relation": "declaration-changed",
+                        "kind": identity[0],
+                        "name": identity[1],
+                        "field": field,
+                        "expected": before.get(field),
+                        "observed": after.get(field),
+                    }
+                )
+
+    git_root = next(
+        (item["live"] for item in snapshot["roots"] if item["label"] == "git"), None
+    )
+    if snapshot["git_generation_sha256"] != observation.get("git_generation_sha256"):
+        categories.append("git")
+        findings.append(
+            {
+                "relation": "git-authority-changed",
+                "root": git_root,
+                "field": "git_generation_sha256",
+                "expected": snapshot["git_generation_sha256"],
+                "observed": observation.get("git_generation_sha256"),
+            }
+        )
+        if baseline_git_rows is not None:
+            findings.extend(_git_authority_diff(baseline_git_rows, git_rows))
+        else:
+            findings.extend(_git_authority_ranking(git_rows))
+
+    distinct = sorted(set(categories))
+    if not distinct:
+        return {
+            "code": "LIVE_GENERATION_EPOCH",
+            "root": None,
+            "label": None,
+            "detail": "no single sealed term reproduced under diagnosis",
+        }
+    code = (
+        LIVE_GENERATION_CATEGORY_CODES[distinct[0]]
+        if len(distinct) == 1
+        else "LIVE_GENERATION_MIXED"
+    )
+    primary = findings[0]
+    changed_labels = sorted(
+        {str(item.get("label")) for item in findings if item.get("label") is not None}
+    )
+    return {
+        "code": code,
+        "root": primary.get("root") or git_root,
+        "label": primary.get("label"),
+        "field": primary.get("field"),
+        "expected": primary.get("expected"),
+        "observed": primary.get("observed"),
+        "count": len(findings),
+        "sample": findings,
+        "detail": (
+            f"changed={len(findings)} categories={','.join(distinct)} "
+            f"roots={','.join(changed_labels) or 'none'} "
+            f"first={_refusal_finding_brief(primary)}"
+        ),
+    }
+
+
+def _refusal_finding_brief(finding: dict[str, Any]) -> str:
+    parts = [str(finding.get("relation"))]
+    for key in ("root", "label", "relative_path", "name", "authority", "worktree"):
+        value = finding.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    field = finding.get("field")
+    if field is not None:
+        parts.append(f"field={field}")
+    return " ".join(parts)
 
 
 def _reverse_snapshot_path(path: str | Path, roots: Sequence[dict[str, str]]) -> str:
@@ -3790,7 +4521,14 @@ def _live_git_authorities(git_root: Path) -> list[tuple[Path, Path]]:
     return authorities
 
 
-def _git_live_generation(git_root: Path) -> str:
+def _git_live_authority_rows(git_root: Path) -> list[dict[str, Any]]:
+    """The exact rows the git generation digest is taken over.
+
+    The generation is still `sha256(canonical_bytes(rows))` over this list, so
+    no sealed byte changes. Returning the rows rather than the digest is what
+    lets a refusal name the authority, worktree, HEAD, or index that moved
+    instead of printing two hexdigests the operator cannot invert.
+    """
     authorities: dict[str, Path] = {}
     for repository, common in _live_git_authorities(git_root):
         authorities.setdefault(os.fspath(common), repository)
@@ -3828,7 +4566,122 @@ def _git_live_generation(git_root: Path) -> str:
                 "worktrees": observed_worktrees,
             }
         )
-    return sha256_bytes(canonical_bytes(rows))
+    return rows
+
+
+WORKTREE_AUTHORITY_FIELDS = (
+    "branch",
+    "detached",
+    "head",
+    "index_sha256",
+    "locked",
+    "prunable",
+)
+
+
+def _git_authority_diff(
+    expected: Sequence[dict[str, Any]], observed: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Name the authorities, worktrees, and fields that moved between two rows.
+
+    This is what turns "Git authority changed" into "worktree
+    /Users/jess/git/foo head 1a2b -> 3c4d". Rows are keyed on the common
+    directory and then on the worktree path, so an added or removed
+    repository or worktree is reported as such rather than as a field
+    mismatch on whatever happened to sort into that position.
+    """
+    before = {row["common"]: row for row in expected}
+    after = {row["common"]: row for row in observed}
+    findings: list[dict[str, Any]] = []
+    for common in sorted(set(before) | set(after)):
+        if common not in after:
+            findings.append({"authority": common, "relation": "authority-removed"})
+            continue
+        if common not in before:
+            findings.append({"authority": common, "relation": "authority-added"})
+            continue
+        old, new = before[common], after[common]
+        if old.get("refs") != new.get("refs"):
+            findings.append(
+                {
+                    "authority": common,
+                    "relation": "refs-changed",
+                    "field": "refs",
+                    "expected": _git_refs_summary(old.get("refs")),
+                    "observed": _git_refs_summary(new.get("refs")),
+                }
+            )
+        old_worktrees = {item["path"]: item for item in old.get("worktrees", [])}
+        new_worktrees = {item["path"]: item for item in new.get("worktrees", [])}
+        for path in sorted(set(old_worktrees) | set(new_worktrees)):
+            if path not in new_worktrees:
+                findings.append(
+                    {
+                        "authority": common,
+                        "worktree": path,
+                        "relation": "worktree-removed",
+                    }
+                )
+                continue
+            if path not in old_worktrees:
+                findings.append(
+                    {
+                        "authority": common,
+                        "worktree": path,
+                        "relation": "worktree-added",
+                    }
+                )
+                continue
+            for field in WORKTREE_AUTHORITY_FIELDS:
+                if old_worktrees[path].get(field) != new_worktrees[path].get(field):
+                    findings.append(
+                        {
+                            "authority": common,
+                            "worktree": path,
+                            "relation": "worktree-changed",
+                            "field": field,
+                            "expected": old_worktrees[path].get(field),
+                            "observed": new_worktrees[path].get(field),
+                        }
+                    )
+    return findings
+
+
+def _git_refs_summary(refs: Any) -> Any:
+    """A bounded stand-in for a whole ref table inside a refusal record."""
+    if isinstance(refs, dict):
+        return {"kind": "refs", "count": len(refs)}
+    if isinstance(refs, list):
+        return {"kind": "refs", "count": len(refs)}
+    return refs
+
+
+def _git_authority_ranking(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank observed authorities by git-directory mtime, newest first.
+
+    Used only when nothing can be diffed — when the seal carries the git
+    generation as one aggregate digest and no matching baseline observation
+    exists. This is explicitly a heuristic ranking of where to look, not a
+    claim about what changed, and every sample it produces says so.
+    """
+    ranked: list[dict[str, Any]] = []
+    for row in rows:
+        common = row.get("common")
+        try:
+            mtime_ns = os.stat(common).st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        ranked.append(
+            {
+                "relation": "observed-only",
+                "basis": "git-dir-mtime-ranked",
+                "authority": common,
+                "mtime_ns": mtime_ns,
+                "worktrees": len(row.get("worktrees", [])),
+            }
+        )
+    ranked.sort(key=lambda item: (item["mtime_ns"] is None, -(item["mtime_ns"] or 0)))
+    return ranked
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -4159,12 +5012,16 @@ def _capture_live_snapshot(
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
         spill_dir = _base_record_spill_dir(snapshot_root, partial)
-        with phase_timing("base-custody"):
+        # No watchdog: this encloses `custody-base`, which carries the real
+        # denominator and ticks per record. Two heartbeat streams for the same
+        # 940 s of work, one of them permanently at `done=0`, reads as stalled.
+        with phase_timing("base-custody", unit="records"):
             base_index = validate_snapshot_custody(
                 base_snapshot,
                 collect_records=True,
                 payload_custody=base_custody,
                 spill_dir=spill_dir,
+                progress_phase="custody-base",
             )
         try:
             base_root = Path(base_snapshot["seal_path"]).parent
@@ -4192,16 +5049,20 @@ def _capture_live_snapshot(
             raise
     methods: dict[str, int] = defaultdict(int)
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
-    censuses: list[tuple[str, int]] = []
+    censuses: list[tuple[str, int, int]] = []
     durable_makedirs(snapshot_root.parent)
     for label, live, provider, excluded in descriptors:
-        with phase_timing("census", label) as sample:
+        with phase_timing("census", label, unit="entries") as sample:
             observed = _tree_census(live, provider=provider, exclusions=excluded)
-            sample.files = observed[1]
+            # `_tree_census` returns (digest, charged_bytes, entries); the byte
+            # total used to land in `files=`, which is why a real capture log
+            # read `files=67779718491`.
+            sample.bytes = observed[1]
+            sample.files = observed[2]
         censuses.append(observed)
     charged_bytes = 0
     for index, (label, live, provider, excluded) in enumerate(descriptors):
-        with phase_timing("charge", label) as sample:
+        with phase_timing("charge", label, unit="entries", watchdog=True) as sample:
             charge = _snapshot_delta_charge(
                 live,
                 base_paths[index],
@@ -4219,13 +5080,15 @@ def _capture_live_snapshot(
     published = False
     try:
         durable_makedirs(partial)
-        git_generation = _git_live_generation(git_backing)
-        git_tree_generation = _tree_generation(
-            git_backing, provider=None, exclusions=()
-        )
+        git_authority_rows = _git_live_authority_rows(git_backing)
+        git_generation = sha256_bytes(canonical_bytes(git_authority_rows))
+        with phase_timing("generation-pre", "git", unit="entries"):
+            git_tree_generation = _tree_generation(
+                git_backing, provider=None, exclusions=()
+            )
         for index, (label, live, provider, excluded) in enumerate(descriptors):
             work_target = Path(work_roots[index]["snapshot"])
-            with phase_timing("copy", label) as sample:
+            with phase_timing("copy", label, unit="entries") as sample:
                 observed_methods, observed_ledger = _copy_live_tree(
                     live,
                     work_target,
@@ -4239,19 +5102,71 @@ def _capture_live_snapshot(
             transfer_ledgers.append(observed_ledger)
             for method, count in observed_methods.items():
                 methods[method] += count
-            after = _tree_census(live, provider=provider, exclusions=excluded)
+            with phase_timing("recensus", label, unit="entries") as sample:
+                after = _tree_census(live, provider=provider, exclusions=excluded)
+                sample.bytes = after[1]
+                sample.files = after[2]
             if censuses[index][0] != after[0]:
                 raise BulkloadError(f"live snapshot path set changed: {live}")
         _rewrite_git_snapshot_links(git_controls, work_roots)
-        if _git_live_generation(git_backing) != git_generation:
-            raise BulkloadError("Git authority changed during live snapshot")
-        if (
-            _tree_generation(git_backing, provider=None, exclusions=())
-            != git_tree_generation
-        ):
-            raise BulkloadError("Git bytes changed during live snapshot")
+        observed_authority_rows = _git_live_authority_rows(git_backing)
+        observed_git_generation = sha256_bytes(canonical_bytes(observed_authority_rows))
+        if observed_git_generation != git_generation:
+            # Both row sets are in hand here, so this refusal can name the
+            # repository, worktree, HEAD, or index that moved during the copy
+            # instead of comparing two hexdigests the operator cannot invert.
+            findings = _git_authority_diff(git_authority_rows, observed_authority_rows)
+            primary = findings[0] if findings else {}
+            raise refuse(
+                "Git authority changed during live snapshot",
+                code="LIVE_SNAPSHOT_GIT_AUTHORITY",
+                phase="capture-live-snapshot",
+                root=git_backing,
+                label="git",
+                field=primary.get("field"),
+                expected=primary.get("expected"),
+                observed=primary.get("observed"),
+                count=len(findings),
+                sample=findings,
+                remedy=(
+                    "A Git writer moved refs, HEAD, or an index under the "
+                    "capture. Let it settle, then re-run the capture; the "
+                    "snapshot cannot be sealed across the change."
+                ),
+                detail=(
+                    f"changed={len(findings)} first={_refusal_finding_brief(primary)}"
+                    if findings
+                    else f"expected={git_generation} observed={observed_git_generation}"
+                ),
+            )
+        with phase_timing("generation-post", "git", unit="entries"):
+            observed_tree_generation = _tree_generation(
+                git_backing, provider=None, exclusions=()
+            )
+        if observed_tree_generation != git_tree_generation:
+            raise refuse(
+                "Git bytes changed during live snapshot",
+                code="LIVE_SNAPSHOT_GIT_BYTES",
+                phase="capture-live-snapshot",
+                root=git_backing,
+                label="git",
+                field="generation_sha256",
+                expected=git_tree_generation,
+                observed=observed_tree_generation,
+                remedy=(
+                    "Content under the Git root changed during the copy. "
+                    "Re-run the capture. The content census keeps a rolling "
+                    "digest and no path set, so this refusal names the root "
+                    "but cannot name the file."
+                ),
+                detail=(
+                    f"root={os.fspath(git_backing)} "
+                    f"expected={git_tree_generation} "
+                    f"observed={observed_tree_generation}"
+                ),
+            )
         for index, (label, _, provider, excluded) in enumerate(descriptors):
-            with phase_timing("digest", label):
+            with phase_timing("digest", label, unit="entries"):
                 roots[index]["generation_sha256"] = (
                     git_tree_generation
                     if roots[index]["label"] == "git"
@@ -4284,7 +5199,7 @@ def _capture_live_snapshot(
             binding = seat_bindings[name]
             snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
             snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
-        with phase_timing("catalog"):
+        with phase_timing("catalog", unit="workspaces", watchdog=True):
             captured = capture_agent_state(
                 role=role,
                 home=home,
@@ -4343,7 +5258,7 @@ def _capture_live_snapshot(
                 if item["classification"] == "sqlite"
             ]
         partial_index = partial / "snapshot-index.jsonl"
-        with phase_timing("seal") as sample:
+        with phase_timing("seal", watchdog=True) as sample:
             index_sha256, index_entries = _write_snapshot_index(
                 partial_index, work_roots, transfer_ledgers
             )
@@ -4466,7 +5381,7 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
         "on",
     }:
         return
-    with phase_timing("witness"):
+    with phase_timing("witness", unit="entries"):
         try:
             observed = validate_live_snapshot_generation(snapshot, passes=1)
             divergence = "none" if observed else "unobserved: live-fence break-glass"
@@ -4636,11 +5551,21 @@ def capture_agent_state(
             return common, representative, error
 
     workspace_workers = workspace_worker_count(jobs, len(workspace_inputs))
+    progress_total(len(workspace_inputs))
+    workspace_results: list[
+        tuple[
+            Path,
+            Path,
+            tuple[dict[str, Any], list[dict[str, str]]]
+            | _OpaqueGitFallback
+            | BulkloadError,
+        ]
+    ] = []
     if workspace_workers:
         with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
-            workspace_results = list(pool.map(capture_workspace, workspace_inputs))
-    else:
-        workspace_results = []
+            for outcome in pool.map(capture_workspace, workspace_inputs):
+                workspace_results.append(outcome)
+                progress_tick()
     workspaces: list[dict[str, Any]] = []
     for common, representative, result in workspace_results:
         if isinstance(result, tuple):
@@ -4953,7 +5878,99 @@ def validate_agent_capture(
             or isinstance(snapshot["max_sqlite_rows"], bool)
             or snapshot["max_sqlite_rows"] < 1
         ):
-            raise BulkloadError("AgentCaptureV4 live snapshot seal is invalid")
+            raise refuse(
+                "AgentCaptureV4 live snapshot seal is invalid",
+                phase="validate-agent-capture",
+                root=snapshot.get("seal_path"),
+                label=snapshot.get("snapshot_id"),
+                remedy=(
+                    "The seal does not describe this capture. Re-capture "
+                    "rather than editing the seal; a contract_sha256 or "
+                    "inventory_sha256 mismatch means the capture flags or "
+                    "the catalog changed under it."
+                ),
+                **first_mismatch(
+                    "CAPTURE_SEAL",
+                    (
+                        refusal_eq(
+                            "MODE",
+                            "snapshot.mode",
+                            LIVE_SNAPSHOT_MODE,
+                            lambda: snapshot["mode"],
+                        ),
+                        refusal_eq(
+                            "SNAPSHOT_ID",
+                            "snapshot.snapshot_id",
+                            lambda: value["capture_id"],
+                            lambda: snapshot["snapshot_id"],
+                        ),
+                        refusal_eq(
+                            "CONTRACT_DIGEST",
+                            "snapshot.contract_sha256",
+                            lambda: _snapshot_contract(catalog),
+                            lambda: snapshot["contract_sha256"],
+                        ),
+                        refusal_eq(
+                            "INVENTORY_DIGEST",
+                            "snapshot.inventory_sha256",
+                            lambda: sha256_bytes(
+                                canonical_bytes({**catalog, "snapshot": None})
+                            ),
+                            lambda: snapshot["inventory_sha256"],
+                        ),
+                        refusal_check(
+                            "GIT_GENERATION",
+                            "snapshot.git_generation_sha256",
+                            lambda: bool(
+                                re.fullmatch(
+                                    r"[0-9a-f]{64}",
+                                    snapshot["git_generation_sha256"],
+                                )
+                            ),
+                            "64 lowercase hex characters",
+                            lambda: snapshot["git_generation_sha256"],
+                        ),
+                        refusal_check(
+                            "INDEX_ENTRIES",
+                            "snapshot.index_entries",
+                            lambda: (
+                                isinstance(snapshot["index_entries"], int)
+                                and not isinstance(snapshot["index_entries"], bool)
+                                and snapshot["index_entries"] >= 1
+                            ),
+                            "a positive integer",
+                            lambda: snapshot["index_entries"],
+                        ),
+                        refusal_check(
+                            "INDEX_PATH",
+                            "snapshot.index_path",
+                            lambda: Path(snapshot["index_path"]).is_absolute(),
+                            "an absolute path",
+                            lambda: snapshot["index_path"],
+                        ),
+                        refusal_check(
+                            "INDEX_DIGEST",
+                            "snapshot.index_sha256",
+                            lambda: bool(
+                                re.fullmatch(r"[0-9a-f]{64}", snapshot["index_sha256"])
+                            ),
+                            "64 lowercase hex characters",
+                            lambda: snapshot["index_sha256"],
+                        ),
+                        refusal_check(
+                            "MAX_SQLITE_ROWS",
+                            "snapshot.max_sqlite_rows",
+                            lambda: (
+                                isinstance(snapshot["max_sqlite_rows"], int)
+                                and not isinstance(snapshot["max_sqlite_rows"], bool)
+                                and snapshot["max_sqlite_rows"] >= 1
+                            ),
+                            "a positive integer",
+                            lambda: snapshot["max_sqlite_rows"],
+                        ),
+                    ),
+                ),
+            )
         if snapshot["base"] is not None:
             require_exact_keys(
                 snapshot["base"],

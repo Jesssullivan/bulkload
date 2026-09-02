@@ -78,6 +78,20 @@ py_test(
 )
 
 py_test(
+    name = "refusal_record_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_refusal_records.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_refusal_records.py",
+        "tests/test_wave0_perf.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "custody_source_fold_tests",
     imports = ["tests"],
     legacy_create_init = 0,
@@ -185,6 +199,7 @@ test_suite(
         ":custody_source_fold_tests",
         ":installer_test",
         ":mover_tests",
+        ":refusal_record_tests",
         ":repo_contract_test",
         ":runtime_bootstrap_tests",
         ":skill_contract_test",
