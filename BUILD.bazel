@@ -107,6 +107,10 @@ py_test(
     size = "small",
     srcs = ["tests/test_runtime_bootstrap.py"],
     data = [":skill_bundle"],
+    # `test_runtime_closure_lists_agree` imports `RUNTIME_SOURCE_NAMES` to
+    # compare it against the launcher's own `RUNTIME_FILES`, so this target
+    # needs the library on its import path and not only in its runfiles.
+    deps = [":bulkload_lib"],
 )
 
 py_test(
