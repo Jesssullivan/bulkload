@@ -101,6 +101,14 @@ def _pin_sources(root: Path) -> dict[str, tuple[Path, bytes, bool]]:
     # keeps the launcher's own trust channel (BULKLOAD_RUNTIME_SOURCE_SHA256,
     # always overwritten below) from leaking a stale value across launcher
     # invocations inside one process tree — the defect a setdefault had.
+    #
+    # The pin is a fix for an engine whose CUSTODY SEMANTICS are unchanged. It
+    # must not be used to carry a catalog across a change in what the custody
+    # comparison means: a seal written by one runtime and read by another whose
+    # required/seen fold differs is a silent mismatch, because the pin makes
+    # the closure fence agree while the two engines no longer agree on which
+    # paths are the same path. When the fold changes, re-capture. Every seal
+    # states the folding it was written under in `source_path_folding`.
     os.environ["BULKLOAD_RUNTIME_SOURCE_SHA256"] = os.environ.get(
         "BULKLOAD_RUNTIME_SOURCE_PIN", closure
     )

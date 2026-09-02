@@ -78,6 +78,20 @@ py_test(
 )
 
 py_test(
+    name = "custody_source_fold_tests",
+    imports = ["tests"],
+    legacy_create_init = 0,
+    main = "tests/test_custody_source_fold.py",
+    size = "large",
+    srcs = [
+        "tests/test_bulkload.py",
+        "tests/test_custody_source_fold.py",
+        "tests/test_wave0_perf.py",
+    ],
+    deps = [":bulkload_lib"],
+)
+
+py_test(
     name = "bazel_binary_smoke_test",
     legacy_create_init = 0,
     main = "tests/test_bazel_binary_smoke.py",
@@ -164,6 +178,7 @@ test_suite(
         ":bazel_binary_smoke_test",
         ":bulkload_tests",
         ":ci_contract_test",
+        ":custody_source_fold_tests",
         ":installer_test",
         ":mover_tests",
         ":repo_contract_test",
