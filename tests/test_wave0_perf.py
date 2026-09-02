@@ -28,7 +28,12 @@ from bulkload_lib import cli
 from bulkload_lib.cli import _agent_stage, build_parser
 from bulkload_lib import executor
 from bulkload_lib.executor import push_agent_transport, stage_agent_plan
-from bulkload_lib.model import BulkloadError, canonical_bytes, sha256_bytes
+from bulkload_lib.model import (
+    EXIT_REFUSED,
+    BulkloadError,
+    canonical_bytes,
+    sha256_bytes,
+)
 from bulkload_lib import scanner
 from bulkload_lib.scanner import (
     _jsonl_records,
@@ -490,9 +495,10 @@ class LiveFenceBreakGlassTests(unittest.TestCase):
                 os.environ.pop(BREAK_GLASS, None)
                 with contextlib.redirect_stderr(honest):
                     scanner._witness_epoch(snapshot)
-            self.assertIn(
-                "bulkload-witness divergence=BulkloadError", honest.getvalue()
-            )
+            # The fence raises the `EpochRefusal` specialisation of
+            # `BulkloadError`, and the witness prints the concrete type it
+            # caught, so this is the name a real divergence arrives under.
+            self.assertIn("bulkload-witness divergence=EpochRefusal", honest.getvalue())
 
             environment = {"BULKLOAD_WITNESS_EPOCH": "1"}
             environment.update(self.open_glass(snapshot, note))
@@ -1817,11 +1823,11 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                         str(log_path),
                     ]
                 )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             runs = self._lines(log_path.read_text(encoding="utf-8"), "bulkload-run")
             self.assertEqual([item["event"] for item in runs], ["start", "end"])
             self.assertEqual(runs[1]["status"], "fail")
-            self.assertEqual(runs[1]["exit"], "1")
+            self.assertEqual(runs[1]["exit"], str(EXIT_REFUSED))
 
     def test_unreadable_evidence_plants_nothing_and_still_names_the_file(self) -> None:
         """The log is created only once the complete root set has cleared it.
@@ -1852,7 +1858,7 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                         str(log_path),
                     ]
                 )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertFalse(log_path.exists())
             self.assertIn("missing-a.json", stream.getvalue())
             runs = self._lines(stream.getvalue(), "bulkload-run")
@@ -1929,7 +1935,7 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                         str(log_path),
                     ]
                 )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("progress log overlaps live root", stream.getvalue())
             self.assertFalse(log_path.exists())
 
@@ -1981,8 +1987,8 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                             str(root / "plan.json"),
                         ]
                     )
-            self.assertEqual(code, 1)
-            self.assertIn("bulkload: FAIL:", captured.getvalue())
+            self.assertEqual(code, EXIT_REFUSED)
+            self.assertIn("bulkload: FAIL[4]:", captured.getvalue())
             self.assertIn("missing-a.json", captured.getvalue())
 
     def test_a_measured_zero_is_not_an_unmeasured_field(self) -> None:
@@ -2120,7 +2126,7 @@ class DefaultOnTelemetryTests(unittest.TestCase):
                         str(fixture.source_git / "progress.log"),
                     ]
                 )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("progress log overlaps live root", stream.getvalue())
             self.assertFalse((fixture.source_git / "progress.log").exists())
 

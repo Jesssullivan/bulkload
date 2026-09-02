@@ -31,6 +31,7 @@ from .model import (
     AGENT_CAPTURE_SCHEMA,
     GIT_WORKSPACE_SCHEMA,
     BulkloadError,
+    EpochRefusal,
     MAX_JSON_BYTES,
     assert_no_overlap,
     atomic_write_json,
@@ -923,7 +924,7 @@ def _declared_root(
     else:
         raise BulkloadError("declared root is neither a directory nor a directory link")
     if _stable_stat(logical) != before:
-        raise BulkloadError("declared root changed during capture")
+        raise EpochRefusal("declared root changed during capture")
     return logical, backing, proof, True
 
 
@@ -978,7 +979,7 @@ def _file_record(
     else:
         raise BulkloadError(f"special filesystem entry is unsupported: {path}")
     if _stable_stat(path) != before:
-        raise BulkloadError(f"filesystem entry changed during capture: {path}")
+        raise EpochRefusal(f"filesystem entry changed during capture: {path}")
     return {
         "classification": classification,
         "kind": kind,
@@ -2435,7 +2436,7 @@ def _capture_seat(
         record["destination_relative_path"] = record["relative_path"]
         record["identity"] = record["relative_path"]
         if _stable_stat(logical) != before:
-            raise BulkloadError("file seat changed during capture")
+            raise EpochRefusal("file seat changed during capture")
         return {
             "destination_path": destination,
             "exists": True,
@@ -2586,7 +2587,7 @@ def _tree_census(
             before[:5] == after[:5] if live_sqlite or not content else before == after
         )
         if not stable_identity:
-            raise BulkloadError(f"live snapshot census entry changed: {path}")
+            raise EpochRefusal(f"live snapshot census entry changed: {path}")
         if portable:
             authority = [before[2], before[3]]
             if not live_sqlite:
@@ -2686,7 +2687,7 @@ def _base_regular_reusable(
     before = _stable_stat(source)
     reusable = sha256_file(source) == expected_digest
     if _stable_stat(source) != before:
-        raise BulkloadError(f"live file changed during base comparison: {source}")
+        raise EpochRefusal(f"live file changed during base comparison: {source}")
     return reusable
 
 
@@ -2707,7 +2708,7 @@ def _copy_live_regular(
         result = reflink_clone(base, destination, expected_sha256=expected, mode=mode)
         if _stable_stat(source) != before:
             destination.unlink(missing_ok=True)
-            raise BulkloadError(f"live file changed during base clone: {source}")
+            raise EpochRefusal(f"live file changed during base clone: {source}")
         return f"base-{result['method']}"
     source_info = source.stat(follow_symlinks=False)
     if source_info.st_dev == destination.parent.stat().st_dev:
@@ -2723,7 +2724,7 @@ def _copy_live_regular(
                 return result["method"]
             destination.unlink(missing_ok=True)
         else:
-            raise BulkloadError(f"live file did not converge for snapshot: {source}")
+            raise EpochRefusal(f"live file did not converge for snapshot: {source}")
     for _ in range(3):
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{destination.name}.snapshot-", dir=destination.parent
@@ -2771,7 +2772,7 @@ def _copy_live_regular(
                 pass
             temporary.unlink(missing_ok=True)
             raise
-    raise BulkloadError(f"live file did not converge for snapshot: {source}")
+    raise EpochRefusal(f"live file did not converge for snapshot: {source}")
 
 
 def _copy_live_tree(
@@ -4124,7 +4125,7 @@ def validate_live_snapshot_generation(
                     observed = (logical, logical, None, False)
                 else:
                     if not stat.S_ISREG(info.st_mode):
-                        raise BulkloadError("declared file seat changed type after B")
+                        raise EpochRefusal("declared file seat changed type after B")
                     observed = (logical, resolve_real(logical), None, True)
             else:
                 observed = _declared_root(logical, allow_absent=True)
@@ -4270,6 +4271,7 @@ def validate_live_snapshot_generation(
                     git_rows=git_rows,
                     baseline_git_rows=baseline_git_rows,
                 ),
+                kind=EpochRefusal,
             )
     return True
 
@@ -5107,7 +5109,7 @@ def _capture_live_snapshot(
                 sample.bytes = after[1]
                 sample.files = after[2]
             if censuses[index][0] != after[0]:
-                raise BulkloadError(f"live snapshot path set changed: {live}")
+                raise EpochRefusal(f"live snapshot path set changed: {live}")
         _rewrite_git_snapshot_links(git_controls, work_roots)
         observed_authority_rows = _git_live_authority_rows(git_backing)
         observed_git_generation = sha256_bytes(canonical_bytes(observed_authority_rows))
@@ -5138,6 +5140,7 @@ def _capture_live_snapshot(
                     if findings
                     else f"expected={git_generation} observed={observed_git_generation}"
                 ),
+                kind=EpochRefusal,
             )
         with phase_timing("generation-post", "git", unit="entries"):
             observed_tree_generation = _tree_generation(
@@ -5164,6 +5167,7 @@ def _capture_live_snapshot(
                     f"expected={git_tree_generation} "
                     f"observed={observed_tree_generation}"
                 ),
+                kind=EpochRefusal,
             )
         for index, (label, _, provider, excluded) in enumerate(descriptors):
             with phase_timing("digest", label, unit="entries"):
@@ -6222,7 +6226,7 @@ def stable_capture_pair(
             first["catalog_sha256"] != second["catalog_sha256"]
             or first["catalog"] != second["catalog"]
         ):
-            raise BulkloadError(f"{role} A/B captures are not byte-stable")
+            raise EpochRefusal(f"{role} A/B captures are not byte-stable")
     else:
         first_snapshot = first["catalog"]["snapshot"]
         second_snapshot = second["catalog"]["snapshot"]
@@ -6236,11 +6240,11 @@ def stable_capture_pair(
                 "snapshot_id": first_snapshot["snapshot_id"],
             }
         ):
-            raise BulkloadError(f"{role} A/B live snapshot contract is unstable")
+            raise EpochRefusal(f"{role} A/B live snapshot contract is unstable")
         missing = _catalog_path_identities(first["catalog"]) - _catalog_path_identities(
             second["catalog"]
         )
         if missing:
-            raise BulkloadError(f"{role} A/B live snapshot loses prior custody")
+            raise EpochRefusal(f"{role} A/B live snapshot loses prior custody")
     if not first["complete"] or not second["complete"]:
         raise BulkloadError(f"{role} captures contain blockers")

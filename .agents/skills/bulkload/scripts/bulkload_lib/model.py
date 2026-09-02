@@ -38,8 +38,24 @@ RUNTIME_SOURCE_NAMES = (
 )
 
 
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_BOOTSTRAP = 2
+EXIT_EPOCH = 3
+EXIT_REFUSED = 4
+EXIT_STORAGE = 5
+EXIT_INTERNAL = 6
+EXIT_INTERRUPTED = 130
+
+
 class BulkloadError(RuntimeError):
     """A fail-closed protocol, custody, or safety error.
+
+    `exit_code` is the documented process status this refusal class exits
+    with. The base class is the general custody/plan refusal (4); the two
+    subclasses below narrow it where the engine can prove a more specific
+    cause. Every refusal remains a `BulkloadError`, so existing handlers and
+    tests that catch the base class are unaffected.
 
     `refusal` carries the structured refusal record for the sites that have
     one. It is keyword-only and defaults to None so that every existing
@@ -48,9 +64,41 @@ class BulkloadError(RuntimeError):
     record to write. Nothing reads `refusal` on the success path.
     """
 
+    exit_code = EXIT_REFUSED
+
     def __init__(self, *args: Any, refusal: dict[str, Any] | None = None) -> None:
         super().__init__(*args)
         self.refusal = refusal
+
+
+class EpochRefusal(BulkloadError):
+    """The live source moved under an in-flight capture or A/B pair.
+
+    Raised only where the engine observed live divergence: an entry, root,
+    seat, or Git authority that changed during capture, a snapshot that did
+    not converge, or an A/B pair that is not stable. This is the retryable
+    class -- the inputs were not wrong, the host moved.
+    """
+
+    exit_code = EXIT_EPOCH
+
+
+class StorageRefusal(BulkloadError):
+    """A storage volume cannot hold or clone what was charged against it.
+
+    Raised by the capacity gate and by a required reflink that failed. The
+    volume is deliberately not named in the class: the same gate guards the
+    destination stage, the rollback custody root, AND the source host's own
+    live-snapshot custody (`scanner.py` `_capture_live_snapshot`), which runs
+    during `agent-capture` -- a verb that has no destination at all. Naming
+    this class after the destination would send an operator whose source disk
+    filled to the wrong machine. Every message raised here names the path, so
+    the caller reads the volume off the message and the host off the path. A
+    full-copy fallback is forbidden, so this is a hard stop and not a
+    degraded-mode warning.
+    """
+
+    exit_code = EXIT_STORAGE
 
 
 REFUSAL_SCHEMA = "dev.tinyland.bulkload.refusal.v1"
@@ -167,6 +215,7 @@ def refuse(
     observed: Any = None,
     count: Any = None,
     sample: Iterable[Any] = (),
+    kind: type[BulkloadError] = BulkloadError,
 ) -> BulkloadError:
     """Return a BulkloadError whose message is the original static string.
 
@@ -174,10 +223,16 @@ def refuse(
     exact prefix is deliberate: every caller, runbook, and test that matches
     on the historical text keeps matching, while the operator finally gets the
     naming clause that decides what to do next.
+
+    `kind` picks the refusal class, and with it the documented exit code. A
+    structured record and an exit code are two independent facts about the
+    same refusal: a live-generation divergence is an `EpochRefusal` (3)
+    whether or not it can name the worktree that moved, so the class travels
+    with the site rather than with the record.
     """
     line = f"{message}: {detail}" if detail else message
     line = _refusal_text(line)
-    return BulkloadError(
+    return kind(
         line,
         refusal=refusal_record(
             code=code,
@@ -652,8 +707,9 @@ def require_capacity(
     observed = capacity_observation(path)
     required = charged_bytes + reserve_bytes
     if observed["available_bytes"] < required:
-        raise BulkloadError(
-            "capacity gate failed: exact charged bytes plus reserve exceed available bytes"
+        raise StorageRefusal(
+            f"capacity gate failed on {path}: exact charged bytes plus reserve "
+            f"({required}) exceed available bytes ({observed['available_bytes']})"
         )
     return {
         **observed,
@@ -750,7 +806,7 @@ def reflink_clone(
         temporary.unlink(missing_ok=True)
         if isinstance(error, BulkloadError):
             raise
-        raise BulkloadError(
+        raise StorageRefusal(
             f"required reflink clone failed for {destination}; full-copy fallback is forbidden"
         ) from error
 

@@ -24,6 +24,7 @@ from bulkload_lib import executor
 from bulkload_lib import scanner
 from bulkload_lib.model import (
     AGENT_STAGE_SCHEMA,
+    EXIT_REFUSED,
     REFUSAL_SAMPLE_LIMIT,
     REFUSAL_SCHEMA,
     REFUSAL_STRING_LIMIT,
@@ -294,7 +295,7 @@ class FailureOutputTests(unittest.TestCase):
                 with mock.patch.object(cli, "build_parser") as parser:
                     parser.return_value.parse_args.return_value = arguments
                     code = cli.main([])
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             record = json.loads(failure.read_text(encoding="utf-8"))
             self.assertEqual(record["code"], "CUSTODY_REQUIRED_NOT_SEEN")
             self.assertEqual(record["command"], "agent-rollback")
@@ -324,7 +325,7 @@ class FailureOutputTests(unittest.TestCase):
             with mock.patch.object(cli, "build_parser") as parser:
                 parser.return_value.parse_args.return_value = arguments
                 code = cli.main([])
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             record = json.loads(failure.read_text(encoding="utf-8"))
             self.assertEqual(record["code"], "UNCLASSIFIED")
             self.assertEqual(record["schema"], REFUSAL_SCHEMA)
@@ -425,7 +426,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                             spelling,
                         )
                     )
-                    self.assertEqual(code, 1)
+                    self.assertEqual(code, EXIT_REFUSED)
                     self.assertIn("must differ from the evidence output", stderr)
                     self.assertEqual(evidence.read_bytes(), b"EVIDENCE\n")
 
@@ -454,7 +455,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     os.fspath(root / "ev" / "PLAN.json"),
                 ]
             )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("must differ from the --plan artifact", stderr)
             self.assertEqual(plan.read_bytes(), b"PLAN\n")
 
@@ -470,7 +471,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     "-",
                 )
             )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("stdout carries evidence", stderr)
 
     def test_the_failure_path_may_not_land_inside_a_live_root(self) -> None:
@@ -491,7 +492,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                             os.fspath(planted),
                         )
                     )
-                    self.assertEqual(code, 1)
+                    self.assertEqual(code, EXIT_REFUSED)
                     self.assertIn("failure output overlaps live root", stderr)
                     self.assertEqual(sorted(live.iterdir()), [])
 
@@ -509,7 +510,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     os.fspath(root / "HOME" / "REFUSAL.json"),
                 )
             )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("failure output overlaps live root", stderr)
             self.assertEqual(sorted((root / "home").iterdir()), [])
 
@@ -533,7 +534,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     os.fspath(stage / "REFUSAL.json"),
                 ]
             )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("failure output overlaps live root", stderr)
             self.assertEqual(sorted(stage.iterdir()), [])
 
@@ -555,11 +556,11 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     ):
                         with mock.patch.object(cli, "atomic_write", side_effect=raised):
                             code, stderr = self.run_main(argv)
-                    self.assertEqual(code, 1)
-                    self.assertIn("bulkload: FAIL: the refusal", stderr)
+                    self.assertEqual(code, EXIT_REFUSED)
+                    self.assertIn("bulkload: FAIL[4]: the refusal", stderr)
                     self.assertIn("WARN: cannot write failure record", stderr)
                     self.assertLess(
-                        stderr.index("FAIL:"), stderr.index("WARN:"), stderr
+                        stderr.index("FAIL["), stderr.index("WARN:"), stderr
                     )
 
     def test_an_unexpandable_failure_path_refuses_instead_of_tracebacking(self) -> None:
@@ -574,7 +575,7 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     "~nosuchuser0987/failure.json",
                 )
             )
-            self.assertEqual(code, 1)
+            self.assertEqual(code, EXIT_REFUSED)
             self.assertIn("cannot expand path", stderr)
 
     def test_a_lawful_failure_path_beside_the_evidence_still_works(self) -> None:
@@ -594,8 +595,8 @@ class FailureOutputWriteChannelTests(unittest.TestCase):
                     os.fspath(failure),
                 )
             )
-            self.assertEqual(code, 1)
-            self.assertIn("bulkload: FAIL:", stderr)
+            self.assertEqual(code, EXIT_REFUSED)
+            self.assertIn("bulkload: FAIL[4]:", stderr)
             record = json.loads(failure.read_text(encoding="utf-8"))
             self.assertEqual(record["command"], "agent-capture")
             self.assertEqual(stat.S_IMODE(failure.stat().st_mode), 0o600)

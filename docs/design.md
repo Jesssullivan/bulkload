@@ -263,3 +263,34 @@ deployment, activation, browser profile migration, or credential rotation. It
 does not mirror undeclared home state and never deletes source data. It does
 not silently resolve structural ambiguity, unsafe typed state, capacity
 shortfall, failed reflinks, or post-plan destination movement.
+
+## Exit codes and rehearsal
+
+Refusals are typed at the process boundary as well as in the receipt. `0` is
+completion; `1` a usage error; `2` a launcher bootstrap failure; `3` a
+quiescence/epoch refusal, meaning the live source moved and the verb is worth
+retrying; `4` the general custody, plan, or typed-invariant refusal; `5` a
+storage refusal from the capacity gate or a required reflink; `6` an
+unexpected internal error, including input evidence that is not the document it
+claims to be; `130` an operator interrupt. `3` and `5` are narrowings of `4`,
+raised only where the engine proved the specific cause, so a caller may branch
+on the number without parsing a message. The table is defined once, in
+`model.py`, and rendered into `--help`, README, and SKILL.md.
+
+Two boundaries keep those two numbers honest. `3` marks a coarse epoch fence --
+a declared root or file seat, a live snapshot's census or Git authority, the
+A/B pair -- and never a single entry: per-entry churn during the walk is
+recorded as a capture blocker, so the capture exits `0` incomplete and the plan
+refuses it `4`. `5` names a volume rather than a role, because the capacity
+gate and the reflink requirement guard the source host's own live-snapshot
+custody as well as the destination stage and the rollback root; every message
+raised there names the path, and `6` always prints its traceback because it is
+the only class with no curated message.
+
+`--dry-run` on capture, plan, stage, and apply reports the exact mutations a
+verb would perform and the refusals reachable without reading the corpus, from
+the same functions the real verb calls, and writes nothing -- including no
+evidence document. It names the gates it did not reach rather than implying it
+checked them. `--progress` reports phase and heartbeat lines on stderr only,
+is on by default whether or not stderr is a terminal -- the silence complaint
+is a redirected-log one -- and never signals a process.
