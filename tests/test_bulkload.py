@@ -430,7 +430,7 @@ class SchemaAndCaptureTests(unittest.TestCase):
 
             for inspect in (
                 scanner._git_snapshot_authorities,
-                scanner._git_live_generation,
+                scanner._git_live_authority_rows,
             ):
                 with self.subTest(inspect=inspect.__name__):
                     with self.assertRaisesRegex(
