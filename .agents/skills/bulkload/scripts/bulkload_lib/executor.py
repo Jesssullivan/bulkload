@@ -31,10 +31,14 @@ from .model import (
     atomic_write_json,
     canonical_bytes,
     durable_makedirs,
+    first_mismatch,
     fsync_directory,
     git_environment,
     new_id,
     read_json,
+    refusal_check,
+    refusal_eq,
+    refuse,
     reflink_clone,
     require_capacity,
     require_digest,
@@ -408,6 +412,27 @@ def _snapshot_allowlist_stream(
     snapshot.seek(0)
 
 
+def _transport_block_diff(
+    left: dict[str, Any], right: dict[str, Any]
+) -> dict[str, Any]:
+    """The fields of `left` that `right` does not reproduce, bounded."""
+    return {
+        key: _snapshot_brief(value) if key == "source_snapshot" else value
+        for key, value in sorted(left.items())
+        if right.get(key) != value
+    }
+
+
+def _snapshot_brief(snapshot: Any) -> Any:
+    """Identify a snapshot inside a refusal without inlining the whole seal."""
+    if not isinstance(snapshot, dict):
+        return snapshot
+    return {
+        "seal_sha256": snapshot.get("seal_sha256"),
+        "snapshot_id": snapshot.get("snapshot_id"),
+    }
+
+
 def _validate_prepare_receipt(
     plan: dict[str, Any],
     phase: str,
@@ -437,7 +462,120 @@ def _validate_prepare_receipt(
         or receipt["transport"]["source_snapshot"] != source.get("snapshot")
         or receipt["transport"]["transport_receipt_sha256"] is not None
     ):
-        raise BulkloadError("prepare receipt is detached from the accepted stage plan")
+        raise refuse(
+            "prepare receipt is detached from the accepted stage plan",
+            phase=f"stage-{phase}-prepare",
+            root=stage_root,
+            label=receipt.get("stage_id"),
+            remedy=(
+                "Re-run agent-stage --transport-mode prepare on the "
+                "destination against this exact plan and stage root; a "
+                "prepare receipt is only valid for the plan digest it names."
+            ),
+            **first_mismatch(
+                "STAGE_PREPARE",
+                (
+                    refusal_eq(
+                        "PLAN_SHA256",
+                        "receipt.plan_sha256",
+                        lambda: plan["plan_sha256"],
+                        lambda: receipt["plan_sha256"],
+                    ),
+                    refusal_eq(
+                        "PHASE", "receipt.phase", phase, lambda: receipt["phase"]
+                    ),
+                    refusal_eq(
+                        "STAGE_ROOT",
+                        "receipt.stage_root",
+                        lambda: os.fspath(stage_root),
+                        lambda: receipt["stage_root"],
+                    ),
+                    refusal_check(
+                        "READY_FOR_APPLY",
+                        "receipt.ready_for_apply",
+                        lambda: not receipt["ready_for_apply"],
+                        False,
+                        lambda: receipt["ready_for_apply"],
+                    ),
+                    refusal_check(
+                        "MANIFEST_ENTRIES",
+                        "receipt.manifest.entries",
+                        lambda: not receipt["manifest"]["entries"],
+                        0,
+                        lambda: len(receipt["manifest"]["entries"]),
+                    ),
+                    refusal_eq(
+                        "TRANSPORT_MODE",
+                        "receipt.transport.mode",
+                        "destination-prepare",
+                        lambda: receipt["transport"]["mode"],
+                    ),
+                    refusal_eq(
+                        "ALLOWLIST_DIGEST",
+                        "receipt.transport.allowlist_sha256",
+                        lambda: sha256_bytes(payload),
+                        lambda: receipt["transport"]["allowlist_sha256"],
+                    ),
+                    refusal_eq(
+                        "ALLOWLIST_SIZE",
+                        "receipt.transport.allowlist_size",
+                        lambda: len(payload),
+                        lambda: receipt["transport"]["allowlist_size"],
+                    ),
+                    refusal_eq(
+                        "DESTINATION_HOST",
+                        "receipt.transport.destination_host",
+                        lambda: destination["transport"]["hostname"],
+                        lambda: receipt["transport"]["destination_host"],
+                    ),
+                    refusal_eq(
+                        "DESTINATION_RSYNC",
+                        "receipt.transport.destination_rsync",
+                        lambda: destination["transport"]["rsync"],
+                        lambda: receipt["transport"]["destination_rsync"],
+                    ),
+                    refusal_eq(
+                        "SOURCE_HOST",
+                        "receipt.transport.source_host",
+                        lambda: source["transport"]["hostname"],
+                        lambda: receipt["transport"]["source_host"],
+                    ),
+                    refusal_eq(
+                        "SOURCE_ROOTS",
+                        "receipt.transport.source_roots",
+                        lambda: _catalog_source_roots(source),
+                        lambda: receipt["transport"]["source_roots"],
+                    ),
+                    refusal_eq(
+                        "SOURCE_RSYNC",
+                        "receipt.transport.source_rsync",
+                        lambda: source["transport"]["rsync"],
+                        lambda: receipt["transport"]["source_rsync"],
+                    ),
+                    refusal_check(
+                        "SOURCE_SNAPSHOT",
+                        "receipt.transport.source_snapshot",
+                        lambda: (
+                            receipt["transport"]["source_snapshot"]
+                            == source.get("snapshot")
+                        ),
+                        lambda: _snapshot_brief(source.get("snapshot")),
+                        lambda: _snapshot_brief(
+                            receipt["transport"]["source_snapshot"]
+                        ),
+                    ),
+                    refusal_check(
+                        "TRANSPORT_RECEIPT",
+                        "receipt.transport.transport_receipt_sha256",
+                        lambda: (
+                            receipt["transport"]["transport_receipt_sha256"] is None
+                        ),
+                        None,
+                        lambda: receipt["transport"]["transport_receipt_sha256"],
+                    ),
+                ),
+            ),
+        )
     if receipt["transport"]["quarantine_root"] != os.fspath(
         stage_root / ".transport-quarantine"
     ):
@@ -480,7 +618,73 @@ def push_agent_transport(
         or transport_authority["quarantine_root"]
         != os.fspath(stage_root / ".transport-quarantine")
     ):
-        raise BulkloadError("prepare receipt is detached from the accepted push")
+        raise refuse(
+            "prepare receipt is detached from the accepted push",
+            phase=f"stage-{phase}-push",
+            root=stage_root,
+            label=prepare_receipt.get("stage_id"),
+            remedy=(
+                "The push must quote the same plan digest, phase, and stage "
+                "root the destination prepared. Re-read the prepare receipt "
+                "the destination actually wrote before pushing 84 GiB again."
+            ),
+            **first_mismatch(
+                "PUSH_PREPARE",
+                (
+                    refusal_eq(
+                        "PLAN_SHA256",
+                        "prepare_receipt.plan_sha256",
+                        accepted_plan_sha256,
+                        lambda: prepare_receipt["plan_sha256"],
+                    ),
+                    refusal_eq(
+                        "PHASE",
+                        "prepare_receipt.phase",
+                        phase,
+                        lambda: prepare_receipt["phase"],
+                    ),
+                    refusal_eq(
+                        "STAGE_ROOT",
+                        "prepare_receipt.stage_root",
+                        lambda: os.fspath(stage_root),
+                        lambda: prepare_receipt["stage_root"],
+                    ),
+                    refusal_check(
+                        "READY_FOR_APPLY",
+                        "prepare_receipt.ready_for_apply",
+                        lambda: not prepare_receipt["ready_for_apply"],
+                        False,
+                        lambda: prepare_receipt["ready_for_apply"],
+                    ),
+                    refusal_check(
+                        "MANIFEST_ENTRIES",
+                        "prepare_receipt.manifest.entries",
+                        lambda: not prepare_receipt["manifest"]["entries"],
+                        0,
+                        lambda: len(prepare_receipt["manifest"]["entries"]),
+                    ),
+                    refusal_eq(
+                        "TRANSPORT_MODE",
+                        "prepare_receipt.transport.mode",
+                        "destination-prepare",
+                        lambda: transport_authority["mode"],
+                    ),
+                    refusal_check(
+                        "TRANSPORT_RECEIPT",
+                        "prepare_receipt.transport.transport_receipt_sha256",
+                        lambda: transport_authority["transport_receipt_sha256"] is None,
+                        None,
+                        lambda: transport_authority["transport_receipt_sha256"],
+                    ),
+                    refusal_eq(
+                        "QUARANTINE_ROOT",
+                        "prepare_receipt.transport.quarantine_root",
+                        lambda: os.fspath(stage_root / ".transport-quarantine"),
+                        lambda: transport_authority["quarantine_root"],
+                    ),
+                ),
+            ),
+        )
     assert_no_overlap(
         stage_root,
         [Path(value) for value in transport_authority["source_roots"]],
@@ -637,8 +841,76 @@ def _materialized_transport(
         != sha256_bytes(expected_allowlist)
         or transport_receipt["transport"]["allowlist_size"] != len(expected_allowlist)
     ):
-        raise BulkloadError(
-            "transport receipt is detached from the accepted stage plan"
+        raise refuse(
+            "transport receipt is detached from the accepted stage plan",
+            phase=f"stage-{phase}-materialize",
+            root=stage_root,
+            label=transport_receipt.get("stage_id"),
+            remedy=(
+                "Materialize only from the transport receipt this push "
+                "produced for this plan; a transport-block mismatch means "
+                "the quarantine was filled by a different push."
+            ),
+            **first_mismatch(
+                "TRANSPORT_RECEIPT",
+                (
+                    refusal_eq(
+                        "PLAN_SHA256",
+                        "transport_receipt.plan_sha256",
+                        lambda: plan["plan_sha256"],
+                        lambda: transport_receipt["plan_sha256"],
+                    ),
+                    refusal_eq(
+                        "PHASE",
+                        "transport_receipt.phase",
+                        phase,
+                        lambda: transport_receipt["phase"],
+                    ),
+                    refusal_eq(
+                        "STAGE_ROOT",
+                        "transport_receipt.stage_root",
+                        lambda: os.fspath(stage_root),
+                        lambda: transport_receipt["stage_root"],
+                    ),
+                    refusal_check(
+                        "READY_FOR_APPLY",
+                        "transport_receipt.ready_for_apply",
+                        lambda: not transport_receipt["ready_for_apply"],
+                        False,
+                        lambda: transport_receipt["ready_for_apply"],
+                    ),
+                    refusal_check(
+                        "MANIFEST_ENTRIES",
+                        "transport_receipt.manifest.entries",
+                        lambda: not transport_receipt["manifest"]["entries"],
+                        0,
+                        lambda: len(transport_receipt["manifest"]["entries"]),
+                    ),
+                    refusal_check(
+                        "TRANSPORT_BLOCK",
+                        "transport_receipt.transport",
+                        lambda: transport_receipt["transport"] == expected_transport,
+                        lambda: _transport_block_diff(
+                            expected_transport, transport_receipt["transport"]
+                        ),
+                        lambda: _transport_block_diff(
+                            transport_receipt["transport"], expected_transport
+                        ),
+                    ),
+                    refusal_eq(
+                        "ALLOWLIST_DIGEST",
+                        "transport_receipt.transport.allowlist_sha256",
+                        lambda: sha256_bytes(expected_allowlist),
+                        lambda: transport_receipt["transport"]["allowlist_sha256"],
+                    ),
+                    refusal_eq(
+                        "ALLOWLIST_SIZE",
+                        "transport_receipt.transport.allowlist_size",
+                        lambda: len(expected_allowlist),
+                        lambda: transport_receipt["transport"]["allowlist_size"],
+                    ),
+                ),
+            ),
         )
     quarantine = stage_root / ".transport-quarantine"
     if transport_receipt["transport"]["quarantine_root"] != os.fspath(quarantine):
@@ -1381,7 +1653,100 @@ def validate_stage_receipt(
         )
         or transport["source_roots"] != sorted(set(transport["source_roots"]))
     ):
-        raise BulkloadError("AgentStageV4 transport authority is invalid")
+        raise refuse(
+            "AgentStageV4 transport authority is invalid",
+            phase="validate-stage-receipt",
+            root=value.get("stage_root"),
+            label=value.get("stage_id"),
+            remedy=(
+                "The receipt's transport block is malformed, not merely "
+                "mismatched. Regenerate it from the verb that wrote it; do "
+                "not hand-edit a sealed receipt."
+            ),
+            **first_mismatch(
+                "STAGE_TRANSPORT",
+                (
+                    refusal_check(
+                        "ALLOWLIST_SIZE",
+                        "transport.allowlist_size",
+                        lambda: (
+                            isinstance(transport["allowlist_size"], int)
+                            and not isinstance(transport["allowlist_size"], bool)
+                            and 0 <= transport["allowlist_size"] <= MAX_JSON_BYTES
+                        ),
+                        f"an integer in [0, {MAX_JSON_BYTES}]",
+                        lambda: transport["allowlist_size"],
+                    ),
+                    refusal_check(
+                        "ALLOWLIST_DIGEST",
+                        "transport.allowlist_sha256",
+                        lambda: (
+                            isinstance(transport["allowlist_sha256"], str)
+                            and bool(
+                                re.fullmatch(
+                                    r"[0-9a-f]{64}", transport["allowlist_sha256"]
+                                )
+                            )
+                        ),
+                        "64 lowercase hex characters",
+                        lambda: transport["allowlist_sha256"],
+                    ),
+                    refusal_check(
+                        "SOURCE_HOST",
+                        "transport.source_host",
+                        lambda: (
+                            isinstance(transport["source_host"], str)
+                            and bool(transport["source_host"])
+                        ),
+                        "a non-empty hostname",
+                        lambda: transport["source_host"],
+                    ),
+                    refusal_check(
+                        "DESTINATION_HOST",
+                        "transport.destination_host",
+                        lambda: (
+                            isinstance(transport["destination_host"], str)
+                            and bool(transport["destination_host"])
+                        ),
+                        "a non-empty hostname",
+                        lambda: transport["destination_host"],
+                    ),
+                    refusal_check(
+                        "SOURCE_ROOTS_KIND",
+                        "transport.source_roots",
+                        lambda: (
+                            isinstance(transport["source_roots"], list)
+                            and not any(
+                                not isinstance(root, str)
+                                or not Path(root).is_absolute()
+                                for root in transport["source_roots"]
+                            )
+                        ),
+                        "a list of absolute paths",
+                        lambda: (
+                            [
+                                root
+                                for root in transport["source_roots"]
+                                if not isinstance(root, str)
+                                or not Path(root).is_absolute()
+                            ]
+                            if isinstance(transport["source_roots"], list)
+                            else transport["source_roots"]
+                        ),
+                    ),
+                    refusal_check(
+                        "SOURCE_ROOTS_ORDER",
+                        "transport.source_roots",
+                        lambda: (
+                            transport["source_roots"]
+                            == sorted(set(transport["source_roots"]))
+                        ),
+                        "sorted and unique",
+                        lambda: transport["source_roots"],
+                    ),
+                ),
+            ),
+        )
 
 
 def _verify_stage_objects(manifest: dict[str, Any], stage_root: Path) -> None:
@@ -1417,7 +1782,47 @@ def _verify_stage_objects(manifest: dict[str, Any], stage_root: Path) -> None:
                 or info.st_size != size
                 or sha256_file(path) != digest
             ):
-                raise BulkloadError("sealed stage object failed exact verification")
+                raise refuse(
+                    "sealed stage object failed exact verification",
+                    phase="verify-stage-objects",
+                    root=stage_root,
+                    label=digest,
+                    count=len(blobs),
+                    sample=[
+                        {
+                            "object": os.fspath(path),
+                            "blob_sha256": digest,
+                            "expected_size": size,
+                            "observed_size": info.st_size,
+                        }
+                    ],
+                    remedy=(
+                        "One content-addressed stage object no longer matches "
+                        "its digest. Re-stage that object; the whole stage is "
+                        "not necessarily lost, but this one is."
+                    ),
+                    **first_mismatch(
+                        "STAGE_OBJECT",
+                        (
+                            refusal_check(
+                                "KIND",
+                                "object.kind",
+                                lambda: stat.S_ISREG(info.st_mode),
+                                "regular",
+                                lambda: stat.filemode(info.st_mode),
+                            ),
+                            refusal_eq(
+                                "SIZE", "object.size", size, lambda: info.st_size
+                            ),
+                            refusal_eq(
+                                "DIGEST",
+                                "object.sha256",
+                                digest,
+                                lambda: sha256_file(path),
+                            ),
+                        ),
+                    ),
+                )
             progress.advance(observed=size)
 
 

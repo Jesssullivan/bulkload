@@ -246,7 +246,7 @@ def no_root_may_be_read():
         for name in (
             "_tree_generation",
             "sqlite_catalog",
-            "_git_live_generation",
+            "_git_live_authority_rows",
             "_declared_root",
         ):
             stack.enter_context(mock.patch.object(scanner, name, side_effect=forbidden))
