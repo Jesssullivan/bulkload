@@ -112,6 +112,17 @@ That base is admitted with `--base-custody full` by default, which re-hashes
 every byte of A while capturing B. `--base-custody sealed` admits it on A's
 already-verified seal digest, index digest, and namespace digest instead, and
 still re-derives the git root and every SQLite payload byte for byte.
+
+Capture also records `source_path_folding` in the snapshot seal: a read-only
+measurement of whether the source filesystems hold two case spellings, or two
+Unicode normal forms, of one name as one directory entry. A destination folds
+custody paths on exactly those axes and only when the seal says the source
+does; an unmeasured, false, or contradicted axis leaves the required/seen
+comparison byte-exact. Seals written before this field exists carry no licence
+and stay byte-exact. Because the measurement is part of the seal, a catalog
+must never be paired with a runtime whose folding rules differ from the one
+that sealed it -- see the break-glass note in `scripts/bulkload.py`.
+
 On the destination,
 use `--role destination`, the live destination `--home` and `--git-root`, and
 the same source-to-destination path maps. Repeat into two destination files.
