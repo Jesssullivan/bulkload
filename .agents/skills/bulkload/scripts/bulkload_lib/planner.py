@@ -26,9 +26,16 @@ from .scanner import (
 
 
 def _fingerprint(item: dict[str, Any], *, translated: bool = False) -> tuple[Any, ...]:
+    # A symlink's mode is not portable across kernels (darwin reports the
+    # creating umask's bits, Linux fixes every link at 0777 and has no
+    # lchmod), and the executor installs links with a bare os.symlink, so the
+    # destination mode is always the destination kernel's. Including it here
+    # would re-plan and re-install every byte-identical symlink on every
+    # cross-kernel run, so the lane could never converge on a no-op. The link
+    # stays bound by kind, size, and the target-path digest.
     return (
         item.get("kind"),
-        item.get("mode"),
+        None if item.get("kind") == "symlink" else item.get("mode"),
         item.get("translated_size", item.get("size"))
         if translated
         else item.get("size"),

@@ -6,6 +6,7 @@ from array import array
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+import functools
 import hashlib
 import heapq
 import json
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable, Sequence
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 from .model import (
@@ -65,6 +67,14 @@ DEFAULT_MAX_SQLITE_ROWS = 5_000_000
 MAX_CAPTURE_WORKSPACE_WORKERS = 3
 MAX_CAPTURE_JOBS = 64
 BASE_CUSTODY_MODES = ("full", "sealed")
+# The measured source-spelling equivalences a seal may carry. Absent, malformed
+# or false means the custody comparison stays byte-exact -- the fold is only
+# ever licensed by a measurement the SOURCE host actually made.
+SOURCE_FOLDING_KEY = "source_path_folding"
+SOURCE_FOLDING_FIELDS = ("case_insensitive", "normalization_insensitive")
+# Entries examined per root before a probe gives up and reports "undecided",
+# which the aggregate then treats as "do not fold".
+SOURCE_FOLDING_PROBE_LIMIT = 4096
 SNAPSHOT_INDEX_BUFFER_BYTES = 1024 * 1024
 # Chosen to minimise resident bytes. One chunk of N strings costs ~130 B each;
 # the merge then costs one read block per run, and a block costs twice its size
@@ -121,6 +131,220 @@ MANAGED_EXCLUSION_NAMESPACES = {
     },
 }
 SAFE_EXECUTABLE_PATH = re.compile(r"/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+")
+
+
+def _simple_lower(value: str) -> str:
+    """Per-codepoint lowercase that can never merge two distinct filenames.
+
+    `str.casefold()` is FULL Unicode case folding and is the wrong tool for a
+    custody fence: it merges pairs that are two separate directory entries on
+    every filesystem in existence, case-insensitive APFS included -- 'ß'->'ss',
+    'ﬁ'->'fi', 'ſ'->'s'. Nothing about case-insensitivity licenses certifying
+    a required 'masse.txt' against a sealed 'maße.txt'.
+
+    This maps each codepoint to its lowercase form only when that mapping stays
+    a single codepoint, so the result is length-preserving in codepoints and
+    the only pairs it can ever merge are genuine one-to-one case pairs
+    ('A'/'a', U+212A KELVIN SIGN/'k'). Expanding mappings ('ß', 'İ') are left
+    exactly as they were spelled.
+    """
+    if value.isascii():
+        # ASCII lowercase is already per-codepoint and never expands.
+        return value.lower()
+    folded = []
+    for character in value:
+        lowered = character.lower()
+        folded.append(lowered if len(lowered) == 1 else character)
+    return "".join(folded)
+
+
+def _case_variant(name: str) -> str | None:
+    """The same name with its case flipped, or None if that is the same name.
+
+    Only one-to-one mappings are used, for the same reason `_simple_lower`
+    only uses them: an expanding mapping would probe a name that is not a case
+    variant of this one at all.
+    """
+    flipped = []
+    changed = False
+    for character in name:
+        other = character.upper() if character.islower() else character.lower()
+        if len(other) == 1 and other != character:
+            flipped.append(other)
+            changed = True
+        else:
+            flipped.append(character)
+    return "".join(flipped) if changed else None
+
+
+def _normalization_variant(name: str) -> str | None:
+    """The same name in the other Unicode normal form, or None if identical."""
+    for form in ("NFD", "NFC"):
+        other = unicodedata.normalize(form, name)
+        if other != name:
+            return other
+    return None
+
+
+def _same_directory_entry(path: Path, variant: Path) -> bool | None:
+    """Do two spellings name one directory entry? None when undecidable.
+
+    Read-only on purpose: the probe runs against the LIVE source tree during a
+    capture, so it must not create, touch or remove anything the generation
+    fence would later have to explain.
+    """
+    try:
+        left = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    try:
+        right = variant.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _probe_source_root(root: Path, variant_of) -> bool | None:
+    """Measure one equivalence on the filesystem holding `root`.
+
+    The root's own directory entry answers first and costs one stat, which is
+    what keeps this off the critical path of a million-entry capture. Only when
+    the root's own name has no distinct variant -- an all-ASCII name under the
+    normalization probe, say -- does it walk, in sorted order, until a name
+    settles the question or SOURCE_FOLDING_PROBE_LIMIT entries have been
+    examined. None means "no entry could answer it", which the aggregate reads
+    as "do not fold".
+    """
+    try:
+        root_info = root.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if root.parent != root:
+        variant = variant_of(root.name)
+        if variant is not None:
+            answer = _same_directory_entry(root, root.with_name(variant))
+            if answer is not None:
+                return answer
+    if not stat.S_ISDIR(root_info.st_mode):
+        return None
+    examined = 0
+    for parent, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        for name in sorted([*directories, *files]):
+            examined += 1
+            if examined > SOURCE_FOLDING_PROBE_LIMIT:
+                return None
+            variant = variant_of(name)
+            if variant is None:
+                continue
+            answer = _same_directory_entry(Path(parent) / name, Path(parent) / variant)
+            if answer is not None:
+                return answer
+    return None
+
+
+def _device_of(root: Path) -> int | None:
+    try:
+        return root.stat(follow_symlinks=False).st_dev
+    except OSError:
+        return None
+
+
+def measure_source_path_folding(roots: Iterable[Path]) -> dict[str, bool]:
+    """What the SOURCE filesystems say about two spellings of one name.
+
+    Recorded in the live snapshot seal so that a destination -- which may be
+    case-sensitive, normalization-sensitive, or a different kernel entirely --
+    folds custody paths only when the source it is certifying says it must.
+
+    Case and normalization behaviour is a property of a mounted filesystem, so
+    the answers are pooled by `st_dev`: a root whose own entries cannot settle
+    the question (an empty `.claude`, an all-ASCII tree under the
+    normalization probe) inherits the verdict of a sibling root on the same
+    device, and a single contradicting root turns that device's verdict off.
+    An equivalence is claimed only when EVERY root sits on a device that was
+    measured and never once measured false.
+    """
+    roots = list(roots)
+    devices = [_device_of(root) for root in roots]
+    folding: dict[str, bool] = {}
+    for field, variant_of in zip(
+        SOURCE_FOLDING_FIELDS, (_case_variant, _normalization_variant)
+    ):
+        answers = [_probe_source_root(root, variant_of) for root in roots]
+        verdict: dict[int, bool] = {}
+        for device, answer in zip(devices, answers):
+            if device is None or answer is None:
+                continue
+            verdict[device] = verdict.get(device, True) and answer
+        folding[field] = bool(roots) and all(
+            device is not None and verdict.get(device) is True for device in devices
+        )
+    return folding
+
+
+def source_path_folding(snapshot: dict[str, Any]) -> dict[str, bool]:
+    """Read the seal's measurement, fail-closed on anything unexpected."""
+    recorded = snapshot.get(SOURCE_FOLDING_KEY)
+    if not isinstance(recorded, dict):
+        return {field: False for field in SOURCE_FOLDING_FIELDS}
+    return {field: recorded.get(field) is True for field in SOURCE_FOLDING_FIELDS}
+
+
+def _custody_identity(
+    path: "str | Path",
+    *,
+    fold_case: bool = False,
+    fold_normalization: bool = False,
+) -> str:
+    """Identity for the required/seen comparison in validate_snapshot_custody.
+
+    The sealed index spells every relative path as the SOURCE filesystem
+    reported it; the plan spells git worktree paths as git's pointer files
+    recorded them. Where the source holds those two spellings as ONE directory
+    entry they name one set of sealed bytes, and keeping them as two custody
+    keys makes the required/seen equality unclosable on a case-sensitive
+    destination.
+
+    Both folds default OFF. They are enabled per call from the seal's measured
+    `source_path_folding`, never from the host running the comparison, and they
+    never change which bytes are hashed or which digest is compared.
+    """
+    identity = os.fspath(path)
+    if fold_normalization:
+        identity = unicodedata.normalize("NFC", identity)
+    if fold_case:
+        identity = _simple_lower(identity)
+    return identity
+
+
+def _fold_required(required_paths: Iterable["str | Path"], identity) -> set[str]:
+    """Fold the required set, refusing if the fold merges two of its members.
+
+    A fold is only ever allowed to make the destination agree with the source's
+    own identity. If two distinct required paths land on one key, the source
+    cannot be holding them as one entry, so the licence the seal granted does
+    not cover this plan and the comparison must stay refused.
+    """
+    absolute = {os.path.abspath(os.fspath(path)) for path in required_paths}
+    folded = {identity(path) for path in absolute}
+    if len(folded) != len(absolute):
+        raise BulkloadError("custody required paths collide under the source fold")
+    return folded
+
+
+def _record_custody_identity(seen: dict[str, str], identity: str, exact: str) -> None:
+    """Bind one folded key to one exact spelling, refusing a second one.
+
+    Two sealed index entries that fold together are proof the source held them
+    as two directory entries, which is exactly the case the fold must not be
+    applied to. Refuse rather than let one entry stand in for its twin.
+    """
+    previous = seen.setdefault(identity, exact)
+    if previous != exact:
+        raise BulkloadError("sealed index paths collide under the source fold")
 
 
 class _OpaqueGitFallback(BulkloadError):
@@ -2988,6 +3212,11 @@ def validate_snapshot_custody(
     check, the declared-roots equality and the namespace digest — the
     anti-planting perimeter. Under "sealed" that whole perimeter stays on, and
     so does the read-back of the index file itself.
+
+    The required/seen comparison is byte-exact unless the seal carries a
+    `source_path_folding` measurement the SOURCE host made; each fold it
+    licenses is additionally fenced on cardinality, so a fold that would merge
+    two required paths or two sealed index entries refuses instead.
     """
     if payload_custody not in BASE_CUSTODY_MODES:
         raise BulkloadError("snapshot payload custody mode is unsupported")
@@ -3094,10 +3323,28 @@ def validate_snapshot_custody(
     for root in actual_roots:
         if not _within(root, seal_path.parent):
             raise BulkloadError("live snapshot payload escapes custody root")
+    folding = source_path_folding(snapshot)
+    identity = functools.partial(
+        _custody_identity,
+        fold_case=folding["case_insensitive"],
+        fold_normalization=folding["normalization_insensitive"],
+    )
     required = (
-        None
+        None if required_paths is None else _fold_required(required_paths, identity)
+    )
+    # `_fold_required` keeps only the folded keys, and a refusal has to name the
+    # path the caller actually asked for rather than its fold. `_fold_required`
+    # has already refused any fold that merges two required members, so this
+    # mapping is one-to-one wherever it exists.
+    required_exact: dict[str, str] = (
+        {}
         if required_paths is None
-        else {Path(os.path.abspath(os.fspath(path))) for path in required_paths}
+        else {
+            identity(os.path.abspath(os.fspath(path))): os.path.abspath(
+                os.fspath(path)
+            )
+            for path in required_paths
+        }
     )
     # X3: the git root's sealed generation_sha256 is derived from the LIVE tree,
     # not from the snapshot copy, so nothing anywhere ever compares the git
@@ -3117,7 +3364,9 @@ def validate_snapshot_custody(
             relatives.add(relative_path)
             relatives.update(relative_path + suffix for suffix in SQLITE_SIDECARS)
         always_relatives[root_index] = relatives
-    seen: set[Path] = set()
+    # Folded key -> the one exact spelling that claimed it. Only populated when
+    # a required set is being closed; `seen` is never read otherwise.
+    seen: dict[str, str] = {}
     collected = _BaseRecordMap(
         [item["label"] for item in snapshot["roots"]],
         spill_dir=spill_dir if collect_records else None,
@@ -3180,7 +3429,10 @@ def validate_snapshot_custody(
                 namespace_digest.update(canonical_bytes(list(key)) + b"\0")
                 if collect_records:
                     collected.append(root_index, relative, line)
-                if required is None or original_path in required:
+                original_identity = (
+                    None if required is None else identity(original_path)
+                )
+                if required is None or original_identity in required:
                     if (
                         payload_custody == "full"
                         or root_index in always_roots
@@ -3246,7 +3498,10 @@ def validate_snapshot_custody(
                                     ),
                                     code="CUSTODY_PAYLOAD_RECORD",
                                 )
-                    seen.add(original_path)
+                    if original_identity is not None:
+                        _record_custody_identity(
+                            seen, original_identity, os.fspath(original_path)
+                        )
                 count += 1
     except OSError as error:
         collected.close()
@@ -3276,7 +3531,7 @@ def validate_snapshot_custody(
         count != snapshot["index_entries"]
         or digest.hexdigest() != snapshot["index_sha256"]
         or required is not None
-        and seen != required
+        and set(seen) != required
         or required is None
         and (
             observed_count != count
@@ -3292,6 +3547,7 @@ def validate_snapshot_custody(
             count=count,
             digest=digest.hexdigest(),
             required=required,
+            required_exact=required_exact,
             seen=seen,
             observed_count=observed_count,
             observed_namespace=observed_namespace.hexdigest(),
@@ -3320,8 +3576,9 @@ def _diagnose_custody_totals(
     *,
     count: int,
     digest: str,
-    required: set[Path] | None,
-    seen: set[Path],
+    required: set[str] | None,
+    required_exact: dict[str, str],
+    seen: dict[str, str],
     observed_count: int,
     observed_namespace: str,
     namespace_digest: str,
@@ -3352,9 +3609,16 @@ def _diagnose_custody_totals(
             "count": count,
             "detail": f"expected={snapshot['index_sha256']} observed={digest}",
         }
-    if required is not None and seen != required:
-        missing = sorted(os.fspath(path) for path in (required - seen))
-        extra = sorted(os.fspath(path) for path in (seen - required))
+    if required is not None and set(seen) != required:
+        # `seen` binds one folded custody key to the exact spelling the sealed
+        # index carried for it, so an extra key can be named as the source
+        # spelled it. A missing key was never seen at all, and the folded key
+        # -- which is the required path's own spelling whenever the seal
+        # licensed no fold -- is the only name there is for it.
+        missing = sorted(
+            required_exact.get(key, key) for key in (required - set(seen))
+        )
+        extra = sorted(seen[key] for key in (set(seen) - required))
         sample = [
             {"relation": "required-not-seen", "path": path}
             for path in missing[:REFUSAL_SAMPLE_LIMIT]
@@ -3402,10 +3666,104 @@ def _diagnose_custody_totals(
     }
 
 
+BREAK_GLASS_NOTE_ENV = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE"
+BREAK_GLASS_EXPECT_ENV = "BULKLOAD_BREAK_GLASS_LIVE_FENCE_EXPECT"
+
+
+def _break_glass_root_observation(root: dict[str, Any]) -> dict[str, Any]:
+    """One live root, read for metadata only, for the break-glass record.
+
+    `expected` is re-derived from the sealed snapshot alone, so a deviation
+    record carrying only `expected` says nothing whatever about the tree that
+    was not fenced -- it can neither support nor refute the "the roots are
+    frozen" precondition the break-glass rests on. This walks the live root
+    with `lstat` and no content read, which is orders of magnitude below one
+    fence pass, and reports what it saw:
+
+    * `mtime_ceiling_ns` -- the highest `st_mtime_ns`/`st_ctime_ns` in the
+      root. A later reader can compare it to the seal time, and a second
+      break-glass line can be compared to the first.
+    * `entries`, `dev`, `ino` -- the shape and identity of the root.
+    * `pruned_leaves` -- how many entries the provider prune rules removed.
+      This is the #24 signature: a root with `pruned_leaves == 0` cannot be
+      affected by the defect the break-glass exists for, so a record whose
+      roots are all zero is evidence it was opened for something else.
+
+    It never raises. It is the record of a bypass, not a second fence.
+    """
+    live = Path(root["live"])
+    provider = root.get("provider")
+    exclusions = root.get("exclusions", ())
+    row: dict[str, Any] = {
+        "dev": None,
+        "entries": 0,
+        "exists": False,
+        "ino": None,
+        "label": root.get("label"),
+        "live": os.fspath(live),
+        "mtime_ceiling_ns": None,
+        "pruned_leaves": 0,
+        "unreadable": 0,
+    }
+    try:
+        info = live.lstat()
+    except OSError:
+        row["unreadable"] = 1
+        return row
+    row["exists"] = True
+    row["dev"] = info.st_dev
+    row["ino"] = info.st_ino
+    row["entries"] = 1
+    ceiling = max(info.st_mtime_ns, info.st_ctime_ns)
+    if stat.S_ISDIR(info.st_mode):
+        for current, directories, files in os.walk(
+            live, topdown=True, followlinks=False
+        ):
+            current_path = Path(current)
+            retained: list[str] = []
+            children: list[Path] = []
+            for name in sorted(directories):
+                child = current_path / name
+                relative = child.relative_to(live).as_posix()
+                if provider is not None and _is_pruned(provider, relative, exclusions):
+                    row["pruned_leaves"] += 1
+                    continue
+                retained.append(name)
+                children.append(child)
+            directories[:] = retained
+            for name in sorted(files):
+                child = current_path / name
+                relative = child.relative_to(live).as_posix()
+                if provider is not None and _is_pruned(provider, relative, exclusions):
+                    row["pruned_leaves"] += 1
+                    continue
+                children.append(child)
+            for child in children:
+                try:
+                    child_info = child.lstat()
+                except OSError:
+                    row["unreadable"] += 1
+                    continue
+                row["entries"] += 1
+                ceiling = max(ceiling, child_info.st_mtime_ns, child_info.st_ctime_ns)
+    row["mtime_ceiling_ns"] = ceiling
+    return row
+
+
 def validate_live_snapshot_generation(
-    snapshot: dict[str, Any], *, passes: int = 2
-) -> None:
+    snapshot: dict[str, Any],
+    *,
+    passes: int = 2,
+    allow_break_glass: bool = True,
+) -> bool:
     """Fence final transport against any source mutation after snapshot B.
+
+    Returns True when the live census actually ran and matched, and False when
+    the disclosed break-glass below skipped it. The return value is the whole
+    contract for a caller that seals an attestation over this observation:
+    such a caller must either refuse the break-glass with
+    `allow_break_glass=False` or carry the False into what it seals. A caller
+    that discards the return is asserting the fence is advisory for it.
 
     `passes` is the number of full-corpus re-derivations. It defaults to 2
     because a single pass is not atomic: `epoch()` walks the roots in order,
@@ -3414,6 +3772,30 @@ def validate_live_snapshot_generation(
     second pass is therefore a wider straggler window, not a redundant read.
     Only a fence that is strictly dominated by a later full-strength fence
     over the same snapshot may ask for `passes=1`.
+
+    Break-glass, for Jesssullivan/bulkload#24. Two variables, both required:
+
+    * `BULKLOAD_BREAK_GLASS_LIVE_FENCE_NOTE=<path>` -- where the deviation
+      record is appended.
+    * `BULKLOAD_BREAK_GLASS_LIVE_FENCE_EXPECT=<64-hex>` -- the sealed
+      expectation this glass is being opened for. It must equal the `expected`
+      computed here or the call is a hard `BulkloadError`, so an export left
+      in a shell profile, a launchd/systemd unit, a tmux environment or a CI
+      job cannot silently disable a *later* fence over a *different* snapshot.
+      The refusal prints the value to set.
+
+    Callers are process-wide otherwise: `_transport_environment` forwards the
+    environment to children, so both variables reach every subprocess. The
+    skip is for the whole snapshot, not for the affected roots alone --
+    scoping it per root would need a per-root epoch, which is exactly the
+    full-content cost the skip is buying back, so that waits for the #24 fix.
+
+    The fence runs at seven sites, not only in the final phase: five under
+    `phase == "final"` in the stage and push paths, once in `verify_agent_plan`
+    at the cutover release (gated on the destination receipt, not on a phase),
+    and once in `_witness_epoch`. The cutover release passes
+    `allow_break_glass=False`, because it seals `independent_fresh_observation`
+    over this call and a break-glass there would make that receipt a lie.
     """
     if not isinstance(passes, int) or isinstance(passes, bool) or passes < 1:
         raise BulkloadError("live generation fence requires at least one pass")
@@ -3499,6 +3881,67 @@ def validate_live_snapshot_generation(
         }
         return sha256_bytes(canonical_bytes(observation)), observation, git_rows
 
+    # Disclosed break-glass. The sealed `generation_sha256` is censused over
+    # the immutable snapshot copy, which omits the pruned managed leaves, while
+    # `epoch()` re-derives it over the live root. `_tree_census(portable=True)`
+    # puts a directory's `st_size` into its authority, so any directory holding
+    # a pruned leaf is a different entry in the two trees and this fence can
+    # never pass for such a root (Jesssullivan/bulkload#24). Each pass is a
+    # full-content read of every root, so computing an epoch only to record a
+    # mismatch the issue already explains is cost, not evidence: record the
+    # skip and return before the census. What is recorded is not the skip
+    # alone -- `expected` is a function of the snapshot and observes nothing,
+    # so a metadata-only reading of every live root goes in beside it. Absent
+    # the variables, and once #24 lands, behaviour below is unchanged.
+    note = os.environ.get(BREAK_GLASS_NOTE_ENV, "").strip()
+    if note:
+        if not allow_break_glass:
+            raise BulkloadError(
+                "live-fence break-glass is refused at this call site: the "
+                "cutover release seals independent_fresh_observation over "
+                "this fence and cannot attest to an observation it skipped"
+            )
+        if os.environ.get(BREAK_GLASS_EXPECT_ENV, "").strip().lower() != expected:
+            raise BulkloadError(
+                "live-fence break-glass is not bound to this snapshot: set "
+                f"{BREAK_GLASS_EXPECT_ENV}={expected} to open it here"
+            )
+        observation = [
+            _break_glass_root_observation(root) for root in snapshot["roots"]
+        ]
+        record = {
+            "break_glass": "live-fence-skipped",
+            "expected": expected,
+            "observation": observation,
+            "passes_requested": passes,
+            "reason": (
+                "seal censuses the snapshot copy, fence censuses "
+                "the live root (bulkload#24)"
+            ),
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            with open(note, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as error:
+            # The only non-BulkloadError exit this function had, and it fired
+            # mid-transport. A break-glass whose record cannot be written is
+            # an undisclosed bypass, so it fails closed like everything else.
+            raise BulkloadError(
+                f"live-fence break-glass cannot write its deviation record: {note}"
+            ) from error
+        pruned = sum(row["pruned_leaves"] for row in observation)
+        print(
+            "bulkload: BREAK-GLASS live fence skipped "
+            f"(expected {expected[:12]}, {passes} pass(es) not computed, "
+            f"{len(observation)} root(s) observed, {pruned} pruned leaf/leaves); "
+            f"deviation recorded at {note}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
     # Each epoch re-derives the live generation and compares it to the sealed
     # expectation. Two passes are the default because the walk is sequential
     # and therefore not atomic: `first == expected` with `second != expected`
@@ -3533,6 +3976,7 @@ def validate_live_snapshot_generation(
                     baseline_git_rows=baseline_git_rows,
                 ),
             )
+    return True
 
 
 LIVE_GENERATION_CATEGORY_CODES = {
@@ -4533,6 +4977,12 @@ def _capture_live_snapshot(
             "mode": LIVE_SNAPSHOT_MODE,
             "roots": roots,
             "snapshot_id": snapshot_id,
+            # Measured on the LIVE source roots, read-only, so a destination on
+            # another kernel can tell which spelling differences the source
+            # itself holds as one directory entry.
+            SOURCE_FOLDING_KEY: measure_source_path_folding(
+                Path(root["live"]) for root in roots
+            ),
         }
         seal_path = snapshot_root / "snapshot-seal.json"
         snapshot = seal({**snapshot, "seal_path": os.fspath(seal_path)}, "seal_sha256")
@@ -4596,8 +5046,12 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
     cost of the thing Wave 3 would have to run.
 
     `passes=1` is the documented exception, not a shortcut: an observation is
-    strictly dominated by all six real fence sites, which still run at full
-    strength on every path.
+    strictly dominated by the six real fence sites, which run at full strength
+    on every path where the #24 break-glass is not open. Where it *is* open
+    none of them run, this one included, and a witness that printed
+    `divergence=none` for a census it never took would corrupt the Wave 3
+    cost/trade measurement it exists to produce. So the skip is reported as
+    `unobserved`, which is neither divergence nor its absence.
 
     The `except` below is deliberately `Exception` and not `BulkloadError`.
     The fence walks the *live* tree, and a live tree can move underneath it in
@@ -4621,8 +5075,8 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
         return
     with phase_timing("witness"):
         try:
-            validate_live_snapshot_generation(snapshot, passes=1)
-            divergence = "none"
+            observed = validate_live_snapshot_generation(snapshot, passes=1)
+            divergence = "none" if observed else "unobserved: live-fence break-glass"
         except Exception as error:  # noqa: BLE001 — an observation may not fail a capture
             divergence = f"{type(error).__name__}: {error}"
         with suppress(Exception):
@@ -5053,9 +5507,22 @@ def validate_agent_capture(
                 "seal_path",
                 "seal_sha256",
                 "snapshot_id",
+                SOURCE_FOLDING_KEY,
             },
             "AgentCaptureV4 live snapshot",
         )
+        require_exact_keys(
+            snapshot[SOURCE_FOLDING_KEY],
+            set(SOURCE_FOLDING_FIELDS),
+            "AgentCaptureV4 live snapshot source path folding",
+        )
+        if any(
+            not isinstance(snapshot[SOURCE_FOLDING_KEY][field], bool)
+            for field in SOURCE_FOLDING_FIELDS
+        ):
+            raise BulkloadError(
+                "AgentCaptureV4 live snapshot source path folding is invalid"
+            )
         require_digest(snapshot, "seal_sha256")
         require_exact_keys(
             snapshot["capacity"],
