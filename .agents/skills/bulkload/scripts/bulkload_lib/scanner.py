@@ -3340,9 +3340,7 @@ def validate_snapshot_custody(
         {}
         if required_paths is None
         else {
-            identity(os.path.abspath(os.fspath(path))): os.path.abspath(
-                os.fspath(path)
-            )
+            identity(os.path.abspath(os.fspath(path))): os.path.abspath(os.fspath(path))
             for path in required_paths
         }
     )
@@ -3615,9 +3613,7 @@ def _diagnose_custody_totals(
         # spelled it. A missing key was never seen at all, and the folded key
         # -- which is the required path's own spelling whenever the seal
         # licensed no fold -- is the only name there is for it.
-        missing = sorted(
-            required_exact.get(key, key) for key in (required - set(seen))
-        )
+        missing = sorted(required_exact.get(key, key) for key in (required - set(seen)))
         extra = sorted(seen[key] for key in (set(seen) - required))
         sample = [
             {"relation": "required-not-seen", "path": path}
