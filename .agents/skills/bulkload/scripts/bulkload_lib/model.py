@@ -55,9 +55,19 @@ class BulkloadError(RuntimeError):
     subclasses below narrow it where the engine can prove a more specific
     cause. Every refusal remains a `BulkloadError`, so existing handlers and
     tests that catch the base class are unaffected.
+
+    `refusal` carries the structured refusal record for the sites that have
+    one. It is keyword-only and defaults to None so that every existing
+    `BulkloadError("...")` construction keeps its exact behaviour, and so an
+    unconverted site still refuses in precisely the same way — it just has no
+    record to write. Nothing reads `refusal` on the success path.
     """
 
     exit_code = EXIT_REFUSED
+
+    def __init__(self, *args: Any, refusal: dict[str, Any] | None = None) -> None:
+        super().__init__(*args)
+        self.refusal = refusal
 
 
 class EpochRefusal(BulkloadError):
@@ -88,6 +98,237 @@ class StorageRefusal(BulkloadError):
     """
 
     exit_code = EXIT_STORAGE
+
+
+REFUSAL_SCHEMA = "dev.tinyland.bulkload.refusal.v1"
+REFUSAL_SAMPLE_LIMIT = 20
+REFUSAL_STRING_LIMIT = 512
+REFUSAL_SEQUENCE_LIMIT = 20
+REFUSAL_MAPPING_LIMIT = 40
+REFUSAL_DEPTH_LIMIT = 6
+UNCLASSIFIED_REFUSAL_CODE = "UNCLASSIFIED"
+
+
+def refusal_json(value: Any, *, depth: int = 0) -> Any:
+    """Coerce an arbitrary observation into bounded, canonical-JSON-safe data.
+
+    A refusal record is written on the failure path of a ceremony that may be
+    holding 1.8M index records, so every field is bounded here rather than at
+    each call site: strings are truncated, sequences and mappings are capped,
+    and recursion stops at a fixed depth. Anything that is not representable
+    becomes its `repr`, because a record that cannot be serialized is a record
+    the operator never sees.
+    """
+    if depth > REFUSAL_DEPTH_LIMIT:
+        return "<depth-limited>"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, str):
+        return _refusal_text(value)
+    if isinstance(value, (bytes, bytearray)):
+        return _refusal_text(bytes(value).hex())
+    if isinstance(value, os.PathLike):
+        return _refusal_text(os.fspath(value))
+    if isinstance(value, dict):
+        items = list(value.items())[:REFUSAL_MAPPING_LIMIT]
+        return {
+            _refusal_text(str(key)): refusal_json(item, depth=depth + 1)
+            for key, item in items
+        }
+    if isinstance(value, (set, frozenset)):
+        try:
+            ordered = sorted(value, key=lambda item: str(item))
+        except TypeError:
+            ordered = list(value)
+        return [
+            refusal_json(item, depth=depth + 1)
+            for item in ordered[:REFUSAL_SEQUENCE_LIMIT]
+        ]
+    if isinstance(value, (list, tuple)):
+        return [
+            refusal_json(item, depth=depth + 1)
+            for item in list(value)[:REFUSAL_SEQUENCE_LIMIT]
+        ]
+    return _refusal_text(repr(value))
+
+
+def _refusal_text(value: str) -> str:
+    flattened = value.replace("\n", "\\n").replace("\r", "\\r")
+    if len(flattened) > REFUSAL_STRING_LIMIT:
+        return flattened[:REFUSAL_STRING_LIMIT] + "..."
+    return flattened
+
+
+def refusal_record(
+    *,
+    code: str,
+    phase: str,
+    remedy: str,
+    message: str,
+    root: Any = None,
+    label: Any = None,
+    field: Any = None,
+    expected: Any = None,
+    observed: Any = None,
+    count: Any = None,
+    sample: Iterable[Any] = (),
+) -> dict[str, Any]:
+    """Build one structured refusal record.
+
+    The shape is fixed so an agent can branch on it without sniffing: every
+    key is always present, `sample` is always a list bounded by
+    REFUSAL_SAMPLE_LIMIT, and `message` is always the exact single line that
+    also went to stderr.
+    """
+    return {
+        "schema": REFUSAL_SCHEMA,
+        "code": code,
+        "phase": phase,
+        "root": refusal_json(root),
+        "label": refusal_json(label),
+        "field": refusal_json(field),
+        "expected": refusal_json(expected),
+        "observed": refusal_json(observed),
+        "count": refusal_json(count),
+        "sample": [refusal_json(item) for item in list(sample)[:REFUSAL_SAMPLE_LIMIT]],
+        "remedy": _refusal_text(remedy),
+        "message": _refusal_text(message),
+    }
+
+
+def refuse(
+    message: str,
+    *,
+    code: str,
+    phase: str,
+    remedy: str,
+    detail: str = "",
+    root: Any = None,
+    label: Any = None,
+    field: Any = None,
+    expected: Any = None,
+    observed: Any = None,
+    count: Any = None,
+    sample: Iterable[Any] = (),
+    kind: type[BulkloadError] = BulkloadError,
+) -> BulkloadError:
+    """Return a BulkloadError whose message is the original static string.
+
+    `detail` is appended after a colon. Keeping the original sentence as the
+    exact prefix is deliberate: every caller, runbook, and test that matches
+    on the historical text keeps matching, while the operator finally gets the
+    naming clause that decides what to do next.
+
+    `kind` picks the refusal class, and with it the documented exit code. A
+    structured record and an exit code are two independent facts about the
+    same refusal: a live-generation divergence is an `EpochRefusal` (3)
+    whether or not it can name the worktree that moved, so the class travels
+    with the site rather than with the record.
+    """
+    line = f"{message}: {detail}" if detail else message
+    line = _refusal_text(line)
+    return kind(
+        line,
+        refusal=refusal_record(
+            code=code,
+            phase=phase,
+            remedy=remedy,
+            message=line,
+            root=root,
+            label=label,
+            field=field,
+            expected=expected,
+            observed=observed,
+            count=count,
+            sample=sample,
+        ),
+    )
+
+
+def refusal_eq(
+    suffix: str, field: str, expected: Any, observed: Any
+) -> tuple[Any, ...]:
+    """An equality check for `first_mismatch`; both sides are lazy thunks."""
+    return (suffix, field, None, expected, observed)
+
+
+def refusal_check(
+    suffix: str,
+    field: str,
+    predicate: Any,
+    expected: Any = None,
+    observed: Any = None,
+) -> tuple[Any, ...]:
+    """A general check for `first_mismatch`; `predicate` holds when True."""
+    return (suffix, field, predicate, expected, observed)
+
+
+def _refusal_thunk(value: Any) -> Any:
+    return value() if callable(value) else value
+
+
+def first_mismatch(family: str, checks: Iterable[tuple[Any, ...]]) -> dict[str, Any]:
+    """Name the first failing condition of an already-decided refusal.
+
+    This runs *after* the guarding `if` has decided to refuse, so it never
+    changes control flow and never costs anything on the success path. Checks
+    are evaluated lazily and in the source order of the original boolean
+    chain, and any exception inside a check counts as that check failing —
+    which is exactly what the original short-circuit `or` would have meant.
+    Returns kwargs for `refuse`; when nothing reproduces (a racing observation
+    that settled between the guard and the diagnosis) the family code is
+    returned unqualified rather than a wrong name.
+    """
+    for suffix, field, predicate, expected, observed in checks:
+        try:
+            held = (
+                bool(predicate())
+                if predicate is not None
+                else _refusal_thunk(expected) == _refusal_thunk(observed)
+            )
+        except Exception:  # noqa: BLE001 - a failing probe is a failing check
+            held = False
+        if held:
+            continue
+        try:
+            expected_value = _refusal_thunk(expected)
+        except Exception:  # noqa: BLE001
+            expected_value = "<unavailable>"
+        try:
+            observed_value = _refusal_thunk(observed)
+        except Exception:  # noqa: BLE001
+            observed_value = "<unavailable>"
+        return {
+            "code": f"{family}_{suffix}",
+            "field": field,
+            "expected": expected_value,
+            "observed": observed_value,
+            "detail": f"field={field} expected={_refusal_brief(expected_value)} "
+            f"observed={_refusal_brief(observed_value)}",
+        }
+    return {
+        "code": family,
+        "field": None,
+        "expected": None,
+        "observed": None,
+        "detail": "no single condition reproduced under diagnosis",
+    }
+
+
+def _refusal_brief(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(refusal_json(value), separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = repr(value)
+    text = text.replace("\n", "\\n").replace("\r", "\\r")
+    return text if len(text) <= 120 else text[:120] + "..."
 
 
 def utc_now() -> str:
@@ -382,21 +623,50 @@ def git_environment() -> dict[str, str]:
     return environment
 
 
-def assert_no_overlap(path: Path, protected: Iterable[Path], label: str) -> None:
-    candidate = Path(os.path.realpath(os.path.abspath(os.fspath(path.expanduser()))))
+def path_identity(path: str | Path, *, fold_case: bool = False) -> Path:
+    """One comparable spelling for two path arguments.
+
+    `~/a`, `a/../a` and an absolute `a` are three spellings of one directory
+    entry, and on the case-insensitive APFS volume this ceremony runs on so is
+    `A`. A bare `Path(x) == Path(y)` at a call site sees four distinct paths;
+    every overlap and collision guard needs to see one. `fold_case` is opt-in
+    because folding is the safe direction only for a guard that refuses: on a
+    case-sensitive destination it can refuse two genuinely distinct names,
+    which costs an operator one renamed argument, while not folding on a
+    case-insensitive source silently writes over the file the guard exists to
+    protect.
+
+    A path that cannot be expanded at all refuses here, the same way
+    `resolve_real` refuses one that cannot be resolved. `Path.expanduser()`
+    raises `RuntimeError` for an unknown `~user`, which no caller of a guard
+    catches; a guard must refuse, not crash.
+    """
+    try:
+        expanded = os.fspath(Path(path).expanduser())
+    except (OSError, RuntimeError) as error:
+        raise BulkloadError(f"cannot expand path {path!r}") from error
+    resolved = os.path.realpath(os.path.abspath(expanded))
+    return Path(resolved.casefold() if fold_case else resolved)
+
+
+def assert_no_overlap(
+    path: Path, protected: Iterable[Path], label: str, *, fold_case: bool = False
+) -> None:
+    candidate = path_identity(path, fold_case=fold_case)
     for raw in protected:
-        root = Path(os.path.realpath(os.path.abspath(os.fspath(raw.expanduser()))))
+        named = path_identity(raw)
+        root = path_identity(raw, fold_case=fold_case)
         try:
             candidate.relative_to(root)
         except ValueError:
             pass
         else:
-            raise BulkloadError(f"{label} overlaps live root {root}")
+            raise BulkloadError(f"{label} overlaps live root {named}")
         try:
             root.relative_to(candidate)
         except ValueError:
             continue
-        raise BulkloadError(f"{label} contains live root {root}")
+        raise BulkloadError(f"{label} contains live root {named}")
 
 
 def ensure_safe_target(root: Path, relative: str) -> Path:

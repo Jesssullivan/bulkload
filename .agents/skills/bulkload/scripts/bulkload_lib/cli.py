@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import gc
 import os
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from . import __version__
 from .executor import (
@@ -37,11 +38,14 @@ from .model import (
     BulkloadError,
     EpochRefusal,
     MAX_JSON_BYTES,
+    UNCLASSIFIED_REFUSAL_CODE,
     assert_no_overlap,
     atomic_write,
     canonical_bytes,
     capacity_observation,
+    path_identity,
     read_json,
+    refusal_record,
 )
 from .planner import compile_agent_plan_authorities, validate_agent_plan
 from .scanner import (
@@ -338,9 +342,8 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def _protect_output(arguments: argparse.Namespace) -> None:
-    if arguments.output == "-":
-        return
+def _protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Every live root this verb reads, which no output of ours may enter."""
     roots: list[Path] = []
     if arguments.command == "agent-capture":
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
@@ -383,7 +386,87 @@ def _protect_output(arguments: argparse.Namespace) -> None:
         )
     if hasattr(arguments, "stage_root"):
         roots.append(Path(arguments.stage_root))
-    assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    return roots
+
+
+@contextlib.contextmanager
+def _disarmed_on_refusal(arguments: argparse.Namespace) -> Iterator[None]:
+    """Drop the failure path before re-raising a refusal that is about it.
+
+    `main` writes the refusal record inside the handler for the very refusal
+    these guards raise. Without this, a guard that refuses a failure path
+    performs, one frame later, exactly the write it just refused.
+    """
+    try:
+        yield
+    except BaseException:
+        arguments.failure_output = None
+        raise
+
+
+def _protect_output(arguments: argparse.Namespace) -> None:
+    """Keep both output channels out of every live root the verb reads.
+
+    `--failure-output` is a write channel like `--output`, and `atomic_write`
+    creates the whole parent tree, so an unguarded refusal path plants
+    directories and a file inside a root a capture is walking — the exact
+    shape that refuses the capture with "live snapshot path set changed".
+    """
+    failure_output = getattr(arguments, "failure_output", None)
+    if arguments.output == "-" and not failure_output:
+        return
+    roots = _protected_roots(arguments)
+    if arguments.output != "-":
+        assert_no_overlap(Path(arguments.output), roots, "evidence output")
+    if failure_output:
+        with _disarmed_on_refusal(arguments):
+            assert_no_overlap(
+                Path(failure_output), roots, "failure output", fold_case=True
+            )
+
+
+# Every argument that names a file the verb reads or seals. A refusal record
+# is small and always writable, so pointing it at one of these silently
+# replaces a sealed input with a 400-byte JSON object.
+ARTIFACT_ARGUMENTS = (
+    "source_a",
+    "source_b",
+    "destination_a",
+    "destination_b",
+    "plan",
+    "stage_receipt",
+    "prepare_receipt",
+    "transport_allowlist",
+    "transport_receipt",
+    "apply_receipt",
+    "destination_verify_receipt",
+    "journal",
+    "snapshot_base_seal",
+)
+
+
+def _protect_failure_output(arguments: argparse.Namespace) -> None:
+    """Refuse a failure path that could damage the evidence it explains."""
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    with _disarmed_on_refusal(arguments):
+        if path == "-":
+            raise BulkloadError(
+                "failure output must be a path; stdout carries evidence"
+            )
+        identity = path_identity(path, fold_case=True)
+        if arguments.output != "-" and identity == path_identity(
+            arguments.output, fold_case=True
+        ):
+            raise BulkloadError("failure output must differ from the evidence output")
+        for name in ARTIFACT_ARGUMENTS:
+            value = getattr(arguments, name, None)
+            if value and identity == path_identity(value, fold_case=True):
+                flag = name.replace("_", "-")
+                raise BulkloadError(
+                    f"failure output must differ from the --{flag} artifact: {value}"
+                )
 
 
 def _parse_mapping(value: str) -> tuple[str, str]:
@@ -1002,9 +1085,26 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
         help="print the pinned Bulkload version and exit",
     )
+    # Every verb accepts --failure-output. It is declared on a parent parser
+    # so the flag reads naturally after the verb and still lands on one
+    # namespace attribute that main() can consult without knowing the verb.
+    refusal = argparse.ArgumentParser(add_help=False)
+    refusal.add_argument(
+        "--failure-output",
+        metavar="PATH",
+        help=(
+            "write a structured refusal record (JSON) here when the verb "
+            "refuses; the stderr line comes first either way. Must not be "
+            "--output, an input artifact, or inside any live root"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    capture = commands.add_parser("agent-capture", help="write AgentCaptureV4 evidence")
+    capture = commands.add_parser(
+        "agent-capture",
+        parents=[refusal],
+        help="write AgentCaptureV4 evidence",
+    )
     capture.add_argument(
         "--role",
         choices=("source", "destination"),
@@ -1123,7 +1223,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(capture, dry_run=True)
     capture.set_defaults(handler=_agent_capture)
 
-    plan = commands.add_parser("agent-plan", help="compile an exact four-capture union")
+    plan = commands.add_parser(
+        "agent-plan",
+        parents=[refusal],
+        help="compile an exact four-capture union",
+    )
     plan.add_argument(
         "--source-a", required=True, help="source capture A: the sealed immutable base"
     )
@@ -1151,7 +1255,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=_agent_plan)
 
     stage = commands.add_parser(
-        "agent-stage", help="materialize preseed or final stage"
+        "agent-stage",
+        parents=[refusal],
+        help="materialize preseed or final stage",
     )
     stage.add_argument(
         "--phase",
@@ -1218,7 +1324,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(stage, dry_run=True)
     stage.set_defaults(handler=_agent_stage)
 
-    apply = commands.add_parser("agent-apply", help="apply a sealed final stage")
+    apply = commands.add_parser(
+        "agent-apply",
+        parents=[refusal],
+        help="apply a sealed final stage",
+    )
     apply.add_argument("--plan", required=True, help="the accepted final AgentPlanV4")
     apply.add_argument(
         "--stage-receipt",
@@ -1253,7 +1363,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply.set_defaults(handler=_agent_apply)
 
     verify = commands.add_parser(
-        "agent-verify", help="independently verify final state"
+        "agent-verify",
+        parents=[refusal],
+        help="independently verify final state",
     )
     verify.add_argument("--plan", required=True, help="the applied final AgentPlanV4")
     verify.add_argument(
@@ -1273,7 +1385,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.set_defaults(handler=_agent_verify)
 
     rollback = commands.add_parser(
-        "agent-rollback", help="restore exact overwritten state"
+        "agent-rollback",
+        parents=[refusal],
+        help="restore exact overwritten state",
     )
     rollback.add_argument(
         "--apply-receipt", required=True, help="the apply receipt being reverted"
@@ -1290,7 +1404,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.set_defaults(handler=_agent_rollback)
 
     recover = commands.add_parser(
-        "agent-recover", help="resume or roll back an interrupted apply"
+        "agent-recover",
+        parents=[refusal],
+        help="resume or roll back an interrupted apply",
     )
     recover.add_argument(
         "--plan",
@@ -1321,12 +1437,71 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failure_record(
+    arguments: argparse.Namespace, error: BaseException
+) -> dict[str, Any]:
+    """The structured record for one refusal, converted or not.
+
+    A refusal site that has not been converted yet still produces a record —
+    with code UNCLASSIFIED and the raised sentence as its message — so a
+    caller reading `--failure-output` can tell "this refusal has no diagnosis
+    yet" apart from "no refusal happened".
+
+    The channel covers everything `main` catches, which is now every
+    exception below `KeyboardInterrupt` and `SystemExit`. A defect in the
+    engine itself therefore also earns a record — code UNCLASSIFIED, exit 6 —
+    instead of escaping as a bare traceback with an undocumented status.
+    """
+    record = getattr(error, "refusal", None)
+    if not isinstance(record, dict):
+        record = refusal_record(
+            code=UNCLASSIFIED_REFUSAL_CODE,
+            phase=getattr(arguments, "command", None) or "unknown",
+            remedy=(
+                "This refusal site does not carry a structured diagnosis yet; "
+                "read the message and the verb's inputs."
+            ),
+            message=str(error),
+            observed=type(error).__name__,
+        )
+    return {
+        **record,
+        "command": getattr(arguments, "command", None),
+        "version": __version__,
+    }
+
+
+def _emit_failure(arguments: argparse.Namespace, error: BaseException) -> None:
+    """Write the refusal record, and never let that write mask the refusal.
+
+    Building the record and writing it both happen inside the guard: a bad
+    value in the record is as capable of raising as a bad path is, and either
+    one must cost a WARN line, not the diagnosis. The catch is `Exception`,
+    not `(BulkloadError, OSError)`, because `Path.expanduser()` alone raises
+    `RuntimeError` for an unresolvable `~user`.
+    """
+    path = getattr(arguments, "failure_output", None)
+    if not path:
+        return
+    try:
+        record = _failure_record(arguments, error)
+        atomic_write(Path(path), canonical_bytes(record) + b"\n", mode=0o600)
+    except Exception as failure:  # noqa: BLE001 - the refusal outranks its record
+        print(
+            f"bulkload: WARN: cannot write failure record: {failure}", file=sys.stderr
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     progress = Progress(progress_enabled(arguments), command=arguments.command)
     try:
         with progress:
+            # The flag-only half of the refusal-path guard runs first: every
+            # handler below writes the refusal record, and none of them may
+            # write it to a path this rejects.
+            _protect_failure_output(arguments)
             if getattr(arguments, "dry_run", False):
                 progress.phase("dry-run")
                 report = dry_run(arguments)
@@ -1344,7 +1519,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress.phase("write-evidence")
             _write(arguments.output, result)
     except KeyboardInterrupt:
-        # The operator stopped this process. Bulkload never signals one.
+        # The operator stopped this process. Bulkload never signals one, and
+        # an interruption is not a refusal, so no record is written for it.
         print("bulkload: INTERRUPTED", file=sys.stderr)
         return EXIT_INTERRUPTED
     except SystemExit:
@@ -1354,7 +1530,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # a malformed evidence document used to escape as a bare KeyError
         # traceback with an undocumented status. It now exits 6 with one line.
         code = exit_code_for(error)
+        # The refusal is the deliverable; the record is a convenience. Print
+        # first so no failure of the record write can cost the operator the
+        # one line that names what refused.
         print(f"bulkload: FAIL[{code}]: {failure_detail(error, code)}", file=sys.stderr)
+        _emit_failure(arguments, error)
         # 6 is the only class with no curated message: nothing in the engine
         # meant to raise it, so the one-liner names a type and not a cause. An
         # operator whose hour-4 ceremony dies on `KeyError: 'catalog'` cannot
