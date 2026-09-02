@@ -292,9 +292,7 @@ class CaseFoldTests(DoctorTreeCase):
                 ]
             ),
         )
-        self.assertEqual(
-            self.check(report, "case-fold-collision")["status"], "warn"
-        )
+        self.assertEqual(self.check(report, "case-fold-collision")["status"], "warn")
         self.assertIsNone(report["destination"]["path_identity"])
         self.assertTrue(report["ok"])
 
@@ -636,9 +634,7 @@ class SqliteSidecarTests(DoctorTreeCase):
         (vendor / "systemd-journal").write_text("ordinary source")
         (vendor / "notes-wal").write_text("ordinary source")
         report = self.doctor()
-        self.assertEqual(
-            self.check(report, "sqlite-sidecar-orphan")["status"], "pass"
-        )
+        self.assertEqual(self.check(report, "sqlite-sidecar-orphan")["status"], "pass")
         shadowed = self.check(report, "sqlite-sidecar-shadowed")
         self.assertEqual(shadowed["status"], "warn")
         self.assertEqual(shadowed["finding_count"], 2)
@@ -896,9 +892,7 @@ class RuntimeParityTests(DoctorTreeCase):
             BULKLOAD_RUNTIME_SOURCE_SHA256="c" * 64,
         )
         report = self.doctor()
-        self.assertEqual(
-            self.check(report, "runtime-source-parity")["status"], "warn"
-        )
+        self.assertEqual(self.check(report, "runtime-source-parity")["status"], "warn")
         self.assertTrue(report["ok"])
 
     def test_a_malformed_pin_fails_instead_of_raising(self) -> None:
@@ -1014,7 +1008,7 @@ class PeerProbeTests(DoctorTreeCase):
             'case "$1" in\n'
             "  /usr/bin/uname) echo 'sh: /usr/bin/uname: not found' >&2; exit 127 ;;\n"
             "esac\n"
-            'shift\n'
+            "shift\n"
             'case "$1" in\n'
             "  uname) echo Linux ;;\n"
             "  '') printf 'SHELL=/bin/bash\\n' ;;\n"

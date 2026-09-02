@@ -653,7 +653,18 @@ def _verify_record(
             raise _StageSourceChanged(f"directory changed before staging: {path}")
     else:
         raise _StageSourceChanged("unsupported staged entry kind")
-    if f"{stat.S_IMODE(info.st_mode):04o}" != record.get("mode"):
+    # Symlink permission bits are not portable across kernels: darwin lstat
+    # reports the creating umask's bits while Linux fixes every symlink at 0777
+    # and has no lchmod. The custody verifier already exempts symlink mode
+    # (c81de89); a quarantined symlink's identity is its target bytes, checked
+    # above via sha256_symlink. The record must still *declare* a mode for
+    # every kind, so a mode-less record cannot slip past this gate and reach
+    # _materialize_file's record["mode"] as a KeyError instead of a refusal.
+    recorded_mode = record.get("mode")
+    if recorded_mode is None or (
+        expected_kind != "symlink"
+        and f"{stat.S_IMODE(info.st_mode):04o}" != recorded_mode
+    ):
         raise _StageSourceChanged(f"state mode changed before staging: {path}")
 
 
@@ -1670,11 +1681,20 @@ def _same_record(
 ) -> bool:
     if current is None or expected is None:
         return current is expected
-    return all(
-        current.get(key) == expected.get(key)
-        for key in ("kind", "mode", "sha256", "size")
-        if key in expected
-    )
+    keys: tuple[str, ...] = ("kind", "mode", "sha256", "size")
+    if current.get("kind") == "symlink" and expected.get("kind") == "symlink":
+        # Symlink permission bits are not portable across kernels: darwin
+        # lstat reports the creating umask's bits (commonly 0755) while Linux
+        # fixes every symlink at 0777 and offers no lchmod, so the mode a
+        # source host records can never be reproduced on the other kernel.
+        # _atomic_install_blob installs links with a bare os.symlink and never
+        # chmods one, so the live destination mode is always the destination
+        # kernel's, not the manifest's. The link stays bound by kind, size,
+        # and the target-path digest; only mode is exempt, and only when both
+        # sides agree the entry is a symlink — the same two-sided shape the
+        # custody verifier uses (scanner.validate_snapshot_custody, c81de89).
+        keys = ("kind", "sha256", "size")
+    return all(current.get(key) == expected.get(key) for key in keys if key in expected)
 
 
 def _snapshot_target(target: Path, rollback_root: Path) -> tuple[dict[str, Any], int]:
@@ -2678,7 +2698,15 @@ def verify_agent_plan(
         if not isinstance(snapshot, dict):
             raise BulkloadError("cutover release requires immutable source B custody")
         validate_snapshot_custody(snapshot)
-        validate_live_snapshot_generation(snapshot)
+        # `allow_break_glass=False`, and only here. This site is not gated on
+        # a phase -- it runs whenever a destination receipt is presented --
+        # and the receipt built immediately below seals
+        # `independent_fresh_observation: True` and `verified: True`, which
+        # `validate_verify_receipt` then *requires*. Under the #24 break-glass
+        # that observation would not have happened, and the sealed receipt
+        # would be byte-identical to an honest one. So the bypass is refused
+        # at the one site that would launder it into a clean cutover.
+        validate_live_snapshot_generation(snapshot, allow_break_glass=False)
         receipt = {
             "apply_receipt_sha256": apply_receipt["receipt_sha256"],
             "destination_verify_receipt_sha256": destination_verify_receipt[
