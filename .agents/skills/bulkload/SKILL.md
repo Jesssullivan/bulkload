@@ -89,6 +89,62 @@ is skipped rather than allowed to replace the verb's own refusal.
 Telemetry is diagnostic only: it never reaches an artifact and never changes a
 digest.
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | the verb completed and its evidence was written |
+| `1` | usage error on the command line (`--help`/`--version` still exit `0`) |
+| `2` | the pinned launcher could not build its source closure |
+| `3` | quiescence/epoch refusal: the live source moved under the capture, at a coarse fence (root, seat, snapshot, A/B pair). Retryable; no live path was mutated |
+| `4` | custody, plan, or typed-invariant refusal -- the general fail-closed class |
+| `5` | storage refusal: a volume could not hold or reflink-clone what was charged; the message names the path (it may be the **source** host's snapshot custody) |
+| `6` | unexpected internal error, including malformed input evidence; the traceback is always printed |
+| `130` | the operator interrupted the process. Bulkload never signals one |
+
+Branch on the code, not on the message. `3` and `5` are narrowings of `4`,
+raised only where the engine proved the specific cause; every other refusal is
+`4`.
+
+A single filesystem entry that changes or is unsupported mid-walk is **not**
+exit `3`. It is recorded as a capture blocker, the capture exits `0` with
+`complete: false`, and `agent-plan` then refuses it with `4`. Exit `3` means a
+coarse fence moved: a declared root or file seat, a live snapshot's census or
+Git authority, or the A/B pair itself.
+
+Exit `5` names a volume, not a host. `agent-capture` reaches the same capacity
+gate for its own live-snapshot custody on the source, so a full source disk
+exits `5` as well. Read the path out of the message before deciding which
+machine to look at.
+
+## Rehearse before a long verb
+
+`--dry-run` on `agent-capture`, `agent-plan`, `agent-stage`, and `agent-apply`
+prints a JSON report of the exact mutations that verb would perform, the
+refusals it already reaches -- the overlap fence, the argument shape, the
+accepted plan digest, the stage receipt -- and, in `not_evaluated`, the gates
+it did not reach. It writes nothing: not the stage, not the journal, not the
+`--output` document. Its `exit_code` field is the process status, so use it as
+a gate before a multi-hour run.
+
+Read `complete` before `mutations`. A report that refused early carries
+`complete: false`, and its `mutations` list is a prefix rather than an
+inventory. Only `complete: true` with an empty list means the verb mutates
+nothing.
+
+`--progress` is on by default on every stderr, a redirected log included --
+that is the case a silent hour actually happens in. `--no-progress` suppresses
+it. Lines go to stderr only, so evidence on stdout stays byte-exact, and a
+silent hour stops being indistinguishable from a hang. Progress reports; it
+never signals a session.
+
+`--progress` names the verb's coarse phases from the CLI; the per-root phase
+and heartbeat lines described in **Watch it run** come from the engine. Both
+are on by default, both write only to stderr, and either `--no-progress` or
+`--quiet` silences both -- byte-exact stderr is one promise, not two.
+`--progress-log` is unaffected: a silenced stderr still fills the file an
+unattended agent tails.
+
 ## Capture twice per role
 
 Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both
