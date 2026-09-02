@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Iterable, Sequence
 import unicodedata
@@ -520,42 +521,305 @@ def canonical_path_map(entries: Iterable[tuple[str, str]]) -> list[dict[str, str
     return result
 
 
+DEFAULT_HEARTBEAT_SECONDS = 30.0
+MAX_HEARTBEAT_SECONDS = 86400.0
+_PROGRESS_STDERR = True
+_PROGRESS_LOG: Any = None
+_PROGRESS_INTERVAL = DEFAULT_HEARTBEAT_SECONDS
+_PROGRESS_PHASES = threading.local()
+_PROGRESS_ACCOUNTED = 0.0
+_PROGRESS_ACCOUNT_LOCK = threading.Lock()
+
+
+def configure_progress(
+    *,
+    stderr: bool = True,
+    interval: float | None = None,
+    log_stream: Any = None,
+) -> None:
+    """Bind the process-wide progress sinks.
+
+    Progress is default-on to stderr: a verb that runs for two and a half
+    hours must not produce a zero-byte log. It stays diagnostic only — it
+    never reaches an artifact, never changes a digest, and every write is
+    guarded so a broken sink cannot fail a cutover.
+    """
+    global _PROGRESS_STDERR, _PROGRESS_LOG, _PROGRESS_INTERVAL
+    reset_phase_accounting()
+    if interval is not None:
+        if not 0 < float(interval) <= MAX_HEARTBEAT_SECONDS:
+            raise BulkloadError("progress heartbeat interval is out of range")
+        _PROGRESS_INTERVAL = float(interval)
+    _PROGRESS_STDERR = bool(stderr)
+    _PROGRESS_LOG = log_stream
+
+
+def reset_phase_accounting() -> None:
+    """Forget the phase seconds accumulated so far. One run, one budget."""
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED = 0.0
+
+
+def _account_phase(seconds: float) -> None:
+    global _PROGRESS_ACCOUNTED
+    with _PROGRESS_ACCOUNT_LOCK:
+        _PROGRESS_ACCOUNTED += seconds
+
+
+def unaccounted_seconds(elapsed: float, *, threshold: float = 0.9) -> float | None:
+    """Seconds of a run that no phase claimed, when that is worth saying.
+
+    Lane F asked for this by name: name the holes the instrumentation does
+    not cover, or the next hidden hole stays invisible. The profile lane
+    spent a day inferring a 29-minute gap that the engine could have printed.
+    Returns `None` when nothing was timed (there is no budget to compare
+    against) or when the timed phases already account for `threshold` of the
+    wall clock.
+    """
+    with _PROGRESS_ACCOUNT_LOCK:
+        accounted = _PROGRESS_ACCOUNTED
+    if elapsed <= 0 or accounted <= 0 or accounted >= elapsed * threshold:
+        return None
+    return elapsed - accounted
+
+
+def progress_enabled() -> bool:
+    """True when at least one sink is bound and the operator has not opted out.
+
+    `BULKLOAD_PHASE_TIMING` survives only as an off switch for callers that
+    cannot reach the CLI flags; the historical "1" that used to turn timing on
+    now means what it always looked like it meant.
+    """
+    if os.environ.get("BULKLOAD_PHASE_TIMING", "").strip().lower() in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }:
+        return False
+    return bool(_PROGRESS_STDERR) or _PROGRESS_LOG is not None
+
+
+def emit_progress(line: str) -> None:
+    """Write one telemetry line to every bound sink. Never raises.
+
+    "Never raises" is load-bearing and was not true of the first cut. This
+    runs inside `phase_timing`'s `finally` and inside `cli.main`'s `finally`,
+    so anything that escapes here replaces an in-flight refusal with a
+    telemetry error and destroys the error path. The measured case: run any
+    verb with fd 2 closed (`2>&-`) and CPython sets `sys.stderr` to `None`,
+    at which point `sys.stderr.write` raises `AttributeError` — which is
+    neither `OSError` nor `ValueError`, and which `cli.main`'s
+    `except (BulkloadError, OSError, sqlite3.Error)` does not catch either.
+    A missing input then exited 1 with no message at all instead of naming
+    the file. Hence the `None` guard and the deliberately blind excepts: a
+    diagnostic sink may never decide the outcome of a cutover.
+    """
+    if not progress_enabled():
+        return
+    text = line if line.endswith("\n") else line + "\n"
+    # Bind once: `sys.stderr` is process-global and another thread may swap or
+    # close it between the guard and the write.
+    stream = sys.stderr if _PROGRESS_STDERR else None
+    if stream is not None:
+        try:
+            stream.write(text)
+            stream.flush()
+        except Exception:
+            pass
+    log = _PROGRESS_LOG
+    if log is not None:
+        try:
+            log.write(text)
+            log.flush()
+        except Exception:
+            pass
+
+
+def _rate_fields(done: int, elapsed: float, total: int | None) -> tuple[str, str]:
+    if elapsed <= 0 or done <= 0:
+        return "-", "-"
+    rate = done / elapsed
+    if total is None or total <= done:
+        return f"{rate:.1f}", "-"
+    return f"{rate:.1f}", f"{(total - done) / rate:.1f}"
+
+
 class _PhaseSample:
     """Counters a timed phase fills in while it runs."""
 
-    __slots__ = ("bytes", "files")
+    __slots__ = (
+        "bytes",
+        "files",
+        "done",
+        "observed_bytes",
+        "total",
+        "unit",
+        "phase",
+        "root",
+        "_advanced",
+        "_started",
+        "_last",
+    )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        phase: str = "-",
+        root: str = "-",
+        total: int | None = None,
+        unit: str = "files",
+    ) -> None:
         self.bytes: int | None = None
         self.files: int | None = None
+        self.done = 0
+        # `None` until something measures bytes, because a measured zero and
+        # an unmeasured field must not print the same character. `-` means
+        # "cannot measure" everywhere in this format.
+        self.observed_bytes: int | None = None
+        self.total = total
+        self.unit = unit
+        self.phase = phase
+        self.root = root
+        # Distinguishes "advanced zero times" from "advanced, and the count
+        # is zero", which `done or None` could not.
+        self._advanced = False
+        self._started = time.monotonic()
+        self._last = self._started
+
+    def advance(self, count: int = 1, *, observed: int | None = None) -> None:
+        """Count `count` more units of work and heartbeat if a tick is due.
+
+        `observed=None` means this caller does not measure bytes at all;
+        `observed=0` means it measured and the answer was zero.
+        """
+        self.done += count
+        self._advanced = True
+        if observed is not None:
+            self.observed_bytes = (self.observed_bytes or 0) + observed
+        self.heartbeat()
+
+    def heartbeat(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last < _PROGRESS_INTERVAL:
+            return
+        self._last = now
+        elapsed = now - self._started
+        rate, eta = _rate_fields(self.done, elapsed, self.total)
+        emit_progress(
+            "bulkload-progress"
+            f" phase={self.phase}"
+            f" root={self.root}"
+            f" seconds={elapsed:.3f}"
+            f" unit={self.unit}"
+            f" done={self.done}"
+            f" total={'-' if self.total is None else self.total}"
+            f" bytes={'-' if self.observed_bytes is None else self.observed_bytes}"
+            f" rate={rate}"
+            f" eta={eta}"
+        )
+
+
+def _phase_stack() -> list[_PhaseSample]:
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if stack is None:
+        stack = []
+        _PROGRESS_PHASES.stack = stack
+    return stack
+
+
+def progress_tick(count: int = 1, *, observed: int | None = None) -> None:
+    """Advance the innermost timed phase on this thread, if there is one.
+
+    Deep walk helpers use this instead of threading a sample through every
+    signature. It is a no-op outside a timed phase and on worker threads,
+    which is why it can never change a result.
+    """
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if not stack:
+        return
+    stack[-1].advance(count, observed=observed)
+
+
+def progress_total(total: int) -> None:
+    """Bind the innermost timed phase's denominator once it is known.
+
+    The count of work a phase will do is often discovered inside the phase
+    (the workspace inventory, for example). Without this the heartbeat can
+    only print elapsed time; with it, `total`, `rate` and `eta` are real.
+    """
+    stack = getattr(_PROGRESS_PHASES, "stack", None)
+    if stack:
+        stack[-1].total = total
+
+
+def _heartbeat_watchdog(sample: _PhaseSample, stop: threading.Event) -> None:
+    while not stop.wait(_PROGRESS_INTERVAL):
+        sample.heartbeat(force=True)
 
 
 @contextmanager
-def phase_timing(phase: str, root: str = "-") -> Iterable[_PhaseSample]:
-    """Emit one stderr timing line per phase when BULKLOAD_PHASE_TIMING=1.
+def phase_timing(
+    phase: str,
+    root: str = "-",
+    *,
+    total: int | None = None,
+    unit: str = "files",
+    watchdog: bool = False,
+) -> Iterable[_PhaseSample]:
+    """Time one phase, heartbeat while it runs, and print one line at exit.
 
-    Timing is diagnostic only: it never reaches an artifact, never changes a
-    digest, and is off unless the operator asks for it. The counters are read
-    at exit, so a phase sets them inside the block.
+    `watchdog=True` starts a daemon ticker for a phase that blocks in one
+    opaque call (the rsync payload push) and therefore cannot advance a
+    counter itself. Timing is diagnostic only: it never reaches an artifact
+    and never changes a digest.
     """
-    sample = _PhaseSample()
-    if os.environ.get("BULKLOAD_PHASE_TIMING") != "1":
+    sample = _PhaseSample(phase, root, total, unit)
+    if not progress_enabled():
         yield sample
         return
-    started = time.monotonic()
+    stack = _phase_stack()
+    stack.append(sample)
+    stop: threading.Event | None = None
+    ticker: threading.Thread | None = None
+    if watchdog:
+        stop = threading.Event()
+        ticker = threading.Thread(
+            target=_heartbeat_watchdog,
+            args=(sample, stop),
+            name="bulkload-progress",
+            daemon=True,
+        )
+        ticker.start()
+    started = sample._started
     try:
         yield sample
     finally:
-        sys.stderr.write(
+        if stop is not None:
+            stop.set()
+        if ticker is not None:
+            ticker.join(timeout=5.0)
+        if stack and stack[-1] is sample:
+            stack.pop()
+        elapsed = time.monotonic() - started
+        if not stack:
+            # Only outermost phases are summed, so a nested phase cannot be
+            # counted twice against the run's wall clock.
+            _account_phase(elapsed)
+        files = (
+            sample.files
+            if sample.files is not None
+            else (sample.done if sample._advanced else None)
+        )
+        observed = sample.bytes if sample.bytes is not None else sample.observed_bytes
+        emit_progress(
             "bulkload-phase"
             f" phase={phase}"
             f" root={root}"
-            f" seconds={time.monotonic() - started:.3f}"
-            f" files={'-' if sample.files is None else sample.files}"
-            f" bytes={'-' if sample.bytes is None else sample.bytes}"
-            "\n"
+            f" seconds={elapsed:.3f}"
+            f" files={'-' if files is None else files}"
+            f" bytes={'-' if observed is None else observed}"
         )
-        sys.stderr.flush()
 
 
 def workspace_worker_count(jobs: int | None, pending: int) -> int:
@@ -2284,11 +2548,13 @@ def _tree_census(
     exclusions: Sequence[str],
     content: bool = False,
     portable: bool = False,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     digest = hashlib.sha256()
     charged_bytes = 0
+    entries = 0
 
     def observe(path: Path, relative: str) -> tuple[str, int]:
+        nonlocal entries
         before = _stable_stat(path)
         live_sqlite = (
             provider is not None
@@ -2333,12 +2599,14 @@ def _tree_census(
         digest.update(
             canonical_bytes([relative, kind, authority, content_digest]) + b"\0"
         )
+        entries += 1
+        progress_tick(observed=size)
         return kind, size
 
     root_info = root.stat(follow_symlinks=False)
     if stat.S_ISREG(root_info.st_mode):
         _, charged_bytes = observe(root, ".")
-        return digest.hexdigest(), charged_bytes
+        return digest.hexdigest(), charged_bytes, entries
     if not stat.S_ISDIR(root_info.st_mode):
         raise BulkloadError(f"snapshot root is not a regular file or directory: {root}")
     observe(root, ".")
@@ -2372,7 +2640,7 @@ def _tree_census(
                 continue
             _, size = observe(child, relative)
             charged_bytes += size
-    return digest.hexdigest(), charged_bytes
+    return digest.hexdigest(), charged_bytes, entries
 
 
 def _tree_generation(
@@ -2528,6 +2796,9 @@ def _copy_live_tree(
             "method": method,
             "source_device": source_info.st_dev,
         }
+        progress_tick(
+            observed=source_info.st_size if stat.S_ISREG(source_info.st_mode) else 0
+        )
 
     source_info = source.stat(follow_symlinks=False)
     if stat.S_ISREG(source_info.st_mode):
@@ -2734,6 +3005,7 @@ def _snapshot_delta_charge(
                 and _provider_classification(provider, relative) == "sqlite"
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
             elif not _base_regular_reusable(
                 child,
                 base_path,
@@ -2741,6 +3013,11 @@ def _snapshot_delta_charge(
                 (base_records or {}).get(relative),
             ):
                 charged += child_info.st_size
+                progress_tick(observed=child_info.st_size)
+            else:
+                # Reused from the base: examined, charged nothing. `bytes=0`
+                # is the measurement, not the absence of one.
+                progress_tick(observed=0)
     return charged
 
 
@@ -2890,6 +3167,7 @@ def _write_snapshot_index(
                     stream.write(payload)
                     digest.update(payload)
                     count += 1
+                    progress_tick(observed=len(payload))
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException:
@@ -3204,6 +3482,7 @@ def validate_snapshot_custody(
     collect_records: bool = False,
     payload_custody: str = "full",
     spill_dir: Path | None = None,
+    progress_phase: str = "custody",
 ) -> _BaseRecordMap:
     """Reopen a seal/index and either all payloads or an explicit stage subset.
 
@@ -3374,8 +3653,17 @@ def validate_snapshot_custody(
     namespace_digest = hashlib.sha256()
     count = 0
     previous: tuple[int, str] | None = None
+    sealed_entries = snapshot.get("index_entries")
     try:
-        with index_path.open("rb") as stream:
+        with (
+            phase_timing(
+                progress_phase,
+                "mirror" if mirror is not None else "live",
+                total=sealed_entries if isinstance(sealed_entries, int) else None,
+                unit="records",
+            ) as sample,
+            index_path.open("rb") as stream,
+        ):
             for line in stream:
                 if not line.endswith(b"\n") or len(line) > 64 * 1024:
                     raise BulkloadError("snapshot payload index line is malformed")
@@ -3502,6 +3790,10 @@ def validate_snapshot_custody(
                             seen, original_identity, os.fspath(original_path)
                         )
                 count += 1
+                size = record["size"]
+                sample.advance(
+                    observed=size if isinstance(size, int) and size > 0 else 0
+                )
     except OSError as error:
         collected.close()
         raise BulkloadError("snapshot payload index cannot be read") from error
@@ -3520,12 +3812,19 @@ def validate_snapshot_custody(
             item.name for item in roots_parent.iterdir()
         } != {root["label"] for root in snapshot["roots"]}:
             raise BulkloadError("live snapshot declared roots differ")
-        for root_index, root in enumerate(actual_roots):
-            for relative, _ in _snapshot_namespace(root):
-                observed_namespace.update(
-                    canonical_bytes([root_index, relative]) + b"\0"
-                )
-                observed_count += 1
+        with phase_timing(
+            f"{progress_phase}-namespace",
+            "mirror" if mirror is not None else "live",
+            total=count,
+            unit="entries",
+        ) as sample:
+            for root_index, root in enumerate(actual_roots):
+                for relative, _ in _snapshot_namespace(root):
+                    observed_namespace.update(
+                        canonical_bytes([root_index, relative]) + b"\0"
+                    )
+                    observed_count += 1
+                    sample.advance()
     if (
         count != snapshot["index_entries"]
         or digest.hexdigest() != snapshot["index_sha256"]
@@ -3946,7 +4245,7 @@ def validate_live_snapshot_generation(
     # cursor. The only term that was genuinely dead in the original fence is
     # `first != second`, which the other two comparisons already imply.
     baseline_git_rows: list[dict[str, Any]] | None = None
-    with phase_timing("validate"):
+    with phase_timing("validate", unit="entries", watchdog=True):
         for _ in range(passes):
             digest, observation, git_rows = epoch()
             if digest == expected:
@@ -4715,12 +5014,16 @@ def _capture_live_snapshot(
         if base_snapshot.get("mode") != LIVE_SNAPSHOT_MODE:
             raise BulkloadError("snapshot base seal is not immutable-live custody")
         spill_dir = _base_record_spill_dir(snapshot_root, partial)
-        with phase_timing("base-custody"):
+        # No watchdog: this encloses `custody-base`, which carries the real
+        # denominator and ticks per record. Two heartbeat streams for the same
+        # 940 s of work, one of them permanently at `done=0`, reads as stalled.
+        with phase_timing("base-custody", unit="records"):
             base_index = validate_snapshot_custody(
                 base_snapshot,
                 collect_records=True,
                 payload_custody=base_custody,
                 spill_dir=spill_dir,
+                progress_phase="custody-base",
             )
         try:
             base_root = Path(base_snapshot["seal_path"]).parent
@@ -4748,16 +5051,20 @@ def _capture_live_snapshot(
             raise
     methods: dict[str, int] = defaultdict(int)
     transfer_ledgers: list[dict[str, dict[str, int | str]]] = []
-    censuses: list[tuple[str, int]] = []
+    censuses: list[tuple[str, int, int]] = []
     durable_makedirs(snapshot_root.parent)
     for label, live, provider, excluded in descriptors:
-        with phase_timing("census", label) as sample:
+        with phase_timing("census", label, unit="entries") as sample:
             observed = _tree_census(live, provider=provider, exclusions=excluded)
-            sample.files = observed[1]
+            # `_tree_census` returns (digest, charged_bytes, entries); the byte
+            # total used to land in `files=`, which is why a real capture log
+            # read `files=67779718491`.
+            sample.bytes = observed[1]
+            sample.files = observed[2]
         censuses.append(observed)
     charged_bytes = 0
     for index, (label, live, provider, excluded) in enumerate(descriptors):
-        with phase_timing("charge", label) as sample:
+        with phase_timing("charge", label, unit="entries", watchdog=True) as sample:
             charge = _snapshot_delta_charge(
                 live,
                 base_paths[index],
@@ -4777,12 +5084,13 @@ def _capture_live_snapshot(
         durable_makedirs(partial)
         git_authority_rows = _git_live_authority_rows(git_backing)
         git_generation = sha256_bytes(canonical_bytes(git_authority_rows))
-        git_tree_generation = _tree_generation(
-            git_backing, provider=None, exclusions=()
-        )
+        with phase_timing("generation-pre", "git", unit="entries"):
+            git_tree_generation = _tree_generation(
+                git_backing, provider=None, exclusions=()
+            )
         for index, (label, live, provider, excluded) in enumerate(descriptors):
             work_target = Path(work_roots[index]["snapshot"])
-            with phase_timing("copy", label) as sample:
+            with phase_timing("copy", label, unit="entries") as sample:
                 observed_methods, observed_ledger = _copy_live_tree(
                     live,
                     work_target,
@@ -4796,7 +5104,10 @@ def _capture_live_snapshot(
             transfer_ledgers.append(observed_ledger)
             for method, count in observed_methods.items():
                 methods[method] += count
-            after = _tree_census(live, provider=provider, exclusions=excluded)
+            with phase_timing("recensus", label, unit="entries") as sample:
+                after = _tree_census(live, provider=provider, exclusions=excluded)
+                sample.bytes = after[1]
+                sample.files = after[2]
             if censuses[index][0] != after[0]:
                 raise EpochRefusal(f"live snapshot path set changed: {live}")
         _rewrite_git_snapshot_links(git_controls, work_roots)
@@ -4831,9 +5142,10 @@ def _capture_live_snapshot(
                 ),
                 kind=EpochRefusal,
             )
-        observed_tree_generation = _tree_generation(
-            git_backing, provider=None, exclusions=()
-        )
+        with phase_timing("generation-post", "git", unit="entries"):
+            observed_tree_generation = _tree_generation(
+                git_backing, provider=None, exclusions=()
+            )
         if observed_tree_generation != git_tree_generation:
             raise refuse(
                 "Git bytes changed during live snapshot",
@@ -4858,7 +5170,7 @@ def _capture_live_snapshot(
                 kind=EpochRefusal,
             )
         for index, (label, _, provider, excluded) in enumerate(descriptors):
-            with phase_timing("digest", label):
+            with phase_timing("digest", label, unit="entries"):
                 roots[index]["generation_sha256"] = (
                     git_tree_generation
                     if roots[index]["label"] == "git"
@@ -4891,7 +5203,7 @@ def _capture_live_snapshot(
             binding = seat_bindings[name]
             snapshot_path = _snapshot_path(binding[1], work_roots, label="snapshot")
             snapshot_seats.append((name, snapshot_path, seat_kinds[name]))
-        with phase_timing("catalog"):
+        with phase_timing("catalog", unit="workspaces", watchdog=True):
             captured = capture_agent_state(
                 role=role,
                 home=home,
@@ -4950,7 +5262,7 @@ def _capture_live_snapshot(
                 if item["classification"] == "sqlite"
             ]
         partial_index = partial / "snapshot-index.jsonl"
-        with phase_timing("seal") as sample:
+        with phase_timing("seal", watchdog=True) as sample:
             index_sha256, index_entries = _write_snapshot_index(
                 partial_index, work_roots, transfer_ledgers
             )
@@ -5073,7 +5385,7 @@ def _witness_epoch(snapshot: dict[str, Any]) -> None:
         "on",
     }:
         return
-    with phase_timing("witness"):
+    with phase_timing("witness", unit="entries"):
         try:
             observed = validate_live_snapshot_generation(snapshot, passes=1)
             divergence = "none" if observed else "unobserved: live-fence break-glass"
@@ -5243,11 +5555,21 @@ def capture_agent_state(
             return common, representative, error
 
     workspace_workers = workspace_worker_count(jobs, len(workspace_inputs))
+    progress_total(len(workspace_inputs))
+    workspace_results: list[
+        tuple[
+            Path,
+            Path,
+            tuple[dict[str, Any], list[dict[str, str]]]
+            | _OpaqueGitFallback
+            | BulkloadError,
+        ]
+    ] = []
     if workspace_workers:
         with ThreadPoolExecutor(max_workers=workspace_workers) as pool:
-            workspace_results = list(pool.map(capture_workspace, workspace_inputs))
-    else:
-        workspace_results = []
+            for outcome in pool.map(capture_workspace, workspace_inputs):
+                workspace_results.append(outcome)
+                progress_tick()
     workspaces: list[dict[str, Any]] = []
     for common, representative, result in workspace_results:
         if isinstance(result, tuple):

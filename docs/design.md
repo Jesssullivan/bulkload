@@ -219,6 +219,43 @@ receipt keeps `provider_runtime_acceptance_verified=false`; a fresh attended
 Codex/Claude/Pi action is required before claiming working authentication or
 resume continuity.
 
+## Telemetry
+
+Telemetry is default-on and diagnostic only. It is written to stderr, and to
+`--progress-log` when the operator names one; it never enters an artifact,
+never contributes to a digest, and every sink write is guarded so a broken
+sink cannot fail a cutover. Three line kinds, all `key=value` after a leading
+token:
+
+```text
+bulkload-run      event=start|end verb= version= pid= host= seconds= status= exit=
+bulkload-progress phase= root= seconds= unit= done= total= bytes= rate= eta=
+bulkload-phase    phase= root= seconds= files= bytes=
+```
+
+`bulkload-progress` is emitted *during* a phase on a fixed interval
+(`--heartbeat-seconds`, default 30), not at its exit, because the phases that
+matter run for hours. A phase that blocks in one opaque call — the rsync
+payload push, the workspace catalog, the base-custody read-back, the seal, the
+delta charge, the live-epoch validation — is ticked by a watchdog and reports
+elapsed time against whatever denominator it has, rather than an invented
+position. `files` counts entries and `bytes` counts bytes; no field carries the
+other's value, and `-` is reserved for a field that was not measured, so a
+measured zero prints `0`. A run whose timed phases cover under 90% of its wall
+clock closes with `bulkload-phase phase=UNACCOUNTED`, naming the gap instead of
+leaving it to be inferred. Every line names a phase, a root label, and counters
+only: never a path, a credential, or a remote URL.
+
+Telemetry is the only subsystem that is allowed to fail silently, and it is
+required to: it runs inside the `finally` of every phase and of `main`, so an
+error raised by a sink would replace the refusal the operator needs to read.
+`--progress-log` is the one telemetry sink that writes to the filesystem, and
+it is therefore held to the same rule as evidence output — it may not land
+under any root the running verb owns. The complete root set for a mutating
+verb lives inside its plan, so the file is buffered and created only after
+that evidence has cleared it; a verb that refuses earlier leaves nothing
+behind.
+
 ## Explicit boundaries
 
 Bulkload does not invoke a terminal multiplexer, TCFS runtime, Home Manager,

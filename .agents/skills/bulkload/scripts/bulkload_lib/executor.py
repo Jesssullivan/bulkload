@@ -56,6 +56,7 @@ from .scanner import (
     _sqlite_catalog_from_snapshot,
     _typed_sql_value,
     inspect_rsync,
+    phase_timing,
     shell_safe_executable,
     snapshot_sqlite,
     sqlite_catalog,
@@ -581,6 +582,17 @@ def _validate_prepare_receipt(
         raise BulkloadError("prepare receipt quarantine binding is invalid")
 
 
+def _charged_bytes(receipt: dict[str, Any]) -> int | None:
+    """The sealed charge for a receipt, for telemetry denominators only."""
+    try:
+        charged = receipt["capacity"]["charged_bytes"]
+    except (KeyError, TypeError):
+        return None
+    return (
+        charged if isinstance(charged, int) and not isinstance(charged, bool) else None
+    )
+
+
 def push_agent_transport(
     prepare_receipt: dict[str, Any],
     allowlist_path: Path,
@@ -682,7 +694,7 @@ def push_agent_transport(
         raise BulkloadError("transport push must run on the captured source host")
     source_snapshot = transport_authority["source_snapshot"]
     if isinstance(source_snapshot, dict):
-        validate_snapshot_custody(source_snapshot)
+        validate_snapshot_custody(source_snapshot, progress_phase="custody-push")
         if phase == "final":
             # One pass here, and only here. This fence is strictly dominated
             # by the full-strength fence below, which re-runs over the same
@@ -724,27 +736,35 @@ def push_agent_transport(
         # is therefore a second full read of the corpus that proves nothing the
         # destination does not prove independently. --transport-checksum
         # restores it for an operator who wants the transport to fail earlier.
-        result = subprocess.run(
-            [
-                source_binding["path"],
-                "-a",
-                "--from0",
-                "--files-from=-",
-                *(("--checksum",) if transport_checksum else ()),
-                "--delay-updates",
-                "--ignore-missing-args",
-                "--no-devices",
-                "--no-specials",
-                f"--rsync-path={transport_authority['destination_rsync']['path']}",
-                "/",
-                f"{host}:{quarantine}/",
-            ],
-            stdin=snapshot,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            env=_transport_environment(ssh_path),
-        )
+        # rsync is opaque from this side, so the watchdog reports elapsed
+        # time against the sealed charge rather than inventing progress. The
+        # charge is read defensively: telemetry may never fail a transport.
+        charged = _charged_bytes(prepare_receipt)
+        with phase_timing(
+            "push", phase, total=charged, unit="bytes", watchdog=True
+        ) as pushed:
+            pushed.bytes = charged
+            result = subprocess.run(
+                [
+                    source_binding["path"],
+                    "-a",
+                    "--from0",
+                    "--files-from=-",
+                    *(("--checksum",) if transport_checksum else ()),
+                    "--delay-updates",
+                    "--ignore-missing-args",
+                    "--no-devices",
+                    "--no-specials",
+                    f"--rsync-path={transport_authority['destination_rsync']['path']}",
+                    "/",
+                    f"{host}:{quarantine}/",
+                ],
+                stdin=snapshot,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=_transport_environment(ssh_path),
+            )
     if result.returncode != 0:
         raise BulkloadError("authenticated rsync quarantine push failed")
     if isinstance(source_snapshot, dict) and phase == "final":
@@ -1750,56 +1770,60 @@ def _verify_stage_objects(manifest: dict[str, Any], stage_root: Path) -> None:
                     add(worktree["index"])
         else:
             raise BulkloadError("stage manifest contains an unknown entry kind")
-    for digest, size in sorted(blobs.items()):
-        path = _object_path(stage_root, digest)
-        try:
-            info = path.stat(follow_symlinks=False)
-        except FileNotFoundError as error:
-            raise BulkloadError("sealed stage object is missing") from error
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_size != size
-            or sha256_file(path) != digest
-        ):
-            raise refuse(
-                "sealed stage object failed exact verification",
-                phase="verify-stage-objects",
-                root=stage_root,
-                label=digest,
-                count=len(blobs),
-                sample=[
-                    {
-                        "object": os.fspath(path),
-                        "blob_sha256": digest,
-                        "expected_size": size,
-                        "observed_size": info.st_size,
-                    }
-                ],
-                remedy=(
-                    "One content-addressed stage object no longer matches "
-                    "its digest. Re-stage that object; the whole stage is "
-                    "not necessarily lost, but this one is."
-                ),
-                **first_mismatch(
-                    "STAGE_OBJECT",
-                    (
-                        refusal_check(
-                            "KIND",
-                            "object.kind",
-                            lambda: stat.S_ISREG(info.st_mode),
-                            "regular",
-                            lambda: stat.filemode(info.st_mode),
-                        ),
-                        refusal_eq("SIZE", "object.size", size, lambda: info.st_size),
-                        refusal_eq(
-                            "DIGEST",
-                            "object.sha256",
-                            digest,
-                            lambda: sha256_file(path),
+    with phase_timing("stage-objects", unit="objects", total=len(blobs)) as progress:
+        for digest, size in sorted(blobs.items()):
+            path = _object_path(stage_root, digest)
+            try:
+                info = path.stat(follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise BulkloadError("sealed stage object is missing") from error
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size != size
+                or sha256_file(path) != digest
+            ):
+                raise refuse(
+                    "sealed stage object failed exact verification",
+                    phase="verify-stage-objects",
+                    root=stage_root,
+                    label=digest,
+                    count=len(blobs),
+                    sample=[
+                        {
+                            "object": os.fspath(path),
+                            "blob_sha256": digest,
+                            "expected_size": size,
+                            "observed_size": info.st_size,
+                        }
+                    ],
+                    remedy=(
+                        "One content-addressed stage object no longer matches "
+                        "its digest. Re-stage that object; the whole stage is "
+                        "not necessarily lost, but this one is."
+                    ),
+                    **first_mismatch(
+                        "STAGE_OBJECT",
+                        (
+                            refusal_check(
+                                "KIND",
+                                "object.kind",
+                                lambda: stat.S_ISREG(info.st_mode),
+                                "regular",
+                                lambda: stat.filemode(info.st_mode),
+                            ),
+                            refusal_eq(
+                                "SIZE", "object.size", size, lambda: info.st_size
+                            ),
+                            refusal_eq(
+                                "DIGEST",
+                                "object.sha256",
+                                digest,
+                                lambda: sha256_file(path),
+                            ),
                         ),
                     ),
-                ),
-            )
+                )
+            progress.advance(observed=size)
 
 
 def stage_agent_plan(
@@ -1945,7 +1969,10 @@ def stage_agent_plan(
                 if os.fspath(Path("/") / item) not in metadata
             }
             validate_snapshot_custody(
-                snapshot, mirror=source_mirror, required_paths=required
+                snapshot,
+                mirror=source_mirror,
+                required_paths=required,
+                progress_phase="custody-materialize",
             )
     else:
         source = plan["source"]["catalog"]["transport"]
@@ -1961,7 +1988,7 @@ def stage_agent_plan(
             raise BulkloadError("local rsync differs from captured authority")
         snapshot = plan["source"]["catalog"].get("snapshot")
         if isinstance(snapshot, dict):
-            validate_snapshot_custody(snapshot)
+            validate_snapshot_custody(snapshot, progress_phase="custody-stage")
             if phase == "final":
                 validate_live_snapshot_generation(snapshot)
         payload = b"".join(
@@ -1984,6 +2011,72 @@ def stage_agent_plan(
     stats = defaultdict(int)
     entries: list[dict[str, Any]] = []
     resolver = PlanOperationResolver(plan)
+    with phase_timing(
+        "stage",
+        phase,
+        total=len(plan["operations"]),
+        unit="operations",
+    ) as staged:
+        _stage_operations(
+            plan,
+            phase=phase,
+            stage_root=stage_root,
+            source_mirror=source_mirror,
+            allow_accounted_copy=allow_accounted_copy,
+            resolver=resolver,
+            entries=entries,
+            stats=stats,
+            progress=staged,
+        )
+    snapshot = plan["source"]["catalog"].get("snapshot")
+    if phase == "final" and transport_mode == "local" and isinstance(snapshot, dict):
+        validate_live_snapshot_generation(snapshot)
+    manifest = {
+        "created_at": utc_now(),
+        "entries": entries,
+        "holds": plan["holds"],
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "stage_id": new_id(),
+        "stage_root": os.fspath(stage_root),
+    }
+    seal(manifest, "manifest_sha256")
+    receipt = {
+        "capacity": capacity,
+        "created_at": utc_now(),
+        "manifest": manifest,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "materialization": dict(sorted(stats.items())),
+        "phase": phase,
+        "plan_sha256": plan["plan_sha256"],
+        "ready_for_apply": phase == "final",
+        "receipt_id": new_id(),
+        "schema": AGENT_STAGE_SCHEMA,
+        "stage_root": os.fspath(stage_root),
+        "transport": transport,
+    }
+    seal(receipt, "receipt_sha256")
+    atomic_write_json(receipt_path, receipt)
+    return receipt
+
+
+def _stage_operations(
+    plan: dict[str, Any],
+    *,
+    phase: str,
+    stage_root: Path,
+    source_mirror: Path | None,
+    allow_accounted_copy: bool,
+    resolver: PlanOperationResolver,
+    entries: list[dict[str, Any]],
+    stats: dict[str, int],
+    progress: Any,
+) -> None:
+    """Materialize every plan operation into `entries`, heartbeating as it goes.
+
+    Split out of `stage_agent_plan` only so the loop can live inside one timed
+    phase without re-indenting the whole verb; the body is unchanged.
+    """
     for compact_operation in plan["operations"]:
         operation = resolver.materialize(compact_operation)
         try:
@@ -2028,36 +2121,7 @@ def stage_agent_plan(
             if phase == "final":
                 raise
             stats["deferred_operations"] += 1
-    snapshot = plan["source"]["catalog"].get("snapshot")
-    if phase == "final" and transport_mode == "local" and isinstance(snapshot, dict):
-        validate_live_snapshot_generation(snapshot)
-    manifest = {
-        "created_at": utc_now(),
-        "entries": entries,
-        "holds": plan["holds"],
-        "phase": phase,
-        "plan_sha256": plan["plan_sha256"],
-        "stage_id": new_id(),
-        "stage_root": os.fspath(stage_root),
-    }
-    seal(manifest, "manifest_sha256")
-    receipt = {
-        "capacity": capacity,
-        "created_at": utc_now(),
-        "manifest": manifest,
-        "manifest_sha256": manifest["manifest_sha256"],
-        "materialization": dict(sorted(stats.items())),
-        "phase": phase,
-        "plan_sha256": plan["plan_sha256"],
-        "ready_for_apply": phase == "final",
-        "receipt_id": new_id(),
-        "schema": AGENT_STAGE_SCHEMA,
-        "stage_root": os.fspath(stage_root),
-        "transport": transport,
-    }
-    seal(receipt, "receipt_sha256")
-    atomic_write_json(receipt_path, receipt)
-    return receipt
+        progress.advance()
 
 
 def _current_record(path: Path) -> dict[str, Any] | None:
@@ -2768,6 +2832,33 @@ def _apply_mutations(
                 journal["snapshot_progress"] = len(journal["rollback_snapshots"])
         _write_apply_journal(journal_path, journal)
     mutations = journal["mutations"]
+    with phase_timing("apply", unit="mutations", total=len(mutations)) as progress:
+        progress.advance(journal.get("progress", 0))
+        _run_mutations(
+            journal,
+            journal_path=journal_path,
+            stage_root=stage_root,
+            mutations=mutations,
+            progress=progress,
+        )
+    journal["state"] = "mutations-applied"
+    journal["updated_at"] = utc_now()
+    _write_apply_journal(journal_path, journal)
+
+
+def _run_mutations(
+    journal: dict[str, Any],
+    *,
+    journal_path: Path,
+    stage_root: Path,
+    mutations: list[dict[str, Any]],
+    progress: Any,
+) -> None:
+    """Apply every outstanding journalled mutation, heartbeating as it goes.
+
+    Split out of `_apply_mutations` only so the loop can live inside one timed
+    phase without re-indenting the transaction; the body is unchanged.
+    """
     for index in range(journal.get("progress", 0), len(mutations)):
         mutation = mutations[index]
         target = Path(mutation["target"])
@@ -2803,9 +2894,7 @@ def _apply_mutations(
         journal["updated_at"] = utc_now()
         _write_apply_journal(journal_path, journal)
         _crash_fence(journal)
-    journal["state"] = "mutations-applied"
-    journal["updated_at"] = utc_now()
-    _write_apply_journal(journal_path, journal)
+        progress.advance()
 
 
 def _load_manifest(stage_receipt: dict[str, Any]) -> dict[str, Any]:
@@ -3055,6 +3144,65 @@ def _verify_git_entry(entry: dict[str, Any]) -> list[dict[str, str]]:
     return failures
 
 
+def _verify_entries(manifest: dict[str, Any], progress: Any) -> list[dict[str, str]]:
+    """Re-observe every applied entry, heartbeating as it goes.
+
+    Split out of `verify_agent_plan` only so the loop can live inside one
+    timed phase without re-indenting the verb; the body is unchanged.
+    """
+    failures: list[dict[str, str]] = []
+    for entry in manifest["entries"]:
+        if entry["kind"] == "git-workspace":
+            failures.extend(_verify_git_entry(entry))
+        elif entry["kind"] == "sqlite":
+            target = Path(entry["destination_path"])
+            try:
+                observed = sqlite_catalog(target)
+            except BulkloadError:
+                failures.append(
+                    {
+                        "code": "sqlite-verification-failed",
+                        "path": entry["destination_path"],
+                    }
+                )
+            else:
+                if (
+                    observed["logical_sha256"]
+                    != entry["expected_logical"]["logical_sha256"]
+                ):
+                    failures.append(
+                        {
+                            "code": "sqlite-logical-mismatch",
+                            "path": entry["destination_path"],
+                        }
+                    )
+                for suffix in ("-wal", "-shm", "-journal"):
+                    if Path(entry["destination_path"] + suffix).exists():
+                        failures.append(
+                            {
+                                "code": "sqlite-sidecar-after-apply",
+                                "path": entry["destination_path"],
+                            }
+                        )
+        elif entry["kind"] == "file":
+            current = _current_record(Path(entry["destination_path"]))
+            expected = {
+                "kind": entry["payload_kind"],
+                "mode": entry["mode"],
+                "sha256": entry["blob_sha256"],
+                "size": entry["size"],
+            }
+            if not _same_record(current, expected):
+                failures.append(
+                    {
+                        "code": "file-verification-failed",
+                        "path": entry["destination_path"],
+                    }
+                )
+        progress.advance()
+    return failures
+
+
 def verify_agent_plan(
     plan: dict[str, Any],
     stage_receipt: dict[str, Any],
@@ -3106,7 +3254,7 @@ def verify_agent_plan(
         snapshot = source.get("snapshot")
         if not isinstance(snapshot, dict):
             raise BulkloadError("cutover release requires immutable source B custody")
-        validate_snapshot_custody(snapshot)
+        validate_snapshot_custody(snapshot, progress_phase="custody-release")
         # `allow_break_glass=False`, and only here. This site is not gated on
         # a phase -- it runs whenever a destination receipt is presented --
         # and the receipt built immediately below seals
@@ -3144,55 +3292,10 @@ def verify_agent_plan(
         or journal.get("stage_receipt_sha256") != stage_receipt["receipt_sha256"]
     ):
         raise BulkloadError("verify evidence is detached from its journal")
-    failures: list[dict[str, str]] = []
-    for entry in manifest["entries"]:
-        if entry["kind"] == "git-workspace":
-            failures.extend(_verify_git_entry(entry))
-        elif entry["kind"] == "sqlite":
-            target = Path(entry["destination_path"])
-            try:
-                observed = sqlite_catalog(target)
-            except BulkloadError:
-                failures.append(
-                    {
-                        "code": "sqlite-verification-failed",
-                        "path": entry["destination_path"],
-                    }
-                )
-            else:
-                if (
-                    observed["logical_sha256"]
-                    != entry["expected_logical"]["logical_sha256"]
-                ):
-                    failures.append(
-                        {
-                            "code": "sqlite-logical-mismatch",
-                            "path": entry["destination_path"],
-                        }
-                    )
-                for suffix in ("-wal", "-shm", "-journal"):
-                    if Path(entry["destination_path"] + suffix).exists():
-                        failures.append(
-                            {
-                                "code": "sqlite-sidecar-after-apply",
-                                "path": entry["destination_path"],
-                            }
-                        )
-        elif entry["kind"] == "file":
-            current = _current_record(Path(entry["destination_path"]))
-            expected = {
-                "kind": entry["payload_kind"],
-                "mode": entry["mode"],
-                "sha256": entry["blob_sha256"],
-                "size": entry["size"],
-            }
-            if not _same_record(current, expected):
-                failures.append(
-                    {
-                        "code": "file-verification-failed",
-                        "path": entry["destination_path"],
-                    }
-                )
+    with phase_timing(
+        "verify", unit="entries", total=len(manifest["entries"])
+    ) as progress:
+        failures = _verify_entries(manifest, progress)
     receipt = {
         "apply_receipt_sha256": apply_receipt["receipt_sha256"],
         "destination_verify_receipt_sha256": None,
