@@ -40,6 +40,55 @@ and Pi auth are typed source-authority operations. Claude
 auth is nonportable: preserve it as a hold and authenticate on the destination
 attended. Offline receipts do not prove provider acceptance.
 
+## Watch it run
+
+Every verb narrates itself on stderr. There is nothing to turn on.
+
+- `bulkload-run event=start verb=... version=... pid=... host=...` opens each
+  invocation and `bulkload-run event=end verb=... seconds=... status=... exit=...`
+  closes it, so no invocation can leave a zero-byte log behind.
+- `bulkload-progress phase=... root=... seconds=... unit=... done=... total=...
+  bytes=... rate=... eta=...` is a heartbeat emitted *during* a long phase,
+  every 30 s by default. `rate` is `unit` per second and `eta` is seconds
+  remaining; both read `-` until the phase can measure them. The payload push
+  is opaque from the source side, so its heartbeat carries elapsed time against
+  the sealed charge rather than an invented byte position.
+- `bulkload-phase phase=... root=... seconds=... files=... bytes=...` closes
+  each phase. `files` is an entry count and `bytes` is a byte total; the named
+  phases are `base-custody` (which encloses `custody-base`), `custody*`,
+  `census`, `charge`, `generation-pre`, `copy`, `recensus`,
+  `generation-post`, `digest`, `catalog`, `seal`, `witness`, `validate`,
+  `stage`, `stage-objects`, `push`, `apply`, `verify`. Phases nest, so two
+  lines can cover the same seconds.
+- `bulkload-phase phase=UNACCOUNTED seconds=...` closes a run whose timed
+  phases covered under 90% of its wall clock, and names the remainder. It is
+  the instrument admitting where it is blind; treat it as a profiling lead,
+  not a fault.
+
+In every line `-` means "not measured". A field that was measured prints its
+value, `0` included: `bytes=0` is a measured zero and `bytes=-` is no
+measurement at all.
+
+Flags, on every verb:
+
+- `--progress-log PATH` appends the same lines to a file an unattended agent
+  can tail. It is refused if it would land under any live, stage, snapshot or
+  rollback root of the verb that is running — including the destination roots
+  that only a plan or a stage receipt names, which is why the file is not
+  created until that evidence has been read and has cleared it. A verb that
+  refuses before it can read that evidence writes the refusal to stderr and
+  creates no file at all.
+- `--heartbeat-seconds N` changes the heartbeat interval (default 30).
+- `--quiet` suppresses stderr telemetry. `BULKLOAD_PHASE_TIMING=0` does the
+  same for a caller that cannot reach the flags.
+
+Telemetry cannot fail a run. Every sink write is guarded, and a sink that has
+gone away — `2>&-` closes fd 2 and CPython then sets `sys.stderr` to `None` —
+is skipped rather than allowed to replace the verb's own refusal.
+
+Telemetry is diagnostic only: it never reaches an artifact and never changes a
+digest.
+
 ## Capture twice per role
 
 Run the canonical launcher directly or the Bazel-built `bulkload` binary. Both

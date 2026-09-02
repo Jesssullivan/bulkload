@@ -16,7 +16,12 @@ import threading
 import unittest
 from unittest import mock
 
-from bulkload_lib.cli import _agent_plan, _protect_output, build_parser
+from bulkload_lib.cli import (
+    _agent_plan,
+    _evidence_protected_roots,
+    _protect_output,
+    build_parser,
+)
 from bulkload_lib.executor import (
     _atomic_install_blob,
     _current_record,
@@ -574,7 +579,10 @@ class SchemaAndCaptureTests(unittest.TestCase):
                 ]
             )
             with self.assertRaisesRegex(BulkloadError, "evidence output overlaps"):
-                _protect_output(release_arguments)
+                _protect_output(
+                    release_arguments,
+                    _evidence_protected_roots(release_arguments),
+                )
             fake_ssh = fixture.root / "fake-ssh-live"
             fake_ssh.write_text(
                 "#!/usr/bin/env python3\n"

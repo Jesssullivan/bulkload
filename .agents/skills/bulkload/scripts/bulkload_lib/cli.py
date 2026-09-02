@@ -7,9 +7,11 @@ import contextlib
 import gc
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import sys
-from typing import Any, Iterator, Sequence
+import time
+from typing import Any, Iterable, Iterator, Sequence
 
 from . import __version__
 from .executor import (
@@ -35,12 +37,16 @@ from .model import (
 )
 from .planner import compile_agent_plan_authorities
 from .scanner import (
+    DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_SQLITE_ROWS,
     _catalog_path_identities,
     canonical_path_map,
     capture_agent_state,
+    configure_progress,
+    emit_progress,
+    unaccounted_seconds,
     validate_agent_capture,
 )
 
@@ -151,8 +157,12 @@ def _catalog_roots(catalog: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def _protected_roots(arguments: argparse.Namespace) -> list[Path]:
-    """Every live root this verb reads, which no output of ours may enter."""
+def _evidence_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Every live root this verb reads, which no output of ours may enter.
+
+    Reads the verb's evidence to get there, which for `agent-plan` means four
+    multi-gigabyte captures, so callers compute it once and share the result.
+    """
     roots: list[Path] = []
     if arguments.command == "agent-capture":
         roots.extend((Path(arguments.home), Path(arguments.git_root)))
@@ -213,18 +223,26 @@ def _disarmed_on_refusal(arguments: argparse.Namespace) -> Iterator[None]:
         raise
 
 
-def _protect_output(arguments: argparse.Namespace) -> None:
+def _protect_output(
+    arguments: argparse.Namespace, protected: Sequence[Path] | None = None
+) -> None:
     """Keep both output channels out of every live root the verb reads.
 
     `--failure-output` is a write channel like `--output`, and `atomic_write`
     creates the whole parent tree, so an unguarded refusal path plants
     directories and a file inside a root a capture is walking — the exact
     shape that refuses the capture with "live snapshot path set changed".
+
+    `protected` is the shared root set when the caller already had to derive
+    it for `--progress-log`; for `agent-plan` that derivation costs four
+    multi-gigabyte reads and must not happen twice. Left at None it is
+    derived here, and only once both output channels are known to need it,
+    which keeps the cost off a verb that writes evidence to stdout alone.
     """
     failure_output = getattr(arguments, "failure_output", None)
     if arguments.output == "-" and not failure_output:
         return
-    roots = _protected_roots(arguments)
+    roots = _evidence_protected_roots(arguments) if protected is None else protected
     if arguments.output != "-":
         assert_no_overlap(Path(arguments.output), roots, "evidence output")
     if failure_output:
@@ -503,6 +521,142 @@ def _agent_recover(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _telemetry_parser() -> argparse.ArgumentParser:
+    """The progress flags every verb carries.
+
+    Telemetry is on by default: a verb that runs for hours must never leave a
+    zero-byte log behind. `--quiet` is the opt-out, and `--progress-log`
+    duplicates the same lines into a file an unattended agent can tail.
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress phase and heartbeat telemetry on stderr",
+    )
+    parent.add_argument(
+        "--progress-log",
+        help=(
+            "append phase and heartbeat telemetry to this file as well as "
+            "stderr. It must not live under any live, stage, or snapshot root."
+        ),
+    )
+    parent.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SECONDS,
+        help=(
+            "seconds between in-phase heartbeat lines "
+            f"(default {DEFAULT_HEARTBEAT_SECONDS:g})"
+        ),
+    )
+    return parent
+
+
+def _cheap_protected_roots(arguments: argparse.Namespace) -> list[Path]:
+    """Roots a progress log must not land in, read straight off the flags.
+
+    Deliberately does not open any evidence: this runs before the first
+    telemetry line, and `agent-plan`'s four captures are gigabytes each.
+    """
+    roots: list[Path] = []
+    for name in ("home", "git_root", "codex_root", "claude_root", "pi_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    for declaration in [
+        *getattr(arguments, "seat", []),
+        *getattr(arguments, "file_seat", []),
+    ]:
+        roots.append(declaration[1])
+    for name in ("stage_root", "rollback_root"):
+        value = getattr(arguments, name, None)
+        if value:
+            roots.append(Path(value))
+    seal = getattr(arguments, "snapshot_base_seal", None)
+    if seal:
+        roots.append(Path(seal).expanduser().parent)
+    return roots
+
+
+# One telemetry line is ~120 bytes and only the run banner is written before
+# activation, so this bound is three orders of magnitude of headroom against a
+# sink that never opens.
+MAX_BUFFERED_PROGRESS_LINES = 1024
+
+
+class _DeferredProgressLog:
+    """A `--progress-log` that does not exist until it is proven safe.
+
+    The advertised refusal — "it must not live under any live, stage, or
+    snapshot root" — held for `agent-capture` alone, because that is the one
+    verb whose roots are all readable straight off the flags. `agent-apply`'s
+    destination roots live inside the plan, and the file was created `O_CREAT`
+    before the plan was read, so `--progress-log <path under the destination
+    home>` planted a file in the destination live tree that the apply journal
+    does not record and `agent-rollback` therefore does not remove.
+
+    Opening the file earlier cannot fix that; opening it later can. Lines are
+    buffered from the first banner until `activate` has cleared the candidate
+    against the complete per-verb root set, and only then is the file created.
+    A verb that refuses before activation leaves nothing behind at all — the
+    refusal is still printed on stderr, which is the sink that is always
+    there.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._buffer: list[str] = []
+        self._stream: Any = None
+
+    def activate(self, protected: Iterable[Path]) -> None:
+        assert_no_overlap(self.path, protected, "progress log")
+        descriptor = os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        stream = os.fdopen(descriptor, "a", buffering=1, encoding="utf-8", closefd=True)
+        for line in self._buffer:
+            stream.write(line)
+        self._buffer.clear()
+        stream.flush()
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        if self._stream is not None:
+            self._stream.write(text)
+        elif len(self._buffer) < MAX_BUFFERED_PROGRESS_LINES:
+            self._buffer.append(text)
+
+    def flush(self) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+
+    def close(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            stream.close()
+
+
+def _open_progress_log(arguments: argparse.Namespace) -> _DeferredProgressLog | None:
+    """Bind the progress log and refuse everything the flags alone can refuse.
+
+    This is the cheap half of the guard: it runs before the first telemetry
+    line, so it may not open evidence. The complete half is
+    `_DeferredProgressLog.activate`.
+    """
+    path = getattr(arguments, "progress_log", None)
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    output = getattr(arguments, "output", None)
+    if output and output != "-" and Path(output).expanduser() == candidate:
+        raise BulkloadError("progress log must not be the evidence output path")
+    assert_no_overlap(candidate, _cheap_protected_roots(arguments), "progress log")
+    return _DeferredProgressLog(candidate)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkload",
@@ -525,10 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    telemetry = _telemetry_parser()
 
     capture = commands.add_parser(
         "agent-capture",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="write AgentCaptureV4 evidence",
     )
     capture.add_argument("--role", choices=("source", "destination"), required=True)
@@ -582,7 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser(
         "agent-plan",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="compile an exact four-capture union",
     )
     plan.add_argument("--source-a", required=True)
@@ -594,7 +749,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage = commands.add_parser(
         "agent-stage",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="materialize preseed or final stage",
     )
     stage.add_argument("--phase", choices=("preseed", "final"), required=True)
@@ -628,7 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     apply = commands.add_parser(
         "agent-apply",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="apply a sealed final stage",
     )
     apply.add_argument("--plan", required=True)
@@ -644,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = commands.add_parser(
         "agent-verify",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="independently verify final state",
     )
     verify.add_argument("--plan", required=True)
@@ -656,7 +811,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rollback = commands.add_parser(
         "agent-rollback",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="restore exact overwritten state",
     )
     rollback.add_argument("--apply-receipt", required=True)
@@ -666,7 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     recover = commands.add_parser(
         "agent-recover",
-        parents=[refusal],
+        parents=[refusal, telemetry],
         help="resume or roll back an interrupted apply",
     )
     recover.add_argument("--plan", required=True)
@@ -737,16 +892,96 @@ def _emit_failure(arguments: argparse.Namespace, error: BaseException) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    started = time.monotonic()
+    log = None
+    status = "fail"
+    code: int | None = None
     try:
-        _protect_failure_output(arguments)
-        _protect_output(arguments)
-        result = arguments.handler(arguments)
-        _write(arguments.output, result)
-    except (BulkloadError, OSError, sqlite3.Error) as error:
-        # The refusal is the deliverable; the record is a convenience. Print
-        # first so no failure of the record write can cost the operator the
-        # one line that names what refused.
-        print(f"bulkload: FAIL: {error}", file=sys.stderr)
-        _emit_failure(arguments, error)
-        return 1
-    return 0
+        try:
+            # The flag-only half of the refusal-path guard runs before
+            # anything else, because every later handler writes the refusal
+            # record and none of them may write it to a path this rejects.
+            _protect_failure_output(arguments)
+            log = _open_progress_log(arguments)
+            configure_progress(
+                stderr=not arguments.quiet,
+                interval=arguments.heartbeat_seconds,
+                log_stream=log,
+            )
+        except (BulkloadError, OSError) as error:
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            _emit_failure(arguments, error)
+            code = 1
+            return 1
+        # Every verb announces itself. This line, and the closing one below,
+        # are why no invocation can leave a zero-byte log behind again.
+        emit_progress(
+            "bulkload-run"
+            " event=start"
+            f" verb={arguments.command}"
+            f" version={__version__}"
+            f" pid={os.getpid()}"
+            f" host={socket.gethostname()}"
+        )
+        try:
+            # One derivation, two guards. The progress log and the evidence
+            # output are both writes this verb makes outside its own
+            # contract, and both must clear the same roots. Deriving it here
+            # also means the progress log clears the roots that only the
+            # evidence names — the destination home in an apply plan, the
+            # source roots in a stage prepare receipt — which the flag-only
+            # check cannot see. With no log there is nothing to share, so
+            # `_protect_output` derives it itself, and only if it needs it.
+            protected: list[Path] | None = None
+            if log is not None:
+                protected = _evidence_protected_roots(arguments)
+                log.activate([*protected, *_cheap_protected_roots(arguments)])
+            _protect_output(arguments, protected)
+            result = arguments.handler(arguments)
+            _write(arguments.output, result)
+        except (BulkloadError, OSError, sqlite3.Error) as error:
+            # The refusal is the deliverable; the record is a convenience.
+            # Print first so no failure of the record write can cost the
+            # operator the one line that names what refused.
+            print(f"bulkload: FAIL: {error}", file=sys.stderr)
+            _emit_failure(arguments, error)
+            code = 1
+            return 1
+        status = "ok"
+        code = 0
+        return 0
+    finally:
+        elapsed = time.monotonic() - started
+        # Lane F's ask: name the hole rather than let the next one hide. If
+        # the timed phases do not cover 90% of the run, say how much they
+        # missed instead of leaving it to be inferred from a wall clock.
+        unaccounted = unaccounted_seconds(elapsed)
+        if unaccounted is not None:
+            emit_progress(
+                "bulkload-phase"
+                " phase=UNACCOUNTED"
+                " root=-"
+                f" seconds={unaccounted:.3f}"
+                " files=-"
+                " bytes=-"
+            )
+        emit_progress(
+            "bulkload-run"
+            " event=end"
+            f" verb={arguments.command}"
+            f" seconds={elapsed:.3f}"
+            f" status={status}"
+            f" exit={'-' if code is None else code}"
+        )
+        # `interval=None` means "keep", so the process-global heartbeat has to
+        # be restored by name or a caller's tuning outlives its own run.
+        configure_progress(
+            stderr=not arguments.quiet,
+            interval=DEFAULT_HEARTBEAT_SECONDS,
+            log_stream=None,
+        )
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
