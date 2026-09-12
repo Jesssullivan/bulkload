@@ -17,18 +17,15 @@ test:
 test-local:
     cd {{ root }} && bazelisk test //:tests
 
-skill-validate:
-    cd {{ root }} && python3 scripts/validate_skill.py --self-test .agents/skills/bulkload
-
 repo-manifest-validate:
     cd {{ root }} && python3 scripts/validate_repo_manifest.py tinyland.repo.json
 
 python-lint:
-    cd {{ root }} && ruff check .agents/skills/bulkload/scripts scripts tests
-    cd {{ root }} && ruff format --check .agents/skills/bulkload/scripts scripts tests
+    cd {{ root }} && ruff check scripts tests
+    cd {{ root }} && ruff format --check scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/install-skill.sh scripts/demo.sh scripts/ci-public-read-guard.sh
+    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml
@@ -44,7 +41,7 @@ flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
 # Source gates owned by this repository's development shell.
-check-source: skill-validate repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir
+check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir
 
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.
@@ -67,11 +64,5 @@ ci:
     cd {{ root }} && nix develop .#default --command just ci-source
     cd {{ root }} && just flywheel-build //:bulkload
     cd {{ root }} && just flywheel-test //:tests
-
-demo:
-    cd {{ root }} && scripts/demo.sh
-
-install-skill:
-    cd {{ root }} && scripts/install-skill.sh --all
 
 import? "justfile.flywheel"

@@ -3,7 +3,7 @@
   "repo": {
     "name": "bulkload",
     "github": "Jesssullivan/bulkload",
-    "description": "Manifest-first, verified repository and agent-context migration tooling"
+    "description": "Bulkload product contract; implementation in the TCFS Rust workspace"
   },
   "taxonomy": {
     "primary_role": "private-migration-tooling",
@@ -31,23 +31,10 @@
   },
   "boundaries": {
     "default_read_only": true,
-    "capture_schema": "dev.tinyland.bulkload.agent-capture.v4",
-    "git_workspace_schema": "dev.tinyland.bulkload.git-workspace.v2",
-    "copies_generic_credentials": false,
-    "copies_typed_agent_auth": true,
-    "claude_auth_policy": "nonportable-hold",
-    "credential_copy_policy": "typed-opt-in-attended",
-    "captures_live_wal_sqlite": true,
-    "composes_typed_agent_sqlite": true,
-    "installs_typed_agent_sqlite": true,
-    "preseed_mutates_live_destination": false,
-    "final_apply_requires_reflink_rollback": true,
-    "full_copy_rollback_fallback": false,
-    "unknown_state_policy": "stop",
-    "shared_divergence_policy": "stop-unless-typed-source-authority-or-git-recovery",
-    "private_runtime_acceptance_required": true,
-    "invokes_terminal_multiplexers": false,
-    "owns_tcfs_runtime": false,
+    "runtime": "retired-python",
+    "implementation_repository": "Jesssullivan/tummycrypt",
+    "preserves_unique_state": true,
+    "signals_processes": false,
     "owns_home_manager_activation": false
   }
 }

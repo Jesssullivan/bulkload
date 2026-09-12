@@ -1,4 +1,4 @@
 interface:
   display_name: "Bulkload"
-  short_description: "Cut over typed Git and agent state safely"
-  default_prompt: "Use $bulkload to capture, plan, stage, apply, verify, roll back, or recover an AgentCaptureV4 Git and agent-state cutover."
+  short_description: "Continue a live dev-seat migration through TCFS"
+  default_prompt: "Use $bulkload to inspect the TCFS Rust migration carrier and complete working continuity while preserving both hosts’ unique state."

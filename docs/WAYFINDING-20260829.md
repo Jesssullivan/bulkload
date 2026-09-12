@@ -1,8 +1,7 @@
 # Wayfinding — the Bulkload → sting migration week (2026-08-21 → 2026-09-02)
 
 This document is the shareable map of the migration week for the operator's other
-agents: what happened, what was ruled, where every artifact lives, and what stands
-now. Verbatim source material lives in [`docs/wayfinding-20260829/`](wayfinding-20260829/).
+agents: what happened, what was ruled, where every artifact lives, and the historical decisions. Verbatim source material lives in [`docs/wayfinding-20260829/`](wayfinding-20260829/).
 
 ## 1. The week in one page
 
@@ -63,10 +62,6 @@ and standing/superseded/discharged status. Standing invariants of note:
 
 ## 4. Artifact map
 
-- GitHub (repos, PRs #1–#34, branches, local clones):
-  [`wayfinding-20260829/github-map.md`](wayfinding-20260829/github-map.md)
-- Linear (15 tickets, Sting Dev-Box project, Cordillera + Tummycrypt initiatives):
-  [`wayfinding-20260829/linear-map.md`](wayfinding-20260829/linear-map.md)
 - Durable receipts: `tinyland-state/archives/bulkload-migration-20260829.tgz`
   (STATUS ledger, week-review, interview packets, judge docs, 41 run logs).
 - The append-only STATUS ledger (kept in place):
@@ -78,6 +73,6 @@ and standing/superseded/discharged status. Standing invariants of note:
 |---|---|
 | R25 Rust rebuild | tummycrypt `crates/tcfs-bulkload*` (PR #592 draft; milestones M0–M10) |
 | Product bar | this repo, issue #34 |
-| Python engine (archived reference) | this repo `main` + `/Volumes/TinylandSSD/bulkload-refactor` |
+| Python engine (archived reference) | this repo Git history (runtime retired) |
 | Sting seat ops | lab `docs/operations/STING_FIRST_HOUR.md`, PR #1595 |
 | TCFS follow-on | TIN-1556 (D4), TIN-4193 (fabric F1–F3), TIN-4194 (v0.12.19) |

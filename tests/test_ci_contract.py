@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -25,8 +24,8 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "fa92c9535479ab91f7184bddc14e74d6d0e60ea013a140ffd1cf5e65c3c65a5f"
-GUARD_SHA256 = "50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11"
+ACTION_SHA256 = "4cfacae895547ef1990750fdd51087303842786ebd456ae7c166e36f2241d38c"
+GUARD_SHA256 = "f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924"
 SOURCE_GATE_STEP_SHA256 = (
     "96893435532ebb5d5e4b53e813e2069a28c8c23303a70c1bb9b1a9fb4071bdf2"
 )
@@ -43,7 +42,7 @@ BOOTSTRAP_IMPL_LINE = (
 BAZEL_VERSION_SHA256 = (
     "4fa9948d0ae7007cbd1cc05768bc3e7cc6ec46ad0ea84c87df79e7a0c48d76b4"
 )
-FLAKE_SHA256 = "971a3040c2c6b44392c793b43d1e82f7d501070e76bb5ed593b6cc72bae39489"
+FLAKE_SHA256 = "d3bafa87bfc6675db39cf3567ebc7e740ce4fb842d5353d7d2c51137961268c1"
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
 EXPECTED_SHA_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
@@ -65,7 +64,7 @@ MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
 TERMINAL_GATES = ("source", "build", "test")
 TERMINAL_CONSUMERS = {
     "source": "Run repository-owned source gates",
-    "build": "Build the Bulkload binary through the public Flywheel action",
+    "build": "Build the Bulkload documentation through the public Flywheel action",
     "test": "Test the complete Bulkload Bazel graph through the public Flywheel action",
 }
 ACTION_STEP_GATES = {
@@ -875,7 +874,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "Enforce the discovered public-read boundary",
         "Verify effective Nix client authority",
         "Revalidate immutable Bazel build authority",
-        "Build the Bulkload binary through the public Flywheel action",
+        "Build the Bulkload documentation through the public Flywheel action",
         "Revalidate immutable Bazel test authority",
         "Test the complete Bulkload Bazel graph through the public Flywheel action",
         "Run repository-owned source gates",
@@ -908,7 +907,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             "env",
             "run",
         ),
-        "Build the Bulkload binary through the public Flywheel action": (
+        "Build the Bulkload documentation through the public Flywheel action": (
             "if",
             "uses",
             "env",
@@ -1795,60 +1794,6 @@ def validate_bazelrc(
         raise ContractError("vendored bazelrc lost the read-only default")
 
 
-def validate_bulkload_bootstrap_build(build: str) -> None:
-    try:
-        tree = ast.parse(build)
-    except SyntaxError as error:
-        raise ContractError("BUILD source is not statically parseable") from error
-    candidates: list[ast.Call] = []
-    for statement in tree.body:
-        if (
-            not isinstance(statement, ast.Expr)
-            or not isinstance(statement.value, ast.Call)
-            or not isinstance(statement.value.func, ast.Name)
-            or statement.value.func.id != "py_binary"
-        ):
-            continue
-        if any(
-            keyword.arg == "name"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value == "bulkload"
-            for keyword in statement.value.keywords
-        ):
-            candidates.append(statement.value)
-    if len(candidates) != 1:
-        raise ContractError("BUILD must contain one direct bulkload py_binary")
-    candidate = candidates[0]
-    if candidate.args or any(keyword.arg is None for keyword in candidate.keywords):
-        raise ContractError("bulkload py_binary arguments must be explicit keywords")
-    keywords = [keyword.arg for keyword in candidate.keywords]
-    if len(keywords) != len(set(keywords)):
-        raise ContractError("bulkload py_binary keywords must be unique")
-    name_values = [
-        keyword.value for keyword in candidate.keywords if keyword.arg == "name"
-    ]
-    interpreter_values = [
-        keyword.value
-        for keyword in candidate.keywords
-        if keyword.arg == "interpreter_args"
-    ]
-    if (
-        len(name_values) != 1
-        or not isinstance(name_values[0], ast.Constant)
-        or name_values[0].value != "bulkload"
-        or len(interpreter_values) != 1
-        or not isinstance(interpreter_values[0], (ast.List, ast.Tuple))
-        or [
-            item.value if isinstance(item, ast.Constant) else None
-            for item in interpreter_values[0].elts
-        ]
-        != ["-I", "-S"]
-    ):
-        raise ContractError(
-            "bulkload py_binary must use literal interpreter_args [-I, -S]"
-        )
-
-
 def validate_flake_topology(
     flake: str, lock_source: str, *, exact_digest: bool = True
 ) -> None:
@@ -1950,7 +1895,6 @@ class CiContractTest(unittest.TestCase):
         validate_local_action(self.action)
         validate_guard(self.guard)
         validate_bazelrc(self.workspace_bazelrc, self.bazelrc)
-        validate_bulkload_bootstrap_build(self.build)
         validate_flake_topology(self.flake, self.flake_lock)
         self.assertEqual(sha256(self.bazel_version), BAZEL_VERSION_SHA256)
         mode = (self.root / GUARD_PATH).stat().st_mode
@@ -3207,36 +3151,6 @@ class CiContractTest(unittest.TestCase):
         for flywheel in flywheel_variants:
             with self.assertRaises(ContractError):
                 validate_bazelrc(self.workspace_bazelrc, flywheel, exact_digest=False)
-
-    def test_bulkload_bootstrap_build_mutations_fail_closed(self) -> None:
-        literal_block = '    interpreter_args = [\n        "-I",\n        "-S",\n    ],'
-        build_variants = (
-            self.build.replace('        "-I",\n', "", 1),
-            self.build.replace('        "-S",\n', "", 1),
-            self.build.replace(
-                literal_block,
-                '    interpreter_args = [\n        "-S",\n        "-I",\n    ],',
-                1,
-            ),
-            self.build.replace(
-                literal_block,
-                "    interpreter_args = [\n"
-                '        "-I",\n'
-                '        "-S",\n'
-                '        "-E",\n'
-                "    ],",
-                1,
-            ),
-            self.build.replace(
-                literal_block,
-                "    interpreter_args = BOOTSTRAP_ARGS,",
-                1,
-            ),
-        )
-        for build in build_variants:
-            self.assertNotEqual(build, self.build)
-            with self.assertRaises(ContractError):
-                validate_bulkload_bootstrap_build(build)
 
     def test_flake_private_source_mutations_fail_closed(self) -> None:
         flake_variants = (
