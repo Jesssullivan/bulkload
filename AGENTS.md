@@ -1,76 +1,23 @@
 # bulkload Development Context
 
-`bulkload` is a manifest-first migration tool and agent skill for one-way,
-reviewed movement of Git working state and selected agent context. Its default
-operation is read-only.
+The Python migration engine is retired. Implementation belongs to the TCFS Rust
+workspace in [tummycrypt PR #592](https://github.com/Jesssullivan/tummycrypt/pull/592).
+M0/M1 work is not a completed M2 mover. Read docs/design.md for the product contract.
+Historical rulings and interviews are evidence, not current operational status.
 
-## Start here
+- Keep all operator and agent sessions running. Never signal a process.
+- Include Git, agents, credentials, dots, SQLite and worktrees. Preserve both
+  hosts’ unique state; an unresolved state class is not an implicit exclusion.
+- Git-aware union preserves refs, objects, real stashes, indexes, working bytes
+  and worktree administration without changing an active checkout.
+- Carry account credentials privately; preserve destination machine identity
+  and Home Manager authority. Never print credentials.
+- Capture SQLite through its backup API; never copy live WAL/SHM bytes or replace
+  a database with unique rows. Preserve conflicts for explicit resolution.
+- Reclaim only proven redundant data after preserving unique content.
+- Do not recreate the Python engine, stillness ceremony or installer.
+- Use existing registered checks and apply_patch; stage explicit paths.
+- CI remains on GloriousFlywheel tinyland-nix. Keep .bazelrc.flywheel endpoint-free.
 
-1. Run `git status --short --branch`.
-2. Read `docs/design.md` before changing safety or manifest semantics.
-3. Use `just --list`; keep Bazel targets as the CI/build/test source of truth.
-4. Keep the canonical skill at `.agents/skills/bulkload/` self-contained.
-5. Read the imported `justfile.flywheel` contract before changing build or CI
-   routing.
-
-## Hard rules
-
-- Never promote credentials, auth stores, databases, browser profiles, `.env`
-  files, private keys, kubeconfigs, or decrypted secret material through a
-  generic file adapter. `AgentCaptureV4` is the only copy authority for Codex,
-  Claude, Pi, and declared mutable-seat state. It records hashes and typed
-  structure, never credential values or SQLite rows. Claude auth is a
-  nonportable hold. Descendants of a declared provider root default to typed
-  portable-private state; special entries, unsafe typed state, and structural
-  collisions stop planning.
-- Sessions remain alive and no process is ever signaled. A stable capture
-  pair is an immutable live-snapshot A capture plus a B capture seal-chained off
-  it (contract stability and identity superset, never catalog byte-equality on
-  a living host). Writers keep running during preliminary preseed; final
-  authority comes from an attended no-interaction interval proven by two
-  matching complete live epochs before and after transport, a fresh final
-  capture pair, and a fresh plan. Quiescence is verified read-only and refused
-  fail-closed; it is never enforced by stopping anything. SQLite/WAL state uses
-  the backup API, composed only when schema and shared primary-key rows agree,
-  and checked independently before a final receipt. Offline receipts still
-  require a fresh attended provider turn before claiming runtime
-  authentication.
-- All commands use the supported `-I -S` launcher and bind the pinned Bulkload
-  application-source closure into captures and plans. This does not bind the
-  Python interpreter or standard-library closure.
-- Never delete source data. Final destination changes require the exact plan
-  digest, a sealed final stage, an exact-overwrite capacity gate, and a complete
-  reflinked rollback snapshot. A failed reflink is a hard stop; never silently
-  fall back to a full duplicate. Preseed writes only beneath its external stage
-  root and must not mutate any live destination path.
-- Never apply a plan without an exact plan digest supplied by the operator.
-- Require a stable source capture pair before creating an actionable plan
-  (live mode: B seal-chained off A; catalog byte-equality is only the legacy
-  `--acknowledge-writers-quiesced` shape and is unsatisfiable on a living host).
-- Treat Git refs/objects, worktree bytes, worktree administration, agent
-  transcripts, generated caches, and authentication as separate state classes.
-- Do not infer worktree identity from a basename; record path, branch, HEAD,
-  common Git directory, dirt, and remote backing separately.
-- Do not invoke `cmux` or another terminal multiplexer. Migration tooling may
-  inventory session artifacts, but terminal ownership remains with the operator.
-- Do not execute Home Manager switches, deploys, activations, credential
-  ceremonies, or TCFS runtime operations from this repository.
-- CI runs only on the GloriousFlywheel `tinyland-nix` capability class. Never
-  add a GitHub-hosted label, bare `self-hosted`, dynamic fallback, repo-shaped
-  workflow label, or an unaudited reusable workflow.
-- Keep `.bazelrc.flywheel` endpoint-free and drive Bazel through
-  `gloriousflywheel-bazel`. PRs are cache-read-only; cache hits do not prove
-  remote execution.
-- Use `apply_patch` for authored edits. Do not add AI attribution to commits.
-
-## Validation
-
-```bash
-just check
-```
-
-`just check` requires an attached GloriousFlywheel profile and is the normal
-build/test path. `just ci` additionally verifies the profile, evaluates the
-flake, scans committed history, and exercises `//:bulkload` plus `//:tests` on
-the shared cache. `just check-local` is an explicit source-only fallback for an
-unattached development shell and is never cache, runner, or enrollment proof.
+just check validates repository and CI contracts. //:bulkload packages documents,
+not an executable. Rust tests and benchmarks belong in the TCFS workspace.

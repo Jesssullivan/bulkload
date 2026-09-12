@@ -68,23 +68,10 @@ def validate(value: Any) -> None:
     boundaries = value["boundaries"]
     required_boundaries = {
         "default_read_only": True,
-        "capture_schema": "dev.tinyland.bulkload.agent-capture.v4",
-        "git_workspace_schema": "dev.tinyland.bulkload.git-workspace.v2",
-        "copies_generic_credentials": False,
-        "copies_typed_agent_auth": True,
-        "claude_auth_policy": "nonportable-hold",
-        "credential_copy_policy": "typed-opt-in-attended",
-        "captures_live_wal_sqlite": True,
-        "composes_typed_agent_sqlite": True,
-        "installs_typed_agent_sqlite": True,
-        "preseed_mutates_live_destination": False,
-        "final_apply_requires_reflink_rollback": True,
-        "full_copy_rollback_fallback": False,
-        "unknown_state_policy": "stop",
-        "shared_divergence_policy": "stop-unless-typed-source-authority-or-git-recovery",
-        "private_runtime_acceptance_required": True,
-        "invokes_terminal_multiplexers": False,
-        "owns_tcfs_runtime": False,
+        "runtime": "retired-python",
+        "implementation_repository": "Jesssullivan/tummycrypt",
+        "preserves_unique_state": True,
+        "signals_processes": False,
         "owns_home_manager_activation": False,
     }
     if boundaries != required_boundaries:
@@ -117,51 +104,22 @@ def self_test() -> None:
         },
         "boundaries": {
             "default_read_only": True,
-            "capture_schema": "dev.tinyland.bulkload.agent-capture.v4",
-            "git_workspace_schema": "dev.tinyland.bulkload.git-workspace.v2",
-            "copies_generic_credentials": False,
-            "copies_typed_agent_auth": True,
-            "claude_auth_policy": "nonportable-hold",
-            "credential_copy_policy": "typed-opt-in-attended",
-            "captures_live_wal_sqlite": True,
-            "composes_typed_agent_sqlite": True,
-            "installs_typed_agent_sqlite": True,
-            "preseed_mutates_live_destination": False,
-            "final_apply_requires_reflink_rollback": True,
-            "full_copy_rollback_fallback": False,
-            "unknown_state_policy": "stop",
-            "shared_divergence_policy": "stop-unless-typed-source-authority-or-git-recovery",
-            "private_runtime_acceptance_required": True,
-            "invokes_terminal_multiplexers": False,
-            "owns_tcfs_runtime": False,
+            "runtime": "retired-python",
+            "implementation_repository": "Jesssullivan/tummycrypt",
+            "preserves_unique_state": True,
+            "signals_processes": False,
             "owns_home_manager_activation": False,
         },
     }
     validate(valid)
     invalid = json.loads(json.dumps(valid))
-    invalid["boundaries"]["copies_generic_credentials"] = True
+    invalid["boundaries"]["preserves_unique_state"] = False
     try:
         validate(invalid)
     except ContractError:
         pass
     else:
         raise AssertionError("invalid boundary was accepted")
-    invalid = json.loads(json.dumps(valid))
-    invalid["boundaries"]["installs_typed_agent_sqlite"] = False
-    try:
-        validate(invalid)
-    except ContractError:
-        pass
-    else:
-        raise AssertionError("missing typed auth installer was accepted")
-    invalid = json.loads(json.dumps(valid))
-    invalid["boundaries"]["full_copy_rollback_fallback"] = True
-    try:
-        validate(invalid)
-    except ContractError:
-        pass
-    else:
-        raise AssertionError("SQLite composer boundary drift was accepted")
     invalid = json.loads(json.dumps(valid))
     invalid["enrollment"]["executionPool"] = "ubuntu-latest"
     try:

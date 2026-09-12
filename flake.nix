@@ -1,5 +1,5 @@
 {
-  description = "Manifest-first repository and agent-context migration tooling";
+  description = "Bulkload product contract and CI validation";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -18,7 +18,6 @@
             gitleaks
             just
             (python312.withPackages (pythonPackages: [ pythonPackages.pyyaml ]))
-            rsync
             ruff
             shellcheck
           ];

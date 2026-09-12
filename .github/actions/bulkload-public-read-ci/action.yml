@@ -125,7 +125,7 @@ runs:
         USE_BAZEL_VERSION: ""
       run: |
         set -euo pipefail
-        expected=50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11
+        expected=f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924
         source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
         [[ "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" == "$expected" ]]
         guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
@@ -236,7 +236,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- preflight
 
     - name: Discover sanctioned runner endpoint authority
@@ -424,7 +424,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- enforce
 
     - name: Verify effective Nix client authority
@@ -615,10 +615,10 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
-    - name: Build the Bulkload binary through the public Flywheel action
+    - name: Build the Bulkload documentation through the public Flywheel action
       if: ${{ inputs.gate == 'build' }}
       uses: tinyland-inc/ci-templates/.github/actions/flywheel-bazel@139bd4c7deabbe07c918dc764a3b9f054066431d # v2.13.0
       env:
@@ -789,7 +789,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 50b7dceb8fe911e422d986d44c696f380e83a39c945da446ce6572f0c5541f11 ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == f68a9c3a1574f62921c9900e4cfe36058b4e1b09421e1ddf3969f0cca3a33924 ]]
         printf '%s' "$guard_source" | /bin/bash --noprofile --norc -p -s -- bazel
 
     - name: Test the complete Bulkload Bazel graph through the public Flywheel action
