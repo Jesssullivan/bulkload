@@ -226,6 +226,7 @@ impl SqliteCache {
     /// Refuses if `SQLite` declines to open the file or to create the schema.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = rusqlite::Connection::open(path).map_err(|_| BulkloadRefusal::Io(None))?;
+        crate::io::durable::configure_sqlite(&conn)?;
         Self::from_connection(conn)
     }
 

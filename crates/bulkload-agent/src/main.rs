@@ -18,7 +18,7 @@ const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
-    bulkload-agent <SUBCOMMAND>
+    bulkload-agent [--durability=group|strict] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -71,6 +71,9 @@ SUBCOMMANDS:
     help        Print this message
 
 BOUNDARIES:
+    --durability=group (the default) seals each file with a barrier and makes
+    each group of files durable with one SQLite commit; --durability=strict
+    fully flushes every file (A/B comparison). pull passes strict to serve.
     copy/pull require an existing destination directory.
     copy/pull preserve divergent destinations and refuse live SQLite files.
     They enumerate the source each run; completed content is resumable.
@@ -95,7 +98,13 @@ COUNTERS:
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
-    let mut args = std::env::args_os().skip(1);
+    let mut args = match durability_flag(std::env::args_os().skip(1).collect()) {
+        Ok(args) => args.into_iter(),
+        Err(refusal) => {
+            eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     let command = args.next();
     let verb = command
         .as_ref()
@@ -135,10 +144,12 @@ fn main() -> ExitCode {
             | "estate-apply"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
-        Some("serve") => bulkload_agent::transfer::serve(
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout().lock(),
-        ),
+        Some("serve") => {
+            let (input, output) = (std::io::stdin(), std::io::stdout());
+            bulkload_agent::transfer::tune_stream(&input);
+            bulkload_agent::transfer::tune_stream(&output);
+            bulkload_agent::transfer::serve(&mut input.lock(), &mut output.lock())
+        }
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -161,6 +172,21 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Remove `--durability=MODE` from the arguments and apply it process-wide.
+fn durability_flag(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
+    let mut rest = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--durability="))
+        {
+            Some(mode) => bulkload_agent::io::durable::set_durability(mode.parse()?),
+            None => rest.push(arg),
+        }
+    }
+    Ok(rest)
 }
 
 // The only capture-policy word the agent accepts; anything else is a typo, and
@@ -582,10 +608,13 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
         }
         ssh.arg("-F").arg(config);
     }
+    ssh.arg("--").arg(host).arg(remote);
+    if bulkload_agent::io::durable::durability() == bulkload_agent::io::durable::Durability::Strict
+    {
+        ssh.arg("--durability=strict");
+    }
     let mut child = ssh
-        .arg("--")
-        .arg(host)
-        .args([remote, "serve"])
+        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -593,6 +622,8 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
     let result = {
         let mut output = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
+        bulkload_agent::transfer::tune_stream(&output);
+        bulkload_agent::transfer::tune_stream(&input);
         bulkload_agent::transfer::receive(
             &mut input,
             &mut output,

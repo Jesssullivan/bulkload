@@ -2,16 +2,17 @@
 
 use std::ffi::CString;
 use std::fs::{File, Permissions};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::counters::{self, CountedSync as _, Counter};
+use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
-use crate::transfer_store::{Manifest, Store};
+use crate::transfer_store::{ChunkHint, Manifest, OutputRecord, Store, StorePublisher};
 use crate::{BulkloadRefusal, Result, RowSchema};
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +22,8 @@ pub struct Destination {
     root: File,
     path: PathBuf,
     directories: Vec<PendingDirectory>,
+    /// A directory entry was sealed by barrier only and awaits a full flush.
+    unflushed: bool,
 }
 
 struct PendingDirectory {
@@ -42,6 +45,7 @@ impl Destination {
             root,
             path: std::fs::canonicalize(path)?,
             directories: Vec::new(),
+            unflushed: false,
         })
     }
 
@@ -84,7 +88,8 @@ impl Destination {
                 ino: metadata.ino(),
                 key,
             });
-            parent.sync_dir_counted()?;
+            crate::io::durable::seal_dir(&parent)?;
+            self.unflushed = true;
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -111,7 +116,7 @@ impl Destination {
     ///
     /// # Errors
     /// Refuses changed/removed directories and failed durable metadata writes.
-    pub fn finish_directories(&self, store: &Store) -> Result<()> {
+    pub fn finish_directories(&mut self, store: &Store) -> Result<()> {
         for pending in self.directories.iter().rev() {
             let (parent, leaf) = self.parent(&pending.path)?;
             let directory = open_dir(parent.as_raw_fd(), &leaf)?;
@@ -120,9 +125,30 @@ impl Destination {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
             directory.set_permissions(Permissions::from_mode(pending.mode))?;
-            directory.sync_dir_counted()?;
+            crate::io::durable::seal_dir(&directory)?;
             store.complete_directory(&pending.key)?;
             counters::bump(Counter::DirectoriesFinished);
+        }
+        if !self.directories.is_empty() {
+            // Each completion commit above was a full flush issued after every
+            // barrier of this session.
+            self.unflushed = false;
+        }
+        Ok(())
+    }
+
+    /// End a session: when a directory or symlink was sealed only by a
+    /// barrier, issue the session's one full flush on the root so those
+    /// entries reach stable media.
+    ///
+    /// # Errors
+    /// Returns the flush failure.
+    pub fn flush_session(&mut self) -> Result<()> {
+        if self.unflushed {
+            counters::timed(Counter::FlushFull, Counter::FlushFullNs, || {
+                crate::io::sys::full_flush(&self.root)
+            })?;
+            self.unflushed = false;
         }
         Ok(())
     }
@@ -131,7 +157,7 @@ impl Destination {
     ///
     /// # Errors
     /// Refuses a different existing target or any unsafe ancestor.
-    pub fn symlink(&self, row: &RowSchema) -> Result<()> {
+    pub fn symlink(&mut self, row: &RowSchema) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         let target = row
             .link_target
@@ -142,7 +168,8 @@ impl Destination {
         let result =
             unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
         if result == 0 {
-            parent.sync_dir_counted()?;
+            crate::io::durable::seal_dir(&parent)?;
+            self.unflushed = true;
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -167,22 +194,27 @@ impl Destination {
         Ok(())
     }
 
-    /// Verify chunks and publish a complete file with link-at no-replace semantics.
+    /// An existing regular output at `row`'s path, opened without following
+    /// any link, or `None` when the path is free.
     ///
     /// # Errors
-    /// Refuses corrupt/missing chunks, size/digest mismatches or destination divergence.
-    pub fn file(
-        &self,
-        row: &RowSchema,
-        manifest: &Manifest,
-        store: &Store,
-    ) -> Result<StatIdentity> {
+    /// Refuses a conflicting node or unsafe ancestor.
+    pub(crate) fn existing(&self, row: &RowSchema) -> Result<Option<File>> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         match open_regular(&parent, &leaf) {
-            Ok(file) => return verify_existing(file, row, manifest),
-            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => (),
-            Err(error) => return Err(error),
+            Ok(file) => Ok(Some(file)),
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
+            Err(error) => Err(error),
         }
+    }
+
+    /// Create a private temporary file (`O_EXCL`, mode 0600) beside `row`'s
+    /// leaf. The caller writes it and hands it to a [`PublishSink`].
+    ///
+    /// # Errors
+    /// Refuses an unsafe ancestor or a failed create.
+    pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
+        let (parent, leaf) = self.parent(&row.rel_path)?;
         let temporary = cstring(
             format!(
                 ".bulkload-{}-{}",
@@ -204,32 +236,23 @@ impl Destination {
             return Err(std::io::Error::last_os_error().into());
         }
         // SAFETY: fd is a newly-created uniquely owned descriptor.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let result = write_chunks(&mut file, row, manifest, store).and_then(|()| {
-            // SAFETY: all descriptors/paths valid; linkat never replaces an existing leaf.
-            let linked = unsafe {
-                libc::linkat(
-                    parent.as_raw_fd(),
-                    temporary.as_ptr(),
-                    parent.as_raw_fd(),
-                    leaf.as_ptr(),
-                    0,
-                )
-            };
-            if linked != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            parent.sync_dir_counted()?;
-            Ok(())
-        });
-        // SAFETY: remove only the unique temporary name created above.
-        let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
-        if removed != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        result?;
-        counters::bump(Counter::FilesMaterialized);
-        verify_existing(file, row, manifest)
+        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(StagedFile {
+            parent,
+            temporary,
+            leaf,
+            file: Arc::new(file),
+        })
+    }
+
+    /// Open a published output read-only by relative path, component by
+    /// component, following no link.
+    ///
+    /// # Errors
+    /// Refuses a missing output, a non-regular node or an unsafe ancestor.
+    pub(crate) fn open_output(&self, rel_path: &[u8]) -> Result<File> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        open_regular(&parent, &leaf)
     }
 
     fn parent(&self, path: &[u8]) -> Result<(File, CString)> {
@@ -249,40 +272,164 @@ impl Destination {
     }
 }
 
-fn write_chunks(
-    file: &mut File,
-    row: &RowSchema,
-    manifest: &Manifest,
-    store: &Store,
-) -> Result<()> {
-    let mut hasher = blake3::Hasher::new();
-    let mut size = 0_u64;
-    for chunk in &manifest.chunks {
-        let data = store
-            .chunk_for(&chunk.digest, Counter::DestMaterializePackRead)?
-            .ok_or(BulkloadRefusal::SealedObjectMissing)?;
-        if data.len() as u64 != chunk.size {
-            return Err(BulkloadRefusal::DigestMismatch);
-        }
-        size = size
-            .checked_add(chunk.size)
-            .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        if size > row.size {
-            return Err(BulkloadRefusal::DigestMismatch);
-        }
-        counters::update(&mut hasher, Counter::HashMaterializeFile, &data);
-        file.write_all(&data)?;
-        counters::add_len(Counter::DestMaterializeWrite, data.len());
+/// A destination file written under a private temporary name, published
+/// by a [`PublishSink`] once its data is sealed.
+pub(crate) struct StagedFile {
+    parent: File,
+    temporary: CString,
+    leaf: CString,
+    file: Arc<File>,
+}
+
+impl StagedFile {
+    /// The open temporary file. It stays readable after publication.
+    pub(crate) const fn file(&self) -> &Arc<File> {
+        &self.file
     }
-    if size != row.size || *hasher.finalize().as_bytes() != manifest.digest {
-        return Err(BulkloadRefusal::DigestMismatch);
+
+    /// Remove the temporary name, abandoning the file.
+    ///
+    /// # Errors
+    /// Returns a failed unlink.
+    pub(crate) fn discard(self) -> Result<()> {
+        unlink(&self.parent, &self.temporary)
     }
-    file.set_permissions(Permissions::from_mode(row.mode & 0o7777))?;
-    file.sync_file_counted()?;
+
+    /// Seal the data, then rename into place without replacing anything.
+    /// The identity is taken from the open file after the rename.
+    fn publish(self) -> Result<(StatIdentity, File)> {
+        if let Err(error) = crate::io::durable::seal_file(&self.file) {
+            let _ = unlink(&self.parent, &self.temporary);
+            return Err(error.into());
+        }
+        if let Err(error) =
+            crate::io::sys::rename_noreplace(&self.parent, &self.temporary, &self.leaf)
+        {
+            let _ = unlink(&self.parent, &self.temporary);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                BulkloadRefusal::GitDestinationOccupied
+            } else {
+                error.into()
+            });
+        }
+        counters::bump(Counter::FilesMaterialized);
+        Ok((
+            StatIdentity::from_metadata(&self.file.metadata()?),
+            self.parent,
+        ))
+    }
+}
+
+fn unlink(parent: &File, name: &CString) -> Result<()> {
+    // SAFETY: parent descriptor and NUL-terminated name remain valid; flag 0
+    // removes only a non-directory entry.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
-fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Result<StatIdentity> {
+/// One destination output for a group commit.
+pub(crate) enum Publication {
+    /// A fully written staged file to seal, rename into place and record.
+    Staged {
+        staged: StagedFile,
+        record: PendingOutput,
+    },
+    /// An existing output already verified against its manifest.
+    Adopted(OutputRecord),
+}
+
+/// The record for a staged file, completed with its identity once published.
+pub(crate) struct PendingOutput {
+    pub key: Vec<u8>,
+    pub rel_path: Vec<u8>,
+    pub size: u64,
+    pub hints: Vec<ChunkHint>,
+}
+
+/// Group-commit sink for a destination: seal each file, rename it into
+/// place, seal each touched directory once, then commit every record of the
+/// group in one transaction.
+pub(crate) struct PublishSink {
+    publisher: StorePublisher,
+    outcomes: Vec<(Vec<u8>, Result<()>)>,
+}
+
+impl PublishSink {
+    /// `publisher` holds the destination store's single-writer guard.
+    pub(crate) const fn new(publisher: StorePublisher) -> Self {
+        Self {
+            publisher,
+            outcomes: Vec::new(),
+        }
+    }
+}
+
+impl crate::io::durable::GroupSink for PublishSink {
+    type Item = Publication;
+    /// `(relative path, outcome)` for every submitted output, in commit order.
+    type Report = Vec<(Vec<u8>, Result<()>)>;
+
+    fn weight(item: &Publication) -> (u64, u64) {
+        match item {
+            Publication::Staged { record, .. } => (1, record.size),
+            Publication::Adopted(_) => (1, 0),
+        }
+    }
+
+    fn commit(&mut self, items: Vec<Publication>) {
+        let mut records = Vec::with_capacity(items.len());
+        let mut directories: Vec<File> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in items {
+            match item {
+                Publication::Staged { staged, record } => match staged.publish() {
+                    Ok((identity, parent)) => {
+                        if let Ok(metadata) = parent.metadata() {
+                            if seen.insert((metadata.dev(), metadata.ino())) {
+                                directories.push(parent);
+                            }
+                        } else {
+                            directories.push(parent);
+                        }
+                        records.push(OutputRecord {
+                            key: record.key,
+                            rel_path: record.rel_path,
+                            identity,
+                            hints: record.hints,
+                        });
+                    }
+                    Err(refusal) => self.outcomes.push((record.rel_path, Err(refusal))),
+                },
+                Publication::Adopted(record) => records.push(record),
+            }
+        }
+        let sealed = directories.iter().try_for_each(|directory| {
+            crate::io::durable::seal_dir(directory).map_err(BulkloadRefusal::from)
+        });
+        let committed = sealed.and_then(|()| self.publisher.store().commit_outputs(&records));
+        for record in records {
+            self.outcomes.push((record.rel_path, committed.clone()));
+        }
+    }
+
+    fn finish(self) -> Self::Report {
+        self.outcomes
+    }
+}
+
+/// Verify an existing output byte-for-byte against `manifest` before adopting
+/// it. Only the adopt path uses this; freshly written outputs are built from
+/// verified chunks and are not read back.
+///
+/// # Errors
+/// Refuses a size, mode or digest difference, or a change while reading.
+pub(crate) fn verify_existing(
+    mut file: File,
+    row: &RowSchema,
+    manifest: &Manifest,
+) -> Result<StatIdentity> {
     file.rewind()?;
     let before = file.metadata()?;
     if before.len() != row.size || before.mode() & 0o7777 != row.mode & 0o7777 {
@@ -349,4 +496,61 @@ fn open_regular(parent: &File, name: &CString) -> Result<File> {
 
 fn cstring(bytes: &[u8]) -> Result<CString> {
     CString::new(bytes).map_err(|_| BulkloadRefusal::PathNotPortable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::durable::GroupSink as _;
+    use std::io::Write as _;
+
+    #[test]
+    fn publish_never_replaces_an_output_that_appeared_meanwhile() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-materialize-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(source.join("file"), b"ours")?;
+        let row = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let target = Destination::open(&destination)?;
+        let staged = target.stage(&row)?;
+        (&**staged.file()).write_all(b"ours")?;
+        std::fs::write(destination.join("file"), b"theirs")?;
+        let mut sink = PublishSink::new(Store::open(&base.join("state"))?.into_publisher()?);
+        sink.commit(vec![Publication::Staged {
+            staged,
+            record: PendingOutput {
+                key: b"key".to_vec(),
+                rel_path: b"file".to_vec(),
+                size: 4,
+                hints: Vec::new(),
+            },
+        }]);
+        let report = sink.finish();
+        let listed = std::fs::read_dir(&destination)?.count();
+        let kept = std::fs::read(destination.join("file"))?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [(
+                b"file".to_vec(),
+                Err(BulkloadRefusal::GitDestinationOccupied)
+            )]
+        );
+        assert_eq!(kept, b"theirs");
+        assert_eq!(listed, 1, "the temporary name is removed");
+        Ok(())
+    }
 }

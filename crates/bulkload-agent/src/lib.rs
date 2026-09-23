@@ -22,6 +22,7 @@ pub mod freshness;
 pub mod git_carry;
 pub mod handoff;
 pub mod hash;
+pub mod io;
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod transfer;

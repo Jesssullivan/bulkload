@@ -16,19 +16,21 @@
 //! - `flush_barrier`: `fcntl(F_BARRIERFSYNC)` (Darwin only).
 //! - `flush_fdatasync`: `File::sync_data` on a regular file. On Darwin the
 //!   standard library implements it as `fcntl(F_FULLFSYNC)` too.
-//! - `flush_dir`: any sync of a directory descriptor (`sync_all`, which is
+//! - `flush_dir`: a full sync of a directory descriptor (`sync_all`, which is
 //!   `F_FULLFSYNC` on Darwin).
+//! - `flush_dir_barrier`: a group-commit directory seal (`F_BARRIERFSYNC` on
+//!   Darwin, `fsync` elsewhere).
+//!
+//! Every bulkload `SQLite` store runs `synchronous=FULL` with `fullfsync=ON`,
+//! so each counted commit also issues one `F_FULLFSYNC` on Darwin. The derived
+//! `full_flushes_total` adds those commits to the explicit full flushes.
 //!
 //! Flush counts are attempts (a failed flush is still counted). `SQLite`
 //! commit counters count successful commits only.
 //!
-//! Not counted as flushes: `SQLite`'s own syncs, and syncs done by child
-//! processes. The transfer store runs `synchronous=FULL` with the default
-//! rollback journal, which syncs at least twice per commit (journal, then
-//! database) through `SQLite`'s VFS; on Darwin that is `fsync`, not
-//! `F_FULLFSYNC`, unless `PRAGMA fullfsync` is set. `git` children spawned by
-//! the Git carry verbs flush on their own. Both are invisible here, so the
-//! flush counters are a lower bound on the syncs a verb causes.
+//! Not counted as flushes: syncs done by child processes. `git` children
+//! spawned by the Git carry verbs flush on their own, so the flush counters
+//! are a lower bound on the syncs a verb causes.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,8 +67,7 @@ counters! {
     SourceFileRead => "read_source_file_bytes",
     SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
     SourcePackReadback => "read_source_pack_readback_bytes",
-    DestPresenceRead => "read_dest_presence_check_bytes",
-    DestMaterializePackRead => "read_dest_materialize_pack_bytes",
+    DestLocalReuseRead => "read_dest_local_reuse_bytes",
     DestVerifyRead => "read_dest_verify_existing_bytes",
     OtherChunkRead => "read_other_chunk_bytes",
     HashFileRead => "read_hash_file_bytes",
@@ -84,10 +85,10 @@ counters! {
     // BLAKE3 bytes hashed, by purpose.
     HashCaptureChunk => "blake3_capture_chunk_bytes",
     HashCaptureFile => "blake3_capture_file_bytes",
-    HashPublishVerify => "blake3_publish_verify_bytes",
     HashStoreReadVerify => "blake3_store_read_verify_bytes",
     HashLegacyPut => "blake3_legacy_put_bytes",
-    HashMaterializeFile => "blake3_materialize_file_bytes",
+    HashWireVerify => "blake3_dest_wire_verify_bytes",
+    HashDestReuse => "blake3_dest_local_reuse_bytes",
     HashVerifyExisting => "blake3_verify_existing_bytes",
     HashFile => "blake3_hash_file_bytes",
     HashOther => "blake3_other_bytes",
@@ -100,15 +101,18 @@ counters! {
     FlushFdatasyncNs => "flush_fdatasync_ns",
     FlushDir => "flush_dir_count",
     FlushDirNs => "flush_dir_ns",
+    FlushDirBarrier => "flush_dir_barrier_count",
+    FlushDirBarrierNs => "flush_dir_barrier_ns",
+    // Group commit (io::durable) and transport tuning.
+    DurableGroups => "durable_groups",
+    TransportTuned => "transport_buffers_raised",
     // SQLite commits, by kind. Autocommit statements count as one commit each.
-    SqlitePublishSource => "sqlite_publish_source_commits",
-    SqlitePublishDest => "sqlite_publish_dest_commits",
-    SqlitePublishOther => "sqlite_publish_other_commits",
-    SqliteRecordOutput => "sqlite_record_output_commits",
+    SqliteSchema => "sqlite_schema_commits",
+    SqliteGroupSource => "sqlite_group_source_commits",
+    SqliteGroupDest => "sqlite_group_dest_commits",
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
-    SqliteSettings => "sqlite_settings_commits",
     SqliteCommitNs => "sqlite_commit_ns",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
@@ -171,7 +175,11 @@ pub fn update(hasher: &mut blake3::Hasher, purpose: Counter, data: &[u8]) {
     hasher.update(data);
 }
 
-fn timed(
+/// Run `flush`, counting one `count` and its nanoseconds under `time`.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn timed(
     count: Counter,
     time: Counter,
     flush: impl FnOnce() -> std::io::Result<()>,
@@ -298,24 +306,60 @@ impl Counters {
         self.0.get(counter as usize).copied().unwrap_or(0)
     }
 
+    fn sum(&self, counters: &[Counter]) -> u64 {
+        counters.iter().fold(0_u64, |total, counter| {
+            total.saturating_add(self.get(*counter))
+        })
+    }
+
     /// Sum of every BLAKE3 purpose.
     #[must_use]
     pub fn blake3_total(&self) -> u64 {
-        [
+        self.sum(&[
             Counter::HashCaptureChunk,
             Counter::HashCaptureFile,
-            Counter::HashPublishVerify,
             Counter::HashStoreReadVerify,
             Counter::HashLegacyPut,
-            Counter::HashMaterializeFile,
+            Counter::HashWireVerify,
+            Counter::HashDestReuse,
             Counter::HashVerifyExisting,
             Counter::HashFile,
             Counter::HashOther,
-        ]
-        .iter()
-        .fold(0_u64, |total, counter| {
-            total.saturating_add(self.get(*counter))
-        })
+        ])
+    }
+
+    /// BLAKE3 bytes hashed by the destination half of a transfer.
+    #[must_use]
+    pub fn blake3_destination(&self) -> u64 {
+        self.sum(&[
+            Counter::HashWireVerify,
+            Counter::HashDestReuse,
+            Counter::HashVerifyExisting,
+        ])
+    }
+
+    /// Every `SQLite` commit counted, each one full flush on Darwin.
+    #[must_use]
+    pub fn sqlite_commits(&self) -> u64 {
+        self.sum(&[
+            Counter::SqliteSchema,
+            Counter::SqliteGroupSource,
+            Counter::SqliteGroupDest,
+            Counter::SqliteRecordCapture,
+            Counter::SqliteDirectoryPending,
+            Counter::SqliteDirectoryComplete,
+        ])
+    }
+
+    /// Explicit full flushes plus `SQLite` commits (see the module notes).
+    #[must_use]
+    pub fn full_flushes_total(&self) -> u64 {
+        self.sum(&[
+            Counter::FlushFull,
+            Counter::FlushFdatasync,
+            Counter::FlushDir,
+        ])
+        .saturating_add(self.sqlite_commits())
     }
 
     /// Space-separated `key=value` pairs, ending with the derived totals.
@@ -329,7 +373,14 @@ impl Counters {
             }
             let _ = write!(line, "{}={value}", counter.name());
         }
-        let _ = write!(line, " blake3_total_bytes={}", self.blake3_total());
+        let _ = write!(
+            line,
+            " blake3_total_bytes={} blake3_dest_bytes={} sqlite_commits_total={} full_flushes_total={}",
+            self.blake3_total(),
+            self.blake3_destination(),
+            self.sqlite_commits(),
+            self.full_flushes_total(),
+        );
         line
     }
 }
@@ -359,17 +410,17 @@ mod tests {
         // Counters are process-global and other tests commit concurrently,
         // so the decision is checked through the return value.
         assert!(sqlite_commit(
-            Counter::SqliteSettings,
+            Counter::SqliteSchema,
             Instant::now(),
             &Ok::<(), ()>(())
         ));
         assert!(!sqlite_commit(
-            Counter::SqliteSettings,
+            Counter::SqliteSchema,
             Instant::now(),
             &Err::<(), ()>(())
         ));
         let wrapped = Counters([1; COUNT]).since(Counters([u64::MAX; COUNT]));
-        assert_eq!(wrapped.get(Counter::SqliteSettings), 2);
+        assert_eq!(wrapped.get(Counter::SqliteSchema), 2);
     }
 
     #[test]
