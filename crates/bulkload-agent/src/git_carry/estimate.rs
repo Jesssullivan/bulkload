@@ -812,12 +812,19 @@ fn tally(reader: impl BufRead) -> Result<Tally> {
 /// `pack-objects --stdout --thin --revs --delta-base-offset` over `request`,
 /// its stdout counted in a reused buffer and discarded (R-N74). Nothing is
 /// built when `missing` holds no object: there is then no pack to send.
+///
+/// `pack.useSparse=false`: Git's default sparse edge marking may pack objects
+/// the haves already reach (one extra tree or blob for bulkload in the cohort
+/// run), so the pack would no longer be exactly the walked set. A pack whose
+/// header count still differs from the walk is refused, not reported.
 fn thin_pack(source: &Path, request: &str, missing: Tally) -> Result<ThinPack> {
     if missing.objects() == 0 {
         return Ok(ThinPack::default());
     }
     let mut pack = hardened(source)
         .args([
+            "-c",
+            "pack.useSparse=false",
             "pack-objects",
             "--stdout",
             "--thin",
@@ -844,6 +851,9 @@ fn thin_pack(source: &Path, request: &str, missing: Tally) -> Result<ThinPack> {
     let counted = counted?;
     if !status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    if counted.objects != missing.objects() {
+        return Err(BulkloadRefusal::ContractSelfInconsistent);
     }
     Ok(counted)
 }
@@ -1589,6 +1599,25 @@ mod tests {
             result.thin_pack,
             fetched_pack(&fixture, &destination, &source),
         );
+    }
+
+    /// R-N74: the thin pack is exactly the walked set. A directory rename
+    /// makes Git's default sparse edge marking (`pack.useSparse`) pack the
+    /// moved blobs again although the have already holds them.
+    #[test]
+    fn thin_pack_objects_equal_the_walk_across_a_directory_rename() {
+        let fixture = Fixture::new("thin-sparse");
+        let source = fixture.repo("source");
+        commit(&source, "a/z.txt", "other");
+        let base = commit(&source, "a/x.txt", "shared");
+        output(git(&source).args(["mv", "a", "b"])).unwrap();
+        commit(&source, "b/y.txt", "new");
+        let destination = fixture.repo("destination");
+        mirror(&source, &destination, &[(&base, "refs/heads/main")]);
+        let result = estimate(&source, &Destination::Local(destination)).unwrap();
+        // One commit, the root tree, tree b and blob y.
+        assert_eq!(result.missing.objects(), 4);
+        assert_eq!(result.thin_pack.objects, 4);
     }
 
     /// F11: ssh gets a connect timeout, and a failed probe carries a bounded,
