@@ -74,6 +74,15 @@ historical rulings ledger (evidence, not current instructions).
 - Reclaim only proven redundant data after preserving unique content.
 - Estate operations are frozen until the M2 gates pass (R-N56).
 
+## Durable notes
+
+Every session writes one entry in `docs/agent-notes/`, named
+`YYYY-MM-DD-<lane>.md` (R-N13, R-N84). An entry records what was done,
+the rulings it cites, the PRs and shas it produced, and what is still open.
+Distilled facts and rulings also go on the owning Linear issue. Nothing
+durable is left in `/tmp` or a harness scratchpad. Delete entries that are
+no longer true (R-N55).
+
 ## Validation
 
 `just check` runs the repository contract checks and `just rust-check`
