@@ -5974,6 +5974,91 @@ mod review_pr53b {
         assert!(notes, "notes did not round-trip");
     }
 
+    // A gitlink whose path a (malformed, dangling) tree also holds as a tree.
+    // Git's own read-tree collapses the duplicate: the index ends with sub/f
+    // and no gitlink, so there is nothing for the capture to choose between.
+    // The fixed verdict: no nest custody, and sub/f is carried staged and in
+    // the worktree and restores byte-identical. Nothing is dropped.
+    #[test]
+    fn rv_gitlink_and_tree_at_same_path() {
+        let root = fresh("gitlink-tree");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let head = String::from_utf8(g(&outer, &["rev-parse", "HEAD"])).unwrap();
+        let head = head.trim();
+        let blob = String::from_utf8(
+            input(
+                git(&outer).args(["hash-object", "-w", "--stdin"]),
+                b"under gitlink",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blob = blob.trim();
+        let tree_f = String::from_utf8(
+            input(
+                git(&outer).args(["mktree"]),
+                format!("100644 blob {blob}\tf\n").as_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let file_blob = String::from_utf8(g(&outer, &["rev-parse", "HEAD:file"])).unwrap();
+        let listing = format!(
+            "100644 blob {}\tfile\n160000 commit {head}\tsub\n040000 tree {}\tsub\n",
+            file_blob.trim(),
+            tree_f.trim()
+        );
+        let tree = input(git(&outer).args(["mktree"]), listing.as_bytes());
+        let _ = git(&outer)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(format!("160000,{head},sub"))
+            .output()
+            .unwrap();
+        let _ = git(&outer)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(format!("100644,{blob},sub/f"))
+            .output()
+            .unwrap();
+        if let Ok(t) = tree {
+            let t = String::from_utf8(t).unwrap();
+            let _ = git(&outer).args(["read-tree", t.trim()]).output().unwrap();
+        }
+        fs::create_dir_all(outer.join("sub")).unwrap();
+        fs::write(outer.join("sub/f"), b"under gitlink").unwrap();
+        let index = String::from_utf8(g(&outer, &["ls-files", "--stage"])).unwrap();
+        let v = verdict(&outer);
+        let capture = root.join("capture");
+        let e = export_repository_with_policy(&outer, &capture, None, CapturePolicy::default());
+        let staged = e
+            .as_ref()
+            .map(|_| {
+                String::from_utf8(g(
+                    &capture.join("repository.git"),
+                    &["ls-tree", "-r", "refs/carry-export/staged"],
+                ))
+                .unwrap()
+            })
+            .ok();
+        let restored = root.join("restored");
+        let back = e
+            .as_ref()
+            .map(|export| {
+                restore_bundle(&export.bundle, &restored, "neo").unwrap();
+                fs::read(restored.join("sub/f")).unwrap()
+            })
+            .ok();
+        fs::remove_dir_all(root).unwrap();
+        assert!(!index.contains("160000"), "{index}");
+        assert!(index.contains("\tsub/f"), "{index}");
+        assert_eq!(v, "CUSTODY []");
+        assert_eq!(e.map(|e| e.nested_repositories), Ok(Vec::new()));
+        assert!(staged.unwrap().contains(&format!("blob {blob}\tsub/f")));
+        assert_eq!(back.unwrap(), b"under gitlink");
+    }
+
     // N4: filter drivers from the nest's own config must not run during the
     // clean check (the nest now refuses); fsmonitor from its config must not.
     #[test]
