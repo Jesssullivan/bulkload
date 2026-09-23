@@ -54,16 +54,22 @@ fn inject_fault(point: PublishFault) -> Result<()> {
     Ok(())
 }
 
+// Each publication point is both a unit-test refusal hook (`PublishFault`, the
+// thread-local error path) and a crash point (`fault_point!`, which under the
+// `fault-injection` feature can end the process there).
 #[cfg(test)]
 macro_rules! publication_fault {
-    ($point:ident) => {{
+    ($point:ident, $crash:ident) => {{
+        fault_point!($crash);
         inject_fault(PublishFault::$point)?;
     }};
 }
 
 #[cfg(not(test))]
 macro_rules! publication_fault {
-    ($point:ident) => {{}};
+    ($point:ident, $crash:ident) => {{
+        fault_point!($crash);
+    }};
 }
 
 /// Maximum buffered chunks per producer (at most 64 MiB of chunk payload).
@@ -707,11 +713,11 @@ impl StorePublisher<'_> {
             locations.push((digest, offset, data.len()));
         }
         PACK_APPEND_NS.fetch_add(nanos(append_started), Ordering::Relaxed);
-        publication_fault!(AfterAppend);
+        publication_fault!(AfterAppend, PublishAfterAppend);
         if !locations.is_empty() {
             timed_sync(&self.pack, &FILE_SYNCS, &FILE_SYNC_NS)?;
         }
-        publication_fault!(AfterSync);
+        publication_fault!(AfterSync, PublishAfterPackSync);
         Ok(locations)
     }
 
@@ -745,7 +751,7 @@ impl StorePublisher<'_> {
                     )
                     .map_err(sqlite_error)?;
             }
-            publication_fault!(AfterLocationInsert);
+            publication_fault!(AfterLocationInsert, PublishAfterLocationInsert);
             for event in events {
                 if let PreparedEvent::Complete { key, manifest, .. } = event {
                     self.store
@@ -758,7 +764,7 @@ impl StorePublisher<'_> {
                         .map_err(sqlite_error)?;
                 }
             }
-            publication_fault!(AfterManifestInsert);
+            publication_fault!(AfterManifestInsert, PublishAfterManifestInsert);
             Ok(())
         })();
         if let Err(error) = persisted {
@@ -767,25 +773,22 @@ impl StorePublisher<'_> {
         }
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
         let commit_started = Instant::now();
-        #[cfg(test)]
-        let committed = inject_fault(PublishFault::BeforeCommit).and_then(|()| {
-            self.store
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(sqlite_error)
-        });
-        #[cfg(not(test))]
-        let committed = self
-            .store
-            .conn
-            .execute_batch("COMMIT")
-            .map_err(sqlite_error);
+        let committed = self.commit();
         SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
+        fault_point!(PublishAfterCommit);
         Ok(())
+    }
+
+    fn commit(&self) -> Result<()> {
+        publication_fault!(BeforeCommit, PublishBeforeCommit);
+        self.store
+            .conn
+            .execute_batch("COMMIT")
+            .map_err(sqlite_error)
     }
 
     fn acknowledgements(events: Vec<PreparedEvent>) -> Vec<PublishAck> {

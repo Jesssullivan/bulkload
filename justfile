@@ -38,11 +38,15 @@ secrets-scan-history:
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
-# including the agent's dependency-wall test).
+# including the agent's dependency-wall test). The last two lines lint and run
+# the W7 crash-resume and live-writer harness, which needs the agent's
+# `fault-injection` feature; only that one test target is rebuilt with it.
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo test --workspace --locked
+    cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
+    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --test fault_harness
 
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file

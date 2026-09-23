@@ -258,6 +258,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
             },
         )?;
     }
+    fault_point!(ServeBeforeDone);
     write_frame(
         output,
         FrameKind::TransferDone {
@@ -336,7 +337,9 @@ fn send_batch<R: Read, W: Write>(
                     ) => break,
                 }
             }
-            for ack in publisher.publish_group(group)? {
+            let acknowledgements = publisher.publish_group(group)?;
+            fault_point!(ServeAfterPublishGroup);
+            for ack in acknowledgements {
                 bytes_read = bytes_read.saturating_add(ack.bytes_read);
                 completed += 1;
                 let row = batch
@@ -352,6 +355,7 @@ fn send_batch<R: Read, W: Write>(
                 match ack.captured {
                     Ok(manifest) => {
                         send_content(input, output, &manifest, store, row)?;
+                        fault_point!(ServeAfterContent);
                     }
                     Err(refusal) => write_frame(
                         output,
@@ -471,6 +475,7 @@ pub fn receive<R: Read, W: Write>(
                         needed: needed.clone(),
                     },
                 )?;
+                fault_point!(ReceiveAfterWantFiles);
                 loop {
                     match read_frame(input)?.kind {
                         FrameKind::FileContent { index } => {
@@ -572,7 +577,12 @@ fn receive_content<R: Read, W: Write>(
     let materialize_started = Instant::now();
     let applied = received
         .and_then(|()| context.target.file(row, &manifest, context.store))
-        .and_then(|identity| context.store.record_output(&key, &identity));
+        .and_then(|identity| {
+            fault_point!(ReceiveBeforeRecordOutput);
+            context.store.record_output(&key, &identity)?;
+            fault_point!(ReceiveAfterRecordOutput);
+            Ok(())
+        });
     MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
     write_frame(
         output,
@@ -580,6 +590,7 @@ fn receive_content<R: Read, W: Write>(
             success: applied.is_ok(),
         },
     )?;
+    fault_point!(ReceiveAfterApplied);
     match applied {
         Ok(()) => stats.completed += 1,
         Err(refusal) => stats
@@ -628,6 +639,7 @@ fn receive_chunks<R: Read, W: Write>(
                         capture_id: 0,
                         chunks: std::mem::take(&mut pending),
                     }])?;
+                    fault_point!(ReceiveAfterChunkPublish);
                 }
             }
             FrameKind::Refusal { .. } => return Err(BulkloadRefusal::SealedObjectMissing),
@@ -638,6 +650,7 @@ fn receive_chunks<R: Read, W: Write>(
         capture_id: 0,
         chunks: pending,
     }])?;
+    fault_point!(ReceiveAfterChunkPublish);
     Ok(())
 }
 
@@ -724,6 +737,7 @@ fn capture_uncached(
         crate::hash::CDC_MAX_BYTES,
     ) {
         let chunk = chunk.map_err(|_| BulkloadRefusal::Io(None))?;
+        fault_mid_read!(chunks.is_empty(), &file_path);
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
