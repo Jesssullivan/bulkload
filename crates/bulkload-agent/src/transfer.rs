@@ -149,8 +149,8 @@ pub fn copy(
     // on neo under load and surfaced as EAGAIN (errno 35) from the timeout.
     #[cfg(test)]
     for stream in [&sender, &receiver] {
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(300)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_mins(5)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_mins(5)))?;
     }
     std::thread::scope(|scope| -> Result<TransferStats> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {

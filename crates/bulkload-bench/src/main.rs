@@ -439,11 +439,10 @@ fn metric(value: Option<u64>) -> String {
 }
 
 fn print_sample(sample: &Sample, verification_rows: usize) {
-    let throughput = if sample.elapsed_ns > 0 {
-        u128::from(sample.workload_bytes).saturating_mul(1_000_000_000) / sample.elapsed_ns
-    } else {
-        0
-    };
+    let throughput = u128::from(sample.workload_bytes)
+        .saturating_mul(1_000_000_000)
+        .checked_div(sample.elapsed_ns)
+        .unwrap_or(0);
     let rss_scope = match sample.arm {
         Arm::Native => "cumulative-process-peak",
         Arm::Rclone => "cumulative-children-peak",

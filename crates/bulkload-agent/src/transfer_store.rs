@@ -248,7 +248,7 @@ impl Store {
                 .open(&db)?;
         }
         let conn = rusqlite::Connection::open(db).map_err(sqlite_error)?;
-        conn.busy_timeout(std::time::Duration::from_secs(60))
+        conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
         conn.execute_batch(
             "PRAGMA synchronous=FULL;
@@ -279,7 +279,7 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(sqlite_error)?;
-        conn.busy_timeout(std::time::Duration::from_secs(60))
+        conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
         Ok(Self { root, conn })
     }
