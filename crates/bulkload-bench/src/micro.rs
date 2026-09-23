@@ -162,39 +162,78 @@ const fn place_self(_: Class) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `work` on `threads` threads placed on `class`; return total bytes and wall time.
+/// CPU time consumed so far by the calling thread.
 ///
-/// Timing starts once every thread is placed and waiting at the barrier.
+/// Rates over thread CPU time are insensitive to time-slicing by other load,
+/// so they estimate per-core throughput on a contended host.
+fn thread_cpu() -> io::Result<Duration> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a live, writable timespec for the duration of the call,
+    // and CLOCK_THREAD_CPUTIME_ID is a valid clock on Darwin and Linux.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let seconds = u64::try_from(now.tv_sec).map_err(io::Error::other)?;
+    let nanos = u32::try_from(now.tv_nsec).map_err(io::Error::other)?;
+    Ok(Duration::new(seconds, nanos))
+}
+
+/// Bytes processed, wall time, and CPU time summed over the worker threads.
+struct Measured {
+    bytes: u64,
+    wall: Duration,
+    cpu: Duration,
+}
+
+/// Run `work` on `threads` threads placed on `class`.
+///
+/// Wall timing starts once every thread is placed and waiting at the barrier.
 fn on_class(
     class: Class,
     threads: usize,
     work: &(dyn Fn() -> io::Result<u64> + Sync),
-) -> io::Result<(u64, Duration)> {
+) -> io::Result<Measured> {
     let barrier = Barrier::new(threads + 1);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let barrier = &barrier;
-            handles.push(scope.spawn(move || -> io::Result<u64> {
+            handles.push(scope.spawn(move || -> io::Result<(u64, Duration)> {
                 let placed = place_self(class);
                 barrier.wait();
                 placed?;
-                work()
+                let before = thread_cpu()?;
+                let bytes = work()?;
+                Ok((bytes, thread_cpu()?.saturating_sub(before)))
             }));
         }
         barrier.wait();
         let started = Instant::now();
         let mut total = 0_u64;
+        let mut cpu = Duration::ZERO;
         let mut failure = None;
         for handle in handles {
             match handle.join() {
-                Ok(Ok(bytes)) => total = total.saturating_add(bytes),
+                Ok(Ok((bytes, spent))) => {
+                    total = total.saturating_add(bytes);
+                    cpu = cpu.saturating_add(spent);
+                }
                 Ok(Err(error)) => failure = Some(error),
                 Err(_) => failure = Some(io::Error::other("micro worker panicked")),
             }
         }
-        let elapsed = started.elapsed();
-        failure.map_or(Ok((total, elapsed)), Err)
+        let wall = started.elapsed();
+        failure.map_or(
+            Ok(Measured {
+                bytes: total,
+                wall,
+                cpu,
+            }),
+            Err,
+        )
     })
 }
 
@@ -243,23 +282,30 @@ fn cpu_rows(
         }
         for threads in shapes {
             let mut rates = Vec::with_capacity(cli.reps);
+            let mut cpu_rates = Vec::with_capacity(cli.reps);
             for rep in 0..cli.reps {
-                let (bytes, elapsed) = on_class(*class, threads, work)?;
-                let rate = gb_per_s(bytes, elapsed);
+                let measured = on_class(*class, threads, work)?;
+                let rate = gb_per_s(measured.bytes, measured.wall);
+                // Per-thread rate over CPU time actually received.
+                let cpu_rate = gb_per_s(measured.bytes, measured.cpu);
                 rates.push(rate);
+                cpu_rates.push(cpu_rate);
                 println!(
-                    "micro name={name} variant={variant} core_class={} qos={} threads={threads} rep={rep} bytes={bytes} elapsed_ns={} gb_s={rate:.3}",
+                    "micro name={name} variant={variant} core_class={} qos={} threads={threads} rep={rep} bytes={} elapsed_ns={} cpu_ns={} gb_s={rate:.3} cpu_gb_s_per_thread={cpu_rate:.3}",
                     class.label(),
                     class.qos_label(),
-                    elapsed.as_nanos(),
+                    measured.bytes,
+                    measured.wall.as_nanos(),
+                    measured.cpu.as_nanos(),
                 );
             }
             println!(
-                "micro_median name={name} variant={variant} core_class={} qos={} threads={threads} reps={} gb_s={:.3}",
+                "micro_median name={name} variant={variant} core_class={} qos={} threads={threads} reps={} gb_s={:.3} cpu_gb_s_per_thread={:.3}",
                 class.label(),
                 class.qos_label(),
                 cli.reps,
                 median(&mut rates),
+                median(&mut cpu_rates),
             );
         }
     }
@@ -399,7 +445,7 @@ fn get_buffer(stream: &UnixStream, option: libc::c_int) -> io::Result<libc::c_in
     Ok(value)
 }
 
-fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::Result<Duration> {
+fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::Result<Measured> {
     let (mut writer, mut reader) = UnixStream::pair()?;
     if let Some(bytes) = buffer {
         for stream in [&writer, &reader] {
@@ -409,26 +455,28 @@ fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::R
     }
     let payload = random_bytes(SOCKET_IO, 0x50c4);
     let barrier = Barrier::new(3);
-    std::thread::scope(|scope| -> io::Result<Duration> {
+    std::thread::scope(|scope| -> io::Result<Measured> {
         let barrier = &barrier;
         let payload = &payload;
-        let writing = scope.spawn(move || -> io::Result<()> {
+        let writing = scope.spawn(move || -> io::Result<Duration> {
             let placed = place_self(class);
             barrier.wait();
             placed?;
+            let before = thread_cpu()?;
             let mut remaining = total;
             while remaining > 0 {
                 let count = remaining.min(payload.len());
                 writer.write_all(payload.get(..count).unwrap_or(payload))?;
                 remaining -= count;
             }
-            Ok(())
+            Ok(thread_cpu()?.saturating_sub(before))
         });
-        let reading = scope.spawn(move || -> io::Result<()> {
+        let reading = scope.spawn(move || -> io::Result<Duration> {
             let placed = place_self(class);
             let mut sink = vec![0_u8; SOCKET_IO];
             barrier.wait();
             placed?;
+            let before = thread_cpu()?;
             let mut remaining = total;
             while remaining > 0 {
                 let read = reader.read(&mut sink)?;
@@ -437,7 +485,7 @@ fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::R
                 }
                 remaining = remaining.saturating_sub(read);
             }
-            Ok(())
+            Ok(thread_cpu()?.saturating_sub(before))
         });
         barrier.wait();
         let started = Instant::now();
@@ -447,10 +495,13 @@ fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::R
         let drained = reading
             .join()
             .map_err(|_| io::Error::other("receiver panicked"));
-        let elapsed = started.elapsed();
-        sent??;
-        drained??;
-        Ok(elapsed)
+        let wall = started.elapsed();
+        let cpu = sent??.saturating_add(drained??);
+        Ok(Measured {
+            bytes: total as u64,
+            wall,
+            cpu,
+        })
     })
 }
 
@@ -480,14 +531,15 @@ fn socket(cli: &MicroCli) -> io::Result<()> {
         for class in &cli.class {
             let mut rates = Vec::with_capacity(cli.reps);
             for rep in 0..cli.reps {
-                let elapsed = socket_once(*class, total, buffer)?;
-                let rate = gb_per_s(total as u64, elapsed);
+                let measured = socket_once(*class, total, buffer)?;
+                let rate = gb_per_s(measured.bytes, measured.wall);
                 rates.push(rate);
                 println!(
-                    "micro name=socket variant={variant} core_class={} qos={} threads=2 rep={rep} bytes={total} elapsed_ns={} gb_s={rate:.3}",
+                    "micro name=socket variant={variant} core_class={} qos={} threads=2 rep={rep} bytes={total} elapsed_ns={} cpu_ns_both_threads={} gb_s={rate:.3}",
                     class.label(),
                     class.qos_label(),
-                    elapsed.as_nanos(),
+                    measured.wall.as_nanos(),
+                    measured.cpu.as_nanos(),
                 );
             }
             println!(
