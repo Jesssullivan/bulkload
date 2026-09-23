@@ -18,6 +18,17 @@
 //!   standard library implements it as `fcntl(F_FULLFSYNC)` too.
 //! - `flush_dir`: any sync of a directory descriptor (`sync_all`, which is
 //!   `F_FULLFSYNC` on Darwin).
+//!
+//! Flush counts are attempts (a failed flush is still counted). `SQLite`
+//! commit counters count successful commits only.
+//!
+//! Not counted as flushes: `SQLite`'s own syncs, and syncs done by child
+//! processes. The transfer store runs `synchronous=FULL` with the default
+//! rollback journal, which syncs at least twice per commit (journal, then
+//! database) through `SQLite`'s VFS; on Darwin that is `fsync`, not
+//! `F_FULLFSYNC`, unless `PRAGMA fullfsync` is set. `git` children spawned by
+//! the Git carry verbs flush on their own. Both are invisible here, so the
+//! flush counters are a lower bound on the syncs a verb causes.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,9 +117,7 @@ counters! {
 
 const COUNT: usize = Counter::ALL.len();
 
-#[allow(clippy::declare_interior_mutable_const)]
-const ZERO: AtomicU64 = AtomicU64::new(0);
-static VALUES: [AtomicU64; COUNT] = [ZERO; COUNT];
+static VALUES: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
 fn slot(counter: Counter) -> Option<&'static AtomicU64> {
     VALUES.get(counter as usize)
@@ -137,10 +146,16 @@ pub fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Record one `SQLite` commit of `kind` that took `started.elapsed()`.
-pub fn sqlite_commit(kind: Counter, started: Instant) {
-    bump(kind);
-    add(Counter::SqliteCommitNs, elapsed_ns(started));
+/// Record one successful `SQLite` commit of `kind` that took `started.elapsed()`.
+///
+/// Only an `Ok` outcome is counted (count and nanoseconds); a failed or
+/// rolled-back statement is not a commit. Returns whether it was counted.
+pub fn sqlite_commit<T, E>(kind: Counter, started: Instant, outcome: &Result<T, E>) -> bool {
+    if outcome.is_ok() {
+        bump(kind);
+        add(Counter::SqliteCommitNs, elapsed_ns(started));
+    }
+    outcome.is_ok()
 }
 
 /// BLAKE3 of `data`, counted under `purpose`.
@@ -270,7 +285,9 @@ impl Counters {
     pub fn since(self, before: Self) -> Self {
         let mut values = self.0;
         for (value, earlier) in values.iter_mut().zip(before.0) {
-            *value = value.saturating_sub(earlier);
+            // Counters are monotonic u64s; wrapping keeps the delta exact
+            // even across a (theoretical) wrap of the underlying atomic.
+            *value = value.wrapping_sub(earlier);
         }
         Self(values)
     }
@@ -335,6 +352,24 @@ mod tests {
         assert!(after.blake3_total() >= 10);
         assert!(after.render().contains("blake3_other_bytes="));
         assert!(after.render().contains("blake3_total_bytes="));
+    }
+
+    #[test]
+    fn sqlite_commits_count_only_on_ok() {
+        // Counters are process-global and other tests commit concurrently,
+        // so the decision is checked through the return value.
+        assert!(sqlite_commit(
+            Counter::SqliteSettings,
+            Instant::now(),
+            &Ok::<(), ()>(())
+        ));
+        assert!(!sqlite_commit(
+            Counter::SqliteSettings,
+            Instant::now(),
+            &Err::<(), ()>(())
+        ));
+        let wrapped = Counters([1; COUNT]).since(Counters([u64::MAX; COUNT]));
+        assert_eq!(wrapped.get(Counter::SqliteSettings), 2);
     }
 
     #[test]

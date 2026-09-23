@@ -373,7 +373,7 @@ impl Store {
                 [random.as_slice()],
             )
             .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteSettings, started);
+        counters::sqlite_commit(Counter::SqliteSettings, started, &inserted);
         inserted?;
         let bytes: Vec<u8> = self
             .conn
@@ -422,7 +422,7 @@ impl Store {
                 (key, encoded),
             )
             .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteRecordCapture, started);
+        counters::sqlite_commit(Counter::SqliteRecordCapture, started, &recorded);
         recorded?;
         Ok(())
     }
@@ -459,7 +459,7 @@ impl Store {
                 (key, identity),
             )
             .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteRecordOutput, started);
+        counters::sqlite_commit(Counter::SqliteRecordOutput, started, &recorded);
         recorded?;
         Ok(())
     }
@@ -487,7 +487,7 @@ impl Store {
                     (key, &identity),
                 )
                 .map_err(sqlite_error);
-            counters::sqlite_commit(Counter::SqliteDirectoryPending, started);
+            counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
             recorded?;
             return Ok(true);
         }
@@ -513,7 +513,7 @@ impl Store {
             .conn
             .execute("DELETE FROM directories WHERE key = ?1", [key])
             .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteDirectoryComplete, started);
+        counters::sqlite_commit(Counter::SqliteDirectoryComplete, started, &completed);
         completed?;
         Ok(())
     }
@@ -884,6 +884,7 @@ impl StorePublisher<'_> {
                 Side::Unattributed => Counter::SqlitePublishOther,
             },
             commit_started,
+            &committed,
         );
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
