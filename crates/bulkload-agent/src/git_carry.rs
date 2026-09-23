@@ -394,6 +394,38 @@ impl KeyParts {
             && self.omitted == other.omitted
             && self.identities == other.identities
     }
+
+    /// Everything that moved between these pre-pass parts and `later`, the
+    /// parts re-read after the pass.
+    ///
+    /// An export takes its own ref and census snapshot, later than a caller's
+    /// pre-pass key. A ref deleted in between is invisible to the export, yet
+    /// the pre-pass key still names it. The result is empty exactly when the
+    /// two parts are equal, and only then may the pre-pass key be recorded as
+    /// a clean reuse key; otherwise the capture is recorded as drifted, and a
+    /// later pass must re-capture or extend it, never reuse it (R-N72).
+    ///
+    /// Seats compare on the whole census row here, directory timestamps
+    /// included: the pre-pass key hashes every field of every row.
+    ///
+    /// # Errors
+    /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] when anything outside
+    /// the ref inventory and the worktree census moved, or when the parts
+    /// differ in a way no drift row can name.
+    pub fn drift_to(&self, later: &Self) -> Result<CaptureDrift> {
+        if !self.drift_only(later) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        let mut drift = CaptureDrift::default();
+        drift.extend(reference_drift(&self.inventory, &later.inventory)?);
+        drift.extend(seat_drift_by(&self.rows, &later.rows, |a, b| a == b));
+        drift.seal()?;
+        // Fail closed: a key that moved must name what moved.
+        if drift.is_empty() != (self == later) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        Ok(drift)
+    }
 }
 
 /// The typed inputs of the reusable capture key for `repo`, default policy.
@@ -798,6 +830,10 @@ fn export_repository_inner(
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
+    #[cfg(test)]
+    mid_pass::fire(&repo, mid_pass::Stage::Snapshot);
+    // Before the census, so every seat the census stamps is judged against it.
+    let started_ns = pass_start_ns();
     let before_refs = refs(&repo)?;
     let configuration = source_configuration(&repo)?;
     let boundary = shallow::frontier(&repo)?;
@@ -819,13 +855,10 @@ fn export_repository_inner(
         &commit_tree(&private, &staged, "bulkload staged tree")?,
     )?;
     #[cfg(test)]
-    mid_pass::fire(&repo);
+    mid_pass::fire(&repo, mid_pass::Stage::BytePass);
     // Seats a retained capture already holds at this exact identity are emitted
     // by object name. Nothing is opened for them and no source byte is re-read.
-    let reuse = match options.reuse {
-        Some(previous) => reusable_blobs(&private, previous, seats)?,
-        None => raw_tree::Reuse::new(),
-    };
+    let (reuse, reuse_unavailable) = offered_reuse(&private, options.reuse, &boundary, seats)?;
     let pass = raw_tree::capture(&private, &repo, seats, &reuse)?;
     let after = capture_census(&repo, &common, options.policy)?;
     // Git authority moving under the capture is never drift. The nested
@@ -909,6 +942,8 @@ fn export_repository_inner(
         omitted,
         drift,
         bytes_read: pass.bytes_read,
+        started_ns,
+        reuse_unavailable,
     })
 }
 
@@ -961,24 +996,90 @@ fn observed_drift(
     Ok(drift)
 }
 
+// A clock before the epoch yields zero, which makes every seat racy: the
+// failure mode is a re-read, never a stale reuse.
+fn pass_start_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i128::try_from(elapsed.as_nanos()).unwrap_or(0))
+}
+
+// What a pass may reuse from the retained capture it was offered, if any.
+fn offered_reuse(
+    private: &Path,
+    offered: Option<RetainedCapture<'_>>,
+    boundary: &[u8],
+    seats: &[crate::RowSchema],
+) -> Result<(raw_tree::Reuse, Option<ReuseUnavailable>)> {
+    Ok(match offered {
+        None => (raw_tree::Reuse::new(), None),
+        // Shallow custody carries no worktree tree; say so rather than
+        // silently re-reading every seat.
+        Some(_) if !boundary.is_empty() => {
+            (raw_tree::Reuse::new(), Some(ReuseUnavailable::Shallow))
+        }
+        Some(retained) => match reusable_blobs(private, &retained, seats)? {
+            Ok(reuse) => (reuse, None),
+            Err(why) => (raw_tree::Reuse::new(), Some(why)),
+        },
+    })
+}
+
+/// Transient refs a retained capture is fetched under. Never carried on.
+const REUSE_NAMESPACE: &str = "refs/carry-reuse/";
+
 /// Blobs a retained capture of this same checkout already holds.
 ///
 /// Only seats whose `StatIdentity` is unchanged since that capture qualify:
-/// exactly the freshness tuple `RowSchema::stat_identity` documents. A seat that
-/// drifted in the retained pass is absent from its tree and is therefore read
-/// again here, which is the whole point of the incremental pass (R-N28).
+/// exactly the freshness tuple `RowSchema::stat_identity` documents, and only
+/// when the retained row was not racy (see [`RACY_GRANULARITY_NS`]). A seat
+/// that drifted in the retained pass is absent from its tree and is therefore
+/// read again here, which is the whole point of the incremental pass (R-N28).
+///
+/// A retained capture that cannot be fetched or decoded degrades to no reuse:
+/// the pass reads every seat, and the result says why. Whatever happened, every
+/// `refs/carry-reuse/*` ref is deleted before this returns, so the bundle this
+/// pass writes with `--all` can never carry them; if that cannot be proved,
+/// this refuses.
 fn reusable_blobs(
     private: &Path,
-    previous: &Path,
+    retained: &RetainedCapture<'_>,
+    seats: &[crate::RowSchema],
+) -> Result<std::result::Result<raw_tree::Reuse, ReuseUnavailable>> {
+    let attempt = retained_blobs(private, retained, seats);
+    clear_reuse_refs(private)?;
+    Ok(attempt.map_err(|_| ReuseUnavailable::RetainedUnreadable))
+}
+
+// Delete every transient reuse ref, then prove none remains.
+fn clear_reuse_refs(private: &Path) -> Result<()> {
+    let listed = |private: &Path| -> Result<String> {
+        text(
+            git(private)
+                .args(["for-each-ref", "--format=%(refname)"])
+                .arg(REUSE_NAMESPACE),
+        )
+    };
+    for name in listed(private)?.lines() {
+        output(git(private).args(["update-ref", "-d", name]))?;
+    }
+    if !listed(private)?.is_empty() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    Ok(())
+}
+
+fn retained_blobs(
+    private: &Path,
+    retained: &RetainedCapture<'_>,
     seats: &[crate::RowSchema],
 ) -> Result<raw_tree::Reuse> {
     use bulkload_proto::FileKind;
     use std::process::Stdio;
     let mut reuse = raw_tree::Reuse::new();
-    // An unreadable or unsatisfiable retained bundle costs only the optimization.
     if !git(private)
         .args(["fetch", "--no-tags", "--quiet"])
-        .arg(previous)
+        .arg(retained.bundle)
         .args([
             "+refs/carry-export/worktree:refs/carry-reuse/worktree",
             "+refs/carry-export/filesystem-v1:refs/carry-reuse/filesystem-v1",
@@ -989,7 +1090,7 @@ fn reusable_blobs(
         .status()?
         .success()
     {
-        return Ok(reuse);
+        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let held: Vec<crate::RowSchema> = postcard::from_bytes(&output(
         git(private).args(["show", "refs/carry-reuse/filesystem-v1:value"]),
@@ -1030,18 +1131,12 @@ fn reusable_blobs(
             continue;
         };
         if row.kind == FileKind::Regular
+            && !racy(before, retained.started_ns)
             && seat_equivalent(before, row)
             && raw_tree::mode_of(row)? == mode
         {
             reuse.insert(path.to_vec(), object.to_owned());
         }
-    }
-    // The retained capture's refs are an optimization input, never carried on.
-    for name in [
-        "refs/carry-reuse/worktree",
-        "refs/carry-reuse/filesystem-v1",
-    ] {
-        output(git(private).args(["update-ref", "-d", name]))?;
     }
     Ok(reuse)
 }
@@ -1049,27 +1144,43 @@ fn reusable_blobs(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) mod mid_pass {
-    //! Test-only injection point: run a closure inside one export, after its
-    //! census and ref snapshot and before its byte pass, keyed by the captured
+    //! Test-only injection points inside one export, keyed by the captured
     //! checkout so parallel tests never fire each other's hooks.
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    type Hook = Box<dyn FnOnce() + Send>;
-    static ARMED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
-
-    pub fn arm(repo: &Path, hook: impl FnOnce() + Send + 'static) {
-        let repo = std::fs::canonicalize(repo).expect("armed checkout exists");
-        ARMED.lock().expect("hooks").push((repo, Box::new(hook)));
+    /// Where in the export an armed hook runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Stage {
+        /// Before the export takes its own ref and census snapshot: the window
+        /// between a caller's pre-pass key and the export's snapshot.
+        Snapshot,
+        /// After the census and ref snapshot, before the byte pass.
+        BytePass,
     }
 
-    pub fn fire(repo: &Path) {
+    type Hook = Box<dyn FnOnce() + Send>;
+    static ARMED: Mutex<Vec<(PathBuf, Stage, Hook)>> = Mutex::new(Vec::new());
+
+    pub fn arm(repo: &Path, hook: impl FnOnce() + Send + 'static) {
+        arm_at(repo, Stage::BytePass, hook);
+    }
+
+    pub fn arm_at(repo: &Path, stage: Stage, hook: impl FnOnce() + Send + 'static) {
+        let repo = std::fs::canonicalize(repo).expect("armed checkout exists");
+        ARMED
+            .lock()
+            .expect("hooks")
+            .push((repo, stage, Box::new(hook)));
+    }
+
+    pub fn fire(repo: &Path, stage: Stage) {
         let hook = {
             let mut armed = ARMED.lock().expect("hooks");
             armed
                 .iter()
-                .position(|(path, _)| path == repo)
-                .map(|index| armed.remove(index).1)
+                .position(|(path, armed_stage, _)| path == repo && *armed_stage == stage)
+                .map(|index| armed.remove(index).2)
         };
         if let Some(hook) = hook {
             hook();
@@ -1175,10 +1286,65 @@ pub struct ExportOptions<'a> {
     pub policy: CapturePolicy,
     /// A retained capture of this same checkout whose blobs may be reused.
     ///
-    /// Every seat whose `StatIdentity` is unchanged since that capture is
-    /// emitted by object name instead of being opened: the R25 never-rewalk
-    /// clause, measured by [`Export::bytes_read`].
-    pub reuse: Option<&'a Path>,
+    /// Every seat whose `StatIdentity` is unchanged since that capture, and
+    /// was not racy when it was taken, is emitted by object name instead of
+    /// being opened: the R25 never-rewalk clause, measured by
+    /// [`Export::bytes_read`].
+    pub reuse: Option<RetainedCapture<'a>>,
+}
+
+/// A retained capture offered for blob reuse, with the instant its pass began.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainedCapture<'a> {
+    /// The retained, verified capture bundle.
+    pub bundle: &'a Path,
+    /// [`Export::started_ns`] of the pass that wrote `bundle`.
+    pub started_ns: i128,
+}
+
+/// Timestamp granularity the racy-seat guard allows for, in nanoseconds.
+///
+/// Two seconds covers the coarsest filesystem a checkout may sit on (FAT and
+/// SMB at 2 s; HFS+, ext3 and many NFS servers at 1 s) and the jiffy-coarse
+/// clock Linux stamps inodes with. The cost of erring wide is one re-read of a
+/// seat written in the two seconds before a pass.
+pub const RACY_GRANULARITY_NS: i128 = 2_000_000_000;
+
+// Racy, exactly as Git defines it for its index: a seat stamped at or after
+// the capture pass start, less one timestamp tick, can be rewritten at the same
+// size in that same tick without its StatIdentity moving. Its identity
+// therefore cannot vouch for the captured bytes, and it is never reused by
+// identity; the next pass reads it again.
+const fn racy(row: &crate::RowSchema, started_ns: i128) -> bool {
+    let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
+    row.mtime_ns >= window || row.ctime_ns >= window
+}
+
+/// Why a pass that was offered a retained capture read every seat anyway.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseUnavailable {
+    /// The checkout is shallow: its bundle is shallow-graph custody, which
+    /// carries no worktree tree to reuse blobs from.
+    Shallow,
+    /// The retained capture could not be fetched or decoded. Its transient
+    /// refs were deleted and the pass read every seat.
+    RetainedUnreadable,
+    /// The retained capture predates the recorded pass start, so no seat in it
+    /// can be proved free of racy timestamps.
+    PassStartUnrecorded,
+}
+
+impl ReuseUnavailable {
+    /// The receipt value, as in `reuse_unavailable=shallow`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Shallow => "shallow",
+            Self::RetainedUnreadable => "retained-unreadable",
+            Self::PassStartUnrecorded => "pass-start-unrecorded",
+        }
+    }
 }
 
 /// A completed export: the bundle, the custody for what it did not carry, what
@@ -1193,6 +1359,12 @@ pub struct Export {
     pub drift: CaptureDrift,
     /// Bytes streamed from source file descriptors during this pass.
     pub bytes_read: u64,
+    /// Wall-clock nanoseconds since the epoch, taken before the census. A
+    /// retained capture's seats stamped within [`RACY_GRANULARITY_NS`] of this
+    /// instant are racy and never reused by identity.
+    pub started_ns: i128,
+    /// Set when a retained capture was offered and no blob could be reused.
+    pub reuse_unavailable: Option<ReuseUnavailable>,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -1329,11 +1501,12 @@ pub enum DriftKind {
     RefChanged,
     /// A ref in the pre-pass inventory was deleted.
     RefRemoved,
-    /// A seat absent from the pre-pass census appeared; it is not carried.
+    /// A seat absent from the pre-pass census appeared.
     SeatAdded,
-    /// A seat's identity changed under the pass; its bytes are not carried.
+    /// A seat's identity changed under the pass; the capture does not vouch
+    /// for its bytes.
     SeatChanged,
-    /// A seat in the pre-pass census was removed; its bytes are not carried.
+    /// A seat in the pre-pass census was removed.
     SeatRemoved,
 }
 
@@ -1446,6 +1619,15 @@ impl CaptureDrift {
         self.rows.extend(rows);
     }
 
+    /// Fold in drift observed over a wider window than the export's own.
+    ///
+    /// # Errors
+    /// Refuses drift larger than [`DRIFT_ROW_LIMIT`].
+    pub(crate) fn merge(&mut self, other: Self) -> Result<()> {
+        self.rows.extend(other.rows);
+        self.seal()
+    }
+
     // Deterministic order, exactly as the census sorts its seats, and a hard
     // budget: drift larger than the cap is a rebuild, not a captured pass.
     fn seal(&mut self) -> Result<()> {
@@ -1501,6 +1683,14 @@ fn seat_equivalent(a: &crate::RowSchema, b: &crate::RowSchema) -> bool {
 }
 
 fn seat_drift(before: &[crate::RowSchema], after: &[crate::RowSchema]) -> Vec<DriftRow> {
+    seat_drift_by(before, after, seat_equivalent)
+}
+
+fn seat_drift_by(
+    before: &[crate::RowSchema],
+    after: &[crate::RowSchema],
+    same: impl Fn(&crate::RowSchema, &crate::RowSchema) -> bool,
+) -> Vec<DriftRow> {
     fn index(rows: &[crate::RowSchema]) -> std::collections::BTreeMap<&[u8], &crate::RowSchema> {
         rows.iter()
             .map(|row| (row.rel_path.as_slice(), row))
@@ -1511,7 +1701,7 @@ fn seat_drift(before: &[crate::RowSchema], after: &[crate::RowSchema]) -> Vec<Dr
     for (path, row) in &before {
         match after.get(path) {
             None => rows.push(DriftRow::seat(DriftKind::SeatRemoved, path)),
-            Some(current) if !seat_equivalent(row, current) => {
+            Some(current) if !same(row, current) => {
                 rows.push(DriftRow::seat(DriftKind::SeatChanged, path));
             }
             Some(_) => (),
@@ -3896,7 +4086,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // ---- drift tolerance (R25, bulkload #34; rulings R-N28/R-N29/R-N30) ----
+    // ---- drift tolerance (R25, bulkload #34; R-N28/R-N30/R-N72; R-N29 deferred to bulkload#48) ----
 
     fn drift_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let root =
@@ -4276,6 +4466,192 @@ mod tests {
         );
         assert!(matches!(refused, Err(BulkloadRefusal::Io(Some(_)))));
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn held_census(private: &Path) -> Vec<crate::RowSchema> {
+        postcard::from_bytes(
+            &output(git(private).args(["show", "refs/carry-export/filesystem-v1:value"])).unwrap(),
+        )
+        .unwrap()
+    }
+
+    // R-N72 (TIN-4540) finding 2: racy timestamps, exactly as in Git. A seat
+    // rewritten at the same size within one timestamp tick of the capture
+    // keeps its whole StatIdentity on a coarse-timestamp filesystem, so its
+    // identity cannot tell the new bytes from the captured ones.
+    #[test]
+    fn a_same_size_rewrite_in_the_capture_tick_is_never_reused_by_identity() {
+        let (root, source) = drift_fixture("racy");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        // The census exactly as a coarse-timestamp filesystem reports it after
+        // the rewrite below: every seat at the identity the capture holds.
+        let held = held_census(&root.join("first/repository.git"));
+        fs::write(source.join("tracked"), b"TRACKED BYTES AT CENSUS").unwrap();
+        let second = root.join("second");
+        fs::create_dir(&second).unwrap();
+        let private = prepare_private(&source, &second).unwrap();
+        let retained = RetainedCapture {
+            bundle: &first.bundle,
+            started_ns: first.started_ns,
+        };
+        let reuse = reusable_blobs(&private, &retained, &held).unwrap().unwrap();
+        assert!(
+            !reuse.contains_key(b"tracked".as_slice()),
+            "a racy seat is never reused by stat identity"
+        );
+        // A seat stamped well before its pass start is reused on identity alone:
+        // the guard is Git's racy check, not a blanket disable of R25 reuse.
+        let settled = RetainedCapture {
+            started_ns: first.started_ns + 60 * RACY_GRANULARITY_NS,
+            ..retained
+        };
+        let reuse = reusable_blobs(&private, &settled, &held).unwrap().unwrap();
+        assert!(reuse.contains_key(b"tracked".as_slice()));
+        assert!(!refs(&private).unwrap().contains(REUSE_NAMESPACE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 4: a retained capture that cannot be decoded
+    // costs only the optimization. Its refs/carry-reuse/* refs are deleted
+    // before the pass continues, so `bundle create --all` never carries them.
+    #[test]
+    fn an_undecodable_retained_capture_degrades_to_no_reuse_and_leaks_no_refs() {
+        let (root, source) = drift_fixture("undecodable-retained");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        let retained = root.join("first/repository.git");
+        output(git(&retained).args(["update-ref", "-d", "refs/carry-export/filesystem-v1"]))
+            .unwrap();
+        metadata(&retained, "filesystem-v1", b"\xff not a postcard census").unwrap();
+        let corrupt = root.join("corrupt.bundle");
+        output(
+            git(&retained)
+                .args(["bundle", "create"])
+                .arg(&corrupt)
+                .arg("--all"),
+        )
+        .unwrap();
+        let capture = root.join("second");
+        let export = export_repository_with_drift(
+            &source,
+            &capture,
+            &ExportOptions {
+                reuse: Some(RetainedCapture {
+                    bundle: &corrupt,
+                    started_ns: first.started_ns,
+                }),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            export.reuse_unavailable,
+            Some(ReuseUnavailable::RetainedUnreadable)
+        );
+        assert_eq!(
+            export.bytes_read, first.bytes_read,
+            "degraded to a full read"
+        );
+        assert!(!refs(&capture.join("repository.git"))
+            .unwrap()
+            .contains("refs/carry-reuse/"));
+        let heads = text(
+            git(&source)
+                .args(["bundle", "list-heads"])
+                .arg(&export.bundle),
+        )
+        .unwrap();
+        assert!(!heads.contains("refs/carry-reuse/"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 1, the reviewer's reproduction: the export's
+    // own snapshot cannot see a ref deleted before it, but the pre- and
+    // post-pass key parts can, and only equal parts are a clean reuse key.
+    #[test]
+    fn a_ref_deleted_before_the_export_snapshot_is_key_drift() {
+        let (root, source) = drift_fixture("adv-stale-key");
+        output(git(&source).args(["checkout", "-q", "-b", "side"])).unwrap();
+        fs::write(source.join("side-only"), b"unique").unwrap();
+        output(git(&source).args(["add", "side-only"])).unwrap();
+        output(git(&source).args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "side"]))
+            .unwrap();
+        let side = text(git(&source).args(["rev-parse", "side"])).unwrap();
+        output(git(&source).args(["checkout", "-q", "-"])).unwrap();
+        let pre = capture_key_parts(&source).unwrap();
+        let recorded_key = pre.digest().unwrap();
+        output(git(&source).args(["update-ref", "-d", "refs/heads/side"])).unwrap();
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        let post = capture_key_parts(&source).unwrap();
+        assert!(pre.drift_only(&post));
+        assert!(export.drift.is_empty(), "the export alone cannot see it");
+        assert_eq!(
+            pre.drift_to(&post).unwrap().rows,
+            vec![row(DriftKind::RefRemoved, b"refs/heads/side")]
+        );
+        assert!(post.drift_to(&post).unwrap().is_empty());
+        // Why the pre-pass key must never be recorded as clean here: the
+        // branch's return at the same commit reproduces it exactly.
+        output(git(&source).args(["update-ref", "refs/heads/side", &side])).unwrap();
+        assert_eq!(reusable_capture_key(&source).unwrap(), recorded_key);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 4: a shallow checkout's bundle is shallow-graph
+    // custody with no worktree tree to reuse, so the pass says so.
+    #[test]
+    fn a_shallow_checkout_reports_reuse_unavailable_instead_of_silently_rereading() {
+        let root = std::env::temp_dir().join(format!(
+            "bulkload-drift-shallow-reuse-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let full = root.join("full");
+        committed_repository(&full, b"first");
+        fs::write(full.join("tracked"), b"second").unwrap();
+        output(git(&full).args(["-c", "commit.gpgsign=false", "commit", "-qam", "second"]))
+            .unwrap();
+        let source = root.join("shallow");
+        output(
+            git(&root)
+                .args(["clone", "-q", "--depth=1", "--no-local"])
+                .arg(format!("file://{}", full.display()))
+                .arg(&source),
+        )
+        .unwrap();
+        output(git(&source).args([
+            "config",
+            "remote.origin.url",
+            "https://example.test/shallow.git",
+        ]))
+        .unwrap();
+        fs::write(source.join("untracked"), b"untracked payload").unwrap();
+        assert!(!shallow::frontier(&source).unwrap().is_empty());
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        assert_eq!(first.reuse_unavailable, None, "no reuse was offered");
+        let second = export_repository_with_drift(
+            &source,
+            &root.join("second"),
+            &ExportOptions {
+                reuse: Some(RetainedCapture {
+                    bundle: &first.bundle,
+                    // Settled: nothing is racy, so shallow is the only reason.
+                    started_ns: first.started_ns + 60 * RACY_GRANULARITY_NS,
+                }),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.reuse_unavailable, Some(ReuseUnavailable::Shallow));
+        assert_eq!(second.bytes_read, first.bytes_read);
         fs::remove_dir_all(root).unwrap();
     }
 }

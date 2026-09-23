@@ -50,22 +50,25 @@ pub struct Receipt {
     pub outcome: &'static str,
     pub reason: Option<String>,
     /// One line per ref or seat that drifted under the capture this receipt
-    /// names, followed by any seat the apply destination already held that
-    /// the drift list says was never captured (R-N29). Empty is the ordinary
-    /// case. The durable statement is the `{bundle}.drift` sidecar.
+    /// names. Empty is the ordinary case, and always empty on apply: apply
+    /// refuses a drifted capture (`CAPTURE_DRIFTED`). The durable statement is
+    /// the `{bundle}.drift` sidecar.
     pub drift: Vec<String>,
     /// Bytes streamed from source file descriptors by this operation. A reuse
     /// hit and an apply read no source bytes; an incremental pass reads
-    /// exactly the drifted seats (R25).
+    /// exactly the drifted and racy seats (R25).
     pub bytes_read: u64,
+    /// Why a pass that had a retained capture reused none of its blobs, as in
+    /// `reuse_unavailable=shallow`. `None` when reuse ran or was not offered.
+    pub reuse_unavailable: Option<&'static str>,
 }
 
 /// One item's completed operation and what it carried.
 struct Completion {
     outcome: &'static str,
     drift: Vec<String>,
-    held: Vec<String>,
     bytes_read: u64,
+    reuse_unavailable: Option<&'static str>,
 }
 
 impl Completion {
@@ -73,19 +76,23 @@ impl Completion {
         Self {
             outcome,
             drift: Vec::new(),
-            held: Vec::new(),
             bytes_read: 0,
+            reuse_unavailable: None,
         }
     }
 }
 
-// The authority digest of the key parts a capture was taken under. A later
-// pass with the same authority extends that capture: only the ref inventory
-// and the worktree census differ, and the census difference is exactly the
-// set of seats the incremental pass re-reads. Same sidecar shape as `Base`.
+// What the next pass needs from a capture, beside its record. Same sidecar
+// shape as `Base`: the Capture postcard gains no field.
 #[derive(Serialize, Deserialize)]
 struct Parts {
+    // The authority digest of the key parts the capture was taken under. A
+    // later pass with the same authority extends a drifted capture: only the
+    // ref inventory and the worktree census differ.
     authority: [u8; 32],
+    // When the capture's pass began. A seat stamped within one timestamp tick
+    // of it is racy and never reused by identity (R-N72).
+    started_ns: i128,
 }
 
 // A drifted capture deliberately omits the drifted seats' bytes, so its sidecar
@@ -100,11 +107,13 @@ fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift
 }
 
 // Absent for captures retained from before this sidecar existed: such a
-// capture is still reused blob-for-blob, it just never reports as extended.
-fn retained_authority(corpus: &Path, bundle: &str) -> Result<Option<[u8; 32]>> {
+// capture is still a reuse hit on an equal key, but with no recorded pass start
+// none of its seats can be proved free of racy timestamps, so a changed key
+// re-reads every seat and says so.
+fn retained_parts(corpus: &Path, bundle: &str) -> Result<Option<Parts>> {
     let path = corpus.join(format!("{bundle}.parts"));
     if path.try_exists()? {
-        Ok(Some(read::<Parts>(&path)?.authority))
+        Ok(Some(read::<Parts>(&path)?))
     } else {
         Ok(None)
     }
@@ -358,10 +367,16 @@ enum Retained {
     /// Same key, no drift: the retained bundle is the capture.
     Hit,
     /// A retained bundle of this checkout whose blobs this pass may reuse:
-    /// every seat at an unchanged `StatIdentity` costs zero source bytes (R25).
-    /// `extends` says the difference is confined to the ref inventory and
-    /// the worktree census, so this pass extends rather than starts over.
-    Extend { bundle: PathBuf, extends: bool },
+    /// every seat at an unchanged, non-racy `StatIdentity` costs zero source
+    /// bytes (R25). `started_ns` is its recorded pass start, absent for a
+    /// capture from before that was recorded. `extends` says the retained
+    /// capture drifted and the difference is confined to the ref inventory and
+    /// the worktree census, so this pass completes it.
+    Extend {
+        bundle: PathBuf,
+        started_ns: Option<i128>,
+        extends: bool,
+    },
     /// Nothing retained.
     None,
 }
@@ -387,8 +402,9 @@ fn retained_capture(
         return Ok(Retained::None);
     }
     let drift = retained_drift(corpus, &previous.bundle)?;
-    // A drifted bundle does not hold the drifted seats' bytes. It is never a
-    // reuse hit; it is the input the next pass extends (R-N28).
+    // A drifted bundle does not hold the drifted seats' bytes, and its key is
+    // a pre-pass key the source may return to. It is never a reuse hit; it is
+    // the input the next pass extends (R-N28, R-N72).
     if previous.key == key && drift.is_empty() {
         if git_carry::shared::requires_base(&bundle)? {
             let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
@@ -398,8 +414,51 @@ fn retained_capture(
         }
         return Ok(Retained::Hit);
     }
-    let extends = retained_authority(corpus, &previous.bundle)? == Some(authority);
-    Ok(Retained::Extend { bundle, extends })
+    let parts = retained_parts(corpus, &previous.bundle)?;
+    let extends = !drift.is_empty()
+        && parts
+            .as_ref()
+            .is_some_and(|parts| parts.authority == authority);
+    Ok(Retained::Extend {
+        bundle,
+        started_ns: parts.map(|parts| parts.started_ns),
+        extends,
+    })
+}
+
+// Without a recorded pass start no retained seat can be proved non-racy.
+const fn reuse_offer(
+    retained: Option<&Path>,
+    started_ns: Option<i128>,
+) -> (
+    Option<git_carry::RetainedCapture<'_>>,
+    Option<git_carry::ReuseUnavailable>,
+) {
+    match (retained, started_ns) {
+        (Some(bundle), Some(started_ns)) => (
+            Some(git_carry::RetainedCapture { bundle, started_ns }),
+            None,
+        ),
+        (Some(_), None) => (None, Some(git_carry::ReuseUnavailable::PassStartUnrecorded)),
+        (None, _) => (None, None),
+    }
+}
+
+// Failed private attempts are retained, never silently overwritten.
+fn attempt_directory(state: &Path, identity: &str, key: [u8; 32]) -> Result<PathBuf> {
+    let mut generation = 0u64;
+    loop {
+        let candidate = state.join(format!(
+            "{identity}-{}-{generation}",
+            blake3::Hash::from_bytes(key).to_hex()
+        ));
+        if !candidate.try_exists()? {
+            return Ok(candidate);
+        }
+        generation = generation
+            .checked_add(1)
+            .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+    }
 }
 
 fn capture_item(
@@ -416,25 +475,17 @@ fn capture_item(
     let parts = git_carry::capture_key_parts_with_policy(&item.source, policy)?;
     let key = parts.digest()?;
     let authority = parts.authority()?;
-    let (retained, extends) = match retained_capture(&record, corpus, key, authority)? {
+    let (retained, started_ns, extends) = match retained_capture(&record, corpus, key, authority)? {
         Retained::Hit => return Ok(Completion::clean("capture-reused-after-census")),
-        Retained::Extend { bundle, extends } => (Some(bundle), extends),
-        Retained::None => (None, false),
+        Retained::Extend {
+            bundle,
+            started_ns,
+            extends,
+        } => (Some(bundle), started_ns, extends),
+        Retained::None => (None, None, false),
     };
-    let mut generation = 0u64;
-    let attempt = loop {
-        let candidate = state.join(format!(
-            "{identity}-{}-{generation}",
-            blake3::Hash::from_bytes(key).to_hex()
-        ));
-        if !candidate.try_exists()? {
-            break candidate;
-        }
-        generation = generation
-            .checked_add(1)
-            .ok_or(BulkloadRefusal::FieldDomainViolation)?;
-    };
-    // Failed private attempts are retained, never silently overwritten.
+    let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
+    let attempt = attempt_directory(state, &identity, key)?;
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
     let export = git_carry::export_repository_with_drift(
         &item.source,
@@ -442,18 +493,21 @@ fn capture_item(
         &git_carry::ExportOptions {
             prerequisite: prerequisite.as_deref(),
             policy,
-            reuse: retained.as_deref(),
+            reuse,
         },
     )?;
-    // Not an opaque key comparison: the ref inventory and the worktree census
-    // moving is the drift this capture already reported. Anything else moving
-    // is Git authority changing under the capture and still refuses (R-N30).
-    if !parts.drift_only(&git_carry::capture_key_parts_with_policy(
+    // Not an opaque key comparison. Anything outside the ref inventory and the
+    // worktree census moving is Git authority changing under the capture and
+    // still refuses (R-N30). Within them, the export's own snapshot is later
+    // than the pre-pass key: a ref deleted in between is invisible to it. The
+    // pass is clean only when the pre- and post-pass parts are exactly equal;
+    // any difference is drift recorded with the capture, so the pre-pass key
+    // it records can never be a reuse hit (R-N72).
+    let mut drift = export.drift;
+    drift.merge(parts.drift_to(&git_carry::capture_key_parts_with_policy(
         &item.source,
         policy,
-    )?) {
-        return Err(BulkloadRefusal::GitAuthorityChanged);
-    }
+    )?)?)?;
     let bundle = export.bundle;
     let digest = hash_file(&bundle)?;
     let name = format!(
@@ -477,14 +531,24 @@ fn capture_item(
     }
     // Separate sidecars, exactly as the shared-base dependency is: the Capture
     // postcard is positional and gains no field, so every retained record and
-    // every live restore journal still decodes.
-    if !export.drift.is_empty() {
-        write(&corpus.join(format!("{name}.drift")), &export.drift)?;
+    // every live restore journal still decodes. This sidecar can be a superset
+    // of the bundle's own capture-drift-v1 ref: it also names what moved
+    // between the pre-pass key and the export's snapshot.
+    let drift_sidecar = corpus.join(format!("{name}.drift"));
+    if !drift.is_empty() {
+        write(&drift_sidecar, &drift)?;
     }
-    write(&corpus.join(format!("{name}.parts")), &Parts { authority })?;
-    // The pre-pass key is recorded, as it always was. When the pass drifted it
-    // no longer matches the source, so the next pass is an incremental one that
-    // re-reads exactly the drifted seats and reuses every other blob.
+    write(
+        &corpus.join(format!("{name}.parts")),
+        &Parts {
+            authority,
+            started_ns: export.started_ns,
+        },
+    )?;
+    // The pre-pass key is recorded, as it always was. When the pass drifted,
+    // the drift sidecar written above keeps it from ever being a reuse hit;
+    // the next pass re-reads exactly the drifted and racy seats and reuses
+    // every other blob.
     write(
         &record,
         &Capture {
@@ -494,7 +558,16 @@ fn capture_item(
             identity: crate::freshness::StatIdentity::from_metadata(&metadata),
         },
     )?;
-    let outcome = if !export.drift.is_empty() {
+    if drift.is_empty() && drift_sidecar.try_exists()? {
+        // A clean pass can reproduce a drifted pass's bundle byte for byte
+        // when the drift lay only before the export's snapshot. Retire the
+        // stale record only after the clean completion is durable: a crash in
+        // between leaves the capture drifted, which costs one more pass and
+        // never a stale reuse.
+        fs::remove_file(&drift_sidecar)?;
+        fs::File::open(corpus)?.sync_all()?;
+    }
+    let outcome = if !drift.is_empty() {
         "captured-with-drift"
     } else if extends {
         "capture-extended-from-drift"
@@ -503,9 +576,11 @@ fn capture_item(
     };
     Ok(Completion {
         outcome,
-        drift: export.drift.lines(),
-        held: Vec::new(),
+        drift: drift.lines(),
         bytes_read: export.bytes_read,
+        reuse_unavailable: unrecorded
+            .or(export.reuse_unavailable)
+            .map(git_carry::ReuseUnavailable::code),
     })
 }
 
@@ -525,28 +600,27 @@ fn execute(
     let refused = std::sync::atomic::AtomicBool::new(false);
     pool.install(|| {
         plan.items.par_iter().try_for_each(|item| {
-            let (outcome, reason, drift, bytes_read) = match operation(item) {
+            let (done, reason) = match operation(item) {
                 Ok(done) => {
                     // The count rides in the layout-safe reason; the rows ride
                     // in the sidecar and the in-process receipt.
                     let reason =
                         (!done.drift.is_empty()).then(|| format!("drift={}", done.drift.len()));
-                    let mut lines = done.drift;
-                    lines.extend(done.held);
-                    (done.outcome, reason, lines, done.bytes_read)
+                    (done, reason)
                 }
                 Err(error) => {
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                    ("refused", Some(error.to_string()), Vec::new(), 0)
+                    (Completion::clean("refused"), Some(error.to_string()))
                 }
             };
             receipt(&Receipt {
                 item: id(item)?,
                 source: item.source.clone(),
-                outcome,
+                outcome: done.outcome,
                 reason,
-                drift,
-                bytes_read,
+                drift: done.drift,
+                bytes_read: done.bytes_read,
+                reuse_unavailable: done.reuse_unavailable,
             })
         })
     })?;
@@ -720,30 +794,6 @@ fn import_base(
     Ok(())
 }
 
-// R-N29: an apply proceeds when the destination already holds a seat the drift
-// list says was never captured, and names each such seat in its receipt. It
-// never writes over it: the captured tree does not contain that seat at all.
-fn held_uncaptured(workspace: &Path, drift: &git_carry::CaptureDrift) -> Vec<String> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Component;
-    let mut held = Vec::new();
-    for row in drift.rows.iter().filter(|row| row.kind.is_seat()) {
-        let relative = Path::new(std::ffi::OsStr::from_bytes(&row.name));
-        if relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            continue;
-        }
-        if fs::symlink_metadata(workspace.join(relative)).is_ok() {
-            // Debug-escaped on purpose: receipts must not carry raw newlines.
-            #[allow(clippy::unnecessary_debug_formatting)]
-            held.push(format!("HeldUncaptured {relative:?}"));
-        }
-    }
-    held
-}
-
 fn apply_item(
     item: &Item,
     corpus: &Path,
@@ -756,9 +806,14 @@ fn apply_item(
     if !filename(&captured.bundle) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
-    // The drift a capture recorded rides into every receipt that names its
-    // bundle, so an apply never silently presents an incomplete capture.
-    let drift = retained_drift(corpus, &captured.bundle)?;
+    // A drifted capture does not hold the drifted seats' bytes. Apply refuses
+    // it, fail-closed, before any journal or destination is touched; the next
+    // capture pass extends it clean. R-N29 (apply proceeds on an occupied
+    // destination, recording uncaptured seats) is deferred to W6 git carry v2
+    // (bulkload#48).
+    if !retained_drift(corpus, &captured.bundle)?.is_empty() {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -771,36 +826,26 @@ fn apply_item(
             "refs-imported" => "previous-ref-custody-not-workspace-parity",
             _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
         };
-        return Ok(Completion {
-            outcome,
-            drift: drift.lines(),
-            held: Vec::new(),
-            bytes_read: 0,
-        });
+        return Ok(Completion::clean(outcome));
     }
     let bundle = corpus.join(&captured.bundle);
     if hash_file(&bundle)? != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
     import_base(item, &captured, corpus, source, imported)?;
-    let (outcome, held) = if let Some(workspace) = &item.workspace {
+    let outcome = if let Some(workspace) = &item.workspace {
         if item.repository == *workspace {
             git_carry::restore_bundle(&bundle, workspace, source)?;
         } else {
             git_carry::restore_linked(&bundle, &item.repository, workspace, source)?;
         }
-        ("workspace-restored", held_uncaptured(workspace, &drift))
+        "workspace-restored"
     } else {
         git_carry::import_bundle(&item.repository, &bundle, source)?;
-        ("refs-imported", Vec::new())
+        "refs-imported"
     };
     write(&journal, &outcome.to_owned())?;
-    Ok(Completion {
-        outcome,
-        drift: drift.lines(),
-        held,
-        bytes_read: 0,
-    })
+    Ok(Completion::clean(outcome))
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -1037,7 +1082,7 @@ mod tests {
         fs::remove_dir_all(&root).expect("remove owned fixture");
     }
 
-    // ---- drift tolerance (R25, bulkload #34; rulings R-N28/R-N29/R-N30) ----
+    // ---- drift tolerance (R25, bulkload #34; R-N28/R-N30/R-N72; R-N29 deferred to bulkload#48) ----
 
     fn drifting_plan(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         let root =
@@ -1120,8 +1165,12 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // R-N72 (TIN-4540) finding 3: a drifted capture does not hold the drifted
+    // seats' bytes, so apply refuses it, fail-closed, before touching the
+    // destination. R-N29 (apply proceeds on an occupied destination, recording
+    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
     #[test]
-    fn a_drifted_capture_still_applies_and_its_drift_rides_into_the_receipt() {
+    fn a_drifted_capture_refuses_to_apply_until_a_later_pass_extends_it() {
         let (root, source, target, plan, corpus) = drifting_plan("applies");
         let state = root.join("state");
         arm_drift(&source);
@@ -1131,38 +1180,110 @@ mod tests {
         let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
         assert!(corpus.join(format!("{}.drift", record.bundle)).is_file());
         let applied = root.join("applied");
-        let receipts = Mutex::new(Vec::new());
-        apply(&plan, &corpus, &applied, "neo", 2, &|row| {
-            receipts
+        let refused = Mutex::new(Vec::new());
+        let result = apply(&plan, &corpus, &applied, "neo", 2, &|row| {
+            refused
                 .lock()
                 .unwrap()
-                .push((row.outcome, row.reason.clone(), row.drift.clone()));
+                .push((row.outcome, row.reason.clone()));
             Ok(())
-        })
-        .unwrap();
-        let (outcome, reason, drift) = receipts.lock().unwrap().first().unwrap().clone();
-        assert_eq!(outcome, "workspace-restored");
-        assert_eq!(reason.as_deref(), Some("drift=3"));
-        assert!(drift.contains(&"SeatChanged \"tracked\"".to_owned()));
-        // No seat named in drift was restored with uncaptured bytes: the
-        // drifted seats are absent, and the destination held nothing (R-N29).
-        assert!(!target.join("tracked").exists());
-        assert!(!target.join("appeared").exists());
-        assert!(!drift.iter().any(|line| line.starts_with("HeldUncaptured")));
-        assert_eq!(fs::read(target.join("small")).unwrap(), b"small untracked");
-        assert_eq!(fs::read(target.join("big")).unwrap(), vec![b'b'; 65_536]);
-        // R-N29: a destination that already holds an uncaptured seat is named,
-        // never clobbered. The apply journal is done; the check is the receipt's.
-        fs::write(target.join("appeared"), b"operator wrote this").unwrap();
-        let held = held_uncaptured(
-            &target,
-            &read(&corpus.join(format!("{}.drift", record.bundle))).unwrap(),
-        );
-        assert_eq!(held, vec!["HeldUncaptured \"appeared\"".to_owned()]);
+        });
+        assert!(result.is_err(), "a drifted capture must never apply");
         assert_eq!(
-            fs::read(target.join("appeared")).unwrap(),
-            b"operator wrote this"
+            *refused.lock().unwrap(),
+            vec![("refused", Some("CAPTURE_DRIFTED".to_owned()))]
         );
+        assert!(!target.exists(), "the destination is never touched");
+        // The next pass extends the capture clean, and only that capture applies.
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
+        apply(&plan, &corpus, &applied, "neo", 2, &|_| Ok(())).unwrap();
+        assert_eq!(
+            fs::read(target.join("tracked")).unwrap(),
+            b"rewritten mid-pass"
+        );
+        assert_eq!(fs::read(target.join("appeared")).unwrap(), b"new seat");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn rev_parse(path: &Path, name: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--verify", name])
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    // R-N72 (TIN-4540) finding 1: a ref deleted between the pre-pass key and
+    // the export's own snapshot is invisible to the export. Recording the
+    // pre-pass key as a clean reuse key would let the branch's re-creation at
+    // the same commit Hit a bundle that holds neither the ref nor its commit.
+    #[test]
+    fn a_ref_deleted_before_the_export_snapshot_never_reuses_a_stale_key() {
+        let (root, source, _, plan, corpus) = drifting_plan("stale-key");
+        let state = root.join("state");
+        git(&source, &["checkout", "-q", "-b", "side"]);
+        fs::write(source.join("side-only"), b"unique").unwrap();
+        git(&source, &["add", "side-only"]);
+        git(&source, &["commit", "-q", "-m", "side"]);
+        let side = rev_parse(&source, "side");
+        git(&source, &["checkout", "-q", "-"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm_at(&source, git_carry::mid_pass::Stage::Snapshot, move || {
+            git(&inside, &["update-ref", "-d", "refs/heads/side"]);
+        });
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        // The branch returns at the same commit: the source is again exactly
+        // the state the pre-pass key described.
+        git(&source, &["update-ref", "refs/heads/side", &side]);
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_ne!(
+            second.first().unwrap().0,
+            "capture-reused-after-census",
+            "the retained bundle lacks refs/heads/side and its commit"
+        );
+        let (outcome, reason, drift, _) = first.first().unwrap();
+        assert_eq!(*outcome, "captured-with-drift");
+        assert_eq!(reason.as_deref(), Some("drift=1"));
+        assert_eq!(*drift, vec!["RefRemoved \"refs/heads/side\"".to_owned()]);
+        assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
+        // The capture the second pass recorded holds the ref and its commit.
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
+        let heads = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["bundle", "list-heads"])
+            .arg(corpus.join(&record.bundle))
+            .output()
+            .unwrap();
+        let heads = String::from_utf8(heads.stdout).unwrap();
+        assert!(heads
+            .lines()
+            .any(|line| line.starts_with(&side) && line.ends_with("refs/heads/side")));
+        let third = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(third.first().unwrap().0, "capture-reused-after-census");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 4: `capture-extended-from-drift` names only a
+    // pass that follows a drifted capture. A clean capture followed by an
+    // ordinary change between passes is an ordinary capture.
+    #[test]
+    fn a_change_after_a_clean_capture_is_not_labelled_extended_from_drift() {
+        let (root, source, _, plan, corpus) = drifting_plan("clean-change");
+        let state = root.join("state");
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(first.first().unwrap().0, "captured");
+        fs::write(source.join("later"), b"a seat added between passes").unwrap();
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        let (outcome, reason, drift, _) = second.first().unwrap();
+        assert_eq!(*outcome, "captured");
+        assert_eq!(*reason, None);
+        assert!(drift.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1201,6 +1322,106 @@ mod tests {
         let rows = receipts(&plan, &state, &corpus).unwrap();
         assert_eq!(rows.first().unwrap().0, "capture-reused-after-census");
         assert_eq!(rows.first().unwrap().3, 0);
+        // With no recorded pass start no retained seat can be proved non-racy:
+        // a changed key re-reads every seat and the receipt says why.
+        fs::write(source.join("later"), b"a seat added between passes").unwrap();
+        assert_eq!(
+            reuse_signals(&plan, &state, &corpus),
+            vec![("captured", Some("pass-start-unrecorded"))]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn reuse_signals(
+        plan: &Path,
+        state: &Path,
+        corpus: &Path,
+    ) -> Vec<(&'static str, Option<&'static str>)> {
+        let rows = Mutex::new(Vec::new());
+        capture(plan, state, corpus, 2, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reuse_unavailable));
+            Ok(())
+        })
+        .unwrap();
+        rows.into_inner().unwrap()
+    }
+
+    // Seats written by a fixture are racy for any pass that starts within one
+    // timestamp tick of them. A test proving identity reuse waits that out.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_nanos(
+            u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
+        ));
+    }
+
+    // R-N72 (TIN-4540) finding 4: a shallow checkout's retained capture offers
+    // no blobs to reuse, and the receipt says so instead of re-reading silently.
+    #[test]
+    fn a_shallow_item_reports_reuse_unavailable_on_its_receipt() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-shallow-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let full = root.join("full");
+        fs::create_dir(&full).unwrap();
+        git(&full, &["init", "--template="]);
+        for bytes in ["first", "second"] {
+            fs::write(full.join("tracked"), bytes).unwrap();
+            git(&full, &["add", "tracked"]);
+            git(&full, &["commit", "-q", "-m", bytes]);
+        }
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--depth=1",
+                "--no-local",
+                &format!("file://{}", full.display()),
+                source.to_str().unwrap(),
+            ],
+        );
+        git(
+            &source,
+            &["config", "remote.origin.url", "https://example.test/x.git"],
+        );
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let (state, corpus) = (root.join("state"), root.join("corpus"));
+        assert_eq!(
+            reuse_signals(&plan, &state, &corpus),
+            vec![("captured", None)]
+        );
+        fs::write(source.join("later"), b"a seat added between passes").unwrap();
+        assert_eq!(
+            reuse_signals(&plan, &state, &corpus),
+            vec![("captured", Some("shallow"))]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A clean pass can reproduce a drifted pass's bundle byte for byte when the
+    // drift lay only before the export's snapshot. The stale drift record must
+    // not outlive it, or the capture could never be reused or applied again.
+    #[test]
+    fn a_clean_pass_after_pre_snapshot_drift_retires_the_drift_record() {
+        let (root, source, target, plan, corpus) = drifting_plan("retire");
+        let state = root.join("state");
+        git(&source, &["branch", "gone"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm_at(&source, git_carry::mid_pass::Stage::Snapshot, move || {
+            git(&inside, &["update-ref", "-d", "refs/heads/gone"]);
+        });
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(first.first().unwrap().0, "captured-with-drift");
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
+        let third = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(third.first().unwrap().0, "capture-reused-after-census");
+        apply(&plan, &corpus, &root.join("applied"), "neo", 2, &|_| Ok(())).unwrap();
+        assert_eq!(fs::read(target.join("small")).unwrap(), b"small untracked");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1209,6 +1430,9 @@ mod tests {
     fn a_second_pass_after_drift_rereads_only_the_drifted_seats() {
         let (root, source, target, plan, corpus) = drifting_plan("rereads");
         let state = root.join("state");
+        // The fixture's seats must predate pass 1 by more than one timestamp
+        // tick, or they are racy and pass 2 rightly reads them again.
+        settle();
         arm_drift(&source);
         let first = receipts(&plan, &state, &corpus).unwrap();
         assert_eq!(first.first().unwrap().0, "captured-with-drift");
