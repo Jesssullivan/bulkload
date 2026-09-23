@@ -95,9 +95,9 @@ pub struct ChunkTiming {
     pub publish_groups: u64,
     /// Aggregate nanoseconds spent appending payload bytes to the pack.
     pub pack_append_ns: u64,
-    /// Durable `SQLite` publication commits attempted by this process.
+    /// Successful durable `SQLite` publication commits by this process.
     pub sqlite_commits: u64,
-    /// Aggregate nanoseconds spent committing publication transactions.
+    /// Aggregate nanoseconds spent in successful publication commits.
     pub sqlite_commit_ns: u64,
 }
 
@@ -861,7 +861,6 @@ impl StorePublisher<'_> {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
-        SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
         let commit_started = Instant::now();
         #[cfg(test)]
         let committed = inject_fault(PublishFault::BeforeCommit).and_then(|()| {
@@ -876,7 +875,11 @@ impl StorePublisher<'_> {
             .conn
             .execute_batch("COMMIT")
             .map_err(sqlite_error);
-        SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
+        if committed.is_ok() {
+            // Successful commits only, matching `counters::sqlite_commit`.
+            SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
+            SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
+        }
         counters::sqlite_commit(
             match self.store.side {
                 Side::Source => Counter::SqlitePublishSource,
