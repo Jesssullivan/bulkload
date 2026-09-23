@@ -2,9 +2,10 @@
 //!
 //! Bundles preserve staged state separately from the worktree (including ignored
 //! files), minus the fixed rebuildable set in [`REBUILDABLE_DIRECTORIES`], which
-//! is recorded as custody instead of carried. Foreign repositories nested under
-//! the worktree and gitlink (submodule) index entries are likewise recorded as
-//! [`NestedRepository`] custody and never carried: each is its own estate item.
+//! is recorded as custody instead of carried. Clean foreign repositories nested
+//! under the worktree and gitlink (submodule) index entries are likewise
+//! recorded as [`NestedRepository`] custody and never carried: each is its own
+//! estate item. A gitlink entry itself stays in the staged tree.
 //! This is not Git administration reconstruction. Capture is optimistic, not an
 //! atomic filesystem snapshot.
 
@@ -582,10 +583,11 @@ fn admin_controls(admin: &Path) -> Result<Vec<(String, Option<Vec<u8>>)>> {
 ///
 /// # Errors
 /// Refuses unsupported/unmerged indexes and changing refs/index/worktree. A
-/// gitlink (submodule) entry or a foreign nested repository is recorded as
-/// [`NestedRepository`] custody, never carried: it is its own capture. On
-/// refusal the private capture is retained for diagnosis; source state is
-/// never changed.
+/// gitlink (submodule) entry or a clean foreign nested repository is recorded
+/// as [`NestedRepository`] custody, never carried: it is its own capture. A
+/// nest with any staged, unstaged or untracked change, or with paths under it
+/// that this repository tracks, refuses (R-N73). On refusal the private
+/// capture is retained for diagnosis; source state is never changed.
 pub fn export_repository(repo: &Path, capture: &Path) -> Result<PathBuf> {
     Ok(export_repository_inner(repo, capture, None, CapturePolicy::default())?.bundle)
 }
