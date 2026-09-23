@@ -1794,14 +1794,20 @@ fn nest_operation_in_progress(directory: &Path) -> Result<bool> {
         "rebase-apply",
         "sequencer",
     ];
+    // D2: one rev-parse resolves every marker (one path per line, in order);
+    // a count that disagrees (a newline in the administration path) is
+    // malformed inventory rather than a guess.
+    let mut command = git(directory);
+    command.args(["--git-dir=.git", "rev-parse", "--path-format=absolute"]);
     for marker in MARKERS {
-        let path = text(git(directory).args([
-            "--git-dir=.git",
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            marker,
-        ]))?;
+        command.args(["--git-path", marker]);
+    }
+    let resolved = text(&mut command)?;
+    let paths: Vec<&str> = resolved.lines().collect();
+    if paths.len() != MARKERS.len() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    for path in paths {
         match fs::symlink_metadata(path) {
             Ok(_) => return Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
