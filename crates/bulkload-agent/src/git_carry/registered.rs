@@ -113,7 +113,7 @@ pub fn restore(
     source: &str,
     receipt: &Path,
 ) -> Result<()> {
-    super::refuse_drift_marked(bundle)?;
+    let staged = super::stage_bundle(bundle)?;
     let repository = fs::canonicalize(repository)?;
     let common = common_repository(&repository)?;
     let admin = fs::canonicalize(admin)?;
@@ -169,7 +169,7 @@ pub fn restore(
         receipt.join("original-administration.postcard"),
         postcard::to_allocvec(&before).map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
-    fs::copy(bundle, receipt.join("capture.bundle"))?;
+    fs::copy(staged.path(), receipt.join("capture.bundle"))?;
     sync_private_tree(&receipt)?;
     fs::File::open(&receipt_parent)?.sync_all()?;
     super::import_verified(&repository, &receipt.join("capture.bundle"), source)?;

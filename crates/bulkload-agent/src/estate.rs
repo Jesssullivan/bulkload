@@ -503,6 +503,10 @@ fn capture_item(
             Retained::None => (None, None, false),
         };
     let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
+    // A future-stamped seat blocked the whole-capture reuse above, and will on
+    // every pass until the clock passes it: say so (round-3 N5).
+    let future = (retained.is_some() && parts.stamped_after(git_carry::pass_start_ns()))
+        .then_some(git_carry::ReuseUnavailable::FutureStamp);
     let attempt = attempt_directory(state, &identity, key)?;
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
     let export = git_carry::export_repository_with_drift(
@@ -610,6 +614,7 @@ fn capture_item(
         drift: drift.lines(),
         bytes_read: export.bytes_read,
         reuse_unavailable: unrecorded
+            .or(future)
             .or(export.reuse_unavailable)
             .map(git_carry::ReuseUnavailable::code),
     })
@@ -783,15 +788,16 @@ pub fn capture_with_policy(
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
 
+// `bundle` is the staged copy of the capture this apply restores.
 fn import_base(
     item: &Item,
     captured: &Capture,
+    bundle: &Path,
     corpus: &Path,
     source: &str,
     imported: &ImportedBases,
 ) -> Result<()> {
-    let bundle = corpus.join(&captured.bundle);
-    if !git_carry::shared::requires_base(&bundle)? {
+    if !git_carry::shared::requires_base(bundle)? {
         return Ok(());
     }
     let base: Base = read(&corpus.join(format!("{}.base", captured.bundle)))?;
@@ -814,10 +820,12 @@ fn import_base(
     {
         return Ok(());
     }
-    if hash_file(&path)? != base.digest || git_carry::shared::requires_base(&path)? {
+    let staged = git_carry::stage_bundle(&path)?;
+    if hash_file(staged.path())? != base.digest || git_carry::shared::requires_base(staged.path())?
+    {
         return Err(BulkloadRefusal::DigestMismatch);
     }
-    git_carry::import_bundle(&item.repository, &path, source)?;
+    git_carry::import_staged(&item.repository, &staged, source)?;
     imported
         .lock()
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
@@ -844,7 +852,11 @@ fn apply_item(
     // pass extends it clean. Key-only drift leaves a coherent snapshot, which
     // applies. R-N29 (apply proceeds on an occupied destination, recording
     // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
-    git_carry::refuse_drift_marked(&corpus.join(&captured.bundle))?;
+    //
+    // One private stage is the only copy this apply reads: the marker check,
+    // the digest check and the restore all see the same bytes (round-3 N4),
+    // and the restore verbs below do not check again.
+    let staged = git_carry::stage_bundle(&corpus.join(&captured.bundle))?;
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -859,20 +871,19 @@ fn apply_item(
         };
         return Ok(Completion::clean(outcome));
     }
-    let bundle = corpus.join(&captured.bundle);
-    if hash_file(&bundle)? != captured.digest {
+    if hash_file(staged.path())? != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
-    import_base(item, &captured, corpus, source, imported)?;
+    import_base(item, &captured, staged.path(), corpus, source, imported)?;
     let outcome = if let Some(workspace) = &item.workspace {
         if item.repository == *workspace {
-            git_carry::restore_bundle(&bundle, workspace, source)?;
+            git_carry::restore_staged(&staged, workspace, source, None)?;
         } else {
-            git_carry::restore_linked(&bundle, &item.repository, workspace, source)?;
+            git_carry::restore_linked_staged(&staged, &item.repository, workspace, source)?;
         }
         "workspace-restored"
     } else {
-        git_carry::import_bundle(&item.repository, &bundle, source)?;
+        git_carry::import_staged(&item.repository, &staged, source)?;
         "refs-imported"
     };
     write(&journal, &outcome.to_owned())?;
@@ -1597,6 +1608,340 @@ mod tests {
         assert!(recorded_heads(&plan, &corpus, &source)
             .lines()
             .any(|line| line.ends_with("refs/heads/gone")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- round-3 adversarial tests (review of 72fc71e), ported ----
+
+    fn r3_git_out(path: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Bulkload test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    // Unpack the recorded bundle's refs/carry-export/* into a scratch bare repo.
+    fn r3_recorded(plan: &Path, corpus: &Path, root: &Path, tag: &str) -> PathBuf {
+        let item = id(inspect(plan).unwrap().first().unwrap()).unwrap();
+        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
+        let scratch = root.join(format!("scratch-{tag}"));
+        r3_git_out(root, &["init", "-q", "--bare", scratch.to_str().unwrap()]);
+        r3_git_out(
+            &scratch,
+            &[
+                "fetch",
+                "-q",
+                corpus.join(&record.bundle).to_str().unwrap(),
+                "+refs/carry-export/*:refs/b/*",
+            ],
+        );
+        scratch
+    }
+
+    // Every receipt of one capture, refused rows included.
+    fn attempt(plan: &Path, state: &Path, corpus: &Path) -> Vec<(&'static str, Option<String>)> {
+        let rows = Mutex::new(Vec::new());
+        let _ = capture(plan, state, corpus, 2, &|row| {
+            rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        rows.into_inner().unwrap()
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    // R-N72 round-3 N1: Git authority A->B->A across the two windows no export
+    // comparison brackets (pre-pass key -> export snapshot, export end ->
+    // post-pass key). The pre- and post-pass keys are equal. The capture must
+    // refuse, and must never leave a whole-capture Hit on a bundle carrying B.
+    fn r3_authority_round_trip(class: &str) {
+        use git_carry::mid_pass::Stage;
+        let (root, source, _, plan, corpus) = drifting_plan(&format!("r3-auth-{class}"));
+        let state = root.join("state");
+        let a = rev_parse(&source, "HEAD");
+        let inside = fs::canonicalize(&source).unwrap();
+        let (to_b, to_a): (Hook, Hook) = match class {
+            "detached-head" => {
+                git(&source, &["checkout", "-q", "--detach"]);
+                #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
+                let tree = rev_parse(&source, "HEAD^{tree}");
+                let b = r3_git_out(&source, &["commit-tree", &tree, "-p", &a, "-m", "b"])
+                    .trim()
+                    .to_owned();
+                let (i1, i2, a2) = (inside.clone(), inside, a.clone());
+                (
+                    Box::new(move || git(&i1, &["update-ref", "--no-deref", "HEAD", &b])),
+                    Box::new(move || git(&i2, &["update-ref", "--no-deref", "HEAD", &a2])),
+                )
+            }
+            "symbolic-head" => {
+                let main = r3_git_out(&source, &["symbolic-ref", "HEAD"])
+                    .trim()
+                    .to_owned();
+                git(&source, &["branch", "twin"]);
+                let (i1, i2) = (inside.clone(), inside);
+                (
+                    Box::new(move || git(&i1, &["symbolic-ref", "HEAD", "refs/heads/twin"])),
+                    Box::new(move || git(&i2, &["symbolic-ref", "HEAD", &main])),
+                )
+            }
+            "exclude" => {
+                let path = inside.join(".git/info/exclude");
+                fs::create_dir_all(inside.join(".git/info")).unwrap();
+                fs::write(&path, b"# A\n").unwrap();
+                let p2 = path.clone();
+                (
+                    Box::new(move || fs::write(&path, b"# B: never on disk at a key\n").unwrap()),
+                    Box::new(move || fs::write(&p2, b"# A\n").unwrap()),
+                )
+            }
+            "config" => {
+                let path = inside.join(".git/config");
+                let original = fs::read(&path).unwrap();
+                let mut changed = original.clone();
+                changed.extend_from_slice(b"[user]\n\tname = B never at a key\n");
+                let p2 = path.clone();
+                (
+                    Box::new(move || fs::write(&path, changed).unwrap()),
+                    Box::new(move || fs::write(&p2, original).unwrap()),
+                )
+            }
+            _ => {
+                let path = inside.join(".git/index");
+                let original = fs::read(&path).unwrap();
+                let i1 = inside;
+                let p2 = path;
+                (
+                    Box::new(move || git(&i1, &["update-index", "--chmod=+x", "tracked"])),
+                    Box::new(move || fs::write(&p2, original).unwrap()),
+                )
+            }
+        };
+        settle();
+        git_carry::mid_pass::arm_at(&source, Stage::Snapshot, to_b);
+        git_carry::mid_pass::arm_at(&source, Stage::AfterPass, to_a);
+        let first = attempt(&plan, &state, &corpus);
+        settle();
+        let second = attempt(&plan, &state, &corpus);
+        let hit = second.first().unwrap().0 == "capture-reused-after-census";
+        if hit {
+            let scratch = r3_recorded(&plan, &corpus, &root, class);
+            let carried = match class {
+                "detached-head" => r3_git_out(&scratch, &["rev-parse", "refs/b/head"]).trim() == a,
+                "symbolic-head" => {
+                    !r3_git_out(&scratch, &["show", "refs/b/head-symbolic:value"]).contains("twin")
+                }
+                "exclude" => r3_git_out(&scratch, &["show", "refs/b/exclude:value"]) == "# A\n",
+                "config" => !r3_git_out(&scratch, &["show", "refs/b/configuration-v1:value"])
+                    .contains("never at a key"),
+                #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
+                _ => r3_git_out(&scratch, &["ls-tree", "refs/b/staged^{tree}"])
+                    .contains("100644 blob"),
+            };
+            assert!(carried, "{class}: a whole-capture Hit on a stale bundle");
+        }
+        assert_eq!(
+            first,
+            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))],
+            "{class}: authority moved inside the capture window"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r3_detached_head_round_trip_across_unguarded_windows_refuses() {
+        r3_authority_round_trip("detached-head");
+    }
+
+    #[test]
+    fn r3_symbolic_head_round_trip_across_unguarded_windows_refuses() {
+        r3_authority_round_trip("symbolic-head");
+    }
+
+    #[test]
+    fn r3_exclude_round_trip_across_unguarded_windows_refuses() {
+        r3_authority_round_trip("exclude");
+    }
+
+    #[test]
+    fn r3_config_round_trip_across_unguarded_windows_refuses() {
+        r3_authority_round_trip("config");
+    }
+
+    #[test]
+    fn r3_index_round_trip_across_unguarded_windows_refuses() {
+        r3_authority_round_trip("index");
+    }
+
+    // N1, stash: refs/stash keeps its value throughout; only the reflog below
+    // it is rewritten and restored, so stash S1 is missing from the bundle.
+    #[test]
+    fn r3_stash_reflog_round_trip_across_unguarded_windows_refuses() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, _, plan, corpus) = drifting_plan("r3-stash");
+        let state = root.join("state");
+        fs::write(source.join("tracked"), b"stash one").unwrap();
+        git(&source, &["stash", "push", "-q"]);
+        let s1 = rev_parse(&source, "refs/stash");
+        fs::write(source.join("tracked"), b"stash two").unwrap();
+        git(&source, &["stash", "push", "-q"]);
+        let s2 = rev_parse(&source, "refs/stash");
+        let inside = fs::canonicalize(&source).unwrap();
+        let (i1, i2) = (inside.clone(), inside);
+        let (s1c, s2c) = (s1.clone(), s2.clone());
+        settle();
+        git_carry::mid_pass::arm_at(&source, Stage::Snapshot, move || {
+            git(&i1, &["stash", "drop", "-q", "stash@{1}"]);
+        });
+        git_carry::mid_pass::arm_at(&source, Stage::AfterPass, move || {
+            git(&i2, &["stash", "clear"]);
+            git(&i2, &["stash", "store", "-m", "one", &s1c]);
+            git(&i2, &["stash", "store", "-m", "two", &s2c]);
+        });
+        let first = attempt(&plan, &state, &corpus);
+        assert_eq!(
+            r3_git_out(&source, &["reflog", "show", "--format=%H", "refs/stash"]),
+            format!("{s2}\n{s1}\n"),
+            "the source is back at A"
+        );
+        settle();
+        let second = attempt(&plan, &state, &corpus);
+        let heads = recorded_heads(&plan, &corpus, &source);
+        assert!(
+            second.first().unwrap().0 != "capture-reused-after-census"
+                || heads.contains(&format!("stashes/{s1}")),
+            "a whole-capture Hit on a bundle that lost stash S1"
+        );
+        assert_eq!(
+            first,
+            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))]
+        );
+        assert!(heads.contains(&format!("stashes/{s1}")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Packed-refs rewrite under the pass: not drift, and the next pass Hits.
+    #[test]
+    fn r3_packed_refs_rewrite_is_not_drift() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, _, plan, corpus) = drifting_plan("r3-packrefs");
+        let state = root.join("state");
+        git(&source, &["branch", "side"]);
+        settle();
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm_at(&source, Stage::BytePass, move || {
+            git(&inside, &["pack-refs", "--all", "--prune"]);
+        });
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(first.first().unwrap().0, "captured");
+        settle();
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "capture-reused-after-census");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Reflog-only change on an ordinary branch between passes: not custody.
+    #[test]
+    fn r3_branch_reflog_only_change_keeps_the_hit() {
+        let (root, source, _, plan, corpus) = drifting_plan("r3-reflog");
+        let state = root.join("state");
+        settle();
+        receipts(&plan, &state, &corpus).unwrap();
+        git(&source, &["reflog", "expire", "--expire=now", "--all"]);
+        settle();
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "capture-reused-after-census");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Sidecar deleted AND record key forged to the source's current key. The
+    // record is not authenticated (a documented known limit), so the forged
+    // record is a whole-capture Hit; the bundle still refuses in-band on
+    // apply. Ref-only export drift, so no racy seat blocks the Hit (the
+    // reviewer's variant forged the pre-drift key, which the drifted source
+    // no longer matches).
+    #[test]
+    fn r3_sidecar_deleted_and_key_forged_still_refuses_in_band() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, target, plan, corpus) = drifting_plan("r3-forge");
+        let state = root.join("state");
+        let head = rev_parse(&source, "HEAD");
+        update_ref_at(
+            &source,
+            Stage::BytePass,
+            &["update-ref", "refs/heads/lane", &head],
+        );
+        settle();
+        assert_eq!(
+            receipts(&plan, &state, &corpus).unwrap().first().unwrap().0,
+            "captured-with-drift"
+        );
+        fs::remove_file(drift_sidecar(&plan, &corpus)).unwrap();
+        let key = git_carry::reusable_capture_key_with_policy(
+            &source,
+            git_carry::CapturePolicy::default(),
+        )
+        .unwrap();
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        let record_path = corpus.join(format!("{item}.capture"));
+        let record: Capture = read(&record_path).unwrap();
+        write(&record_path, &Capture { key, ..record }).unwrap();
+        settle();
+        assert_eq!(
+            receipts(&plan, &state, &corpus).unwrap().first().unwrap().0,
+            "capture-reused-after-census",
+            "the forged record Hits: records are not authenticated"
+        );
+        let refused = Mutex::new(Vec::new());
+        let result = apply(&plan, &corpus, &root.join("applied"), "neo", 2, &|row| {
+            refused.lock().unwrap().push(row.reason.clone());
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            *refused.lock().unwrap(),
+            vec![Some("CAPTURE_DRIFTED".to_owned())]
+        );
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 round-3 N5: a future-dated seat blocks the whole-capture Hit on
+    // every pass, and the receipt says so instead of re-reading silently.
+    #[test]
+    fn a_future_stamped_seat_reports_reuse_unavailable_future_stamp() {
+        let (root, source, _, plan, corpus) = drifting_plan("future-stamp");
+        let state = root.join("state");
+        let future = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
+        fs::File::options()
+            .write(true)
+            .open(source.join("small"))
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        settle();
+        receipts(&plan, &state, &corpus).unwrap();
+        settle();
+        assert_eq!(
+            reuse_signals(&plan, &state, &corpus),
+            vec![("captured", Some("future-stamp"))]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

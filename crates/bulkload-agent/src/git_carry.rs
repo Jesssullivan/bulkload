@@ -161,7 +161,9 @@ fn capture_tree(private: &Path, repo: &Path, _index: &Path) -> Result<String> {
     Ok(pass.tree)
 }
 
-fn capture_refs(repo: &Path, private: &Path, inventory: &str) -> Result<()> {
+// `stash` is the reflog read with the carried authority, never re-read here:
+// the bundle carries exactly the stash commits the snapshot saw.
+fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
     let mut pending = std::collections::BTreeMap::new();
     for line in inventory.lines() {
         let (value, name) = line
@@ -183,18 +185,13 @@ fn capture_refs(repo: &Path, private: &Path, inventory: &str) -> Result<()> {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
     }
-    let stash = output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]));
-    if let Ok(stash) = stash {
-        let stash = String::from_utf8(stash).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-        for value in stash.lines() {
-            if !oid(value) {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            let name = format!("refs/carry-export/stashes/{value}");
-            pending.entry(name).or_insert_with(|| value.to_owned());
+    let stash = std::str::from_utf8(stash).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    for value in stash.lines() {
+        if !oid(value) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
         }
-    } else if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        let name = format!("refs/carry-export/stashes/{value}");
+        pending.entry(name).or_insert_with(|| value.to_owned());
     }
     // One create-only Git transaction instead of one process per ref. NUL
     // framing preserves legal quote characters without command interpolation.
@@ -409,6 +406,29 @@ impl KeyParts {
         self.rows.iter().any(|row| racy(row, started_ns, now_ns))
     }
 
+    /// Whether any seat is stamped later than `now_ns`, this pass's own clock.
+    ///
+    /// Such a seat is racy on every pass until the clock passes its stamp, so
+    /// it blocks every whole-capture reuse; the receipt names it (round-3 N5).
+    #[must_use]
+    pub fn stamped_after(&self, now_ns: i128) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.mtime_ns > now_ns || row.ctime_ns > now_ns)
+    }
+
+    /// Whether these parts name exactly the authority an export carried.
+    #[must_use]
+    pub fn carries(&self, carried: &CarriedAuthority) -> bool {
+        self.head == carried.head
+            && self.symbolic == carried.symbolic
+            && self.index == carried.index
+            && self.exclude == carried.exclude
+            && self.stash == carried.stash
+            && self.configuration == carried.configuration
+            && self.boundary == carried.boundary
+    }
+
     /// Everything that moved across a whole capture: between these pre-pass
     /// parts and the inventory `export` snapshotted, under the export itself
     /// (already in [`Export::drift`]), between the export's last ref read and
@@ -419,9 +439,20 @@ impl KeyParts {
     /// equal to `later`, yet the bundle lacks it; only comparing the keyed
     /// inventories with the export's own names it (R-N72).
     ///
+    /// Git authority is never drift. HEAD, the symbolic HEAD, the index, the
+    /// exclude file, the stash reflog, the configuration or the shallow
+    /// frontier that moved away and back between a key and the export's
+    /// snapshot or end, leaving the two keys equal, still refuses: the bundle
+    /// carries what the source held at neither key.
+    ///
     /// # Errors
-    /// Refuses as [`KeyParts::drift_to`] does, and on malformed inventories.
+    /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] unless both key parts
+    /// name exactly the authority the export carried, as
+    /// [`KeyParts::drift_to`] does, and on malformed inventories.
     pub fn drift_across(&self, export: &Export, later: &Self) -> Result<CaptureDrift> {
+        if !self.carries(&export.authority) || !later.carries(&export.authority) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
         let mut drift = self.drift_to(later)?;
         drift.extend(reference_drift(&self.inventory, &export.refs_before)?);
         drift.extend(reference_drift(&export.refs_after, &later.inventory)?);
@@ -462,6 +493,62 @@ impl KeyParts {
     }
 }
 
+/// The Git authority one capture carries: HEAD, the symbolic HEAD, the index
+/// bytes, the exclude file, the stash reflog, the configuration files and the
+/// shallow frontier.
+///
+/// The reusable key hashes exactly these values, and an export carries exactly
+/// the values it read once, at its snapshot. A caller compares them with its
+/// pre- and post-pass key parts: authority that moved away and back between
+/// those reads is a stale bundle behind an equal key (R-N72).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedAuthority {
+    head: String,
+    symbolic: Vec<u8>,
+    index: Vec<u8>,
+    exclude: Vec<u8>,
+    stash: Vec<u8>,
+    configuration: Vec<(String, Vec<u8>)>,
+    boundary: Vec<u8>,
+}
+
+// One read of the authority a key hashes and an export carries. The stash
+// reflog is read only when `inventory` lists refs/stash, exactly as the key
+// always read it. No census walk.
+fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
+    let head = text(git(repo).args(["rev-parse", "--verify", "HEAD"]))?;
+    let symbolic = git(repo).args(["symbolic-ref", "-q", "HEAD"]).output()?;
+    if !symbolic.status.success() && symbolic.status.code() != Some(1) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let (_, index) = source_index(repo)?;
+    let exclude_path = text(git(repo).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "info/exclude",
+    ]))?;
+    let exclude = match fs::read(exclude_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
+        output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
+    } else {
+        Vec::new()
+    };
+    Ok(CarriedAuthority {
+        head,
+        symbolic: symbolic.stdout,
+        index,
+        exclude,
+        stash,
+        configuration: source_configuration(repo)?,
+        boundary: shallow::frontier(repo)?,
+    })
+}
+
 /// The typed inputs of the reusable capture key for `repo`, default policy.
 ///
 /// # Errors
@@ -481,31 +568,17 @@ pub fn capture_key_parts_with_policy(repo: &Path, policy: CapturePolicy) -> Resu
     let repo = fs::canonicalize(repo)?;
     let common = common_repository(&repo)?;
     let inventory = refs(&repo)?;
-    let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let symbolic = git(&repo).args(["symbolic-ref", "-q", "HEAD"]).output()?;
-    if !symbolic.status.success() && symbolic.status.code() != Some(1) {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    let (_, index) = source_index(&repo)?;
-    let exclude_path = text(git(&repo).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?;
-    let exclude = match fs::read(exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        output(git(&repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
-    } else {
-        Vec::new()
-    };
+    let authority = read_authority(&repo, &inventory)?;
+    let CarriedAuthority {
+        head,
+        symbolic,
+        index,
+        exclude,
+        stash,
+        configuration,
+        boundary,
+    } = authority;
     let census = capture_census(&repo, &common, policy)?;
-    let configuration = source_configuration(&repo)?;
-    let boundary = shallow::frontier(&repo)?;
     let mut identities = Vec::with_capacity(2);
     for directory in [&repo, &common] {
         let identity = crate::freshness::StatIdentity::from_metadata(&fs::metadata(directory)?);
@@ -516,7 +589,7 @@ pub fn capture_key_parts_with_policy(repo: &Path, policy: CapturePolicy) -> Resu
         common: common.as_os_str().as_bytes().to_vec(),
         inventory,
         head,
-        symbolic: symbolic.stdout,
+        symbolic,
         index,
         exclude,
         stash,
@@ -580,9 +653,9 @@ fn repair_missing_index_inner(
     before_publish: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    refuse_drift_marked(bundle)?;
+    let staged = stage_bundle(bundle)?;
+    let bundle = staged.path();
     let repo = fs::canonicalize(repo)?;
-    let bundle = fs::canonicalize(bundle)?;
     let admin = PathBuf::from(text(git(&repo).args(["rev-parse", "--absolute-git-dir"]))?);
     let index = PathBuf::from(text(git(&repo).args([
         "rev-parse",
@@ -603,7 +676,7 @@ fn repair_missing_index_inner(
         require_missing(&admin.join(name))?;
     }
     let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let heads = shallow::headers(&repo, &bundle)?;
+    let heads = shallow::headers(&repo, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -639,7 +712,7 @@ fn repair_missing_index_inner(
     fs::File::open(receipt.join("original-administration.postcard"))?.sync_all()?;
     fs::File::open(&receipt)?.sync_all()?;
     fs::File::open(&receipt_parent)?.sync_all()?;
-    import_verified(&repo, &bundle, source)?;
+    import_verified(&repo, bundle, source)?;
     let staged_entries = output(git(&repo).args(["ls-tree", "-r", "-z", &find("staged")?]))?;
     if staged_entries
         .split(|b| *b == 0)
@@ -870,19 +943,16 @@ fn export_repository_inner(
     // Before the census, so every seat the census stamps is judged against it.
     let started_ns = pass_start_ns();
     let before_refs = refs(&repo)?;
-    let configuration = source_configuration(&repo)?;
-    let boundary = shallow::frontier(&repo)?;
+    // Read once and carried exactly: nothing below re-reads HEAD, the symbolic
+    // HEAD, the index, exclude, the stash reflog, configuration or the frontier
+    // for the bundle's content, only to compare at the end of the pass.
+    let authority = read_authority(&repo, &before_refs)?;
     let common = common_repository(&repo)?;
     let census = capture_census(&repo, &common, options.policy)?;
     let seats = &census.rows;
-    let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let (index_path, before_index) = source_index(&repo)?;
-    let private = prepare_private(&repo, &capture)?;
-    capture_refs(&repo, &private, &before_refs)?;
-    set_ref(&private, "refs/carry-export/head", &head)?;
-    capture_administration(&repo, &private, &boundary, &configuration)?;
+    let private = carry_authority(&repo, &capture, &before_refs, &authority)?;
     let index = capture.join("index");
-    fs::write(&index, &before_index)?;
+    fs::write(&index, &authority.index)?;
     let staged = text(snapshot_command(&private, &repo, &index).arg("write-tree"))?;
     set_ref(
         &private,
@@ -893,24 +963,26 @@ fn export_repository_inner(
     mid_pass::fire(&repo, mid_pass::Stage::BytePass);
     // Seats a retained capture already holds at this exact identity are emitted
     // by object name. Nothing is opened for them and no source byte is re-read.
-    let (reuse, reuse_unavailable) =
-        offered_reuse(&private, options.reuse, &boundary, seats, started_ns)?;
+    let (reuse, reuse_unavailable) = offered_reuse(
+        &private,
+        options.reuse,
+        &authority.boundary,
+        seats,
+        started_ns,
+    )?;
     let pass = raw_tree::capture(&private, &repo, seats, &reuse)?;
     let after = capture_census(&repo, &common, options.policy)?;
     // Git authority moving under the capture is never drift. The nested
     // worktree census is compared apart from the seats precisely because it
     // carries each nested HEAD, which must keep its refusal; so is the omitted
     // set, because it is a key input a rebuild can move.
-    if configuration != source_configuration(&repo)?
-        || boundary != shallow::frontier(&repo)?
-        || before_index != fs::read(index_path)?
-        || head != text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?
+    let refs_after = refs(&repo)?;
+    if !authority_held(&repo, &authority, &refs_after)?
         || census.nested_worktrees != after.nested_worktrees
         || census.omitted != after.omitted
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    let refs_after = refs(&repo)?;
     let drift = observed_drift(pass.drift, &before_refs, &refs_after, seats, &after.rows)?;
     // A seat whose identity moved only after its bytes were streamed is already
     // in the tree; withdraw it rather than present bytes the pass cannot vouch for.
@@ -975,6 +1047,7 @@ fn export_repository_inner(
         reuse_unavailable,
         refs_before: before_refs,
         refs_after,
+        authority,
     })
 }
 
@@ -995,33 +1068,22 @@ fn mark_drift(private: &Path, drift: &CaptureDrift) -> Result<()> {
 
 // HEAD, the symbolic head, the exclude file, the shallow frontier and the
 // configuration: administration every capture carries, before the byte pass.
-fn capture_administration(
-    repo: &Path,
-    private: &Path,
-    boundary: &[u8],
-    configuration: &[(String, Vec<u8>)],
-) -> Result<()> {
-    let symbolic_head = text(git(repo).args(["symbolic-ref", "-q", "HEAD"])).unwrap_or_default();
-    metadata(private, "head-symbolic", symbolic_head.as_bytes())?;
-    let exclude_path = PathBuf::from(text(git(repo).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?);
-    let exclude = match fs::read(exclude_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    metadata(private, "exclude", &exclude)?;
-    if !boundary.is_empty() {
-        metadata(private, "shallow-frontier-v1", boundary)?;
+fn capture_administration(private: &Path, authority: &CarriedAuthority) -> Result<()> {
+    // Exactly the bytes the snapshot read; the metadata holds the ref name
+    // without the trailing newline, as it always did.
+    let symbolic = std::str::from_utf8(&authority.symbolic)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        .trim_end();
+    metadata(private, "head-symbolic", symbolic.as_bytes())?;
+    metadata(private, "exclude", &authority.exclude)?;
+    if !authority.boundary.is_empty() {
+        metadata(private, "shallow-frontier-v1", &authority.boundary)?;
     }
     metadata(
         private,
         "configuration-v1",
-        &postcard::to_allocvec(configuration).map_err(|_| BulkloadRefusal::FrameCodec)?,
+        &postcard::to_allocvec(&authority.configuration)
+            .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )
 }
 
@@ -1076,56 +1138,114 @@ fn offered_reuse(
     })
 }
 
-/// Refuse a bundle that carries the in-band `capture-drift-v1` marker.
+/// Whether a bundle's own headers carry the in-band drift marker.
 ///
-/// A capture that drifted under its export omits the drifted seats' bytes;
-/// the marker is the bundle's own statement of that, independent of any
-/// corpus sidecar. Every restore and import verb calls this before it writes
-/// anything. Shallow custody carries its inventory inside the envelope, which
-/// is read in a private scratch repository that is removed afterwards.
+/// A capture that drifted under its export omits the drifted seats' bytes; the
+/// marker is the bundle's own statement of that, independent of any corpus
+/// sidecar. A plain bundle lists `refs/carry-export/capture-drift-v1`; a
+/// shallow envelope lifts it into its headers as `shallow-drift-v1`. Only the
+/// headers are read: no pack is fetched and nothing is written.
+fn drift_marked(heads: &str) -> bool {
+    let plain = format!("refs/carry-export/{CAPTURE_DRIFT_METADATA}");
+    heads.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(_, name)| name == plain || name == shallow::DRIFT_MARKER)
+    })
+}
+
+/// A bundle staged for one restore or import: a private copy whose headers
+/// were checked for the drift marker, and the only path the verb reads.
+///
+/// Checking one path and importing it again later is a window in which the
+/// file can be replaced. The copy lives in a directory this process created
+/// exclusively (mode 0700, named by a process-wide counter, never reused);
+/// the check and every later read see the same bytes. On APFS, btrfs and XFS
+/// the copy is a clone. The directory is removed when the stage is dropped.
+#[derive(Debug)]
+pub struct StagedBundle {
+    directory: PathBuf,
+    bundle: PathBuf,
+}
+
+impl StagedBundle {
+    /// The staged copy every later read of this verb uses.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.bundle
+    }
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        // Best effort: a leftover private copy is disk, never custody.
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Stage `bundle` privately and refuse it if it carries the drift marker.
 ///
 /// # Errors
 /// Refuses [`BulkloadRefusal::CaptureDrifted`] for a marked bundle, and
 /// unreadable or malformed bundles.
-pub fn refuse_drift_marked(bundle: &Path) -> Result<()> {
+pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
     use std::os::unix::fs::DirBuilderExt;
-    let bundle = fs::canonicalize(bundle)?;
-    let parent = bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
-    let heads = text(git(parent).args(["bundle", "list-heads"]).arg(&bundle))?;
-    let marked = |inventory: &str| {
-        let marker = format!("refs/carry-export/{CAPTURE_DRIFT_METADATA}");
-        inventory
-            .lines()
-            .any(|line| line.split_once(' ').is_some_and(|(_, name)| name == marker))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let source = fs::canonicalize(bundle)?;
+    let directory = loop {
+        let candidate = std::env::temp_dir().join(format!(
+            "bulkload-staged-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     };
-    if marked(&heads) {
+    let staged = StagedBundle {
+        bundle: directory.join("capture.bundle"),
+        directory,
+    };
+    fs::copy(&source, &staged.bundle)?;
+    let heads = text(
+        git(&staged.directory)
+            .args(["bundle", "list-heads"])
+            .arg(&staged.bundle),
+    )?;
+    if drift_marked(&heads) {
         return Err(BulkloadRefusal::CaptureDrifted);
     }
-    if !shallow::is_custody(&heads) {
-        return Ok(());
+    #[cfg(test)]
+    mid_pass::fire(&source, mid_pass::Stage::BundleChecked);
+    Ok(staged)
+}
+
+// A private repository holding the snapshot's refs and exactly the authority
+// the snapshot read, before any worktree byte is captured.
+fn carry_authority(
+    repo: &Path,
+    capture: &Path,
+    inventory: &str,
+    authority: &CarriedAuthority,
+) -> Result<PathBuf> {
+    let private = prepare_private(repo, capture)?;
+    // prepare_private installs the frontier it read; it must be the carried one.
+    if shallow::frontier(&private)? != authority.boundary {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    let probe = std::env::temp_dir().join(format!(
-        "bulkload-drift-probe-{}-{}",
-        std::process::id(),
-        pass_start_ns()
-    ));
-    fs::DirBuilder::new().mode(0o700).create(&probe)?;
-    let result = (|| -> Result<bool> {
-        let format = bundle_object_format(&heads)?;
-        output(git(&probe).args([
-            "init",
-            "--bare",
-            "--quiet",
-            "--template=",
-            &format!("--object-format={format}"),
-        ]))?;
-        Ok(marked(&shallow::headers(&probe, &bundle)?))
-    })();
-    fs::remove_dir_all(&probe)?;
-    if result? {
-        return Err(BulkloadRefusal::CaptureDrifted);
-    }
-    Ok(())
+    capture_refs(&private, inventory, &authority.stash)?;
+    set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    capture_administration(&private, authority)?;
+    Ok(private)
+}
+
+// The whole carried authority, re-read against the same inventory rule the
+// snapshot used: a stash reflog rewritten under refs/stash, a symbolic HEAD or
+// an exclude file moving under the pass all refuse.
+fn authority_held(repo: &Path, carried: &CarriedAuthority, inventory: &str) -> Result<bool> {
+    Ok(read_authority(repo, inventory)? == *carried)
 }
 
 /// Transient refs a retained capture is fetched under. Never carried on.
@@ -1270,6 +1390,9 @@ pub(crate) mod mid_pass {
         /// Fired by the estate after a capture record is written and before a
         /// stale drift record is retired.
         RecordWritten,
+        /// Keyed by a bundle, not a checkout: after its drift check, before a
+        /// restore reads it again.
+        BundleChecked,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -1451,6 +1574,10 @@ pub enum ReuseUnavailable {
     /// The retained capture predates the recorded pass start, so no seat in it
     /// can be proved free of racy timestamps.
     PassStartUnrecorded,
+    /// A seat is stamped later than this pass's own clock, so it is racy on
+    /// every pass and the whole capture is never reused until the clock passes
+    /// its stamp. Other seats may still be reused one by one.
+    FutureStamp,
 }
 
 impl ReuseUnavailable {
@@ -1461,6 +1588,7 @@ impl ReuseUnavailable {
             Self::Shallow => "shallow",
             Self::RetainedUnreadable => "retained-unreadable",
             Self::PassStartUnrecorded => "pass-start-unrecorded",
+            Self::FutureStamp => "future-stamp",
         }
     }
 }
@@ -1487,6 +1615,8 @@ pub struct Export {
     pub refs_before: String,
     /// The ref inventory this export read last, after its byte pass.
     pub refs_after: String,
+    /// The Git authority this export read once and carried.
+    pub authority: CarriedAuthority,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -2200,11 +2330,19 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
 /// Refuses invalid source names, non-export bundle refs, collisions or invalid
 /// bundles. A failed fetch may leave unreachable objects, never changed HEAD.
 pub fn import_bundle(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
-    refuse_drift_marked(bundle)?;
-    import_verified(repo, bundle, source)
+    import_staged(repo, &stage_bundle(bundle)?, source)
 }
 
-// `import_bundle` for a verb that already refused a drift-marked bundle.
+/// [`import_bundle`] from a bundle this process already staged and checked.
+///
+/// # Errors
+/// As [`import_bundle`].
+pub fn import_staged(repo: &Path, staged: &StagedBundle, source: &str) -> Result<usize> {
+    import_verified(repo, staged.path(), source)
+}
+
+// `import_bundle` for a verb that already staged and checked its bundle, and
+// reads only the staged copy.
 pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -2741,7 +2879,8 @@ fn attach_payload(
     receipt: &Path,
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    refuse_drift_marked(bundle)?;
+    let staged = stage_bundle(bundle)?;
+    let bundle = staged.path();
     let destination = fs::canonicalize(destination)?;
     let repository = repository.map(fs::canonicalize).transpose()?;
     let common = repository.as_deref().map(common_repository).transpose()?;
@@ -2885,24 +3024,32 @@ pub fn restore_bundle_configured(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    restore_staged(&stage_bundle(bundle)?, destination, source, mapping)
+}
+
+/// [`restore_bundle_configured`] from a bundle this process already staged.
+///
+/// # Errors
+/// As [`restore_bundle_configured`].
+pub fn restore_staged(
+    staged: &StagedBundle,
+    destination: &Path,
+    source: &str,
+    mapping: Option<(&Path, &Path)>,
+) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    refuse_drift_marked(bundle)?;
-    let bundle = fs::canonicalize(bundle)?;
+    let bundle = staged.path();
     fs::DirBuilder::new().mode(0o700).create(destination)?;
     let destination = fs::canonicalize(destination)?;
     // Read bundle headers without assuming the destination's object format.
-    let heads = text(
-        git(&destination)
-            .args(["bundle", "list-heads"])
-            .arg(&bundle),
-    )?;
+    let heads = text(git(&destination).args(["bundle", "list-heads"]).arg(bundle))?;
     if !shallow::is_custody(&heads) {
         capture_revision(&heads, "configuration-v1")?;
     }
     let format = bundle_object_format(&heads)?;
     output(git(&destination).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_verified(&destination, &bundle, source)?;
-    let heads = shallow::headers(&destination, &bundle)?;
+    import_verified(&destination, bundle, source)?;
+    let heads = shallow::headers(&destination, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -2959,9 +3106,22 @@ pub fn restore_linked(
     destination: &Path,
     source: &str,
 ) -> Result<()> {
+    restore_linked_staged(&stage_bundle(bundle)?, repository, destination, source)
+}
+
+/// [`restore_linked`] from a bundle this process already staged and checked.
+///
+/// # Errors
+/// As [`restore_linked`].
+pub fn restore_linked_staged(
+    staged: &StagedBundle,
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
-    refuse_drift_marked(bundle)?;
+    let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
@@ -2975,10 +3135,9 @@ pub fn restore_linked(
             .file_name()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     );
-    let bundle = fs::canonicalize(bundle)?;
     let repository = fs::canonicalize(repository)?;
-    import_verified(&repository, &bundle, source)?;
-    let heads = shallow::headers(&repository, &bundle)?;
+    import_verified(&repository, bundle, source)?;
+    let heads = shallow::headers(&repository, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -4917,6 +5076,20 @@ mod tests {
             export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
                 .unwrap();
         assert!(!export.drift.is_empty());
+        // Round-3 N2: the marker is visible from the envelope's own headers,
+        // so the check never has to fetch the shallow pack.
+        let heads = text(
+            git(&root)
+                .args(["bundle", "list-heads"])
+                .arg(&export.bundle),
+        )
+        .unwrap();
+        assert!(
+            heads
+                .lines()
+                .any(|line| line.ends_with("refs/carry-export/shallow-drift-v1")),
+            "{heads}"
+        );
         let restored = root.join("restored");
         assert!(drift_refused(restore_bundle(
             &export.bundle,
@@ -4952,6 +5125,39 @@ mod tests {
             clear_reuse_refs(&private),
             Err(BulkloadRefusal::GitInventoryMalformed)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-3 N4: the drift check and the restore must read the same bytes. A
+    // bundle swapped for a drift-marked one after its check is never the one
+    // restored.
+    #[test]
+    fn a_bundle_swapped_after_its_drift_check_is_never_the_one_restored() {
+        let (root, source) = drift_fixture("swap-after-check");
+        let clean =
+            export_repository_with_drift(&source, &root.join("clean"), &ExportOptions::default())
+                .unwrap();
+        let lane = source.clone();
+        mid_pass::arm(&source, move || {
+            fs::write(lane.join("tracked"), b"rewritten mid-pass").unwrap();
+        });
+        let marked =
+            export_repository_with_drift(&source, &root.join("marked"), &ExportOptions::default())
+                .unwrap();
+        assert!(!marked.drift.is_empty());
+        let offered = root.join("offered.bundle");
+        fs::copy(&clean.bundle, &offered).unwrap();
+        let (from, to) = (marked.bundle, offered.clone());
+        mid_pass::arm_at(&offered, mid_pass::Stage::BundleChecked, move || {
+            fs::copy(&from, &to).unwrap();
+        });
+        let restored = root.join("restored");
+        restore_bundle(&offered, &restored, "neo").unwrap();
+        assert_eq!(
+            fs::read(restored.join("tracked")).unwrap(),
+            b"tracked bytes at census",
+            "the restored bytes are the checked bytes"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

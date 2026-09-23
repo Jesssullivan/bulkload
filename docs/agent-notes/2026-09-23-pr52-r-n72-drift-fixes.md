@@ -42,3 +42,20 @@ Tests that expect a Hit now wait out the 2 s racy window with `settle()`.
 
 Gates run with `CARGO_TARGET_DIR` inside this worktree after the #53 lane
 reported a shared target dir.
+
+## Round-3 re-review of 72fc71e (R-N72, TIN-4540)
+
+The reviewer's adversarial tests (review-artifacts/pr52-r3) were ported; the
+authority round trip is split per class so each reproduction fails alone.
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| N1 HIGH authority A to B to A | `CarriedAuthority`: one read of HEAD, symbolic HEAD, index, exclude, stash reflog, configuration and frontier; the export carries exactly it and re-reads it at pass end; `drift_across` refuses `GIT_AUTHORITY_CHANGED` unless both key parts carry it | `r3_detached_head_…`, `r3_symbolic_head_…`, `r3_exclude_…`, `r3_config_…`, `r3_index_…`, `r3_stash_reflog_round_trip_across_unguarded_windows_refuses` |
+| N2 MED shallow probe fetched the pack | Envelope lifts the marker into its headers (`shallow-drift-v1`); the check reads headers only; the duplicate apply check is gone | `a_drift_marked_shallow_bundle_refuses_to_restore` (headers assertion) |
+| N3 LOW probe name collision | Probe directory removed; staging directories use an atomic counter and exclusive create | covered by N4 |
+| N4 LOW check/import TOCTOU | `stage_bundle`: private copy; the check, digest and restore all read it | `a_bundle_swapped_after_its_drift_check_is_never_the_one_restored` |
+| N5 LOW silent future stamp | `reuse_unavailable=future-stamp` | `a_future_stamped_seat_reports_reuse_unavailable_future_stamp` |
+| INFO unauthenticated records | Known limit in design.md | `r3_sidecar_deleted_and_key_forged_still_refuses_in_band` (guard) |
+
+Guards that must stay green: `r3_packed_refs_rewrite_is_not_drift`,
+`r3_branch_reflog_only_change_keeps_the_hit`.

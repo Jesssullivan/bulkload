@@ -42,6 +42,13 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   pre-pass key parts, the export's own before and after ref inventories, and
   the post-pass key parts all agree; a ref that vanishes before the export's
   snapshot and returns after its last ref read is drift (R-N72).
+- Git authority is read once per export and carried exactly: HEAD, the
+  symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
+  configuration files and the shallow frontier. The export re-reads all of
+  it at the end of its pass, and the capture refuses `GIT_AUTHORITY_CHANGED`
+  unless both key parts name exactly what the export carried, so authority
+  that moves away and back outside the export's window can never leave a
+  stale bundle behind an equal key.
 - There are two drift classes. Export drift moved under the export itself:
   the bundle omits the drifted seats' bytes and carries the in-band
   `refs/carry-export/capture-drift-v1` marker. Every restore and import verb
@@ -49,7 +56,11 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   `git-repair-missing-index`, both `git-attach-*` verbs and
   `git-restore-registered-payload`) refuses a marked bundle with
   `CAPTURE_DRIFTED` before it writes anything, whether or not any corpus
-  sidecar exists. Key drift moved only outside the export's window: the
+  sidecar exists. A shallow envelope lifts the marker into its own headers
+  (`shallow-drift-v1`), so the check reads bundle headers only and never
+  fetches a pack. Each verb first stages the bundle into a private copy and
+  reads only that copy, so the checked bytes are the imported bytes (a clone
+  on APFS, btrfs and XFS; a full copy elsewhere). Key drift moved only outside the export's window: the
   bundle is a coherent snapshot of the export's own view and applies.
 - A drifted capture of either class records a poisoned key that no census
   hashes to, so it is never a reuse hit, even if its `{bundle}.drift` sidecar
@@ -67,8 +78,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   timestamp tick (a 2 s allowance) of the retained pass start can be
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
-  offered says why: `reuse_unavailable=shallow`, `retained-unreadable` or
-  `pass-start-unrecorded`. A retained capture that cannot be read degrades
+  offered says why: `reuse_unavailable=shallow`, `retained-unreadable`,
+  `pass-start-unrecorded` or `future-stamp` (a seat stamped later than the
+  pass's clock blocks every whole-capture reuse until the clock passes it). A retained capture that cannot be read degrades
   to a full read, and its transient refs never reach the new bundle.
 - A seat stamped later than the current pass's own clock reading is racy too
   (fail-closed on timestamps from the future). Known limit: the racy
@@ -77,6 +89,11 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   (an NFS or SMB server with NTP skew) can stamp a write made after the pass
   start earlier than the window, and the guard cannot see it. Bulkload never
   writes into a source to read the filesystem's clock.
+- Known limit: capture records and their sidecars (`.capture`, `.parts`,
+  `.drift`, `.base`) are not authenticated. Anyone who can write the corpus
+  can forge a record into a whole-capture reuse. The in-band drift marker
+  still makes every restore verb refuse a drifted bundle, and apply still
+  checks the bundle digest, but corpus integrity rests on its 0700 custody.
 
 ## Performance
 
