@@ -77,6 +77,24 @@ fn take_blocks_until_a_slab_is_returned() {
     );
 }
 
+/// Review #8: a timeout too large for an `Instant` deadline must not
+/// overflow; it waits forever, and a returned slab still ends the wait.
+#[test]
+fn an_unrepresentable_timeout_waits_forever_without_overflow() {
+    let pool = SlabPool::with_geometry(64, 64, 1).unwrap();
+    assert!(pool.take_timeout(Duration::MAX).unwrap().is_some());
+    let held = pool.take().unwrap();
+    let waiter = pool.clone();
+    let handle = std::thread::spawn(move || waiter.take_timeout(Duration::MAX).unwrap().is_some());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while pool.stats().waiting == 0 {
+        assert!(Instant::now() < deadline, "the taker never blocked");
+        std::thread::yield_now();
+    }
+    drop(held);
+    assert!(handle.join().unwrap());
+}
+
 #[derive(Clone, Debug)]
 enum Step {
     Take,

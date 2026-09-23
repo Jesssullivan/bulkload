@@ -44,8 +44,8 @@ rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
-    cd {{ root }} && cargo test --workspace --locked
     cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
+    cd {{ root }} && cargo test --workspace --locked
 
 # Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
 # current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.

@@ -16,6 +16,7 @@
     clippy::indexing_slicing
 )]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::{check, BarrierScope, Image, Options, Report, StateInfo, MAX_EXHAUSTIVE};
@@ -181,6 +182,7 @@ const fn strict() -> Options {
         barrier_scope: BarrierScope::Object,
         exhaustive_limit: 12,
         sector: None,
+        accept_bounded: false,
     }
 }
 
@@ -273,19 +275,26 @@ fn a_new_directory_is_a_dependency_of_its_entries() {
             kind: SyncKind::Fsync,
         },
     ];
-    let mut seen_child_without_parent = false;
-    // The root is never synced, so the mkdir may be lost; its child may
-    // survive only together with it.
-    let report = check(&initial(), &events, &Options::default(), |root, _| {
-        if root.join("d/x").exists() && !root.join("d").exists() {
-            seen_child_without_parent = true;
+    // The root is never synced, so the mkdir (event 0) stays optional while
+    // the fsync of `d` makes the create (event 1) durable. Without the parent
+    // edge the checker would build states where the create persisted and the
+    // mkdir did not; the materializer hides that (the orphaned directory is
+    // unreachable), so the check is on the persisted set itself.
+    let mut child_only = 0_usize;
+    let mut states_with_child = 0_usize;
+    let report = check(&initial(), &events, &Options::default(), |_, info| {
+        if info.persisted.contains(&1) {
+            states_with_child += 1;
+            if !info.persisted.contains(&0) {
+                child_only += 1;
+            }
         }
         Ok(())
     })
     .unwrap();
     assert!(report.passed());
-    assert!(!seen_child_without_parent);
-    assert!(report.states >= 3);
+    assert!(states_with_child > 0, "the durable create must appear");
+    assert_eq!(child_only, 0, "a create persisted without its parent mkdir");
 }
 
 #[test]
@@ -304,10 +313,24 @@ fn a_bounded_crash_point_is_logged_not_silent() {
         exhaustive_limit: 4,
         ..Options::default()
     };
-    let report = check(&initial(), &events, &options, |_, _| Ok(())).unwrap();
+    // Count the files present in each complete state: the bounded family
+    // must include drop-one states (11 of the 12 mutations persisted).
+    let mut drop_one_seen = false;
+    let report = check(&initial(), &events, &options, |_, info| {
+        if info.complete && info.persisted.len() == 11 {
+            drop_one_seen = true;
+        }
+        Ok(())
+    })
+    .unwrap();
     let summary = report.summary(&events);
     eprintln!("{summary}");
     assert!(!report.bounded.is_empty());
+    assert!(!report.exhaustive());
+    assert!(
+        drop_one_seen,
+        "the bound must still try every drop-one state"
+    );
     let last = report.bounded.last().unwrap();
     assert_eq!(last.crash_point, 12);
     assert_eq!(last.optional, 12);
@@ -315,6 +338,27 @@ fn a_bounded_crash_point_is_logged_not_silent() {
     // Prefix, required, 12 drop-one and 12 keep-one states, deduplicated.
     assert!(last.explored <= 2 + 2 * 12);
     assert!(summary.contains("bound: crash point 12 has 12 optional mutations"));
+    assert!(summary.contains("exhaustive=false"));
+
+    // Review probe P2: with no violations a bounded run is still not a pass
+    // unless the caller opts in.
+    assert!(report.violations.is_empty());
+    assert!(
+        !report.passed(),
+        "a bounded run must not report passed by default"
+    );
+    let accepted = check(
+        &initial(),
+        &events,
+        &Options {
+            accept_bounded: true,
+            ..options
+        },
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(accepted.passed());
+    assert!(!accepted.exhaustive());
 }
 
 /// `fchmod` is metadata: `fdatasync` does not make it durable, `fsync` does.
@@ -433,6 +477,196 @@ fn a_scanned_tree_materializes_unchanged() {
     );
 }
 
+/// Review probe P1: a trace whose Create reuses an inode identity the image
+/// (or an earlier event) already names is refused, not conflated.
+#[test]
+fn inode_reuse_in_a_trace_is_refused() {
+    let events = vec![
+        Event::Unlink {
+            dir: ROOT,
+            name: b"keep".to_vec(),
+        },
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"fresh".to_vec()),
+            node: KEEP_NODE,
+            mode: 0o644,
+        },
+        write(KEEP_NODE, NEW),
+        Event::Sync {
+            node: KEEP_NODE,
+            kind: SyncKind::Fsync,
+        },
+        Event::Sync {
+            node: ROOT,
+            kind: SyncKind::Fsync,
+        },
+    ];
+    let error = check(&initial(), &events, &Options::default(), |_, _| Ok(())).unwrap_err();
+    assert!(error.to_string().contains("inode reuse"), "{error}");
+
+    let twice = vec![
+        Event::Mkdir {
+            dir: ROOT,
+            name: b"a".to_vec(),
+            node: n(20),
+            mode: 0o755,
+        },
+        Event::Mkdir {
+            dir: ROOT,
+            name: b"b".to_vec(),
+            node: n(20),
+            mode: 0o755,
+        },
+    ];
+    assert!(check(&initial(), &twice, &Options::default(), |_, _| Ok(())).is_err());
+}
+
+const OTHER: NodeId = n(5);
+
+fn with_other() -> Image {
+    initial().with_file(b"other", OTHER, b"")
+}
+
+/// `(keep, other)` file contents of one crash state.
+type Pair = (Vec<u8>, Vec<u8>);
+
+/// Collect `(keep, other)` contents of every state, and of the complete
+/// states separately.
+fn contents(events: &[Event], options: &Options) -> (Vec<Pair>, Vec<Pair>) {
+    let mut complete = Vec::new();
+    let mut any = Vec::new();
+    let report = check(&with_other(), events, options, |root, info| {
+        let keep = std::fs::read(root.join("keep")).map_err(|error| error.to_string())?;
+        let other = std::fs::read(root.join("other")).map_err(|error| error.to_string())?;
+        if info.complete {
+            complete.push((keep.clone(), other.clone()));
+        }
+        any.push((keep, other));
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed(), "{}", report.summary(events));
+    (complete, any)
+}
+
+/// Review M3 (drain rule): `F_FULLFSYNC` on Y drains only what was already
+/// sent to the drive. An unsynced write to X stays optional; once X was
+/// kicked (sent) before the flush, the flush makes it durable.
+#[test]
+fn a_full_flush_drains_only_what_was_sent() {
+    let unsent = vec![
+        write(KEEP_NODE, b"XXXX"),
+        Event::Sync {
+            node: LEDGER,
+            kind: SyncKind::FullFlush,
+        },
+    ];
+    let (complete, _) = contents(&unsent, &Options::default());
+    let keeps: BTreeSet<Vec<u8>> = complete.into_iter().map(|(keep, _)| keep).collect();
+    assert_eq!(
+        keeps,
+        [KEEP.to_vec(), b"XXXX-bytes".to_vec()].into(),
+        "an unsent write must survive or vanish after another file's full flush"
+    );
+
+    let sent = vec![
+        write(KEEP_NODE, b"XXXX"),
+        Event::Sync {
+            node: KEEP_NODE,
+            kind: SyncKind::Kick,
+        },
+        Event::Sync {
+            node: LEDGER,
+            kind: SyncKind::FullFlush,
+        },
+    ];
+    let (complete, _) = contents(&sent, &Options::default());
+    let keeps: BTreeSet<Vec<u8>> = complete.into_iter().map(|(keep, _)| keep).collect();
+    assert_eq!(
+        keeps,
+        [b"XXXX-bytes".to_vec()].into(),
+        "a sent write is drained"
+    );
+}
+
+/// Review M4 (device-wide barrier): the barrier on Y orders only mutations
+/// already sent before it. With the X write unsent, a state holding the later
+/// Z write but not the X write is reachable; with X sent first, it is not.
+#[test]
+fn a_device_barrier_orders_only_sent_mutations() {
+    let z_without_x = |events: &[Event]| {
+        let (_, any) = contents(events, &Options::default());
+        any.iter()
+            .any(|(keep, other)| keep == KEEP && other == b"Z")
+    };
+    let unsent = vec![
+        write(KEEP_NODE, b"XXXX"),
+        Event::Sync {
+            node: LEDGER,
+            kind: SyncKind::Barrier,
+        },
+        write(OTHER, b"Z"),
+    ];
+    assert!(
+        z_without_x(&unsent),
+        "an unsent X write is not ordered by Y's barrier"
+    );
+
+    let sent = vec![
+        write(KEEP_NODE, b"XXXX"),
+        Event::Sync {
+            node: KEEP_NODE,
+            kind: SyncKind::Kick,
+        },
+        Event::Sync {
+            node: LEDGER,
+            kind: SyncKind::Barrier,
+        },
+        write(OTHER, b"Z"),
+    ];
+    assert!(!z_without_x(&sent), "a sent X write is ordered before Z");
+}
+
+/// Review M5 (a sync counts only once it completed): create tmp, write,
+/// rename, then fsync the file, then fsync the directory. A crash between the
+/// rename and the file fsync can publish `data` without its bytes, so this
+/// protocol must fail, at crash point 3.
+#[test]
+fn syncing_the_file_after_the_rename_is_too_late() {
+    let events = vec![
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"tmp".to_vec()),
+            node: TMP,
+            mode: 0o600,
+        },
+        write(TMP, NEW),
+        Event::Rename {
+            node: TMP,
+            from_dir: ROOT,
+            from: b"tmp".to_vec(),
+            to_dir: ROOT,
+            to: b"data".to_vec(),
+        },
+        Event::Sync {
+            node: TMP,
+            kind: SyncKind::Fsync,
+        },
+        Event::Sync {
+            node: ROOT,
+            kind: SyncKind::Fsync,
+        },
+    ];
+    for options in [Options::default(), strict()] {
+        let report = run(&events, &options);
+        assert!(!report.passed());
+        assert!(report.violations.iter().any(
+            |violation| violation.crash_point == 3 && violation.message.contains("wrong bytes")
+        ));
+    }
+}
+
 #[test]
 fn partial_traces_and_bad_options_are_refused() {
     let untraced = vec![Event::Untraced {
@@ -508,7 +742,7 @@ mod recorded {
                 anonymous = temp.is_anonymous();
                 sys::pwrite_all(temp.fd(), NEW, 0).unwrap();
                 seal(temp.fd(), file, false);
-                temp.publish(&root, &data).unwrap();
+                temp.publish(&data).unwrap();
             }
             seal(&root, dir, true);
             if drain {
@@ -583,8 +817,7 @@ mod recorded {
     #[test]
     fn recorded_o_tmpfile_publish_on_tmpfs() {
         let base = Path::new("/dev/shm");
-        if tempfile::TempDir::new_in(base).is_err() {
-            eprintln!("SKIP: /dev/shm is not writable here");
+        if crate::io::tests::shm_dir("recorded_o_tmpfile_publish_on_tmpfs").is_none() {
             return;
         }
         let (image, events, anonymous) =

@@ -86,34 +86,45 @@ pub enum Event {
 }
 
 #[cfg(feature = "io-trace")]
-pub use recorder::record;
+pub use recorder::{record, serialize};
 
 #[cfg(feature = "io-trace")]
 pub mod recorder {
-    use std::cell::RefCell;
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
     use super::Event;
 
-    type Sink = Arc<Mutex<Vec<Event>>>;
+    #[derive(Debug, Default)]
+    struct Shared {
+        events: Mutex<Vec<Event>>,
+        /// True while some thread is inside a traced call.
+        busy: Mutex<bool>,
+        idle: Condvar,
+    }
 
     thread_local! {
-        static CURRENT: RefCell<Option<Sink>> = const { RefCell::new(None) };
+        static CURRENT: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+        /// Nesting depth of traced calls on this thread (`barrier_dir` calls
+        /// `barrier`; the rename fallback calls `linkat` and `unlinkat`).
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
     }
 
     /// A shared, ordered event log. Attach it to every thread whose calls
-    /// belong to the trace (a committer thread included); the mutex gives one
-    /// global order.
+    /// belong to the trace (a committer thread included). While attached,
+    /// each traced call holds the recorder's serial lock from before its
+    /// syscall until its event is appended, so the trace order is the order
+    /// in which the syscalls took effect, across threads.
     #[derive(Clone, Debug, Default)]
     pub struct Recorder {
-        sink: Sink,
+        shared: Arc<Shared>,
     }
 
     /// Detaches the recorder from the thread on drop, restoring whatever was
     /// attached before.
     #[must_use = "the recorder detaches when this guard drops"]
     pub struct Attached {
-        previous: Option<Sink>,
+        previous: Option<Arc<Shared>>,
     }
 
     impl Drop for Attached {
@@ -131,13 +142,62 @@ pub mod recorder {
         /// Record this thread's calls into `self` until the guard drops.
         pub fn attach(&self) -> Attached {
             let previous =
-                CURRENT.with(|current| current.borrow_mut().replace(Arc::clone(&self.sink)));
+                CURRENT.with(|current| current.borrow_mut().replace(Arc::clone(&self.shared)));
             Attached { previous }
         }
 
         /// Remove and return every event recorded so far.
         pub fn take(&self) -> Vec<Event> {
-            std::mem::take(&mut *self.sink.lock().unwrap_or_else(PoisonError::into_inner))
+            std::mem::take(
+                &mut *self
+                    .shared
+                    .events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            )
+        }
+    }
+
+    /// Holds the serial lock of the attached recorder; see [`serialize`].
+    #[must_use = "the serial lock is released when this guard drops"]
+    pub struct Serial {
+        held: Option<Arc<Shared>>,
+    }
+
+    /// Enter a traced call. With a recorder attached, the outermost call on a
+    /// thread waits for the recorder's serial lock and holds it until the
+    /// guard drops; nested calls on the same thread pass through. With no
+    /// recorder attached this is one thread-local read.
+    pub fn serialize() -> Serial {
+        let Some(shared) = CURRENT.with(|current| current.borrow().clone()) else {
+            return Serial { held: None };
+        };
+        let depth = DEPTH.with(Cell::get);
+        if depth == 0 {
+            let mut busy = shared.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            while *busy {
+                busy = shared
+                    .idle
+                    .wait(busy)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *busy = true;
+        }
+        DEPTH.with(|cell| cell.set(depth + 1));
+        Serial { held: Some(shared) }
+    }
+
+    impl Drop for Serial {
+        fn drop(&mut self) {
+            let Some(shared) = self.held.take() else {
+                return;
+            };
+            let depth = DEPTH.with(Cell::get).saturating_sub(1);
+            DEPTH.with(|cell| cell.set(depth));
+            if depth == 0 {
+                *shared.busy.lock().unwrap_or_else(PoisonError::into_inner) = false;
+                shared.idle.notify_one();
+            }
         }
     }
 
@@ -145,15 +205,16 @@ pub mod recorder {
     /// thread. `make` runs only then, so an unattached thread pays one
     /// thread-local read per call.
     pub fn record(call: &'static str, make: impl FnOnce() -> std::io::Result<Event>) {
-        let sink = CURRENT.with(|current| current.borrow().clone());
-        let Some(sink) = sink else {
+        let Some(shared) = CURRENT.with(|current| current.borrow().clone()) else {
             return;
         };
         let event = make().unwrap_or_else(|error| Event::Untraced {
             call,
             error: error.to_string(),
         });
-        sink.lock()
+        shared
+            .events
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(event);
     }

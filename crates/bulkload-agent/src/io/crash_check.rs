@@ -36,6 +36,8 @@
 //!    barrier. With [`BarrierScope::Object`] (the strict option) only
 //!    mutations on `X` are ordered: a later mutation of `X` in `P` requires
 //!    every earlier mutation of `X`.
+//! 4. **Parents.** A mutation inside a directory created by a traced mkdir, or
+//!    a rename or link of such a directory, requires that mkdir.
 //!
 //! The Darwin rules follow Apple's documentation. `fcntl(2)`: `F_FULLFSYNC`
 //! "does the same thing as fsync(2) then asks the drive to flush all buffered
@@ -49,8 +51,6 @@
 //! that plain `fsync` guarantees neither. The strict per-object scope does not
 //! rely on the drive honouring the barrier device-wide. Use it to check a
 //! protocol that must stay correct without that assumption.
-//! 4. **Parents.** A mutation inside a directory created by a traced mkdir, or
-//!    a rename or link of such a directory, requires that mkdir.
 //!
 //! Everything else may be lost or reordered: writes not covered by a flush,
 //! renames and links not followed by a parent-directory sync, mode changes
@@ -71,9 +71,18 @@
 //! keep-one state (one optional mutation persisted ahead of all other
 //! optional mutations, with what it depends on). Every bounded crash point is
 //! recorded in [`Report::bounded`] with the number of subsets it did not
-//! visit, so the cap is never silent.
+//! visit, so the cap is never silent. A bounded run does not count as a pass
+//! ([`Report::passed`]) unless the caller sets [`Options::accept_bounded`];
+//! [`Report::exhaustive`] says whether any point was bounded.
+//!
+//! # Refused traces
+//!
+//! A trace holding an `Untraced` event (an event the recorder could not
+//! build) is refused, and so is a trace that creates a node identity the
+//! image or an earlier event already names. File systems reuse inode numbers
+//! after an unlink, and the model cannot tell the two inodes apart.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io;
@@ -103,6 +112,10 @@ pub struct Options {
     pub exhaustive_limit: usize,
     /// Split each write into pieces of this many bytes (torn writes).
     pub sector: Option<usize>,
+    /// Let [`Report::passed`] succeed although some crash points were only
+    /// explored within the bound. Off by default: a bounded run is not a
+    /// pass unless the caller says so.
+    pub accept_bounded: bool,
 }
 
 /// Largest accepted [`Options::exhaustive_limit`] (2^20 subsets per point).
@@ -114,6 +127,7 @@ impl Default for Options {
             barrier_scope: BarrierScope::Device,
             exhaustive_limit: 12,
             sector: None,
+            accept_bounded: false,
         }
     }
 }
@@ -428,6 +442,8 @@ pub struct Violation {
 /// The checker's result.
 #[derive(Clone, Debug, Default)]
 pub struct Report {
+    /// Copied from [`Options::accept_bounded`].
+    pub accept_bounded: bool,
     pub events: usize,
     pub ops: usize,
     pub crash_points: usize,
@@ -437,18 +453,27 @@ pub struct Report {
 }
 
 impl Report {
+    /// No violation, and either every crash point was explored exhaustively
+    /// or the caller set [`Options::accept_bounded`].
     pub fn passed(&self) -> bool {
-        self.violations.is_empty()
+        self.violations.is_empty() && (self.exhaustive() || self.accept_bounded)
+    }
+
+    /// Every crash point had every legal subset of its optional mutations
+    /// tried.
+    pub fn exhaustive(&self) -> bool {
+        self.bounded.is_empty()
     }
 
     /// A human-readable account, bound notes and every violation included.
     pub fn summary(&self, events: &[Event]) -> String {
         let mut out = format!(
-            "crash_check events={} ops={} crash_points={} states={} bounded_points={} violations={}\n",
+            "crash_check events={} ops={} crash_points={} states={} exhaustive={} bounded_points={} violations={}\n",
             self.events,
             self.ops,
             self.crash_points,
             self.states,
+            self.exhaustive(),
             self.bounded.len(),
             self.violations.len()
         );
@@ -521,10 +546,22 @@ type Fresh = Vec<(NodeId, Node)>;
     clippy::too_many_lines,
     reason = "one match arm per trace event kind; splitting it hides the lowering"
 )]
-fn build_ops(events: &[Event], options: &Options) -> io::Result<(Vec<Op>, Fresh)> {
+fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result<(Vec<Op>, Fresh)> {
     let mut ops: Vec<Op> = Vec::new();
     let mut fresh = Vec::new();
+    // A node identity names one inode for the whole trace. A file system may
+    // reuse an inode number after an unlink; the model cannot tell the two
+    // apart, so such a trace is refused rather than conflated.
+    let mut known: HashSet<NodeId> = initial.nodes.keys().copied().collect();
     for (index, event) in events.iter().enumerate() {
+        if let Event::Create { node, .. } | Event::Mkdir { node, .. } = event {
+            if !known.insert(*node) {
+                return Err(other(format!(
+                    "trace event {index} creates node {node:?}, which the image or an \
+                     earlier event already names (inode reuse); refusing to conflate them"
+                )));
+            }
+        }
         let mut push = |class: Class, objects: Vec<NodeId>, change: Change| {
             ops.push(Op {
                 event: index,
@@ -670,8 +707,8 @@ fn build_ops(events: &[Event], options: &Options) -> io::Result<(Vec<Op>, Fresh)
 }
 
 impl Plan {
-    fn new(events: &[Event], options: &Options) -> io::Result<Self> {
-        let (ops, fresh) = build_ops(events, options)?;
+    fn new(initial: &Image, events: &[Event], options: &Options) -> io::Result<Self> {
+        let (ops, fresh) = build_ops(initial, events, options)?;
         let mut plan = Self {
             requires: vec![BTreeSet::new(); ops.len()],
             ops,
@@ -900,9 +937,10 @@ pub fn check(
             options.exhaustive_limit
         )));
     }
-    let plan = Plan::new(events, options)?;
+    let plan = Plan::new(initial, events, options)?;
     let scratch = tempfile::TempDir::new()?;
     let mut report = Report {
+        accept_bounded: options.accept_bounded,
         events: events.len(),
         ops: plan.ops.len(),
         ..Report::default()

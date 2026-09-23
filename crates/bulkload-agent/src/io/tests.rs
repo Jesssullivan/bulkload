@@ -237,14 +237,17 @@ fn temp_files_publish_without_clobbering() {
     }
     sys::pwrite_all(temp.fd(), b"staged", 0).unwrap();
     sys::barrier(temp.fd()).unwrap();
-    temp.publish(&root, &c("final")).unwrap();
+    temp.publish(&c("final")).unwrap();
     sys::barrier_dir(&root).unwrap();
     assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"staged");
 
     let second = TempFile::create(&root, 0o600).unwrap();
     sys::pwrite_all(second.fd(), b"other", 0).unwrap();
-    let clobber = second.publish(&root, &c("final"));
-    assert_eq!(clobber.unwrap_err().kind(), ErrorKind::AlreadyExists);
+    let clobber = second.publish(&c("final")).unwrap_err();
+    assert_eq!(clobber.error.kind(), ErrorKind::AlreadyExists);
+    // The staged file comes back and can still be published elsewhere.
+    clobber.temp.publish(&c("final.2")).unwrap();
+    assert_eq!(fs::read(dir.path().join("final.2")).unwrap(), b"other");
     assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"staged");
 }
 
@@ -260,14 +263,33 @@ fn named_temp_fallback_is_private_and_exclusive() {
     assert_ne!(name, other);
 }
 
+/// A scratch directory on tmpfs (`/dev/shm`), where Linux supports
+/// `O_TMPFILE`. Tests on it must run in CI, so a missing or unwritable
+/// `/dev/shm` fails the test; `BULKLOAD_ALLOW_NO_DEV_SHM=1` turns that into a
+/// printed skip for hosts that really have none.
+#[cfg(target_os = "linux")]
+pub fn shm_dir(test: &str) -> Option<tempfile::TempDir> {
+    match tempfile::TempDir::new_in("/dev/shm") {
+        Ok(dir) => {
+            println!("RAN {test}: O_TMPFILE staging under /dev/shm");
+            Some(dir)
+        }
+        Err(error) if std::env::var_os("BULKLOAD_ALLOW_NO_DEV_SHM").is_some() => {
+            println!(
+                "SKIPPED {test}: /dev/shm unusable ({error}); allowed by BULKLOAD_ALLOW_NO_DEV_SHM"
+            );
+            None
+        }
+        Err(error) => panic!("{test} must run on Linux CI but /dev/shm is unusable: {error}"),
+    }
+}
+
 /// On Linux the `O_TMPFILE` + `linkat(/proc/self/fd)` path must actually run
-/// somewhere in CI: tmpfs supports it, so use `/dev/shm` when it is there.
+/// in CI: tmpfs supports it, so the test runs under `/dev/shm`.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_o_tmpfile_publishes_through_proc_self_fd() {
-    let base = Path::new("/dev/shm");
-    let Ok(dir) = tempfile::TempDir::new_in(base) else {
-        eprintln!("SKIP: /dev/shm is not writable here");
+    let Some(dir) = shm_dir("linux_o_tmpfile_publishes_through_proc_self_fd") else {
         return;
     };
     let root = sys::open_root(dir.path()).unwrap();
@@ -276,7 +298,7 @@ fn linux_o_tmpfile_publishes_through_proc_self_fd() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     sys::pwrite_all(temp.fd(), b"anonymous", 0).unwrap();
     sys::data_sync(temp.fd()).unwrap();
-    temp.publish(&root, &c("linked")).unwrap();
+    temp.publish(&c("linked")).unwrap();
     assert_eq!(fs::read(dir.path().join("linked")).unwrap(), b"anonymous");
     assert_eq!(
         fs::metadata(dir.path().join("linked"))
@@ -403,6 +425,70 @@ mod traced {
                 name: b"h".to_vec(),
             }
         );
+    }
+
+    /// Review #12: Create and Mkdir events carry the effective mode (after
+    /// the umask), as `fstat` reports it, not the requested bits.
+    #[test]
+    fn create_and_mkdir_events_record_the_effective_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = sys::open_root(dir.path()).unwrap();
+        let recorder = Recorder::new();
+        let attached = recorder.attach();
+        let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o777)).unwrap();
+        sys::mkdirat(&root, &c("d"), 0o777).unwrap();
+        let temp = TempFile::create(&root, 0o777).unwrap();
+        drop(attached);
+        let file_mode = sys::fstat(&fd).unwrap().permissions();
+        let dir_mode = sys::fstatat_nofollow(&root, &c("d")).unwrap().permissions();
+        let temp_mode = sys::fstat(temp.fd()).unwrap().permissions();
+        let modes: Vec<u32> = recorder
+            .take()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Create { mode, .. } | Event::Mkdir { mode, .. } => Some(*mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, vec![file_mode, dir_mode, temp_mode]);
+    }
+
+    /// Review #3: two threads race overlapping writes into one file. With
+    /// the serial lock, replaying the recorded writes in trace order must
+    /// rebuild exactly the bytes on disk; an event order that differed from
+    /// the syscall order would leave the wrong writer's bytes on top.
+    #[test]
+    fn concurrent_traced_writes_replay_to_the_file_on_disk() {
+        const ROUNDS: usize = 400;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = sys::open_root(dir.path()).unwrap();
+        let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
+        let recorder = Recorder::new();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (byte, offset, len) in [(b'a', 0_u64, 64_usize), (b'b', 16, 32)] {
+                let (recorder, fd, start) = (&recorder, &fd, &start);
+                scope.spawn(move || {
+                    let _attached = recorder.attach();
+                    let payload = vec![byte; len];
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        sys::pwrite_all(fd, &payload, offset).unwrap();
+                    }
+                });
+            }
+        });
+        let events = recorder.take();
+        assert_eq!(events.len(), 2 * ROUNDS, "one event per write");
+        let mut replay = vec![0_u8; 64];
+        for event in &events {
+            let Event::Write { offset, data, .. } = event else {
+                panic!("unexpected event {event:?}");
+            };
+            let start = usize::try_from(*offset).unwrap();
+            replay[start..start + data.len()].copy_from_slice(data);
+        }
+        assert_eq!(fs::read(dir.path().join("f")).unwrap(), replay);
     }
 
     #[test]

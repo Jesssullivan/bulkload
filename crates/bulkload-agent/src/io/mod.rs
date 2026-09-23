@@ -39,6 +39,24 @@
 //! module, so `durable.rs` moves onto this layer without edits to its call
 //! sites.
 
+// R-N54: every unsafe block names its obligations, one unsafe operation per
+// block, so each SAFETY comment covers exactly one call.
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block
+)]
+
+/// Hold the recorder's serial lock for the rest of the enclosing block when
+/// the `io-trace` feature is on and a recorder is attached to this thread, so
+/// traced syscalls and their events happen in one global order. Removed by
+/// `cfg` with the feature off.
+macro_rules! trace_serial {
+    () => {
+        #[cfg(feature = "io-trace")]
+        let _serial = $crate::io::trace::serialize();
+    };
+}
+
 /// Record a trace event when the `io-trace` feature is on.
 ///
 /// `$call` names the syscall; `$make` is an expression of type
@@ -151,54 +169,82 @@ pub enum Qos {
 /// A staged file that is not yet visible under its final name.
 ///
 /// On Linux it is an `O_TMPFILE` inode with no name at all, so a crash leaves
-/// no orphan; a file system without `O_TMPFILE` gets a named temporary
-/// instead. On Darwin it is always a named temporary (`O_EXCL`, private
-/// mode). [`TempFile::publish`] never replaces an existing name.
+/// no orphan; a file system without `O_TMPFILE`, or a process without
+/// `/proc/self/fd`, gets a named temporary instead. On Darwin it is always a
+/// named temporary (`O_EXCL`, private mode). The staged file remembers the
+/// directory it was created in, and [`TempFile::publish`] consumes it and
+/// never replaces an existing name.
 #[derive(Debug)]
-pub enum TempFile {
+pub struct TempFile {
+    fd: OwnedFd,
+    dir: OwnedFd,
+    kind: Staged,
+}
+
+#[derive(Debug)]
+enum Staged {
     /// Linux `O_TMPFILE`: published with `linkat` through `/proc/self/fd`.
-    Anonymous(OwnedFd),
-    /// A named temporary in the destination directory: published with
+    Anonymous,
+    /// A named temporary in the staging directory: published with
     /// rename-no-replace.
-    Named { fd: OwnedFd, name: CString },
+    Named(CString),
+}
+
+/// A failed [`TempFile::publish`]: the staged file comes back to the caller,
+/// who can retry under another name or discard it.
+#[derive(Debug)]
+pub struct PublishError {
+    pub temp: TempFile,
+    pub error: std::io::Error,
 }
 
 impl TempFile {
-    /// Stage a new file in `dir` with permission bits `mode`.
+    /// Stage a new file in `dir` with permission bits `mode`. The directory
+    /// descriptor is duplicated and kept for [`TempFile::publish`].
     ///
     /// # Errors
-    /// Returns the `openat` failure.
+    /// Returns the `openat` or descriptor-duplication failure.
     pub fn create(dir: impl AsFd, mode: u32) -> std::io::Result<Self> {
         let dir = dir.as_fd();
-        if let Some(fd) = sys::open_tmpfile(dir, mode)? {
-            return Ok(Self::Anonymous(fd));
-        }
-        let (fd, name) = sys::create_temp_named(dir, mode)?;
-        Ok(Self::Named { fd, name })
+        let (fd, kind) = if let Some(fd) = sys::open_tmpfile(dir, mode)? {
+            (fd, Staged::Anonymous)
+        } else {
+            let (fd, name) = sys::create_temp_named(dir, mode)?;
+            (fd, Staged::Named(name))
+        };
+        Ok(Self {
+            fd,
+            dir: dir.try_clone_to_owned()?,
+            kind,
+        })
     }
 
     /// The staged file's descriptor, for `pwrite`, sync and `fchmod`.
     pub const fn fd(&self) -> &OwnedFd {
-        match self {
-            Self::Anonymous(fd) | Self::Named { fd, .. } => fd,
-        }
+        &self.fd
     }
 
     /// Whether this is an unnamed `O_TMPFILE` inode.
     pub const fn is_anonymous(&self) -> bool {
-        matches!(self, Self::Anonymous(_))
+        matches!(self.kind, Staged::Anonymous)
     }
 
-    /// Give the staged file the name `name` in `dir`; an existing `name` is
-    /// `EEXIST` and is left untouched. The caller seals the directory
-    /// afterwards: the new name is durable only after a directory sync.
+    /// Give the staged file the name `name` in the directory it was staged in,
+    /// and return its descriptor. An existing `name` is `EEXIST` and is left
+    /// untouched. The caller seals the directory afterwards: the new name is
+    /// durable only after a directory sync.
     ///
     /// # Errors
-    /// Returns the link or rename failure; an occupied name is `EEXIST`.
-    pub fn publish(&self, dir: impl AsFd, name: &std::ffi::CStr) -> std::io::Result<()> {
-        match self {
-            Self::Anonymous(fd) => sys::link_tmpfile(fd, dir, name),
-            Self::Named { name: temp, .. } => sys::rename_noreplace(dir, temp, name),
+    /// Returns the staged file with the link or rename failure; an occupied
+    /// name is `EEXIST`.
+    pub fn publish(self, name: &std::ffi::CStr) -> Result<OwnedFd, Box<PublishError>> {
+        let result = match &self.kind {
+            Staged::Anonymous => sys::link_tmpfile(&self.fd, &self.dir, name),
+            Staged::Named(temp) => sys::rename_noreplace(&self.dir, temp, name),
+        };
+        match result {
+            Ok(()) => Ok(self.fd),
+            Err(error) => Err(Box::new(PublishError { temp: self, error })),
         }
     }
 }

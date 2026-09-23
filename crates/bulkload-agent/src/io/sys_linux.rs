@@ -64,6 +64,7 @@ fn retry_eintr(mut call: impl FnMut() -> libc::c_int) -> io::Result<()> {
 /// # Errors
 /// Returns the flush failure.
 pub fn data_sync(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     // SAFETY: the descriptor is live for every call of the closure;
     // `fdatasync` takes no pointers.
@@ -92,6 +93,7 @@ pub fn barrier(file: impl AsFd) -> io::Result<()> {
 /// # Errors
 /// Returns the flush failure.
 pub fn full_flush(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     fsync_raw(fd)?;
     trace_event!(
@@ -119,6 +121,7 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
 /// # Errors
 /// Returns the `sync_file_range` failure.
 pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     let (offset, len) = (to_off_t(offset)?, to_off_t(len)?);
     // SAFETY: the descriptor is live for every call of the closure;
@@ -158,6 +161,7 @@ pub fn rename_noreplace_at(
     to_dir: impl AsFd,
     to: &CStr,
 ) -> io::Result<()> {
+    trace_serial!();
     let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
     // SAFETY: both descriptors are live for the call and both names are
     // NUL-terminated and outlive it.
@@ -191,13 +195,26 @@ pub fn rename_noreplace_at(
     unlinkat(from_dir, from, false)
 }
 
-/// Stage an unnamed file in `dir` with `O_TMPFILE`. Returns `None` when the
-/// kernel or file system does not support it (`EOPNOTSUPP`, `EISDIR`,
-/// `EINVAL`), and the caller falls back to a named temporary.
+/// Whether `/proc/self/fd` is reachable, probed once per process. Without it
+/// an `O_TMPFILE` inode could not be given a name, so staging uses a named
+/// temporary instead.
+fn proc_fd_reachable() -> bool {
+    static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REACHABLE.get_or_init(|| std::fs::metadata("/proc/self/fd").is_ok_and(|meta| meta.is_dir()))
+}
+
+/// Stage an unnamed file in `dir` with `O_TMPFILE`. Returns `None` when
+/// `/proc/self/fd` is unreachable, or when the kernel or file system does not
+/// support `O_TMPFILE` (`EOPNOTSUPP`, `EISDIR`, `EINVAL`); the caller then
+/// falls back to a named temporary.
 ///
 /// # Errors
 /// Returns any other `openat` failure.
 pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd>> {
+    if !proc_fd_reachable() {
+        return Ok(None);
+    }
+    trace_serial!();
     let here = c".";
     match openat_raw(
         dir,
@@ -212,7 +229,8 @@ pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd
                     dir: Some(fstat(dir)?.node),
                     name: None,
                     node: fstat(&fd)?.node,
-                    mode: mode & 0o7777,
+                    // The effective mode, after the umask.
+                    mode: fstat(&fd)?.permissions(),
                 })
             );
             Ok(Some(fd))
@@ -231,13 +249,13 @@ pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd
 
 /// Give an `O_TMPFILE` inode the name `name` in `dir`:
 /// `linkat(AT_FDCWD, "/proc/self/fd/N", dir, name, AT_SYMLINK_FOLLOW)`, which
-/// needs no capability. Without `/proc` it tries `linkat(fd, "", …,
-/// AT_EMPTY_PATH)`, which needs `CAP_DAC_READ_SEARCH`. An occupied `name` is
-/// `EEXIST`.
+/// needs no capability. [`open_tmpfile`] only stages anonymously when
+/// `/proc/self/fd` is reachable. An occupied `name` is `EEXIST`.
 ///
 /// # Errors
 /// Returns the `linkat` failure.
 pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<()> {
+    trace_serial!();
     let (fd, dir) = (file.as_fd(), dir.as_fd());
     let proc_path = super::c_name(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
     // SAFETY: `dir` is live for the call, both paths are NUL-terminated and
@@ -252,24 +270,7 @@ pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<
         )
     };
     if linked != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error);
-        }
-        // SAFETY: both descriptors are live for the call, the empty path and
-        // `name` are NUL-terminated and outlive it.
-        let linked = unsafe {
-            libc::linkat(
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if linked != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        return Err(io::Error::last_os_error());
     }
     trace_event!(
         "linkat(/proc/self/fd)",

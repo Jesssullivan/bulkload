@@ -64,6 +64,7 @@ fn fcntl_flush(fd: BorrowedFd<'_>, command: libc::c_int) -> io::Result<()> {
 /// # Errors
 /// Returns the `fcntl` failure.
 pub fn barrier(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     fcntl_flush(fd, libc::F_BARRIERFSYNC)?;
     trace_event!(
@@ -97,6 +98,7 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
 /// # Errors
 /// Returns the `fcntl` failure.
 pub fn full_flush(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     fcntl_flush(fd, libc::F_FULLFSYNC)?;
     trace_event!(
@@ -116,6 +118,7 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
 /// # Errors
 /// Returns the `fsync` failure.
 pub fn kick(file: impl AsFd, _offset: u64, _len: u64) -> io::Result<()> {
+    trace_serial!();
     let fd = file.as_fd();
     fsync_raw(fd)?;
     trace_event!(
@@ -149,6 +152,7 @@ pub fn rename_noreplace_at(
     to_dir: impl AsFd,
     to: &CStr,
 ) -> io::Result<()> {
+    trace_serial!();
     let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
     // SAFETY: both descriptors are live for the call and both names are
     // NUL-terminated and outlive it.
@@ -280,11 +284,12 @@ pub fn set_thread_qos(class: Qos) -> io::Result<bool> {
 pub fn thread_qos() -> io::Result<Option<Qos>> {
     let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
     let mut priority: libc::c_int = 0;
-    // SAFETY: `pthread_self` names the live calling thread, and both out
-    // pointers are live, exclusively borrowed locals of the expected types.
-    let ret = unsafe {
-        libc::pthread_get_qos_class_np(libc::pthread_self(), &raw mut class, &raw mut priority)
-    };
+    // SAFETY: `pthread_self` takes no arguments and only names the calling
+    // thread.
+    let thread = unsafe { libc::pthread_self() };
+    // SAFETY: `thread` is the live calling thread, and both out pointers are
+    // live, exclusively borrowed locals of the expected types.
+    let ret = unsafe { libc::pthread_get_qos_class_np(thread, &raw mut class, &raw mut priority) };
     if ret != 0 {
         return Err(io::Error::from_raw_os_error(ret));
     }

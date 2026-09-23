@@ -145,6 +145,7 @@ pub fn openat_beneath(root: impl AsFd, rel: &Path, mode: OpenMode) -> io::Result
 
 /// Create `name` in `dir` as a new regular file (`O_EXCL`, never follows).
 pub(super) fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<OwnedFd> {
+    trace_serial!();
     let fd = openat_raw(
         dir,
         name,
@@ -157,7 +158,8 @@ pub(super) fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io:
             dir: Some(fstat(dir)?.node),
             name: Some(name.to_bytes().to_vec()),
             node: fstat(&fd)?.node,
-            mode: mode & 0o7777,
+            // The effective mode, after the umask.
+            mode: fstat(&fd)?.permissions(),
         })
     );
     Ok(fd)
@@ -268,15 +270,38 @@ pub fn pread_full(fd: impl AsFd, buf: &mut [u8], offset: u64) -> io::Result<usiz
 /// Returns the `pwrite` failure, `WriteZero` if the kernel accepts nothing, or
 /// `InvalidInput` for an offset past `i64::MAX`.
 pub fn pwrite_all(fd: impl AsFd, buf: &[u8], offset: u64) -> io::Result<()> {
+    trace_serial!();
     let fd = fd.as_fd();
-    let raw = fd.as_raw_fd();
     let mut done = 0_usize;
-    while let Some(rest) = buf.get(done..) {
+    let result = pwrite_loop(fd, buf, offset, &mut done);
+    // Bytes the kernel accepted are traced even when a later chunk fails, so
+    // the trace never under-reports what reached the page cache.
+    if done > 0 {
+        trace_event!(
+            "pwrite",
+            buf.get(..done)
+                .ok_or_else(invalid_input)
+                .and_then(|written| {
+                    Ok(super::trace::Event::Write {
+                        node: fstat(fd)?.node,
+                        offset,
+                        data: written.to_vec(),
+                        digest: *blake3::hash(written).as_bytes(),
+                    })
+                })
+        );
+    }
+    result
+}
+
+fn pwrite_loop(fd: BorrowedFd<'_>, buf: &[u8], offset: u64, done: &mut usize) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    while let Some(rest) = buf.get(*done..) {
         if rest.is_empty() {
             break;
         }
         let at =
-            to_off_t(offset.saturating_add(u64::try_from(done).map_err(|_| invalid_input())?))?;
+            to_off_t(offset.saturating_add(u64::try_from(*done).map_err(|_| invalid_input())?))?;
         // SAFETY: `rest` is a live borrowed slice, so its pointer is valid for
         // reads of `rest.len()` bytes; the descriptor is live.
         let wrote = unsafe { libc::pwrite(raw, rest.as_ptr().cast(), rest.len(), at) };
@@ -290,17 +315,8 @@ pub fn pwrite_all(fd: impl AsFd, buf: &[u8], offset: u64) -> io::Result<()> {
         if wrote == 0 {
             return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
-        done = done.saturating_add(usize::try_from(wrote).map_err(|_| invalid_input())?);
+        *done = done.saturating_add(usize::try_from(wrote).map_err(|_| invalid_input())?);
     }
-    trace_event!(
-        "pwrite",
-        Ok(super::trace::Event::Write {
-            node: fstat(fd)?.node,
-            offset,
-            data: buf.to_vec(),
-            digest: *blake3::hash(buf).as_bytes(),
-        })
-    );
     Ok(())
 }
 
@@ -309,6 +325,7 @@ pub fn pwrite_all(fd: impl AsFd, buf: &[u8], offset: u64) -> io::Result<()> {
 /// # Errors
 /// Returns the `fchmod` failure.
 pub fn fchmod(fd: impl AsFd, mode: u32) -> io::Result<()> {
+    trace_serial!();
     let fd = fd.as_fd();
     let bits = super::sys::to_mode_t(mode & 0o7777)?;
     // SAFETY: the descriptor is live for the call; `fchmod` takes no pointers.
@@ -328,6 +345,7 @@ pub fn fchmod(fd: impl AsFd, mode: u32) -> io::Result<()> {
 /// # Errors
 /// Returns the `unlinkat` failure.
 pub fn unlinkat(dir: impl AsFd, name: &CStr, remove_dir: bool) -> io::Result<()> {
+    trace_serial!();
     let dir = dir.as_fd();
     let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: the descriptor is live for the call and `name` is NUL-terminated
@@ -348,6 +366,7 @@ pub fn unlinkat(dir: impl AsFd, name: &CStr, remove_dir: bool) -> io::Result<()>
 /// # Errors
 /// Returns the `mkdirat` failure; an existing name is `EEXIST`.
 pub fn mkdirat(dir: impl AsFd, name: &CStr, mode: u32) -> io::Result<()> {
+    trace_serial!();
     let dir = dir.as_fd();
     let bits = super::sys::to_mode_t(mode & 0o7777)?;
     // SAFETY: the descriptor is live for the call and `name` is NUL-terminated
@@ -359,7 +378,8 @@ pub fn mkdirat(dir: impl AsFd, name: &CStr, mode: u32) -> io::Result<()> {
             dir: fstat(dir)?.node,
             name: name.to_bytes().to_vec(),
             node: fstatat_nofollow(dir, name)?.node,
-            mode: mode & 0o7777,
+            // The effective mode, after the umask.
+            mode: fstatat_nofollow(dir, name)?.permissions(),
         })
     );
     Ok(())
@@ -371,6 +391,7 @@ pub fn mkdirat(dir: impl AsFd, name: &CStr, mode: u32) -> io::Result<()> {
 /// # Errors
 /// Returns the `linkat` failure.
 pub fn linkat(from_dir: impl AsFd, from: &CStr, to_dir: impl AsFd, to: &CStr) -> io::Result<()> {
+    trace_serial!();
     let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
     // SAFETY: both descriptors are live for the call, both names are
     // NUL-terminated and outlive it, and flag 0 never follows a symlink.

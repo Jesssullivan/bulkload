@@ -184,7 +184,11 @@ impl SlabPool {
     /// # Errors
     /// `OutOfMemory` if a first-use allocation fails.
     pub fn take_timeout(&self, timeout: Duration) -> io::Result<Option<Slab>> {
-        self.acquire(Wait::Until(Instant::now() + timeout))
+        // A timeout too large to represent as a deadline waits forever.
+        let wait = Instant::now()
+            .checked_add(timeout)
+            .map_or(Wait::Forever, Wait::Until);
+        self.acquire(wait)
     }
 
     pub fn stats(&self) -> PoolStats {
