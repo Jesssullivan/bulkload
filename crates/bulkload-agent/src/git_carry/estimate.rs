@@ -14,16 +14,17 @@
 //! frontier come from one connection. Every later source command names the
 //! probed git dir with `--git-dir`, never the path it was given.
 //!
-//! The negotiation model is upload-pack's, fed the destination's tips as haves:
-//! - haves are the destination tips the source holds, minus any have that is a
-//!   parent of another have (upload-pack drops those when the child arrives
-//!   first; dropping them always keeps the figure an upper bound);
+//! The negotiation model is upload-pack's, fed M1's first round (R-N113,
+//! R-N116):
+//! - haves are *every* destination tip the source holds, offered ancestors
+//!   first (topological order), so upload-pack keeps each one as an exclusion
+//!   and returns its smallest pack;
 //! - wants are the source's probed tips and stash entries, minus every tip the
 //!   destination already holds;
 //! - for a shallow destination (R-N75 guarantees its frontier equals the
 //!   source's), `pack-objects` runs as upload-pack runs it for a shallow client:
 //!   `--shallow-file ''`, `--shallow` and one `--shallow <oid>` line per
-//!   boundary commit, so the walk is edge-aggressive over the kept haves.
+//!   boundary commit, so the walk is edge-aggressive over every have.
 //!
 //! The source then walks the wants minus the haves (`rev-list --objects
 //! --missing=print`), refusing a non-partial source that cannot reach an object
@@ -34,19 +35,25 @@
 //! pack is exactly the walked set; the M1 sender must pin both too, or it can
 //! send a different set.
 //!
-//! **Gate (R-N97, R-N113):** sent bytes ≤ 1.1 × `missing_thin_pack_bytes`, and
-//! sent objects ≤ `missing_objects`. M1's first round sends *exactly* the
-//! destination's held tips (every destination tip the source holds) as haves,
-//! and the exactness oracle is upload-pack run over exactly that have set, not
-//! `git fetch`'s newest-first negotiation. The estimate equals that oracle up
-//! to the order the haves arrive in: dropping a have implied by a child have
-//! gives upload-pack's largest pack. Haves beyond the held tips are not free:
-//! for a shallow destination an extra intermediate have makes upload-pack drop
-//! the have it implies, and the shallow walk marks only the trees of the haves
-//! it keeps, so an extra have can *enlarge* the pack (reviewer fixture A3:
-//! 232 B with the held tips, 3,919 B once the parent is offered too). Ancestor
-//! probing (`GitHaveQuery`) must therefore not add haves to a shallow
-//! destination's first round.
+//! **Gate (R-N97, R-N113, R-N116):** sent bytes ≤ 1.1 ×
+//! `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`. M1's
+//! first round sends *exactly* the destination's held tips (every destination
+//! tip the source holds) as haves, in topological order, ancestors first. The
+//! exactness oracle is upload-pack run over exactly that have list in that
+//! order, not `git fetch`'s newest-first negotiation; the estimate equals it.
+//! Shallow rule: a shallow destination must be shallow at the source's
+//! frontier (R-N75), the request carries its `shallow <oid>` lines, and
+//! upload-pack packs with `--shallow`, marking the trees of every have.
+//!
+//! Order matters because upload-pack drops a have whose child it has already
+//! seen. For a shallow destination that shrinks the exclusion: offered child
+//! first, the parent's tree is no longer marked (reviewer fixture P1: 162 B
+//! ancestors first, 3,889 B child first). Haves beyond the held tips are not
+//! free either: an extra intermediate have makes upload-pack drop the have it
+//! implies, so it can *enlarge* a shallow pack (fixture A3: 232 B with the
+//! held tips, 3,919 B once the parent is offered too). Extra haves can shrink
+//! a non-shallow pack. Ancestor probing (`GitHaveQuery`) must therefore not
+//! add haves to a shallow destination's first round.
 //!
 //! The pack also depends on `pack.threads` and `pack.windowMemory`, which
 //! [`git`] pins to 2 and 64m for every call; the M1 sender must pin them the
@@ -204,25 +211,27 @@ const REDACTED: &str = "[redacted]";
 
 /// One line of at most [`DETAIL_LIMIT`] characters from a child's stderr.
 ///
-/// Before redaction, ASCII blanks become spaces and every other control,
-/// Unicode whitespace, format (`Cf`) or invisible character is dropped, so no
-/// escape, bidi override or zero-width character can split a secret past the
-/// redactor.
+/// Before redaction, every whitespace or control character (ASCII or Unicode:
+/// NBSP, EM SPACE, U+2028, NUL, BS, DEL, ...) becomes a space, so it separates
+/// a key from its value, and every invisible or format (`Cf`) character is
+/// dropped, so it cannot split a word. A token prefix split across two words
+/// (`gh p_...`) redacts both.
 fn detail(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let cleaned: String = text
         .chars()
         .filter_map(|c| {
-            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}') {
-                Some(' ')
-            } else if c.is_control() || c.is_whitespace() || invisible(c) {
+            if invisible(c) {
                 None
+            } else if c.is_whitespace() || c.is_control() {
+                Some(' ')
             } else {
                 Some(c)
             }
         })
         .collect();
-    let line = redact_words(cleaned.split(' ').filter(|word| !word.is_empty())).join(" ");
+    let words: Vec<&str> = cleaned.split(' ').filter(|word| !word.is_empty()).collect();
+    let line = redact_words(&words).join(" ");
     if line.is_empty() {
         return None;
     }
@@ -269,23 +278,48 @@ const fn invisible(c: char) -> bool {
 }
 
 /// Words whose value, inline or in the next word, is an authorization scheme
-/// followed by the credential itself.
+/// followed by the credential itself (`Bearer`, `Bearer:`, `basic=`).
 fn scheme_word(value: &str) -> bool {
     matches!(
-        value.trim_matches(['"', '\'', ',', ';']),
+        value.trim_matches(['"', '\'', ',', ';', ':', '=']),
         "bearer" | "basic" | "digest" | "token" | "negotiate"
     )
 }
 
-/// Redact credential-shaped words, and the value after a key such as
-/// `password:`, `token =` or `Authorization: Bearer`.
-fn redact_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut redacted = Vec::new();
-    let mut pending = 0_u8;
-    let mut rest_of_line = false;
+const TOKEN_PREFIXES: [&str; 8] = [
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "github_pat_",
+    "glpat-",
+    "xox",
+    "AKIA",
+];
+
+/// Index of the word where a PEM header (`-----BEGIN`) starts, even when a
+/// line break or spaces split it (`-----BEG` / `IN`, `----- BEGIN`).
+fn pem_start(words: &[&str]) -> Option<usize> {
+    let mut squashed = String::new();
+    let mut starts = Vec::with_capacity(words.len());
     for word in words {
+        starts.push(squashed.len());
+        squashed.push_str(&word.to_ascii_lowercase());
+    }
+    let at = squashed.find("-----begin")?;
+    starts.iter().rposition(|start| *start <= at)
+}
+
+/// Redact credential-shaped words, the value after a key such as
+/// `password:`, `token =` or `Authorization: Bearer`, everything from a PEM
+/// header on, and token prefixes split across two words.
+fn redact_words(words: &[&str]) -> Vec<String> {
+    let pem = pem_start(words);
+    let mut redacted = Vec::with_capacity(words.len());
+    let mut pending = 0_u8;
+    for (index, word) in words.iter().enumerate() {
         let lower = word.to_ascii_lowercase();
-        if rest_of_line {
+        if pem.is_some_and(|start| index >= start) {
             redacted.push(REDACTED.to_owned());
             continue;
         }
@@ -297,12 +331,6 @@ fn redact_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
             if lower.trim_matches([':', '=']).is_empty() || scheme_word(&lower) {
                 pending = 1;
             }
-            continue;
-        }
-        if lower.contains("-----begin") {
-            // A PEM block: everything after its header is key material.
-            redacted.push(REDACTED.to_owned());
-            rest_of_line = true;
             continue;
         }
         if let Some(value) = sensitive_key(&lower) {
@@ -318,6 +346,21 @@ fn redact_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
         }
         redacted.push(redact(word));
     }
+    for (index, pair) in words.windows(2).enumerate() {
+        let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        let joined = format!("{first}{second}");
+        if TOKEN_PREFIXES.iter().any(|prefix| {
+            joined.contains(prefix) && !first.contains(prefix) && !second.contains(prefix)
+        }) {
+            for at in [index, index + 1] {
+                if let Some(slot) = redacted.get_mut(at) {
+                    REDACTED.clone_into(slot);
+                }
+            }
+        }
+    }
     redacted
 }
 
@@ -329,70 +372,83 @@ enum KeyValue {
     Inline(String),
 }
 
+/// What must follow a key for it to name a secret.
+#[derive(Clone, Copy)]
+enum Follow {
+    /// Anything: `password hunter2` redacts `hunter2`.
+    Any,
+    /// `:` or `=`: short words like `pass` or `signature` are ordinary
+    /// English until a separator makes them a key.
+    Separator,
+    /// `=` only: query and cookie keys (`?code=`, `session=`).
+    Equals,
+}
+
 /// The value's place when `lower` names a secret at a word boundary.
 fn sensitive_key(lower: &str) -> Option<KeyValue> {
-    const KEYS: [&str; 19] = [
-        "password",
-        "passwd",
-        "passphrase",
-        "pass",
-        "pwd",
-        "token",
-        "secret",
-        "authorization",
-        "bearer",
-        "api_key",
-        "apikey",
-        "api-key",
-        "credential",
-        "private_key",
-        "access_key",
-        "cookie",
-        "sig",
-        "signature",
-        "x-amz-signature",
+    const KEYS: [(&str, Follow); 24] = [
+        ("password", Follow::Any),
+        ("passwd", Follow::Any),
+        ("passphrase", Follow::Any),
+        ("token", Follow::Any),
+        ("secret", Follow::Any),
+        ("authorization", Follow::Any),
+        ("bearer", Follow::Any),
+        ("api_key", Follow::Any),
+        ("apikey", Follow::Any),
+        ("api-key", Follow::Any),
+        ("credential", Follow::Any),
+        ("private_key", Follow::Any),
+        ("access_key", Follow::Any),
+        ("x-amz-signature", Follow::Any),
+        ("pass", Follow::Separator),
+        ("pwd", Follow::Separator),
+        ("sig", Follow::Separator),
+        ("signature", Follow::Separator),
+        ("cookie", Follow::Separator),
+        ("auth", Follow::Equals),
+        ("key", Follow::Equals),
+        ("code", Follow::Equals),
+        ("session", Follow::Equals),
+        ("sid", Follow::Equals),
     ];
-    KEYS.iter().find_map(|key| {
-        let (at, _) = lower.match_indices(key).find(|(at, _)| {
-            let before = lower.get(..*at).and_then(|head| head.chars().next_back());
-            let after = lower
-                .get(at + key.len()..)
-                .and_then(|tail| tail.chars().next());
-            !before.is_some_and(|c| c.is_ascii_alphanumeric())
-                && !after.is_some_and(|c| c.is_ascii_alphabetic())
-        })?;
-        let rest = lower.get(at + key.len()..).unwrap_or("");
-        let rest = rest.trim_start_matches(['"', '\'']);
-        let separated = rest.trim_start_matches([':', '=']);
-        let value = separated.trim_matches(['"', '\'', ',', ';', '}', '{']);
-        if separated.len() == rest.len() || value.is_empty() {
-            return Some(KeyValue::Next);
-        }
-        Some(KeyValue::Inline(value.to_owned()))
+    KEYS.iter().find_map(|(key, follow)| {
+        lower.match_indices(key).find_map(|(at, _)| {
+            let before = lower.get(..at).and_then(|head| head.chars().next_back());
+            let tail = lower.get(at + key.len()..).unwrap_or("");
+            if before.is_some_and(|c| c.is_ascii_alphanumeric())
+                || tail.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            {
+                return None;
+            }
+            let rest = tail.trim_start_matches(['"', '\'']);
+            let separator = rest.chars().next();
+            let accepted = match follow {
+                Follow::Any => true,
+                Follow::Separator => matches!(separator, Some(':' | '=')),
+                Follow::Equals => separator == Some('='),
+            };
+            if !accepted {
+                return None;
+            }
+            let separated = rest.trim_start_matches([':', '=']);
+            let value = separated.trim_matches(['"', '\'', ',', ';', '}', '{']);
+            if separated.len() == rest.len() || value.is_empty() {
+                return Some(KeyValue::Next);
+            }
+            Some(KeyValue::Inline(value.to_owned()))
+        })
     })
 }
 
 /// Drop anything credential-shaped from one word of diagnostic text.
 fn redact(word: &str) -> String {
-    const TOKEN_PREFIXES: [&str; 8] = [
-        "ghp_",
-        "gho_",
-        "ghs_",
-        "ghu_",
-        "github_pat_",
-        "glpat-",
-        "xox",
-        "AKIA",
-    ];
     if TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix)) {
         return REDACTED.to_owned();
     }
     if let Some((scheme, rest)) = word.split_once("://") {
-        // Userinfo runs to the last `@`. It is a credential when it holds a
-        // `:` (a password, which may itself contain `/`) or no `/` at all
-        // (a bare token); `https://host/@scope` is a path, not userinfo.
         if let Some((userinfo, host)) = rest.rsplit_once('@') {
-            if userinfo.contains(':') || !userinfo.contains('/') {
+            if url_credential(userinfo) {
                 return format!("{scheme}://{REDACTED}@{host}");
             }
         }
@@ -410,6 +466,18 @@ fn redact(word: &str) -> String {
         }
     }
     word.to_owned()
+}
+
+/// Whether the text between `://` and a URL's last `@` is userinfo. A bare
+/// token (no `/`) is; so is `user:password`, even when the password holds a
+/// `/`. `host/@scope` and `host:443/@scope` are a path after a host and port.
+fn url_credential(userinfo: &str) -> bool {
+    let Some((authority, _)) = userinfo.split_once('/') else {
+        return true;
+    };
+    authority
+        .split_once(':')
+        .is_some_and(|(_, after)| !after.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Object count and stored bytes of one Git object type.
@@ -497,10 +565,6 @@ pub struct CarryEstimate {
     pub destination_shallow_count: usize,
     /// Destination tips that exist as objects in the source.
     pub haves_used: usize,
-    /// Held tips left out of the request because another held tip is their
-    /// child commit: upload-pack drops them the same way when the child
-    /// arrives first, so dropping them always gives its largest pack (R-N113).
-    pub haves_implied: usize,
     /// Lines in the source's shallow file.
     pub source_shallow_count: usize,
     /// Whether the source is a partial clone (it may then lack objects).
@@ -536,7 +600,6 @@ impl CarryEstimate {
                 self.destination_shallow_count
             ),
             format!("haves_used={}", self.haves_used),
-            format!("haves_implied_by_a_child_have={}", self.haves_implied),
             format!(
                 "destination_tips_unknown_to_source={}",
                 self.destination_tip_count.saturating_sub(self.haves_used)
@@ -558,8 +621,9 @@ impl CarryEstimate {
         }
         lines.push("gate_metric=missing_thin_pack_bytes".to_owned());
         lines.push(
-            "gate_rule=R-N97,R-N113 sent_bytes<=1.1*missing_thin_pack_bytes \
-             sent_objects<=missing_objects oracle=upload-pack(haves=exactly_every_held_tip)"
+            "gate_rule=R-N97,R-N113,R-N116 sent_bytes<=1.1*missing_thin_pack_bytes \
+             sent_objects<=missing_objects oracle=upload-pack(haves=every_held_tip,\
+             order=ancestors_first; shallow: frontier=source's, shallow_lines, --shallow)"
                 .to_owned(),
         );
         lines.push(
@@ -618,7 +682,9 @@ pub fn estimate(
         ceiling: own.ceiling,
     };
     let held = present(&repo, &offer.tips)?;
-    let (haves, haves_implied) = drop_implied_haves(&repo, &held)?;
+    // R-N116: M1 offers every held tip, ancestors first, so upload-pack keeps
+    // each one as an exclusion; the request carries them all.
+    let haves: Vec<String> = held.iter().map(|(value, _)| value.clone()).collect();
     let stash = stash_entries(&repo)?;
     let mut wants = own.tips;
     wants.extend(stash.iter().cloned());
@@ -646,7 +712,6 @@ pub fn estimate(
         destination_tip_count: offer.tips.len(),
         destination_shallow_count: offer.shallow.len(),
         haves_used: held.len(),
-        haves_implied,
         source_shallow_count: own.shallow.len(),
         source_partial: own.partial,
         stash_entries: stash.len(),
@@ -989,54 +1054,6 @@ fn present(source: &Repository, tips: &BTreeSet<String>) -> Result<Vec<(String, 
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     Ok(haves)
-}
-
-/// Haves to send: `held` minus every commit that is a parent of another held
-/// commit, and the number so left out. upload-pack marks a have's parents as
-/// known and then skips them as haves when they arrive later; a fetch client
-/// offers newest first, so a parent normally arrives after its child. Leaving
-/// them out regardless can only shrink the exclusion, so the estimate stays an
-/// upper bound (R-N97).
-fn drop_implied_haves(
-    source: &Repository,
-    held: &[(String, String)],
-) -> Result<(Vec<String>, usize)> {
-    let mut request = String::new();
-    for (value, kind) in held {
-        if kind == "commit" {
-            request.push_str(value);
-            request.push('\n');
-        }
-    }
-    let mut parents = BTreeSet::new();
-    if !request.is_empty() {
-        let listed = feed(
-            hardened(source).args(["rev-list", "--no-walk=unsorted", "--parents", "--stdin"]),
-            request.as_bytes(),
-        )?;
-        let listed =
-            String::from_utf8(listed).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-        for line in listed.lines() {
-            let mut fields = line.split(' ');
-            if !fields.next().is_some_and(oid) {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            for parent in fields {
-                if !oid(parent) {
-                    return Err(BulkloadRefusal::GitInventoryMalformed);
-                }
-                parents.insert(parent.to_owned());
-            }
-        }
-    }
-    let kept: Vec<String> = held
-        .iter()
-        .map(|(value, _)| value)
-        .filter(|value| !parents.contains(*value))
-        .cloned()
-        .collect();
-    let implied = held.len() - kept.len();
-    Ok((kept, implied))
 }
 
 /// Every stash reflog entry, newest first; empty when there is no stash.
@@ -1840,7 +1857,6 @@ mod tests {
             destination_tip_count: 3,
             destination_shallow_count: 0,
             haves_used: 2,
-            haves_implied: 0,
             source_shallow_count: 0,
             source_partial: false,
             stash_entries: 0,
@@ -1871,7 +1887,6 @@ mod tests {
             destination_tip_count: 1,
             destination_shallow_count: 0,
             haves_used: 2,
-            haves_implied: 0,
             source_shallow_count: 0,
             source_partial: false,
             stash_entries: 0,
@@ -2293,8 +2308,10 @@ mod tests {
         assert_eq!(sent.objects, 4);
     }
 
-    /// N3: a have that is a parent of another have is dropped, as
-    /// upload-pack drops it, so the estimate stays an upper bound (R-N97).
+    /// N3 / R-N116: a shallow destination holding a commit and its parent.
+    /// M1 offers them ancestors first, so upload-pack keeps both and the
+    /// estimate equals it; `git fetch` offers newest first, upload-pack drops
+    /// the parent, and the fetch sends more.
     #[test]
     fn shallow_destination_with_a_parent_have_matches_a_real_fetch() {
         let fixture = Fixture::new("shallow-parent-have");
@@ -2317,9 +2334,12 @@ mod tests {
         dated_commit(&source, "x.txt", "one", 5);
         dated_commit(&source, "z.txt", "three", 6);
         let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        let (wants, haves) = r_n113_request(&source, &destination);
+        let oracle = upload_pack_oracle(&source, &wants, &haves, &shallow_of(&destination));
+        assert_eq!(result.thin_pack, oracle);
+        assert_eq!(result.missing.objects(), oracle.objects);
         let sent = real_fetch(&fixture, &destination, &source, PINNED_UPLOAD_PACK);
-        assert_eq!(result.thin_pack, sent);
-        assert_eq!(result.missing.objects(), sent.objects);
+        assert!(sent.objects > oracle.objects, "{sent:?} vs {oracle:?}");
     }
 
     fn partial_destination_fixture(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
@@ -2551,16 +2571,58 @@ mod tests {
         tips
     }
 
-    /// R-N113's request for `destination` against `source`: the wants (source
-    /// tips not held) and, as haves, exactly every destination tip the source
-    /// holds.
+    /// R-N113/R-N116's request for `destination` against `source`: the wants
+    /// (source tips not held) and, as haves, exactly every destination tip the
+    /// source holds, ancestors first (topological order over their commits).
     fn r_n113_request(source: &Path, destination: &Path) -> (BTreeSet<String>, Vec<String>) {
         let held: BTreeSet<String> = tips_of(destination)
             .into_iter()
             .filter(|tip| output(git(source).args(["cat-file", "-e", tip])).is_ok())
             .collect();
         let wants = tips_of(source).difference(&held).cloned().collect();
-        (wants, held.into_iter().collect())
+        (wants, ancestors_first(source, &held))
+    }
+
+    /// `held` ordered so every commit comes after its held ancestors: the
+    /// order in which upload-pack keeps every have (R-N116).
+    fn ancestors_first(source: &Path, held: &BTreeSet<String>) -> Vec<String> {
+        let mut peeled: Vec<(String, Option<String>)> = held
+            .iter()
+            .map(|tip| {
+                let commit = text(git(source).args([
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("{tip}^{{commit}}"),
+                ]))
+                .ok();
+                (tip.clone(), commit)
+            })
+            .collect();
+        let commits: Vec<&String> = peeled
+            .iter()
+            .filter_map(|(_, commit)| commit.as_ref())
+            .collect();
+        let order: Vec<String> = if commits.is_empty() {
+            Vec::new()
+        } else {
+            text(
+                git(source)
+                    .args(["rev-list", "--topo-order", "--reverse"])
+                    .args(&commits),
+            )
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+        };
+        peeled.sort_by_key(|(_, commit)| {
+            commit
+                .as_ref()
+                .and_then(|commit| order.iter().position(|value| value == commit))
+                .map_or(0, |at| at + 1)
+        });
+        peeled.into_iter().map(|(tip, _)| tip).collect()
     }
 
     fn shallow_of(repo: &Path) -> BTreeSet<String> {
@@ -2724,7 +2786,7 @@ mod tests {
             (b"pwd=hunter2", "hunter2"),
             (b"pass: hunter2", "hunter2"),
             (b"Cookie: session=hunter2", "hunter2"),
-            (b"sig hunter2", "hunter2"),
+            (b"sig=hunter2", "hunter2"),
             (b"x-amz-signature: deadbeefcafe", "deadbeefcafe"),
             (b"PRIVATE-TOKEN: glsecretvalue", "glsecretvalue"),
             (b"password:\nhunter2", "hunter2"),
@@ -2753,6 +2815,34 @@ mod tests {
                 b"-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA",
                 "b3BlbnNzaC1rZXktdjEAAAAA",
             ),
+            // R4-3: whitespace and controls separate key from value.
+            ("fatal: password\u{a0}hunter2".as_bytes(), "hunter2"),
+            ("token\u{2003}hunter2".as_bytes(), "hunter2"),
+            ("password\u{2028}hunter2".as_bytes(), "hunter2"),
+            (b"passwd\0hunter2", "hunter2"),
+            (b"password\x08hunter2", "hunter2"),
+            (b"password\x7fhunter2", "hunter2"),
+            (
+                b"Authorization: Bearer: eyJhbGciOiJIUzI1NiJ9sekrit",
+                "eyJhbGciOiJIUzI1NiJ9sekrit",
+            ),
+            // R4-4: query keys, split and spaced PEM headers.
+            (b"https://h/x?auth=s3cr3tvalue", "s3cr3tvalue"),
+            (b"https://h/x?key=s3cr3tvalue", "s3cr3tvalue"),
+            (b"https://h/x?code=s3cr3tvalue", "s3cr3tvalue"),
+            (b"session=s3cr3tvalue", "s3cr3tvalue"),
+            (
+                b"-----BEG\nIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAxq9Zbody",
+                "MIIEowIBAAKCAQEAxq9Zbody",
+            ),
+            (
+                b"----- BEGIN PRIVATE KEY -----\nMIIEowIBAAKCAQEAxq9Zbody",
+                "MIIEowIBAAKCAQEAxq9Zbody",
+            ),
+            (
+                b"-----BEGIN OPENSSH PRIVATE KEY-----\r\nb3BlbnNzaC1rZXktdjEAAAAA\r\n",
+                "b3BlbnNzaC1rZXktdjEAAAAA",
+            ),
         ];
         for (input, secret) in cases {
             let out = detail(input).unwrap_or_default();
@@ -2762,7 +2852,11 @@ mod tests {
                 String::from_utf8_lossy(input)
             );
         }
-        // Ordinary diagnostics survive.
+    }
+
+    /// R4-4: ordinary diagnostics survive redaction unchanged.
+    #[test]
+    fn redaction_keeps_ordinary_diagnostics() {
         let kept = detail(b"ssh: connect to host sting port 22: Connection timed out").unwrap();
         assert_eq!(
             kept,
@@ -2773,5 +2867,137 @@ mod tests {
             kept,
             "fatal: bypass passed; design signed https://h/@scope/pkg"
         );
+        // R4-4: short keys need `=` or `:`; a port is not a password.
+        for keep in [
+            "hint: pass --force to override",
+            "error: no signature found",
+            "gpg: Signature made Tue 23 Sep",
+            "fetch https://host:443/@scope/pkg",
+            "exit status 128",
+        ] {
+            assert_eq!(detail(keep.as_bytes()).unwrap(), keep);
+        }
+    }
+
+    // ---- PR #55 review r4 (R-N116) -----------------------------------------
+
+    /// R-N116, reviewer fixture P1: shallow destination holding a parent P
+    /// and its child C. Whatever order the tips list in (four seeds give both
+    /// hex orders), ancestors-first upload-pack keeps both haves and equals
+    /// the estimate; child-first it drops P and sends more.
+    #[test]
+    fn parent_and_child_held_tips_equal_upload_pack_ancestors_first() {
+        for seed in 1..=4_u64 {
+            let fixture = Fixture::new(&format!("r4-p1-{seed}"));
+            let origin = fixture.repo("origin");
+            dated_commit(&origin, "base.txt", &format!("base{seed}"), 1);
+            let boundary = dated_commit(&origin, "keep.txt", &noise(80 + seed, 50), 2);
+            let parent = dated_commit(&origin, "g.txt", &noise(82, 400), 3);
+            output(git(&origin).args(["branch", "old", &parent])).unwrap();
+            output(git(&origin).args(["rm", "--quiet", "g.txt"])).unwrap();
+            let child = dated_commit(&origin, "rm.txt", "rm", 4);
+            let source = fixture.plain_clone(&origin, "source");
+            let destination = fixture.plain_clone(&origin, "destination");
+            for repo in [&source, &destination] {
+                std::fs::write(repo.join(".git/shallow"), format!("{boundary}\n")).unwrap();
+            }
+            output(git(&destination).args(["branch", "--quiet", "old", "origin/old"])).unwrap();
+            dated_commit(&source, "g.txt", &noise(82, 400), 6);
+            let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+            let (wants, haves) = r_n113_request(&source, &destination);
+            assert_eq!(haves, vec![parent.clone(), child.clone()], "seed {seed}");
+            let frontier = shallow_of(&destination);
+            let oracle = upload_pack_oracle(&source, &wants, &haves, &frontier);
+            assert_eq!(result.thin_pack, oracle, "seed {seed}");
+            let child_first = upload_pack_oracle(&source, &wants, &[child, parent], &frontier);
+            assert!(child_first.objects > oracle.objects, "seed {seed}");
+        }
+    }
+
+    /// R-N116, reviewer fixture M: merge, annotated tags and three branches,
+    /// non-shallow and shallow (one frontier). The estimate equals
+    /// upload-pack over every held tip, ancestors first.
+    #[test]
+    fn merges_tags_and_branches_equal_upload_pack_ancestors_first() {
+        let fixture = Fixture::new("r4-m");
+        let origin = fixture.repo("origin");
+        let boundary = dated_commit(&origin, "keep.txt", &noise(111, 50), 1);
+        output(git(&origin).args(["checkout", "--quiet", "-b", "side"])).unwrap();
+        let side = dated_commit(&origin, "s.txt", &noise(112, 300), 2);
+        output(git(&origin).args(["tag", "-a", "-m", "t", "vs", &side])).unwrap();
+        output(git(&origin).args(["rm", "--quiet", "s.txt"])).unwrap();
+        dated_commit(&origin, "rm.txt", "rm", 3);
+        output(git(&origin).args(["checkout", "--quiet", "main"])).unwrap();
+        dated_commit(&origin, "m.txt", &noise(113, 100), 4);
+        output(git(&origin).args(["merge", "--quiet", "--no-edit", "side"])).unwrap();
+        output(git(&origin).args(["checkout", "--quiet", "-b", "other"])).unwrap();
+        dated_commit(&origin, "t.txt", &noise(114, 200), 6);
+        output(git(&origin).args(["checkout", "--quiet", "main"])).unwrap();
+        let destination = fixture.plain_clone(&origin, "destination");
+        let source = fixture.plain_clone(&origin, "source");
+        for repo in [&destination, &source] {
+            output(git(repo).args(["fetch", "--quiet", "--tags", "origin"])).unwrap();
+            output(git(repo).args(["branch", "--quiet", "side", "origin/side"])).unwrap();
+        }
+        output(git(&destination).args(["branch", "--quiet", "other", "origin/other"])).unwrap();
+        let tip = dated_commit(&source, "s.txt", &noise(112, 300), 7);
+        output(git(&source).args(["tag", "-a", "-m", "t2", "v2", &tip])).unwrap();
+        output(git(&source).args(["checkout", "--quiet", "-b", "feat", "origin/other"])).unwrap();
+        dated_commit(&source, "t2.txt", &format!("{}x", noise(114, 200)), 9);
+        output(git(&source).args(["checkout", "--quiet", "main"])).unwrap();
+        for shallow in [false, true] {
+            if shallow {
+                for repo in [&source, &destination] {
+                    std::fs::write(repo.join(".git/shallow"), format!("{boundary}\n")).unwrap();
+                }
+            }
+            let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+            let (wants, haves) = r_n113_request(&source, &destination);
+            let oracle = upload_pack_oracle(&source, &wants, &haves, &shallow_of(&destination));
+            assert_eq!(result.thin_pack, oracle, "shallow={shallow}");
+            assert_eq!(
+                result.missing.objects(),
+                oracle.objects,
+                "shallow={shallow}"
+            );
+        }
+    }
+
+    /// R-N116, reviewer fixture F: shallow at two frontiers (two roots), the
+    /// held grandparent on the second root.
+    #[test]
+    fn two_frontier_shallow_destination_equals_upload_pack_ancestors_first() {
+        let fixture = Fixture::new("r4-f");
+        let origin = fixture.repo("origin");
+        dated_commit(&origin, "a0.txt", "a0", 1);
+        let first = dated_commit(&origin, "a1.txt", &noise(121, 50), 2);
+        output(git(&origin).args(["checkout", "--quiet", "--orphan", "r2"])).unwrap();
+        output(git(&origin).args(["rm", "-r", "-f", "--quiet", "."])).unwrap();
+        dated_commit(&origin, "b0.txt", "b0", 3);
+        let second = dated_commit(&origin, "b1.txt", &noise(122, 50), 4);
+        let held = dated_commit(&origin, "h.txt", &noise(123, 300), 5);
+        output(git(&origin).args(["branch", "hold", &held])).unwrap();
+        output(git(&origin).args(["rm", "--quiet", "h.txt"])).unwrap();
+        dated_commit(&origin, "rm.txt", "rm", 6);
+        dated_commit(&origin, "z.txt", "z", 7);
+        output(git(&origin).args(["checkout", "--quiet", "main"])).unwrap();
+        dated_commit(&origin, "a2.txt", "a2", 8);
+        let source = fixture.plain_clone(&origin, "source");
+        let destination = fixture.plain_clone(&origin, "destination");
+        for repo in [&source, &destination] {
+            std::fs::write(repo.join(".git/shallow"), format!("{first}\n{second}\n")).unwrap();
+            for branch in ["r2", "hold"] {
+                output(git(repo).args(["branch", "--quiet", branch, &format!("origin/{branch}")]))
+                    .unwrap();
+            }
+        }
+        output(git(&source).args(["checkout", "--quiet", "r2"])).unwrap();
+        dated_commit(&source, "h.txt", &noise(123, 300), 9);
+        output(git(&source).args(["checkout", "--quiet", "main"])).unwrap();
+        let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        let (wants, haves) = r_n113_request(&source, &destination);
+        let oracle = upload_pack_oracle(&source, &wants, &haves, &shallow_of(&destination));
+        assert_eq!(result.thin_pack, oracle);
+        assert_eq!(result.destination_shallow_count, 2);
     }
 }
