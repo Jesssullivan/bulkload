@@ -70,9 +70,9 @@
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `directory.after_intent` | a pending-directory intent record and no directory |
-//! | `directory.after_mkdir` | a new 0700 directory whose intent record names no inode yet |
-//! | `directory.after_pending_record` | the 0700 directory and its record bound to that inode |
+//! | `directory.after_mkdir` | an empty 0700 `.bulkload-<tag>-d-*` temporary directory, no record |
+//! | `directory.after_pending_record` | the temporary, its parent synced, and a record bound to its inode; not renamed |
+//! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent not synced |
 //! | `directory.before_complete` | the final mode applied and synced; the pending record still present |
 //!
 //! Protocol boundaries, in `transfer`:
@@ -146,12 +146,12 @@ pub enum Point {
     MaterializeAfterLink,
     /// `materialize.after_parent_sync`
     MaterializeAfterParentSync,
-    /// `directory.after_intent`
-    DirectoryAfterIntent,
     /// `directory.after_mkdir`
     DirectoryAfterMkdir,
     /// `directory.after_pending_record`
     DirectoryAfterPendingRecord,
+    /// `directory.after_rename`
+    DirectoryAfterRename,
     /// `directory.before_complete`
     DirectoryBeforeComplete,
     /// `serve.after_publish_group`
@@ -191,9 +191,9 @@ impl Point {
         Self::MaterializeAfterTempSync,
         Self::MaterializeAfterLink,
         Self::MaterializeAfterParentSync,
-        Self::DirectoryAfterIntent,
         Self::DirectoryAfterMkdir,
         Self::DirectoryAfterPendingRecord,
+        Self::DirectoryAfterRename,
         Self::DirectoryBeforeComplete,
         Self::ServeAfterPublishGroup,
         Self::ServeAfterContent,
@@ -229,9 +229,9 @@ impl Point {
             Self::MaterializeAfterTempSync => "materialize.after_temp_sync",
             Self::MaterializeAfterLink => "materialize.after_link",
             Self::MaterializeAfterParentSync => "materialize.after_parent_sync",
-            Self::DirectoryAfterIntent => "directory.after_intent",
             Self::DirectoryAfterMkdir => "directory.after_mkdir",
             Self::DirectoryAfterPendingRecord => "directory.after_pending_record",
+            Self::DirectoryAfterRename => "directory.after_rename",
             Self::DirectoryBeforeComplete => "directory.before_complete",
             Self::ServeAfterPublishGroup => "serve.after_publish_group",
             Self::ServeAfterContent => "serve.after_content",

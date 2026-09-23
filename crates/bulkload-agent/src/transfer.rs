@@ -57,6 +57,9 @@ pub struct TransferStats {
     /// Temporary-grammar names left in place because the sweep could not
     /// prove this store created them, by destination-relative path.
     pub temporaries_left: Vec<Vec<u8>>,
+    /// Source files in the tagged temporary-name grammar that the source walk
+    /// recorded and did not carry, by source-relative path.
+    pub source_engine_temporaries: Vec<Vec<u8>>,
 }
 
 /// Cumulative process-scope phase counters; concurrent transfers may overlap.
@@ -226,6 +229,10 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
                 rel_path: refused.rel_path,
             },
         )?;
+    }
+    // Recorded, never carried: the receiver reports each one (R-N79).
+    for rel_path in census.engine_temporaries {
+        write_frame(output, FrameKind::EngineTemporary { rel_path })?;
     }
     let mut source_bytes_read = 0;
     let mut rows = 0;
@@ -460,7 +467,7 @@ pub fn receive<R: Read, W: Write>(
     ))?;
     let mut publisher = store.publisher(PublisherSide::Destination)?;
     // Under the exclusive publisher no temporary of this store is in flight.
-    target.sweep_root()?;
+    target.sweep_root(&store)?;
     let mut stats = TransferStats::default();
     let mut rows = 0;
     loop {
@@ -512,6 +519,9 @@ pub fn receive<R: Read, W: Write>(
                 }
             }
             FrameKind::Refusal { code, rel_path } => stats.refusals.push((rel_path, code)),
+            FrameKind::EngineTemporary { rel_path } => {
+                stats.source_engine_temporaries.push(rel_path);
+            }
             FrameKind::TransferDone {
                 rows: sent,
                 source_bytes_read,
@@ -1164,67 +1174,6 @@ mod tests {
         assert!(!outside.join("secret").exists());
     }
 
-    fn nested_row(corpus: &Corpus, mode: u32) -> RowSchema {
-        let source = corpus.base.join("source");
-        std::fs::create_dir(source.join("nested")).unwrap();
-        let mut row = walk(&WalkOptions::new(source), &mut NullCache)
-            .unwrap()
-            .rows
-            .remove(0);
-        row.mode = mode;
-        row
-    }
-
-    fn private_directory(path: &Path) {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[test]
-    fn directory_intent_adopts_only_the_shape_mkdirat_left() {
-        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
-        // R-N78: an intent committed before a crash that came after mkdirat.
-        let corpus = Corpus::new();
-        let row = nested_row(&corpus, 0o40_555);
-        let destination = corpus.base.join("destination");
-        let store = Store::open(&corpus.base.join("destination-state")).unwrap();
-        let key = postcard::to_stdvec(&(b"authority".as_slice(), &row.rel_path)).unwrap();
-        store.record_directory_intent(&key, 0o555).unwrap();
-        private_directory(&destination.join("nested"));
-        let mut resumed = Destination::open(&destination, &store).unwrap();
-        resumed.directory(&row, &store, b"authority").unwrap();
-        resumed.finish_directories(&store).unwrap();
-        assert_eq!(mode(&destination.join("nested")), 0o555);
-        assert_eq!(store.directory_record(&key).unwrap(), None);
-
-        // The same 0700 directory with no record at all fails closed.
-        let unrecorded = Corpus::new();
-        let row = nested_row(&unrecorded, 0o40_555);
-        let destination = unrecorded.base.join("destination");
-        let store = Store::open(&unrecorded.base.join("destination-state")).unwrap();
-        private_directory(&destination.join("nested"));
-        let mut target = Destination::open(&destination, &store).unwrap();
-        assert!(matches!(
-            target.directory(&row, &store, b"authority"),
-            Err(BulkloadRefusal::GitDestinationOccupied)
-        ));
-        assert_eq!(mode(&destination.join("nested")), 0o700);
-
-        // An intent never adopts a directory mkdirat could not have left.
-        store.record_directory_intent(&key, 0o555).unwrap();
-        std::fs::set_permissions(
-            destination.join("nested"),
-            std::fs::Permissions::from_mode(0o750),
-        )
-        .unwrap();
-        assert!(matches!(
-            target.directory(&row, &store, b"authority"),
-            Err(BulkloadRefusal::GitDestinationOccupied)
-        ));
-        assert_eq!(mode(&destination.join("nested")), 0o750);
-    }
-
     #[test]
     fn sweep_removes_only_this_stores_temporaries_and_records_the_rest() {
         let corpus = Corpus::new();
@@ -1232,23 +1181,33 @@ mod tests {
         let destination = corpus.base.join("destination");
         std::fs::create_dir(source.join("nested")).unwrap();
         std::fs::write(source.join("nested/data"), vec![3_u8; 70_000]).unwrap();
-        // Payload that merely shares the prefix is carried; a source file in
-        // the temporary grammar is recorded by the walk and never carried.
+        // Payload that merely shares the prefix, or matches only the untagged
+        // form, is carried; a tagged temporary in the source is recorded by
+        // the walk, forwarded, and never carried.
         std::fs::write(source.join(".bulkload-notes"), b"operator notes").unwrap();
+        std::fs::write(source.join(".bulkload-2026-09"), b"september").unwrap();
         std::fs::write(source.join(".bulkload-fedcba9876543210-9-9"), b"orphan").unwrap();
         let first = corpus.run().unwrap();
         assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+        assert_eq!(
+            first.source_engine_temporaries,
+            vec![b".bulkload-fedcba9876543210-9-9".to_vec()]
+        );
         assert!(destination.join(".bulkload-notes").exists());
+        assert_eq!(
+            std::fs::read(destination.join(".bulkload-2026-09")).unwrap(),
+            b"september"
+        );
         assert!(!destination.join(".bulkload-fedcba9876543210-9-9").exists());
 
         let tag = {
             let store = Store::open(&corpus.base.join("destination-state")).unwrap();
             crate::materialize::temporary_tag(&store.authority().unwrap())
         };
-        let own = |serial: u32| {
+        let own = |mark: &str, serial: u32| {
             let mut name = b".bulkload-".to_vec();
             name.extend_from_slice(&tag);
-            name.extend_from_slice(format!("-1-{serial}").as_bytes());
+            name.extend_from_slice(format!("{mark}-1-{serial}").as_bytes());
             PathBuf::from(std::ffi::OsString::from_vec(name))
         };
         let foreign = if tag.as_slice() == b"0123456789abcdef" {
@@ -1258,47 +1217,59 @@ mod tests {
         };
         let outside = corpus.base.join("outside");
         std::fs::write(&outside, b"not ours").unwrap();
-        // Removed: an orphan copy, and a second link to a published output.
-        std::fs::write(destination.join(own(1)), b"partial").unwrap();
+        // Removed: an orphan copy, a second link to a published output, and
+        // an empty directory temporary.
+        std::fs::write(destination.join(own("", 1)), b"partial").unwrap();
         std::fs::hard_link(
             destination.join("nested/data"),
-            destination.join("nested").join(own(2)),
+            destination.join("nested").join(own("", 2)),
         )
         .unwrap();
-        // Left and recorded: this store's tag on a symlink and on a directory,
-        // another store's tag, and the untagged form.
-        std::os::unix::fs::symlink(&outside, destination.join(own(3))).unwrap();
-        std::fs::create_dir(destination.join(own(4))).unwrap();
+        std::fs::create_dir(destination.join(own("-d", 7))).unwrap();
+        // Left and recorded: this store's file tag on a symlink and on a
+        // directory, a non-empty directory temporary, another store's tag,
+        // and the untagged form. `.bulkload-2026-09` is outside the grammar
+        // (a leading zero), so it is not even considered.
+        std::os::unix::fs::symlink(&outside, destination.join(own("", 3))).unwrap();
+        std::fs::create_dir(destination.join(own("", 4))).unwrap();
+        std::fs::create_dir(destination.join(own("-d", 8))).unwrap();
+        std::fs::write(destination.join(own("-d", 8)).join("held"), b"kept").unwrap();
         std::fs::write(destination.join(foreign), b"another store").unwrap();
         std::fs::write(destination.join(".bulkload-77-6"), b"untagged").unwrap();
 
         let second = corpus.run().unwrap();
         assert!(second.refusals.is_empty(), "{:?}", second.refusals);
-        assert_eq!(second.temporaries_removed, 2);
+        assert_eq!(second.temporaries_removed, 3);
         let mut left = second.temporaries_left;
         left.sort();
         let mut expected = vec![
-            own(3).as_os_str().as_bytes().to_vec(),
-            own(4).as_os_str().as_bytes().to_vec(),
+            own("", 3).as_os_str().as_bytes().to_vec(),
+            own("", 4).as_os_str().as_bytes().to_vec(),
+            own("-d", 8).as_os_str().as_bytes().to_vec(),
             foreign.as_bytes().to_vec(),
             b".bulkload-77-6".to_vec(),
         ];
         expected.sort();
         assert_eq!(left, expected);
-        assert!(!destination.join(own(1)).exists());
-        assert!(std::fs::symlink_metadata(destination.join("nested").join(own(2))).is_err());
+        assert!(!destination.join(own("", 1)).exists());
+        assert!(std::fs::symlink_metadata(destination.join("nested").join(own("", 2))).is_err());
+        assert!(std::fs::symlink_metadata(destination.join(own("-d", 7))).is_err());
         let data = std::fs::metadata(destination.join("nested/data")).unwrap();
         assert_eq!(data.nlink(), 1);
         assert_eq!(
             std::fs::read(destination.join("nested/data")).unwrap(),
             vec![3_u8; 70_000]
         );
-        assert!(std::fs::symlink_metadata(destination.join(own(3)))
+        assert!(std::fs::symlink_metadata(destination.join(own("", 3)))
             .unwrap()
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&outside).unwrap(), b"not ours");
-        assert!(destination.join(own(4)).is_dir());
+        assert!(destination.join(own("", 4)).is_dir());
+        assert_eq!(
+            std::fs::read(destination.join(own("-d", 8)).join("held")).unwrap(),
+            b"kept"
+        );
         assert!(destination.join(foreign).is_file());
         assert!(destination.join(".bulkload-77-6").is_file());
         assert_eq!(
@@ -1312,7 +1283,11 @@ mod tests {
         use crate::materialize::{temporary_name, TemporaryName};
         assert_eq!(
             temporary_name(b".bulkload-0123456789abcdef-12-0"),
-            Some(TemporaryName::Tagged(*b"0123456789abcdef"))
+            Some(TemporaryName::File(*b"0123456789abcdef"))
+        );
+        assert_eq!(
+            temporary_name(b".bulkload-0123456789abcdef-d-12-0"),
+            Some(TemporaryName::Directory(*b"0123456789abcdef"))
         );
         assert_eq!(
             temporary_name(b".bulkload-4242-7"),
@@ -1324,7 +1299,13 @@ mod tests {
             b".bulkload-0123456789ABCDEF-1-2",
             b".bulkload-0123456789abcde-1-2",
             b".bulkload-0123456789abcdef-1-2-3",
+            b".bulkload-0123456789abcdef-x-1-2",
             b".bulkload-0123456789abcdef-1-",
+            b".bulkload-0123456789abcdef-01-2",
+            b".bulkload-0123456789abcdef-d-1-00",
+            b".bulkload-0123456789abcdef-1-99999999999999999999",
+            b".bulkload-0123456789abcdef-+1-2",
+            b".bulkload-012-7",
             b".bulkload-1-2.tmp",
             b".bulkload--1",
             b"x.bulkload-1-2",

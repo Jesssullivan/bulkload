@@ -44,8 +44,10 @@
 //! - `live_writer_*_leaves_no_source_index`: a refused capture leaves the
 //!   victim's chunks and committed `chunk_locations` rows in the source store.
 //!
-//! Every `materialize.*` point must leave at least one temporary at the crash,
-//! so I4 is exercised, not vacuous, at each of them.
+//! Every `materialize.*` point, and `directory.after_mkdir` and
+//! `directory.after_pending_record` (an empty directory temporary not yet
+//! renamed into place), must leave at least one temporary at the crash, so I4
+//! is exercised, not vacuous, at each of them.
 //!
 //! # Live writer
 //!
@@ -371,7 +373,10 @@ fn assert_i2(label: &str, scratch: &Scratch) -> usize {
     let mut temporaries = 0;
     for (path, metadata) in tree(&scratch.destination()) {
         if is_temporary(&path) {
-            assert!(metadata.is_file(), "{label} I2: temporary is not a file");
+            assert!(
+                metadata.is_file() || metadata.is_dir(),
+                "{label} I2: temporary is neither a file nor a directory"
+            );
             temporaries += 1;
             continue;
         }
@@ -510,6 +515,16 @@ fn assert_complete(
     }
 }
 
+/// Points whose crash always leaves a tagged temporary: a file temporary in
+/// output publication, a directory temporary before the rename.
+fn leaves_temporary(point: Point) -> bool {
+    point.name().starts_with("materialize.")
+        || matches!(
+            point,
+            Point::DirectoryAfterMkdir | Point::DirectoryAfterPendingRecord
+        )
+}
+
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
@@ -575,10 +590,10 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let temporaries = assert_i2(&format!("{label} resumed"), &scratch);
     assert_complete(&label, &scratch, fixture, &files, &after);
     // I4: the sweep leaves no temporary behind and removes only the crash's.
-    if point.name().starts_with("materialize.") {
+    if leaves_temporary(point) {
         assert!(
             crash_temporaries >= 1,
-            "{label}: a materialize crash must leave a temporary for I4 to sweep"
+            "{label}: this crash must leave a temporary for I4 to sweep"
         );
     }
     assert_eq!(
@@ -672,9 +687,9 @@ scenarios! {
     materialize_after_temp_sync_mid => MaterializeAfterTempSync: 25, WITH_REFUSAL;
     materialize_after_link_mid => MaterializeAfterLink: 25, WITH_REFUSAL;
     materialize_after_parent_sync_mid => MaterializeAfterParentSync: 25, WITH_REFUSAL;
-    directory_after_intent => DirectoryAfterIntent: 1, NO_REFUSAL;
     directory_after_mkdir => DirectoryAfterMkdir: 1, NO_REFUSAL;
     directory_after_pending_record => DirectoryAfterPendingRecord: 1, NO_REFUSAL;
+    directory_after_rename => DirectoryAfterRename: 1, NO_REFUSAL;
     directory_before_complete => DirectoryBeforeComplete: 1, NO_REFUSAL;
     serve_after_publish_group_first => ServeAfterPublishGroup: 1, WITH_REFUSAL;
     serve_after_publish_group_mid => ServeAfterPublishGroup: 4, WITH_REFUSAL;

@@ -2,13 +2,21 @@
 //!
 //! # Temporaries
 //!
-//! [`Destination::file`] writes each output under a temporary name in the
-//! output's own directory, links the final name to it and unlinks it. The name
-//! is `.bulkload-<tag>-<pid>-<n>`: `<tag>` is 16 lowercase hex digits derived
-//! from the destination store's random authority, so only a process holding
-//! that store can produce it. A crash inside `file` leaves the name behind;
-//! after `materialize.after_link` it is a second hard link to the published
-//! output.
+//! Every name this module creates first appears under a tagged temporary name
+//! in its own parent directory:
+//!
+//! - [`Destination::file`] writes an output as `.bulkload-<tag>-<pid>-<n>`,
+//!   links the final name to it and unlinks it;
+//! - [`Destination::directory`] creates a directory as
+//!   `.bulkload-<tag>-d-<pid>-<n>`, binds its record to that inode and renames
+//!   it into place without replacement (R-N102).
+//!
+//! `<tag>` is 16 lowercase hex digits derived from the destination store's
+//! random authority, so only a process holding that store can produce it.
+//! `<pid>` and `<n>` are canonical decimals (no leading zeros). A crash inside
+//! either publication leaves the temporary behind; after
+//! `materialize.after_link` a file temporary is a second hard link to the
+//! published output.
 //!
 //! A later invocation removes such a name only when every check holds (R-N79):
 //!
@@ -17,14 +25,16 @@
 //!   publisher is held, so no temporary of this store is in flight;
 //! - the leaf matches the grammar exactly and carries this store's tag;
 //! - `fstatat(AT_SYMLINK_NOFOLLOW)`, relative to that directory's descriptor,
-//!   reports a regular file owned by the effective uid.
+//!   reports the kind the grammar names (a regular file, or a directory)
+//!   owned by the effective uid.
 //!
 //! Removal is `unlinkat` of the temporary name alone, relative to the same
-//! descriptor, so a published name sharing its inode is never touched. A
-//! grammar match that fails any check (another store's tag, the untagged form
-//! earlier engines generated, a symlink, a directory, another owner) is left
-//! in place and reported by [`Destination::swept`]. A name outside the grammar
-//! is not a temporary at all and is never considered.
+//! descriptor: a published name sharing a file's inode is never touched, and a
+//! directory goes only if it is empty (`AT_REMOVEDIR` refuses anything else).
+//! A grammar match that fails any check (another store's tag, the untagged
+//! form earlier engines generated, the wrong kind, another owner, a non-empty
+//! directory) is left in place and reported by [`Destination::swept`]. A name
+//! outside the grammar is not a temporary at all and is never considered.
 
 use std::ffi::{CStr, CString};
 use std::fs::{File, Permissions};
@@ -39,22 +49,57 @@ use crate::freshness::StatIdentity;
 use crate::transfer_store::{Manifest, PendingDirectory, Store};
 use crate::{BulkloadRefusal, Result, RowSchema};
 
-static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-/// Prefix of every temporary name [`Destination::file`] publishes through.
+/// Prefix of every temporary name this module publishes through.
 pub const TEMPORARY_PREFIX: &[u8] = b".bulkload-";
 /// Hex digits in a temporary's store tag.
 const TAG_HEX: usize = 16;
 /// Key-derivation context for the temporary tag.
 const TAG_CONTEXT: &str = "bulkload 2026-09-23 materialize temporary tag v1";
+/// Marks a directory temporary: `.bulkload-<tag>-d-<pid>-<n>`.
+const DIRECTORY_MARK: &[u8] = b"d";
 
 /// A leaf name in the temporary-name grammar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemporaryName {
-    /// `.bulkload-<16 hex>-<pid>-<n>`, carrying one store's tag.
-    Tagged([u8; TAG_HEX]),
+    /// `.bulkload-<16 hex>-<pid>-<n>`: an output file, carrying one store's tag.
+    File([u8; TAG_HEX]),
+    /// `.bulkload-<16 hex>-d-<pid>-<n>`: a directory, carrying one store's tag.
+    Directory([u8; TAG_HEX]),
     /// `.bulkload-<pid>-<n>`, the untagged form earlier engines generated.
+    /// Never removed and never excluded from a walk: it proves nothing.
     Untagged,
+}
+
+impl TemporaryName {
+    /// The store tag, for a tagged name.
+    #[must_use]
+    pub const fn tag(self) -> Option<[u8; TAG_HEX]> {
+        match self {
+            Self::File(tag) | Self::Directory(tag) => Some(tag),
+            Self::Untagged => None,
+        }
+    }
+}
+
+/// A canonical decimal `u64`: digits only, no sign, no leading zero.
+fn canonical_decimal(part: &[u8]) -> bool {
+    std::str::from_utf8(part)
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .is_some_and(|value| value.to_string().as_bytes() == part)
+}
+
+fn tag_of(part: &[u8]) -> Option<[u8; TAG_HEX]> {
+    if part
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        part.try_into().ok()
+    } else {
+        None
+    }
 }
 
 /// Classify `leaf` under the temporary-name grammar; `None` for any name
@@ -62,20 +107,17 @@ pub enum TemporaryName {
 #[must_use]
 pub fn temporary_name(leaf: &[u8]) -> Option<TemporaryName> {
     let rest = leaf.strip_prefix(TEMPORARY_PREFIX)?;
-    let digits =
-        |part: &[u8]| (1..=20).contains(&part.len()) && part.iter().all(u8::is_ascii_digit);
-    let mut parts = rest.split(|byte| *byte == b'-');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(tag), Some(pid), Some(serial), None)
-            if digits(pid)
-                && digits(serial)
-                && tag
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)) =>
+    let parts: Vec<&[u8]> = rest.split(|byte| *byte == b'-').collect();
+    match parts.as_slice() {
+        [tag, mark, pid, serial]
+            if *mark == DIRECTORY_MARK && canonical_decimal(pid) && canonical_decimal(serial) =>
         {
-            tag.try_into().ok().map(TemporaryName::Tagged)
+            tag_of(tag).map(TemporaryName::Directory)
         }
-        (Some(pid), Some(serial), None, None) if digits(pid) && digits(serial) => {
+        [tag, pid, serial] if canonical_decimal(pid) && canonical_decimal(serial) => {
+            tag_of(tag).map(TemporaryName::File)
+        }
+        [pid, serial] if canonical_decimal(pid) && canonical_decimal(serial) => {
             Some(TemporaryName::Untagged)
         }
         _ => None,
@@ -84,21 +126,28 @@ pub fn temporary_name(leaf: &[u8]) -> Option<TemporaryName> {
 
 /// The tag this destination store's temporaries carry.
 pub(crate) fn temporary_tag(authority: &[u8; 32]) -> [u8; TAG_HEX] {
-    use std::fmt::Write as _;
-    let mut tag = String::with_capacity(TAG_HEX);
-    for byte in blake3::derive_key(TAG_CONTEXT, authority)
-        .iter()
-        .take(TAG_HEX / 2)
-    {
-        let _ = write!(tag, "{byte:02x}");
+    const fn hex(nibble: u8) -> u8 {
+        if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        }
     }
-    tag.as_bytes().try_into().unwrap_or([b'0'; TAG_HEX])
+    let key = blake3::derive_key(TAG_CONTEXT, authority);
+    let mut tag = [0_u8; TAG_HEX];
+    for (pair, byte) in tag.chunks_exact_mut(2).zip(key) {
+        if let [high, low] = pair {
+            *high = hex(byte >> 4);
+            *low = hex(byte & 0x0f);
+        }
+    }
+    tag
 }
 
 /// What the temporary sweep did in this invocation.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Sweep {
-    /// Temporaries of this store removed by name.
+    /// Temporaries of this store removed by name, files and empty directories.
     pub removed: u64,
     /// Grammar matches left in place because they failed a check, by
     /// destination-relative path.
@@ -144,9 +193,9 @@ impl Destination {
     ///
     /// # Errors
     /// Refuses an unreadable root directory.
-    pub fn sweep_root(&mut self) -> Result<()> {
+    pub fn sweep_root(&mut self, store: &Store) -> Result<()> {
         let root = self.root.try_clone()?;
-        self.sweep(&root, &[])
+        self.sweep(&root, &[], store)
     }
 
     /// What the temporary sweep has done so far.
@@ -176,52 +225,69 @@ impl Destination {
 
     /// Create a directory, retaining an existing directory's metadata.
     ///
-    /// The pending-directory intent is durable before `mkdirat` (R-N78), so a
-    /// crash at any point leaves either no directory, or a directory with a
-    /// record naming it. A resume adopts an existing directory only when its
-    /// record owns it: the inode it was bound to, or, for an intent never
-    /// bound, the exact shape `mkdirat` produced (mode 0700, owned by this
-    /// user) at the recorded path. A directory with no record keeps the old
-    /// rule and fails closed on a divergent mode. An existing directory is
-    /// swept of this store's orphaned temporaries; see the module docs.
+    /// Creation is create-then-rename (R-N102): `mkdirat` under a tagged
+    /// temporary name, `fstat` through an `O_NOFOLLOW | O_DIRECTORY`
+    /// descriptor, sync the parent, commit the record bound to that
+    /// `(dev, ino)`, then rename into place without replacement. A crash
+    /// therefore leaves either an empty tagged temporary (removed by a later
+    /// sweep) or a final directory whose record names its inode; no state ever
+    /// names only a path. A rename that finds the leaf taken refuses it as
+    /// foreign and removes this invocation's temporary.
+    ///
+    /// An existing directory is adopted only when its record names its inode
+    /// and mode. Any other record is cleared, so it can never adopt later. A
+    /// directory with no owning record fails closed on a divergent mode. An
+    /// existing directory is swept of this store's orphaned temporaries.
     ///
     /// # Errors
-    /// Refuses non-directory conflicts and divergent existing modes.
+    /// Refuses non-directory conflicts, divergent existing modes and foreign
+    /// directories that appear during creation.
     pub fn directory(&mut self, row: &RowSchema, store: &Store, authority: &[u8]) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         let key = postcard::to_stdvec(&(authority, &row.rel_path))?;
-        let mode = row.mode & 0o7777;
         if stat_at(parent.as_raw_fd(), &leaf)?.is_some() {
-            let record = store.directory_record(&key)?;
-            return self.existing_directory(row, &parent, &leaf, key, record, store);
+            return self.existing_directory(row, &parent, &leaf, &key, store);
         }
-        store.record_directory_intent(&key, mode)?;
-        fault_point!(DirectoryAfterIntent);
-        // SAFETY: both descriptors and the NUL-terminated leaf remain valid.
-        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) };
-        if created == 0 {
-            fault_point!(DirectoryAfterMkdir);
-            let metadata = open_dir(parent.as_raw_fd(), &leaf)?.metadata()?;
-            store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
-            fault_point!(DirectoryAfterPendingRecord);
-            self.directories.push(OwnedDirectory {
-                path: row.rel_path.clone(),
-                mode,
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-                key,
+        let mode = row.mode & 0o7777;
+        let temporary = self.temporary(Some(DIRECTORY_MARK))?;
+        // SAFETY: the descriptor and NUL-terminated name remain valid.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), temporary.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        fault_point!(DirectoryAfterMkdir);
+        let bound = open_dir(parent.as_raw_fd(), &temporary)
+            .and_then(|created| Ok(created.metadata()?))
+            .and_then(|metadata| {
+                parent.sync_all()?;
+                store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
+                Ok(metadata)
             });
-            parent.sync_all()?;
-            return Ok(());
+        let metadata = match bound {
+            Ok(metadata) => metadata,
+            Err(refusal) => {
+                discard_directory(&parent, &temporary, &key, store);
+                return Err(refusal);
+            }
+        };
+        fault_point!(DirectoryAfterPendingRecord);
+        if let Err(error) = rename_no_replace(&parent, &temporary, &leaf) {
+            discard_directory(&parent, &temporary, &key, store);
+            return Err(if error.raw_os_error() == Some(libc::EEXIST) {
+                BulkloadRefusal::GitDestinationOccupied
+            } else {
+                error.into()
+            });
         }
-        let error = std::io::Error::last_os_error();
-        // The leaf appeared after the existence check, so this invocation did
-        // not create it; its intent must never let a resume adopt it.
-        store.complete_directory(&key)?;
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
-        }
-        self.existing_directory(row, &parent, &leaf, key, None, store)
+        fault_point!(DirectoryAfterRename);
+        parent.sync_all()?;
+        self.directories.push(OwnedDirectory {
+            path: row.rel_path.clone(),
+            mode,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            key,
+        });
+        Ok(())
     }
 
     fn existing_directory(
@@ -229,40 +295,32 @@ impl Destination {
         row: &RowSchema,
         parent: &File,
         leaf: &CString,
-        key: Vec<u8>,
-        record: Option<PendingDirectory>,
+        key: &[u8],
         store: &Store,
     ) -> Result<()> {
         let mode = row.mode & 0o7777;
         let existing = open_dir(parent.as_raw_fd(), leaf)?;
-        self.sweep(&existing, &row.rel_path)?;
+        self.sweep(&existing, &row.rel_path, store)?;
         let metadata = existing.metadata()?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
-        let owned = match record {
-            Some(PendingDirectory::Created {
-                dev: recorded_dev,
-                ino: recorded_ino,
-                mode: recorded_mode,
-            }) => recorded_dev == dev && recorded_ino == ino && recorded_mode == mode,
-            Some(PendingDirectory::Intent {
-                mode: recorded_mode,
-            }) => {
-                recorded_mode == mode
-                    && metadata.mode() & 0o7777 == 0o700
-                    && metadata.uid() == effective_uid()
+        let owned = match store.directory_record(key) {
+            Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => true,
+            // A record that does not own this directory is stale; clear it
+            // so it can never adopt one later (R-N102, F3).
+            Ok(Some(_)) | Err(BulkloadRefusal::SchemaMismatch) => {
+                store.complete_directory(key)?;
+                false
             }
-            None => false,
+            Ok(None) => false,
+            Err(refusal) => return Err(refusal),
         };
         if owned {
-            if matches!(record, Some(PendingDirectory::Intent { .. })) {
-                store.record_directory_created(&key, dev, ino, mode)?;
-            }
             self.directories.push(OwnedDirectory {
                 path: row.rel_path.clone(),
                 mode,
                 dev,
                 ino,
-                key,
+                key: key.to_vec(),
             });
         } else if metadata.mode() & 0o7777 != mode {
             return Err(BulkloadRefusal::GitDestinationOccupied);
@@ -270,10 +328,29 @@ impl Destination {
         Ok(())
     }
 
-    /// Unlink this store's orphaned temporaries directly inside `directory`,
+    /// A fresh temporary name in this store's grammar; `mark` names a kind.
+    fn temporary(&self, mark: Option<&[u8]>) -> Result<CString> {
+        let mut name = TEMPORARY_PREFIX.to_vec();
+        name.extend_from_slice(&self.tag);
+        if let Some(mark) = mark {
+            name.push(b'-');
+            name.extend_from_slice(mark);
+        }
+        name.extend_from_slice(
+            format!(
+                "-{}-{}",
+                std::process::id(),
+                NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+            )
+            .as_bytes(),
+        );
+        cstring(&name)
+    }
+
+    /// Remove this store's orphaned temporaries directly inside `directory`,
     /// by name and relative to its descriptor; record every other grammar
     /// match and leave it alone. See the module docs.
-    fn sweep(&mut self, directory: &File, rel_dir: &[u8]) -> Result<()> {
+    fn sweep(&mut self, directory: &File, rel_dir: &[u8], store: &Store) -> Result<()> {
         let euid = effective_uid();
         let mut removed = false;
         for (name, kind) in temporary_candidates(directory)? {
@@ -282,23 +359,33 @@ impl Destination {
                 rel_path.push(b'/');
             }
             rel_path.extend_from_slice(name.as_bytes());
-            if kind != TemporaryName::Tagged(self.tag) {
-                self.swept.left.push(rel_path);
-                continue;
-            }
+            let (expected, flags) = match kind {
+                TemporaryName::File(tag) if tag == self.tag => (libc::S_IFREG, 0),
+                TemporaryName::Directory(tag) if tag == self.tag => {
+                    (libc::S_IFDIR, libc::AT_REMOVEDIR)
+                }
+                _ => {
+                    self.swept.left.push(rel_path);
+                    continue;
+                }
+            };
             let Some(stat) = stat_at(directory.as_raw_fd(), &name)? else {
                 continue;
             };
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_uid != euid {
+            if stat.st_mode & libc::S_IFMT != expected || stat.st_uid != euid {
                 self.swept.left.push(rel_path);
                 continue;
             }
-            // SAFETY: descriptor and NUL-terminated name are valid. With flags
-            // 0 `unlinkat` removes this one name and never a directory; the
-            // inode survives under any other name linked to it.
-            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            // SAFETY: descriptor and NUL-terminated name are valid. `unlinkat`
+            // removes this one name: with flags 0 never a directory (the inode
+            // survives under any other link), with AT_REMOVEDIR only an empty
+            // directory.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
                 self.swept.removed += 1;
                 removed = true;
+                if expected == libc::S_IFDIR {
+                    store.clear_directories_bound_to(stat_dev(&stat), stat_ino(&stat))?;
+                }
             } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
                 self.swept.left.push(rel_path);
             }
@@ -385,17 +472,7 @@ impl Destination {
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => (),
             Err(error) => return Err(error),
         }
-        let mut temporary = TEMPORARY_PREFIX.to_vec();
-        temporary.extend_from_slice(&self.tag);
-        temporary.extend_from_slice(
-            format!(
-                "-{}-{}",
-                std::process::id(),
-                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-            )
-            .as_bytes(),
-        );
-        let temporary = cstring(&temporary)?;
+        let temporary = self.temporary(None)?;
         // SAFETY: parent descriptor and path are valid; mode accompanies O_CREAT.
         let fd = unsafe {
             libc::openat(
@@ -513,6 +590,103 @@ fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Resu
     Ok(identity)
 }
 
+/// Best-effort undo of a directory creation that did not publish: clear its
+/// record and remove the still-empty temporary. Anything left is swept later.
+fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store) {
+    // Ignored on purpose: the caller already refuses, a surviving record
+    // names an inode that no final directory holds, and a surviving empty
+    // temporary is removed by the next sweep.
+    let _ = store.complete_directory(key);
+    // SAFETY: descriptor and NUL-terminated name are valid; AT_REMOVEDIR
+    // removes only an empty directory.
+    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR) };
+}
+
+/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
+/// replacing an existing `to`.
+#[cfg(target_os = "linux")]
+fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    let fd = libc::c_long::from(parent.as_raw_fd());
+    // SAFETY: renameat2 reads two NUL-terminated names relative to a valid
+    // descriptor; the raw syscall avoids depending on a libc wrapper.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            fd,
+            from.as_ptr(),
+            fd,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
+/// replacing an existing `to`.
+#[cfg(target_os = "android")]
+fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    // SAFETY: both names are NUL-terminated and the descriptor is valid.
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
+/// replacing an existing `to`.
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    // SAFETY: both names are NUL-terminated and the descriptor is valid.
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// No atomic no-replace rename is known here, so directory creation refuses
+/// rather than risk replacing a foreign directory.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_no_replace(_: &File, _: &CStr, _: &CStr) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+// `dev_t` is signed on some targets; this is the same cast
+// `MetadataExt::dev` makes, so the value matches what records hold.
+#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+const fn stat_dev(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[allow(clippy::useless_conversion)]
+fn stat_ino(stat: &libc::stat) -> u64 {
+    u64::from(stat.st_ino)
+}
+
 /// `fstatat` without following a final symlink; `None` when the name is absent.
 fn stat_at(parent: i32, name: &CStr) -> Result<Option<libc::stat>> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -567,14 +741,14 @@ fn temporary_candidates(directory: &File) -> Result<Vec<(CString, TemporaryName)
     }
     let mut found = Vec::new();
     let listed = loop {
-        clear_errno();
+        let checked = clear_errno();
         // SAFETY: stream is a live directory stream owned by this function.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             let error = std::io::Error::last_os_error();
             break match error.raw_os_error() {
-                Some(0) | None => Ok(()),
-                Some(_) => Err(error),
+                Some(code) if checked && code != 0 => Err(error),
+                _ => Ok(()),
             };
         }
         // SAFETY: readdir returned a live entry whose NUL-terminated d_name
@@ -590,16 +764,50 @@ fn temporary_candidates(directory: &File) -> Result<Vec<(CString, TemporaryName)
     Ok(found)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn clear_errno() {
+/// Zero this thread's `errno`, so a NULL from `readdir` separates the end of
+/// the stream from an error. Returns `false` on a target with no known errno
+/// accessor; there a NULL is read as the end of the stream, which can only
+/// shorten a sweep (leave temporaries), never widen what it removes.
+fn clear_errno() -> bool {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "dragonfly",
+        target_os = "l4re",
+    ))]
     // SAFETY: __errno_location returns this thread's errno slot, valid for writes.
-    unsafe { *libc::__errno_location() = 0 };
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn clear_errno() {
+    unsafe {
+        *libc::__errno_location() = 0;
+        return true;
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     // SAFETY: __error returns this thread's errno slot, valid for writes.
-    unsafe { *libc::__error() = 0 };
+    unsafe {
+        *libc::__error() = 0;
+        return true;
+    }
+    #[cfg(any(
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "cygwin",
+        target_os = "nuttx",
+    ))]
+    // SAFETY: __errno returns this thread's errno slot, valid for writes.
+    unsafe {
+        *libc::__errno() = 0;
+        return true;
+    }
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    // SAFETY: ___errno returns this thread's errno slot, valid for writes.
+    unsafe {
+        *libc::___errno() = 0;
+        return true;
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 fn open_dir(parent: i32, name: &CString) -> Result<File> {

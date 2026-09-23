@@ -248,27 +248,19 @@ pub(crate) struct StorePublisher<'a> {
     side: PublisherSide,
 }
 
-/// An unfinished directory this state is publishing, keyed by its row.
+/// An unfinished directory this state created, keyed by its row.
 ///
-/// The record is written as [`PendingDirectory::Intent`] before `mkdirat`, then
-/// rebound to [`PendingDirectory::Created`] once the inode exists, and deleted
-/// once the final mode is durable.
+/// Committed once the directory exists under a tagged temporary name and its
+/// parent is synced, before it is renamed into place (R-N102), and deleted
+/// once the final mode is durable. It names an inode, never just a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PendingDirectory {
-    /// Committed before `mkdirat`; the directory may or may not exist yet.
-    Intent {
-        /// The final mode `finish_directories` applies.
-        mode: u32,
-    },
-    /// The directory inode this state created, and its final mode.
-    Created {
-        /// Device of the created directory.
-        dev: u64,
-        /// Inode of the created directory.
-        ino: u64,
-        /// The final mode `finish_directories` applies.
-        mode: u32,
-    },
+pub struct PendingDirectory {
+    /// Device of the created directory.
+    pub dev: u64,
+    /// Inode of the created directory.
+    pub ino: u64,
+    /// The final mode `finish_directories` applies.
+    pub mode: u32,
 }
 
 /// A private, source-bound transfer state directory.
@@ -463,18 +455,6 @@ impl Store {
         Ok(())
     }
 
-    /// Commit the intent to create a directory, before `mkdirat` runs (R-N78).
-    ///
-    /// The record names the key and the final mode only: no inode exists yet.
-    /// A crash after this write and before [`Self::record_directory_created`]
-    /// leaves an intent that a resume may adopt, and nothing else may.
-    ///
-    /// # Errors
-    /// Refuses persistence failures.
-    pub fn record_directory_intent(&self, key: &[u8], mode: u32) -> Result<()> {
-        self.put_directory(key, PendingDirectory::Intent { mode })
-    }
-
     /// Bind a pending directory to the inode this state created.
     ///
     /// # Errors
@@ -486,14 +466,25 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        self.put_directory(key, PendingDirectory::Created { dev, ino, mode })
+        self.conn
+            .execute(
+                "INSERT INTO directories VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                (
+                    key,
+                    postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?,
+                ),
+            )
+            .map_err(sqlite_error)?;
+        Ok(())
     }
 
     /// The unfinished-directory record for `key`, if any.
     ///
     /// # Errors
-    /// Refuses database failures and a record this engine cannot decode
-    /// exactly, so an unreadable record never grants ownership.
+    /// Refuses database failures, and refuses a record this engine cannot
+    /// decode exactly with [`BulkloadRefusal::SchemaMismatch`], so an
+    /// unreadable record never grants ownership.
     pub fn directory_record(&self, key: &[u8]) -> Result<Option<PendingDirectory>> {
         let found: Option<Vec<u8>> = self
             .conn
@@ -512,14 +503,36 @@ impl Store {
             .transpose()
     }
 
-    fn put_directory(&self, key: &[u8], record: PendingDirectory) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO directories VALUES (?1, ?2)
-            ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (key, postcard::to_stdvec(&record)?),
-            )
-            .map_err(sqlite_error)?;
+    /// Clear every pending record bound to `(dev, ino)`, once that inode is
+    /// gone, so a recycled inode number can never inherit its ownership.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn clear_directories_bound_to(&self, dev: u64, ino: u64) -> Result<()> {
+        let bound: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT key, identity FROM directories")
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            let mut bound = Vec::new();
+            for row in rows {
+                let (key, identity) = row.map_err(sqlite_error)?;
+                if let Ok((record, [])) = postcard::take_from_bytes::<PendingDirectory>(&identity) {
+                    if record.dev == dev && record.ino == ino {
+                        bound.push(key);
+                    }
+                }
+            }
+            bound
+        };
+        for key in bound {
+            self.complete_directory(&key)?;
+        }
         Ok(())
     }
 

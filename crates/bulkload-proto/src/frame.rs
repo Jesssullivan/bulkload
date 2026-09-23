@@ -12,7 +12,7 @@ use crate::row::RowSchema;
 use crate::Result;
 
 /// Wire protocol version. Bump on any incompatible [`Frame`] change.
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;
 
 /// Bytes of frame header carrying the body length.
 pub const LENGTH_PREFIX_BYTES: usize = 4;
@@ -62,6 +62,9 @@ pub enum FrameKind {
     FileContent { index: u32 },
     /// All requested batch rows have produced content or a refusal.
     BatchDone,
+    /// A source regular file in the materializer's tagged temporary-name
+    /// grammar: recorded by the walk and never carried. Not a refusal.
+    EngineTemporary { rel_path: Vec<u8> },
 }
 
 /// A content-defined chunk in a source file, in file order.
