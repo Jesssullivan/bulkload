@@ -3130,7 +3130,7 @@ pub fn restore_bundle_configured(
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
     restore_entries(&destination, &entries)?;
     let staged = find("staged")?;
-    restore_gitlink_directories(&destination, &staged)?;
+    restore_gitlink_directories(&destination, &staged, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let config_receipt = destination.join(".git/carry-config");
@@ -3236,7 +3236,7 @@ pub fn restore_linked(
     }
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     restore_entries(&destination, &entries)?;
-    restore_gitlink_directories(&destination, &find("staged")?)?;
+    restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let final_exclude = match fs::read(exclude_path) {
@@ -3253,38 +3253,78 @@ pub fn restore_linked(
     Ok(())
 }
 
-// N7 (R-N73): a gitlink's content is its own estate item, but its seat is
-// not: without a directory at the gitlink path Git reports the submodule as
-// deleted. An empty directory is exactly what `git clone` without
-// --recurse-submodules leaves. Created before the captured modes are applied,
-// so a read-only parent is still writable here; existing directories (an
-// unpopulated submodule's captured seat) are kept.
-fn restore_gitlink_directories(destination: &Path, staged: &str) -> Result<()> {
+// N7 (R-N73): a populated submodule is a directory nest, so its seat is not
+// carried, and without a directory at the gitlink path Git reports the
+// submodule as deleted. For exactly those gitlinks (the census recorded a
+// Directory nest at the path, per the capture's nested-repositories-v1
+// custody) and only when lstat finds nothing there, restore creates the empty
+// directory `git clone` without --recurse-submodules leaves. Anything already
+// at the path (a carried file or symlink seat, a nest's carried ignored
+// files) is left alone and never followed; a gitlink with no seat at all in
+// the source (`AD`) gets none. Runs before captured modes are applied, so a
+// read-only parent is still writable. A parent that is not a real directory
+// refuses rather than be followed.
+fn restore_gitlink_directories(destination: &Path, staged: &str, heads: &str) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Component;
+    let name = format!("refs/carry-export/{NESTED_REPOSITORIES_METADATA}");
+    let Some(sidecar) = heads.lines().find_map(|line| {
+        line.split_once(' ')
+            .filter(|(_, reference)| *reference == name)
+            .map(|(value, _)| value)
+    }) else {
+        return Ok(());
+    };
+    if !oid(sidecar) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let custody: Vec<NestedRepository> = postcard::from_bytes(&output(
+        git(destination).args(["show", &format!("{sidecar}:value")]),
+    )?)
+    .map_err(|_| BulkloadRefusal::FrameCodec)?;
+    let directories: std::collections::BTreeSet<&[u8]> = custody
+        .iter()
+        .filter(|nest| nest.kind == NestedRepositoryKind::Directory)
+        .map(|nest| nest.rel_path.as_slice())
+        .collect();
+    if directories.is_empty() {
+        return Ok(());
+    }
     let entries = output(git(destination).args(["ls-tree", "-r", "-z", staged]))?;
     for entry in entries
         .split(|b| *b == 0)
         .filter(|entry| entry.starts_with(b"160000 "))
     {
-        let relative = entry
+        let bytes = entry
             .iter()
             .position(|b| *b == b'\t')
             .and_then(|tab| entry.get(tab + 1..))
-            .map(|path| Path::new(std::ffi::OsStr::from_bytes(path)))
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if !directories.contains(bytes) {
+            continue;
+        }
+        let relative = Path::new(std::ffi::OsStr::from_bytes(bytes));
         if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part, Component::Normal(name) if !name.as_bytes().eq_ignore_ascii_case(b".git"))) {
             return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        match fs::symlink_metadata(destination.join(relative)) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let mut current = destination.to_path_buf();
         for part in relative.components() {
             current.push(part);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => return Err(BulkloadRefusal::PathEscapesRoot),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             match fs::create_dir(&current) {
-                Ok(()) => (),
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !fs::symlink_metadata(&current)?.is_dir() {
-                        return Err(BulkloadRefusal::PathEscapesRoot);
-                    }
+                    return Err(BulkloadRefusal::GitDestinationOccupied);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -6714,5 +6754,112 @@ mod review_pr53c {
         for (attributes, v) in refused {
             assert_eq!(v, expected, "{attributes}");
         }
+    }
+    // H. N7 regression: a gitlink whose worktree seat is a file (typechange)
+    // or a symlink captures fine and must restore.
+    fn gitlink_typechange(name: &str, seat: &str) -> (Result<()>, String) {
+        let root = fresh(name);
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let head = String::from_utf8(g(&outer, &["rev-parse", "HEAD"])).unwrap();
+        g(
+            &outer,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},sub", head.trim()),
+            ],
+        );
+        match seat {
+            "file" => fs::write(outer.join("sub"), b"a file where the submodule was").unwrap(),
+            "symlink" => std::os::unix::fs::symlink("file", outer.join("sub")).unwrap(),
+            _ => {}
+        }
+        // Git's own view, success or not: with a symlink at a gitlink path
+        // `git status` itself exits 128 in the source, and must match after.
+        let status = |repo: &Path| {
+            let out = git(repo).args(["status", "--porcelain"]).output().unwrap();
+            format!(
+                "{}:{}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stdout)
+            )
+        };
+        let before = status(&outer);
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        let restored = root.join("restored");
+        let result = restore_bundle(&export.bundle, &restored, "neo");
+        let after = if result.is_ok() {
+            status(&restored)
+        } else {
+            String::new()
+        };
+        fs::remove_dir_all(root).unwrap();
+        (result, format!("before=[{before}] after=[{after}]"))
+    }
+
+    #[test]
+    fn rv3_gitlink_with_a_file_seat_restores() {
+        let (result, status) = gitlink_typechange("gl-file", "file");
+        assert_eq!(result, Ok(()), "{status}");
+    }
+
+    #[test]
+    fn rv3_gitlink_with_a_symlink_seat_restores() {
+        let (result, status) = gitlink_typechange("gl-link", "symlink");
+        assert_eq!(result, Ok(()), "{status}");
+    }
+
+    #[test]
+    fn rv3_gitlink_with_no_seat_restores_its_deletion() {
+        let (result, status) = gitlink_typechange("gl-none", "none");
+        assert_eq!(result, Ok(()), "{status}");
+        let (before, after) = status.split_once(" after=").unwrap();
+        assert_eq!(
+            before.trim_start_matches("before="),
+            after,
+            "restore invents a directory the source did not have"
+        );
+    }
+
+    // B2: the populated-submodule case N7 exists for still gets its empty
+    // directory, and a symlink seat at a gitlink path is never followed.
+    #[test]
+    fn rv3_gitlink_symlink_seat_is_restored_as_a_link_not_followed() {
+        let root = fresh("gl-link-target");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let head = String::from_utf8(g(&outer, &["rev-parse", "HEAD"])).unwrap();
+        g(
+            &outer,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},sub", head.trim()),
+            ],
+        );
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, outer.join("sub")).unwrap();
+        let export = export_repository(&outer, &root.join("capture")).unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&export, &restored, "neo").unwrap();
+        let seat = fs::symlink_metadata(restored.join("sub")).unwrap();
+        let untouched = fs::read_dir(&elsewhere).unwrap().next().is_none();
+        fs::remove_dir_all(root).unwrap();
+        assert!(seat.is_symlink());
+        assert!(untouched);
     }
 }
