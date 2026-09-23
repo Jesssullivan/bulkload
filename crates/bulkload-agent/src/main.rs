@@ -81,6 +81,10 @@ BOUNDARIES:
     any depth when Git tracks nothing beneath it, records each omitted root and
     its size as custody, and carries every other untracked and ignored file.
     --include-rebuildable carries the rebuildable set too, at full fidelity.
+    A foreign repository nested in a checkout, or a gitlink, is custody named
+    per nest (path, HEAD, unpushed commits) on git-export stderr and in every
+    estate receipt, never carried; a nest with any staged, unstaged or
+    untracked change, or with outer-tracked paths under it, refuses (R-N73).
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
 ";
@@ -178,14 +182,9 @@ fn export_command(
             omission.entries
         );
     }
+    // Escaped and quoted: a newline in a nest path cannot forge a line (F8).
     for nested in &export.nested_repositories {
-        eprintln!(
-            "nested-repository path={} kind={:?} gitdir={:?} head={}",
-            String::from_utf8_lossy(&nested.rel_path),
-            nested.kind,
-            nested.gitdir_kind,
-            nested.head_oid.as_deref().unwrap_or("unborn")
-        );
+        eprintln!("{}", nested.receipt_line());
     }
     println!("{}", export.bundle.display());
     Ok(())
@@ -399,6 +398,11 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             "item={} source={:?} outcome={} reason={:?}",
             row.item, row.source, row.outcome, row.reason
         )?;
+        // One line per nest after the item line, so a nest-free item stays
+        // one line (R-N73). Paths inside are byte-escaped.
+        for line in &row.nested {
+            writeln!(output, "item={} {line}", row.item)?;
+        }
         output.flush()?;
         Ok(())
     };

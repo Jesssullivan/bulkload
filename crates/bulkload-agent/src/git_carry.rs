@@ -262,6 +262,21 @@ pub fn reusable_capture_key(repo: &Path) -> Result<[u8; 32]> {
 /// # Errors
 /// Refuses unsupported source indexes, filesystem seats or Git state.
 pub fn reusable_capture_key_with_policy(repo: &Path, policy: CapturePolicy) -> Result<[u8; 32]> {
+    Ok(reusable_capture_key_with_custody(repo, policy)?.0)
+}
+
+/// [`reusable_capture_key_with_policy`], plus the nested-repository custody
+/// that key was computed over.
+///
+/// A receipt for a reuse hit names exactly the nests the retained capture
+/// recorded: equal keys mean an equal custody sidecar (R-N73).
+///
+/// # Errors
+/// Refuses unsupported source indexes, filesystem seats or Git state.
+pub fn reusable_capture_key_with_custody(
+    repo: &Path,
+    policy: CapturePolicy,
+) -> Result<([u8; 32], Vec<NestedRepository>)> {
     use std::os::unix::ffi::OsStrExt;
     let repo = fs::canonicalize(repo)?;
     let common = common_repository(&repo)?;
@@ -364,7 +379,7 @@ pub fn reusable_capture_key_with_policy(repo: &Path, policy: CapturePolicy) -> R
             hash.update(&value.to_le_bytes());
         }
     }
-    Ok(*hash.finalize().as_bytes())
+    Ok((*hash.finalize().as_bytes(), nested_repositories))
 }
 
 /// Reconstruct a missing index from a same-HEAD capture without touching payload.
@@ -3595,7 +3610,7 @@ mod tests {
             nested_sidecar(&capture.join("repository.git")),
             Some(expected.clone())
         );
-        let line = expected[0].receipt_line();
+        let line = expected.first().unwrap().receipt_line();
         assert!(line.contains("path=\"vendor/inner\""));
         assert!(line.contains(" unpushed=2 remotes=yes"));
         // Pushing moves the key: unpushed is custody, not decoration.
@@ -3603,7 +3618,14 @@ mod tests {
         output(git(&nest).args(["update-ref", "refs/remotes/origin/main", &head_of(&nest)]))
             .unwrap();
         assert_ne!(key, reusable_capture_key(&source).unwrap());
-        assert_eq!(nested_repositories(&source).unwrap()[0].unpushed, 0);
+        assert_eq!(
+            nested_repositories(&source)
+                .unwrap()
+                .iter()
+                .map(|nest| nest.unpushed)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3697,7 +3719,9 @@ mod tests {
         // Cache-like and clean: custody, with no remote to compare against.
         let custody = nested_repositories(&source).unwrap();
         assert_eq!(custody, vec![directory_nest(rel, Some(head_of(&module)))]);
-        assert!(custody[0]
+        assert!(custody
+            .first()
+            .unwrap()
             .receipt_line()
             .ends_with(" unpushed=0 remotes=none"));
         assert!(nested_worktrees(&source).unwrap().is_empty());

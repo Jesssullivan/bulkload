@@ -49,6 +49,28 @@ pub struct Receipt {
     pub source: PathBuf,
     pub outcome: &'static str,
     pub reason: Option<String>,
+    /// One line per foreign nested repository or gitlink the capture names
+    /// as custody and does not carry (R-N73), from
+    /// [`git_carry::NestedRepository::receipt_line`]. Empty for a repository
+    /// without nests. The durable statement is the `{bundle}.nested` sidecar.
+    pub nested: Vec<String>,
+}
+
+/// One item's completed operation and the nests its capture did not carry.
+struct Completion {
+    outcome: &'static str,
+    nested: Vec<git_carry::NestedRepository>,
+}
+
+// The nests a retained capture recorded. Absent means it recorded none: the
+// sidecar is written whenever the capture's custody is non-empty.
+fn retained_nested(corpus: &Path, bundle: &str) -> Result<Vec<git_carry::NestedRepository>> {
+    let path = corpus.join(format!("{bundle}.nested"));
+    if path.try_exists()? {
+        read(&path)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// Read the exact reviewed items without performing capture or apply.
@@ -300,10 +322,12 @@ fn capture_item(
     corpus: &Path,
     base: Option<&Base>,
     policy: git_carry::CapturePolicy,
-) -> Result<&'static str> {
+) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
-    let key = git_carry::reusable_capture_key_with_policy(&item.source, policy)?;
+    // The key covers the nested custody, so a reuse hit names exactly the
+    // nests the retained capture recorded.
+    let (key, nested) = git_carry::reusable_capture_key_with_custody(&item.source, policy)?;
     if record.try_exists()? {
         let previous: Capture = read(&record)?;
         if !filename(&previous.bundle) {
@@ -321,7 +345,10 @@ fn capture_item(
                     return Err(BulkloadRefusal::ReceiptBindingInvalid);
                 }
             }
-            return Ok("capture-reused-after-census");
+            return Ok(Completion {
+                outcome: "capture-reused-after-census",
+                nested,
+            });
         }
     }
     let mut generation = 0u64;
@@ -339,16 +366,18 @@ fn capture_item(
     };
     // Failed private attempts are retained, never silently overwritten.
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
-    let bundle = git_carry::export_repository_with_policy(
+    let export = git_carry::export_repository_with_policy(
         &item.source,
         &attempt,
         prerequisite.as_deref(),
         policy,
-    )?
-    .bundle;
-    if key != git_carry::reusable_capture_key_with_policy(&item.source, policy)? {
+    )?;
+    if key != git_carry::reusable_capture_key_with_policy(&item.source, policy)?
+        || export.nested_repositories != nested
+    {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
+    let bundle = export.bundle;
     let digest = hash_file(&bundle)?;
     let name = format!(
         "{identity}-{}.bundle",
@@ -369,6 +398,11 @@ fn capture_item(
         // Publish dependency custody before the unchanged completion codec.
         write(&corpus.join(format!("{name}.base")), base)?;
     }
+    // A separate sidecar, as `.base` is: the Capture postcard is positional
+    // and gains no field. Written only when there is custody to record.
+    if !nested.is_empty() {
+        write(&corpus.join(format!("{name}.nested")), &nested)?;
+    }
     write(
         &record,
         &Capture {
@@ -378,13 +412,16 @@ fn capture_item(
             identity: crate::freshness::StatIdentity::from_metadata(&metadata),
         },
     )?;
-    Ok("captured")
+    Ok(Completion {
+        outcome: "captured",
+        nested,
+    })
 }
 
 fn execute(
     plan: &Plan,
     jobs: usize,
-    operation: &(impl Fn(&Item) -> Result<&'static str> + Sync),
+    operation: &(impl Fn(&Item) -> Result<Completion> + Sync),
     receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
 ) -> Result<()> {
     if !(1..=2).contains(&jobs) {
@@ -397,11 +434,23 @@ fn execute(
     let refused = std::sync::atomic::AtomicBool::new(false);
     pool.install(|| {
         plan.items.par_iter().try_for_each(|item| {
-            let (outcome, reason) = match operation(item) {
-                Ok(outcome) => (outcome, None),
+            let (outcome, reason, nested) = match operation(item) {
+                Ok(done) => {
+                    // The count rides in the layout-safe reason (and so in the
+                    // durable `.outcome` tuple); the rows ride in the sidecar
+                    // and the in-process receipt lines.
+                    let reason =
+                        (!done.nested.is_empty()).then(|| format!("nested={}", done.nested.len()));
+                    let lines = done
+                        .nested
+                        .iter()
+                        .map(git_carry::NestedRepository::receipt_line)
+                        .collect();
+                    (done.outcome, reason, lines)
+                }
                 Err(error) => {
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                    ("refused", Some(error.to_string()))
+                    ("refused", Some(error.to_string()), Vec::new())
                 }
             };
             receipt(&Receipt {
@@ -409,6 +458,7 @@ fn execute(
                 source: item.source.clone(),
                 outcome,
                 reason,
+                nested,
             })
         })
     })?;
@@ -588,12 +638,15 @@ fn apply_item(
     state: &Path,
     source: &str,
     imported: &ImportedBases,
-) -> Result<&'static str> {
+) -> Result<Completion> {
     let identity = id(item)?;
     let captured: Capture = read(&corpus.join(format!("{identity}.capture")))?;
     if !filename(&captured.bundle) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
+    // The nests a capture did not carry ride into every receipt that names
+    // its bundle, so an apply never presents them as restored.
+    let nested = retained_nested(corpus, &captured.bundle)?;
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -601,11 +654,12 @@ fn apply_item(
     ));
     if journal.try_exists()? {
         let done: String = read(&journal)?;
-        return match done.as_str() {
-            "workspace-restored" => Ok("previous-workspace-restoration-not-revalidated"),
-            "refs-imported" => Ok("previous-ref-custody-not-workspace-parity"),
-            _ => Err(BulkloadRefusal::ReceiptBindingInvalid),
+        let outcome = match done.as_str() {
+            "workspace-restored" => "previous-workspace-restoration-not-revalidated",
+            "refs-imported" => "previous-ref-custody-not-workspace-parity",
+            _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
         };
+        return Ok(Completion { outcome, nested });
     }
     let bundle = corpus.join(&captured.bundle);
     if hash_file(&bundle)? != captured.digest {
@@ -624,7 +678,7 @@ fn apply_item(
         "refs-imported"
     };
     write(&journal, &outcome.to_owned())?;
-    Ok(outcome)
+    Ok(Completion { outcome, nested })
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -771,6 +825,137 @@ mod tests {
             fs::read(second_target.join("file")).unwrap(),
             b"second dirty"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B3: every estate receipt names every nest. A clean nest two
+    // commits ahead of its remote-tracking ref is custody; the capture, the
+    // reuse hit and the apply each name it with unpushed=2, the count rides
+    // in the layout-safe reason, and the rows ride in `{bundle}.nested`.
+    #[test]
+    fn every_estate_receipt_names_every_nest_with_its_unpushed_count() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-nested-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let nest = source.join("vendor/inner");
+        fs::create_dir_all(&nest).unwrap();
+        git(&nest, &["init", "--template="]);
+        fs::write(nest.join("lib.c"), b"v1").unwrap();
+        git(&nest, &["add", "lib.c"]);
+        git(&nest, &["commit", "-m", "v1"]);
+        git(
+            &nest,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/inner.git",
+            ],
+        );
+        git(&nest, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        for step in ["v2", "v3"] {
+            fs::write(nest.join("lib.c"), step).unwrap();
+            git(&nest, &["commit", "-am", step]);
+        }
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        let rows = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.nested.clone()));
+            Ok(())
+        };
+        capture(&plan, &state, &corpus, 1, &record).unwrap();
+        capture(&plan, &state, &corpus, 1, &record).unwrap();
+        apply(&plan, &corpus, &root.join("applied"), "neo", 1, &record).unwrap();
+        let rows = rows.into_inner().unwrap();
+        let outcomes: Vec<_> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                "captured",
+                "capture-reused-after-census",
+                "workspace-restored"
+            ]
+        );
+        for (_, reason, nested) in &rows {
+            assert_eq!(reason.as_deref(), Some("nested=1"));
+            assert_eq!(nested.len(), 1);
+            let line = nested.first().unwrap();
+            assert!(line.starts_with("nested-repository path=\"vendor/inner\" "));
+            assert!(line.contains(" unpushed=2 remotes=yes"));
+        }
+        // The durable sidecar beside the bundle; the Capture codec is unchanged.
+        let items = inspect(&plan).unwrap();
+        let item = items.first().unwrap();
+        let captured: Capture =
+            read(&corpus.join(format!("{}.capture", id(item).unwrap()))).unwrap();
+        let sidecar: Vec<git_carry::NestedRepository> =
+            read(&corpus.join(format!("{}.nested", captured.bundle))).unwrap();
+        assert_eq!(
+            sidecar.iter().map(|nest| nest.unpushed).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(!target.join("vendor/inner").exists());
+        assert_eq!(fs::read(target.join("file")).unwrap(), b"base");
+
+        // A dirty nest is refused by name of refusal, never silently dropped.
+        fs::write(nest.join("lib.c"), b"unsaved edit").unwrap();
+        let refused = Mutex::new(Vec::new());
+        assert!(capture(&plan, &state, &corpus, 1, &|row| {
+            refused
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(
+            refused.into_inner().unwrap(),
+            vec![(
+                "refused",
+                Some(BulkloadRefusal::GitInventoryMalformed.to_string())
+            )]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A capture of a repository with no nest writes no `.nested` sidecar and
+    // its receipt reason stays None, exactly as before.
+    #[test]
+    fn a_nest_free_capture_has_no_nested_sidecar_or_reason() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-no-nest-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let plan = root.join("plan");
+        add(&plan, &source, &root.join("destination"), None).unwrap();
+        let corpus = root.join("corpus");
+        let rows = Mutex::new(Vec::new());
+        capture(&plan, &root.join("state"), &corpus, 1, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.reason.clone(), row.nested.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.into_inner().unwrap(), vec![(None, Vec::new())]);
+        assert!(!fs::read_dir(&corpus)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().extension() == Some("nested".as_ref())));
         fs::remove_dir_all(root).unwrap();
     }
 
