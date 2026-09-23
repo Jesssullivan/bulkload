@@ -59,7 +59,55 @@ pub struct Receipt {
 /// One item's completed operation and the nests its capture did not carry.
 struct Completion {
     outcome: &'static str,
-    nested: Vec<git_carry::NestedRepository>,
+    /// Receipt lines, one per nest, already naming any carrying item.
+    nested: Vec<String>,
+}
+
+/// Plan items by canonical source: which item carries a checkout (R-N114).
+type Owners = std::collections::BTreeMap<PathBuf, String>;
+
+fn owners(plan: &Plan) -> Result<Owners> {
+    let mut owners = Owners::new();
+    for item in &plan.items {
+        owners.entry(item.source.clone()).or_insert(id(item)?);
+    }
+    Ok(owners)
+}
+
+// R-N114: the sources of other plan items nested strictly inside this one.
+// Those nests carry their own seats; this item's capture carries none of them.
+fn planned_nests(item: &Item, owners: &Owners) -> Vec<PathBuf> {
+    owners
+        .keys()
+        .filter(|source| source.starts_with(&item.source) && **source != item.source)
+        .cloned()
+        .collect()
+}
+
+// One receipt line per nest; a nest planned as its own item is named with the
+// item that carries it (R-N114).
+fn nest_lines(item: &Item, owners: &Owners, nested: &[git_carry::NestedRepository]) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    nested
+        .iter()
+        .map(|nest| {
+            let line = nest.receipt_line();
+            let carrier = nest
+                .own_item
+                .then(|| {
+                    owners.get(
+                        &item
+                            .source
+                            .join(std::ffi::OsStr::from_bytes(&nest.rel_path)),
+                    )
+                })
+                .flatten();
+            match carrier {
+                Some(carrier) => format!("{line} carried-by={carrier}"),
+                None => line,
+            }
+        })
+        .collect()
 }
 
 // The nests a retained capture recorded. Absent means it recorded none: the
@@ -182,11 +230,11 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
         Plan::default()
     };
     let mut identities = std::collections::HashSet::new();
-    let mut targets = std::collections::HashSet::new();
+    let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
     for previous in &contents.items {
         identities.insert(id(previous)?);
         if let Some(target) = &previous.workspace {
-            targets.insert(target.clone());
+            targets.push((target.clone(), previous.source.clone()));
         }
     }
     for incoming in items {
@@ -201,13 +249,37 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
             continue;
         }
         if let Some(target) = &item.workspace {
-            if !targets.insert(target.clone()) {
+            if targets
+                .iter()
+                .any(|(other, source)| overlapping(target, &item.source, other, source))
+            {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
+            targets.push((target.clone(), item.source.clone()));
         }
         contents.items.push(item);
     }
     write(plan, &contents)
+}
+
+// R-N114: two workspace targets collide when they are equal, or when one lies
+// inside the other anywhere but at exactly the place the inner item's source
+// lies inside the outer item's source (a nested repository planned as its own
+// item, restored where it was). Component-wise, never string prefixes.
+fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) -> bool {
+    if target == other {
+        return true;
+    }
+    let nested = |inner: &Path, inner_source: &Path, outer: &Path, outer_source: &Path| {
+        inner
+            .strip_prefix(outer)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| outer_source.join(relative) != inner_source)
+    };
+    nested(target, source, other, other_source)
+        .or_else(|| nested(other, other_source, target, source))
+        .unwrap_or(false)
 }
 
 struct Exclusive(fs::File);
@@ -322,12 +394,15 @@ fn capture_item(
     corpus: &Path,
     base: Option<&Base>,
     policy: git_carry::CapturePolicy,
+    owners: &Owners,
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
+    let planned = planned_nests(item, owners);
     // The key covers the nested custody, so a reuse hit names exactly the
     // nests the retained capture recorded.
-    let (key, nested) = git_carry::reusable_capture_key_with_custody(&item.source, policy)?;
+    let (key, nested) =
+        git_carry::reusable_capture_key_with_planned(&item.source, policy, &planned)?;
     if record.try_exists()? {
         let previous: Capture = read(&record)?;
         if !filename(&previous.bundle) {
@@ -347,7 +422,7 @@ fn capture_item(
             }
             return Ok(Completion {
                 outcome: "capture-reused-after-census",
-                nested,
+                nested: nest_lines(item, owners, &nested),
             });
         }
     }
@@ -366,13 +441,14 @@ fn capture_item(
     };
     // Failed private attempts are retained, never silently overwritten.
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
-    let export = git_carry::export_repository_with_policy(
+    let export = git_carry::export_repository_with_planned(
         &item.source,
         &attempt,
         prerequisite.as_deref(),
         policy,
+        &planned,
     )?;
-    if key != git_carry::reusable_capture_key_with_policy(&item.source, policy)?
+    if key != git_carry::reusable_capture_key_with_planned(&item.source, policy, &planned)?.0
         || export.nested_repositories != nested
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
@@ -414,7 +490,7 @@ fn capture_item(
     )?;
     Ok(Completion {
         outcome: "captured",
-        nested,
+        nested: nest_lines(item, owners, &nested),
     })
 }
 
@@ -441,12 +517,7 @@ fn execute(
                     // and the in-process receipt lines.
                     let reason =
                         (!done.nested.is_empty()).then(|| format!("nested={}", done.nested.len()));
-                    let lines = done
-                        .nested
-                        .iter()
-                        .map(git_carry::NestedRepository::receipt_line)
-                        .collect();
-                    (done.outcome, reason, lines)
+                    (done.outcome, reason, done.nested)
                 }
                 Err(error) => {
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -577,12 +648,13 @@ pub fn capture_with_policy(
     let contents: Plan = read(plan)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let groups = capture_groups(&contents)?;
+    let owners = owners(&contents)?;
     execute(
         &contents,
         jobs,
         &|item| {
             let base = group_base(item, &groups, state, corpus)?;
-            capture_item(item, state, corpus, base.as_ref(), policy)
+            capture_item(item, state, corpus, base.as_ref(), policy, &owners)
         },
         &|row| emit(state, row, receipt),
     )
@@ -638,6 +710,7 @@ fn apply_item(
     state: &Path,
     source: &str,
     imported: &ImportedBases,
+    owners: &Owners,
 ) -> Result<Completion> {
     let identity = id(item)?;
     let captured: Capture = read(&corpus.join(format!("{identity}.capture")))?;
@@ -646,7 +719,7 @@ fn apply_item(
     }
     // The nests a capture did not carry ride into every receipt that names
     // its bundle, so an apply never presents them as restored.
-    let nested = retained_nested(corpus, &captured.bundle)?;
+    let nested = nest_lines(item, owners, &retained_nested(corpus, &captured.bundle)?);
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -701,7 +774,11 @@ pub fn apply(
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
     for item in &contents.items {
-        let common = if item.repository.try_exists()? {
+        // A standalone restore's repository is its own workspace: if it is
+        // already there, that is a collision the restore refuses by type
+        // (R-N114), not Git administration to serialise on.
+        let standalone = item.workspace.as_ref() == Some(&item.repository);
+        let common = if !standalone && item.repository.try_exists()? {
             git_carry::common_repository(&item.repository)?
         } else {
             item.repository.clone()
@@ -709,23 +786,43 @@ pub fn apply(
         groups.insert(id(item)?, common.clone());
         locks.entry(common).or_insert_with(|| Mutex::new(()));
     }
-    execute(
-        &contents,
-        jobs,
-        &|item| {
-            let common = groups
-                .get(&id(item)?)
-                .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
-            let lock = locks
-                .get(common)
-                .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
-            let _guard = lock
-                .lock()
-                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-            apply_item(item, corpus, state, source, &imported)
-        },
-        &|row| emit(state, row, receipt),
-    )
+    let owners = owners(&contents)?;
+    let operation = |item: &Item| {
+        let common = groups
+            .get(&id(item)?)
+            .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
+        let lock = locks
+            .get(common)
+            .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+        apply_item(item, corpus, state, source, &imported, &owners)
+    };
+    // R-N114: an item whose workspace lies inside another item's workspace
+    // restores after it, level by level, so the outer checkout lays down the
+    // parent directories and the nested item creates its own directory. Items
+    // within a level still run in parallel. Every level runs; any refusal is
+    // reported at the end, exactly as within one level.
+    let mut levels = std::collections::BTreeMap::<usize, Plan>::new();
+    for item in &contents.items {
+        let depth = item.workspace.as_ref().map_or(0, |workspace| {
+            contents
+                .items
+                .iter()
+                .filter_map(|other| other.workspace.as_ref())
+                .filter(|other| workspace.starts_with(other) && workspace != *other)
+                .count()
+        });
+        levels.entry(depth).or_default().items.push(item.clone());
+    }
+    let mut outcome = Ok(());
+    for level in levels.values() {
+        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+            outcome = Err(error);
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -956,6 +1053,157 @@ mod tests {
         assert!(!fs::read_dir(&corpus)
             .unwrap()
             .any(|entry| entry.unwrap().path().extension() == Some("nested".as_ref())));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N114: a populated submodule planned as its own item. The outer names
+    // it as carried by that item and creates no directory for it; the item
+    // restores it exactly once; the restored outer is clean.
+    #[test]
+    fn a_populated_submodule_planned_as_its_own_item_restores_once() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-own-sub-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let upstream = root.join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "--template=", "-b", "main"]);
+        fs::write(upstream.join("lib.c"), b"v1").unwrap();
+        git(&upstream, &["add", "lib.c"]);
+        git(&upstream, &["commit", "-m", "v1"]);
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template=", "-b", "main"]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        git(
+            &outer,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        git(&outer, &["commit", "-m", "sub"]);
+        let sub = outer.join("sub");
+        git(
+            &sub,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/sub.git",
+            ],
+        );
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        add(&plan, &sub, &target.join("sub"), Some(&target.join("sub"))).unwrap();
+        let items = inspect(&plan).unwrap();
+        let sub_id = id(items
+            .iter()
+            .find(|item| item.source.ends_with("sub"))
+            .unwrap())
+        .unwrap();
+        let rows = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.nested.clone()));
+            Ok(())
+        };
+        capture(&plan, &root.join("state"), &root.join("corpus"), 1, &record).unwrap();
+        apply(
+            &plan,
+            &root.join("corpus"),
+            &root.join("applied"),
+            "neo",
+            1,
+            &record,
+        )
+        .unwrap();
+        let rows = rows.into_inner().unwrap();
+        assert!(rows.iter().all(|row| row.0 != "refused"), "{rows:?}");
+        assert!(rows.iter().any(|row| row
+            .2
+            .iter()
+            .any(|line| line.ends_with(&format!(" seats=own-item carried-by={sub_id}")))));
+        assert!(target.join("sub/.git").exists());
+        assert_eq!(fs::read(target.join("sub/lib.c")).unwrap(), b"v1");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N114: overlapping workspace targets are refused unless the inner item
+    // is the outer item's nested source restored at the same relative place;
+    // a restore onto an existing destination is a typed collision, never an
+    // errno.
+    #[test]
+    fn overlapping_targets_and_occupied_destinations_refuse_by_type() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-overlap-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template="]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        git(&other, &["init", "--template="]);
+        fs::write(other.join("file"), b"other").unwrap();
+        git(&other, &["add", "file"]);
+        git(&other, &["commit", "-m", "other"]);
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        // Another repository restored inside the outer's target: a collision.
+        let inside = target.join("vendor/other");
+        assert_eq!(
+            add(&plan, &other, &inside, Some(&inside)),
+            Err(BulkloadRefusal::GitDestinationOccupied)
+        );
+        // The outer restored inside another item's target: a collision too.
+        let around = root.join("around");
+        let plan2 = root.join("plan2");
+        add(&plan2, &other, &around.join("x"), Some(&around.join("x"))).unwrap();
+        assert_eq!(
+            add(&plan2, &outer, &around, Some(&around)),
+            Err(BulkloadRefusal::GitDestinationOccupied)
+        );
+        // A restore onto an existing directory is typed.
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        fs::create_dir(&target).unwrap();
+        let refused = Mutex::new(Vec::new());
+        assert!(
+            apply(&plan, &corpus, &root.join("applied"), "neo", 1, &|row| {
+                refused.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            refused.into_inner().unwrap(),
+            vec![Some(BulkloadRefusal::GitDestinationOccupied.to_string())]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

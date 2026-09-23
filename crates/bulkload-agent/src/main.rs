@@ -85,9 +85,12 @@ BOUNDARIES:
     per nest (path, admin, HEAD, unpushed commits, carried-ignored count) on
     git-export stderr and in every estate receipt; its tracked content and
     history are its own item and are not carried, its ignored files are
-    (R-N89). A nest with any staged, unstaged or untracked change, hidden
-    index flags, a stash, a detached-only commit, an operation in progress,
-    filter commands, or outer-tracked paths under it refuses (R-N73, R-N83).
+    (R-N89) unless the nest is planned as its own estate item, which then
+    owns them and is named as carried-by=<item> (R-N114). A nest with any
+    staged, unstaged or untracked change, hidden index flags, a conversion
+    attribute, a stash, a detached-only commit, an operation in progress,
+    filter commands, a populated submodule, or outer-tracked paths under it
+    refuses (R-N73, R-N83, R-N115).
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
 ";

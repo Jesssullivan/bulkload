@@ -279,6 +279,23 @@ pub fn reusable_capture_key_with_custody(
     repo: &Path,
     policy: CapturePolicy,
 ) -> Result<([u8; 32], Vec<NestedRepository>)> {
+    reusable_capture_key_with_planned(repo, policy, &[])
+}
+
+/// [`reusable_capture_key_with_custody`] for a checkout some of whose nested
+/// repositories are planned as their own estate items (R-N114).
+///
+/// `planned` holds the canonical source paths of those items. Such a nest is
+/// still custody and still refused on the same rules, but its seats (its
+/// carried ignored files, R-N89) belong to its own item, never to this one.
+///
+/// # Errors
+/// Refuses unsupported source indexes, filesystem seats or Git state.
+pub fn reusable_capture_key_with_planned(
+    repo: &Path,
+    policy: CapturePolicy,
+    planned: &[PathBuf],
+) -> Result<([u8; 32], Vec<NestedRepository>)> {
     use std::os::unix::ffi::OsStrExt;
     let repo = fs::canonicalize(repo)?;
     let common = common_repository(&repo)?;
@@ -305,7 +322,7 @@ pub fn reusable_capture_key_with_custody(
     } else {
         Vec::new()
     };
-    let census = capture_census(&repo, &common, policy)?;
+    let census = capture_census_planned(&repo, &common, policy, planned)?;
     let rows = postcard::to_allocvec(&census.rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
     let configuration = postcard::to_allocvec(&source_configuration(&repo)?)
         .map_err(|_| BulkloadRefusal::FrameCodec)?;
@@ -593,7 +610,7 @@ fn admin_controls(admin: &Path) -> Result<Vec<(String, Option<Vec<u8>>)>> {
 /// the private capture is retained for diagnosis; source state is never
 /// changed.
 pub fn export_repository(repo: &Path, capture: &Path) -> Result<PathBuf> {
-    Ok(export_repository_inner(repo, capture, None, CapturePolicy::default())?.bundle)
+    Ok(export_repository_inner(repo, capture, None, CapturePolicy::default(), &[])?.bundle)
 }
 
 /// Export one worktree under an explicit capture policy and prerequisite.
@@ -610,7 +627,23 @@ pub fn export_repository_with_policy(
     prerequisite: Option<&Path>,
     policy: CapturePolicy,
 ) -> Result<Export> {
-    export_repository_inner(repo, capture, prerequisite, policy)
+    export_repository_inner(repo, capture, prerequisite, policy, &[])
+}
+
+/// [`export_repository_with_policy`] for a checkout some of whose nested
+/// repositories are planned as their own estate items (R-N114); see
+/// [`reusable_capture_key_with_planned`].
+///
+/// # Errors
+/// Refuses everything [`export_repository_with_policy`] refuses.
+pub fn export_repository_with_planned(
+    repo: &Path,
+    capture: &Path,
+    prerequisite: Option<&Path>,
+    policy: CapturePolicy,
+    planned: &[PathBuf],
+) -> Result<Export> {
+    export_repository_inner(repo, capture, prerequisite, policy, planned)
 }
 
 /// Export workspace state without repacking a shared base's commit closure.
@@ -625,7 +658,7 @@ pub fn export_repository_with_prerequisite(
     capture: &Path,
     base: &Path,
 ) -> Result<PathBuf> {
-    Ok(export_repository_inner(repo, capture, Some(base), CapturePolicy::default())?.bundle)
+    Ok(export_repository_inner(repo, capture, Some(base), CapturePolicy::default(), &[])?.bundle)
 }
 
 fn export_repository_inner(
@@ -633,6 +666,7 @@ fn export_repository_inner(
     capture: &Path,
     prerequisite: Option<&Path>,
     policy: CapturePolicy,
+    planned: &[PathBuf],
 ) -> Result<Export> {
     use std::os::unix::fs::DirBuilderExt;
     let repo = fs::canonicalize(repo)?;
@@ -645,7 +679,7 @@ fn export_repository_inner(
     let configuration = source_configuration(&repo)?;
     let boundary = shallow::frontier(&repo)?;
     let common = common_repository(&repo)?;
-    let census = capture_census(&repo, &common, policy)?;
+    let census = capture_census_planned(&repo, &common, policy, planned)?;
     let seats = &census.rows;
     let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
     let (index_path, before_index, gitlinks) = source_index(&repo)?;
@@ -688,7 +722,7 @@ fn export_repository_inner(
         || boundary != shallow::frontier(&repo)?
         || before_index != fs::read(index_path)?
         || head != text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?
-        || census != capture_census(&repo, &common, policy)?
+        || census != capture_census_planned(&repo, &common, policy, planned)?
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
@@ -935,7 +969,17 @@ fn vanished(error: &std::io::Error) -> bool {
 // of seats unless the policy asks for full fidelity. Attach and comparison
 // paths keep the strict full census; they verify payload that is already here.
 fn capture_census(root: &Path, common: &Path, policy: CapturePolicy) -> Result<Census> {
-    filesystem_census(root, Some(common), policy)
+    capture_census_planned(root, common, policy, &[])
+}
+
+// R-N114: nests planned as their own items keep custody but carry no seats.
+fn capture_census_planned(
+    root: &Path,
+    common: &Path,
+    policy: CapturePolicy,
+    planned: &[PathBuf],
+) -> Result<Census> {
+    filesystem_census(root, Some(common), policy, planned)
 }
 
 // A name on the fixed list is only rebuildable if Git tracks nothing beneath
@@ -1061,6 +1105,10 @@ pub struct NestedRepository {
     /// inside the nest are omitted and recorded like the checkout's. Always 0
     /// for a gitlink.
     pub ignored_carried: u64,
+    /// The nest is planned as its own estate item (R-N114): its seats are that
+    /// item's, this capture carries none of them, and restore leaves its
+    /// directory for that item to create. Always false for a gitlink.
+    pub own_item: bool,
 }
 
 impl NestedRepository {
@@ -1086,11 +1134,12 @@ impl NestedRepository {
                     format!("all({})", self.unpushed)
                 };
                 format!(
-                    "nested-repository path=\"{path}\" kind=Directory gitdir={:?} admin=\"{}\" head={head} unpushed={unpushed} remotes={} ignored-carried={}",
+                    "nested-repository path=\"{path}\" kind=Directory gitdir={:?} admin=\"{}\" head={head} unpushed={unpushed} remotes={} ignored-carried={}{}",
                     self.gitdir_kind,
                     self.admin.escape_ascii(),
                     if self.remotes { "yes" } else { "none" },
                     self.ignored_carried,
+                    if self.own_item { " seats=own-item" } else { "" },
                 )
             }
         }
@@ -1180,15 +1229,30 @@ fn nested_head(directory: &Path) -> Result<Option<String>> {
 // - R-N83 (a): the nest holds no stash (refs/stash absent, stash reflog
 //   empty) and no commit reachable only from a detached HEAD. Each refuses
 //   with its own typed refusal, since both are work the capture would lose.
+// What a census knows while classifying nests: the checkout's common
+// directory, its index (read lazily), the capture policy, and the nests
+// planned as their own items (R-N114).
+#[derive(Clone, Copy)]
+struct NestScope<'a> {
+    common: &'a Path,
+    outer: &'a OuterIndex,
+    policy: CapturePolicy,
+    planned: &'a [PathBuf],
+}
+
 fn foreign_nest(
     root: &Path,
     directory: &Path,
-    common: &Path,
-    outer: &OuterIndex,
-    policy: CapturePolicy,
+    scope: NestScope<'_>,
     rel_path: Vec<u8>,
     gitdir_kind: GitdirKind,
 ) -> Result<(NestedRepository, NestSeats)> {
+    let NestScope {
+        common,
+        outer,
+        policy,
+        planned,
+    } = scope;
     let seen = text(git(directory).args([
         "--git-dir=.git",
         "rev-parse",
@@ -1261,7 +1325,18 @@ fn foreign_nest(
             _ => return Err(BulkloadRefusal::GitInventoryMalformed),
         }
     }
-    let seats = nest_ignored_seats(root, directory, &rel_path, &ignored, policy)?;
+    // R-N114: a nest planned as its own item owns its seats; this capture
+    // names it and carries none of them.
+    let own_item = planned.iter().any(|item| item.as_path() == directory);
+    let seats = if own_item {
+        NestSeats {
+            rows: Vec::new(),
+            omitted: Vec::new(),
+            carried: 0,
+        }
+    } else {
+        nest_ignored_seats(root, directory, &rel_path, &ignored, policy)?
+    };
     let (unpushed, remotes) = unpushed_commits(directory, head_oid.as_deref())?;
     Ok((
         NestedRepository {
@@ -1273,6 +1348,7 @@ fn foreign_nest(
             unpushed,
             remotes,
             ignored_carried: seats.carried,
+            own_item,
         },
         seats,
     ))
@@ -1941,14 +2017,19 @@ enum NestedCustody {
 // administration owned by Git-native capture; on these attach and comparison
 // paths (no custody) any nested .git refuses: restored payload never has one.
 fn filesystem_rows(root: &Path) -> Result<Vec<crate::RowSchema>> {
-    Ok(filesystem_census(root, None, CapturePolicy::including_rebuildable())?.rows)
+    Ok(filesystem_census(root, None, CapturePolicy::including_rebuildable(), &[])?.rows)
 }
 
 // A checkout census: registered worktrees of `common` and foreign repositories
 // nested below `root` are recorded as custody and not descended; a malformed
 // nested .git still refuses. Full fidelity: nothing rebuildable is omitted.
 fn repository_census(root: &Path, common: &Path) -> Result<Census> {
-    filesystem_census(root, Some(common), CapturePolicy::including_rebuildable())
+    filesystem_census(
+        root,
+        Some(common),
+        CapturePolicy::including_rebuildable(),
+        &[],
+    )
 }
 
 // Classify a directory below the root that contains an entry named .git.
@@ -1962,13 +2043,12 @@ fn repository_census(root: &Path, common: &Path) -> Result<Census> {
 fn nested_administration(
     root: &Path,
     directory: &Path,
-    common: &Path,
-    outer: &OuterIndex,
-    policy: CapturePolicy,
+    scope: NestScope<'_>,
 ) -> Result<Option<NestedCustody>> {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
+    let common = scope.common;
     let pointer = directory.join(".git");
     let meta = match fs::symlink_metadata(&pointer) {
         Ok(meta) => meta,
@@ -1984,15 +2064,8 @@ fn nested_administration(
             .to_vec())
     };
     if meta.is_dir() {
-        let (custody, seats) = foreign_nest(
-            root,
-            directory,
-            common,
-            outer,
-            policy,
-            rel_path()?,
-            GitdirKind::Directory,
-        )?;
+        let (custody, seats) =
+            foreign_nest(root, directory, scope, rel_path()?, GitdirKind::Directory)?;
         return Ok(Some(NestedCustody::Repository(custody, seats)));
     }
     if !meta.is_file() || meta.len() > GITDIR_POINTER_LIMIT {
@@ -2023,15 +2096,8 @@ fn nested_administration(
     if admin.parent() != Some(worktrees.as_path()) {
         // Not our administration at all: a worktree of another repository, or
         // a populated submodule (`<common>/modules/<name>`).
-        let (custody, seats) = foreign_nest(
-            root,
-            directory,
-            common,
-            outer,
-            policy,
-            rel_path()?,
-            GitdirKind::PointerFile,
-        )?;
+        let (custody, seats) =
+            foreign_nest(root, directory, scope, rel_path()?, GitdirKind::PointerFile)?;
         return Ok(Some(NestedCustody::Repository(custody, seats)));
     }
     let worktree_name = admin
@@ -2098,7 +2164,12 @@ fn seat_row(path: &Path, relative: &[u8], meta: &fs::Metadata) -> Result<crate::
     })
 }
 
-fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) -> Result<Census> {
+fn filesystem_census(
+    root: &Path,
+    common: Option<&Path>,
+    policy: CapturePolicy,
+    planned: &[PathBuf],
+) -> Result<Census> {
     use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
     let mut pending = vec![root.to_path_buf()];
@@ -2127,7 +2198,18 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
                 // custody, not seats: no row for its root, no descent, no
                 // contents. Its own item carries them.
                 match common
-                    .map(|common| nested_administration(root, &path, common, &outer, policy))
+                    .map(|common| {
+                        nested_administration(
+                            root,
+                            &path,
+                            NestScope {
+                                common,
+                                outer: &outer,
+                                policy,
+                                planned,
+                            },
+                        )
+                    })
                     .transpose()?
                     .flatten()
                 {
@@ -2325,6 +2407,7 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
             unpushed: 0,
             remotes: false,
             ignored_carried: 0,
+            own_item: false,
         });
     }
     collapsed_gitlinks(repo, &mut gitlinks)?;
@@ -2391,6 +2474,7 @@ fn collapsed_gitlinks(repo: &Path, gitlinks: &mut Vec<NestedRepository>) -> Resu
             unpushed: 0,
             remotes: false,
             ignored_carried: 0,
+            own_item: false,
         });
     }
     Ok(())
@@ -3122,7 +3206,15 @@ pub fn restore_bundle_configured(
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let bundle = fs::canonicalize(bundle)?;
-    fs::DirBuilder::new().mode(0o700).create(destination)?;
+    // R-N114: a destination already there is a collision, refused by type,
+    // never as a bare errno.
+    match fs::DirBuilder::new().mode(0o700).create(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        Err(error) => return Err(error.into()),
+    }
     let destination = fs::canonicalize(destination)?;
     // Read bundle headers without assuming the destination's object format.
     let heads = text(
@@ -3323,7 +3415,7 @@ fn restore_gitlink_directories(destination: &Path, staged: &str, heads: &str) ->
     .map_err(|_| BulkloadRefusal::FrameCodec)?;
     let directories: std::collections::BTreeSet<&[u8]> = custody
         .iter()
-        .filter(|nest| nest.kind == NestedRepositoryKind::Directory)
+        .filter(|nest| nest.kind == NestedRepositoryKind::Directory && !nest.own_item)
         .map(|nest| nest.rel_path.as_slice())
         .collect();
     if directories.is_empty() {
@@ -3370,6 +3462,16 @@ fn restore_gitlink_directories(destination: &Path, staged: &str, heads: &str) ->
         }
     }
     Ok(())
+}
+
+// R-N114: a restore seat that already exists is a collision between items,
+// refused as GIT_DESTINATION_OCCUPIED rather than an errno.
+fn occupied(error: std::io::Error) -> BulkloadRefusal {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        BulkloadRefusal::GitDestinationOccupied
+    } else {
+        error.into()
+    }
 }
 
 fn restore_entries(destination: &Path, entries: &[u8]) -> Result<()> {
@@ -3446,14 +3548,16 @@ fn restore_entry(
         "120000" => {
             let mut target = Vec::new();
             objects.copy_into(value, &mut target, Some(65_536))?;
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)?;
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)
+                .map_err(occupied)?;
         }
         "100644" | "100755" => {
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)?;
+                .open(&path)
+                .map_err(occupied)?;
             objects.copy_into(value, &mut file, None)?;
             file.set_permissions(fs::Permissions::from_mode(if mode == "100755" {
                 0o755
@@ -4232,6 +4336,7 @@ mod tests {
             unpushed: 0,
             remotes: false,
             ignored_carried: 0,
+            own_item: false,
         }
     }
 
@@ -4924,6 +5029,7 @@ mod tests {
             unpushed: 0,
             remotes: false,
             ignored_carried: 0,
+            own_item: false,
         };
         assert_eq!(
             gitlink.receipt_line(),
@@ -5176,6 +5282,7 @@ mod tests {
             unpushed: 0,
             remotes: false,
             ignored_carried: 0,
+            own_item: false,
         };
         let (_, before_index, gitlinks) = source_index(&source).unwrap();
         assert_eq!(gitlinks, vec![gitlink.clone()]);
@@ -6921,5 +7028,459 @@ mod review_pr53c {
         fs::remove_dir_all(root).unwrap();
         assert!(seat.is_symlink());
         assert!(untouched);
+    }
+    // C. R-N89 "like the outer repo's": a FIFO in the outer refuses, a FIFO
+    // (untracked or ignored) in a nest is silently neither carried nor named.
+    #[test]
+    #[ignore = "D1, deferred by the coordinator: FIFO/socket inside a nest"]
+    fn rv3_fifo_in_a_nest_is_treated_like_the_outer() {
+        let (root, outer, inner) = outer_with_nest("fifo");
+        let mk = |path: &Path| {
+            assert!(std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        };
+        mk(&outer.join("outer-fifo"));
+        let outer_verdict = verdict(&outer);
+        fs::remove_file(outer.join("outer-fifo")).unwrap();
+        mk(&inner.join("nest-fifo"));
+        let nest_verdict = verdict(&outer);
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        );
+        fs::remove_dir_all(root).unwrap();
+        assert!(outer_verdict.starts_with("REFUSED"), "{outer_verdict}");
+        assert!(
+            nest_verdict.starts_with("REFUSED"),
+            "outer refuses a FIFO, nest drops it silently: {nest_verdict}; export ok={}",
+            export.is_ok()
+        );
+    }
+
+    fn nest_with_ignored(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, outer, inner) = outer_with_nest(name);
+        fs::write(inner.join(".gitignore"), b".env\nnotes/\n").unwrap();
+        commit_all(&inner, "ignore");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fs::write(
+            inner.join(".env"),
+            format!("TOK{}=rv3-unique-credential", "EN"),
+        )
+        .unwrap();
+        fs::create_dir(inner.join("notes")).unwrap();
+        fs::write(inner.join("notes/todo.md"), b"rv3 unique untracked work").unwrap();
+        (root, outer, inner)
+    }
+
+    // D. An ignored nest file that changes between census and byte read.
+    #[test]
+    fn rv3_ignored_nest_file_changing_mid_capture_refuses() {
+        let (root, outer, inner) = nest_with_ignored("midchange");
+        let common = common_repository(&outer).unwrap();
+        let census = capture_census(&outer, &common, CapturePolicy::default()).unwrap();
+        assert!(census
+            .rows
+            .iter()
+            .any(|row| row.rel_path == b"vendor/inner/.env"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            inner.join(".env"),
+            format!("TOK{}=rv3-unique-credentiaX", "EN"),
+        )
+        .unwrap();
+        let private = prepare_private(&outer, &root).unwrap();
+        let result = raw_tree::capture(&private, &outer, &census.rows);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            result.map(|_| ()),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        );
+    }
+
+    // E. A parent directory swapped for a symlink after the census.
+    #[test]
+    fn rv3_symlinked_parent_swapped_mid_capture_refuses() {
+        let (root, outer, inner) = nest_with_ignored("parentswap");
+        let common = common_repository(&outer).unwrap();
+        let census = capture_census(&outer, &common, CapturePolicy::default()).unwrap();
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("todo.md"), b"attacker bytes").unwrap();
+        fs::rename(inner.join("notes"), root.join("notes.moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, inner.join("notes")).unwrap();
+        let private = prepare_private(&outer, &root).unwrap();
+        let result = raw_tree::capture(&private, &outer, &census.rows);
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err(), "read through a swapped parent");
+    }
+
+    // F. Ignored symlinks (to a directory, escaping the nest) are carried as
+    // links, never followed, and restore as the same links.
+    #[test]
+    fn rv3_ignored_escaping_symlinks_are_links_not_followed() {
+        let (root, outer, inner) = outer_with_nest("symlinks");
+        fs::write(inner.join(".gitignore"), b"l*\n").unwrap();
+        commit_all(&inner, "ignore");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let secret = root.join("outside-secret");
+        fs::write(&secret, b"rv3 outside bytes").unwrap();
+        std::os::unix::fs::symlink("../../../outside-secret", inner.join("lesc")).unwrap();
+        std::os::unix::fs::symlink(&root, inner.join("ldir")).unwrap();
+        let v = verdict(&outer);
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        let carried = String::from_utf8(g(
+            &root.join("capture/repository.git"),
+            &["ls-tree", "-r", "refs/carry-export/worktree"],
+        ))
+        .unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&export.bundle, &restored, "neo").unwrap();
+        let lesc = fs::read_link(restored.join("vendor/inner/lesc")).unwrap();
+        let ldir = fs::symlink_metadata(restored.join("vendor/inner/ldir")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.contains("ignored-carried=2"), "{v}");
+        assert!(carried.contains("120000 blob") && carried.contains("vendor/inner/lesc"));
+        assert!(!carried.contains("rv3 outside bytes"));
+        assert_eq!(lesc, Path::new("../../../outside-secret"));
+        assert!(ldir.is_symlink());
+    }
+
+    // G. F5 made reachable by R-N89, through the public estate flow: the outer
+    // and the nest as two planned items, the nest's workspace under the
+    // outer's. The outer restore writes the nest's ignored files at the nest
+    // path; the nest item then meets an occupied directory. A control nest
+    // without ignored files restores in the same plan shape.
+    fn estate_two_items(
+        name: &str,
+        with_ignored: bool,
+    ) -> (Vec<(String, Option<String>)>, bool, String) {
+        use crate::estate;
+        let (root, outer, inner) = if with_ignored {
+            nest_with_ignored(name)
+        } else {
+            outer_with_nest(name)
+        };
+        let destination = root.join("dest");
+        let plan = root.join("plan");
+        estate::add(&plan, &outer, &destination, Some(&destination)).unwrap();
+        let nest_destination = destination.join("vendor/inner");
+        estate::add(&plan, &inner, &nest_destination, Some(&nest_destination)).unwrap();
+        let rows = std::sync::Mutex::new(Vec::new());
+        let record = |row: &estate::Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome.to_owned(), row.reason.clone()));
+            Ok(())
+        };
+        estate::capture(&plan, &root.join("state"), &root.join("corpus"), 1, &record).unwrap();
+        let _ = estate::apply(
+            &plan,
+            &root.join("corpus"),
+            &root.join("applied"),
+            "neo",
+            1,
+            &record,
+        );
+        let nest_repo_restored = nest_destination.join(".git").exists()
+            && (!with_ignored
+                || (fs::read(nest_destination.join(".env")).unwrap()
+                    == fs::read(inner.join(".env")).unwrap()
+                    && fs::read(nest_destination.join("notes/todo.md")).unwrap()
+                        == fs::read(inner.join("notes/todo.md")).unwrap()));
+        // What the restored OUTER thinks of the nest's carried secret.
+        let status = if destination.join(".git").exists() {
+            String::from_utf8(g(
+                &destination,
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignored",
+                ],
+            ))
+            .unwrap()
+        } else {
+            String::new()
+        };
+        let rows = rows.into_inner().unwrap();
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+rwx"])
+            .arg(&root)
+            .status();
+        fs::remove_dir_all(root).unwrap();
+        (rows, nest_repo_restored, status)
+    }
+
+    #[test]
+    fn rv3_estate_control_nest_without_ignored_files_restores_after_outer() {
+        let (rows, nest_restored, _) = estate_two_items("estate-control", false);
+        eprintln!("control rows: {rows:?}");
+        assert!(nest_restored, "{rows:?}");
+    }
+
+    // R-N114: the nest item owns its seats. The outer carries none of the
+    // nest's ignored files and names the carrying item; the `.env` restores
+    // exactly once, through the nest item, and is never untracked in the
+    // restored outer.
+    #[test]
+    fn rv3_estate_nest_with_ignored_files_restores_after_outer() {
+        let (rows, nest_restored, status) = estate_two_items("estate-ignored", true);
+        assert!(
+            rows.iter().all(|(outcome, _)| outcome != "refused"),
+            "{rows:?}"
+        );
+        assert!(
+            !status.contains("?? vendor/inner/.env"),
+            "nest secret is untracked (not ignored) in the restored outer:\n{status}"
+        );
+        assert!(
+            nest_restored,
+            "nest item cannot restore after the outer: {rows:?}"
+        );
+    }
+
+    // I. Judgment (b): an ignored nested repository inside a nest refuses,
+    // while the same shape one level up is custody.
+    #[test]
+    fn rv3_ignored_repo_inside_nest_refuses_but_outer_equivalent_is_custody() {
+        let (root, outer, inner) = outer_with_nest("nest-in-nest");
+        fs::write(inner.join(".gitignore"), b"cache/\n").unwrap();
+        commit_all(&inner, "ignore");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let deep = inner.join("cache/deep");
+        init(&deep);
+        fs::write(deep.join("x"), b"x").unwrap();
+        commit_all(&deep, "x");
+        let in_nest = verdict(&outer);
+        fs::write(outer.join(".gitignore"), b"cache/\n").unwrap();
+        commit_all(&outer, "ignore");
+        fs::rename(inner.join("cache"), outer.join("cache")).unwrap();
+        let in_outer = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        eprintln!("in nest: {in_nest}\nin outer: {in_outer}");
+        assert!(in_nest.starts_with("REFUSED"));
+        assert!(in_outer.starts_with("CUSTODY"));
+    }
+
+    // J. Credentials: no receipt line, refusal or Debug output of the custody
+    // carries a carried secret's bytes or a credentialed remote URL.
+    #[test]
+    fn rv3_no_credential_in_receipts_or_debug() {
+        let (root, outer, inner) = nest_with_ignored("creds");
+        g(
+            &inner,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("https://user:{}@example.invalid/i.git", "rv3-url-token"),
+            ],
+        );
+        let custody = nested_repositories(&outer).unwrap();
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        let text = format!(
+            "{custody:?}\n{:?}\n{}",
+            export,
+            custody
+                .iter()
+                .map(NestedRepository::receipt_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        fs::remove_dir_all(root).unwrap();
+        for needle in [
+            "rv3-unique-credential",
+            "rv3-url-token",
+            "rv3 unique untracked",
+        ] {
+            assert!(!text.contains(needle), "{needle} leaked");
+        }
+    }
+
+    // K. Legacy key: print for a fixture made once, outside, so the same
+    // bytes and inode can be keyed by main and by this head.
+    #[test]
+    #[ignore = "reviewer probe: RV3_FIXTURE=<repo>"]
+    fn rv3_print_legacy_key() {
+        let Some(fixture) = std::env::var_os("RV3_FIXTURE") else {
+            return;
+        };
+        let fixture = PathBuf::from(fixture);
+        let hex = |key: [u8; 32]| blake3::Hash::from_bytes(key).to_hex().to_string();
+        println!(
+            "RV3KEY default={} full={}",
+            hex(reusable_capture_key(&fixture).unwrap()),
+            hex(
+                reusable_capture_key_with_policy(&fixture, CapturePolicy::including_rebuildable())
+                    .unwrap()
+            )
+        );
+    }
+    // L. A nest's populated submodule is a nest-in-nest the census never
+    // walks. R-N115 now refuses the nest by name, so R-N83 (stash), N1
+    // (hidden index flags) and R-N89 (ignored files) cannot be skipped there.
+    fn nest_with_populated_submodule(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, outer, inner) = outer_with_nest(name);
+        let upstream = root.join("upstream");
+        init(&upstream);
+        fs::write(upstream.join("s.c"), b"s1").unwrap();
+        fs::write(upstream.join(".gitignore"), b".env\n").unwrap();
+        commit_all(&upstream, "s1");
+        g(
+            &inner,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "s",
+            ],
+        );
+        g(&inner, &["commit", "-q", "-m", "add s"]);
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let sub = inner.join("s");
+        // R-N115: a populated submodule inside a nest now refuses by name,
+        // before any of the checks this section probes could be skipped.
+        assert!(
+            verdict(&outer).starts_with("REFUSED GitNestPopulatedSubmodule"),
+            "{}",
+            verdict(&outer)
+        );
+        (root, outer, sub)
+    }
+
+    #[test]
+    fn rv3_stash_in_a_nests_submodule_refuses() {
+        let (root, outer, sub) = nest_with_populated_submodule("subm-stash");
+        fs::write(sub.join("s.c"), b"stashed unique work").unwrap();
+        g(&sub, &["stash", "-q"]);
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "stash in nest submodule: {v}");
+    }
+
+    #[test]
+    fn rv3_assume_unchanged_edit_in_a_nests_submodule_refuses() {
+        let (root, outer, sub) = nest_with_populated_submodule("subm-assume");
+        g(&sub, &["update-index", "--assume-unchanged", "s.c"]);
+        fs::write(sub.join("s.c"), b"hidden unique edit").unwrap();
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            v.starts_with("REFUSED"),
+            "assume-unchanged in nest submodule: {v}"
+        );
+    }
+
+    #[test]
+    fn rv3_ignored_file_in_a_nests_submodule_is_carried_or_refused() {
+        let (root, outer, sub) = nest_with_populated_submodule("subm-ignored");
+        fs::write(sub.join(".env"), format!("TOK{}=rv3-subm-credential", "EN")).unwrap();
+        let v = verdict(&outer);
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        );
+        let carried = export.as_ref().ok().map(|_| {
+            String::from_utf8(g(
+                &root.join("capture/repository.git"),
+                &["ls-tree", "-r", "--name-only", "refs/carry-export/worktree"],
+            ))
+            .unwrap()
+        });
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            v.starts_with("REFUSED")
+                || carried
+                    .as_deref()
+                    .is_some_and(|c| c.contains("vendor/inner/s/.env")),
+            "submodule ignored file silently dropped: {v} carried={carried:?}"
+        );
+    }
+
+    // M. N7 + F5 for gitlinks: the outer's populated submodule as its own
+    // planned item under the outer's workspace.
+    #[test]
+    fn rv3_estate_populated_submodule_item_restores_after_outer() {
+        use crate::estate;
+        let root = fresh("estate-subm");
+        let upstream = root.join("upstream");
+        init(&upstream);
+        fs::write(upstream.join("s.c"), b"s1").unwrap();
+        commit_all(&upstream, "s1");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        g(
+            &outer,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        g(&outer, &["commit", "-q", "-m", "add sub"]);
+        let sub = outer.join("sub");
+        g(&sub, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let destination = root.join("dest");
+        let plan = root.join("plan");
+        estate::add(&plan, &outer, &destination, Some(&destination)).unwrap();
+        let sub_destination = destination.join("sub");
+        estate::add(&plan, &sub, &sub_destination, Some(&sub_destination)).unwrap();
+        let rows = std::sync::Mutex::new(Vec::new());
+        let record = |row: &estate::Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome.to_owned(), row.reason.clone()));
+            Ok(())
+        };
+        let captured =
+            estate::capture(&plan, &root.join("state"), &root.join("corpus"), 1, &record);
+        let _ = estate::apply(
+            &plan,
+            &root.join("corpus"),
+            &root.join("applied"),
+            "neo",
+            1,
+            &record,
+        );
+        let restored = sub_destination.join(".git").exists();
+        let rows = rows.into_inner().unwrap();
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+rwx"])
+            .arg(&root)
+            .status();
+        fs::remove_dir_all(root).unwrap();
+        eprintln!(
+            "submodule estate rows: {rows:?} capture ok={}",
+            captured.is_ok()
+        );
+        assert!(restored, "{rows:?}");
     }
 }
