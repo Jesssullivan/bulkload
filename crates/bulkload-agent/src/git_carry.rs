@@ -1002,6 +1002,10 @@ pub enum NestedRepositoryKind {
     Directory,
     /// A mode `160000` index entry (a submodule), whether or not populated.
     Gitlink,
+    /// A path HEAD's tree names as both a gitlink and a tree: Git's own index
+    /// resolution collapses the gitlink. The capture carries the index as Git
+    /// resolved it and names the collapse (R-N110).
+    CollapsedGitlink,
 }
 
 /// What the nested `.git` is, for a [`NestedRepositoryKind::Directory`] nest.
@@ -1071,6 +1075,9 @@ impl NestedRepository {
         match self.kind {
             NestedRepositoryKind::Gitlink => {
                 format!("nested-repository path=\"{path}\" kind=Gitlink head={head}")
+            }
+            NestedRepositoryKind::CollapsedGitlink => {
+                format!("gitlink-collapsed path=\"{path}\" head-gitlink={head} carried-as=index")
             }
             NestedRepositoryKind::Directory => {
                 let unpushed = if self.remotes {
@@ -1324,8 +1331,9 @@ struct NestSeats {
 // inside the nest (a directory on the fixed list the nest tracks nothing
 // beneath) is omitted and recorded instead, unless the policy carries the
 // rebuildable set. An ignored nested repository (a `dir/` entry) outside such
-// a root, a `.git` component, or a listed path that is not what lstat finds
-// refuses: nothing listed is dropped silently.
+// a root refuses GIT_NEST_INNER_REPOSITORY naming it (R-N111); a `.git` or
+// dot-dot component, or a listed path lstat disagrees with, refuses too:
+// nothing listed is dropped silently.
 fn nest_ignored_seats(
     root: &Path,
     directory: &Path,
@@ -1382,7 +1390,19 @@ fn nest_ignored_seats(
             continue;
         }
         if is_directory {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
+            // R-N111: an ignored repository inside the nest is named, escaped
+            // and typed. Any other `dir/` entry (Git lists one only when it
+            // does not descend) is still refused, generically.
+            let inner = directory
+                .join(std::ffi::OsStr::from_bytes(path))
+                .join(".git");
+            return Err(match fs::symlink_metadata(inner) {
+                Ok(_) => BulkloadRefusal::GitNestInnerRepository(joined(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    BulkloadRefusal::GitInventoryMalformed
+                }
+                Err(error) => error.into(),
+            });
         }
         // The nest root and each directory on the way are seats too, so
         // restore recreates them with their captured modes.
@@ -2205,8 +2225,73 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
             ignored_carried: 0,
         });
     }
+    collapsed_gitlinks(repo, &mut gitlinks)?;
     gitlinks.sort();
     Ok((index_path, before_index, gitlinks))
+}
+
+// R-N110: HEAD's own tree names a path as both a gitlink and a tree (a
+// duplicate entry Git's tree reader tolerates), so Git's index resolution of
+// HEAD collapses the gitlink. The index is carried exactly as Git resolved it;
+// this names the collapse on every receipt. An unborn HEAD has nothing to
+// compare. Nothing is recorded for an ordinary HEAD, so it keeps its exact key.
+fn collapsed_gitlinks(repo: &Path, gitlinks: &mut Vec<NestedRepository>) -> Result<()> {
+    let head = git(repo)
+        .args(["rev-parse", "--verify", "-q", "HEAD^{tree}"])
+        .output()?;
+    match head.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(()),
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    let listed = output(git(repo).args(["ls-tree", "-r", "-z", "--full-tree", "HEAD"]))?;
+    let mut entries = Vec::new();
+    for entry in listed.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header = std::str::from_utf8(
+            entry
+                .get(..tab)
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?,
+        )
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let path = entry
+            .get(tab + 1..)
+            .filter(|path| !path.is_empty())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        entries.push((header, path));
+    }
+    for (header, rel_path) in &entries {
+        if !header.starts_with("160000 ") {
+            continue;
+        }
+        let beneath = entries.iter().any(|(_, path)| {
+            path.len() > rel_path.len()
+                && path.starts_with(rel_path)
+                && path.get(rel_path.len()) == Some(&b'/')
+        });
+        if !beneath {
+            continue;
+        }
+        let value = header
+            .split_whitespace()
+            .nth(2)
+            .filter(|value| oid(value))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        gitlinks.push(NestedRepository {
+            rel_path: rel_path.to_vec(),
+            kind: NestedRepositoryKind::CollapsedGitlink,
+            head_oid: Some(value.to_owned()),
+            gitdir_kind: GitdirKind::None,
+            admin: Vec::new(),
+            unpushed: 0,
+            remotes: false,
+            ignored_carried: 0,
+        });
+    }
+    Ok(())
 }
 
 fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
@@ -5980,6 +6065,7 @@ mod review_pr53b {
     // The fixed verdict: no nest custody, and sub/f is carried staged and in
     // the worktree and restores byte-identical. Nothing is dropped.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn rv_gitlink_and_tree_at_same_path() {
         let root = fresh("gitlink-tree");
         let outer = root.join("outer");
@@ -6012,6 +6098,7 @@ mod review_pr53b {
             tree_f.trim()
         );
         let tree = input(git(&outer).args(["mktree"]), listing.as_bytes());
+        assert!(tree.is_ok());
         let _ = git(&outer)
             .args(["update-index", "--add", "--cacheinfo"])
             .arg(format!("160000,{head},sub"))
@@ -6022,8 +6109,8 @@ mod review_pr53b {
             .arg(format!("100644,{blob},sub/f"))
             .output()
             .unwrap();
-        if let Ok(t) = tree {
-            let t = String::from_utf8(t).unwrap();
+        if let Ok(t) = &tree {
+            let t = String::from_utf8(t.clone()).unwrap();
             let _ = git(&outer).args(["read-tree", t.trim()]).output().unwrap();
         }
         fs::create_dir_all(outer.join("sub")).unwrap();
@@ -6050,13 +6137,105 @@ mod review_pr53b {
                 fs::read(restored.join("sub/f")).unwrap()
             })
             .ok();
+        // R-N110: once a commit's tree names `sub` as both a gitlink and a
+        // tree, Git's read-tree of HEAD collapses the index the same way; the
+        // capture carries that index and names the collapse on its receipt.
+        let duplicate = String::from_utf8(tree.as_ref().unwrap().clone()).unwrap();
+        let commit = String::from_utf8(g(
+            &outer,
+            &[
+                "commit-tree",
+                duplicate.trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                "duplicate",
+            ],
+        ))
+        .unwrap();
+        g(&outer, &["update-ref", "refs/heads/main", commit.trim()]);
+        g(&outer, &["read-tree", "HEAD"]);
+        let collapsed =
+            format!("gitlink-collapsed path=\"sub\" head-gitlink={head} carried-as=index");
+        let committed = (verdict(&outer), collapsed.clone());
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture-committed"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        let lines: Vec<String> = export
+            .nested_repositories
+            .iter()
+            .map(NestedRepository::receipt_line)
+            .collect();
+        let restored = root.join("restored-committed");
+        restore_bundle(&export.bundle, &restored, "neo").unwrap();
+        let back_committed = fs::read(restored.join("sub/f")).unwrap();
         fs::remove_dir_all(root).unwrap();
+        assert_eq!(lines, vec![collapsed]);
+        assert_eq!(
+            export.nested_repositories.first().map(|nest| nest.kind),
+            Some(NestedRepositoryKind::CollapsedGitlink)
+        );
+        assert_eq!(back_committed, b"under gitlink");
         assert!(!index.contains("160000"), "{index}");
         assert!(index.contains("\tsub/f"), "{index}");
+        // Only a dangling tree ever named both: nothing in HEAD to compare.
         assert_eq!(v, "CUSTODY []");
+        assert_eq!(committed.0, format!("CUSTODY [{:?}]", committed.1));
         assert_eq!(e.map(|e| e.nested_repositories), Ok(Vec::new()));
         assert!(staged.unwrap().contains(&format!("blob {blob}\tsub/f")));
         assert_eq!(back.unwrap(), b"under gitlink");
+    }
+
+    // R-N111: an ignored nested repository inside a clean nest, outside any
+    // rebuildable root, refuses with a typed code naming the inner path
+    // (escaped). Under a rebuildable root it is omitted like the rest.
+    #[test]
+    fn rv_ignored_inner_repository_in_nest_refuses_by_name() {
+        let (root, outer, inner) = outer_with_pushed_nest("inner-repo");
+        fs::write(inner.join(".gitignore"), b"vendored/\nnode_modules/\n").unwrap();
+        commit_all(&inner, "ignore");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // Under a rebuildable root (default capture policy): omitted, custody.
+        let deep = inner.join("node_modules/dep");
+        init(&deep);
+        let omitted = export_repository_with_policy(
+            &outer,
+            &root.join("capture-omitted"),
+            None,
+            CapturePolicy::default(),
+        )
+        .map(|export| {
+            export
+                .omitted
+                .into_iter()
+                .map(|omission| omission.rel_path)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(omitted, Ok(vec![b"vendor/inner/node_modules".to_vec()]));
+        let odd = inner.join("vendored/odd\nname");
+        init(&odd);
+        // Default capture policy: node_modules/dep is omitted, so the only
+        // refusal is the ignored repository outside a rebuildable root. (The
+        // full-fidelity nested_repositories() API would name node_modules/dep
+        // first; that API/policy split is follow-up F6.)
+        let key = reusable_capture_key(&outer);
+        let export = export_repository(&outer, &root.join("capture"));
+        fs::remove_dir_all(root).unwrap();
+        let expected =
+            BulkloadRefusal::GitNestInnerRepository(b"vendor/inner/vendored/odd\nname".to_vec());
+        assert_eq!(key, Err(expected.clone()));
+        assert_eq!(export, Err(expected.clone()));
+        assert_eq!(expected.code(), "GIT_NEST_INNER_REPOSITORY");
+        let shown = expected.to_string();
+        assert_eq!(
+            shown,
+            "GIT_NEST_INNER_REPOSITORY path=\"vendor/inner/vendored/odd\\nname\""
+        );
+        assert_eq!(shown.lines().count(), 1);
     }
 
     // N4: filter drivers from the nest's own config must not run during the

@@ -79,6 +79,11 @@ pub enum BulkloadRefusal {
     /// A nested repository's detached HEAD holds commits no local branch,
     /// tag or remote-tracking ref reaches (R-N83).
     GitNestDetachedUnreachable,
+    /// A nested repository holds an ignored repository of its own, outside
+    /// any rebuildable root, which no capture carries (R-N111). Carries the
+    /// inner repository's path relative to the captured checkout, raw bytes;
+    /// [`fmt::Display`] prints it escaped.
+    GitNestInnerRepository(Vec<u8>),
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -151,6 +156,7 @@ impl BulkloadRefusal {
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
             Self::GitNestStashed => "GIT_NEST_STASHED",
             Self::GitNestDetachedUnreachable => "GIT_NEST_DETACHED_UNREACHABLE",
+            Self::GitNestInnerRepository(_) => "GIT_NEST_INNER_REPOSITORY",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -171,6 +177,10 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
+            // Escaped inside quotes: a path cannot forge a second line.
+            Self::GitNestInnerRepository(ref path) => {
+                write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
+            }
             _ => f.write_str(self.code()),
         }
     }
@@ -226,6 +236,7 @@ mod tests {
             BulkloadRefusal::GitIgnorePolicyConflict,
             BulkloadRefusal::GitNestStashed,
             BulkloadRefusal::GitNestDetachedUnreachable,
+            BulkloadRefusal::GitNestInnerRepository(Vec::new()),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
