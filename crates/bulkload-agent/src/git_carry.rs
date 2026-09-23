@@ -1201,6 +1201,11 @@ fn foreign_nest(
     if nest_detached_unreachable(directory, head_oid.as_deref())? {
         return Err(BulkloadRefusal::GitNestDetachedUnreachable);
     }
+    // N1: status trusts the index; an entry flagged assume-unchanged or
+    // skip-worktree, a sparse checkout, or a split index can hide an edit.
+    if nest_index_hides_changes(directory)? {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
     // Ignored entries are listed too (R-N83 b): they are custody, not dirt.
     let status = output(nest_status(directory)?.args([
         "--git-dir=.git",
@@ -1232,6 +1237,38 @@ fn foreign_nest(
         ignored_sample,
         ignored_digest,
     })
+}
+
+// N1 (R-N73, R-N83): the refusal `source_index` applies to the enclosing
+// repository, applied to a nest before its status is believed. Any non-zero
+// index entry flag (assume-unchanged, skip-worktree, intent-to-add), a sparse
+// checkout, or a split index means status may not see every change.
+fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
+    let debug = output(git(directory).args(["--git-dir=.git", "ls-files", "--debug"]))?;
+    let flagged = debug
+        .split(|b| *b == b'\n')
+        .filter_map(|line| {
+            line.windows(8)
+                .position(|window| window == b"\tflags: ")
+                .and_then(|at| line.get(at + 8..))
+        })
+        .any(|flags| flags != b"0");
+    if flagged {
+        return Ok(true);
+    }
+    let sparse = git(directory)
+        .args(["--git-dir=.git", "config", "--bool", "core.sparseCheckout"])
+        .output()?;
+    match sparse.status.code() {
+        Some(0) if sparse.stdout.trim_ascii() != b"false" => return Ok(true),
+        Some(0 | 1) => {}
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    Ok(
+        !output(git(directory).args(["--git-dir=.git", "rev-parse", "--shared-index-path"]))?
+            .trim_ascii()
+            .is_empty(),
+    )
 }
 
 /// How deep populated submodules inside a nest are followed for filter
@@ -5189,6 +5226,49 @@ mod review_pr53b {
             ),
             Err(e) => format!("REFUSED {e:?}"),
         }
+    }
+
+    // N1: assume-unchanged hides a worktree edit from `status`.
+    #[test]
+    fn rv_assume_unchanged_edit_in_nest_must_refuse() {
+        let (root, outer, inner) = outer_with_pushed_nest("assume");
+        g(&inner, &["update-index", "--assume-unchanged", "lib.c"]);
+        fs::write(inner.join("lib.c"), b"v2 unique unsaved edit").unwrap();
+        assert!(g(
+            &inner,
+            &["status", "--porcelain=v2", "--untracked-files=all"]
+        )
+        .is_empty());
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "{v}");
+    }
+
+    // N1: skip-worktree hides a worktree edit from `status`.
+    #[test]
+    fn rv_skip_worktree_edit_in_nest_must_refuse() {
+        let (root, outer, inner) = outer_with_pushed_nest("skipwt");
+        g(&inner, &["update-index", "--skip-worktree", "lib.c"]);
+        fs::write(inner.join("lib.c"), b"v2 unique unsaved edit").unwrap();
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "{v}");
+    }
+
+    // N1: a sparse checkout hides paths from `status` the same way, and a
+    // split index is refused exactly as the outer repository's is.
+    #[test]
+    fn rv_sparse_or_split_index_nest_must_refuse() {
+        let (root, outer, inner) = outer_with_pushed_nest("sparse");
+        g(&inner, &["config", "core.sparseCheckout", "true"]);
+        let sparse = verdict(&outer);
+        g(&inner, &["config", "--unset", "core.sparseCheckout"]);
+        assert!(verdict(&outer).starts_with("CUSTODY"));
+        g(&inner, &["update-index", "--split-index"]);
+        let split = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(sparse.starts_with("REFUSED"), "{sparse}");
+        assert!(split.starts_with("REFUSED"), "{split}");
     }
 
     // N4: filter drivers from the nest's own config must not run during the
