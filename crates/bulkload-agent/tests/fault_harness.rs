@@ -20,6 +20,29 @@
 //! - the resume converges with only the fixture's own refusal, and the final
 //!   destination is byte-identical to the source.
 //!
+//! # What this harness cannot see
+//!
+//! `_exit` models a **process crash only**. The kernel page cache survives
+//! it, so bytes the process wrote are still there after the crash whether or
+//! not they were synced. This harness therefore **cannot detect a missing or
+//! misplaced fsync**. It does detect ordering errors that show up without
+//! power loss: a record committed before its data, a final name holding
+//! partial content, or a resume that cannot adopt what a crash left.
+//! Power-loss coverage is the remaining W7 follow-up: a power-loss replay
+//! harness, either a syscall-log (ALICE-style) crash-state checker or
+//! dm-log-writes replay.
+//!
+//! # Known violations
+//!
+//! Tests marked `#[ignore]` with a "known violation" reason assert invariants
+//! the v3 engine breaks today (R-N86). They are listed, not fixed, and never
+//! count as coverage:
+//!
+//! - `directory_after_mkdir`: a crash between `mkdirat` and the pending
+//!   directory record never converges.
+//! - `live_writer_*_leaves_no_source_index`: a refused capture leaves the
+//!   victim's chunks and committed `chunk_locations` rows in the source store.
+//!
 //! # Live writer
 //!
 //! A mid-read hook rewrites, truncates, rename-replaces or same-size rewrites
