@@ -452,13 +452,8 @@ fn repair_missing_index_inner(
     fs::File::open(&receipt)?.sync_all()?;
     fs::File::open(&receipt_parent)?.sync_all()?;
     import_bundle(&repo, &bundle, source)?;
-    let staged_entries = output(git(&repo).args(["ls-tree", "-r", "-z", &find("staged")?]))?;
-    if staged_entries
-        .split(|b| *b == 0)
-        .any(|entry| entry.starts_with(b"160000 "))
-    {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
+    // A gitlink in the staged tree is the captured index entry, restored as
+    // is: reading it needs no submodule commit (R-N73, B2).
     let private_index = receipt.join("captured.index");
     output(
         git(&repo)
@@ -660,7 +655,6 @@ fn export_repository_inner(
     )?;
     let index = capture.join("index");
     fs::write(&index, &before_index)?;
-    strip_gitlinks(&private, &repo, &index, &gitlinks)?;
     let staged = text(snapshot_command(&private, &repo, &index).arg("write-tree"))?;
     set_ref(
         &private,
@@ -706,8 +700,9 @@ fn export_repository_inner(
     // gitlink index entries. Neither's content is carried: a nested repository
     // (a vendored checkout, a tool cache, a build dependency, a populated
     // submodule) must be captured as its own estate item, and a gitlink names a
-    // commit this bundle does not hold. Directory nests hold still or the
-    // census comparison above refuses; gitlinks hold still or the index does.
+    // commit this bundle does not hold (the entry itself is in the staged
+    // tree). Directory nests hold still or the census comparison above
+    // refuses; gitlinks hold still or the index does.
     let nested_repositories = nested_custody(&census.nested_repositories, &gitlinks);
     nested_repositories_metadata(&private, &nested_repositories)?;
     // Omission is recorded, never silent. Sizes are measured once, here, and
@@ -1007,9 +1002,10 @@ pub enum GitdirKind {
 /// worktree of the same repository, or a gitlink entry in its index.
 ///
 /// Its content is never carried by the enclosing capture: nothing below a
-/// directory nest is walked, and a gitlink is removed from the staged tree
-/// the bundle writes. The nested repository must be its own estate item; this
-/// row is the enclosing capture's custody statement for it (R-N32).
+/// directory nest is walked, and the commit a gitlink names is not bundled
+/// (the gitlink entry itself stays in the staged tree, exactly as indexed).
+/// The nested repository must be its own estate item; this row is the
+/// enclosing capture's custody statement for it (R-N32, R-N73).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct NestedRepository {
     /// Nest root relative to the captured checkout, as raw OS bytes.
@@ -1035,35 +1031,6 @@ pub fn nested_repositories(repo: &Path) -> Result<Vec<NestedRepository>> {
     let census = repository_census(&repo, &common)?;
     let (_, _, gitlinks) = source_index(&repo)?;
     Ok(nested_custody(&census.nested_repositories, &gitlinks))
-}
-
-// The staged tree must not name a gitlink to a commit the bundle does not
-// carry. Gitlinks leave the private index copy (never the source index) and
-// travel as custody; the submodule's content is its own estate item.
-fn strip_gitlinks(
-    private: &Path,
-    repo: &Path,
-    index: &Path,
-    gitlinks: &[NestedRepository],
-) -> Result<()> {
-    if gitlinks.is_empty() {
-        return Ok(());
-    }
-    let mut paths = Vec::new();
-    for gitlink in gitlinks {
-        paths.extend_from_slice(&gitlink.rel_path);
-        paths.push(0);
-    }
-    input(
-        snapshot_command(private, repo, index).args([
-            "update-index",
-            "--force-remove",
-            "-z",
-            "--stdin",
-        ]),
-        &paths,
-    )?;
-    Ok(())
 }
 
 // The in-bundle custody ref, written only when there is custody to record, so
@@ -1114,6 +1081,67 @@ fn nested_head(directory: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     Err(BulkloadRefusal::GitInventoryMalformed)
+}
+
+// A directory whose `.git` (a directory, or a pointer file that does not
+// resolve into our `worktrees/`) may be a foreign repository. It is custody
+// only when all of these hold; otherwise it is malformed inventory (R-N73):
+//
+// - F7: Git must be able to read it, and its common directory must not be
+//   this repository's. Checked for both `.git` kinds, through `--git-dir` so
+//   discovery can never walk up into the enclosing checkout.
+// - B1: the enclosing repository tracks nothing under the nest path. A
+//   gitlink at exactly the nest path (a populated submodule) is the one
+//   permitted entry; any other tracked path under it would be dropped from
+//   the capture, since nothing below a nest is walked.
+fn foreign_nest(
+    root: &Path,
+    directory: &Path,
+    common: &Path,
+    rel_path: Vec<u8>,
+    gitdir_kind: GitdirKind,
+) -> Result<NestedRepository> {
+    let seen = text(git(directory).args([
+        "--git-dir=.git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]))?;
+    if fs::canonicalize(seen).ok().as_deref() == Some(common) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    if tracked_under(root, &rel_path)? {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(NestedRepository {
+        rel_path,
+        kind: NestedRepositoryKind::Directory,
+        head_oid: nested_head(directory)?,
+        gitdir_kind,
+    })
+}
+
+// Whether the enclosing repository's index holds any path at or below `rel`
+// other than a single gitlink at exactly `rel`. Same literal, top-anchored
+// pathspec as `rebuildable_root`.
+fn tracked_under(root: &Path, rel: &[u8]) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut pathspec = std::ffi::OsString::from(":(top,literal)");
+    pathspec.push(std::ffi::OsStr::from_bytes(rel));
+    let entries = output(
+        git(root)
+            .args(["ls-files", "-z", "--stage", "--"])
+            .arg(pathspec),
+    )?;
+    Ok(entries
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+                return true;
+            };
+            !(entry.starts_with(b"160000 ") && entry.get(tab + 1..) == Some(rel))
+        }))
 }
 
 // One directory below the root whose `.git` classified as custody.
@@ -1168,12 +1196,13 @@ fn nested_administration(
             .to_vec())
     };
     if meta.is_dir() {
-        return Ok(Some(NestedCustody::Repository(NestedRepository {
-            rel_path: rel_path()?,
-            kind: NestedRepositoryKind::Directory,
-            head_oid: nested_head(directory)?,
-            gitdir_kind: GitdirKind::Directory,
-        })));
+        return Ok(Some(NestedCustody::Repository(foreign_nest(
+            root,
+            directory,
+            common,
+            rel_path()?,
+            GitdirKind::Directory,
+        )?)));
     }
     if !meta.is_file() || meta.len() > GITDIR_POINTER_LIMIT {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -1202,19 +1231,14 @@ fn nested_administration(
     let worktrees = common.join("worktrees");
     if admin.parent() != Some(worktrees.as_path()) {
         // Not our administration at all: a worktree of another repository, or
-        // a populated submodule (`<common>/modules/<name>`). Git must be able
-        // to read it and must not report it as this repository.
-        let seen =
-            text(git(directory).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
-        if fs::canonicalize(seen).ok().as_deref() == Some(common) {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        return Ok(Some(NestedCustody::Repository(NestedRepository {
-            rel_path: rel_path()?,
-            kind: NestedRepositoryKind::Directory,
-            head_oid: nested_head(directory)?,
-            gitdir_kind: GitdirKind::PointerFile,
-        })));
+        // a populated submodule (`<common>/modules/<name>`).
+        return Ok(Some(NestedCustody::Repository(foreign_nest(
+            root,
+            directory,
+            common,
+            rel_path()?,
+            GitdirKind::PointerFile,
+        )?)));
     }
     let worktree_name = admin
         .file_name()
@@ -1433,9 +1457,10 @@ fn safe_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
 }
 
 // The source index path, its exact bytes, and every gitlink it holds as
-// custody. A gitlink names a submodule commit this repository's objects do not
-// contain; it is recorded, removed from the staged tree the capture writes,
-// and never carried. The submodule's own content is its own estate item.
+// custody. A gitlink names a submodule commit this repository's objects need
+// not contain; the entry stays in the staged tree (Git bundles and restores a
+// gitlink to an absent commit as is), the commit is never carried, and the
+// submodule's own content is its own estate item (R-N73, B2).
 fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)> {
     let index_path = PathBuf::from(text(git(repo).args([
         "rev-parse",
@@ -3222,6 +3247,236 @@ mod tests {
         text(git(repo).args(["rev-parse", "--verify", "HEAD"])).unwrap()
     }
 
+    // A fresh, empty per-process fixture root.
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn committed(repo: &Path, content: &[u8]) {
+        committed_repository(repo, content);
+    }
+
+    fn commit(repo: &Path, message: &str) {
+        output(git(repo).args(["-c", "commit.gpgsign=false", "commit", "-m", message])).unwrap();
+    }
+
+    fn refuses_everywhere(source: &Path, capture: &Path) {
+        assert_eq!(
+            reusable_capture_key(source),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
+        assert_eq!(
+            nested_repositories(source),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
+        assert_eq!(
+            export_repository(source, capture),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
+    }
+
+    // R-N73 B1, the reviewer's reproduction: the outer repository tracks
+    // vendor/inner/lib.c, then a repository is initialised over it and the file
+    // edited. Treating vendor/inner as foreign custody silently dropped the
+    // outer's tracked file and the user's edit. It must refuse instead.
+    #[test]
+    fn adv_outer_tracked_file_under_nested_git_refuses_instead_of_dropping() {
+        let root = fresh("bulkload-adv-tracked-under-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let inner = source.join("vendor/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        output(git(&source).args(["add", "vendor/inner/lib.c"])).unwrap();
+        commit(&source, "vendor lib");
+        output(git(&inner).args(["init", "--template="])).unwrap();
+        fs::write(inner.join("lib.c"), b"v2 unique user edit").unwrap();
+        refuses_everywhere(&source, &root.join("capture"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B1 in isolation: the nest is perfectly clean (it commits lib.c
+    // itself), so only the outer's tracking of a path under it can refuse.
+    // Both a `.git` directory and a pointer-file nest are covered.
+    #[test]
+    fn adv_outer_tracked_file_under_a_clean_nest_refuses() {
+        let root = fresh("bulkload-adv-tracked-under-clean-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let inner = source.join("vendor/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        output(git(&source).args(["add", "vendor/inner/lib.c"])).unwrap();
+        commit(&source, "vendor lib");
+        // `committed` adds everything present, lib.c included.
+        committed(&inner, b"inner");
+        assert!(output(git(&inner).args(["status", "--porcelain"]))
+            .unwrap()
+            .is_empty());
+        refuses_everywhere(&source, &root.join("capture-directory"));
+        fs::remove_dir_all(&inner).unwrap();
+        output(git(&source).args(["rm", "-q", "--cached", "vendor/inner/lib.c"])).unwrap();
+        commit(&source, "untrack");
+        assert!(nested_repositories(&source).unwrap().is_empty());
+
+        // A pointer-file nest: another repository's linked worktree, with a
+        // path under it tracked by the outer repository.
+        let other = root.join("other");
+        committed(&other, b"other");
+        let foreign = source.join("vendor/foreign");
+        output(
+            git(&other)
+                .args(["worktree", "add", "-b", "foreign"])
+                .arg(&foreign),
+        )
+        .unwrap();
+        assert!(foreign.join(".git").is_file());
+        let blob = input(
+            git(&source).args(["hash-object", "-w", "--stdin"]),
+            b"outer copy",
+        )
+        .unwrap();
+        let blob = String::from_utf8(blob).unwrap();
+        output(git(&source).args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},vendor/foreign/tracked", blob.trim()),
+        ]))
+        .unwrap();
+        commit(&source, "track under foreign");
+        refuses_everywhere(&source, &root.join("capture-pointer"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B2, inverted from the reviewer's reproduction: a committed
+    // submodule must restore as a submodule. Stripping the gitlink from the
+    // staged tree made `git diff --cached HEAD` show `D lib/vendor` after both
+    // restore_bundle and repair_missing_index.
+    #[test]
+    fn adv_committed_gitlink_restores_without_a_staged_submodule_deletion() {
+        let root = fresh("bulkload-adv-committed-gitlink");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let oid = head_of(&source);
+        fs::create_dir_all(source.join("lib/vendor")).unwrap();
+        output(git(&source).args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{oid},lib/vendor"),
+        ]))
+        .unwrap();
+        commit(&source, "submodule");
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&bundle, &restored, "neo").unwrap();
+        let clean = |repo: &Path| {
+            assert_eq!(
+                output(git(repo).args(["diff", "--cached", "--name-status", "HEAD"])).unwrap(),
+                b""
+            );
+            assert_eq!(
+                text(git(repo).args(["ls-files", "--stage", "--", "lib/vendor"])).unwrap(),
+                format!("160000 {oid} 0\tlib/vendor")
+            );
+        };
+        clean(&restored);
+        fs::remove_file(restored.join(".git/index")).unwrap();
+        repair_missing_index(&bundle, &restored, "neo", &root.join("repair")).unwrap();
+        clean(&restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B2: the reviewer's proof that no strip is needed. A gitlink naming
+    // a commit that exists nowhere bundles, verifies and restores as-is.
+    #[test]
+    fn adv_gitlink_to_absent_commit_bundles_fine_without_stripping() {
+        let root = fresh("bulkload-adv-absent-gitlink");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert!(!git(&source)
+            .args(["cat-file", "-e", absent])
+            .status()
+            .unwrap()
+            .success());
+        output(git(&source).args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{absent},third_party/absent"),
+        ]))
+        .unwrap();
+        commit(&source, "absent submodule");
+        let capture = root.join("capture");
+        let bundle = export_repository(&source, &capture).unwrap();
+        let private = capture.join("repository.git");
+        output(git(&private).args(["bundle", "verify"]).arg(&bundle)).unwrap();
+        assert_eq!(
+            text(git(&private).args([
+                "ls-tree",
+                "refs/carry-export/staged",
+                "--",
+                "third_party/absent"
+            ]))
+            .unwrap(),
+            format!("160000 commit {absent}\tthird_party/absent")
+        );
+        assert!(!git(&private)
+            .args(["cat-file", "-e", absent])
+            .status()
+            .unwrap()
+            .success());
+        let restored = root.join("restored");
+        restore_bundle(&bundle, &restored, "neo").unwrap();
+        assert_eq!(
+            output(git(&restored).args(["diff", "--cached", "--name-status", "HEAD"])).unwrap(),
+            b""
+        );
+        assert_eq!(
+            text(git(&restored).args(["ls-files", "--stage", "--", "third_party/absent"])).unwrap(),
+            format!("160000 {absent} 0\tthird_party/absent")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 F7: a `.git` DIRECTORY whose common directory is this repository
+    // (a hand-built `commondir` administration) is not foreign custody. The
+    // pointer-file branch already refused this; the directory branch did not.
+    #[test]
+    fn a_dot_git_directory_resolving_to_this_repository_refuses() {
+        let root = fresh("bulkload-dotgit-dir-same-repository");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/alias");
+        fs::create_dir_all(nest.join(".git")).unwrap();
+        fs::write(
+            nest.join(".git/commondir"),
+            format!("{}\n", source.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(nest.join(".git/HEAD"), format!("{}\n", head_of(&source))).unwrap();
+        let seen = text(git(&nest).args([
+            "--git-dir=.git",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]))
+        .unwrap();
+        assert_eq!(
+            fs::canonicalize(seen).unwrap(),
+            fs::canonicalize(source.join(".git")).unwrap()
+        );
+        refuses_everywhere(&source, &root.join("capture"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // R-N32, measured on neo: medical-massage-specialists-infra refused on
     // .terraform-data/edge-security/modules/zone_custom_ruleset/.git, a
     // Terraform module cache under an ignored directory. It is a foreign
@@ -3370,11 +3625,12 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // R-N32, measured on neo: crs310-8g-2s-in holds one 160000 gitlink. The
-    // index keeps it (source state is never changed); the staged tree the
-    // bundle writes does not, because the bundle does not carry that commit.
+    // R-N32, measured on neo: crs310-8g-2s-in holds one 160000 gitlink. It is
+    // custody, and it stays in the staged tree the bundle writes (R-N73, B2):
+    // Git bundles a gitlink to a commit it does not hold, and stripping it made
+    // a committed submodule restore as a staged deletion.
     #[test]
-    fn a_gitlink_index_entry_is_custody_and_absent_from_the_staged_tree() {
+    fn a_gitlink_index_entry_is_custody_and_kept_in_the_staged_tree() {
         let root = std::env::temp_dir().join(format!("bulkload-gitlink-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         let source = root.join("crs310");
@@ -3383,6 +3639,7 @@ mod tests {
         // An uninitialized submodule: a gitlink in the index, an empty directory
         // on disk, exactly what `git clone` without --recurse-submodules leaves.
         fs::create_dir_all(source.join("lib/vendor")).unwrap();
+        let gitlink_oid = commit.clone();
         output(git(&source).args([
             "update-index",
             "--add",
@@ -3393,7 +3650,7 @@ mod tests {
         let gitlink = NestedRepository {
             rel_path: b"lib/vendor".to_vec(),
             kind: NestedRepositoryKind::Gitlink,
-            head_oid: Some(commit),
+            head_oid: Some(commit.clone()),
             gitdir_kind: GitdirKind::None,
         };
         let (_, before_index, gitlinks) = source_index(&source).unwrap();
@@ -3418,8 +3675,7 @@ mod tests {
         )
         .unwrap();
         assert!(staged.contains("tracked"));
-        assert!(!staged.contains("160000"));
-        assert!(!staged.contains("lib/vendor"));
+        assert!(staged.contains(&format!("160000 commit {commit}\tlib/vendor")));
         assert_eq!(nested_sidecar(&private), Some(vec![gitlink.clone()]));
         // The empty submodule seat is an ordinary directory row; no contents.
         let paths = manifest_paths(&private);
@@ -3438,12 +3694,15 @@ mod tests {
             String::from_utf8(output(git(&restored).args(["ls-files", "--stage"])).unwrap())
                 .unwrap();
         assert!(index.contains("tracked"));
-        assert!(!index.contains("160000"));
+        assert!(index.contains(&format!("160000 {gitlink_oid} 0\tlib/vendor")));
         assert_eq!(imported_nested_custody(&restored), Some(vec![gitlink]));
-        // A same-HEAD index repair reads the gitlink-free staged tree.
+        // A same-HEAD index repair reads the staged tree, gitlink included.
         fs::remove_file(restored.join(".git/index")).unwrap();
         repair_missing_index(&export.bundle, &restored, "neo", &root.join("repair")).unwrap();
-        assert!(restored.join(".git/index").is_file());
+        let index =
+            String::from_utf8(output(git(&restored).args(["ls-files", "--stage"])).unwrap())
+                .unwrap();
+        assert!(index.contains(&format!("160000 {gitlink_oid} 0\tlib/vendor")));
         fs::remove_dir_all(root).unwrap();
     }
 
