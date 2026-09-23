@@ -2867,6 +2867,7 @@ pub fn restore_bundle_configured(
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
     restore_entries(&destination, &entries)?;
     let staged = find("staged")?;
+    restore_gitlink_directories(&destination, &staged)?;
     output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let config_receipt = destination.join(".git/carry-config");
@@ -2972,6 +2973,7 @@ pub fn restore_linked(
     }
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     restore_entries(&destination, &entries)?;
+    restore_gitlink_directories(&destination, &find("staged")?)?;
     output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let final_exclude = match fs::read(exclude_path) {
@@ -2984,6 +2986,46 @@ pub fn restore_linked(
     }
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    Ok(())
+}
+
+// N7 (R-N73): a gitlink's content is its own estate item, but its seat is
+// not: without a directory at the gitlink path Git reports the submodule as
+// deleted. An empty directory is exactly what `git clone` without
+// --recurse-submodules leaves. Created before the captured modes are applied,
+// so a read-only parent is still writable here; existing directories (an
+// unpopulated submodule's captured seat) are kept.
+fn restore_gitlink_directories(destination: &Path, staged: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let entries = output(git(destination).args(["ls-tree", "-r", "-z", staged]))?;
+    for entry in entries
+        .split(|b| *b == 0)
+        .filter(|entry| entry.starts_with(b"160000 "))
+    {
+        let relative = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .and_then(|tab| entry.get(tab + 1..))
+            .map(|path| Path::new(std::ffi::OsStr::from_bytes(path)))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part, Component::Normal(name) if !name.as_bytes().eq_ignore_ascii_case(b".git"))) {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        let mut current = destination.to_path_buf();
+        for part in relative.components() {
+            current.push(part);
+            match fs::create_dir(&current) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !fs::symlink_metadata(&current)?.is_dir() {
+                        return Err(BulkloadRefusal::PathEscapesRoot);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
@@ -5882,6 +5924,88 @@ mod review_pr53b {
                 }
             }
         }
+    }
+}
+
+// N7 (R-N73): a POPULATED submodule restored with its directory absent,
+// which Git reports as an unstaged deletion of the gitlink. Restore now
+// creates an empty directory at every gitlink path, as `git clone` without
+// --recurse-submodules leaves it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53b_b2 {
+    use super::*;
+
+    #[test]
+    fn rv_populated_submodule_restore_worktree_status() {
+        let root = std::env::temp_dir().join(format!("rv53b-popsub-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let mk = |repo: &Path| {
+            fs::create_dir_all(repo).unwrap();
+            output(git(repo).args(["init", "-q", "--template=", "-b", "main"])).unwrap();
+            output(git(repo).args(["config", "user.name", "T"])).unwrap();
+            output(git(repo).args(["config", "user.email", "t@l"])).unwrap();
+            output(git(repo).args(["config", "commit.gpgsign", "false"])).unwrap();
+        };
+        let upstream = root.join("upstream");
+        mk(&upstream);
+        fs::write(upstream.join("lib.c"), b"v1").unwrap();
+        output(git(&upstream).args(["add", "-A"])).unwrap();
+        output(git(&upstream).args(["commit", "-qm", "v1"])).unwrap();
+        let outer = root.join("outer");
+        mk(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        output(git(&outer).args(["add", "-A"])).unwrap();
+        output(git(&outer).args(["commit", "-qm", "outer"])).unwrap();
+        output(
+            git(&outer)
+                .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+                .arg(&upstream)
+                .arg("deps/sub"),
+        )
+        .unwrap();
+        output(git(&outer).args(["commit", "-qm", "sub"])).unwrap();
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        assert!(export
+            .nested_repositories
+            .iter()
+            .any(|nest| nest.kind == NestedRepositoryKind::Gitlink));
+        let restored = root.join("restored");
+        restore_bundle(&export.bundle, &restored, "neo").unwrap();
+        let cached =
+            output(git(&restored).args(["diff", "--cached", "--name-status", "HEAD"])).unwrap();
+        let status = output(git(&restored).args(["status", "--porcelain"])).unwrap();
+        let empty_dir = fs::read_dir(restored.join("deps/sub"))
+            .unwrap()
+            .next()
+            .is_none();
+        // The same through a linked restore.
+        let linked = root.join("linked");
+        restore_linked(&export.bundle, &restored, &linked, "neo").unwrap();
+        let linked_status = output(git(&linked).args(["status", "--porcelain"])).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(cached.is_empty(), "{:?}", String::from_utf8_lossy(&cached));
+        assert!(
+            status.is_empty(),
+            "restored worktree reports {:?}",
+            String::from_utf8_lossy(&status)
+        );
+        assert!(empty_dir);
+        assert!(
+            linked_status.is_empty(),
+            "linked worktree reports {:?}",
+            String::from_utf8_lossy(&linked_status)
+        );
     }
 }
 
