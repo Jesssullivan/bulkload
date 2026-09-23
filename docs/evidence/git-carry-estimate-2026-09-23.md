@@ -4,24 +4,32 @@ Lane W6-M0 of Bulkload M2 (bulkload#48, Linear TIN-4545). Ruling R-N60 sets
 this as the measurement baseline for negotiated thin packs. Rulings R-N74
 (the thin-pack gate metric) and R-N75 (refuse destinations whose refs do not
 prove their history) followed the PR #55 review, and this page was re-measured
-under them.
+under them. R-N97 then replaced the equal-count half of the R-N74 gate: the
+estimate is an upper bound, and exactness is checked against `git fetch`.
 
 ## Verdict
 
-**Gate metric (R-N74): `missing_thin_pack_bytes`.** It is the byte count of
-the thin pack that `pack-objects --stdout --thin --revs --delta-base-offset`
-builds for the missing set, counted in flight and never written. Against
-sting's current refs, neo is missing **3,944 objects**, and their thin pack is
-**8.530 MB**. The informational stored size of the same objects
-(`missing_bytes_disk`) is 15.028 MB. The thin pack is smaller because it sends
+**Gate metric (R-N74, R-N97): `missing_thin_pack_bytes`.** It is the byte
+count of the thin pack that `pack-objects --stdout --thin --revs
+--delta-base-offset` builds for the missing set, counted in flight and never
+written. The negotiation model is upload-pack's: sparse edges and bitmaps
+pinned off, and, for a shallow destination, upload-pack's shallow-client
+invocation. Against sting's current refs, neo is missing **3,938 objects**, and
+their thin pack is **8.531 MB**. The informational stored size of the same
+objects (`missing_bytes_disk`) is 15.049 MB. The thin pack is smaller because it sends
 deltas against objects sting already holds. crs310-8g-2s-in shows this most
 clearly: 0.449 MB thin against 3.550 MB stored.
 
-**The W6 M1 gate is now:** sent pack bytes ≤ 1.1× `missing_thin_pack_bytes`,
-and the missing object count equal (`missing_thin_pack_objects` =
-`missing_objects`), for the same source and destination state (R-N74).
+**The W6 M1 gate is now (R-N97):** for the same source and destination state,
+sent bytes ≤ 1.1× `missing_thin_pack_bytes`, and sent objects ≤
+`missing_objects`. The estimate is an upper bound: it models the first
+negotiation round only, and ancestor probing (`GitHaveQuery`) can only shrink
+the pack. Exactness is checked against Git itself: on every fixture, M1's sent
+object set must equal what a real `git fetch` with the same haves sends. The
+M1 sender must pin `pack.useSparse=false` and `pack.useBitmaps=false`, as the
+estimate does.
 
-The cohort-1 history on disk is 1,467.47 MB (informational), so the carry
+The cohort-1 history on disk is 1,467.49 MB (informational), so the carry
 moves 0.58 % of it. No pair was refused (R-N75): blahaj is shallow on both
 sides at the same frontier, so it estimates, and no destination is a partial
 clone.
@@ -83,7 +91,7 @@ clone.
 | DarwinNicUtil | 1.07 | 416 | 65 | 56 | 9 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | MassageIthaca | 199.37 | 21,443 | 1,793 | 1,787 | 6 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | account-controller | 1.53 | 832 | 32 | 22 | 10 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| blahaj | 34.11 | 39,787 | 2,281 | 1,784 | 497 | 4 | 38 | **0.013** | 38 | 0.029 | 3 / 23 / 12 / 0 |
+| blahaj ¹ | 34.13 | 39,797 | 2,281 | 1,784 | 497 | 4 | 32 | **0.015** | 32 | 0.050 | 5 / 19 / 8 / 0 |
 | bulkload | 7.81 | 2,723 | 78 | 68 | 10 | 2 | 672 | **0.426** | 672 | 1.909 | 115 / 335 / 221 / 1 |
 | ci-templates | 5.05 | 2,091 | 213 | 182 | 31 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | claude-kvm | 205.06 | 2,013 | 32 | 26 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
@@ -106,15 +114,42 @@ clone.
 | printstack | 1.75 | 2,624 | 30 | 25 | 5 | 2 | 10 | **0.025** | 10 | 0.070 | 2 / 4 / 4 / 0 |
 | asfirewire-legalab | 45.02 | 19,483 | 61 | 60 | 1 | 0 | 2,234 | **1.258** | 2,234 | 1.587 | 140 / 1098 / 996 / 0 |
 | crs310-8g-2s-in | 7.51 | 6,015 | 273 | 273 | 0 | 1 | 614 | **0.449** | 614 | 3.550 | 66 / 267 / 281 / 0 |
-| **Total (26)** | **1,467.47** | **350,553** | **6,906** | **6,052** | **854** | **22** | **3,944** | **8.530** | **3,944** | **15.028** | 368 / 1922 / 1653 / 1 |
+| **Total (26)** | **1,467.49** | **350,563** | **6,906** | **6,052** | **854** | **22** | **3,938** | **8.531** | **3,938** | **15.049** | 370 / 1918 / 1649 / 1 |
+
+¹ **blahaj was re-run alone** at 19:29:25Z–19:29:42Z after the PR #55 r2
+review fixes. It reran with the release binary built from `66bce2f`:
+upload-pack's shallow-client model and the flag pins. The other 25
+rows are from the 17:56Z run. neo's blahaj gained 2 commits between the runs,
+so its row mixes new source state with the corrected model. blahaj details:
+
+- **Shallow:** both sides are shallow at the same frontier (`bf9acf31`).
+- **Haves:** 296 of its 1,784 held tips were left out as haves, because
+  another held tip is their child (`haves_implied_by_a_child_have`).
+- **The three models, all computed read-only on the same neo state against
+  the same sting tips:**
+
+  | Model | Objects | Thin-pack bytes |
+  |---|---:|---:|
+  | Old verb: plain walk, all haves | 48 | 17,686 |
+  | This verb: upload-pack's shallow model | **32** | **14,826** |
+  | Every held tip kept as a have, `--shallow` | 30 | 14,644 |
+
+  The last model is what upload-pack sends if the client offers every
+  parent before its child. The verb's figure is the upper bound across have
+  orders (R-N97).
+- **Earlier figure:** the r2 review's 20 objects / 10,146 B was measured on
+  the pre-commit state, so it is not comparable.
+- **No writes:** a scan after the run found no file under blahaj's git dir
+  newer than the start of the run, on neo or on sting.
 
 - **Thin-pack objects equal missing objects in every repository.** In the
   first run, from `5098e3e`, bulkload packed 659 objects against 658 walked.
   Git's default sparse edge marking (`pack.useSparse`) had packed one object
-  that sting already reaches. `f65313b` pins `pack.useSparse=false`, and it
-  refuses (`CONTRACT_SELF_INCONSISTENT`) if the counts still differ. The M1
-  sender must build its pack the same way, or its object count can exceed
-  `missing_objects`.
+  that sting already reaches. `f65313b` pins `pack.useSparse=false`. The r2
+  fixes also pin `pack.useBitmaps=false`: bitmap traversal leaves out objects
+  deep in the haves' history, so a bitmapped source was falsely refused. The
+  verb refuses (`CONTRACT_SELF_INCONSISTENT`) if the counts still differ. The M1
+  sender must pin both flags.
 - **Moving repositories:** bulkload and glorious.build gained commits between
   the two runs; the table is the second run.
 - **"Tips unknown to neo"** counts destination tips that neo does not hold as
@@ -207,11 +242,16 @@ The verb uses every destination ref, as the v2 negotiation does.
 
 ## Reading the result for M1
 
-- **Gate (R-N74):** sent pack bytes ≤ 1.1× `missing_thin_pack_bytes`, and the
-  missing object count equal, for the same source and destination state. Use
-  `missing_objects`; `missing_thin_pack_objects` is always equal to it.
-  Measure both sides in the same window: bulkload and glorious.build moved
-  between the two runs on this page.
+- **Gate (R-N97, replacing the equal-count half of R-N74):**
+  - For the same source and destination state, sent bytes ≤ 1.1×
+    `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`.
+    `missing_thin_pack_objects` always equals `missing_objects`.
+  - Exactness is checked against Git, not against the estimate: on every
+    fixture, M1's sent object set must equal a real `git fetch` with the same
+    haves.
+  - The M1 sender pins `pack.useSparse=false` and `pack.useBitmaps=false`.
+  - Measure both sides in the same window: bulkload, glorious.build and blahaj
+    moved between the runs on this page.
 - `missing_bytes_disk` and `source_history_bytes` are informational. A stored
   size can be larger than the thin pack (crs310-8g-2s-in, 7.9×) or smaller,
   because pack entry headers and deltas against haves differ from how the

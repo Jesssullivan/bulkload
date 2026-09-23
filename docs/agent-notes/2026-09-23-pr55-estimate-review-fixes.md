@@ -20,3 +20,25 @@
   check the test list or the binary's strings.
 - **Evidence:** `docs/evidence/git-carry-estimate-2026-09-23.md`, re-measured
   at `f65313b`. Nothing was written on sting or in any cohort repository.
+
+## r2 (same day): re-review BLOCK at `5313c32`
+
+- **Rulings applied:**
+  - R-N74 and R-N75, fail closed.
+  - R-N97: the gate is sent bytes ≤ 1.1× `missing_thin_pack_bytes` and sent
+    objects ≤ `missing_objects`. The estimate is an upper bound, and exactness
+    is checked against `git fetch`.
+  - R-N80: no guard refusals occurred.
+- **Findings fixed:** N1–N6 and N9, with the reviewer's artifacts ported as
+  regression tests (see PR #55). N7 and N8 are deferred to a follow-up PR
+  comment; the "lower bound" wording is corrected to "upper bound" in the
+  module doc.
+- **Found during the fix (N3):** upload-pack drops a have that is a parent of
+  an earlier-processed have. For a shallow client (`--shallow`,
+  edge-aggressive over the command-line haves), that changes the pack. The
+  estimate drops every have that is a parent of another have, which keeps it an
+  upper bound whatever order the client offers them in. It equals a real fetch
+  whenever commit dates order the haves child-first.
+- **Build:** own `CARGO_TARGET_DIR`
+  (`cargo-target-bulkload-m2-w6-estimate`), so there is no shared-target
+  staleness.
