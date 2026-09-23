@@ -80,7 +80,11 @@ historical rulings ledger (evidence, not current instructions).
   more, not even a corrected marker placement, until the operator rules
   (R-N12, R-N80).
 - Keep process-control words out of command text. The repo's pre-commit
-  process-safety audit is the authoritative wording check (R-N92).
+  process-safety audit is the authoritative wording check (R-N92). If a
+  self-audit that searched for those words is refused, drop the audit and
+  continue. Any other refusal still stops the lane (R-N101).
+- Never check whether a PID is alive. Wait only on your own background
+  tasks' notifications, or on files (R-N104).
 - Never bypass git hooks from the shell (`core.hooksPath`, `--no-verify`).
   Only the product's own cargo tests may disable hooks, and only in fixture
   repos they create and destroy (R-N98).
