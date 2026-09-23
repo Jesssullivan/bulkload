@@ -61,6 +61,7 @@ enum Name {
     Flush,
     Durable,
     DurableCorpus,
+    Residency,
 }
 
 /// Per-file flush kind for `durable-corpus`.
@@ -156,6 +157,7 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
         Name::Flush => flush(&cli),
         Name::Durable => durable(&cli),
         Name::DurableCorpus => durable_corpus(&cli),
+        Name::Residency => residency_line(&cli),
     }
 }
 
@@ -1006,6 +1008,34 @@ fn summary(values: &mut [f64]) -> (f64, f64, f64) {
     (min, median(values), max)
 }
 
+/// Keep the first occurrence of each variant, wherever repeats appear.
+fn unique_variants(requested: &[CorpusVariant]) -> Vec<CorpusVariant> {
+    let mut variants: Vec<CorpusVariant> = Vec::new();
+    for variant in requested {
+        if !variants.contains(variant) {
+            variants.push(*variant);
+        }
+    }
+    variants
+}
+
+/// `micro residency --source CORPUS`: page-cache residency of the corpus now.
+fn residency_line(cli: &MicroCli) -> io::Result<()> {
+    let source = fs::canonicalize(
+        cli.source
+            .as_ref()
+            .ok_or_else(|| io::Error::other("--source is required for residency"))?,
+    )?;
+    let (files, _) = corpus_shape(&source)?;
+    println!(
+        "micro name=residency source={} files={} source_resident_fraction={:.4}",
+        source.display(),
+        files.len(),
+        corpus_residency(&source, &files)?,
+    );
+    Ok(())
+}
+
 fn durable_corpus(cli: &MicroCli) -> io::Result<()> {
     let dir = volume_dir(cli)?;
     let source = fs::canonicalize(
@@ -1018,23 +1048,25 @@ fn durable_corpus(cli: &MicroCli) -> io::Result<()> {
     }
     let shape = corpus_shape(&source)?;
     let bytes = shape.0.iter().map(|file| file.size).sum::<u64>();
-    let mut variants = cli.variant.clone();
-    variants.dedup();
-    let kinds: Vec<Flush> = variants
+    let kinds: Vec<Flush> = unique_variants(&cli.variant)
         .iter()
         .map(|variant| match variant {
             CorpusVariant::Full => Flush::Full,
             CorpusVariant::Barrier => Flush::Barrier,
         })
         .collect();
+    let jobs = cli.jobs.clamp(1, 16);
+    // With several writers, read/write/file-flush times are summed over the
+    // writer threads and can exceed the wall-clock total.
+    let phase_scope = if jobs > 1 { "worker-summed" } else { "wall" };
     println!(
-        "micro_assumptions name=durable-corpus dir={} source={} files={} directories={} bytes={bytes} read_source={} jobs={} write_block={WRITE_BLOCK} payload={} page_cache=not-dropped dest=fresh-directory-per-sample drain=untimed-f_fullfsync-before-sample file_flush=per-file dir_flush=every-created-directory-plus-parent order=rotating-per-rep cleanup=untimed-unlink media_durability_of_f_fullfsync=unproven-on-this-enclosure",
+        "micro_assumptions name=durable-corpus dir={} source={} files={} directories={} bytes={bytes} read_source={} jobs={} write_block={WRITE_BLOCK} payload={} page_cache=not-dropped dest=fresh-directory-per-sample drain=untimed-f_fullfsync-before-sample file_flush=per-file dir_flush=every-created-directory-plus-parent order=rotating-per-rep phase_timing={phase_scope} cleanup=untimed-unlink media_durability_of_f_fullfsync=unproven-on-this-enclosure",
         dir.display(),
         source.display(),
         shape.0.len(),
         shape.1.len(),
         cli.read_source,
-        cli.jobs.clamp(1, 16),
+        jobs,
         if cli.read_source {
             "source-bytes"
         } else {
@@ -1063,7 +1095,7 @@ fn durable_corpus(cli: &MicroCli) -> io::Result<()> {
                 list.push(total);
             }
             println!(
-                "micro name=durable-corpus variant={} rep={rep} order={step} files={} bytes={bytes} read_source={} source_resident_fraction_before={resident:.4} read_ms={:.3} write_ms={:.3} file_flush_ms={:.3} dir_flush_ms={:.3} total_ms={total:.3}",
+                "micro name=durable-corpus variant={} rep={rep} order={step} files={} bytes={bytes} read_source={} jobs={jobs} source_resident_fraction_before={resident:.4} phase_timing={phase_scope} read_ms={:.3} write_ms={:.3} file_flush_ms={:.3} dir_flush_ms={:.3} total_ms={total:.3} total_timing=wall",
                 kind.label(),
                 shape.0.len(),
                 cli.read_source,
@@ -1077,7 +1109,7 @@ fn durable_corpus(cli: &MicroCli) -> io::Result<()> {
     for (kind, list) in kinds.iter().zip(totals.iter_mut()) {
         let (min, middle, max) = summary(list);
         println!(
-            "micro_summary name=durable-corpus variant={} reps={} read_source={} min_ms={min:.3} median_ms={middle:.3} max_ms={max:.3}",
+            "micro_summary name=durable-corpus variant={} reps={} read_source={} jobs={jobs} min_ms={min:.3} median_ms={middle:.3} max_ms={max:.3}",
             kind.label(),
             list.len(),
             cli.read_source,
@@ -1132,6 +1164,28 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn variants_dedup_non_adjacent_repeats_and_residency_runs() -> io::Result<()> {
+        assert_eq!(
+            unique_variants(&[
+                CorpusVariant::Full,
+                CorpusVariant::Barrier,
+                CorpusVariant::Full,
+                CorpusVariant::Barrier,
+            ]),
+            vec![CorpusVariant::Full, CorpusVariant::Barrier]
+        );
+        let source = tempfile::tempdir()?;
+        fs::write(source.path().join("a"), random_bytes(20_000, 9))?;
+        let src = source
+            .path()
+            .to_str()
+            .ok_or_else(|| io::Error::other("path"))?;
+        run(&args(&["micro", "residency", "--source", src]))?;
+        assert!(run(&args(&["micro", "residency"])).is_err());
+        Ok(())
+    }
+
     #[cfg(target_vendor = "apple")]
     #[test]
     fn durable_corpus_mirrors_shape_and_leaves_no_scratch() -> io::Result<()> {
@@ -1152,7 +1206,11 @@ mod tests {
             .path()
             .to_str()
             .ok_or_else(|| io::Error::other("path"))?;
-        for extra in [&[][..], &["--read-source", "--jobs", "2"][..]] {
+        for extra in [
+            &[][..],
+            &["--read-source", "--jobs", "2"][..],
+            &["--variant", "full", "barrier", "full"][..],
+        ] {
             let mut words = vec![
                 "micro",
                 "durable-corpus",
