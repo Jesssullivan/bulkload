@@ -1231,6 +1231,12 @@ fn foreign_nest(
     if nest_index_hides_changes(directory)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // R-N115: a populated submodule inside a nest is refused by name.
+    if let Some(path) = nest_populated_submodule(directory)? {
+        return Err(BulkloadRefusal::GitNestPopulatedSubmodule(
+            [rel_path.as_slice(), b"/", &path].concat(),
+        ));
+    }
     // B1 (round 3): a built-in conversion is a clean filter with no command.
     if let Some(path) = nest_conversion_attribute(directory)? {
         return Err(BulkloadRefusal::GitNestConversionAttribute(
@@ -1469,6 +1475,39 @@ fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
             .trim_ascii()
             .is_empty(),
     )
+}
+
+// R-N115: the first gitlink in a nest's index whose path holds a `.git` (a
+// populated submodule of the nest). Its status would recurse into another
+// repository's config and worktree, and its bytes are nobody's seats.
+fn nest_populated_submodule(directory: &Path) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let staged = output(git(directory).args(["--git-dir=.git", "ls-files", "-z", "--stage"]))?;
+    for entry in staged
+        .split(|b| *b == 0)
+        .filter(|entry| entry.starts_with(b"160000 "))
+    {
+        let path = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .and_then(|tab| entry.get(tab + 1..))
+            .filter(|path| !path.is_empty())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        match fs::symlink_metadata(
+            directory
+                .join(std::ffi::OsStr::from_bytes(path))
+                .join(".git"),
+        ) {
+            Ok(_) => return Ok(Some(path.to_vec())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
 }
 
 // B1 (round 3, R-N73): the first tracked path in a nest whose attributes
@@ -4626,8 +4665,9 @@ mod tests {
     }
 
     // R-N83 / N4: a nest's filter commands would both execute nest-chosen code
-    // and decide what "clean" means. A nest (or a populated submodule inside
-    // it) whose config sets one refuses, and the command never runs.
+    // and decide what "clean" means. A nest whose config sets one refuses,
+    // and the command never runs. A populated submodule inside a nest, with
+    // or without its own filter, refuses by name first (R-N115).
     #[test]
     fn a_nest_with_filter_commands_refuses_without_running_them() {
         let root = fresh("bulkload-filter-nest");
@@ -4640,15 +4680,7 @@ mod tests {
         fs::create_dir_all(&nest).unwrap();
         fs::write(nest.join(".gitattributes"), b"* filter=ev.il\n").unwrap();
         committed(&nest, b"inner");
-        // A populated submodule inside the nest, with its own hostile filter.
-        let sub = nest.join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(sub.join(".gitattributes"), b"* filter=evil2\n").unwrap();
-        committed(&sub, b"sub");
-        output(git(&nest).args(["add", "sub"])).unwrap();
-        commit(&nest, "submodule");
         stat_dirty(&nest.join("tracked"));
-        stat_dirty(&sub.join("tracked"));
         assert_eq!(nested_repositories(&source).unwrap().len(), 1);
 
         // Dotted driver name, every command kind.
@@ -4662,14 +4694,6 @@ mod tests {
         }
         refuses_everywhere(&source, &root.join("capture-nest"));
         assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
-        output(git(&nest).args(["config", "--remove-section", "filter.ev.il"])).unwrap();
-        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
-
-        // Only the submodule inside the nest configures one.
-        output(git(&sub).args(["config", "filter.evil2.clean", &touch("sub-clean")])).unwrap();
-        refuses_everywhere(&source, &root.join("capture-sub"));
-        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
-
         // Control: an unhardened status in the nest does run it.
         let _ = Command::new("git")
             .arg("-C")
@@ -4683,9 +4707,55 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // R-N83: a nest's own fsmonitor command and hooks never run, its index
-    // (and untracked cache) is never written, and its ignore-submodules
-    // config cannot hide a dirty submodule inside it.
+    // R-N115: a nest holding a populated submodule refuses with a typed code
+    // naming the submodule's escaped path; its hostile filter never runs. An
+    // unpopulated gitlink in a nest is fine.
+    #[test]
+    fn a_nest_with_a_populated_submodule_refuses_by_name() {
+        let root = fresh("bulkload-populated-in-nest");
+        let markers = root.join("markers");
+        fs::create_dir(&markers).unwrap();
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        let head = head_of(&nest);
+        output(git(&nest).args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},empty"),
+        ]))
+        .unwrap();
+        commit(&nest, "unpopulated gitlink");
+        fs::create_dir(nest.join("empty")).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        let sub = nest.join("odd\nsub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".gitattributes"), b"* filter=evil2\n").unwrap();
+        committed(&sub, b"sub");
+        output(git(&nest).args(["add", "odd\nsub"])).unwrap();
+        commit(&nest, "populated submodule");
+        output(git(&sub).args([
+            "config",
+            "filter.evil2.clean",
+            &format!("touch {}; cat", markers.join("sub-clean").display()),
+        ]))
+        .unwrap();
+        stat_dirty(&sub.join("tracked"));
+        let expected =
+            BulkloadRefusal::GitNestPopulatedSubmodule(b"vendor/inner/odd\nsub".to_vec());
+        refuses_everywhere_with(&source, &root.join("capture"), &expected);
+        assert_eq!(
+            expected.to_string(),
+            "GIT_NEST_POPULATED_SUBMODULE path=\"vendor/inner/odd\\nsub\""
+        );
+        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N83: a nest's own fsmonitor command and hooks never run, and its
+    // index (and untracked cache) is never written.
     #[test]
     fn a_hostile_nest_config_runs_no_fsmonitor_or_hook_and_writes_nothing() {
         use std::os::unix::fs::PermissionsExt;
@@ -4696,10 +4766,6 @@ mod tests {
         committed(&source, b"outer");
         let nest = source.join("vendor/inner");
         committed(&nest, b"inner");
-        let sub = nest.join("sub");
-        committed(&sub, b"sub");
-        output(git(&nest).args(["add", "sub"])).unwrap();
-        commit(&nest, "submodule");
         let script = root.join("hostile.sh");
         fs::write(
             &script,
@@ -4730,12 +4796,6 @@ mod tests {
         export_repository(&source, &root.join("capture")).unwrap();
         assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
         assert_eq!(fs::read(nest.join(".git/index")).unwrap(), index);
-
-        output(git(&nest).args(["config", "diff.ignoreSubmodules", "all"])).unwrap();
-        output(git(&nest).args(["config", "submodule.sub.ignore", "all"])).unwrap();
-        fs::write(sub.join("untracked"), b"inside the submodule").unwrap();
-        refuses_everywhere(&source, &root.join("capture-dirty-sub"));
-        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
         fs::remove_dir_all(root).unwrap();
     }
 
