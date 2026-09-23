@@ -52,6 +52,13 @@ A record is never committed before the bytes it describes are durable on the
 destination. Existing destination files are never overwritten; publication is
 no-replace.
 
+Records commit in groups. Each file's data is sealed (`F_BARRIERFSYNC` on
+Darwin, `fdatasync` on Linux) and renamed into place without replacement, each
+touched directory is sealed once, and then one `SQLite` WAL commit
+(`synchronous=FULL`, `fullfsync=ON`) makes the whole group durable. Its full
+flush is the group's only device-cache flush. `--durability=strict` fully
+flushes every file instead, for comparison.
+
 ## Reclaim
 
 Unique content is preserved before redundant containers are deleted. Content
