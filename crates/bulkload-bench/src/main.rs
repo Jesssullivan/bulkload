@@ -1,6 +1,11 @@
 //! Real local native/rclone copy and resume comparison on an immutable corpus.
 //! Verification is outside timing and warms the OS cache. Initial means fresh
 //! private application state, not cold storage. Outputs are retained, never deleted.
+//!
+//! `bulkload-bench micro <name>` runs the M0 micro-benchmarks instead; see
+//! [`micro`].
+
+mod micro;
 
 use std::fs;
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -10,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
+use bulkload_agent::counters::Counters;
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
@@ -70,6 +76,7 @@ struct Sample {
     workload_bytes: u64,
     chunk_timing: Option<ChunkTiming>,
     transfer_timing: Option<TransferTiming>,
+    counters: Option<Counters>,
 }
 
 struct SampleRun<'a> {
@@ -95,7 +102,17 @@ struct Fixture {
 }
 
 fn main() -> ExitCode {
-    match run(&Cli::parse()) {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|word| word == "micro") {
+        return match micro::run(args.get(1..).unwrap_or_default()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("micro-benchmark refused: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match run(&Cli::parse_from(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("benchmark refused: {error}; private outputs retained");
@@ -483,6 +500,14 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
             chunk.dir_sync_ns,
         );
     }
+    if let Some(counters) = sample.counters {
+        println!(
+            "native_counters sequence={} phase={} scope=process-both-halves {}",
+            sample.sequence,
+            sample.phase,
+            counters.render(),
+        );
+    }
 }
 
 fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
@@ -496,6 +521,7 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
     }
     let chunk_before = ChunkTiming::snapshot();
     let transfer_before = TransferTiming::snapshot();
+    let counters_before = Counters::snapshot();
     let started = Instant::now();
     let (transferred, source_read) = match run.arm {
         Arm::Native => {
@@ -537,6 +563,7 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
     })?;
     let chunk_timing = ChunkTiming::snapshot().since(chunk_before);
     let transfer_timing = TransferTiming::snapshot().since(transfer_before);
+    let counters = Counters::snapshot().since(counters_before);
     if rows(run.source)? != run.expected || !same_payload(run.expected, &rows(&destination)?) {
         return Err(io::Error::other(
             "source mutation or destination content/mode mismatch",
@@ -554,6 +581,7 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
         workload_bytes: run.workload_bytes,
         chunk_timing: (run.arm == Arm::Native).then_some(chunk_timing),
         transfer_timing: (run.arm == Arm::Native).then_some(transfer_timing),
+        counters: (run.arm == Arm::Native).then_some(counters),
     };
     print_sample(&sample, run.expected.len());
     Ok(sample)
