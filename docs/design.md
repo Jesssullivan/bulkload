@@ -52,12 +52,14 @@ A record is never committed before the bytes it describes are durable on the
 destination. Existing destination files are never overwritten; publication is
 no-replace.
 
-Records commit in groups. Each file's data is sealed (`F_BARRIERFSYNC` on
-Darwin, `fdatasync` on Linux) and renamed into place without replacement, each
-touched directory is sealed once, and then one `SQLite` WAL commit
-(`synchronous=FULL`, `fullfsync=ON`) makes the whole group durable. Its full
-flush is the group's only device-cache flush. `--durability=strict` fully
-flushes every file instead, for comparison.
+Records commit in groups. Each file is sealed (`F_BARRIERFSYNC` on Darwin,
+`fsync` elsewhere, so its mode is durable too) and renamed into place without
+replacement. Each touched directory is sealed once. Each touched device other
+than the state store's is fully flushed. Then one `SQLite` WAL commit
+(`synchronous=FULL`, `fullfsync=ON`) makes the whole group durable; its full
+flush drains the store's own device. A group whose files share the store's
+device therefore needs no other device-cache flush. `--durability=strict`
+fully flushes every file instead, for comparison.
 
 ## Reclaim
 
