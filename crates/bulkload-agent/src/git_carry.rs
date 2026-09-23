@@ -1188,6 +1188,7 @@ fn foreign_nest(
     root: &Path,
     directory: &Path,
     common: &Path,
+    outer: &OuterIndex,
     rel_path: Vec<u8>,
     gitdir_kind: GitdirKind,
 ) -> Result<NestedRepository> {
@@ -1215,7 +1216,7 @@ fn foreign_nest(
     {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    if tracked_under(root, &rel_path)? {
+    if tracked_under(root, &rel_path, directory, outer)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let head_oid = nested_head(directory)?;
@@ -1606,11 +1607,42 @@ fn nest_detached_unreachable(directory: &Path, head: Option<&str>) -> Result<boo
     ]))? > 0)
 }
 
-// Whether the enclosing repository's index holds any path at or below `rel`
-// other than a single gitlink at exactly `rel`. Same literal, top-anchored
-// pathspec as `rebuildable_root`.
-fn tracked_under(root: &Path, rel: &[u8]) -> Result<bool> {
+// The enclosing repository's index, read once per census and only if a nest
+// is found: (is a gitlink, path) per entry.
+#[derive(Default)]
+struct OuterIndex(std::cell::OnceCell<Vec<(bool, Vec<u8>)>>);
+
+impl OuterIndex {
+    fn entries(&self, root: &Path) -> Result<&[(bool, Vec<u8>)]> {
+        if let Some(entries) = self.0.get() {
+            return Ok(entries);
+        }
+        let listed = output(git(root).args(["ls-files", "-z", "--stage"]))?;
+        let mut entries = Vec::new();
+        for entry in listed.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+            let path = entry
+                .iter()
+                .position(|b| *b == b'\t')
+                .and_then(|tab| entry.get(tab + 1..))
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+            entries.push((entry.starts_with(b"160000 "), path.to_vec()));
+        }
+        Ok(self.0.get_or_init(|| entries))
+    }
+}
+
+// Whether the enclosing repository's index holds any path at or below the
+// nest other than a single gitlink at exactly the nest (B1). First the same
+// literal, top-anchored pathspec as `rebuildable_root`; then, because that
+// pathspec is byte-exact and a filesystem may fold case (APFS, NTFS) or
+// Unicode normalisation (APFS), every index path whose leading components
+// could name the nest under such folding (same bytes ignoring ASCII case, or
+// any non-ASCII byte) is resolved through the filesystem itself and compared
+// by (dev, inode) with the nest directory (N3). The filesystem is the
+// authority on which directory a tracked path lands in.
+fn tracked_under(root: &Path, rel: &[u8], directory: &Path, outer: &OuterIndex) -> Result<bool> {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     let mut pathspec = std::ffi::OsString::from(":(top,literal)");
     pathspec.push(std::ffi::OsStr::from_bytes(rel));
     let entries = output(
@@ -1618,7 +1650,7 @@ fn tracked_under(root: &Path, rel: &[u8]) -> Result<bool> {
             .args(["ls-files", "-z", "--stage", "--"])
             .arg(pathspec),
     )?;
-    Ok(entries
+    let literal = entries
         .split(|b| *b == 0)
         .filter(|entry| !entry.is_empty())
         .any(|entry| {
@@ -1626,7 +1658,55 @@ fn tracked_under(root: &Path, rel: &[u8]) -> Result<bool> {
                 return true;
             };
             !(entry.starts_with(b"160000 ") && entry.get(tab + 1..) == Some(rel))
-        }))
+        });
+    if literal {
+        return Ok(true);
+    }
+    let nest = fs::symlink_metadata(directory)?;
+    let depth = rel.split(|b| *b == b'/').count();
+    let mut resolved = std::collections::BTreeMap::<&[u8], bool>::new();
+    for (gitlink, path) in outer.entries(root)? {
+        let components = path.split(|b| *b == b'/').count();
+        if components < depth {
+            continue;
+        }
+        let end = path
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'/')
+            .nth(depth - 1)
+            .map_or(path.len(), |(at, _)| at);
+        let Some(prefix) = path.get(..end) else {
+            continue;
+        };
+        if prefix == rel
+            || !(prefix.eq_ignore_ascii_case(rel) || !prefix.is_ascii() || !rel.is_ascii())
+        {
+            continue;
+        }
+        let same = if let Some(same) = resolved.get(prefix) {
+            *same
+        } else {
+            let same = match fs::symlink_metadata(root.join(std::ffi::OsStr::from_bytes(prefix))) {
+                Ok(meta) => meta.dev() == nest.dev() && meta.ino() == nest.ino(),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            resolved.insert(prefix, same);
+            same
+        };
+        if same && !(*gitlink && components == depth) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // One directory below the root whose `.git` classified as custody.
@@ -1662,6 +1742,7 @@ fn nested_administration(
     root: &Path,
     directory: &Path,
     common: &Path,
+    outer: &OuterIndex,
 ) -> Result<Option<NestedCustody>> {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
@@ -1685,6 +1766,7 @@ fn nested_administration(
             root,
             directory,
             common,
+            outer,
             rel_path()?,
             GitdirKind::Directory,
         )?)));
@@ -1721,6 +1803,7 @@ fn nested_administration(
             root,
             directory,
             common,
+            outer,
             rel_path()?,
             GitdirKind::PointerFile,
         )?)));
@@ -1762,6 +1845,7 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
     let mut rows = Vec::new();
     let mut nested_worktrees = Vec::new();
     let mut nested_repositories = Vec::new();
+    let outer = OuterIndex::default();
     let mut omitted = Vec::new();
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
@@ -1792,7 +1876,7 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
                 // custody, not seats: no row for its root, no descent, no
                 // contents. Its own item carries them.
                 match common
-                    .map(|common| nested_administration(root, &path, common))
+                    .map(|common| nested_administration(root, &path, common, &outer))
                     .transpose()?
                     .flatten()
                 {
@@ -3590,6 +3674,10 @@ mod tests {
             fs::set_permissions(target.join("empty"), fs::Permissions::from_mode(0o700)).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    pub(super) fn committed_repository_pub(repo: &Path, content: &[u8]) {
+        committed_repository(repo, content);
     }
 
     fn committed_repository(repo: &Path, content: &[u8]) {
@@ -5630,6 +5718,69 @@ mod review_pr53b {
         assert!(clean.starts_with("CUSTODY"), "{clean}");
     }
 
+    // N3: B1 on a case-insensitive filesystem. The outer tracks
+    // vendor/Inner/lib.c, the directory on disk is vendor/inner and holds a
+    // clean nest. The literal pathspec is case-sensitive; the filesystem is
+    // not. On a case-sensitive filesystem the two are different directories
+    // and the nest is custody.
+    #[test]
+    fn rv_case_variant_tracked_path_under_clean_nest_must_refuse() {
+        let root = fresh("icase");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        fs::create_dir_all(outer.join("vendor/Inner")).unwrap();
+        fs::write(outer.join("vendor/Inner/lib.c"), b"v1").unwrap();
+        commit_all(&outer, "outer");
+        let probe = outer.join("vendor/INNER");
+        let insensitive = probe.exists();
+        fs::rename(outer.join("vendor/Inner"), outer.join("vendor/tmp")).unwrap();
+        fs::rename(outer.join("vendor/tmp"), outer.join("vendor/inner")).unwrap();
+        let inner = outer.join("vendor/inner");
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v2 outer's tracked file, edited").unwrap();
+        commit_all(&inner, "nest");
+        let v = verdict(&outer);
+        let export = export_repository(&outer, &root.join("capture"));
+        fs::remove_dir_all(root).unwrap();
+        if insensitive {
+            assert!(v.starts_with("REFUSED"), "{v}");
+            assert_eq!(export, Err(BulkloadRefusal::GitInventoryMalformed));
+        } else {
+            assert!(v.starts_with("CUSTODY"), "{v}");
+        }
+    }
+
+    // N3: the same with Unicode normalisation. The outer tracks a path whose
+    // directory name is NFC; on disk the nest directory is the NFD spelling.
+    // APFS folds the two; ext4 does not.
+    #[test]
+    fn rv_normalisation_variant_tracked_path_under_clean_nest_must_refuse() {
+        let root = fresh("nfd");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        let nfc = "vendor/caf\u{e9}";
+        let nfd = "vendor/cafe\u{301}";
+        fs::create_dir_all(outer.join(nfc)).unwrap();
+        fs::write(outer.join(nfc).join("lib.c"), b"v1").unwrap();
+        commit_all(&outer, "outer");
+        fs::rename(outer.join(nfc), outer.join("vendor/tmp")).unwrap();
+        fs::rename(outer.join("vendor/tmp"), outer.join(nfd)).unwrap();
+        let folded = outer.join(nfc).exists();
+        let inner = outer.join(nfd);
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v2 edit of the outer's tracked file").unwrap();
+        commit_all(&inner, "nest");
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        if folded {
+            assert!(v.starts_with("REFUSED"), "{v}");
+        } else {
+            assert!(v.starts_with("CUSTODY"), "{v}");
+        }
+    }
+
     // N4: filter drivers from the nest's own config must not run during the
     // clean check (the nest now refuses); fsmonitor from its config must not.
     #[test]
@@ -5731,5 +5882,50 @@ mod review_pr53b {
                 }
             }
         }
+    }
+}
+
+// The reviewer's case-insensitive restore probe (N3), kept as a regression:
+// on a filesystem that folds case, the outer's tracked vendor/Inner/lib.c
+// under a nest at vendor/inner now refuses instead of being dropped.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53b_icase {
+    use super::*;
+    #[test]
+    fn rv_icase_restore_shape() {
+        let root = std::env::temp_dir().join(format!("rv53b-icase2-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let outer = root.join("outer");
+        crate::git_carry::tests::committed_repository_pub(&outer, b"outer");
+        fs::create_dir_all(outer.join("vendor/Inner")).unwrap();
+        fs::write(outer.join("vendor/Inner/lib.c"), b"v1").unwrap();
+        output(git(&outer).args(["add", "-A"])).unwrap();
+        output(git(&outer).args(["-c", "commit.gpgsign=false", "commit", "-qm", "v"])).unwrap();
+        let insensitive = outer.join("vendor/INNER").exists();
+        fs::rename(outer.join("vendor/Inner"), outer.join("vendor/tmp")).unwrap();
+        fs::rename(outer.join("vendor/tmp"), outer.join("vendor/inner")).unwrap();
+        let inner = outer.join("vendor/inner");
+        crate::git_carry::tests::committed_repository_pub(&inner, b"x");
+        fs::write(inner.join("lib.c"), b"v2 edit of outer-tracked file").unwrap();
+        output(git(&inner).args(["-c", "commit.gpgsign=false", "commit", "-qam", "n"])).unwrap();
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("cap"),
+            None,
+            CapturePolicy::default(),
+        );
+        if insensitive {
+            assert_eq!(export, Err(BulkloadRefusal::GitInventoryMalformed));
+        } else {
+            let restored = root.join("restored");
+            restore_bundle(&export.unwrap().bundle, &restored, "neo").unwrap();
+            assert!(restored.join("vendor").is_dir());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
