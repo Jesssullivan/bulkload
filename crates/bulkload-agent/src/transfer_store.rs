@@ -534,7 +534,7 @@ impl Store {
         }
         let started = Instant::now();
         let committed = self.conn.execute_batch("COMMIT").map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteGroupDest, started, &committed);
+        counters::sqlite_commit(self.group_counter(), started, &committed);
         if let Err(error) = committed {
             let _ = self.conn.execute_batch("ROLLBACK");
             return Err(error);
@@ -679,6 +679,15 @@ impl Store {
             return Ok(Some(data));
         }
         Self::chunk_at(&self.root, digest, stage)
+    }
+
+    /// The group-commit counter for the side that owns this store.
+    const fn group_counter(&self) -> Counter {
+        match self.side {
+            Side::Source => Counter::SqliteGroupSource,
+            Side::Destination => Counter::SqliteGroupDest,
+            Side::Unattributed => Counter::SqliteGroupOther,
+        }
     }
 
     const fn verify_purpose(&self) -> Counter {
@@ -976,7 +985,7 @@ impl StorePublisher {
             SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
             SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
         }
-        counters::sqlite_commit(Counter::SqliteGroupSource, commit_started, &committed);
+        counters::sqlite_commit(self.store.group_counter(), commit_started, &committed);
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
@@ -1294,6 +1303,13 @@ mod tests {
         // 2 is FULL.
         assert_eq!(synchronous, 2);
         assert_eq!(fullfsync, 1);
+        // WAL is persistent: a reader opened later sees the same mode.
+        let reader = Store::open_reader(&root.0.join("state"))?;
+        let reader_mode: String = reader
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        assert_eq!(reader_mode, "wal");
         assert_eq!(
             store.authority()?,
             Store::open(&root.0.join("state"))?.authority()?

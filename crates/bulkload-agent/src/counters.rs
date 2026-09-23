@@ -23,9 +23,13 @@
 //! - `flush_dir_barrier`: a group-commit directory seal (`F_BARRIERFSYNC` on
 //!   Darwin, `fsync` elsewhere).
 //!
-//! Every bulkload `SQLite` store runs `synchronous=FULL` with `fullfsync=ON`,
-//! so each counted commit also issues one `F_FULLFSYNC` on Darwin. The derived
-//! `full_flushes_total` adds those commits to the explicit full flushes.
+//! Every file-backed bulkload `SQLite` store runs in WAL mode with
+//! `synchronous=FULL` and `fullfsync=ON` (`io::durable::configure_sqlite`
+//! refuses to open one otherwise). Each counted commit therefore syncs the
+//! WAL with at least one `F_FULLFSYNC` on Darwin. A commit that runs an
+//! automatic checkpoint also syncs the WAL and the database file. The derived
+//! `full_flushes_total` counts one full flush per commit, so it is a lower
+//! bound when a checkpoint ran.
 //!
 //! Flush counts are attempts (a failed flush is still counted). `SQLite`
 //! commit counters count successful commits only.
@@ -112,6 +116,7 @@ counters! {
     SqliteSchema => "sqlite_schema_commits",
     SqliteGroupSource => "sqlite_group_source_commits",
     SqliteGroupDest => "sqlite_group_dest_commits",
+    SqliteGroupOther => "sqlite_group_other_commits",
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
@@ -347,6 +352,7 @@ impl Counters {
             Counter::SqliteSchema,
             Counter::SqliteGroupSource,
             Counter::SqliteGroupDest,
+            Counter::SqliteGroupOther,
             Counter::SqliteRecordCapture,
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,

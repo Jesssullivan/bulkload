@@ -128,7 +128,9 @@ pub fn seal_dir(directory: &File) -> std::io::Result<()> {
 /// Bundled `SQLite` on Darwin issues a plain `fsync` unless `fullfsync` is on,
 /// and a plain Darwin `fsync` neither drains the device cache nor orders
 /// writes, so a commit could be lost or torn by power loss. With these
-/// settings each commit issues one `F_FULLFSYNC`. Checkpoint-on-close is off:
+/// settings each commit syncs the WAL with `F_FULLFSYNC`; a commit that runs
+/// an automatic checkpoint (at 1,000 WAL pages) also syncs the WAL and the
+/// database file. Checkpoint-on-close is off:
 /// the WAL is durable, so closing a store never adds a flush of its own, and
 /// automatic checkpoints happen inside later commits.
 ///
