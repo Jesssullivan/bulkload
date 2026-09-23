@@ -395,6 +395,18 @@ impl KeyParts {
             && self.identities == other.identities
     }
 
+    /// Whether any seat in this census is racy against a pass that began at
+    /// `started_ns`: its mtime or ctime is at or after that start less
+    /// [`RACY_GRANULARITY_NS`].
+    ///
+    /// An equal key is a stat-identity claim about every seat at once. A racy
+    /// seat can be rewritten at the same size inside one timestamp tick without
+    /// moving the key, so a capture with one is never reused whole (R-N76).
+    #[must_use]
+    pub fn racy_since(&self, started_ns: i128) -> bool {
+        self.rows.iter().any(|row| racy(row, started_ns))
+    }
+
     /// Everything that moved between these pre-pass parts and `later`, the
     /// parts re-read after the pass.
     ///

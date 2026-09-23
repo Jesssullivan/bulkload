@@ -16,7 +16,13 @@ test was run red against the unfixed code, then green after the fix.
 | 4b. Reuse ref leak | Retained fetch/decode failure degrades to no reuse; `refs/carry-reuse/*` deleted and proved gone, else refuse | `an_undecodable_retained_capture_degrades_to_no_reuse_and_leaks_no_refs` |
 | 4c. Shallow | `reuse_unavailable=shallow` (also `retained-unreadable`, `pass-start-unrecorded`) | `a_shallow_checkout_reports_reuse_unavailable_instead_of_silently_rereading`, `a_shallow_item_reports_reuse_unavailable_on_its_receipt` |
 
-Open, not in R-N72 scope: a whole-capture reuse hit (equal key) has the same
-racy-timestamp exposure a per-seat reuse had. It predates #52 (main's key
-equality Hit). Guarding it would make every capture of recently written seats
-a one-seat incremental pass and needs a ruling.
+Follow-up ruling R-N76 (2026-09-23, TIN-4540) closed the whole-capture racy
+gap: a `capture-reused-after-census` Hit also requires a recorded pass start
+and no seat racy against it (`KeyParts::racy_since`). Otherwise the item
+takes the per-seat extend path. Tests:
+`a_same_size_rewrite_in_the_capture_tick_never_reuses_the_whole_capture`
+(red before, green after) and
+`a_capture_whose_seats_predate_the_racy_window_is_still_reused_whole`. Legacy
+records keep their bit-identical key and are re-captured once
+(`retained_captures_from_before_this_change_keep_their_key_and_recapture_once`).
+Tests that expect a Hit now wait out the 2 s racy window with `settle()`.

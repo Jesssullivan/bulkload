@@ -47,6 +47,11 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   capture pass extends it (`capture-extended-from-drift`), and only a clean
   capture applies. R-N29 (apply proceeds on an occupied destination, recording
   uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+- A whole capture is reused (`capture-reused-after-census`) only when its key
+  is unchanged, it recorded no drift, and no seat is racy against its recorded
+  pass start. A capture with a racy seat, or with no recorded pass start
+  (records from before the start was recorded), takes the per-seat path
+  instead (R-N76).
 - An incremental pass reuses a retained blob only for a seat whose stat
   identity is unchanged and which was not racy. A seat stamped within one
   timestamp tick (a 2 s allowance) of the retained pass start can be

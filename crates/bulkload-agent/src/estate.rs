@@ -106,10 +106,10 @@ fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift
     }
 }
 
-// Absent for captures retained from before this sidecar existed: such a
-// capture is still a reuse hit on an equal key, but with no recorded pass start
-// none of its seats can be proved free of racy timestamps, so a changed key
-// re-reads every seat and says so.
+// Absent for captures retained from before this sidecar existed. With no
+// recorded pass start none of their seats can be proved free of racy
+// timestamps, so such a capture is never reused whole or blob by blob: the
+// next pass re-reads every seat, says so, and records its own start (R-N76).
 fn retained_parts(corpus: &Path, bundle: &str) -> Result<Option<Parts>> {
     let path = corpus.join(format!("{bundle}.parts"));
     if path.try_exists()? {
@@ -364,7 +364,7 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
 
 /// What a retained capture record offers the next pass.
 enum Retained {
-    /// Same key, no drift: the retained bundle is the capture.
+    /// Same key, no drift, no racy seat: the retained bundle is the capture.
     Hit,
     /// A retained bundle of this checkout whose blobs this pass may reuse:
     /// every seat at an unchanged, non-racy `StatIdentity` costs zero source
@@ -384,6 +384,7 @@ enum Retained {
 fn retained_capture(
     record: &Path,
     corpus: &Path,
+    parts: &git_carry::KeyParts,
     key: [u8; 32],
     authority: [u8; 32],
 ) -> Result<Retained> {
@@ -402,10 +403,17 @@ fn retained_capture(
         return Ok(Retained::None);
     }
     let drift = retained_drift(corpus, &previous.bundle)?;
+    let recorded = retained_parts(corpus, &previous.bundle)?;
     // A drifted bundle does not hold the drifted seats' bytes, and its key is
     // a pre-pass key the source may return to. It is never a reuse hit; it is
-    // the input the next pass extends (R-N28, R-N72).
-    if previous.key == key && drift.is_empty() {
+    // the input the next pass extends (R-N28, R-N72). An equal key vouches for
+    // no seat that is racy against the retained pass start, and a record with
+    // no recorded start vouches for none: either takes the per-seat path,
+    // which re-reads exactly the racy seats (R-N76).
+    let settled = recorded
+        .as_ref()
+        .is_some_and(|recorded| !parts.racy_since(recorded.started_ns));
+    if previous.key == key && drift.is_empty() && settled {
         if git_carry::shared::requires_base(&bundle)? {
             let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
             if !retained_base(corpus, &bound)? {
@@ -414,14 +422,13 @@ fn retained_capture(
         }
         return Ok(Retained::Hit);
     }
-    let parts = retained_parts(corpus, &previous.bundle)?;
     let extends = !drift.is_empty()
-        && parts
+        && recorded
             .as_ref()
-            .is_some_and(|parts| parts.authority == authority);
+            .is_some_and(|recorded| recorded.authority == authority);
     Ok(Retained::Extend {
         bundle,
-        started_ns: parts.map(|parts| parts.started_ns),
+        started_ns: recorded.map(|recorded| recorded.started_ns),
         extends,
     })
 }
@@ -475,15 +482,16 @@ fn capture_item(
     let parts = git_carry::capture_key_parts_with_policy(&item.source, policy)?;
     let key = parts.digest()?;
     let authority = parts.authority()?;
-    let (retained, started_ns, extends) = match retained_capture(&record, corpus, key, authority)? {
-        Retained::Hit => return Ok(Completion::clean("capture-reused-after-census")),
-        Retained::Extend {
-            bundle,
-            started_ns,
-            extends,
-        } => (Some(bundle), started_ns, extends),
-        Retained::None => (None, None, false),
-    };
+    let (retained, started_ns, extends) =
+        match retained_capture(&record, corpus, &parts, key, authority)? {
+            Retained::Hit => return Ok(Completion::clean("capture-reused-after-census")),
+            Retained::Extend {
+                bundle,
+                started_ns,
+                extends,
+            } => (Some(bundle), started_ns, extends),
+            Retained::None => (None, None, false),
+        };
     let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
     let attempt = attempt_directory(state, &identity, key)?;
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
@@ -956,6 +964,8 @@ mod tests {
         add(&plan, &second, &repository, Some(&second_target)).unwrap();
         let state = root.join("state");
         let corpus = root.join("corpus");
+        // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+        settle();
         capture(&plan, &state, &corpus, 2, &|_| Ok(())).unwrap();
         let outcomes = Mutex::new(Vec::new());
         capture(&plan, &state, &corpus, 2, &|row| {
@@ -1040,6 +1050,8 @@ mod tests {
         assert_eq!(read::<Plan>(&plan).expect("read plan").items.len(), 1);
         let state = root.join("state");
         let corpus = root.join("corpus");
+        // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+        settle();
         capture(&plan, &state, &corpus, 2, &|_| Ok(())).expect("capture");
         let outcomes = Mutex::new(Vec::new());
         capture(&plan, &state, &corpus, 2, &|row| {
@@ -1239,6 +1251,7 @@ mod tests {
         // The branch returns at the same commit: the source is again exactly
         // the state the pre-pass key described.
         git(&source, &["update-ref", "refs/heads/side", &side]);
+        settle();
         let second = receipts(&plan, &state, &corpus).unwrap();
         assert_ne!(
             second.first().unwrap().0,
@@ -1289,9 +1302,11 @@ mod tests {
 
     // The guard for the journals under /srv/fast-local/jess/state/git-carry/neo/
     // and every retained bundle in the corpus: a record whose key was computed
-    // by the pre-change hashing, with no sidecars, is still a reuse hit.
+    // by the pre-change hashing, with no sidecars, still decodes and its key is
+    // bit-identical. With no recorded pass start it vouches for no seat, so it
+    // is re-captured once, never reused whole (R-N76); after that it Hits.
     #[test]
-    fn retained_captures_from_before_this_change_are_still_reused() {
+    fn retained_captures_from_before_this_change_keep_their_key_and_recapture_once() {
         let (root, source, _, plan, corpus) = drifting_plan("retained");
         let state = root.join("state");
         let rows = receipts(&plan, &state, &corpus).unwrap();
@@ -1319,16 +1334,14 @@ mod tests {
             },
         )
         .unwrap();
-        let rows = receipts(&plan, &state, &corpus).unwrap();
-        assert_eq!(rows.first().unwrap().0, "capture-reused-after-census");
-        assert_eq!(rows.first().unwrap().3, 0);
-        // With no recorded pass start no retained seat can be proved non-racy:
-        // a changed key re-reads every seat and the receipt says why.
-        fs::write(source.join("later"), b"a seat added between passes").unwrap();
+        settle();
         assert_eq!(
             reuse_signals(&plan, &state, &corpus),
             vec![("captured", Some("pass-start-unrecorded"))]
         );
+        let rows = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(rows.first().unwrap().0, "capture-reused-after-census");
+        assert_eq!(rows.first().unwrap().3, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1354,6 +1367,67 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_nanos(
             u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
         ));
+    }
+
+    // R-N76 (TIN-4540): a whole-capture reuse is a stat-identity reuse of
+    // every seat at once, so it gets Git's racy check too. A same-size
+    // rewrite inside the capture's timestamp tick leaves the key unchanged on
+    // a coarse-timestamp filesystem; the record is forged to that unchanged
+    // key here, because a nanosecond filesystem always moves ctime.
+    #[test]
+    fn a_same_size_rewrite_in_the_capture_tick_never_reuses_the_whole_capture() {
+        let (root, source, target, plan, corpus) = drifting_plan("racy-hit");
+        let state = root.join("state");
+        assert_eq!(
+            receipts(&plan, &state, &corpus).unwrap().first().unwrap().0,
+            "captured"
+        );
+        fs::write(source.join("small"), b"SMALL UNTRACKED").unwrap();
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        let record_path = corpus.join(format!("{item}.capture"));
+        let record: Capture = read(&record_path).unwrap();
+        write(
+            &record_path,
+            &Capture {
+                key: git_carry::reusable_capture_key_with_policy(
+                    &source,
+                    git_carry::CapturePolicy::default(),
+                )
+                .unwrap(),
+                ..record
+            },
+        )
+        .unwrap();
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_ne!(
+            second.first().unwrap().0,
+            "capture-reused-after-census",
+            "a racy capture is never reused whole"
+        );
+        assert!(
+            second.first().unwrap().3 > 0,
+            "the racy seats were read again"
+        );
+        apply(&plan, &corpus, &root.join("applied"), "neo", 2, &|_| Ok(())).unwrap();
+        assert_eq!(fs::read(target.join("small")).unwrap(), b"SMALL UNTRACKED");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N76 (TIN-4540): the racy check never costs a clean repository its
+    // reuse. Seats older than one timestamp tick before the pass still Hit.
+    #[test]
+    fn a_capture_whose_seats_predate_the_racy_window_is_still_reused_whole() {
+        let (root, _, _, plan, corpus) = drifting_plan("settled-hit");
+        let state = root.join("state");
+        settle();
+        assert_eq!(
+            receipts(&plan, &state, &corpus).unwrap().first().unwrap().0,
+            "captured"
+        );
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "capture-reused-after-census");
+        assert_eq!(second.first().unwrap().3, 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     // R-N72 (TIN-4540) finding 4: a shallow checkout's retained capture offers
@@ -1416,6 +1490,7 @@ mod tests {
         });
         let first = receipts(&plan, &state, &corpus).unwrap();
         assert_eq!(first.first().unwrap().0, "captured-with-drift");
+        settle();
         let second = receipts(&plan, &state, &corpus).unwrap();
         assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
         let third = receipts(&plan, &state, &corpus).unwrap();
@@ -1436,6 +1511,9 @@ mod tests {
         arm_drift(&source);
         let first = receipts(&plan, &state, &corpus).unwrap();
         assert_eq!(first.first().unwrap().0, "captured-with-drift");
+        // Pass 2 re-reads the seats pass 1 raced; they must settle before it
+        // for pass 3 to reuse the whole capture (R-N76).
+        settle();
         let second = receipts(&plan, &state, &corpus).unwrap();
         let (outcome, reason, drift, bytes_read) = second.first().unwrap();
         assert_eq!(*outcome, "capture-extended-from-drift");
