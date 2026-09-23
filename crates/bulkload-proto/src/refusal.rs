@@ -84,6 +84,11 @@ pub enum BulkloadRefusal {
     /// inner repository's path relative to the captured checkout, raw bytes;
     /// [`fmt::Display`] prints it escaped.
     GitNestInnerRepository(Vec<u8>),
+    /// A tracked path in a nested repository has a built-in conversion
+    /// attribute (`ident`, `working-tree-encoding`, `text`, `eol`, `crlf`)
+    /// that can hide an edit from its status (R-N73). Carries the path
+    /// relative to the captured checkout; [`fmt::Display`] prints it escaped.
+    GitNestConversionAttribute(Vec<u8>),
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -157,6 +162,7 @@ impl BulkloadRefusal {
             Self::GitNestStashed => "GIT_NEST_STASHED",
             Self::GitNestDetachedUnreachable => "GIT_NEST_DETACHED_UNREACHABLE",
             Self::GitNestInnerRepository(_) => "GIT_NEST_INNER_REPOSITORY",
+            Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -178,7 +184,7 @@ impl fmt::Display for BulkloadRefusal {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
             // Escaped inside quotes: a path cannot forge a second line.
-            Self::GitNestInnerRepository(ref path) => {
+            Self::GitNestInnerRepository(ref path) | Self::GitNestConversionAttribute(ref path) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
             }
             _ => f.write_str(self.code()),
@@ -237,6 +243,7 @@ mod tests {
             BulkloadRefusal::GitNestStashed,
             BulkloadRefusal::GitNestDetachedUnreachable,
             BulkloadRefusal::GitNestInnerRepository(Vec::new()),
+            BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

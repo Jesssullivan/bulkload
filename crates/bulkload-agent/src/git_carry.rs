@@ -1231,6 +1231,12 @@ fn foreign_nest(
     if nest_index_hides_changes(directory)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // B1 (round 3): a built-in conversion is a clean filter with no command.
+    if let Some(path) = nest_conversion_attribute(directory)? {
+        return Err(BulkloadRefusal::GitNestConversionAttribute(
+            [rel_path.as_slice(), b"/", &path].concat(),
+        ));
+    }
     // Ignored entries are listed too: they are carried seats, not dirt (R-N89).
     let status = output(nest_status(directory)?.args([
         "--git-dir=.git",
@@ -1465,6 +1471,54 @@ fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
     )
 }
 
+// B1 (round 3, R-N73): the first tracked path in a nest whose attributes
+// (in-tree .gitattributes, info/attributes, the attributes file) ask for a
+// built-in conversion between worktree and index: `ident`, a
+// `working-tree-encoding`, or `text`/`eol`/`crlf` set to anything but unset.
+// Each makes status compare converted bytes, so an edit can hide inside the
+// conversion (a same-size edit inside `$Id$`, a re-encode, a CRLF rewrite).
+fn nest_conversion_attribute(directory: &Path) -> Result<Option<Vec<u8>>> {
+    let tracked =
+        output(git(directory).args(["--git-dir=.git", "--work-tree=.", "ls-files", "-z"]))?;
+    if tracked.is_empty() {
+        return Ok(None);
+    }
+    let attributes = input(
+        git(directory).args([
+            "--git-dir=.git",
+            "--work-tree=.",
+            "check-attr",
+            "-z",
+            "--stdin",
+            "ident",
+            "working-tree-encoding",
+            "text",
+            "eol",
+            "crlf",
+        ]),
+        &tracked,
+    )?;
+    let mut fields = attributes.split(|b| *b == 0);
+    while let (Some(path), Some(attribute), Some(info)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        if path.is_empty() {
+            break;
+        }
+        let converts = match attribute {
+            b"ident" => info == b"set",
+            b"working-tree-encoding" | b"text" | b"eol" | b"crlf" => {
+                info != b"unspecified" && info != b"unset"
+            }
+            _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+        };
+        if converts {
+            return Ok(Some(path.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
 /// How deep populated submodules inside a nest are followed for filter
 /// neutralisation before the nest is refused as malformed.
 const NEST_SUBMODULE_DEPTH: usize = 8;
@@ -1489,9 +1543,18 @@ fn nest_status(directory: &Path) -> Result<Command> {
     if filter_drivers(directory, 0, &mut drivers)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // B1 (round 3): the nest's own config must not weaken what status
+    // compares. Stat checks at full strength, modes and symlinks compared,
+    // no line-ending conversion.
     let mut overrides: Vec<(std::ffi::OsString, &str)> = vec![
         ("core.fsmonitor".into(), "false"),
         ("core.untrackedCache".into(), "false"),
+        ("core.trustctime".into(), "true"),
+        ("core.checkStat".into(), "default"),
+        ("core.fileMode".into(), "true"),
+        ("core.ignoreStat".into(), "false"),
+        ("core.autocrlf".into(), "false"),
+        ("core.symlinks".into(), "true"),
     ];
     for name in &drivers {
         for (variable, value) in [
@@ -6466,5 +6529,190 @@ mod review_pr53b_icase {
             assert!(restored.join("vendor").is_dir());
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod review_pr53c {
+    // The #53 round-3 adversarial review of 9bfc58b (R-N73, TIN-4540), kept
+    // as regression tests; each finding's fix makes its verdict definite.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn g(repo: &Path, args: &[&str]) -> Vec<u8> {
+        let out = git(repo)
+            .args([
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@localhost",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rv53c-{name}-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::process::Command::new("chmod")
+                .args(["-R", "u+rwx"])
+                .arg(&root)
+                .status();
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn init(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        g(repo, &["init", "--template=", "-b", "main"]);
+    }
+
+    fn commit_all(repo: &Path, message: &str) {
+        g(repo, &["add", "-A"]);
+        g(repo, &["commit", "-q", "-m", message]);
+    }
+
+    // outer/file tracked; outer/vendor/inner a clean nest pushed to origin/main.
+    fn outer_with_nest(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = fresh(name);
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let inner = outer.join("vendor/inner");
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        commit_all(&inner, "v1");
+        g(
+            &inner,
+            &["remote", "add", "origin", "https://example.invalid/i.git"],
+        );
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        (root, outer, inner)
+    }
+
+    fn verdict(outer: &Path) -> String {
+        match nested_repositories(outer) {
+            Ok(n) => format!(
+                "CUSTODY {:?}",
+                n.iter()
+                    .map(NestedRepository::receipt_line)
+                    .collect::<Vec<_>>()
+            ),
+            Err(e) => format!("REFUSED {e:?}"),
+        }
+    }
+
+    // A. R-N73/N4 class: the built-in `ident` conversion is a lying clean
+    // filter with no command. A same-size edit inside `$Id: ... $` is invisible
+    // to the census status, so a dirty nest is custody.
+    #[test]
+    fn rv3_ident_attribute_hides_an_edit_in_a_clean_nest() {
+        let (root, outer, inner) = outer_with_nest("ident");
+        fs::write(inner.join(".gitattributes"), b"*.c ident\n").unwrap();
+        fs::write(inner.join("a.c"), b"x $Id$ y\n").unwrap();
+        commit_all(&inner, "ident");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fs::remove_file(inner.join("a.c")).unwrap();
+        g(&inner, &["checkout", "--", "a.c"]);
+        let smudged = fs::read_to_string(inner.join("a.c")).unwrap();
+        let start = smudged.find("$Id: ").unwrap() + 5;
+        let mut edited = smudged.clone();
+        edited.replace_range(
+            start..start + 40,
+            "UNIQUE-UNSAVED-EDIT-ZZZZZZZZZZZZZZZZZZZZ",
+        );
+        assert_eq!(edited.len(), smudged.len());
+        fs::write(inner.join("a.c"), &edited).unwrap();
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "ident edit hidden: {v}");
+        assert_eq!(
+            v,
+            format!(
+                "REFUSED {:?}",
+                BulkloadRefusal::GitNestConversionAttribute(b"vendor/inner/a.c".to_vec())
+            )
+        );
+    }
+
+    // B. R-N73/N1 class: the nest's own config weakens what status compares.
+    #[test]
+    fn rv3_nest_core_filemode_false_hides_a_mode_change() {
+        let (root, outer, inner) = outer_with_nest("filemode");
+        g(&inner, &["config", "core.fileMode", "false"]);
+        fs::set_permissions(inner.join("lib.c"), fs::Permissions::from_mode(0o755)).unwrap();
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "chmod hidden: {v}");
+    }
+
+    #[test]
+    fn rv3_nest_trustctime_false_hides_a_same_size_mtime_restored_edit() {
+        let (root, outer, inner) = outer_with_nest("trustctime");
+        g(&inner, &["config", "core.trustctime", "false"]);
+        g(&inner, &["config", "core.checkStat", "minimal"]);
+        let pinned = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(inner.join("lib.c"))
+            .status()
+            .unwrap();
+        assert!(pinned.success());
+        g(&inner, &["update-index", "--refresh"]);
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        fs::write(inner.join("lib.c"), b"XX").unwrap();
+        assert!(std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(inner.join("lib.c"))
+            .status()
+            .unwrap()
+            .success());
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "same-size edit hidden: {v}");
+    }
+
+    // B1 (round 3): text/eol/crlf and working-tree-encoding on a tracked path
+    // refuse by name; an explicitly binary (-text) path does not.
+    #[test]
+    fn rv3_conversion_attributes_refuse_by_name_and_binary_does_not() {
+        let (root, outer, inner) = outer_with_nest("conversions");
+        fs::write(inner.join(".gitattributes"), b"*.bin binary\n").unwrap();
+        fs::write(inner.join("blob.bin"), b"\x00\x01").unwrap();
+        commit_all(&inner, "binary");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let binary = verdict(&outer);
+        let mut refused = Vec::new();
+        for attributes in [
+            "lib.c text\n",
+            "lib.c eol=crlf\n",
+            "lib.c crlf\n",
+            "lib.c working-tree-encoding=UTF-16\n",
+        ] {
+            fs::create_dir_all(inner.join(".git/info")).unwrap();
+            fs::write(inner.join(".git/info/attributes"), attributes).unwrap();
+            refused.push((attributes, verdict(&outer)));
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(binary.starts_with("CUSTODY"), "{binary}");
+        let expected = format!(
+            "REFUSED {:?}",
+            BulkloadRefusal::GitNestConversionAttribute(b"vendor/inner/lib.c".to_vec())
+        );
+        for (attributes, v) in refused {
+            assert_eq!(v, expected, "{attributes}");
+        }
     }
 }
