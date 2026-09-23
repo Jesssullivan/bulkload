@@ -31,18 +31,28 @@
 //! misplaced fsync**. It does detect ordering errors that show up without
 //! power loss: a record committed before its data, a final name holding
 //! partial content, or a resume that cannot adopt what a crash left.
-//! Power-loss coverage is the remaining W7 follow-up: a power-loss replay
-//! harness, either a syscall-log (ALICE-style) crash-state checker or
-//! dm-log-writes replay.
+//! Power-loss coverage is the remaining W7 follow-up (R-N88, tracked on #49):
+//! a power-loss replay harness, either a syscall-log (ALICE-style)
+//! crash-state checker or dm-log-writes replay.
 //!
 //! # Known violations
 //!
-//! Tests marked `#[ignore]` with a "known violation" reason assert invariants
-//! the v3 engine breaks today (R-N86). They are listed, not fixed, and never
-//! count as coverage:
+//! Tests marked `#[ignore = "known violation ..."]` assert invariants the v3
+//! engine breaks today (R-N86). They are listed in `KNOWN_VIOLATIONS`, not
+//! fixed, and never count as coverage; `every_fault_point_has_a_scenario`
+//! checks the list and the ignore attributes against each other:
 //!
-//! - `live_writer_*_leaves_no_source_index`: a refused capture leaves the
-//!   victim's chunks and committed `chunk_locations` rows in the source store.
+//! - `live_writer_*_leaves_no_source_index` (four): a refused capture leaves
+//!   the victim's chunks and committed `chunk_locations` rows in the source
+//!   store.
+//!
+//! # Hung scenarios
+//!
+//! A crash child runs a watchdog: if its fault point is not reached within
+//! `CHILD_WATCHDOG` it ends itself with `_exit(CHILD_WATCHDOG_EXIT_CODE)` and
+//! the parent fails that scenario by name. The child only ever ends itself;
+//! nothing here sends it a signal (R-N11). The parent's own deadline sits just
+//! above the watchdog, so a hung scenario fails well inside the CI job limit.
 //!
 //! Every `materialize.*` point, and `directory.after_mkdir` and
 //! `directory.after_pending_record` (an empty directory temporary not yet
@@ -416,8 +426,9 @@ fn source_files(scratch: &Scratch) -> BTreeMap<Vec<u8>, u64> {
         .collect()
 }
 
-/// Run one armed child `copy` to its fault point.
-fn crash_child(scratch: &Scratch, point: Point, label: &str) {
+/// Run one armed child `copy` to its fault point. Returns the crashing
+/// publication group's composition for a publication point.
+fn crash_child(scratch: &Scratch, point: Point, label: &str) -> Option<String> {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -431,6 +442,7 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) {
             "--nocapture",
         ])
         .env(CHILD_ENV, &scratch.base)
+        .stdin(Stdio::null())
         .env(FAULT_ENV, label)
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
         .stdout(Stdio::piped())
@@ -453,6 +465,13 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) {
             )
         })
         .unwrap();
+    assert_ne!(
+        child.status.code(),
+        Some(CHILD_WATCHDOG_EXIT_CODE),
+        "{label}: hung; the crash child's watchdog ended it after {CHILD_WATCHDOG:?} \
+         (stderr {})",
+        String::from_utf8_lossy(&child.stderr)
+    );
     assert_eq!(
         child.status.code(),
         Some(FAULT_EXIT_CODE),
@@ -460,11 +479,11 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) {
         child.status,
         String::from_utf8_lossy(&child.stderr)
     );
-    assert_receipt(scratch, point);
+    assert_receipt(scratch, point)
 }
 
 /// The crash landed at `point`, and a publication point in the store it names.
-fn assert_receipt(scratch: &Scratch, point: Point) {
+fn assert_receipt(scratch: &Scratch, point: Point) -> Option<String> {
     let receipt = fs::read_to_string(scratch.base.join("receipt")).unwrap();
     let mut lines = receipt.lines();
     assert_eq!(lines.next(), Some(point.name()), "receipt point");
@@ -476,12 +495,25 @@ fn assert_receipt(scratch: &Scratch, point: Point) {
         None
     };
     let expected = store.map(|store| fs::canonicalize(store).unwrap().display().to_string());
+    let publication = expected.is_some();
     assert_eq!(
         lines.next().map(str::to_owned),
         expected,
         "{}: crash receipt names the wrong store",
         point.name()
     );
+    // A publication crash names the group it hit, so a `_mid` failure can be
+    // reproduced from its capture ids and chunk count.
+    let group = lines.next().map(str::to_owned);
+    assert_eq!(
+        group
+            .as_deref()
+            .is_some_and(|line| line.starts_with("group capture_ids=")),
+        publication,
+        "{}: crash receipt group line {group:?}",
+        point.name()
+    );
+    group
 }
 
 /// After a resume: records and names cover every source file, and a
@@ -529,7 +561,7 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    crash_child(&scratch, point, &label);
+    let group = crash_child(&scratch, point, &label);
 
     let before = crash_state(&scratch);
     assert_i1(&label, &scratch, &before);
@@ -612,18 +644,31 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     println!(
         "{label}: outputs_before={} captures_before={} temporaries_at_crash={crash_temporaries} \
          resume_completed={} resume_reused={} resume_source_bytes={} resume_bytes_received={} \
-         temporaries_left={temporaries}",
+         temporaries_left={temporaries}{}",
         before.outputs.len(),
         before.captures.len(),
         resumed.completed,
         resumed.reused,
         resumed.source_bytes_read,
         resumed.bytes_received,
+        group
+            .map(|group| format!(" crash_{group}"))
+            .unwrap_or_default(),
     );
 }
 
-/// How long a crash child may run before the scenario fails.
-const CHILD_DEADLINE: Duration = Duration::from_mins(5);
+/// How long a crash child runs before its watchdog ends it. The slowest
+/// child (`serve.before_done`) performs a whole copy, 64 MiB file included,
+/// before its point; in a debug build on a host at load average ~40 that took
+/// over 90 s, so the watchdog sits well above it and well inside the 15-minute
+/// CI job.
+const CHILD_WATCHDOG: Duration = Duration::from_mins(4);
+
+/// Exit status of a crash child whose watchdog fired: the scenario hung.
+const CHILD_WATCHDOG_EXIT_CODE: i32 = 88;
+
+/// How long the parent waits for a crash child: the watchdog plus a margin.
+const CHILD_DEADLINE: Duration = Duration::from_secs(270);
 
 /// Set only in a child: the scratch base whose trees it copies.
 const CHILD_ENV: &str = "BULKLOAD_W7_CHILD_BASE";
@@ -634,6 +679,15 @@ fn crash_child_entry() {
     let Some(base) = std::env::var_os(CHILD_ENV).map(PathBuf::from) else {
         return;
     };
+    // A scenario that never reaches its fault point must not hold the CI job
+    // open: past the watchdog this child ends itself, never signalled.
+    std::thread::spawn(|| {
+        std::thread::sleep(CHILD_WATCHDOG);
+        eprintln!("crash child watchdog: no fault point within {CHILD_WATCHDOG:?}");
+        // SAFETY: `_exit` takes no pointers and never returns; this process
+        // ends only itself, with a status the parent reports by scenario.
+        unsafe { libc::_exit(CHILD_WATCHDOG_EXIT_CODE) }
+    });
     // An armed fault point ends this process inside `copy`. Returning at all
     // means the point was never reached, which the parent reports.
     let outcome = copy(
@@ -734,12 +788,37 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(parse(""), None);
 }
 
-/// Points whose only crash-resume scenario is an `#[ignore]`d known-violation
-/// test. They are listed here and never counted as coverage.
-const KNOWN_VIOLATIONS: [Point; 0] = [];
+/// The `#[ignore]` reason every known-violation test carries, verbatim prefix.
+const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
+
+/// Known violations (R-N86): `#[ignore]`d tests asserting invariants the
+/// engine breaks today, with the fault point each one is the only scenario
+/// for, if any. Listed, never counted as coverage.
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 4] = [
+    (
+        "live_writer_in_place_overwrite_leaves_no_source_index",
+        None,
+    ),
+    ("live_writer_truncate_leaves_no_source_index", None),
+    ("live_writer_rename_replace_leaves_no_source_index", None),
+    (
+        "live_writer_same_size_mtime_restored_leaves_no_source_index",
+        None,
+    ),
+];
+
+/// The name of the test function an `#[ignore]` attribute at `at` applies to.
+fn ignored_test_name(source: &str, at: usize) -> &str {
+    let after = &source[at..];
+    let start = after.find("\nfn ").unwrap() + "\nfn ".len();
+    let name = &after[start..];
+    &name[..name.find('(').unwrap()]
+}
 
 /// Every point is exercised by a passing (non-ignored) scenario in the
-/// `scenarios!` table, or is listed in [`KNOWN_VIOLATIONS`] — never both.
+/// `scenarios!` table, or is a [`KNOWN_VIOLATIONS`] point, never both. Every
+/// listed violation is an `#[ignore]`d test with the known-violation reason,
+/// and every test ignored for that reason is listed.
 #[test]
 fn every_fault_point_has_a_scenario() {
     let source = include_str!("fault_harness.rs");
@@ -747,7 +826,11 @@ fn every_fault_point_has_a_scenario() {
     let table = &source[start..];
     let table = &table[..table.find("\n}\n").unwrap()];
     let covered = |point: &Point| table.contains(&format!("=> {point:?}:"));
-    let known = |point: &Point| KNOWN_VIOLATIONS.contains(point);
+    let known = |point: &Point| {
+        KNOWN_VIOLATIONS
+            .iter()
+            .any(|(_, known)| known.as_ref() == Some(point))
+    };
     let missing: Vec<&str> = Point::ALL
         .into_iter()
         .filter(|point| !covered(point) && !known(point))
@@ -766,13 +849,37 @@ fn every_fault_point_has_a_scenario() {
         both.is_empty(),
         "known violations also claimed as coverage: {both:?}"
     );
-    for point in KNOWN_VIOLATIONS {
+    // Every `#[ignore = "known violation ..."]` in this file, by test name.
+    let attribute = format!("\n{KNOWN_VIOLATION_REASON}");
+    let ignored: Vec<&str> = source
+        .match_indices(&attribute)
+        .map(|(at, _)| ignored_test_name(source, at))
+        .collect();
+    for (name, point) in KNOWN_VIOLATIONS {
         assert!(
-            source.contains(&format!("crash_resume(Point::{point:?}, ")),
-            "{}: known violation without its ignored test",
-            point.name()
+            ignored.contains(&name),
+            "{name}: listed as a known violation but not #[ignore]d with the reason"
+        );
+        if let Some(point) = point {
+            assert!(
+                source.contains(&format!("crash_resume(Point::{point:?}, ")),
+                "{}: known violation without its crash scenario",
+                point.name()
+            );
+        }
+    }
+    for name in &ignored {
+        assert!(
+            KNOWN_VIOLATIONS.iter().any(|(listed, _)| listed == name),
+            "{name}: ignored as a known violation but not listed"
         );
     }
+    // No other ignore reason may hide a test in this harness.
+    assert_eq!(
+        source.matches("\n#[ignore").count(),
+        ignored.len(),
+        "an #[ignore] here without the known-violation reason"
+    );
 }
 
 /// R-N79: after `materialize.after_link` the orphan is a second hard link to a

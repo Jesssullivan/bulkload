@@ -70,6 +70,30 @@ macro_rules! publication_crash {
     }};
 }
 
+/// Record this group's composition for a crash receipt: its capture ids,
+/// sorted and distinct, and the chunk payloads it carries.
+#[cfg(feature = "fault-injection")]
+fn note_group(events: &[PreparedEvent]) {
+    let mut ids: Vec<usize> = events
+        .iter()
+        .map(|event| match event {
+            PreparedEvent::Chunks { capture_id, .. }
+            | PreparedEvent::Complete { capture_id, .. }
+            | PreparedEvent::Refused { capture_id, .. } => *capture_id,
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let chunks = events
+        .iter()
+        .map(|event| match event {
+            PreparedEvent::Chunks { chunks, .. } => chunks.len(),
+            PreparedEvent::Complete { .. } | PreparedEvent::Refused { .. } => 0,
+        })
+        .sum();
+    crate::fault::note_group(&ids, chunks);
+}
+
 #[cfg(not(feature = "fault-injection"))]
 macro_rules! publication_crash {
     ($publisher:expr, $source:ident, $destination:ident) => {{}};
@@ -952,6 +976,8 @@ impl StorePublisher<'_> {
             return Ok(Vec::new());
         }
         PUBLISH_GROUPS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "fault-injection")]
+        note_group(&events);
         let missing = self.missing_chunks(&events)?;
         let locations = self.append_chunks(missing)?;
         self.commit_group(&locations, &events)?;

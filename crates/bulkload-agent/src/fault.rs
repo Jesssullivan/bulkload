@@ -23,15 +23,17 @@
 //! does detect ordering bugs visible without power loss, such as a record
 //! committed before its data is written, a final name exposed before its
 //! content is complete, or a resume that cannot adopt what a crash left.
-//! Power-loss coverage is the remaining W7 follow-up: a syscall-log
-//! (ALICE-style) crash-state checker, or dm-log-writes replay.
+//! Power-loss coverage is the remaining W7 follow-up (R-N88, tracked on #49):
+//! a syscall-log (ALICE-style) crash-state checker, or dm-log-writes replay.
 //!
 //! # Crash receipt
 //!
 //! With `BULKLOAD_FAULT_RECEIPT=<path>` set, the process writes the armed
 //! point's name, and for publication points the canonical store root on a
-//! second line, to `<path>` just before it exits. Harnesses use it to check
-//! which store a crash landed in.
+//! second line and the crashing group's composition on a third
+//! (`group capture_ids=<ids> chunks=<n>`), to `<path>` just before it exits.
+//! Harnesses use it to check which store a crash landed in, and to reproduce
+//! a failing `_mid` crash from the group it hit.
 //!
 //! An `BULKLOAD_FAULT` value that names no point, or has an `nth` of zero or a
 //! non-number, ends the process at the first fault point it reaches with
@@ -298,12 +300,31 @@ pub fn hit_in(point: Point, store: &Path) {
     hit_at(point, Some(store));
 }
 
+std::thread_local! {
+    static GROUP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Describe the publication group this thread is publishing.
+///
+/// A crash receipt for a publication point records it. Thread-local, because
+/// a local `copy` publishes source and destination groups on different
+/// threads.
+pub fn note_group(capture_ids: &[usize], chunks: usize) {
+    let ids: Vec<String> = capture_ids.iter().map(ToString::to_string).collect();
+    let description = format!("group capture_ids={} chunks={chunks}", ids.join(","));
+    GROUP.with(|group| *group.borrow_mut() = Some(description));
+}
+
 fn receipt(point: Point, store: Option<&Path>) {
     if let Some(path) = std::env::var_os(FAULT_RECEIPT_ENV) {
         let mut body = format!("{}\n", point.name());
         if let Some(store) = store {
             body.push_str(&store.display().to_string());
             body.push('\n');
+            if let Some(group) = GROUP.with(|group| group.borrow().clone()) {
+                body.push_str(&group);
+                body.push('\n');
+            }
         }
         // Best effort: the page cache outlives `_exit`, no sync is needed.
         let _ = std::fs::write(path, body);
