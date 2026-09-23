@@ -1,33 +1,52 @@
-//! Read-only measurement of what git carry v2 would move (R-N60 baseline).
+//! Read-only measurement of what git carry v2 would move (R-N60 baseline;
+//! R-N74 gate metric; R-N75 refusals).
 //!
-//! The destination offers its de-duplicated ref tip oids and its shallow list,
-//! exactly the negotiation input of the v2 design (bulkload#48, D2). The source
-//! keeps as haves the tips it also holds as objects, then walks every object
-//! reachable from its refs, `HEAD` and every stash entry but not from those
-//! haves. Nothing is fetched, written or updated on either side: the source runs
-//! `rev-list`, `cat-file --batch-check`, `for-each-ref` and `reflog show` with
-//! optional locks disabled. A remote destination is reached with
-//! `ssh -T -oBatchMode=yes HOST` and runs only
-//! `git -C PATH for-each-ref '--format=%(objectname)'` and, through `bash -s`,
-//! `cat` of its shallow file.
+//! One probe script, [`PROBE_SCRIPT`], reads a repository's offer: every ref
+//! tip, every worktree's `HEAD` and per-worktree refs (`refs/worktree/`,
+//! `refs/bisect/`, `refs/rewritten/`, found through each administrative
+//! directory under `worktrees/`, so a pruned-away checkout still counts), its
+//! shallow frontier and whether it is a partial clone. The probe first proves
+//! the path is the repository's root: a work tree's top level or a bare
+//! repository's git dir, with discovery fenced by `GIT_CEILING_DIRECTORIES`.
+//! The same text runs through `bash -s` on this host for the source and a local
+//! destination, and through one `ssh` session for a remote destination, so the
+//! remote tips and shallow frontier come from one connection.
+//!
+//! The source keeps as haves the destination tips it holds as objects. Its wants
+//! are its own probed tips plus every stash entry. It then:
+//! - walks the wants minus the haves (`rev-list --objects --missing=print`),
+//!   counting objects it does not hold and tallying `%(objectsize:disk)` of the
+//!   rest (informational: a stored size, not a sent size);
+//! - streams `pack-objects --stdout --thin --revs --delta-base-offset` over the
+//!   same wants and haves into a byte counter. That count,
+//!   `missing_thin_pack_bytes`, is the W6 M1 gate metric (R-N74). The pack
+//!   never reaches disk.
+//!
+//! Nothing is fetched, written or updated on either side. Every Git call runs
+//! with `GIT_NO_LAZY_FETCH=1`, `--no-optional-locks`, `maintenance.auto=false`,
+//! `gc.auto=0` and `core.hooksPath=/dev/null`, and the probe refuses a Git older
+//! than 2.44, which would ignore `GIT_NO_LAZY_FETCH`.
+//!
+//! A destination whose refs cannot prove it holds their history is refused
+//! (R-N75): a partial clone, or a shallow repository whose frontier differs
+//! from the source's. Matching frontiers still estimate.
 //!
 //! This is the lower-bound first round of negotiation. Ancestor probing of
 //! uncovered tips (`GitHaveQuery`) is not modelled, so a destination tip the
 //! source lacks contributes nothing, even where the destination holds much of
-//! that tip's history. `objectsize:disk` is the source's stored size of each
-//! object (a pack delta or a compressed loose object), not the size of the thin
-//! pack a later `pack-objects` would build.
+//! that tip's history.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{BufReader, Write as _};
+use std::fmt;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::{git, oid, output, shallow};
+use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
-/// Where the destination's tips are read from.
+/// Where the destination's offer is read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
     /// A repository on this host.
@@ -108,18 +127,94 @@ fn remote_path(path: &str) -> bool {
         })
 }
 
-/// The shallow file of a remote repository, by convention: `PATH/shallow` for
-/// a bare repository named `*.git`, otherwise `PATH/.git/shallow`.
-fn remote_shallow_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if Path::new(trimmed)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
-    {
-        format!("{trimmed}/shallow")
-    } else {
-        format!("{trimmed}/.git/shallow")
+/// A refusal plus, when a child process explained it, a bounded and redacted
+/// excerpt of that child's standard error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The typed refusal; its code is the stable identity.
+    pub refusal: BulkloadRefusal,
+    /// At most [`DETAIL_LIMIT`] printable characters, one line, with URL
+    /// credentials and token-shaped words removed.
+    pub detail: Option<String>,
+}
+
+impl Refused {
+    const fn new(refusal: BulkloadRefusal, detail: Option<String>) -> Self {
+        Self { refusal, detail }
     }
+}
+
+impl From<BulkloadRefusal> for Refused {
+    fn from(refusal: BulkloadRefusal) -> Self {
+        Self::new(refusal, None)
+    }
+}
+
+impl From<std::io::Error> for Refused {
+    fn from(error: std::io::Error) -> Self {
+        BulkloadRefusal::from(error).into()
+    }
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(f, "{}: {detail}", self.refusal),
+            None => write!(f, "{}", self.refusal),
+        }
+    }
+}
+
+/// Longest stderr excerpt a [`Refused`] carries, in characters.
+pub const DETAIL_LIMIT: usize = 240;
+
+/// One line of at most [`DETAIL_LIMIT`] characters from a child's stderr.
+fn detail(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let words: Vec<String> = text.split_whitespace().map(redact).collect();
+    let line = words.join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    let mut bounded: String = line
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(DETAIL_LIMIT)
+        .collect();
+    if line.chars().count() > DETAIL_LIMIT {
+        bounded.push_str("...");
+    }
+    Some(bounded)
+}
+
+/// Drop anything credential-shaped from one word of diagnostic text.
+fn redact(word: &str) -> String {
+    const TOKEN_PREFIXES: [&str; 8] = [
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "glpat-",
+        "xox",
+        "AKIA",
+    ];
+    let lower = word.to_ascii_lowercase();
+    if TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix))
+        || ["password", "passwd", "token", "secret", "authorization"]
+            .iter()
+            .any(|key| lower.contains(key) && (word.contains('=') || word.contains(':')))
+    {
+        return "[redacted]".to_owned();
+    }
+    if let Some((scheme, rest)) = word.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            let tail = rest.get(authority.len()..).unwrap_or("");
+            return format!("{scheme}://[redacted]@{host}{tail}");
+        }
+    }
+    word.to_owned()
 }
 
 /// Object count and stored bytes of one Git object type.
@@ -142,7 +237,8 @@ pub struct Tally {
     pub blob: TypeTally,
     /// Annotated tags.
     pub tag: TypeTally,
-    /// Listed by the walk but absent from the object store (partial clones).
+    /// Reached by the walk but absent from the source's store: `rev-list
+    /// --missing=print` lines (a partial clone's unfetched objects).
     pub unavailable: u64,
 }
 
@@ -188,10 +284,19 @@ impl Tally {
     }
 }
 
+/// The thin pack `pack-objects` builds for the missing set, counted in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThinPack {
+    /// Bytes of the whole pack stream, header and trailer included.
+    pub bytes: u64,
+    /// Object count from the pack header.
+    pub objects: u64,
+}
+
 /// What git carry v2 would have to move from one source to one destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarryEstimate {
-    /// Distinct oids among the destination's refs.
+    /// Distinct oids among the destination's tips (refs and worktree `HEAD`s).
     pub destination_tip_count: usize,
     /// Lines in the destination's shallow file.
     pub destination_shallow_count: usize,
@@ -199,12 +304,16 @@ pub struct CarryEstimate {
     pub haves_used: usize,
     /// Lines in the source's shallow file.
     pub source_shallow_count: usize,
-    /// Stash reflog entries walked in addition to the refs and `HEAD`.
+    /// Whether the source is a partial clone (it may then lack objects).
+    pub source_partial: bool,
+    /// Stash reflog entries walked in addition to the probed tips.
     pub stash_entries: usize,
-    /// The whole closure of the source's refs, `HEAD` and stash entries.
+    /// The whole closure of the source's tips and stash entries.
     pub source: Tally,
     /// That closure minus everything reachable from the haves.
     pub missing: Tally,
+    /// The thin pack for `missing`: the W6 M1 gate metric (R-N74).
+    pub thin_pack: ThinPack,
 }
 
 impl CarryEstimate {
@@ -219,6 +328,7 @@ impl CarryEstimate {
             format!("source_blobs={}", self.source.blob.count),
             format!("source_tags={}", self.source.tag.count),
             format!("source_unavailable_objects={}", self.source.unavailable),
+            format!("source_partial_clone={}", u8::from(self.source_partial)),
             format!("source_shallow_count={}", self.source_shallow_count),
             format!("stash_entries={}", self.stash_entries),
             format!("destination_tip_count={}", self.destination_tip_count),
@@ -229,9 +339,12 @@ impl CarryEstimate {
             format!("haves_used={}", self.haves_used),
             format!(
                 "destination_tips_unknown_to_source={}",
-                self.destination_tip_count - self.haves_used
+                self.destination_tip_count.saturating_sub(self.haves_used)
             ),
             format!("missing_objects={}", self.missing.objects()),
+            format!("missing_unavailable_objects={}", self.missing.unavailable),
+            format!("missing_thin_pack_bytes={}", self.thin_pack.bytes),
+            format!("missing_thin_pack_objects={}", self.thin_pack.objects),
             format!("missing_bytes_disk={}", self.missing.bytes_disk()),
         ];
         for (name, tally) in [
@@ -243,6 +356,10 @@ impl CarryEstimate {
             lines.push(format!("missing_{name}s={}", tally.count));
             lines.push(format!("missing_{name}_bytes_disk={}", tally.bytes_disk));
         }
+        lines.push("gate_metric=missing_thin_pack_bytes".to_owned());
+        lines.push(
+            "informational=source_history_bytes,missing_bytes_disk,missing_*_bytes_disk".to_owned(),
+        );
         lines
     }
 }
@@ -250,116 +367,243 @@ impl CarryEstimate {
 /// Measure, read-only, what carrying `source` to `destination` would move.
 ///
 /// # Errors
-/// Refuses an unreadable repository, an unreachable remote, or Git output that
-/// is not the shape these commands promise.
-pub fn estimate(source: &Path, destination: &Destination) -> Result<CarryEstimate> {
-    let (tips, destination_shallow) = match destination {
-        Destination::Local(path) => local_offer(path)?,
-        Destination::Remote { host, path } => remote_offer(host, path)?,
+/// Refuses a path that is not a repository root, a destination whose refs do
+/// not prove their history (R-N75), an unreachable remote, or Git output that
+/// is not the shape these commands promise. A refusal raised by a child
+/// process carries a bounded excerpt of its stderr.
+pub fn estimate(
+    source: &Path,
+    destination: &Destination,
+) -> std::result::Result<CarryEstimate, Refused> {
+    let own = run_probe(&mut local_probe(source))?;
+    let offer = match destination {
+        Destination::Local(path) => run_probe(&mut local_probe(path))?,
+        Destination::Remote { host, path } => {
+            if !remote_host(host) || !remote_path(path) || !path.starts_with('/') {
+                return Err(BulkloadRefusal::PathNotPortable.into());
+            }
+            run_probe(&mut ssh_command(host, &remote_command(path)))?
+        }
     };
-    let haves = present(source, &tips)?;
+    if offer.partial {
+        return Err(Refused::new(
+            BulkloadRefusal::GitHavesUnprovable,
+            Some("destination is a partial clone".to_owned()),
+        ));
+    }
+    if !offer.shallow.is_empty() && offer.shallow != own.shallow {
+        return Err(Refused::new(
+            BulkloadRefusal::GitHavesUnprovable,
+            Some("destination is shallow at a frontier other than the source's".to_owned()),
+        ));
+    }
+    let haves = present(source, &offer.tips)?;
     let stash = stash_entries(source)?;
-    let source_shallow = shallow_lines(&shallow::frontier(source)?)?;
-    let closure = walk(source, &stash, &[])?;
-    let missing = if haves.is_empty() {
-        closure
+    let mut wants = own.tips;
+    wants.extend(stash.iter().cloned());
+    let closure = walk(source, &revisions(&wants, &[]))?;
+    let (missing, thin_pack) = if haves.is_empty() {
+        (
+            closure,
+            thin_pack(source, &revisions(&wants, &[]), closure)?,
+        )
     } else {
-        walk(source, &stash, &haves)?
+        let request = revisions(&wants, &haves);
+        let missing = walk(source, &request)?;
+        (missing, thin_pack(source, &request, missing)?)
     };
     Ok(CarryEstimate {
-        destination_tip_count: tips.len(),
-        destination_shallow_count: destination_shallow.len(),
+        destination_tip_count: offer.tips.len(),
+        destination_shallow_count: offer.shallow.len(),
         haves_used: haves.len(),
-        source_shallow_count: source_shallow.len(),
+        source_shallow_count: own.shallow.len(),
+        source_partial: own.partial,
         stash_entries: stash.len(),
         source: closure,
         missing,
+        thin_pack,
     })
 }
 
-fn tip_set(bytes: &[u8]) -> Result<BTreeSet<String>> {
-    let text = std::str::from_utf8(bytes).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let mut tips = BTreeSet::new();
-    for line in text.lines() {
-        if !oid(line) {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        tips.insert(line.to_owned());
+/// [`git`] plus the estimate's no-write, no-network hardening (F1):
+/// `--no-optional-locks`, `gc.auto=0` and `core.hooksPath=/dev/null` come
+/// from [`git`]; this adds `maintenance.auto=false` and `GIT_NO_LAZY_FETCH`.
+fn hardened(repository: &Path) -> Command {
+    let mut command = git(repository);
+    command
+        .args(["-c", "maintenance.auto=false"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+/// What one repository offers, as [`PROBE_SCRIPT`] reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Probe {
+    tips: BTreeSet<String>,
+    shallow: BTreeSet<String>,
+    partial: bool,
+}
+
+/// Exit status of [`PROBE_SCRIPT`] when its argument is not a repository root.
+const PROBE_NOT_A_REPOSITORY: i32 = 4;
+/// Exit status of [`PROBE_SCRIPT`] when Git is older than 2.44.
+const PROBE_GIT_TOO_OLD: i32 = 5;
+
+/// The offer probe, run by `bash -s -- PATH` locally and over ssh alike.
+///
+/// POSIX sh, so bash 3.2 (macOS) and bash 5 (sting) read it the same way. It
+/// runs no program but Git (`git version`, `rev-parse`, `config --get*` and
+/// `for-each-ref`) and reads the shallow file with the shell's `read`. Output: one `partial 0|1` line, then `shallow`
+/// and `tip` lines carrying one oid each, then `end`.
+pub const PROBE_SCRIPT: &str = r#"set -eu
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
+export GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+g() { git --no-optional-locks -c maintenance.auto=false -c gc.auto=0 -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+version=$(git version) || exit 5
+version=${version#git version }
+major=${version%%.*}
+minor=${version#*.}
+minor=${minor%%[!0-9]*}
+case "$major" in ''|*[!0-9]*) exit 5 ;; esac
+case "$minor" in ''|*[!0-9]*) exit 5 ;; esac
+if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 44 ]; }; then exit 5; fi
+[ "$#" -eq 1 ] || exit 2
+root=$(cd -P -- "$1" 2>/dev/null && pwd -P) || exit 4
+GIT_CEILING_DIRECTORIES=${root%/*}
+[ -n "$GIT_CEILING_DIRECTORIES" ] || GIT_CEILING_DIRECTORIES=/
+export GIT_CEILING_DIRECTORIES
+bare=$(g -C "$root" rev-parse --is-bare-repository 2>/dev/null) || exit 4
+if [ "$bare" = true ]; then
+  top=$(g -C "$root" rev-parse --absolute-git-dir 2>/dev/null) || exit 4
+else
+  top=$(g -C "$root" rev-parse --show-toplevel 2>/dev/null) || exit 4
+fi
+[ "$top" = "$root" ] || exit 4
+common=$(g -C "$root" rev-parse --path-format=absolute --git-common-dir)
+shallow=$(g -C "$root" rev-parse --path-format=absolute --git-path shallow)
+partial=0
+if value=$(g -C "$root" config --get extensions.partialClone); then
+  [ -z "$value" ] || partial=1
+else
+  [ "$?" -eq 1 ] || exit 1
+fi
+if value=$(g -C "$root" config --type=bool --get-regexp '^remote\..*\.promisor$'); then
+  case "$value" in *' true'*) partial=1 ;; esac
+else
+  [ "$?" -eq 1 ] || exit 1
+fi
+printf 'partial %s\n' "$partial"
+if [ -e "$shallow" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do printf 'shallow %s\n' "$line"; done < "$shallow"
+fi
+g --git-dir="$common" for-each-ref '--format=tip %(objectname)'
+if head=$(g --git-dir="$common" rev-parse -q --verify HEAD); then printf 'tip %s\n' "$head"; fi
+for admin in "$common"/worktrees/*; do
+  [ -f "$admin/HEAD" ] || continue
+  if head=$(g --git-dir="$admin" rev-parse -q --verify HEAD); then printf 'tip %s\n' "$head"; fi
+  g --git-dir="$admin" for-each-ref '--format=tip %(objectname)' refs/worktree/ refs/bisect/ refs/rewritten/
+done
+printf 'end\n'
+"#;
+
+fn local_probe(repository: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command.args(["-s", "--"]).arg(repository);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(key);
     }
-    Ok(tips)
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command
 }
 
-fn shallow_lines(bytes: &[u8]) -> Result<Vec<String>> {
-    Ok(tip_set(bytes)?.into_iter().collect())
+/// `ssh -T -oBatchMode=yes -oConnectTimeout=15 HOST COMMAND`.
+fn ssh_command(host: &str, command: &str) -> Command {
+    let mut ssh = Command::new("ssh");
+    ssh.args([
+        "-T",
+        "-oBatchMode=yes",
+        "-oConnectTimeout=15",
+        host,
+        command,
+    ]);
+    ssh
 }
 
-type Offer = (BTreeSet<String>, Vec<String>);
-
-fn local_offer(repository: &Path) -> Result<Offer> {
-    let tips = tip_set(&output(
-        git(repository).args(["for-each-ref", "--format=%(objectname)"]),
-    )?)?;
-    let shallow = shallow_lines(&shallow::frontier(repository)?)?;
-    Ok((tips, shallow))
+/// The remote login shell (fish on sting) parses this line. `env` sets the
+/// variable in any shell, and single quotes mean the same thing to POSIX sh
+/// and fish for the [`remote_path`] character set.
+fn remote_command(path: &str) -> String {
+    format!("env GIT_NO_LAZY_FETCH=1 bash -s -- '{path}'")
 }
 
-fn ssh(host: &str, command: &str, script: &[u8]) -> Result<std::process::Output> {
-    let mut child = Command::new("ssh")
-        .args(["-T", "-oBatchMode=yes", host, command])
-        .stdin(if script.is_empty() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
+/// Run the probe with [`PROBE_SCRIPT`] on stdin and parse its answer.
+fn run_probe(command: &mut Command) -> std::result::Result<Probe, Refused> {
+    let mut child = command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| BulkloadRefusal::GitUnavailable)?;
-    // The script is a few hundred bytes and `bash -s` reads it before it
-    // answers, so writing it first cannot deadlock.
-    let written = child
-        .stdin
-        .take()
-        .map_or(Ok(()), |mut stdin| stdin.write_all(script));
-    let result = child.wait_with_output()?;
-    written?;
-    match result.status.code() {
-        Some(255) | None => Err(BulkloadRefusal::GitUnavailable),
-        Some(_) => Ok(result),
+    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
+    let (written, result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(PROBE_SCRIPT.as_bytes()));
+        let result = child.wait_with_output();
+        (writer.join(), result)
+    });
+    let result = result?;
+    let refusal = match result.status.code() {
+        Some(0) => None,
+        Some(PROBE_NOT_A_REPOSITORY) => Some(BulkloadRefusal::GitRepositoryNotAtPath),
+        Some(PROBE_GIT_TOO_OLD | 255) | None => Some(BulkloadRefusal::GitUnavailable),
+        Some(_) => Some(BulkloadRefusal::GitInventoryMalformed),
+    };
+    if let Some(refusal) = refusal {
+        return Err(Refused::new(refusal, detail(&result.stderr)));
     }
+    // A child that answered in full read its whole script.
+    written.map_err(|_| BulkloadRefusal::Io(None))??;
+    Ok(parse_probe(&result.stdout)?)
 }
 
-/// Exit status the shallow probe uses for "this repository is not shallow".
-const NOT_SHALLOW: i32 = 3;
-
-fn remote_offer(host: &str, path: &str) -> Result<Offer> {
-    if !remote_host(host) || !remote_path(path) || !path.starts_with('/') {
-        return Err(BulkloadRefusal::PathNotPortable);
+fn parse_probe(stdout: &[u8]) -> Result<Probe> {
+    let text = std::str::from_utf8(stdout).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let mut probe = Probe::default();
+    let mut partial = None;
+    let mut ended = false;
+    for line in text.lines() {
+        if ended {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        match line.split_once(' ') {
+            Some(("tip", value)) if oid(value) => {
+                probe.tips.insert(value.to_owned());
+            }
+            Some(("shallow", value)) if oid(value) => {
+                probe.shallow.insert(value.to_owned());
+            }
+            Some(("partial", flag @ ("0" | "1"))) if partial.is_none() => {
+                partial = Some(flag == "1");
+            }
+            None if line == "end" => ended = true,
+            _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+        }
     }
-    // Single quotes mean the same thing to POSIX sh and to fish for this
-    // character set; `%(objectname)` must be quoted for fish.
-    let refs = ssh(
-        host,
-        &format!("git -C '{path}' for-each-ref '--format=%(objectname)'"),
-        &[],
-    )?;
-    if !refs.status.success() {
+    if !ended {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    let tips = tip_set(&refs.stdout)?;
-    // `bash -s` with the script on stdin sidesteps the login shell (fish on
-    // sting) and tells "no shallow file" apart from a failed read.
-    let script = format!(
-        "set -eu\nf='{}'\nif [ -e \"$f\" ]; then exec cat -- \"$f\"; fi\nexit {NOT_SHALLOW}\n",
-        remote_shallow_path(path)
-    );
-    let shallow = ssh(host, "bash -s", script.as_bytes())?;
-    let shallow = match shallow.status.code() {
-        Some(0) => shallow_lines(&shallow.stdout)?,
-        Some(NOT_SHALLOW) => Vec::new(),
-        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
-    };
-    Ok((tips, shallow))
+    probe.partial = partial.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(probe)
 }
 
 /// Run `command`, feeding `bytes` on stdin from a separate thread so a large
@@ -371,12 +615,11 @@ fn feed(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
         .stderr(Stdio::null())
         .spawn()?;
     let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
-    let written = std::thread::scope(|scope| {
+    let (writer, result) = std::thread::scope(|scope| {
         let writer = scope.spawn(move || stdin.write_all(bytes));
         let result = child.wait_with_output();
         (writer.join(), result)
     });
-    let (writer, result) = written;
     writer.map_err(|_| BulkloadRefusal::Io(None))??;
     let result = result?;
     if !result.status.success() {
@@ -385,7 +628,20 @@ fn feed(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
-/// Destination tips that exist as objects in `source`, in oid order.
+fn run(command: &mut Command) -> Result<Vec<u8>> {
+    let result = command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !result.status.success() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(result.stdout)
+}
+
+/// Destination tips that exist as objects in `source`, in oid order. With
+/// `GIT_NO_LAZY_FETCH` a partial source answers `missing` for a tip only its
+/// promisor holds instead of fetching it (F1).
 fn present(source: &Path, tips: &BTreeSet<String>) -> Result<Vec<String>> {
     if tips.is_empty() {
         return Ok(Vec::new());
@@ -396,7 +652,7 @@ fn present(source: &Path, tips: &BTreeSet<String>) -> Result<Vec<String>> {
         request.push('\n');
     }
     let answer = feed(
-        git(source).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+        hardened(source).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
     )?;
     let answer = String::from_utf8(answer).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
@@ -422,11 +678,12 @@ fn present(source: &Path, tips: &BTreeSet<String>) -> Result<Vec<String>> {
 
 /// Every stash reflog entry, newest first; empty when there is no stash.
 fn stash_entries(source: &Path) -> Result<Vec<String>> {
-    let stash = output(git(source).args(["for-each-ref", "--format=%(objectname)", "refs/stash"]))?;
+    let stash =
+        run(hardened(source).args(["for-each-ref", "--format=%(objectname)", "refs/stash"]))?;
     if stash.is_empty() {
         return Ok(Vec::new());
     }
-    let entries = output(git(source).args(["reflog", "show", "--format=%H", "refs/stash"]))?;
+    let entries = run(hardened(source).args(["reflog", "show", "--format=%H", "refs/stash"]))?;
     let entries = String::from_utf8(entries).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     entries
         .lines()
@@ -440,15 +697,11 @@ fn stash_entries(source: &Path) -> Result<Vec<String>> {
         .collect()
 }
 
-/// `rev-list --objects --missing=allow-any --all <stash> --not <haves>`,
-/// streamed straight into `cat-file --batch-check` and tallied by type.
-///
-/// `--all` covers every ref and `HEAD`. Stash entries and the negated haves go
-/// through stdin, which `rev-list` reads completely before walking, so writing
-/// it first cannot deadlock; a `--not` read from stdin never negates `--all`.
-fn walk(source: &Path, stash: &[String], haves: &[String]) -> Result<Tally> {
+/// `rev-list`/`pack-objects --revs` stdin: the wants, then `--not` and the
+/// haves when there are any.
+fn revisions(wants: &BTreeSet<String>, haves: &[String]) -> String {
     let mut request = String::new();
-    for value in stash {
+    for value in wants {
         request.push_str(value);
         request.push('\n');
     }
@@ -459,54 +712,96 @@ fn walk(source: &Path, stash: &[String], haves: &[String]) -> Result<Tally> {
             request.push('\n');
         }
     }
-    let mut list = git(source)
+    request
+}
+
+/// `rev-list --objects --missing=print --stdin`, with its `?` lines counted as
+/// unavailable and every other oid forwarded to `cat-file --batch-check`,
+/// tallied by type.
+fn walk(source: &Path, request: &str) -> Result<Tally> {
+    let mut list = hardened(source)
         .args([
             "rev-list",
             "--objects",
             "--no-object-names",
-            "--missing=allow-any",
-            "--all",
+            "--missing=print",
             "--stdin",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut list_input = list.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
-    let written = list_input.write_all(request.as_bytes());
-    drop(list_input);
-    let list_output = list.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
-    let check = git(source)
+    let check = hardened(source)
         .args([
             "cat-file",
             "--batch-check=%(objectname) %(objecttype) %(objectsize:disk)",
         ])
-        .stdin(Stdio::from(list_output))
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();
-    // Always reap the walker, whatever happened to the checker.
-    let (tally, check_status) = match check {
-        Ok(mut check) => {
-            let tally = check
-                .stdout
-                .take()
-                .ok_or(BulkloadRefusal::Io(None))
-                .and_then(|stdout| tally(BufReader::new(stdout)));
-            (tally, check.wait())
+    let mut check = match check {
+        Ok(check) => check,
+        Err(error) => {
+            drop(list.stdin.take());
+            drop(list.stdout.take());
+            list.wait()?;
+            return Err(error.into());
         }
-        Err(error) => (Err(error.into()), Ok(std::process::ExitStatus::default())),
     };
+    let pipes = (
+        list.stdin.take(),
+        list.stdout.take(),
+        check.stdin.take(),
+        check.stdout.take(),
+    );
+    let outcome = std::thread::scope(|scope| {
+        let (Some(mut list_in), Some(list_out), Some(check_in), Some(check_out)) = pipes else {
+            return Err(BulkloadRefusal::Io(None));
+        };
+        let writer = scope.spawn(move || list_in.write_all(request.as_bytes()));
+        let reader = scope.spawn(move || tally(BufReader::new(check_out)));
+        let unavailable = forward(BufReader::new(list_out), BufWriter::new(check_in));
+        let written = writer.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        let tallied = reader.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        let unavailable = unavailable?;
+        written?;
+        let mut tallied = tallied?;
+        tallied.unavailable += unavailable;
+        Ok(tallied)
+    });
     let list_status = list.wait()?;
-    written?;
-    let tally = tally?;
-    if !list_status.success() || !check_status?.success() {
+    let check_status = check.wait()?;
+    let tallied = outcome?;
+    if !list_status.success() || !check_status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    Ok(tally)
+    Ok(tallied)
 }
 
-fn tally(reader: impl std::io::BufRead) -> Result<Tally> {
+/// Copy `rev-list` oids to `cat-file`, counting `?oid` lines instead.
+fn forward(list: impl BufRead, mut check: impl Write) -> Result<u64> {
+    let mut unavailable = 0_u64;
+    for line in list.lines() {
+        let line = line?;
+        if let Some(value) = line.strip_prefix('?') {
+            if !oid(value) {
+                return Err(BulkloadRefusal::GitInventoryMalformed);
+            }
+            unavailable += 1;
+        } else {
+            if !oid(&line) {
+                return Err(BulkloadRefusal::GitInventoryMalformed);
+            }
+            check.write_all(line.as_bytes())?;
+            check.write_all(b"\n")?;
+        }
+    }
+    check.flush()?;
+    Ok(unavailable)
+}
+
+fn tally(reader: impl BufRead) -> Result<Tally> {
     let mut tally = Tally::default();
     for line in reader.lines() {
         tally.add(&line?)?;
@@ -514,10 +809,80 @@ fn tally(reader: impl std::io::BufRead) -> Result<Tally> {
     Ok(tally)
 }
 
+/// `pack-objects --stdout --thin --revs --delta-base-offset` over `request`,
+/// its stdout counted in a reused buffer and discarded (R-N74). Nothing is
+/// built when `missing` holds no object: there is then no pack to send.
+fn thin_pack(source: &Path, request: &str, missing: Tally) -> Result<ThinPack> {
+    if missing.objects() == 0 {
+        return Ok(ThinPack::default());
+    }
+    let mut pack = hardened(source)
+        .args([
+            "pack-objects",
+            "--stdout",
+            "--thin",
+            "--revs",
+            "--delta-base-offset",
+            "--missing=allow-any",
+            "-q",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pipes = (pack.stdin.take(), pack.stdout.take());
+    let counted = std::thread::scope(|scope| {
+        let (Some(mut stdin), Some(stdout)) = pipes else {
+            return Err(BulkloadRefusal::Io(None));
+        };
+        let writer = scope.spawn(move || stdin.write_all(request.as_bytes()));
+        let counted = count_pack(stdout);
+        writer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        counted
+    });
+    let status = pack.wait()?;
+    let counted = counted?;
+    if !status.success() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(counted)
+}
+
+/// Count a pack stream's bytes and read the object count from its header.
+fn count_pack(mut stream: impl Read) -> Result<ThinPack> {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut header = Vec::with_capacity(12);
+    let mut bytes = 0_u64;
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let chunk = buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?;
+        if header.len() < 12 {
+            let wanted = (12 - header.len()).min(chunk.len());
+            header.extend_from_slice(chunk.get(..wanted).ok_or(BulkloadRefusal::Io(None))?);
+        }
+        bytes += u64::try_from(read).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    }
+    let (Some(b"PACK"), Some(count)) = (header.get(..4), header.get(8..12)) else {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    };
+    let count: [u8; 4] = count
+        .try_into()
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(ThinPack {
+        bytes,
+        objects: u64::from(u32::from_be_bytes(count)),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
-    use super::super::text;
+    use super::super::{output, text};
     use super::*;
 
     struct Fixture {
@@ -564,6 +929,62 @@ mod tests {
             configure(&repo);
             repo
         }
+
+        /// A `--filter=blob:none` clone; `origin` must allow filters.
+        fn partial_clone(&self, origin: &Path, name: &str, checkout: bool) -> PathBuf {
+            let repo = self.root.join(name);
+            let url = format!("file://{}", origin.display());
+            let mut command = git(&self.root);
+            command.args(["clone", "--quiet", "--template=", "--filter=blob:none"]);
+            if !checkout {
+                command.arg("--no-checkout");
+            }
+            output(command.args([url.as_str(), repo.to_str().unwrap()])).unwrap();
+            configure(&repo);
+            repo
+        }
+
+        fn plain_clone(&self, origin: &Path, name: &str) -> PathBuf {
+            let repo = self.root.join(name);
+            let url = format!("file://{}", origin.display());
+            output(git(&self.root).args([
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--template=",
+                url.as_str(),
+                repo.to_str().unwrap(),
+            ]))
+            .unwrap();
+            configure(&repo);
+            repo
+        }
+    }
+
+    fn allow_filter(origin: &Path) {
+        output(git(origin).args(["config", "uploadpack.allowFilter", "true"])).unwrap();
+        output(git(origin).args(["config", "uploadpack.allowAnySHA1InWant", "true"])).unwrap();
+    }
+
+    fn pack_count(repo: &Path) -> usize {
+        let pack = text(git(repo).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects/pack",
+        ]))
+        .unwrap();
+        std::fs::read_dir(pack)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .count()
     }
 
     impl Drop for Fixture {
@@ -740,21 +1161,230 @@ mod tests {
         assert_eq!(result.missing.objects(), 3);
     }
 
+    /// R-N75 (F2): a shallow destination whose frontier differs from the
+    /// source's cannot prove it holds its tips' history, so the verb refuses.
     #[test]
-    fn shallow_destination_is_reported() {
+    fn shallow_destination_with_a_different_frontier_is_refused() {
         let fixture = Fixture::new("shallow-destination");
         let source = fixture.repo("source");
         commit(&source, "one.txt", "1");
-        let second = commit(&source, "two.txt", "2");
+        commit(&source, "two.txt", "2");
         let destination = fixture.shallow_clone(&source, "destination", 1);
+        let refused = estimate(&source, &Destination::Local(destination)).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+    }
+
+    /// R-N75: matching shallow frontiers still estimate.
+    #[test]
+    fn shallow_destination_with_the_source_frontier_is_estimated() {
+        let fixture = Fixture::new("shallow-match");
+        let origin = fixture.repo("origin");
+        commit(&origin, "one.txt", "1");
+        commit(&origin, "two.txt", "2");
+        let third = commit(&origin, "three.txt", "3");
+        let source = fixture.shallow_clone(&origin, "source", 1);
+        output(git(&source).args(["checkout", "--quiet", "-b", "local"])).unwrap();
+        commit(&source, "four.txt", "4");
+        let destination = fixture.shallow_clone(&origin, "destination", 1);
         let result = estimate(&source, &Destination::Local(destination)).unwrap();
+        assert_eq!(result.source_shallow_count, 1);
         assert_eq!(result.destination_shallow_count, 1);
-        assert_eq!(result.source_shallow_count, 0);
-        assert!(result.haves_used >= 1);
+        assert_eq!(result.haves_used, 1);
         assert_eq!(
             result.missing.objects(),
-            hand_count(&source, &["--all", "--not", &second])
+            hand_count(&source, &["--all", "--not", &third])
         );
+        assert_eq!(result.missing.objects(), 3);
+    }
+
+    /// R-N75 (F3): a partial-clone destination lacks objects its refs name.
+    #[test]
+    fn partial_clone_destination_is_refused() {
+        let fixture = Fixture::new("partial-destination");
+        let origin = fixture.repo("origin");
+        allow_filter(&origin);
+        commit(&origin, "one.txt", "1");
+        commit(&origin, "two.txt", "2");
+        let source = fixture.plain_clone(&origin, "source");
+        let destination = fixture.partial_clone(&origin, "destination", false);
+        let refused = estimate(&source, &Destination::Local(destination)).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+        // `remote.*.promisor=true` alone also marks a partial clone.
+        let promisor = fixture.plain_clone(&origin, "promisor");
+        output(git(&promisor).args(["config", "remote.origin.promisor", "true"])).unwrap();
+        let refused = estimate(&source, &Destination::Local(promisor)).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+    }
+
+    /// F1: a partial-clone source must not lazily fetch. A destination tip
+    /// only upstream holds stays unknown, and the source gains no pack.
+    #[test]
+    fn partial_clone_source_never_fetches_and_upstream_tip_is_not_a_have() {
+        let fixture = Fixture::new("partial-source");
+        let origin = fixture.repo("origin");
+        allow_filter(&origin);
+        commit(&origin, "one.txt", "1");
+        let source = fixture.partial_clone(&origin, "source", true);
+        let upstream_only = commit(&origin, "two.txt", "upstream only");
+        let destination = fixture.plain_clone(&origin, "destination");
+        let packs = pack_count(&source);
+        let before = snapshot(&source);
+        let result = estimate(&source, &Destination::Local(destination)).unwrap();
+        assert_eq!(pack_count(&source), packs, "the source fetched a pack");
+        assert_eq!(snapshot(&source), before);
+        assert_eq!(result.destination_tip_count, 1);
+        assert_eq!(result.haves_used, 0);
+        let lookup = text(git(&source).env("GIT_NO_LAZY_FETCH", "1").args([
+            "cat-file",
+            "-t",
+            &upstream_only,
+        ]));
+        assert!(lookup.is_err());
+    }
+
+    /// F8: objects the partial source lacks are counted, not dropped.
+    #[test]
+    fn partial_clone_source_counts_unavailable_objects() {
+        let fixture = Fixture::new("partial-unavailable");
+        let origin = fixture.repo("origin");
+        allow_filter(&origin);
+        commit(&origin, "a.txt", "1");
+        commit(&origin, "a.txt", "2");
+        commit(&origin, "a.txt", "3");
+        let source = fixture.partial_clone(&origin, "source", false);
+        let destination = fixture.repo("destination");
+        let packs = pack_count(&source);
+        let result = estimate(&source, &Destination::Local(destination)).unwrap();
+        assert_eq!(pack_count(&source), packs);
+        // Three blob versions of a.txt, none fetched.
+        assert_eq!(result.source.unavailable, 3);
+        assert_eq!(result.missing.unavailable, 3);
+        assert_eq!(result.source.blob.count, 0);
+        assert_eq!(result.source.commit.count, 3);
+        assert!(result.source_partial);
+        // Three commits and three trees are sendable; the blobs are not.
+        assert_eq!(result.thin_pack.objects, 6);
+        assert_eq!(result.thin_pack.objects, result.missing.objects());
+    }
+
+    /// F4: SOURCE and DEST must each be a repository root, not a path Git
+    /// would resolve to an enclosing repository.
+    #[test]
+    fn paths_that_are_not_a_repository_root_are_refused() {
+        let fixture = Fixture::new("not-a-repo");
+        let source = fixture.repo("source");
+        commit(&source, "dir/a.txt", "a");
+        let destination = fixture.repo("destination");
+        std::fs::create_dir(destination.join("sub")).unwrap();
+        let plain = fixture.root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let not_at_path = |source: &Path, destination: PathBuf| {
+            estimate(source, &Destination::Local(destination))
+                .unwrap_err()
+                .refusal
+        };
+        for (source, destination) in [
+            (source.join("dir"), destination.clone()),
+            (source.clone(), destination.join("sub")),
+            (source.clone(), destination.join(".git")),
+            (source.clone(), plain.clone()),
+            (plain, destination.clone()),
+            (source.clone(), fixture.root.join("absent")),
+        ] {
+            assert_eq!(
+                not_at_path(&source, destination),
+                BulkloadRefusal::GitRepositoryNotAtPath
+            );
+        }
+        assert!(estimate(&source, &Destination::Local(destination)).is_ok());
+    }
+
+    /// F5: the remote probe must find the shallow file of a linked worktree
+    /// and of a bare repository whose name does not end in `.git`.
+    #[test]
+    fn remote_probe_reads_shallow_of_linked_worktree_and_bare_repository() {
+        let fixture = Fixture::new("remote-shallow");
+        let origin = fixture.repo("origin");
+        commit(&origin, "one.txt", "1");
+        let tip = commit(&origin, "two.txt", "2");
+        let shallow = fixture.shallow_clone(&origin, "shallow", 1);
+        let linked = fixture.root.join("linked");
+        output(
+            git(&shallow)
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&linked)
+                .arg(&tip),
+        )
+        .unwrap();
+        let bare = fixture.root.join("bare-shallow");
+        let url = format!("file://{}", origin.display());
+        output(git(&fixture.root).args([
+            "clone",
+            "--quiet",
+            "--bare",
+            "--depth=1",
+            url.as_str(),
+            bare.to_str().unwrap(),
+        ]))
+        .unwrap();
+        // The exact script the remote side runs, run here through `bash -s`.
+        for path in [&linked, &bare] {
+            let probe = run_probe(&mut local_probe(path)).unwrap();
+            assert_eq!(
+                probe.shallow,
+                BTreeSet::from([tip.clone()]),
+                "{}",
+                path.display()
+            );
+            assert!(probe.tips.contains(&tip), "{}", path.display());
+            assert!(!probe.partial);
+        }
+        // A shallow destination at the source's frontier estimates.
+        let result = estimate(&shallow, &Destination::Local(bare)).unwrap();
+        assert_eq!(result.destination_shallow_count, 1);
+        assert_eq!(result.missing.objects(), 0);
+    }
+
+    /// F6: per-worktree refs of every worktree are walked, and the result does
+    /// not depend on which worktree path names the source.
+    #[test]
+    fn every_worktree_ref_is_walked_whichever_worktree_is_named() {
+        let fixture = Fixture::new("worktrees");
+        let source = fixture.repo("source");
+        let base = commit(&source, "a.txt", "a");
+        output(git(&source).args(["checkout", "--quiet", "-b", "scratch"])).unwrap();
+        let main_keep = commit(&source, "main-keep.txt", "main keep");
+        output(git(&source).args(["update-ref", "refs/worktree/main-keep", &main_keep])).unwrap();
+        output(git(&source).args(["checkout", "--quiet", "main"])).unwrap();
+        output(git(&source).args(["branch", "--quiet", "-D", "scratch"])).unwrap();
+        let linked = fixture.root.join("linked");
+        output(
+            git(&source)
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&linked)
+                .arg(&base),
+        )
+        .unwrap();
+        let bisect = commit(&linked, "bisect.txt", "bisect");
+        output(git(&linked).args(["update-ref", "refs/bisect/bad", &bisect])).unwrap();
+        output(git(&linked).args(["checkout", "--quiet", "--detach", &base])).unwrap();
+        let keep = commit(&linked, "keep.txt", "keep");
+        output(git(&linked).args(["update-ref", "refs/worktree/keep", &keep])).unwrap();
+        output(git(&linked).args(["checkout", "--quiet", "--detach", &base])).unwrap();
+        let head = commit(&linked, "head.txt", "detached head");
+        let destination = fixture.repo("destination");
+        mirror(&source, &destination, &[(&base, "refs/heads/main")]);
+        let expected = hand_count(
+            &source,
+            &[&main_keep, &bisect, &keep, &head, "--not", &base],
+        );
+        // Four commits, each with a root tree and one new blob.
+        assert_eq!(expected, 12);
+        let from_main = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        let from_linked = estimate(&linked, &Destination::Local(destination)).unwrap();
+        assert_eq!(from_main.missing.objects(), expected);
+        assert_eq!(from_linked.missing.objects(), expected);
+        assert_eq!(from_main, from_linked);
     }
 
     #[test]
@@ -789,8 +1419,10 @@ mod tests {
                 "{refused}"
             );
         }
-        assert_eq!(remote_shallow_path("/srv/r"), "/srv/r/.git/shallow");
-        assert_eq!(remote_shallow_path("/srv/r.git/"), "/srv/r.git/shallow");
+        assert_eq!(
+            remote_command("/srv/fast-local/jess/git/glorious.build"),
+            "env GIT_NO_LAZY_FETCH=1 bash -s -- '/srv/fast-local/jess/git/glorious.build'"
+        );
     }
 
     #[test]
@@ -800,9 +1432,14 @@ mod tests {
             destination_shallow_count: 0,
             haves_used: 2,
             source_shallow_count: 0,
+            source_partial: false,
             stash_entries: 0,
             source: Tally::default(),
             missing: Tally::default(),
+            thin_pack: ThinPack {
+                bytes: 7,
+                objects: 2,
+            },
         };
         result.missing.blob = TypeTally {
             count: 2,
@@ -813,5 +1450,234 @@ mod tests {
         assert!(lines.contains(&"missing_objects=2".to_owned()));
         assert!(lines.contains(&"missing_bytes_disk=10".to_owned()));
         assert!(lines.contains(&"destination_tips_unknown_to_source=1".to_owned()));
+        assert!(lines.contains(&"missing_thin_pack_bytes=7".to_owned()));
+        assert!(lines.contains(&"gate_metric=missing_thin_pack_bytes".to_owned()));
+    }
+
+    /// F9: the unknown-tip count saturates instead of underflowing.
+    #[test]
+    fn unknown_tip_count_saturates() {
+        let result = CarryEstimate {
+            destination_tip_count: 1,
+            destination_shallow_count: 0,
+            haves_used: 2,
+            source_shallow_count: 0,
+            source_partial: false,
+            stash_entries: 0,
+            source: Tally::default(),
+            missing: Tally::default(),
+            thin_pack: ThinPack::default(),
+        };
+        assert!(result
+            .lines()
+            .contains(&"destination_tips_unknown_to_source=0".to_owned()));
+    }
+
+    /// Deterministic, poorly compressible text of `lines` lines.
+    fn noise(seed: u64, lines: usize) -> String {
+        use std::fmt::Write as _;
+        let mut state = seed;
+        let mut text = String::new();
+        for _ in 0..lines {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            writeln!(text, "{state:016x}").unwrap();
+        }
+        text
+    }
+
+    /// A bare destination holding exactly `revision` of `source`, fetched.
+    fn fetched_destination(fixture: &Fixture, source: &Path, revision: &str) -> PathBuf {
+        let destination = fixture.root.join("destination.git");
+        output(
+            git(&fixture.root)
+                .args(["init", "--quiet", "--bare", "--template="])
+                .arg(&destination),
+        )
+        .unwrap();
+        let url = format!("file://{}", source.display());
+        output(git(&destination).args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            url.as_str(),
+            &format!("{revision}:refs/heads/main"),
+        ]))
+        .unwrap();
+        destination
+    }
+
+    /// The pack a real `git fetch` receives (`GIT_TRACE_PACKFILE`): the
+    /// transfer the W6 M1 gate measures. Returns its bytes and header count.
+    fn fetched_pack(fixture: &Fixture, destination: &Path, source: &Path) -> ThinPack {
+        let trace = fixture.root.join("received.pack");
+        let url = format!("file://{}", source.display());
+        output(git(destination).env("GIT_TRACE_PACKFILE", &trace).args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            url.as_str(),
+            "+refs/heads/*:refs/remotes/source/*",
+        ]))
+        .unwrap();
+        count_pack(std::fs::File::open(&trace).unwrap()).unwrap()
+    }
+
+    fn assert_tight(estimated: ThinPack, sent: ThinPack) {
+        assert_eq!(estimated.objects, sent.objects);
+        // Same objects, same deltas: allow 1 % plus a few header bytes for
+        // delta-search variation between our pack-objects and upload-pack's.
+        assert!(
+            estimated.bytes.abs_diff(sent.bytes) <= sent.bytes / 100 + 16,
+            "estimated {} vs sent {}",
+            estimated.bytes,
+            sent.bytes
+        );
+    }
+
+    /// R-N74 (F7): a blob stored whole in the source but sendable as a delta
+    /// against a have. `missing_bytes_disk` is far above what is sent;
+    /// `missing_thin_pack_bytes` matches a real fetch.
+    #[test]
+    fn thin_pack_bytes_match_a_real_fetch_for_a_deltified_blob() {
+        let fixture = Fixture::new("thin-delta");
+        let source = fixture.repo("source");
+        let base = commit(&source, "big.txt", &noise(1, 8000));
+        // Growing the file makes the new version the whole (larger) delta base
+        // after a repack, so the source stores it undeltified.
+        let mut grown = noise(1, 8000);
+        grown.push_str(&noise(2, 40));
+        commit(&source, "big.txt", &grown);
+        output(git(&source).args(["repack", "--quiet", "-a", "-d", "-f"])).unwrap();
+        let destination = fetched_destination(&fixture, &source, &base);
+        let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        assert_eq!(result.haves_used, 1);
+        assert_eq!(result.missing.objects(), 3);
+        assert_eq!(result.thin_pack.objects, 3);
+        assert!(
+            result.thin_pack.bytes * 10 < result.missing.bytes_disk(),
+            "thin {} vs disk {}",
+            result.thin_pack.bytes,
+            result.missing.bytes_disk()
+        );
+        assert_tight(
+            result.thin_pack,
+            fetched_pack(&fixture, &destination, &source),
+        );
+    }
+
+    /// R-N74 (F7): loose missing objects, packed thin in flight.
+    #[test]
+    fn thin_pack_bytes_match_a_real_fetch_for_loose_objects() {
+        let fixture = Fixture::new("thin-loose");
+        let source = fixture.repo("source");
+        let base = commit(&source, "big.txt", &noise(3, 4000));
+        output(git(&source).args(["repack", "--quiet", "-a", "-d"])).unwrap();
+        let mut edited = noise(3, 4000);
+        edited.push_str("one more line\n");
+        commit(&source, "big.txt", &edited);
+        commit(&source, "small.txt", "small");
+        let destination = fetched_destination(&fixture, &source, &base);
+        let loose = text(git(&source).args(["count-objects"])).unwrap();
+        assert!(!loose.starts_with("0 objects"), "{loose}");
+        let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        // Two commits, two root trees, the edited blob and small.txt.
+        assert_eq!(result.missing.objects(), 6);
+        assert_eq!(result.thin_pack.objects, 6);
+        assert_tight(
+            result.thin_pack,
+            fetched_pack(&fixture, &destination, &source),
+        );
+    }
+
+    /// F11: ssh gets a connect timeout, and a failed probe carries a bounded,
+    /// credential-free excerpt of the child's stderr.
+    #[test]
+    fn remote_failures_carry_bounded_redacted_stderr() {
+        let ssh = ssh_command("sting", "true");
+        let args: Vec<_> = ssh.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "-T",
+                "-oBatchMode=yes",
+                "-oConnectTimeout=15",
+                "sting",
+                "true"
+            ]
+        );
+        let mut failing = Command::new("sh");
+        failing.args([
+            "-c",
+            "cat >/dev/null; printf 'ssh: connect to host sting port 22: Connection timed out\\nfetch https://jess:hunter2@example.org/r ghp_abc token=xyz\\n' >&2; head -c 4000 /dev/zero | tr '\\0' x >&2; exit 255",
+        ]);
+        let refused = run_probe(&mut failing).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitUnavailable);
+        let detail = refused.detail.unwrap();
+        assert!(
+            detail.starts_with("ssh: connect to host sting port 22: Connection timed out"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("https://[redacted]@example.org/r"),
+            "{detail}"
+        );
+        for secret in ["hunter2", "ghp_abc", "xyz", "jess:"] {
+            assert!(!detail.contains(secret), "{detail}");
+        }
+        assert!(detail.chars().count() <= DETAIL_LIMIT + 3);
+        assert!(!detail.contains('\n'));
+        let mut malformed = Command::new("sh");
+        malformed.args(["-c", "cat >/dev/null; echo 'fatal: bad object' >&2; exit 1"]);
+        let refused = run_probe(&mut malformed).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
+        assert_eq!(refused.detail.as_deref(), Some("fatal: bad object"));
+        assert_eq!(
+            refused.to_string(),
+            "GIT_INVENTORY_MALFORMED: fatal: bad object"
+        );
+    }
+
+    /// F1: every Git call the probe makes carries the no-write, no-network
+    /// hardening, locally and in the remote command.
+    #[test]
+    fn probe_and_source_git_calls_are_hardened() {
+        let g = PROBE_SCRIPT
+            .lines()
+            .find(|line| line.starts_with("g() {"))
+            .unwrap();
+        for flag in [
+            "--no-optional-locks",
+            "-c maintenance.auto=false",
+            "-c gc.auto=0",
+            "-c core.hooksPath=/dev/null",
+        ] {
+            assert!(g.contains(flag), "{flag}");
+        }
+        assert!(PROBE_SCRIPT.contains("export GIT_NO_LAZY_FETCH=1"));
+        // Every git call but `git version` goes through `g`.
+        for line in PROBE_SCRIPT.lines().filter(|line| line.contains("git ")) {
+            assert!(
+                line.starts_with("g() {")
+                    || line == "version=$(git version) || exit 5"
+                    || line == "version=${version#git version }",
+                "{line}"
+            );
+        }
+        assert!(remote_command("/srv/r").starts_with("env GIT_NO_LAZY_FETCH=1 "));
+        let source = hardened(Path::new("/nonexistent"));
+        let args: Vec<_> = source.get_args().filter_map(|arg| arg.to_str()).collect();
+        for flag in [
+            "--no-optional-locks",
+            "maintenance.auto=false",
+            "gc.auto=0",
+            "core.hooksPath=/dev/null",
+        ] {
+            assert!(args.contains(&flag), "{flag}");
+        }
+        assert!(source
+            .get_envs()
+            .any(|(key, value)| key == "GIT_NO_LAZY_FETCH" && value == Some(OsStr::new("1"))));
     }
 }

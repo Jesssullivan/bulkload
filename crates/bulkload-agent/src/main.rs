@@ -36,7 +36,10 @@ SUBCOMMANDS:
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate SOURCE_REPO DEST [SOURCE_REPO DEST ...]
                 Read-only: report what git carry v2 would move from SOURCE_REPO
-                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes)
+                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes);
+                missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
+                partial or differently-shallow DEST (R-N75); a refused pair
+                prints refused=CODE and the verb exits nonzero
     estate-add PLAN SOURCE_REPO DEST_REPO [ABSENT_WORKSPACE]
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
@@ -281,28 +284,49 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 }
 
 // Read-only on both sides: no fetch, no object or ref write (R-N60 baseline).
+//
+// Each pair prints one whole block, built before any of it is written. A
+// refused pair prints `refused=CODE` (and `refused_detail=` when a child
+// process explained it) in place of its measurements; later pairs still run,
+// and the verb exits nonzero with the first refusal (F13).
 fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::git_carry::estimate::{estimate, Destination, Refused};
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     }
     let mut stdout = std::io::stdout().lock();
+    let mut first = None;
     for (index, pair) in args.chunks_exact(2).enumerate() {
         let [source, destination] = pair else {
             return Err(BulkloadRefusal::RequiredFieldMissing);
         };
         let source = Path::new(source);
-        let destination = bulkload_agent::git_carry::estimate::Destination::parse(destination)?;
-        let estimate = bulkload_agent::git_carry::estimate::estimate(source, &destination)?;
+        let mut block = vec![
+            format!("source={}", source.display()),
+            format!("destination={}", Path::new(destination).display()),
+        ];
+        let outcome = Destination::parse(destination)
+            .map_err(Refused::from)
+            .and_then(|destination| estimate(source, &destination));
+        match outcome {
+            Ok(estimate) => block.extend(estimate.lines()),
+            Err(refused) => {
+                block.push(format!("refused={}", refused.refusal.code()));
+                if let Some(detail) = &refused.detail {
+                    block.push(format!("refused_detail={detail}"));
+                }
+                first.get_or_insert(refused.refusal);
+            }
+        }
         if index > 0 {
             writeln!(stdout)?;
         }
-        writeln!(stdout, "source={}", source.display())?;
-        writeln!(stdout, "destination={}", destination.display())?;
-        for line in estimate.lines() {
+        for line in block {
             writeln!(stdout, "{line}")?;
         }
+        stdout.flush()?;
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
