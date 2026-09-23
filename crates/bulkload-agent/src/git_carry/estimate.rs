@@ -34,12 +34,26 @@
 //! pack is exactly the walked set; the M1 sender must pin both too, or it can
 //! send a different set.
 //!
-//! **Gate (R-N97):** sent bytes ≤ 1.1 × `missing_thin_pack_bytes`, and sent
-//! objects ≤ `missing_objects`. The estimate is an upper bound: it models only
-//! the first negotiation round, with the destination's tips as haves. Ancestor
-//! probing of tips the source lacks (`GitHaveQuery`) can only add haves, and so
-//! only shrink the pack. Exactness of M1's sent set is checked against a real
-//! `git fetch` with the same haves, not against this estimate.
+//! **Gate (R-N97, R-N113):** sent bytes ≤ 1.1 × `missing_thin_pack_bytes`, and
+//! sent objects ≤ `missing_objects`. M1's first round sends *exactly* the
+//! destination's held tips (every destination tip the source holds) as haves,
+//! and the exactness oracle is upload-pack run over exactly that have set, not
+//! `git fetch`'s newest-first negotiation. The estimate equals that oracle up
+//! to the order the haves arrive in: dropping a have implied by a child have
+//! gives upload-pack's largest pack. Haves beyond the held tips are not free:
+//! for a shallow destination an extra intermediate have makes upload-pack drop
+//! the have it implies, and the shallow walk marks only the trees of the haves
+//! it keeps, so an extra have can *enlarge* the pack (reviewer fixture A3:
+//! 232 B with the held tips, 3,919 B once the parent is offered too). Ancestor
+//! probing (`GitHaveQuery`) must therefore not add haves to a shallow
+//! destination's first round.
+//!
+//! The pack also depends on `pack.threads` and `pack.windowMemory`, which
+//! [`git`] pins to 2 and 64m for every call; the M1 sender must pin them the
+//! same way, as well as `pack.useSparse=false` and `pack.useBitmaps=false`.
+//! A bitmapped sender that did not pin bitmaps would pack *fewer* objects than
+//! the walk (W6 M1 spike, bulkload#64), so the estimate stays an upper bound
+//! for it.
 //!
 //! Nothing is fetched, written or updated on either side. Every Git call runs
 //! with `GIT_NO_LAZY_FETCH=1`, `--no-optional-locks`, `maintenance.auto=false`,
@@ -190,24 +204,25 @@ const REDACTED: &str = "[redacted]";
 
 /// One line of at most [`DETAIL_LIMIT`] characters from a child's stderr.
 ///
-/// Control characters are dropped *before* redaction (line breaks and tabs
-/// become spaces), so an escape sequence cannot split a token past the
+/// Before redaction, ASCII blanks become spaces and every other control,
+/// Unicode whitespace, format (`Cf`) or invisible character is dropped, so no
+/// escape, bidi override or zero-width character can split a secret past the
 /// redactor.
 fn detail(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let cleaned: String = text
         .chars()
         .filter_map(|c| {
-            if c.is_whitespace() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}') {
                 Some(' ')
-            } else if c.is_control() {
+            } else if c.is_control() || c.is_whitespace() || invisible(c) {
                 None
             } else {
                 Some(c)
             }
         })
         .collect();
-    let line = redact_words(cleaned.split_whitespace()).join(" ");
+    let line = redact_words(cleaned.split(' ').filter(|word| !word.is_empty())).join(" ");
     if line.is_empty() {
         return None;
     }
@@ -218,29 +233,85 @@ fn detail(stderr: &[u8]) -> Option<String> {
     Some(bounded)
 }
 
+/// Unicode format (`Cf`) and other invisible characters: soft hyphen, Arabic
+/// and Syriac format marks, Mongolian vowel separator, zero-width and bidi
+/// marks, word joiners and invisible operators, the byte-order mark,
+/// interlinear annotation marks, and the shorthand, musical and tag format
+/// blocks.
+const fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// Words whose value, inline or in the next word, is an authorization scheme
+/// followed by the credential itself.
+fn scheme_word(value: &str) -> bool {
+    matches!(
+        value.trim_matches(['"', '\'', ',', ';']),
+        "bearer" | "basic" | "digest" | "token" | "negotiate"
+    )
+}
+
 /// Redact credential-shaped words, and the value after a key such as
 /// `password:`, `token =` or `Authorization: Bearer`.
 fn redact_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut redacted = Vec::new();
     let mut pending = 0_u8;
+    let mut rest_of_line = false;
     for word in words {
         let lower = word.to_ascii_lowercase();
+        if rest_of_line {
+            redacted.push(REDACTED.to_owned());
+            continue;
+        }
         if pending > 0 {
             pending -= 1;
             redacted.push(REDACTED.to_owned());
             // `key = value`, `key : value` and `Authorization: Bearer value`
             // carry the value one word further on.
-            if matches!(
-                lower.trim_end_matches([':', '=']),
-                "" | "bearer" | "basic" | "digest" | "token"
-            ) {
+            if lower.trim_matches([':', '=']).is_empty() || scheme_word(&lower) {
                 pending = 1;
             }
             continue;
         }
-        if let Some(inline) = sensitive_key(&lower) {
+        if lower.contains("-----begin") {
+            // A PEM block: everything after its header is key material.
             redacted.push(REDACTED.to_owned());
-            if !inline {
+            rest_of_line = true;
+            continue;
+        }
+        if let Some(value) = sensitive_key(&lower) {
+            redacted.push(REDACTED.to_owned());
+            // `Authorization: Bearer x` and `authorization=Basic x`.
+            if match value {
+                KeyValue::Next => true,
+                KeyValue::Inline(inline) => scheme_word(&inline),
+            } {
                 pending = 1;
             }
             continue;
@@ -250,13 +321,22 @@ fn redact_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     redacted
 }
 
-/// `Some(inline)` when `lower` names a secret; `inline` when the value is in
-/// the same word (`password=x`, `token:x`).
-fn sensitive_key(lower: &str) -> Option<bool> {
-    const KEYS: [&str; 13] = [
+/// Where a secret key's value is.
+enum KeyValue {
+    /// In the next word (`password: x`, `token x`).
+    Next,
+    /// In the same word (`password=x`, `"token":"x"`).
+    Inline(String),
+}
+
+/// The value's place when `lower` names a secret at a word boundary.
+fn sensitive_key(lower: &str) -> Option<KeyValue> {
+    const KEYS: [&str; 19] = [
         "password",
         "passwd",
         "passphrase",
+        "pass",
+        "pwd",
         "token",
         "secret",
         "authorization",
@@ -267,12 +347,28 @@ fn sensitive_key(lower: &str) -> Option<bool> {
         "credential",
         "private_key",
         "access_key",
+        "cookie",
+        "sig",
+        "signature",
+        "x-amz-signature",
     ];
     KEYS.iter().find_map(|key| {
-        let at = lower.find(key)?;
+        let (at, _) = lower.match_indices(key).find(|(at, _)| {
+            let before = lower.get(..*at).and_then(|head| head.chars().next_back());
+            let after = lower
+                .get(at + key.len()..)
+                .and_then(|tail| tail.chars().next());
+            !before.is_some_and(|c| c.is_ascii_alphanumeric())
+                && !after.is_some_and(|c| c.is_ascii_alphabetic())
+        })?;
         let rest = lower.get(at + key.len()..).unwrap_or("");
-        let value = rest.trim_start_matches([':', '=']);
-        Some(rest.len() != value.len() && !value.trim_matches(['"', '\'']).is_empty())
+        let rest = rest.trim_start_matches(['"', '\'']);
+        let separated = rest.trim_start_matches([':', '=']);
+        let value = separated.trim_matches(['"', '\'', ',', ';', '}', '{']);
+        if separated.len() == rest.len() || value.is_empty() {
+            return Some(KeyValue::Next);
+        }
+        Some(KeyValue::Inline(value.to_owned()))
     })
 }
 
@@ -292,10 +388,13 @@ fn redact(word: &str) -> String {
         return REDACTED.to_owned();
     }
     if let Some((scheme, rest)) = word.split_once("://") {
-        let authority = rest.split('/').next().unwrap_or(rest);
-        if let Some((_, host)) = authority.rsplit_once('@') {
-            let tail = rest.get(authority.len()..).unwrap_or("");
-            return format!("{scheme}://{REDACTED}@{host}{tail}");
+        // Userinfo runs to the last `@`. It is a credential when it holds a
+        // `:` (a password, which may itself contain `/`) or no `/` at all
+        // (a bare token); `https://host/@scope` is a path, not userinfo.
+        if let Some((userinfo, host)) = rest.rsplit_once('@') {
+            if userinfo.contains(':') || !userinfo.contains('/') {
+                return format!("{scheme}://{REDACTED}@{host}");
+            }
         }
         return word.to_owned();
     }
@@ -398,8 +497,9 @@ pub struct CarryEstimate {
     pub destination_shallow_count: usize,
     /// Destination tips that exist as objects in the source.
     pub haves_used: usize,
-    /// Of those, haves left out of the request because another have is their
-    /// child commit (upload-pack drops them the same way).
+    /// Held tips left out of the request because another held tip is their
+    /// child commit: upload-pack drops them the same way when the child
+    /// arrives first, so dropping them always gives its largest pack (R-N113).
     pub haves_implied: usize,
     /// Lines in the source's shallow file.
     pub source_shallow_count: usize,
@@ -458,7 +558,8 @@ impl CarryEstimate {
         }
         lines.push("gate_metric=missing_thin_pack_bytes".to_owned());
         lines.push(
-            "gate_rule=R-N97 sent_bytes<=1.1*missing_thin_pack_bytes sent_objects<=missing_objects"
+            "gate_rule=R-N97,R-N113 sent_bytes<=1.1*missing_thin_pack_bytes \
+             sent_objects<=missing_objects oracle=upload-pack(haves=exactly_every_held_tip)"
                 .to_owned(),
         );
         lines.push(
@@ -2351,5 +2452,326 @@ mod tests {
         assert!(kept.contains("git@github.com:org/repo.git"), "{kept}");
         let split = detail(b"x gh\x1bp_abcdef0123456789 y").unwrap();
         assert!(!split.contains("abcdef0123456789"), "{split}");
+    }
+
+    // ---- PR #55 review r3 (R-N113) -----------------------------------------
+
+    fn pkt_line(out: &mut Vec<u8>, line: &str) {
+        out.extend_from_slice(format!("{:04x}", line.len() + 4).as_bytes());
+        out.extend_from_slice(line.as_bytes());
+    }
+
+    /// R-N113's exactness oracle, the reviewer's `oracle_upload_pack.py` in
+    /// Rust: `upload-pack` itself (protocol v2, stateless), given exactly
+    /// `haves` in this order, with the verb's pack pins. Returns the pack it
+    /// streams on sideband 1.
+    fn upload_pack_oracle(
+        source: &Path,
+        wants: &BTreeSet<String>,
+        haves: &[String],
+        shallow: &BTreeSet<String>,
+    ) -> ThinPack {
+        let mut request = Vec::new();
+        pkt_line(&mut request, "command=fetch\n");
+        request.extend_from_slice(b"0001");
+        for line in ["thin-pack\n", "ofs-delta\n", "no-progress\n"] {
+            pkt_line(&mut request, line);
+        }
+        for value in shallow {
+            pkt_line(&mut request, &format!("shallow {value}\n"));
+        }
+        for value in wants {
+            pkt_line(&mut request, &format!("want {value}\n"));
+        }
+        for value in haves {
+            pkt_line(&mut request, &format!("have {value}\n"));
+        }
+        pkt_line(&mut request, "done\n");
+        request.extend_from_slice(b"0000");
+        let mut child = git(source)
+            .args([
+                "-c",
+                "pack.useSparse=false",
+                "-c",
+                "pack.useBitmaps=false",
+                "upload-pack",
+                "--stateless-rpc",
+                ".",
+            ])
+            .env("GIT_PROTOCOL", "version=2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&request).unwrap();
+        let answer = child.wait_with_output().unwrap();
+        assert!(answer.status.success());
+        let mut rest = &answer.stdout[..];
+        let mut in_pack = false;
+        let mut pack = Vec::new();
+        while rest.len() >= 4 {
+            let length =
+                usize::from_str_radix(std::str::from_utf8(&rest[..4]).unwrap(), 16).unwrap();
+            if length < 4 {
+                rest = &rest[4..];
+                if length == 0 && in_pack {
+                    break;
+                }
+                continue;
+            }
+            let payload = &rest[4..length];
+            rest = &rest[length..];
+            if in_pack {
+                assert_ne!(payload[0], 3, "upload-pack error");
+                if payload[0] == 1 {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+            } else if payload == b"packfile\n" {
+                in_pack = true;
+            }
+        }
+        if pack.is_empty() {
+            ThinPack::default()
+        } else {
+            count_pack(&pack[..]).unwrap()
+        }
+    }
+
+    fn tips_of(repo: &Path) -> BTreeSet<String> {
+        let mut tips: BTreeSet<String> =
+            text(git(repo).args(["for-each-ref", "--format=%(objectname)"]))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+        if let Ok(head) = text(git(repo).args(["rev-parse", "--verify", "-q", "HEAD"])) {
+            tips.insert(head);
+        }
+        tips
+    }
+
+    /// R-N113's request for `destination` against `source`: the wants (source
+    /// tips not held) and, as haves, exactly every destination tip the source
+    /// holds.
+    fn r_n113_request(source: &Path, destination: &Path) -> (BTreeSet<String>, Vec<String>) {
+        let held: BTreeSet<String> = tips_of(destination)
+            .into_iter()
+            .filter(|tip| output(git(source).args(["cat-file", "-e", tip])).is_ok())
+            .collect();
+        let wants = tips_of(source).difference(&held).cloned().collect();
+        (wants, held.into_iter().collect())
+    }
+
+    fn shallow_of(repo: &Path) -> BTreeSet<String> {
+        std::fs::read_to_string(repo.join(".git/shallow"))
+            .or_else(|_| std::fs::read_to_string(repo.join("shallow")))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// R3-1 (R-N113), reviewer fixture B: non-shallow destination whose old
+    /// held tip `git fetch` never offers (the server is ready first). The
+    /// estimate equals upload-pack given every held tip; a real fetch sends
+    /// more, which R-N113 accepts because M1 offers every held tip.
+    #[test]
+    fn every_held_tip_is_a_have_even_when_fetch_would_not_offer_it() {
+        let fixture = Fixture::new("r3-fixture-b");
+        let origin = fixture.repo("origin");
+        dated_commit(&origin, "base.txt", "base", 1);
+        output(git(&origin).args(["checkout", "--quiet", "-b", "feature"])).unwrap();
+        dated_commit(&origin, "f.txt", &noise(31, 2000), 2);
+        output(git(&origin).args(["checkout", "--quiet", "main"])).unwrap();
+        for index in 1..=5 {
+            dated_commit(
+                &origin,
+                &format!("m{index}.txt"),
+                &format!("m{index}"),
+                100 + index,
+            );
+        }
+        let url = format!("file://{}", origin.display());
+        let source = fixture.root.join("source.git");
+        output(
+            git(&fixture.root)
+                .args(["clone", "--quiet", "--bare", "--no-local", url.as_str()])
+                .arg(&source),
+        )
+        .unwrap();
+        let destination = fixture.plain_clone(&origin, "destination");
+        let root = text(git(&destination).args(["rev-list", "--max-parents=0", "HEAD"])).unwrap();
+        output(git(&destination).args(["checkout", "--quiet", "-b", "local", &root])).unwrap();
+        for index in 1..=20 {
+            dated_commit(
+                &destination,
+                &format!("l{index}.txt"),
+                &format!("l{index}"),
+                10 + index,
+            );
+        }
+        output(git(&destination).args(["checkout", "--quiet", "main"])).unwrap();
+        let work = fixture.plain_clone(&origin, "work");
+        output(git(&work).args(["merge", "--quiet", "--no-edit", "origin/feature"])).unwrap();
+        let merged = text(git(&work).args(["rev-parse", "HEAD"])).unwrap();
+        output(
+            git(&source)
+                .args(["fetch", "--quiet"])
+                .arg(&work)
+                .arg(format!("{merged}:refs/heads/merged")),
+        )
+        .unwrap();
+        output(git(&source).args(["update-ref", "-d", "refs/heads/feature"])).unwrap();
+        let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        let (wants, haves) = r_n113_request(&source, &destination);
+        let oracle = upload_pack_oracle(&source, &wants, &haves, &BTreeSet::new());
+        assert_eq!(result.thin_pack, oracle);
+        assert_eq!(result.missing.objects(), oracle.objects);
+        // git fetch's negotiation stops before offering origin/feature, so it
+        // sends f.txt's history too: more than the R-N113 first round.
+        let fetched = real_fetch(&fixture, &destination, &source, PINNED_UPLOAD_PACK);
+        assert!(
+            fetched.objects > oracle.objects,
+            "{fetched:?} vs {oracle:?}"
+        );
+    }
+
+    /// R-N113, reviewer fixture A3: shallow destination whose held tips are a
+    /// commit and its grandparent, neither advertised by the source. The
+    /// estimate equals upload-pack given every held tip, in either order. A
+    /// real `git fetch` sends more: it also offers the intermediate parent,
+    /// upload-pack then drops the grandparent as implied, and the shallow walk
+    /// no longer marks g.txt's tree. An extra have can enlarge a shallow pack.
+    #[test]
+    fn shallow_destination_with_a_grandparent_have_equals_upload_pack() {
+        let fixture = Fixture::new("r3-fixture-a3");
+        let origin = fixture.repo("origin");
+        dated_commit(&origin, "base.txt", "base", 1);
+        let boundary = dated_commit(&origin, "keep.txt", &noise(71, 50), 2);
+        let grandparent = dated_commit(&origin, "g.txt", &noise(72, 400), 3);
+        output(git(&origin).args(["branch", "old", &grandparent])).unwrap();
+        output(git(&origin).args(["rm", "--quiet", "g.txt"])).unwrap();
+        dated_commit(&origin, "rm.txt", "rm", 4);
+        dated_commit(&origin, "y.txt", "y", 5);
+        let destination = fixture.plain_clone(&origin, "destination");
+        std::fs::write(destination.join(".git/shallow"), format!("{boundary}\n")).unwrap();
+        output(git(&destination).args(["branch", "--quiet", "old", "origin/old"])).unwrap();
+        let source = fixture.root.join("source.git");
+        output(
+            git(&fixture.root)
+                .args(["init", "--quiet", "--bare", "--template=", "-b", "main"])
+                .arg(&source),
+        )
+        .unwrap();
+        let work = fixture.plain_clone(&origin, "work");
+        let readded = dated_commit(&work, "g.txt", &noise(72, 400), 6);
+        output(
+            git(&source)
+                .args(["fetch", "--quiet"])
+                .arg(&work)
+                .arg(format!("{readded}:refs/heads/main")),
+        )
+        .unwrap();
+        std::fs::write(source.join("shallow"), format!("{boundary}\n")).unwrap();
+        let result = estimate(&source, &Destination::Local(destination.clone())).unwrap();
+        let (wants, haves) = r_n113_request(&source, &destination);
+        assert_eq!(haves.len(), 2);
+        let frontier = shallow_of(&destination);
+        let oracle = upload_pack_oracle(&source, &wants, &haves, &frontier);
+        let reversed: Vec<String> = haves.iter().rev().cloned().collect();
+        assert_eq!(
+            upload_pack_oracle(&source, &wants, &reversed, &frontier),
+            oracle
+        );
+        assert_eq!(result.thin_pack, oracle);
+        assert_eq!(result.missing.objects(), oracle.objects);
+        // The re-added commit and its tree: g.txt is in the grandparent's tree.
+        assert_eq!(oracle.objects, 2);
+        let fetched = real_fetch(&fixture, &destination, &source, PINNED_UPLOAD_PACK);
+        assert!(fetched.bytes > oracle.bytes, "{fetched:?} vs {oracle:?}");
+    }
+
+    /// R3-2: redaction probes from the r3 review (bearer/basic/digest inline
+    /// values, `pwd`/`pass`/`cookie`/`sig`/`x-amz-signature`, Unicode format
+    /// and invisible separators, `/` in a URL password).
+    #[test]
+    fn redaction_r3_probes_leak_nothing() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
+            (
+                b"authorization:Bearer eyJhbGciOiJIUzI1NiJ9.payload",
+                "eyJhbGciOiJIUzI1NiJ9.payload",
+            ),
+            (b"Authorization=Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
+            (
+                b"token:Bearer eyJhbGciOiJIUzI1NiJ9.payload",
+                "eyJhbGciOiJIUzI1NiJ9.payload",
+            ),
+            (b"authorization=digest s3cr3tvalue", "s3cr3tvalue"),
+            (br#"{"token":"s3cr3tvalue"}"#, "s3cr3tvalue"),
+            (br#"{"token": "s3cr3tvalue"}"#, "s3cr3tvalue"),
+            (br#"{"access_token" : "s3cr3tvalue"}"#, "s3cr3tvalue"),
+            (
+                b"GET https://h/x?access_token=s3cr3tvalue&x=1",
+                "s3cr3tvalue",
+            ),
+            (b"GET https://h/x?sig=s3cr3tvalue&se=1", "s3cr3tvalue"),
+            (
+                b"GET https://h/x?X-Amz-Signature=deadbeefcafe",
+                "deadbeefcafe",
+            ),
+            (b"pwd=hunter2", "hunter2"),
+            (b"pass: hunter2", "hunter2"),
+            (b"Cookie: session=hunter2", "hunter2"),
+            (b"sig hunter2", "hunter2"),
+            (b"x-amz-signature: deadbeefcafe", "deadbeefcafe"),
+            (b"PRIVATE-TOKEN: glsecretvalue", "glsecretvalue"),
+            (b"password:\nhunter2", "hunter2"),
+            (b"line one\r\ntoken =\n  s3cr3tvalue", "s3cr3tvalue"),
+            (b"https://jess:hun/ter2@example.org/r", "hun/ter2"),
+            (b"https://jess:hunter2@example.org/r", "hunter2"),
+            (
+                "x gh\u{2028}p_abcdef0123456789 y".as_bytes(),
+                "abcdef0123456789",
+            ),
+            (
+                "x gh\u{200b}p_abcdef0123456789 y".as_bytes(),
+                "abcdef0123456789",
+            ),
+            (
+                "x gh\u{202e}p_abcdef0123456789 y".as_bytes(),
+                "abcdef0123456789",
+            ),
+            (
+                "x ghp\u{0085}_abcdef0123456789 y".as_bytes(),
+                "abcdef0123456789",
+            ),
+            ("pass\u{feff}word: hunter2".as_bytes(), "hunter2"),
+            (b"secret\xff=hunter2", "hunter2"),
+            (
+                b"-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA",
+                "b3BlbnNzaC1rZXktdjEAAAAA",
+            ),
+        ];
+        for (input, secret) in cases {
+            let out = detail(input).unwrap_or_default();
+            assert!(
+                !out.contains(secret),
+                "leak: {:?} -> {out:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        // Ordinary diagnostics survive.
+        let kept = detail(b"ssh: connect to host sting port 22: Connection timed out").unwrap();
+        assert_eq!(
+            kept,
+            "ssh: connect to host sting port 22: Connection timed out"
+        );
+        let kept = detail(b"fatal: bypass passed; design signed https://h/@scope/pkg").unwrap();
+        assert_eq!(
+            kept,
+            "fatal: bypass passed; design signed https://h/@scope/pkg"
+        );
     }
 }
