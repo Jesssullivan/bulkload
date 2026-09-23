@@ -241,6 +241,45 @@ fn committed(state: &Path, scratch: &Path, table: &str) -> Vec<(RowSchema, Vec<u
     rows
 }
 
+/// Committed `chunk_locations` of one store, digest to size, read from a copy
+/// like [`committed`].
+fn chunk_index(state: &Path, scratch: &Path) -> BTreeMap<[u8; 32], u64> {
+    let database = state.join("transfer.sqlite");
+    let copy = scratch.join(format!(
+        "chunk-locations-{}.sqlite",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::copy(&database, &copy).unwrap();
+    let journal = state.join("transfer.sqlite-journal");
+    let copied_journal = PathBuf::from(format!("{}-journal", copy.display()));
+    if journal.exists() {
+        fs::copy(&journal, &copied_journal).unwrap();
+    }
+    let index = {
+        let connection = rusqlite::Connection::open(&copy).unwrap();
+        let mut statement = connection
+            .prepare("SELECT digest, size FROM chunk_locations")
+            .unwrap();
+        let index = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .map(|row| {
+                let (digest, size) = row.unwrap();
+                (
+                    <[u8; 32]>::try_from(digest.as_slice()).unwrap(),
+                    u64::try_from(size).unwrap(),
+                )
+            })
+            .collect();
+        index
+    };
+    let _ = fs::remove_file(&copy);
+    let _ = fs::remove_file(&copied_journal);
+    index
+}
+
 struct CrashState {
     outputs: BTreeMap<Vec<u8>, (u64, u64, u64, i128, i128)>,
     captures: BTreeMap<Vec<u8>, Manifest>,
@@ -703,7 +742,9 @@ fn mutate(path: &Path, mutation: Mutation) {
     }
 }
 
-fn live_writer(mutation: Mutation) {
+/// Run one mutation; assert the typed refusal and a clean destination. The
+/// scratch is returned for the known-violation source-index checks.
+fn live_writer(mutation: Mutation) -> Scratch {
     let label = format!("{mutation:?}");
     let scratch = Scratch::new("live-writer");
     let source = scratch.source();
@@ -752,6 +793,64 @@ fn live_writer(mutation: Mutation) {
         "{label}: capture committed"
     );
     assert_eq!(assert_i2(&label, &scratch), 0);
+    let bystanders = bystander_chunks(&label, &recorded);
+    assert_index_is(
+        &format!("{label} destination"),
+        &scratch,
+        &scratch.destination_state(),
+        &bystanders,
+    );
+    scratch
+}
+
+/// Distinct chunks of every committed capture, which must all be bystanders.
+fn bystander_chunks(label: &str, recorded: &CrashState) -> BTreeMap<[u8; 32], u64> {
+    let mut chunks = BTreeMap::new();
+    for (path, manifest) in &recorded.captures {
+        assert_ne!(path, VICTIM.as_bytes(), "{label}: victim captured");
+        for chunk in &manifest.chunks {
+            chunks.insert(chunk.digest, chunk.size);
+        }
+    }
+    chunks
+}
+
+/// A store's committed chunk rows and its pack cover exactly `expected`.
+fn assert_index_is(
+    label: &str,
+    scratch: &Scratch,
+    state: &Path,
+    expected: &BTreeMap<[u8; 32], u64>,
+) {
+    let index = chunk_index(state, &scratch.base.join("inspect"));
+    let pack = fs::metadata(state.join("chunks.pack")).unwrap().len();
+    assert!(
+        index == *expected,
+        "{label}: chunk_locations hold {} rows ({} bytes); the bystanders need {} rows",
+        index.len(),
+        index.values().sum::<u64>(),
+        expected.len()
+    );
+    assert_eq!(
+        pack,
+        expected.values().sum::<u64>(),
+        "{label}: chunks.pack holds {pack} bytes; the bystanders need {}",
+        expected.values().sum::<u64>()
+    );
+}
+
+/// The source store keeps no index row or pack byte for a refused capture.
+fn assert_source_index_only_bystanders(mutation: Mutation) {
+    let label = format!("{mutation:?}");
+    let scratch = live_writer(mutation);
+    let recorded = crash_state(&scratch);
+    let bystanders = bystander_chunks(&label, &recorded);
+    assert_index_is(
+        &format!("{label} source"),
+        &scratch,
+        &scratch.source_state(),
+        &bystanders,
+    );
 }
 
 #[test]
@@ -772,4 +871,35 @@ fn live_writer_rename_replace_refuses() {
 #[test]
 fn live_writer_same_size_mtime_restored_refuses() {
     live_writer(Mutation::SameSizeMtimeRestored);
+}
+
+// KNOWN VIOLATION (R-N86), recorded rather than fixed. `capture_uncached`
+// sends each batch of chunks to the publisher as it reads them and only
+// compares the stat identity after the last batch. By the time the refusal
+// is known, the victim's chunks are appended to the source `chunks.pack` and
+// their `chunk_locations` rows are committed. No capture or output record
+// points at them, so I1 holds, but the source store keeps index rows and pack
+// bytes for content that was never a consistent snapshot.
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_in_place_overwrite_leaves_no_source_index() {
+    assert_source_index_only_bystanders(Mutation::InPlaceOverwrite);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_truncate_leaves_no_source_index() {
+    assert_source_index_only_bystanders(Mutation::Truncate);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_rename_replace_leaves_no_source_index() {
+    assert_source_index_only_bystanders(Mutation::RenameReplace);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_same_size_mtime_restored_leaves_no_source_index() {
+    assert_source_index_only_bystanders(Mutation::SameSizeMtimeRestored);
 }
