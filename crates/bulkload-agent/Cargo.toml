@@ -10,6 +10,18 @@ description = "Native resumable file transport, Git estate carry, and provider-s
 name = "bulkload-agent"
 path = "src/main.rs"
 
+[features]
+# Crash-consistency fault points and live-writer hooks (src/fault.rs). Test
+# builds only: `BULKLOAD_FAULT=<point>[:<nth>]` makes the process _exit at the
+# nth hit of a named point. Without the feature every point compiles to nothing.
+fault-injection = []
+
+# Crash-resume and live-writer harness; needs the fault points compiled in.
+[[test]]
+name = "fault_harness"
+path = "tests/fault_harness.rs"
+required-features = ["fault-injection"]
+
 # R34 dependency wall. This list is closed: the `dep_graph` integration test
 # asserts that tokio, opendal, reqwest, ring and tonic are absent from
 # `cargo tree -p bulkload-agent -e normal`. Adding an async runtime, an

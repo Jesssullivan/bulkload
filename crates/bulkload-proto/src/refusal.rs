@@ -1,7 +1,7 @@
 //! The bulkload refusal taxonomy.
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
-//! into families by prefix: `SnapshotCustody*`, `Digest*`, `Git*`,
+//! into families by prefix: `SnapshotCustody*`, `Capture*`, `Digest*`, `Git*`,
 //! `Sqlite*`, `Path*`, `Rollback*` and `Budget*`.
 //!
 //! Every variant is a *refusal*: the operation did not complete. Earlier durable
@@ -29,6 +29,9 @@ pub enum BulkloadRefusal {
     SourceChangedAfterSnapshot,
     /// A capture claimed ownership of a published snapshot it cannot prove.
     SnapshotOwnershipUnproven,
+    /// A capture recorded drift under its pass, so it does not hold every
+    /// seat's bytes; apply refuses it until a later pass extends it clean.
+    CaptureDrifted,
 
     // ---- digest / sealing -------------------------------------------------
     /// A content digest did not match the digest the plan was sealed against.
@@ -145,6 +148,7 @@ impl BulkloadRefusal {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
             Self::SourceChangedAfterSnapshot => "SOURCE_CHANGED_AFTER_SNAPSHOT",
             Self::SnapshotOwnershipUnproven => "SNAPSHOT_OWNERSHIP_UNPROVEN",
+            Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::DigestMismatch => "DIGEST_MISMATCH",
             Self::SealedObjectMissing => "SEALED_OBJECT_MISSING",
             Self::SealedObjectChanged => "SEALED_OBJECT_CHANGED",
@@ -229,6 +233,7 @@ mod tests {
             BulkloadRefusal::SnapshotRootsOverlap,
             BulkloadRefusal::SourceChangedAfterSnapshot,
             BulkloadRefusal::SnapshotOwnershipUnproven,
+            BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::DigestMismatch,
             BulkloadRefusal::SealedObjectMissing,
             BulkloadRefusal::SealedObjectChanged,
