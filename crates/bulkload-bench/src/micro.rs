@@ -142,24 +142,36 @@ mod qos {
 }
 
 /// Ask the scheduler to place the calling thread on `class` cores.
-#[cfg(target_vendor = "apple")]
+///
+/// One signature on every platform: the status is chosen by `cfg` inside the
+/// function and converted by [`placed`]. Other platforms have no core-class
+/// request, so their status is always 0.
 fn place_self(class: Class) -> io::Result<()> {
-    let qos = match class {
-        Class::P => qos::USER_INTERACTIVE,
-        Class::E => qos::BACKGROUND,
+    #[cfg(target_vendor = "apple")]
+    let status = {
+        let qos = match class {
+            Class::P => qos::USER_INTERACTIVE,
+            Class::E => qos::BACKGROUND,
+        };
+        // SAFETY: the call only changes the calling thread's own QoS; both
+        // arguments are plain integers, and relative priority 0 is always valid.
+        unsafe { qos::pthread_set_qos_class_self_np(qos, 0) }
     };
-    // SAFETY: the call only changes the calling thread's own QoS; both
-    // arguments are plain integers, and relative priority 0 is always valid.
-    let result = unsafe { qos::pthread_set_qos_class_self_np(qos, 0) };
-    if result != 0 {
-        return Err(io::Error::from_raw_os_error(result));
-    }
-    Ok(())
+    #[cfg(not(target_vendor = "apple"))]
+    let status = {
+        let _ = class;
+        0
+    };
+    placed(status)
 }
 
-#[cfg(not(target_vendor = "apple"))]
-const fn place_self(_: Class) -> io::Result<()> {
-    Ok(())
+/// Convert a [`place_self`] status into a result.
+fn placed(status: libc::c_int) -> io::Result<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status))
+    }
 }
 
 /// CPU time consumed so far by the calling thread.
@@ -202,9 +214,9 @@ fn on_class(
         for _ in 0..threads {
             let barrier = &barrier;
             handles.push(scope.spawn(move || -> io::Result<(u64, Duration)> {
-                let placed = place_self(class);
+                let placement = place_self(class);
                 barrier.wait();
-                placed?;
+                placement?;
                 let before = thread_cpu()?;
                 let bytes = work()?;
                 Ok((bytes, thread_cpu()?.saturating_sub(before)))
@@ -459,9 +471,9 @@ fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::R
         let barrier = &barrier;
         let payload = &payload;
         let writing = scope.spawn(move || -> io::Result<Duration> {
-            let placed = place_self(class);
+            let placement = place_self(class);
             barrier.wait();
-            placed?;
+            placement?;
             let before = thread_cpu()?;
             let mut remaining = total;
             while remaining > 0 {
@@ -472,10 +484,10 @@ fn socket_once(class: Class, total: usize, buffer: Option<libc::c_int>) -> io::R
             Ok(thread_cpu()?.saturating_sub(before))
         });
         let reading = scope.spawn(move || -> io::Result<Duration> {
-            let placed = place_self(class);
+            let placement = place_self(class);
             let mut sink = vec![0_u8; SOCKET_IO];
             barrier.wait();
-            placed?;
+            placement?;
             let before = thread_cpu()?;
             let mut remaining = total;
             while remaining > 0 {
