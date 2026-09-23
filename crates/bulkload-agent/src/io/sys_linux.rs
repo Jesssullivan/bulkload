@@ -8,9 +8,10 @@ use std::ffi::CStr;
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
-/// `fsync`: the file's data and all of its metadata, including a mode set
-/// with `fchmod` after the last write, are durable when this returns.
-/// `fdatasync` would not carry the mode, so it is not used as a seal.
+/// `fsync`: the file's data and all of its metadata are durable on return.
+///
+/// That includes a mode set with `fchmod` after the last write, which
+/// `fdatasync` would not carry, so `fdatasync` is not used as a seal.
 ///
 /// # Errors
 /// Returns the flush failure.

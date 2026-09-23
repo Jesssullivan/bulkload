@@ -21,9 +21,10 @@ pub fn barrier(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A directory barrier. `F_BARRIERFSYNC` applies to directory descriptors on
-/// APFS; a file system that rejects it gets `F_FULLFSYNC` instead, which is
-/// strictly stronger.
+/// A directory barrier.
+///
+/// `F_BARRIERFSYNC` applies to directory descriptors on APFS; a file system
+/// that rejects it gets `F_FULLFSYNC` instead, which is strictly stronger.
 ///
 /// # Errors
 /// Returns the flush failure.

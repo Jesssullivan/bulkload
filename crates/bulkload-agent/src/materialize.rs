@@ -543,8 +543,9 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 }
 
-/// Verify an existing output byte-for-byte against `manifest` before adopting
-/// it. Only the adopt path uses this; freshly written outputs are built from
+/// Verify an existing output byte-for-byte against `manifest` before adopting it.
+///
+/// Only the adopt path uses this; freshly written outputs are built from
 /// verified chunks and are not read back.
 ///
 /// # Errors

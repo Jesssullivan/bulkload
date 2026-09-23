@@ -111,9 +111,10 @@ impl Frame {
         Ok(out)
     }
 
-    /// Encode a [`FrameKind::Chunk`] frame from borrowed bytes. The result is
-    /// byte-identical to [`Frame::encode`] on the owned frame, without first
-    /// copying `data` into a `Vec`.
+    /// Encode a [`FrameKind::Chunk`] frame from borrowed bytes.
+    ///
+    /// The result is byte-identical to [`Frame::encode`] on the owned frame,
+    /// without first copying `data` into a `Vec`.
     ///
     /// # Errors
     ///

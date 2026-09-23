@@ -27,9 +27,10 @@ pub const SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
 /// `fs.pipe-max-size` for an unprivileged process).
 pub const PIPE_BUFFER_BYTES: libc::c_int = 1024 * 1024;
 
-/// Raise the kernel buffers of one transfer stream: [`SOCKET_BUFFER_BYTES`] on
-/// a socket, [`PIPE_BUFFER_BYTES`] on a Linux pipe, nothing otherwise. Returns
-/// whether anything changed.
+/// Raise the kernel buffers of one transfer stream; return whether any changed.
+///
+/// A socket gets [`SOCKET_BUFFER_BYTES`], a Linux pipe [`PIPE_BUFFER_BYTES`],
+/// anything else nothing.
 ///
 /// # Errors
 /// Returns a failed `fstat`, `setsockopt` or `fcntl`.

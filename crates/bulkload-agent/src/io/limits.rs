@@ -50,9 +50,9 @@ pub fn set_soft_descriptor_limit(soft: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Raise the soft `RLIMIT_NOFILE` to the hard limit (on Darwin, to at most
-/// `OPEN_MAX` when the hard limit is unlimited). Returns the soft limit in
-/// force afterwards.
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit; return the new soft limit.
+///
+/// On Darwin an unlimited hard limit is capped at `OPEN_MAX`.
 ///
 /// # Errors
 /// Returns a failed `getrlimit`; a refused raise leaves the limit unchanged.
