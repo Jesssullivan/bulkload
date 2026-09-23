@@ -3,6 +3,7 @@
 //! Ref custody and usable restored workspaces are separate outcomes. Completed
 //! restores are never replayed over subsequent operator edits.
 
+use crate::counters::CountedSync as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -95,9 +96,9 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         }
     };
     file.write_all(&bytes)?;
-    file.sync_all()?;
+    file.sync_file_counted()?;
     fs::rename(&temporary, path)?;
-    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_all()?;
+    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
     Ok(())
 }
 
@@ -228,7 +229,12 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
         if count == 0 {
             break;
         }
-        hasher.update(buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?);
+        crate::counters::add_len(crate::counters::Counter::HashFileRead, count);
+        crate::counters::update(
+            &mut hasher,
+            crate::counters::Counter::HashFile,
+            buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?,
+        );
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -284,7 +290,7 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
     }
     // Git's successful pack write is not a durability guarantee. Flush the
     // payload before write() publishes and directory-syncs its dependency.
-    fs::File::open(&published)?.sync_all()?;
+    fs::File::open(&published)?.sync_file_counted()?;
     let base = Base {
         bundle: name,
         digest,
@@ -363,7 +369,7 @@ fn capture_item(
         fs::hard_link(&bundle, &published)?;
     }
     // Completion may survive a crash only after its bundle bytes are durable.
-    fs::File::open(&published)?.sync_all()?;
+    fs::File::open(&published)?.sync_file_counted()?;
     let metadata = fs::symlink_metadata(&published)?;
     if let Some(base) = base {
         // Publish dependency custody before the unchanged completion codec.

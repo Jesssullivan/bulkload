@@ -83,11 +83,25 @@ BOUNDARIES:
     --include-rebuildable carries the rebuildable set too, at full fidelity.
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
+
+COUNTERS:
+    Every verb ends with machine-readable key=value lines: `counters` (bytes
+    read/written per stage, BLAKE3 bytes, flushes by kind, SQLite commits by
+    kind, elapsed_ns). copy and pull also print `transfer_timing` and
+    `chunk_timing`. copy and pull print them on stdout; serve prints its
+    source-side lines on stderr (stdout is the wire; ssh relays stderr), and
+    every other verb prints on stderr so its stdout contract is unchanged.
 ";
 
 fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let mut args = std::env::args_os().skip(1);
     let command = args.next();
+    let verb = command
+        .as_ref()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_owned();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
         Some("selftest") => selftest(),
         Some("handoff-verify") => handoff_command(&args.collect::<Vec<_>>()),
@@ -139,6 +153,7 @@ fn main() -> ExitCode {
         }
     };
 
+    report_counters(&verb, started);
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
@@ -605,6 +620,51 @@ fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
     })
 }
 
+/// Print the verb's process-scope counters (M2 W2, TIN-4541).
+///
+/// copy and pull print on stdout beside their transfer line; serve's stdout is
+/// the wire, so it and every other verb print on stderr.
+fn report_counters(verb: &str, started: std::time::Instant) {
+    use bulkload_agent::counters::{elapsed_ns, Counters};
+    use bulkload_agent::transfer::TransferTiming;
+    use bulkload_agent::transfer_store::ChunkTiming;
+    let side = match verb {
+        "copy" => "both",
+        "pull" => "destination",
+        "serve" => "source",
+        _ => "local",
+    };
+    let prefix = format!("verb={verb} side={side} scope=process");
+    let mut lines = Vec::new();
+    if matches!(verb, "copy" | "pull" | "serve") {
+        lines.push(format!(
+            "transfer_timing {prefix} {}",
+            TransferTiming::snapshot().render()
+        ));
+        lines.push(format!(
+            "chunk_timing {prefix} {}",
+            ChunkTiming::snapshot().render()
+        ));
+    }
+    lines.push(format!(
+        "counters {prefix} elapsed_ns={} {}",
+        elapsed_ns(started),
+        Counters::snapshot().render()
+    ));
+    if matches!(verb, "copy" | "pull") {
+        let mut output = std::io::stdout().lock();
+        for line in &lines {
+            let _ = writeln!(output, "{line}");
+        }
+        let _ = output.flush();
+    } else {
+        let mut output = std::io::stderr().lock();
+        for line in &lines {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+}
+
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={}",
@@ -783,7 +843,7 @@ fn scratch_path(name: &str) -> PathBuf {
 fn write_scratch(path: &std::path::Path, payload: &[u8]) -> Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(payload)?;
-    file.sync_all()?;
+    bulkload_agent::counters::sync_full(&file)?;
     Ok(())
 }
 

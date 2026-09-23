@@ -31,10 +31,11 @@ static MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 use bulkload_proto::frame::{ChunkSpec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
 use bulkload_proto::FileKind;
 
+use crate::counters::{self, Counter};
 use crate::freshness::{NullCache, StatIdentity};
 use crate::materialize::Destination;
 use crate::transfer_store::{
-    row_key, Manifest, PreparedEvent, Store, StorePublisher, PERSIST_BATCH,
+    row_key, Manifest, PreparedEvent, Side, Store, StorePublisher, PERSIST_BATCH,
 };
 use crate::walk::{walk, WalkOptions};
 use crate::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
@@ -76,6 +77,20 @@ impl TransferTiming {
             transfer_ns: TRANSFER_NS.load(Ordering::Relaxed),
             materialize_ns: MATERIALIZE_NS.load(Ordering::Relaxed),
         }
+    }
+
+    /// Space-separated `key=value` pairs.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "walk_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={}",
+            self.walk_ns,
+            self.reuse_census_ns,
+            self.cdc_hash_ns,
+            self.queue_wait_ns,
+            self.transfer_ns,
+            self.materialize_ns,
+        )
     }
 
     #[must_use]
@@ -183,7 +198,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         return Err(BulkloadRefusal::FrameCodec);
     };
     let root = std::fs::canonicalize(path(root))?;
-    let store = Store::open(&path(state))?;
+    let store = Store::open(&path(state))?.with_side(Side::Source);
     if store.root().starts_with(&root) || root.starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
@@ -286,7 +301,7 @@ fn send_batch<R: Read, W: Write>(
             let sender = sender.clone();
             let next = &next;
             std::thread::Builder::new().spawn_scoped(scope, move || {
-                let opened = Store::open_reader(state);
+                let opened = Store::open_reader(state).map(|store| store.with_side(Side::Source));
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(row) = batch.get(index) else {
@@ -394,7 +409,7 @@ fn send_content<R: Read, W: Write>(
         if !permitted.contains(&digest) || !requested.insert(digest) {
             return Err(BulkloadRefusal::FrameCodec);
         }
-        match store.chunk(&digest) {
+        match store.chunk_for(&digest, Counter::SourcePackReadback) {
             Ok(Some(data)) => write_frame(output, FrameKind::Chunk { digest, data })?,
             result => {
                 let refusal = result.err().unwrap_or(BulkloadRefusal::SealedObjectMissing);
@@ -427,7 +442,7 @@ pub fn receive<R: Read, W: Write>(
     destination: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
-    let store = Store::open(destination_state)?;
+    let store = Store::open(destination_state)?.with_side(Side::Destination);
     let mut target = Destination::open(destination)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
@@ -604,7 +619,11 @@ fn receive_chunks<R: Read, W: Write>(
         if chunk.size > u64::from(crate::hash::CDC_MAX_BYTES) {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
-        if seen.insert(chunk.digest) && store.chunk(&chunk.digest)?.is_none() {
+        if seen.insert(chunk.digest)
+            && store
+                .chunk_for(&chunk.digest, Counter::DestPresenceRead)?
+                .is_none()
+        {
             missing.push(chunk.digest);
         }
     }
@@ -663,7 +682,10 @@ fn capture(
                 .chunks
                 .iter()
                 .try_fold(true, |available, chunk| -> Result<bool> {
-                    Ok(available && store.chunk(&chunk.digest)?.is_some())
+                    Ok(available
+                        && store
+                            .chunk_for(&chunk.digest, Counter::SourceCaptureReuseRead)?
+                            .is_some())
                 })?;
         if available {
             send_prepared(
@@ -727,8 +749,8 @@ fn capture_uncached(
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
-        hasher.update(&chunk.data);
-        let digest = crate::hash::hash_bytes(&chunk.data);
+        counters::update(&mut hasher, Counter::HashCaptureFile, &chunk.data);
+        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
         chunks.push(ChunkSpec {
             digest,
             size: chunk.data.len() as u64,
@@ -780,6 +802,7 @@ impl<R: Read> Read for CountReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let count = self.input.read(buffer)?;
         *self.count = self.count.saturating_add(count as u64);
+        counters::add_len(Counter::SourceFileRead, count);
         Ok(count)
     }
 }
@@ -802,6 +825,8 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
             .get_mut(LENGTH_PREFIX_BYTES..)
             .ok_or(BulkloadRefusal::FrameCodec)?,
     )?;
+    counters::bump(Counter::WireFramesReceived);
+    counters::add_len(Counter::WireBytesReceived, bytes.len());
     Ok(Frame::decode(&bytes)?.0)
 }
 
@@ -810,8 +835,11 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
 /// # Errors
 /// Refuses oversized messages and broken transports.
 pub fn write_frame<W: Write>(output: &mut W, kind: FrameKind) -> Result<()> {
-    output.write_all(&Frame::new(kind).encode()?)?;
+    let encoded = Frame::new(kind).encode()?;
+    output.write_all(&encoded)?;
     output.flush()?;
+    counters::bump(Counter::WireFramesSent);
+    counters::add_len(Counter::WireBytesSent, encoded.len());
     Ok(())
 }
 

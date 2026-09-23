@@ -9,6 +9,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::counters::{self, CountedSync as _, Counter};
 use crate::freshness::StatIdentity;
 use crate::transfer_store::{Manifest, Store};
 use crate::{BulkloadRefusal, Result, RowSchema};
@@ -83,7 +84,7 @@ impl Destination {
                 ino: metadata.ino(),
                 key,
             });
-            parent.sync_all()?;
+            parent.sync_dir_counted()?;
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -119,8 +120,9 @@ impl Destination {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
             directory.set_permissions(Permissions::from_mode(pending.mode))?;
-            directory.sync_all()?;
+            directory.sync_dir_counted()?;
             store.complete_directory(&pending.key)?;
+            counters::bump(Counter::DirectoriesFinished);
         }
         Ok(())
     }
@@ -140,7 +142,7 @@ impl Destination {
         let result =
             unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
         if result == 0 {
-            parent.sync_all()?;
+            parent.sync_dir_counted()?;
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -217,7 +219,7 @@ impl Destination {
             if linked != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            parent.sync_all()?;
+            parent.sync_dir_counted()?;
             Ok(())
         });
         // SAFETY: remove only the unique temporary name created above.
@@ -226,6 +228,7 @@ impl Destination {
             return Err(std::io::Error::last_os_error().into());
         }
         result?;
+        counters::bump(Counter::FilesMaterialized);
         verify_existing(file, row, manifest)
     }
 
@@ -256,7 +259,7 @@ fn write_chunks(
     let mut size = 0_u64;
     for chunk in &manifest.chunks {
         let data = store
-            .chunk(&chunk.digest)?
+            .chunk_for(&chunk.digest, Counter::DestMaterializePackRead)?
             .ok_or(BulkloadRefusal::SealedObjectMissing)?;
         if data.len() as u64 != chunk.size {
             return Err(BulkloadRefusal::DigestMismatch);
@@ -267,14 +270,15 @@ fn write_chunks(
         if size > row.size {
             return Err(BulkloadRefusal::DigestMismatch);
         }
-        hasher.update(&data);
+        counters::update(&mut hasher, Counter::HashMaterializeFile, &data);
         file.write_all(&data)?;
+        counters::add_len(Counter::DestMaterializeWrite, data.len());
     }
     if size != row.size || *hasher.finalize().as_bytes() != manifest.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
     file.set_permissions(Permissions::from_mode(row.mode & 0o7777))?;
-    file.sync_all()?;
+    file.sync_file_counted()?;
     Ok(())
 }
 
@@ -292,7 +296,12 @@ fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Resu
         if read == 0 {
             break;
         }
-        hasher.update(buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?);
+        counters::add_len(Counter::DestVerifyRead, read);
+        counters::update(
+            &mut hasher,
+            Counter::HashVerifyExisting,
+            buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?,
+        );
     }
     if *hasher.finalize().as_bytes() != manifest.digest
         || StatIdentity::from_metadata(&file.metadata()?) != identity

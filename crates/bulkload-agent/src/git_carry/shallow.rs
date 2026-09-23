@@ -4,6 +4,7 @@
 //! pack is ordinary blob data until this adapter installs its explicit frontier
 //! in new/private administration; no source parent or history is fabricated.
 
+use crate::counters::CountedSync as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -60,7 +61,7 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
     if !status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    file.sync_all()?;
+    file.sync_file_counted()?;
     let envelope = parent.join("shallow-envelope.git");
     let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
     output(
@@ -219,7 +220,7 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
             .mode(0o600)
             .open(&path)?;
         file.write_all(&boundary)?;
-        file.sync_all()?;
+        file.sync_file_counted()?;
     }
     let mut objects = super::batch_objects::BatchObjects::new(repository)?;
     let mut child = git(repository)
@@ -254,7 +255,7 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
             .parent()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     )?
-    .sync_all()?;
+    .sync_dir_counted()?;
     if let Some(reservation) = reservation {
         reservation.release()?;
     }

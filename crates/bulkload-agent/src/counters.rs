@@ -1,0 +1,358 @@
+//! Process-scope byte, hash, flush and commit counters (M2 W2, TIN-4541).
+//!
+//! Every verb prints a snapshot of these counters as one machine-readable
+//! `key=value` line, so each later design number is measured rather than
+//! assumed. Counters are relaxed atomics: cheap enough to leave on in release
+//! builds, and exact once the observed operation has joined.
+//!
+//! Scope is the current process. In the local `copy` verb both protocol halves
+//! run in one process, so source and destination stages are distinguished by
+//! name, not by process. `serve` prints its own (source-side) counters to
+//! stderr because its stdout is the wire.
+//!
+//! Flush kinds are mutually exclusive:
+//! - `flush_full`: `File::sync_all` on a regular file. On Darwin the standard
+//!   library implements it as `fcntl(F_FULLFSYNC)`.
+//! - `flush_barrier`: `fcntl(F_BARRIERFSYNC)` (Darwin only).
+//! - `flush_fdatasync`: `File::sync_data` on a regular file. On Darwin the
+//!   standard library implements it as `fcntl(F_FULLFSYNC)` too.
+//! - `flush_dir`: any sync of a directory descriptor (`sync_all`, which is
+//!   `F_FULLFSYNC` on Darwin).
+
+use std::fs::File;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+macro_rules! counters {
+    ($($variant:ident => $name:literal,)*) => {
+        /// One process-scope counter.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Counter {
+            $(
+                #[doc = concat!("Printed as `", $name, "`.")]
+                $variant,
+            )*
+        }
+
+        impl Counter {
+            /// Every counter, in print order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
+            /// The stable `key` printed for this counter.
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+        }
+    };
+}
+
+counters! {
+    // Bytes read, by stage.
+    SourceFileRead => "read_source_file_bytes",
+    SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
+    SourcePackReadback => "read_source_pack_readback_bytes",
+    DestPresenceRead => "read_dest_presence_check_bytes",
+    DestMaterializePackRead => "read_dest_materialize_pack_bytes",
+    DestVerifyRead => "read_dest_verify_existing_bytes",
+    OtherChunkRead => "read_other_chunk_bytes",
+    HashFileRead => "read_hash_file_bytes",
+    // Bytes written, by stage.
+    SourcePackWrite => "write_source_pack_bytes",
+    DestPackWrite => "write_dest_pack_bytes",
+    OtherPackWrite => "write_other_pack_bytes",
+    LegacyChunkWrite => "write_legacy_chunk_bytes",
+    DestMaterializeWrite => "write_dest_materialize_bytes",
+    // Framed transport, as seen by this process.
+    WireFramesSent => "wire_frames_sent",
+    WireBytesSent => "wire_bytes_sent",
+    WireFramesReceived => "wire_frames_received",
+    WireBytesReceived => "wire_bytes_received",
+    // BLAKE3 bytes hashed, by purpose.
+    HashCaptureChunk => "blake3_capture_chunk_bytes",
+    HashCaptureFile => "blake3_capture_file_bytes",
+    HashPublishVerify => "blake3_publish_verify_bytes",
+    HashStoreReadVerify => "blake3_store_read_verify_bytes",
+    HashLegacyPut => "blake3_legacy_put_bytes",
+    HashMaterializeFile => "blake3_materialize_file_bytes",
+    HashVerifyExisting => "blake3_verify_existing_bytes",
+    HashFile => "blake3_hash_file_bytes",
+    HashOther => "blake3_other_bytes",
+    // Flushes, by kind (mutually exclusive), with worker-summed nanoseconds.
+    FlushFull => "flush_full_count",
+    FlushFullNs => "flush_full_ns",
+    FlushBarrier => "flush_barrier_count",
+    FlushBarrierNs => "flush_barrier_ns",
+    FlushFdatasync => "flush_fdatasync_count",
+    FlushFdatasyncNs => "flush_fdatasync_ns",
+    FlushDir => "flush_dir_count",
+    FlushDirNs => "flush_dir_ns",
+    // SQLite commits, by kind. Autocommit statements count as one commit each.
+    SqlitePublishSource => "sqlite_publish_source_commits",
+    SqlitePublishDest => "sqlite_publish_dest_commits",
+    SqlitePublishOther => "sqlite_publish_other_commits",
+    SqliteRecordOutput => "sqlite_record_output_commits",
+    SqliteRecordCapture => "sqlite_record_capture_commits",
+    SqliteDirectoryPending => "sqlite_directory_pending_commits",
+    SqliteDirectoryComplete => "sqlite_directory_complete_commits",
+    SqliteSettings => "sqlite_settings_commits",
+    SqliteCommitNs => "sqlite_commit_ns",
+    // Destination publication events.
+    FilesMaterialized => "files_materialized",
+    DirectoriesFinished => "directories_finished",
+}
+
+const COUNT: usize = Counter::ALL.len();
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+static VALUES: [AtomicU64; COUNT] = [ZERO; COUNT];
+
+fn slot(counter: Counter) -> Option<&'static AtomicU64> {
+    VALUES.get(counter as usize)
+}
+
+/// Add `amount` to `counter`.
+pub fn add(counter: Counter, amount: u64) {
+    if let Some(value) = slot(counter) {
+        value.fetch_add(amount, Ordering::Relaxed);
+    }
+}
+
+/// Add a byte length to `counter`.
+pub fn add_len(counter: Counter, length: usize) {
+    add(counter, u64::try_from(length).unwrap_or(u64::MAX));
+}
+
+/// Increment `counter` by one.
+pub fn bump(counter: Counter) {
+    add(counter, 1);
+}
+
+/// Nanoseconds elapsed since `started`, saturating.
+#[must_use]
+pub fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Record one `SQLite` commit of `kind` that took `started.elapsed()`.
+pub fn sqlite_commit(kind: Counter, started: Instant) {
+    bump(kind);
+    add(Counter::SqliteCommitNs, elapsed_ns(started));
+}
+
+/// BLAKE3 of `data`, counted under `purpose`.
+#[must_use]
+pub fn hash(purpose: Counter, data: &[u8]) -> [u8; 32] {
+    add_len(purpose, data.len());
+    *blake3::hash(data).as_bytes()
+}
+
+/// Feed `data` to a streaming hasher, counted under `purpose`.
+pub fn update(hasher: &mut blake3::Hasher, purpose: Counter, data: &[u8]) {
+    add_len(purpose, data.len());
+    hasher.update(data);
+}
+
+fn timed(
+    count: Counter,
+    time: Counter,
+    flush: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    bump(count);
+    let started = Instant::now();
+    let result = flush();
+    add(time, elapsed_ns(started));
+    result
+}
+
+/// `sync_all` a regular file (`F_FULLFSYNC` on Darwin), counted as `flush_full`.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn sync_full(file: &File) -> std::io::Result<()> {
+    timed(Counter::FlushFull, Counter::FlushFullNs, || file.sync_all())
+}
+
+/// `sync_data` a regular file, counted as `flush_fdatasync`.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn sync_data(file: &File) -> std::io::Result<()> {
+    timed(Counter::FlushFdatasync, Counter::FlushFdatasyncNs, || {
+        file.sync_data()
+    })
+}
+
+/// `fcntl(F_BARRIERFSYNC)` a regular file, counted as `flush_barrier`.
+///
+/// Orders the file's writes before later writes without draining the device
+/// cache. Other platforms fall back to `sync_data`, still counted here.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn sync_barrier(file: &File) -> std::io::Result<()> {
+    timed(Counter::FlushBarrier, Counter::FlushBarrierNs, || {
+        barrier(file)
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+fn barrier(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: the descriptor is owned by `file`, which outlives the call, and
+    // F_BARRIERFSYNC takes no argument beyond the command.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn barrier(file: &File) -> std::io::Result<()> {
+    file.sync_data()
+}
+
+/// `sync_all` a directory descriptor, counted as `flush_dir`.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn sync_dir(directory: &File) -> std::io::Result<()> {
+    timed(Counter::FlushDir, Counter::FlushDirNs, || {
+        directory.sync_all()
+    })
+}
+
+/// Counted flushes in method position, for `File::open(p)?.sync_…()?` chains.
+pub trait CountedSync {
+    /// [`sync_full`]: a regular file, `flush_full`.
+    ///
+    /// # Errors
+    /// Returns the flush failure.
+    fn sync_file_counted(&self) -> std::io::Result<()>;
+
+    /// [`sync_dir`]: a directory descriptor, `flush_dir`.
+    ///
+    /// # Errors
+    /// Returns the flush failure.
+    fn sync_dir_counted(&self) -> std::io::Result<()>;
+}
+
+impl CountedSync for File {
+    fn sync_file_counted(&self) -> std::io::Result<()> {
+        sync_full(self)
+    }
+
+    fn sync_dir_counted(&self) -> std::io::Result<()> {
+        sync_dir(self)
+    }
+}
+
+/// A point-in-time copy of every counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counters([u64; COUNT]);
+
+impl Counters {
+    /// Snapshot every counter without resetting other observers.
+    #[must_use]
+    pub fn snapshot() -> Self {
+        let mut values = [0_u64; COUNT];
+        for (value, atomic) in values.iter_mut().zip(VALUES.iter()) {
+            *value = atomic.load(Ordering::Relaxed);
+        }
+        Self(values)
+    }
+
+    /// Difference from an earlier snapshot.
+    #[must_use]
+    pub fn since(self, before: Self) -> Self {
+        let mut values = self.0;
+        for (value, earlier) in values.iter_mut().zip(before.0) {
+            *value = value.saturating_sub(earlier);
+        }
+        Self(values)
+    }
+
+    /// The value of one counter.
+    #[must_use]
+    pub fn get(&self, counter: Counter) -> u64 {
+        self.0.get(counter as usize).copied().unwrap_or(0)
+    }
+
+    /// Sum of every BLAKE3 purpose.
+    #[must_use]
+    pub fn blake3_total(&self) -> u64 {
+        [
+            Counter::HashCaptureChunk,
+            Counter::HashCaptureFile,
+            Counter::HashPublishVerify,
+            Counter::HashStoreReadVerify,
+            Counter::HashLegacyPut,
+            Counter::HashMaterializeFile,
+            Counter::HashVerifyExisting,
+            Counter::HashFile,
+            Counter::HashOther,
+        ]
+        .iter()
+        .fold(0_u64, |total, counter| {
+            total.saturating_add(self.get(*counter))
+        })
+    }
+
+    /// Space-separated `key=value` pairs, ending with the derived totals.
+    #[must_use]
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut line = String::new();
+        for (counter, value) in Counter::ALL.iter().zip(self.0) {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            let _ = write!(line, "{}={value}", counter.name());
+        }
+        let _ = write!(line, " blake3_total_bytes={}", self.blake3_total());
+        line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_unique_and_rendered() {
+        let mut names: Vec<_> = Counter::ALL.iter().map(|counter| counter.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Counter::ALL.len());
+        let before = Counters::snapshot();
+        add(Counter::HashOther, 7);
+        let _ = hash(Counter::HashOther, b"abc");
+        let after = Counters::snapshot().since(before);
+        assert!(after.get(Counter::HashOther) >= 10);
+        assert!(after.blake3_total() >= 10);
+        assert!(after.render().contains("blake3_other_bytes="));
+        assert!(after.render().contains("blake3_total_bytes="));
+    }
+
+    #[test]
+    fn flush_wrappers_count_by_kind() -> std::io::Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bulkload-counters-{}", std::process::id()));
+        let file = File::create(&path)?;
+        let before = Counters::snapshot();
+        sync_full(&file)?;
+        sync_data(&file)?;
+        sync_barrier(&file)?;
+        File::open(&dir)?.sync_dir_counted()?;
+        let after = Counters::snapshot().since(before);
+        std::fs::remove_file(&path)?;
+        assert!(after.get(Counter::FlushFull) >= 1);
+        assert!(after.get(Counter::FlushFdatasync) >= 1);
+        assert!(after.get(Counter::FlushBarrier) >= 1);
+        assert!(after.get(Counter::FlushDir) >= 1);
+        Ok(())
+    }
+}

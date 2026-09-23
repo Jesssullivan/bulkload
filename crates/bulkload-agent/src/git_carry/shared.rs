@@ -3,6 +3,7 @@
 //! Shared bases are transport dependencies, not a replacement for each
 //! workspace's staged, dirty, ignored and filesystem metadata capture.
 
+use crate::counters::CountedSync as _;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -193,9 +194,9 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
         .open(&pending)?;
     target.write_all(&header)?;
     std::io::copy(&mut source, &mut target)?;
-    target.sync_all()?;
+    target.sync_file_counted()?;
     fs::rename(&pending, bundle)?;
-    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_all()?;
+    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
     Ok(())
 }
 

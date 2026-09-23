@@ -32,6 +32,7 @@
 //! child onto a reaper thread that only waits on it. There is no `kill`, no // agent-process-safety: allow (prose asserting absence of process control)
 //! `libc::kill`, and no signal of any kind in this file. // agent-process-safety: allow (prose asserting absence of process control)
 
+use crate::counters::CountedSync as _;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -678,7 +679,7 @@ impl Scratch {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
         file.write_all(payload)?;
-        file.sync_all()?;
+        file.sync_file_counted()?;
         Ok(path)
     }
 }

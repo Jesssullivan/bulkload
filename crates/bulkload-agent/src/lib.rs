@@ -16,6 +16,7 @@
 //! rather than any concrete cache, so callers choose a persistent, in-memory
 //! or null cache.
 
+pub mod counters;
 pub mod estate;
 pub mod freshness;
 pub mod git_carry;
