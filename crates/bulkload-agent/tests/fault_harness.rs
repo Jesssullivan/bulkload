@@ -40,9 +40,10 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bulkload_agent::fault::{
     parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV,
@@ -387,7 +388,7 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) {
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
     );
-    let child = Command::new(std::env::current_exe().unwrap())
+    let running = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "crash_child_entry",
@@ -398,7 +399,25 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) {
         .env(CHILD_ENV, &scratch.base)
         .env(FAULT_ENV, label)
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A detached waiter reaps the child; this thread waits on it against a
+    // deadline. On timeout the test fails and the child is left alone: it is
+    // never signalled (R-N11).
+    let (reaped, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = reaped.send(running.wait_with_output());
+    });
+    let child = outcome
+        .recv_timeout(CHILD_DEADLINE)
+        .unwrap_or_else(|timeout| {
+            panic!(
+                "{label}: crash child still running after {CHILD_DEADLINE:?} ({timeout}); \
+                 left running, not signalled"
+            )
+        })
         .unwrap();
     assert_eq!(
         child.status.code(),
@@ -539,6 +558,9 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     );
 }
 
+/// How long a crash child may run before the scenario fails.
+const CHILD_DEADLINE: Duration = Duration::from_mins(5);
+
 /// Set only in a child: the scratch base whose trees it copies.
 const CHILD_ENV: &str = "BULKLOAD_W7_CHILD_BASE";
 
@@ -646,23 +668,45 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(parse(""), None);
 }
 
-/// Every declared point is exercised by at least one scenario above or below.
+/// Points whose only crash-resume scenario is an `#[ignore]`d known-violation
+/// test. They are listed here and never counted as coverage.
+const KNOWN_VIOLATIONS: [Point; 1] = [Point::DirectoryAfterMkdir];
+
+/// Every point is exercised by a passing (non-ignored) scenario in the
+/// `scenarios!` table, or is listed in [`KNOWN_VIOLATIONS`] — never both.
 #[test]
 fn every_fault_point_has_a_scenario() {
     let source = include_str!("fault_harness.rs");
+    let start = source.find("\nscenarios! {\n").unwrap();
+    let table = &source[start..];
+    let table = &table[..table.find("\n}\n").unwrap()];
+    let covered = |point: &Point| table.contains(&format!("=> {point:?}:"));
+    let known = |point: &Point| KNOWN_VIOLATIONS.contains(point);
     let missing: Vec<&str> = Point::ALL
         .into_iter()
-        .filter(|point| {
-            let variant = format!("{point:?}");
-            !source.contains(&format!("=> {variant}:"))
-                && !source.contains(&format!("Point::{variant}, "))
-        })
+        .filter(|point| !covered(point) && !known(point))
         .map(Point::name)
         .collect();
     assert!(
         missing.is_empty(),
-        "fault points without a scenario: {missing:?}"
+        "fault points without a passing scenario: {missing:?}"
     );
+    let both: Vec<&str> = Point::ALL
+        .into_iter()
+        .filter(|point| covered(point) && known(point))
+        .map(Point::name)
+        .collect();
+    assert!(
+        both.is_empty(),
+        "known violations also claimed as coverage: {both:?}"
+    );
+    for point in KNOWN_VIOLATIONS {
+        assert!(
+            source.contains(&format!("crash_resume(Point::{point:?}, ")),
+            "{}: known violation without its ignored test",
+            point.name()
+        );
+    }
 }
 
 /// VIOLATION in the v3 engine (TIN-4546), recorded rather than fixed.
@@ -742,6 +786,26 @@ fn mutate(path: &Path, mutation: Mutation) {
     }
 }
 
+fn ctime_ns(path: &Path) -> i128 {
+    let metadata = fs::metadata(path).unwrap();
+    i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec())
+}
+
+fn wait_for_later_ctime(reference: &Path, tick: &Path) {
+    let reference = ctime_ns(reference);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        fs::write(tick, b"tick").unwrap();
+        if ctime_ns(tick) > reference {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the filesystem clock never passed the victim's ctime"
+        );
+    }
+}
+
 /// Run one mutation; assert the typed refusal and a clean destination. The
 /// scratch is returned for the known-violation source-index checks.
 fn live_writer(mutation: Mutation) -> Scratch {
@@ -756,6 +820,10 @@ fn live_writer(mutation: Mutation) -> Scratch {
         )
         .unwrap();
     }
+    // A coarse-grained filesystem clock could give the mutation the victim's
+    // own ctime. Busy-poll a scratch file (no sleep) until its ctime is past
+    // the victim's, so any later mutation carries a later ctime.
+    wait_for_later_ctime(&source.join(VICTIM), &scratch.base.join("tick"));
     let fired = Arc::new(AtomicBool::new(false));
     let hook = {
         let fired = Arc::clone(&fired);
