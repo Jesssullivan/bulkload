@@ -34,6 +34,9 @@ SUBCOMMANDS:
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
+    git-carry-estimate SOURCE_REPO DEST [SOURCE_REPO DEST ...]
+                Read-only: report what git carry v2 would move from SOURCE_REPO
+                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes)
     estate-add PLAN SOURCE_REPO DEST_REPO [ABSENT_WORKSPACE]
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
@@ -109,6 +112,7 @@ fn main() -> ExitCode {
                 .unwrap_or(""),
             &args.collect::<Vec<_>>(),
         ),
+        Some("git-carry-estimate") => estimate_command(&args.collect::<Vec<_>>()),
         Some("hydrate-state") => hydrate_command(&args.collect::<Vec<_>>()),
         Some("git-repair-missing-index") => repair_index_command(&args.collect::<Vec<_>>()),
         Some("git-restore-registered-payload") => registered_command(&args.collect::<Vec<_>>()),
@@ -274,6 +278,31 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// Read-only on both sides: no fetch, no object or ref write (R-N60 baseline).
+fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let mut stdout = std::io::stdout().lock();
+    for (index, pair) in args.chunks_exact(2).enumerate() {
+        let [source, destination] = pair else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let source = Path::new(source);
+        let destination = bulkload_agent::git_carry::estimate::Destination::parse(destination)?;
+        let estimate = bulkload_agent::git_carry::estimate::estimate(source, &destination)?;
+        if index > 0 {
+            writeln!(stdout)?;
+        }
+        writeln!(stdout, "source={}", source.display())?;
+        writeln!(stdout, "destination={}", destination.display())?;
+        for line in estimate.lines() {
+            writeln!(stdout, "{line}")?;
+        }
+    }
+    Ok(())
 }
 
 fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
