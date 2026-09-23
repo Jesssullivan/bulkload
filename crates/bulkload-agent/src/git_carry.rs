@@ -1134,7 +1134,9 @@ fn nested_custody(
 }
 
 // HEAD of a nested repository, read through its own `.git` with the hardened
-// invocation (no hooks, no fsmonitor, no config). An unborn HEAD is `None`;
+// invocation (no hooks, no fsmonitor, no global or system config; the nest's
+// own config IS read, which rev-parse cannot turn into execution). An unborn
+// HEAD is `None`;
 // a `.git` Git cannot read at all is malformed inventory.
 fn nested_head(directory: &Path) -> Result<Option<String>> {
     let result = git(directory)
@@ -1199,10 +1201,8 @@ fn foreign_nest(
     if nest_detached_unreachable(directory, head_oid.as_deref())? {
         return Err(BulkloadRefusal::GitNestDetachedUnreachable);
     }
-    // `--no-optional-locks` (from `git()`) keeps status from refreshing the
-    // nest's index: the census never writes to a repository it only names.
     // Ignored entries are listed too (R-N83 b): they are custody, not dirt.
-    let status = output(git(directory).args([
+    let status = output(nest_status(directory)?.args([
         "--git-dir=.git",
         "--work-tree=.",
         "status",
@@ -1210,6 +1210,7 @@ fn foreign_nest(
         "-z",
         "--untracked-files=all",
         "--ignored=traditional",
+        "--ignore-submodules=none",
     ]))?;
     let mut ignored = Vec::new();
     for entry in status.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
@@ -1231,6 +1232,128 @@ fn foreign_nest(
         ignored_sample,
         ignored_digest,
     })
+}
+
+/// How deep populated submodules inside a nest are followed for filter
+/// neutralisation before the nest is refused as malformed.
+const NEST_SUBMODULE_DEPTH: usize = 8;
+
+// R-N83 / N4: a nest is foreign, so its configuration is hostile input, and
+// `status` is the one command the census runs there that can execute
+// configured programs. The hardened `git()` already pins core.fsmonitor=false,
+// core.hooksPath=/dev/null and --no-optional-locks (no index or untracked-cache
+// write). A nest whose config (or that of any populated submodule status
+// would recurse into) sets a filter clean, smudge or process command is
+// refused before status runs: such a filter would both execute nest-chosen
+// code and decide what "clean" means (a lying clean filter hides an edit).
+// As defence in depth against a config written between that check and
+// status, every filter driver seen is also neutralised: an empty command runs
+// nothing and required=false keeps it from failing the read. The overrides
+// travel as GIT_CONFIG_COUNT command-scope config, which outranks the nest's
+// own files and which Git passes down to the submodule statuses it spawns;
+// env keys also avoid any `-c key=value` parsing ambiguity in a hostile name.
+fn nest_status(directory: &Path) -> Result<Command> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut drivers = std::collections::BTreeSet::new();
+    if filter_drivers(directory, 0, &mut drivers)? {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let mut overrides: Vec<(std::ffi::OsString, &str)> = vec![
+        ("core.fsmonitor".into(), "false"),
+        ("core.untrackedCache".into(), "false"),
+    ];
+    for name in &drivers {
+        for (variable, value) in [
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        ] {
+            let mut key = std::ffi::OsString::from("filter.");
+            key.push(std::ffi::OsStr::from_bytes(name));
+            key.push(".");
+            key.push(variable);
+            overrides.push((key, value));
+        }
+    }
+    let mut command = git(directory);
+    command.env("GIT_CONFIG_COUNT", overrides.len().to_string());
+    for (index, (key, value)) in overrides.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    Ok(command)
+}
+
+// Every `filter.<name>.*` subsection visible to the repository at `directory`
+// (includes followed, as status would), and recursively to each populated
+// submodule in its index. Returns whether any of them sets a command.
+fn filter_drivers(
+    directory: &Path,
+    depth: usize,
+    drivers: &mut std::collections::BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    if depth > NEST_SUBMODULE_DEPTH {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let listed = git(directory)
+        .args([
+            "--git-dir=.git",
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^filter\.",
+        ])
+        .output()?;
+    match listed.status.code() {
+        Some(0 | 1) => {}
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    let mut commands = false;
+    for entry in listed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let key = entry.split(|b| *b == b'\n').next().unwrap_or_default();
+        let (name, variable) = key
+            .strip_prefix(b"filter.")
+            .and_then(|rest| {
+                let dot = rest.iter().rposition(|b| *b == b'.')?;
+                Some((rest.get(..dot)?, rest.get(dot + 1..)?))
+            })
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        commands |= matches!(variable, b"clean" | b"smudge" | b"process");
+        drivers.insert(name.to_vec());
+    }
+    let staged = output(git(directory).args(["--git-dir=.git", "ls-files", "-z", "--stage"]))?;
+    for entry in staged
+        .split(|b| *b == 0)
+        .filter(|entry| entry.starts_with(b"160000 "))
+    {
+        let path = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .and_then(|tab| entry.get(tab + 1..))
+            .map(|path| Path::new(std::ffi::OsStr::from_bytes(path)))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let submodule = directory.join(path);
+        match fs::symlink_metadata(submodule.join(".git")) {
+            Ok(_) => commands |= filter_drivers(&submodule, depth + 1, drivers)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(commands)
 }
 
 // R-N83 (b): the total, the receipt sample, and a digest over every ignored
@@ -3481,7 +3604,7 @@ mod tests {
         )
     }
 
-    fn directory_nest(rel_path: &[u8], head: Option<String>) -> NestedRepository {
+    pub(super) fn directory_nest(rel_path: &[u8], head: Option<String>) -> NestedRepository {
         NestedRepository {
             rel_path: rel_path.to_vec(),
             kind: NestedRepositoryKind::Directory,
@@ -3894,6 +4017,139 @@ mod tests {
         let carried = carried_paths(&capture.join("repository.git"));
         assert!(!carried.contains(".log"));
         assert!(!carried.contains("x.o"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn markers_fired(markers: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(markers)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    // Stat-dirty but content-clean: status must read content, which is
+    // exactly when it would run a clean filter or consult fsmonitor.
+    fn stat_dirty(file: &Path) {
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    // R-N83 / N4: a nest's filter commands would both execute nest-chosen code
+    // and decide what "clean" means. A nest (or a populated submodule inside
+    // it) whose config sets one refuses, and the command never runs.
+    #[test]
+    fn a_nest_with_filter_commands_refuses_without_running_them() {
+        let root = fresh("bulkload-filter-nest");
+        let markers = root.join("markers");
+        fs::create_dir(&markers).unwrap();
+        let touch = |name: &str| format!("touch {}; cat", markers.join(name).display());
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        fs::create_dir_all(&nest).unwrap();
+        fs::write(nest.join(".gitattributes"), b"* filter=ev.il\n").unwrap();
+        committed(&nest, b"inner");
+        // A populated submodule inside the nest, with its own hostile filter.
+        let sub = nest.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".gitattributes"), b"* filter=evil2\n").unwrap();
+        committed(&sub, b"sub");
+        output(git(&nest).args(["add", "sub"])).unwrap();
+        commit(&nest, "submodule");
+        stat_dirty(&nest.join("tracked"));
+        stat_dirty(&sub.join("tracked"));
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+
+        // Dotted driver name, every command kind.
+        for (key, value) in [
+            ("filter.ev.il.clean", touch("nest-clean")),
+            ("filter.ev.il.smudge", touch("nest-smudge")),
+            ("filter.ev.il.process", touch("nest-process")),
+            ("filter.ev.il.required", "true".to_owned()),
+        ] {
+            output(git(&nest).args(["config", key, &value])).unwrap();
+        }
+        refuses_everywhere(&source, &root.join("capture-nest"));
+        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
+        output(git(&nest).args(["config", "--remove-section", "filter.ev.il"])).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+
+        // Only the submodule inside the nest configures one.
+        output(git(&sub).args(["config", "filter.evil2.clean", &touch("sub-clean")])).unwrap();
+        refuses_everywhere(&source, &root.join("capture-sub"));
+        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
+
+        // Control: an unhardened status in the nest does run it.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&nest)
+            .args(["status", "--porcelain"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(!markers_fired(&markers).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N83: a nest's own fsmonitor command and hooks never run, its index
+    // (and untracked cache) is never written, and its ignore-submodules
+    // config cannot hide a dirty submodule inside it.
+    #[test]
+    fn a_hostile_nest_config_runs_no_fsmonitor_or_hook_and_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fresh("bulkload-hostile-nest");
+        let markers = root.join("markers");
+        fs::create_dir(&markers).unwrap();
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        let sub = nest.join("sub");
+        committed(&sub, b"sub");
+        output(git(&nest).args(["add", "sub"])).unwrap();
+        commit(&nest, "submodule");
+        let script = root.join("hostile.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch {}/\"$(basename \"$0\")\"\nexit 1\n",
+                markers.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = root.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        for hook in ["post-index-change", "fsmonitor-watchman", "post-checkout"] {
+            fs::copy(&script, hooks.join(hook)).unwrap();
+        }
+        for (key, value) in [
+            ("core.fsmonitor", script.display().to_string()),
+            ("core.hooksPath", hooks.display().to_string()),
+            ("core.untrackedCache", "true".to_owned()),
+        ] {
+            output(git(&nest).args(["config", key, &value])).unwrap();
+        }
+        stat_dirty(&nest.join("tracked"));
+        let index = fs::read(nest.join(".git/index")).unwrap();
+
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        reusable_capture_key(&source).unwrap();
+        export_repository(&source, &root.join("capture")).unwrap();
+        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
+        assert_eq!(fs::read(nest.join(".git/index")).unwrap(), index);
+
+        output(git(&nest).args(["config", "diff.ignoreSubmodules", "all"])).unwrap();
+        output(git(&nest).args(["config", "submodule.sub.ignore", "all"])).unwrap();
+        fs::write(sub.join("untracked"), b"inside the submodule").unwrap();
+        refuses_everywhere(&source, &root.join("capture-dirty-sub"));
+        assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4862,5 +5118,179 @@ mod tests {
         assert!(carried.contains("dist/kept"));
         assert!(carried.contains("bazel-out"));
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// The adversarial re-review of #53 at 2b64289 (R-N73, R-N83, TIN-4540), kept
+// as regression tests. Helpers and assertions are the reviewer's, with the
+// verdicts each finding's fix makes definite.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod review_pr53b {
+    use super::*;
+
+    fn g(repo: &Path, args: &[&str]) -> Vec<u8> {
+        output(git(repo).args(args)).unwrap()
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rv53b-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn init(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        g(repo, &["init", "--template=", "-b", "main"]);
+        g(repo, &["config", "user.name", "T"]);
+        g(repo, &["config", "user.email", "t@localhost"]);
+        g(repo, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_all(repo: &Path, message: &str) {
+        g(repo, &["add", "-A"]);
+        g(repo, &["commit", "-q", "-m", message]);
+    }
+
+    // An outer repo and a clean nest `vendor/inner` with a remote-tracking ref
+    // at its HEAD, so unpushed=0 remotes=yes is the baseline.
+    fn outer_with_pushed_nest(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = fresh(name);
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let inner = outer.join("vendor/inner");
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        commit_all(&inner, "v1");
+        g(
+            &inner,
+            &["remote", "add", "origin", "https://example.invalid/i.git"],
+        );
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let only = nested_repositories(&outer).unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].unpushed, 0);
+        assert!(only[0].remotes);
+        (root, outer, inner)
+    }
+
+    fn verdict(outer: &Path) -> String {
+        match nested_repositories(outer) {
+            Ok(n) => format!(
+                "CUSTODY {:?}",
+                n.iter()
+                    .map(NestedRepository::receipt_line)
+                    .collect::<Vec<_>>()
+            ),
+            Err(e) => format!("REFUSED {e:?}"),
+        }
+    }
+
+    // N4: filter drivers from the nest's own config must not run during the
+    // clean check (the nest now refuses); fsmonitor from its config must not.
+    #[test]
+    fn rv_nest_config_code_execution_during_census() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, outer, inner) = outer_with_pushed_nest("filter");
+        let filter_marker = root.join("filter-ran");
+        let fsmon_marker = root.join("fsmonitor-ran");
+        let fsmon = root.join("fsmon.sh");
+        fs::write(
+            &fsmon,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", fsmon_marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fsmon, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(inner.join(".gitattributes"), b"*.c filter=evil\n").unwrap();
+        g(
+            &inner,
+            &[
+                "config",
+                "filter.evil.clean",
+                &format!("touch '{}'; cat", filter_marker.display()),
+            ],
+        );
+        commit_all(&inner, "attrs");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        g(
+            &inner,
+            &["config", "core.fsmonitor", fsmon.to_str().unwrap()],
+        );
+        let _ = fs::remove_file(&filter_marker);
+        let _ = fs::remove_file(&fsmon_marker);
+        // Stat-dirty, content-identical: status must re-hash through the filter.
+        std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(inner.join("lib.c"))
+            .status()
+            .unwrap();
+        let v = verdict(&outer);
+        let filter_ran = filter_marker.exists();
+        let fsmon_ran = fsmon_marker.exists();
+        fs::remove_dir_all(root).unwrap();
+        assert!(!fsmon_ran, "fsmonitor ran");
+        assert!(!filter_ran, "nest clean filter executed during census: {v}");
+        assert!(v.starts_with("REFUSED"), "{v}");
+    }
+
+    // N4: a lying clean filter makes a dirty nest report clean.
+    #[test]
+    fn rv_lying_filter_hides_dirty_nest() {
+        let (root, outer, inner) = outer_with_pushed_nest("liar");
+        fs::write(inner.join(".gitattributes"), b"*.c filter=liar\n").unwrap();
+        commit_all(&inner, "attrs");
+        g(&inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        g(&inner, &["config", "filter.liar.clean", "printf v1"]);
+        fs::write(inner.join("lib.c"), b"v2 unique edit").unwrap();
+        let v = verdict(&outer);
+        fs::remove_dir_all(root).unwrap();
+        assert!(v.starts_with("REFUSED"), "{v}");
+    }
+
+    // F8 quoting: every byte class that could forge or split a receipt line.
+    #[test]
+    fn rv_receipt_line_escaping() {
+        for path in [
+            &b"a\nitem=x nested-repository path=\"forged\""[..],
+            b"a\"b",
+            b"a\\\"b",
+            b"a\rb",
+            b"\x1b[2Jclear",
+            b"tab\there",
+            b"\xe2\x80\xa8u2028",
+        ] {
+            let n = NestedRepository {
+                rel_path: path.to_vec(),
+                ..super::tests::directory_nest(b"", None)
+            };
+            let line = n.receipt_line();
+            assert!(!line.contains('\n') && !line.contains('\r') && !line.contains('\x1b'));
+            assert!(!line.contains('\u{2028}'));
+            let inner = line
+                .strip_prefix("nested-repository path=\"")
+                .unwrap()
+                .split(" kind=")
+                .next()
+                .unwrap();
+            let body = inner.strip_suffix('"').unwrap();
+            // No unescaped quote inside the quoted field.
+            let bytes = body.as_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                if *b == b'"' {
+                    let mut bs = 0;
+                    let mut j = i;
+                    while j > 0 && bytes[j - 1] == b'\\' {
+                        bs += 1;
+                        j -= 1;
+                    }
+                    assert!(bs % 2 == 1, "unescaped quote in {line}");
+                }
+            }
+        }
     }
 }
