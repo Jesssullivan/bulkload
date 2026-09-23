@@ -27,6 +27,16 @@ rusqlite = { workspace = true, features = ["backup"] }
 ignore = { workspace = true }
 crc32c = { workspace = true }
 
+[features]
+# R-N88: record every mutating `io` syscall (write, sync, rename, link,
+# unlink, mkdir, fchmod) into a trace for the crash-state checker. Off by
+# default; with it off the recording sites compile to nothing.
+io-trace = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
 [lints.clippy]
 # R33 deny-panics wall. Refusals are Results, never panics.
 pedantic = { level = "deny", priority = -1 }

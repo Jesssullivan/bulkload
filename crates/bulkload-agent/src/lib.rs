@@ -21,6 +21,17 @@ pub mod freshness;
 pub mod git_carry;
 pub mod handoff;
 pub mod hash;
+// M2 W4 io layer (R-N90, R-N54, R-N88). Unwired until W4 integration: its
+// callers today are its own tests and the chunker micro-bench, so a non-test
+// build sees every item as dead.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "M2 W4 io layer is unwired until W4 integration (R-N90); tests are its callers"
+    )
+)]
+pub(crate) mod io;
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod transfer;

@@ -28,6 +28,9 @@ ignore = { version = "0.4" }
 crc32c = { version = "0.6" }
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = { version = "3" }
+# Dev-only property testing (plan D3 "Borrow"). No default features: no fork,
+# timeout or regex machinery.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
