@@ -1042,7 +1042,20 @@ pub struct NestedRepository {
     pub unpushed: u64,
     /// Whether the nest has any configured remote. Always false for a gitlink.
     pub remotes: bool,
+    /// Ignored entries inside the nest (`status --ignored`), which are custody
+    /// and never carried (R-N83). Always 0 for a gitlink.
+    pub ignored: u64,
+    /// The first [`NESTED_IGNORED_SAMPLE`] ignored paths, sorted, relative to
+    /// the nest, for the receipt. `ignored` is always the full total.
+    pub ignored_sample: Vec<Vec<u8>>,
+    /// Digest over every ignored path and its lstat identity (size, mtime,
+    /// ctime, inode), so any change among them moves the capture key. All
+    /// zeros when there are none.
+    pub ignored_digest: [u8; 32],
 }
+
+/// How many ignored paths a nest's receipt line lists by name.
+pub const NESTED_IGNORED_SAMPLE: usize = 8;
 
 impl NestedRepository {
     /// One receipt line naming this nest.
@@ -1057,12 +1070,24 @@ impl NestedRepository {
             NestedRepositoryKind::Gitlink => {
                 format!("nested-repository path=\"{path}\" kind=Gitlink head={head}")
             }
-            NestedRepositoryKind::Directory => format!(
-                "nested-repository path=\"{path}\" kind=Directory gitdir={:?} head={head} unpushed={} remotes={}",
-                self.gitdir_kind,
-                self.unpushed,
-                if self.remotes { "yes" } else { "none" },
-            ),
+            NestedRepositoryKind::Directory => {
+                use std::fmt::Write as _;
+                let mut line = format!(
+                    "nested-repository path=\"{path}\" kind=Directory gitdir={:?} head={head} unpushed={} remotes={} ignored-not-carried={}",
+                    self.gitdir_kind,
+                    self.unpushed,
+                    if self.remotes { "yes" } else { "none" },
+                    self.ignored,
+                );
+                for ignored in &self.ignored_sample {
+                    let _ = write!(line, " ignored=\"{}\"", ignored.escape_ascii());
+                }
+                let listed = u64::try_from(self.ignored_sample.len()).unwrap_or(u64::MAX);
+                if self.ignored > listed {
+                    let _ = write!(line, " ignored-unlisted={}", self.ignored - listed);
+                }
+                line
+            }
         }
     }
 }
@@ -1176,16 +1201,24 @@ fn foreign_nest(
     }
     // `--no-optional-locks` (from `git()`) keeps status from refreshing the
     // nest's index: the census never writes to a repository it only names.
+    // Ignored entries are listed too (R-N83 b): they are custody, not dirt.
     let status = output(git(directory).args([
         "--git-dir=.git",
         "--work-tree=.",
         "status",
         "--porcelain=v2",
+        "-z",
         "--untracked-files=all",
+        "--ignored=traditional",
     ]))?;
-    if !status.is_empty() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+    let mut ignored = Vec::new();
+    for entry in status.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+        match entry.strip_prefix(b"! ") {
+            Some(path) if !path.is_empty() => ignored.push(path.to_vec()),
+            _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+        }
     }
+    let (ignored, ignored_sample, ignored_digest) = ignored_custody(directory, ignored)?;
     let (unpushed, remotes) = unpushed_commits(directory, head_oid.as_deref())?;
     Ok(NestedRepository {
         rel_path,
@@ -1194,7 +1227,56 @@ fn foreign_nest(
         gitdir_kind,
         unpushed,
         remotes,
+        ignored,
+        ignored_sample,
+        ignored_digest,
     })
+}
+
+// R-N83 (b): the total, the receipt sample, and a digest over every ignored
+// path with its lstat identity. An entry that vanishes between status and
+// lstat is hashed as vanished rather than refused: ignored files never refuse.
+fn ignored_custody(
+    directory: &Path,
+    mut ignored: Vec<Vec<u8>>,
+) -> Result<(u64, Vec<Vec<u8>>, [u8; 32])> {
+    use std::os::unix::ffi::OsStrExt;
+    if ignored.is_empty() {
+        return Ok((0, Vec::new(), [0; 32]));
+    }
+    ignored.sort();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tcfs-git-nested-ignored-v1\0");
+    for path in &ignored {
+        hash.update(
+            &u64::try_from(path.len())
+                .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                .to_le_bytes(),
+        );
+        hash.update(path);
+        let relative = path.strip_suffix(b"/").unwrap_or(path);
+        match fs::symlink_metadata(directory.join(std::ffi::OsStr::from_bytes(relative))) {
+            Ok(meta) => {
+                let identity = crate::freshness::StatIdentity::from_metadata(&meta);
+                hash.update(&[1]);
+                for value in [
+                    i128::from(identity.ino),
+                    i128::from(identity.size),
+                    identity.mtime_ns,
+                    identity.ctime_ns,
+                ] {
+                    hash.update(&value.to_le_bytes());
+                }
+            }
+            Err(error) if vanished(&error) => {
+                hash.update(&[0]);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let total = u64::try_from(ignored.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    ignored.truncate(NESTED_IGNORED_SAMPLE);
+    Ok((total, ignored, *hash.finalize().as_bytes()))
 }
 
 // Commits reachable from the nest's local branches or its HEAD and from none
@@ -1675,6 +1757,9 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
             gitdir_kind: GitdirKind::None,
             unpushed: 0,
             remotes: false,
+            ignored: 0,
+            ignored_sample: Vec::new(),
+            ignored_digest: [0; 32],
         });
     }
     gitlinks.sort();
@@ -3404,6 +3489,9 @@ mod tests {
             gitdir_kind: GitdirKind::Directory,
             unpushed: 0,
             remotes: false,
+            ignored: 0,
+            ignored_sample: Vec::new(),
+            ignored_digest: [0; 32],
         }
     }
 
@@ -3734,6 +3822,81 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // R-N83 (b): ignored files inside a clean nest are custody: never carried,
+    // never a refusal, always counted and (up to a sample) named in the
+    // receipt, and part of the key so a change among them is visible.
+    #[test]
+    fn ignored_files_in_a_clean_nest_are_custody_named_and_keyed() {
+        let root = fresh("bulkload-ignored-in-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        fs::create_dir_all(&nest).unwrap();
+        fs::write(nest.join(".gitignore"), b"*.log\n/build/\n").unwrap();
+        committed(&nest, b"inner");
+        fs::create_dir_all(nest.join("build/deep")).unwrap();
+        fs::write(nest.join("a.log"), b"log").unwrap();
+        fs::write(nest.join("odd\n.log"), b"log").unwrap();
+        fs::write(nest.join("build/x.o"), b"obj").unwrap();
+        fs::write(nest.join("build/deep/y.o"), b"obj").unwrap();
+
+        let custody = nested_repositories(&source).unwrap();
+        let [found] = custody.as_slice() else {
+            unreachable!("one nest: {custody:?}");
+        };
+        assert_eq!(found.ignored, 4);
+        assert_eq!(
+            found.ignored_sample,
+            vec![
+                b"a.log".to_vec(),
+                b"build/deep/y.o".to_vec(),
+                b"build/x.o".to_vec(),
+                b"odd\n.log".to_vec(),
+            ]
+        );
+        assert_ne!(found.ignored_digest, [0; 32]);
+        let line = found.receipt_line();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains(
+            " ignored-not-carried=4 ignored=\"a.log\" ignored=\"build/deep/y.o\" \
+             ignored=\"build/x.o\" ignored=\"odd\\n.log\""
+        ));
+        assert!(!line.contains("ignored-unlisted"));
+
+        // Any change among ignored entries moves the key.
+        let key = reusable_capture_key(&source).unwrap();
+        assert_eq!(key, reusable_capture_key(&source).unwrap());
+        fs::write(nest.join("a.log"), b"longer log").unwrap();
+        assert_ne!(key, reusable_capture_key(&source).unwrap());
+        let key = reusable_capture_key(&source).unwrap();
+        fs::write(nest.join("b.log"), b"log").unwrap();
+        assert_ne!(key, reusable_capture_key(&source).unwrap());
+
+        // Past the sample the total is still stated, with the unlisted rest.
+        for index in 0..10 {
+            fs::write(nest.join(format!("many-{index:02}.log")), b"log").unwrap();
+        }
+        let custody = nested_repositories(&source).unwrap();
+        let found = custody.first().unwrap();
+        assert_eq!(found.ignored, 15);
+        assert_eq!(found.ignored_sample.len(), NESTED_IGNORED_SAMPLE);
+        assert!(found
+            .receipt_line()
+            .contains(" ignored-not-carried=15 ignored=\"a.log\" "));
+        assert!(found.receipt_line().ends_with(" ignored-unlisted=7"));
+
+        // Not carried, not refused.
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_policy(&source, &capture, None, CapturePolicy::default())
+                .unwrap();
+        assert_eq!(export.nested_repositories, custody);
+        let carried = carried_paths(&capture.join("repository.git"));
+        assert!(!carried.contains(".log"));
+        assert!(!carried.contains("x.o"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // R-N73 B3: a foreign nest whose worktree differs from its HEAD, staged or
     // not, is not custody. Its bytes would not be carried, so it refuses.
     #[test]
@@ -3842,7 +4005,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
         assert_eq!(
             line,
-            "nested-repository path=\"odd\\n\\\"name\\xff\" kind=Directory gitdir=Directory head=unborn unpushed=0 remotes=none"
+            "nested-repository path=\"odd\\n\\\"name\\xff\" kind=Directory gitdir=Directory head=unborn unpushed=0 remotes=none ignored-not-carried=0"
         );
         let gitlink = NestedRepository {
             rel_path: b"lib/vendor".to_vec(),
@@ -3851,6 +4014,9 @@ mod tests {
             gitdir_kind: GitdirKind::None,
             unpushed: 0,
             remotes: false,
+            ignored: 0,
+            ignored_sample: Vec::new(),
+            ignored_digest: [0; 32],
         };
         assert_eq!(
             gitlink.receipt_line(),
@@ -3924,7 +4090,7 @@ mod tests {
             .first()
             .unwrap()
             .receipt_line()
-            .ends_with(" unpushed=0 remotes=none"));
+            .ends_with(" unpushed=0 remotes=none ignored-not-carried=0"));
         assert!(nested_worktrees(&source).unwrap().is_empty());
         let key = reusable_capture_key(&source).unwrap();
         assert_eq!(key, reusable_capture_key(&source).unwrap());
@@ -4086,6 +4252,9 @@ mod tests {
             gitdir_kind: GitdirKind::None,
             unpushed: 0,
             remotes: false,
+            ignored: 0,
+            ignored_sample: Vec::new(),
+            ignored_digest: [0; 32],
         };
         let (_, before_index, gitlinks) = source_index(&source).unwrap();
         assert_eq!(gitlinks, vec![gitlink.clone()]);
@@ -4284,6 +4453,9 @@ mod tests {
             gitdir_kind: GitdirKind::PointerFile,
             unpushed: 0,
             remotes: false,
+            ignored: 0,
+            ignored_sample: Vec::new(),
+            ignored_digest: [0; 32],
         }];
         assert_eq!(nested_repositories(&source).unwrap(), expected);
         let capture = root.join("capture");
