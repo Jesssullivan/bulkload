@@ -73,6 +73,12 @@ pub enum BulkloadRefusal {
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
     GitIgnorePolicyConflict,
+    /// A nested repository holds a stash (`refs/stash` or a non-empty stash
+    /// reflog): work its enclosing capture would not carry (R-N83).
+    GitNestStashed,
+    /// A nested repository's detached HEAD holds commits no local branch,
+    /// tag or remote-tracking ref reaches (R-N83).
+    GitNestDetachedUnreachable,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -143,6 +149,8 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
+            Self::GitNestStashed => "GIT_NEST_STASHED",
+            Self::GitNestDetachedUnreachable => "GIT_NEST_DETACHED_UNREACHABLE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -216,6 +224,8 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
+            BulkloadRefusal::GitNestStashed,
+            BulkloadRefusal::GitNestDetachedUnreachable,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

@@ -1034,8 +1034,9 @@ pub struct NestedRepository {
     pub head_oid: Option<String>,
     /// What the on-disk `.git` is; [`GitdirKind::None`] for a gitlink.
     pub gitdir_kind: GitdirKind,
-    /// Commits reachable from the nest's local branches and from none of its
-    /// remote-tracking refs: work that exists only in this nest. Always 0 for
+    /// Commits reachable from the nest's local branches or its HEAD and from
+    /// none of its remote-tracking refs: work that exists only in this nest
+    /// (R-N73; HEAD included per R-N83). Always 0 for
     /// a gitlink, and 0 when [`Self::remotes`] is false (there is nothing to
     /// compare against, which the receipt says as `remotes=none`).
     pub unpushed: u64,
@@ -1144,6 +1145,9 @@ fn nested_head(directory: &Path) -> Result<Option<String>> {
 // - B3: the nest is clean: `status --porcelain=v2 --untracked-files=all` is
 //   empty, so its worktree is exactly its HEAD and nothing below it is lost
 //   by not walking it. Its unpushed count is recorded with its HEAD.
+// - R-N83 (a): the nest holds no stash (refs/stash absent, stash reflog
+//   empty) and no commit reachable only from a detached HEAD. Each refuses
+//   with its own typed refusal, since both are work the capture would lose.
 fn foreign_nest(
     root: &Path,
     directory: &Path,
@@ -1163,6 +1167,13 @@ fn foreign_nest(
     if tracked_under(root, &rel_path)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    let head_oid = nested_head(directory)?;
+    if nest_has_stash(directory)? {
+        return Err(BulkloadRefusal::GitNestStashed);
+    }
+    if nest_detached_unreachable(directory, head_oid.as_deref())? {
+        return Err(BulkloadRefusal::GitNestDetachedUnreachable);
+    }
     // `--no-optional-locks` (from `git()`) keeps status from refreshing the
     // nest's index: the census never writes to a repository it only names.
     let status = output(git(directory).args([
@@ -1175,35 +1186,99 @@ fn foreign_nest(
     if !status.is_empty() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    let (unpushed, remotes) = unpushed_commits(directory)?;
+    let (unpushed, remotes) = unpushed_commits(directory, head_oid.as_deref())?;
     Ok(NestedRepository {
         rel_path,
         kind: NestedRepositoryKind::Directory,
-        head_oid: nested_head(directory)?,
+        head_oid,
         gitdir_kind,
         unpushed,
         remotes,
     })
 }
 
-// Commits reachable from the nest's local branches and from none of its
-// remote-tracking refs, and whether it has any remote at all. With no remote
-// the count is 0 by definition and the flag says so.
-fn unpushed_commits(directory: &Path) -> Result<(u64, bool)> {
+// Commits reachable from the nest's local branches or its HEAD and from none
+// of its remote-tracking refs, and whether it has any remote at all. HEAD is
+// counted so a detached HEAD that only a local tag reaches cannot hide local
+// work (R-N83). With no remote the count is 0 by definition and the flag
+// says so.
+fn unpushed_commits(directory: &Path, head: Option<&str>) -> Result<(u64, bool)> {
     if output(git(directory).args(["--git-dir=.git", "remote"]))?.is_empty() {
         return Ok((0, false));
     }
-    let count = text(git(directory).args([
+    let mut command = git(directory);
+    command.args(["--git-dir=.git", "rev-list", "--count", "--branches"]);
+    command.args(head);
+    command.args(["--not", "--remotes"]);
+    Ok((count(&mut command)?, true))
+}
+
+fn count(command: &mut Command) -> Result<u64> {
+    text(command)?
+        .parse::<u64>()
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
+}
+
+// R-N83 (a): `refs/stash` present, or a stash reflog with entries. The reflog
+// is read through Git's own path resolution (a linked worktree's lives in its
+// common directory); a backend that reports a reflog without a file (reftable)
+// is taken at its word.
+fn nest_has_stash(directory: &Path) -> Result<bool> {
+    if !output(git(directory).args([
+        "--git-dir=.git",
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/stash",
+    ]))?
+    .is_empty()
+    {
+        return Ok(true);
+    }
+    let log = text(git(directory).args([
+        "--git-dir=.git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "logs/refs/stash",
+    ]))?;
+    match fs::symlink_metadata(&log) {
+        Ok(meta) => return Ok(!meta.is_file() || meta.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let exists = git(directory)
+        .args(["--git-dir=.git", "reflog", "exists", "refs/stash"])
+        .status()?;
+    match exists.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+}
+
+// R-N83 (a): a detached HEAD whose commit no local branch, tag or
+// remote-tracking ref reaches. A detached HEAD Git cannot resolve is
+// malformed inventory, never an unborn one.
+fn nest_detached_unreachable(directory: &Path, head: Option<&str>) -> Result<bool> {
+    let symbolic = git(directory)
+        .args(["--git-dir=.git", "symbolic-ref", "-q", "HEAD"])
+        .output()?;
+    match symbolic.status.code() {
+        Some(0) => return Ok(false),
+        Some(1) => {}
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    let head = head.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(count(git(directory).args([
         "--git-dir=.git",
         "rev-list",
         "--count",
-        "--branches",
+        head,
         "--not",
+        "--branches",
+        "--tags",
         "--remotes",
-    ]))?
-    .parse::<u64>()
-    .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    Ok((count, true))
+    ]))? > 0)
 }
 
 // Whether the enclosing repository's index holds any path at or below `rel`
@@ -3532,6 +3607,130 @@ mod tests {
             text(git(&restored).args(["ls-files", "--stage", "--", "third_party/absent"])).unwrap(),
             format!("160000 {absent} 0\tthird_party/absent")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn refuses_everywhere_with(source: &Path, capture: &Path, refusal: &BulkloadRefusal) {
+        assert_eq!(reusable_capture_key(source).as_ref(), Err(refusal));
+        assert_eq!(nested_repositories(source).as_ref(), Err(refusal));
+        assert_eq!(export_repository(source, capture).as_ref(), Err(refusal));
+    }
+
+    // R-N83 (a): a stash in a nest is work the enclosing capture would not
+    // carry. A nest whose worktree is clean but holds refs/stash, or a
+    // non-empty stash reflog, refuses with the typed stash refusal.
+    #[test]
+    fn a_nest_with_a_stash_refuses_naming_stash() {
+        let root = fresh("bulkload-stashed-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        fs::write(nest.join("tracked"), b"stashed edit").unwrap();
+        output(git(&nest).args(["-c", "commit.gpgsign=false", "stash", "-q"])).unwrap();
+        assert!(output(git(&nest).args(["status", "--porcelain"]))
+            .unwrap()
+            .is_empty());
+        refuses_everywhere_with(
+            &source,
+            &root.join("capture-ref"),
+            &BulkloadRefusal::GitNestStashed,
+        );
+        output(git(&nest).args(["stash", "drop", "-q"])).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        // A stash reflog with entries but no ref still names lost work.
+        fs::create_dir_all(nest.join(".git/logs/refs")).unwrap();
+        fs::write(
+            nest.join(".git/logs/refs/stash"),
+            format!(
+                "{} {} T <t@localhost> 0 +0000\tWIP\n",
+                "0".repeat(40),
+                head_of(&nest)
+            ),
+        )
+        .unwrap();
+        refuses_everywhere_with(
+            &source,
+            &root.join("capture-reflog"),
+            &BulkloadRefusal::GitNestStashed,
+        );
+        // An empty stash reflog is no stash.
+        fs::write(nest.join(".git/logs/refs/stash"), b"").unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N83 (a): a commit reachable only from a detached HEAD would be lost
+    // with the nest. It refuses with the typed detached-unreachable refusal.
+    #[test]
+    fn a_detached_nest_with_an_unreachable_commit_refuses() {
+        let root = fresh("bulkload-detached-unreachable-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        output(git(&nest).args(["checkout", "-q", "--detach"])).unwrap();
+        fs::write(nest.join("tracked"), b"detached work").unwrap();
+        output(git(&nest).args(["add", "tracked"])).unwrap();
+        commit(&nest, "only reachable from HEAD");
+        refuses_everywhere_with(
+            &source,
+            &root.join("capture"),
+            &BulkloadRefusal::GitNestDetachedUnreachable,
+        );
+        // Naming it with a tag makes it reachable, and so custody again.
+        output(git(&nest).args(["tag", "kept"])).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N83 (a): a detached HEAD some branch, tag or remote-tracking ref
+    // reaches is custody, and `unpushed` stays honest: it counts local-only
+    // commits reachable from a branch or from HEAD itself.
+    #[test]
+    fn a_detached_nest_on_a_reachable_commit_is_custody_with_an_honest_count() {
+        let root = fresh("bulkload-detached-reachable-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        output(git(&nest).args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/inner.git",
+        ]))
+        .unwrap();
+        output(git(&nest).args(["update-ref", "refs/remotes/origin/main", &head_of(&nest)]))
+            .unwrap();
+        fs::write(nest.join("tracked"), b"branch work").unwrap();
+        output(git(&nest).args(["add", "tracked"])).unwrap();
+        commit(&nest, "on the branch, not pushed");
+        // Detached at the branch tip: reachable from the branch.
+        output(git(&nest).args(["checkout", "-q", "--detach"])).unwrap();
+        let unpushed = |source: &Path| {
+            nested_repositories(source)
+                .unwrap()
+                .iter()
+                .map(|nest| (nest.unpushed, nest.remotes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unpushed(&source), vec![(1, true)]);
+        // Detached on a commit only a local tag reaches: still custody, and
+        // HEAD's local-only commit is counted rather than hidden.
+        fs::write(nest.join("tracked"), b"tagged work").unwrap();
+        output(git(&nest).args(["add", "tracked"])).unwrap();
+        commit(&nest, "reachable from a tag only");
+        output(git(&nest).args(["tag", "release"])).unwrap();
+        assert_eq!(unpushed(&source), vec![(2, true)]);
+        // Detached on the remote-tracking commit: nothing local-only via HEAD.
+        output(git(&nest).args(["checkout", "-q", "--detach", "origin/main"])).unwrap();
+        assert_eq!(unpushed(&source), vec![(1, true)]);
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_policy(&source, &capture, None, CapturePolicy::default())
+                .unwrap();
+        assert_eq!(export.nested_repositories.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
