@@ -4256,6 +4256,14 @@ mod tests {
             vec![row(DriftKind::SeatRemoved, b"doomed")]
         );
         assert!(!manifest_paths(&root.join("deleted/repository.git")).contains(&b"doomed".to_vec()));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root (as on the Linux CI runner) reads a mode-000 file, so an
+            // unreadable seat cannot be produced by permissions; the refusal
+            // half of this test only has meaning for an unprivileged user.
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
         let locked = source.join("locked");
         let lock = locked.clone();
         mid_pass::arm(&source, move || {
