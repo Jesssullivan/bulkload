@@ -4,8 +4,9 @@
 //! files), minus the fixed rebuildable set in [`REBUILDABLE_DIRECTORIES`], which
 //! is recorded as custody instead of carried. Clean foreign repositories nested
 //! under the worktree and gitlink (submodule) index entries are likewise
-//! recorded as [`NestedRepository`] custody and never carried: each is its own
-//! estate item. A gitlink entry itself stays in the staged tree.
+//! recorded as [`NestedRepository`] custody: their tracked content and history
+//! are never carried (each is its own estate item), their ignored files are
+//! carried as ordinary seats (R-N89). A gitlink entry stays in the staged tree.
 //! This is not Git administration reconstruction. Capture is optimistic, not an
 //! atomic filesystem snapshot.
 
@@ -584,10 +585,13 @@ fn admin_controls(admin: &Path) -> Result<Vec<(String, Option<Vec<u8>>)>> {
 /// # Errors
 /// Refuses unsupported/unmerged indexes and changing refs/index/worktree. A
 /// gitlink (submodule) entry or a clean foreign nested repository is recorded
-/// as [`NestedRepository`] custody, never carried: it is its own capture. A
-/// nest with any staged, unstaged or untracked change, or with paths under it
-/// that this repository tracks, refuses (R-N73). On refusal the private
-/// capture is retained for diagnosis; source state is never changed.
+/// as [`NestedRepository`] custody; its tracked content and history are its
+/// own capture, its ignored files are carried here (R-N89). A nest with any
+/// staged, unstaged or untracked change, hidden index flags, a stash, a
+/// detached-only commit, an operation in progress, filter commands, or paths
+/// under it that this repository tracks refuses (R-N73, R-N83). On refusal
+/// the private capture is retained for diagnosis; source state is never
+/// changed.
 pub fn export_repository(repo: &Path, capture: &Path) -> Result<PathBuf> {
     Ok(export_repository_inner(repo, capture, None, CapturePolicy::default())?.bundle)
 }
@@ -1018,9 +1022,11 @@ pub enum GitdirKind {
 /// A repository nested under the captured checkout that is NOT a registered
 /// worktree of the same repository, or a gitlink entry in its index.
 ///
-/// Its content is never carried by the enclosing capture: nothing below a
-/// directory nest is walked, and the commit a gitlink names is not bundled
-/// (the gitlink entry itself stays in the staged tree, exactly as indexed).
+/// Its tracked content and history are never carried by the enclosing
+/// capture, and the commit a gitlink names is not bundled (the gitlink entry
+/// itself stays in the staged tree, exactly as indexed). A clean directory
+/// nest's ignored files are carried as ordinary seats (R-N89); nothing else
+/// below it is walked.
 /// The nested repository must be its own estate item; this row is the
 /// enclosing capture's custody statement for it (R-N32, R-N73).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -1046,20 +1052,12 @@ pub struct NestedRepository {
     pub unpushed: u64,
     /// Whether the nest has any configured remote. Always false for a gitlink.
     pub remotes: bool,
-    /// Ignored entries inside the nest (`status --ignored`), which are custody
-    /// and never carried (R-N83). Always 0 for a gitlink.
-    pub ignored: u64,
-    /// The first [`NESTED_IGNORED_SAMPLE`] ignored paths, sorted, relative to
-    /// the nest, for the receipt. `ignored` is always the full total.
-    pub ignored_sample: Vec<Vec<u8>>,
-    /// Digest over every ignored path and its lstat identity (size, mtime,
-    /// ctime, inode), so any change among them moves the capture key. All
-    /// zeros when there are none.
-    pub ignored_digest: [u8; 32],
+    /// Ignored files and symlinks inside the nest that this capture carries
+    /// as its own seats (R-N89), beside the checkout's own. Rebuildable roots
+    /// inside the nest are omitted and recorded like the checkout's. Always 0
+    /// for a gitlink.
+    pub ignored_carried: u64,
 }
-
-/// How many ignored paths a nest's receipt line lists by name.
-pub const NESTED_IGNORED_SAMPLE: usize = 8;
 
 impl NestedRepository {
     /// One receipt line naming this nest.
@@ -1075,27 +1073,18 @@ impl NestedRepository {
                 format!("nested-repository path=\"{path}\" kind=Gitlink head={head}")
             }
             NestedRepositoryKind::Directory => {
-                use std::fmt::Write as _;
                 let unpushed = if self.remotes {
                     self.unpushed.to_string()
                 } else {
                     format!("all({})", self.unpushed)
                 };
-                let mut line = format!(
-                    "nested-repository path=\"{path}\" kind=Directory gitdir={:?} admin=\"{}\" head={head} unpushed={unpushed} remotes={} ignored-not-carried={}",
+                format!(
+                    "nested-repository path=\"{path}\" kind=Directory gitdir={:?} admin=\"{}\" head={head} unpushed={unpushed} remotes={} ignored-carried={}",
                     self.gitdir_kind,
                     self.admin.escape_ascii(),
                     if self.remotes { "yes" } else { "none" },
-                    self.ignored,
-                );
-                for ignored in &self.ignored_sample {
-                    let _ = write!(line, " ignored=\"{}\"", ignored.escape_ascii());
-                }
-                let listed = u64::try_from(self.ignored_sample.len()).unwrap_or(u64::MAX);
-                if self.ignored > listed {
-                    let _ = write!(line, " ignored-unlisted={}", self.ignored - listed);
-                }
-                line
+                    self.ignored_carried,
+                )
             }
         }
     }
@@ -1189,9 +1178,10 @@ fn foreign_nest(
     directory: &Path,
     common: &Path,
     outer: &OuterIndex,
+    policy: CapturePolicy,
     rel_path: Vec<u8>,
     gitdir_kind: GitdirKind,
-) -> Result<NestedRepository> {
+) -> Result<(NestedRepository, NestSeats)> {
     let seen = text(git(directory).args([
         "--git-dir=.git",
         "rev-parse",
@@ -1234,7 +1224,7 @@ fn foreign_nest(
     if nest_index_hides_changes(directory)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    // Ignored entries are listed too (R-N83 b): they are custody, not dirt.
+    // Ignored entries are listed too: they are carried seats, not dirt (R-N89).
     let status = output(nest_status(directory)?.args([
         "--git-dir=.git",
         "--work-tree=.",
@@ -1252,19 +1242,174 @@ fn foreign_nest(
             _ => return Err(BulkloadRefusal::GitInventoryMalformed),
         }
     }
-    let (ignored, ignored_sample, ignored_digest) = ignored_custody(directory, ignored)?;
+    let seats = nest_ignored_seats(root, directory, &rel_path, &ignored, policy)?;
     let (unpushed, remotes) = unpushed_commits(directory, head_oid.as_deref())?;
-    Ok(NestedRepository {
-        rel_path,
-        kind: NestedRepositoryKind::Directory,
-        head_oid,
-        gitdir_kind,
-        admin: std::os::unix::ffi::OsStrExt::as_bytes(admin.as_os_str()).to_vec(),
-        unpushed,
-        remotes,
-        ignored,
-        ignored_sample,
-        ignored_digest,
+    Ok((
+        NestedRepository {
+            rel_path,
+            kind: NestedRepositoryKind::Directory,
+            head_oid,
+            gitdir_kind,
+            admin: std::os::unix::ffi::OsStrExt::as_bytes(admin.as_os_str()).to_vec(),
+            unpushed,
+            remotes,
+            ignored_carried: seats.carried,
+        },
+        seats,
+    ))
+}
+
+// The first directory on an ignored path inside a nest that is a rebuildable
+// root: on the fixed list, and the nest tracks nothing beneath it. None when
+// the policy carries the rebuildable set. Answers are cached per prefix.
+fn nest_rebuildable_root(
+    directory: &Path,
+    parts: &[&[u8]],
+    directories: usize,
+    policy: CapturePolicy,
+    cache: &mut std::collections::BTreeMap<Vec<u8>, bool>,
+) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    if policy.include_rebuildable {
+        return Ok(None);
+    }
+    let mut prefix = Vec::new();
+    for part in parts.iter().take(directories) {
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(part);
+        if !REBUILDABLE_DIRECTORIES
+            .iter()
+            .any(|candidate| candidate.as_bytes() == *part)
+        {
+            continue;
+        }
+        let omit = if let Some(omit) = cache.get(&prefix) {
+            *omit
+        } else {
+            let mut pathspec = std::ffi::OsString::from(":(top,literal)");
+            pathspec.push(std::ffi::OsStr::from_bytes(&prefix));
+            let omit = output(
+                git(directory)
+                    .args(["--git-dir=.git", "ls-files", "-z", "--"])
+                    .arg(pathspec),
+            )?
+            .is_empty();
+            cache.insert(prefix.clone(), omit);
+            omit
+        };
+        if omit {
+            return Ok(Some(prefix));
+        }
+    }
+    Ok(None)
+}
+
+// A clean nest's ignored content, as this capture's own seats (R-N89).
+struct NestSeats {
+    // Rows relative to the enclosing checkout: the nest root and every
+    // directory leading to a carried file, then the file or symlink itself.
+    rows: Vec<crate::RowSchema>,
+    // Rebuildable roots inside the nest, omitted exactly as the checkout's own.
+    omitted: Vec<Vec<u8>>,
+    // Carried files and symlinks.
+    carried: u64,
+}
+
+// R-N89: every file `status --ignored` lists in a clean nest is carried the
+// way the enclosing capture carries its own ignored files: as census rows,
+// which raw_tree reads with its fstat sandwich and O_NOFOLLOW, and which
+// restore writes back under the nest path. A path under a rebuildable root
+// inside the nest (a directory on the fixed list the nest tracks nothing
+// beneath) is omitted and recorded instead, unless the policy carries the
+// rebuildable set. An ignored nested repository (a `dir/` entry) outside such
+// a root, a `.git` component, or a listed path that is not what lstat finds
+// refuses: nothing listed is dropped silently.
+fn nest_ignored_seats(
+    root: &Path,
+    directory: &Path,
+    nest: &[u8],
+    ignored: &[Vec<u8>],
+    policy: CapturePolicy,
+) -> Result<NestSeats> {
+    use bulkload_proto::FileKind;
+    use std::os::unix::ffi::OsStrExt;
+    let mut rows = std::collections::BTreeMap::<Vec<u8>, crate::RowSchema>::new();
+    let mut omitted = std::collections::BTreeSet::new();
+    let mut rebuildable = std::collections::BTreeMap::<Vec<u8>, bool>::new();
+    let mut carried = 0u64;
+    let joined = |relative: &[u8]| -> Vec<u8> {
+        let mut path = nest.to_vec();
+        if !relative.is_empty() {
+            path.push(b'/');
+            path.extend_from_slice(relative);
+        }
+        path
+    };
+    let seat = |relative: &[u8],
+                rows: &mut std::collections::BTreeMap<Vec<u8>, crate::RowSchema>|
+     -> Result<FileKind> {
+        let outer = joined(relative);
+        if let Some(row) = rows.get(&outer) {
+            return Ok(row.kind);
+        }
+        let path = root.join(std::ffi::OsStr::from_bytes(&outer));
+        let row = seat_row(&path, &outer, &fs::symlink_metadata(&path)?)?;
+        let kind = row.kind;
+        rows.insert(outer, row);
+        Ok(kind)
+    };
+    for entry in ignored {
+        let (path, is_directory) = entry
+            .strip_suffix(b"/")
+            .map_or((entry.as_slice(), false), |path| (path, true));
+        let parts: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
+        if parts.iter().any(|part| {
+            part.is_empty() || *part == b"." || *part == b".." || part.eq_ignore_ascii_case(b".git")
+        }) {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        let directories = if is_directory {
+            parts.len()
+        } else {
+            parts.len().saturating_sub(1)
+        };
+        if let Some(root) =
+            nest_rebuildable_root(directory, &parts, directories, policy, &mut rebuildable)?
+        {
+            omitted.insert(joined(&root));
+            continue;
+        }
+        if is_directory {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        // The nest root and each directory on the way are seats too, so
+        // restore recreates them with their captured modes.
+        let mut prefix = Vec::new();
+        if seat(&prefix, &mut rows)? != FileKind::Directory {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        for part in parts.iter().take(directories) {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(part);
+            if seat(&prefix, &mut rows)? != FileKind::Directory {
+                return Err(BulkloadRefusal::GitAuthorityChanged);
+            }
+        }
+        if seat(path, &mut rows)? == FileKind::Directory {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        carried = carried
+            .checked_add(1)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    }
+    Ok(NestSeats {
+        rows: rows.into_values().collect(),
+        omitted: omitted.into_iter().collect(),
+        carried,
     })
 }
 
@@ -1420,52 +1565,6 @@ fn filter_drivers(
         }
     }
     Ok(commands)
-}
-
-// R-N83 (b): the total, the receipt sample, and a digest over every ignored
-// path with its lstat identity. An entry that vanishes between status and
-// lstat is hashed as vanished rather than refused: ignored files never refuse.
-fn ignored_custody(
-    directory: &Path,
-    mut ignored: Vec<Vec<u8>>,
-) -> Result<(u64, Vec<Vec<u8>>, [u8; 32])> {
-    use std::os::unix::ffi::OsStrExt;
-    if ignored.is_empty() {
-        return Ok((0, Vec::new(), [0; 32]));
-    }
-    ignored.sort();
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"tcfs-git-nested-ignored-v1\0");
-    for path in &ignored {
-        hash.update(
-            &u64::try_from(path.len())
-                .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-                .to_le_bytes(),
-        );
-        hash.update(path);
-        let relative = path.strip_suffix(b"/").unwrap_or(path);
-        match fs::symlink_metadata(directory.join(std::ffi::OsStr::from_bytes(relative))) {
-            Ok(meta) => {
-                let identity = crate::freshness::StatIdentity::from_metadata(&meta);
-                hash.update(&[1]);
-                for value in [
-                    i128::from(identity.ino),
-                    i128::from(identity.size),
-                    identity.mtime_ns,
-                    identity.ctime_ns,
-                ] {
-                    hash.update(&value.to_le_bytes());
-                }
-            }
-            Err(error) if vanished(&error) => {
-                hash.update(&[0]);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let total = u64::try_from(ignored.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-    ignored.truncate(NESTED_IGNORED_SAMPLE);
-    Ok((total, ignored, *hash.finalize().as_bytes()))
 }
 
 // N2: commits reachable from HEAD or any ref and from none of the nest's
@@ -1712,7 +1811,7 @@ fn tracked_under(root: &Path, rel: &[u8], directory: &Path, outer: &OuterIndex) 
 // One directory below the root whose `.git` classified as custody.
 enum NestedCustody {
     Worktree(NestedWorktree),
-    Repository(NestedRepository),
+    Repository(NestedRepository, NestSeats),
 }
 
 // Reuse the transport's typed filesystem seats instead of treating Git's
@@ -1743,6 +1842,7 @@ fn nested_administration(
     directory: &Path,
     common: &Path,
     outer: &OuterIndex,
+    policy: CapturePolicy,
 ) -> Result<Option<NestedCustody>> {
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
@@ -1762,14 +1862,16 @@ fn nested_administration(
             .to_vec())
     };
     if meta.is_dir() {
-        return Ok(Some(NestedCustody::Repository(foreign_nest(
+        let (custody, seats) = foreign_nest(
             root,
             directory,
             common,
             outer,
+            policy,
             rel_path()?,
             GitdirKind::Directory,
-        )?)));
+        )?;
+        return Ok(Some(NestedCustody::Repository(custody, seats)));
     }
     if !meta.is_file() || meta.len() > GITDIR_POINTER_LIMIT {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -1799,14 +1901,16 @@ fn nested_administration(
     if admin.parent() != Some(worktrees.as_path()) {
         // Not our administration at all: a worktree of another repository, or
         // a populated submodule (`<common>/modules/<name>`).
-        return Ok(Some(NestedCustody::Repository(foreign_nest(
+        let (custody, seats) = foreign_nest(
             root,
             directory,
             common,
             outer,
+            policy,
             rel_path()?,
             GitdirKind::PointerFile,
-        )?)));
+        )?;
+        return Ok(Some(NestedCustody::Repository(custody, seats)));
     }
     let worktree_name = admin
         .file_name()
@@ -1837,10 +1941,44 @@ fn nested_administration(
     })))
 }
 
-fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) -> Result<Census> {
+// One typed filesystem seat from its lstat metadata. Sockets, FIFOs and
+// devices are not seats a capture can carry, and refuse.
+fn seat_row(path: &Path, relative: &[u8], meta: &fs::Metadata) -> Result<crate::RowSchema> {
     use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    let identity = crate::freshness::StatIdentity::from_metadata(meta);
+    let kind = if meta.is_dir() {
+        FileKind::Directory
+    } else if meta.is_file() {
+        FileKind::Regular
+    } else if meta.is_symlink() {
+        FileKind::Symlink
+    } else {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    };
+    Ok(crate::RowSchema {
+        rel_path: relative.to_vec(),
+        kind,
+        dev: identity.dev,
+        ino: identity.ino,
+        size: identity.size,
+        mtime_ns: identity.mtime_ns,
+        ctime_ns: identity.ctime_ns,
+        mode: meta.mode(),
+        nlink: meta.nlink(),
+        link_target: if kind == FileKind::Symlink {
+            Some(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+        } else {
+            None
+        },
+        blake3: None,
+    })
+}
+
+fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) -> Result<Census> {
+    use bulkload_proto::FileKind;
+    use std::os::unix::ffi::OsStrExt;
     let mut pending = vec![root.to_path_buf()];
     let mut rows = Vec::new();
     let mut nested_worktrees = Vec::new();
@@ -1858,25 +1996,16 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
             }
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
-            let identity = crate::freshness::StatIdentity::from_metadata(&meta);
-            let kind = if meta.is_dir() {
-                FileKind::Directory
-            } else if meta.is_file() {
-                FileKind::Regular
-            } else if meta.is_symlink() {
-                FileKind::Symlink
-            } else {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            };
             let relative = path
                 .strip_prefix(root)
                 .map_err(|_| BulkloadRefusal::PathEscapesRoot)?;
-            if kind == FileKind::Directory {
+            let row = seat_row(&path, relative.as_os_str().as_bytes(), &meta)?;
+            if row.kind == FileKind::Directory {
                 // A registered nested worktree or a foreign nested repository is
                 // custody, not seats: no row for its root, no descent, no
                 // contents. Its own item carries them.
                 match common
-                    .map(|common| nested_administration(root, &path, common, &outer))
+                    .map(|common| nested_administration(root, &path, common, &outer, policy))
                     .transpose()?
                     .flatten()
                 {
@@ -1884,8 +2013,12 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
                         nested_worktrees.push(custody);
                         continue;
                     }
-                    Some(NestedCustody::Repository(custody)) => {
+                    Some(NestedCustody::Repository(custody, seats)) => {
+                        // R-N89: the nest's ignored files are this capture's
+                        // seats, exactly like the checkout's own ignored files.
                         nested_repositories.push(custody);
+                        rows.extend(seats.rows);
+                        omitted.extend(seats.omitted);
                         continue;
                     }
                     None => {}
@@ -1900,23 +2033,7 @@ fn filesystem_census(root: &Path, common: Option<&Path>, policy: CapturePolicy) 
                 }
                 pending.push(path.clone());
             }
-            rows.push(crate::RowSchema {
-                rel_path: relative.as_os_str().as_bytes().to_vec(),
-                kind,
-                dev: identity.dev,
-                ino: identity.ino,
-                size: identity.size,
-                mtime_ns: identity.mtime_ns,
-                ctime_ns: identity.ctime_ns,
-                mode: meta.mode(),
-                nlink: meta.nlink(),
-                link_target: if kind == FileKind::Symlink {
-                    Some(fs::read_link(&path)?.as_os_str().as_bytes().to_vec())
-                } else {
-                    None
-                },
-                blake3: None,
-            });
+            rows.push(row);
         }
     }
     rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -2085,9 +2202,7 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
             admin: Vec::new(),
             unpushed: 0,
             remotes: false,
-            ignored: 0,
-            ignored_sample: Vec::new(),
-            ignored_digest: [0; 32],
+            ignored_carried: 0,
         });
     }
     gitlinks.sort();
@@ -3889,9 +4004,7 @@ mod tests {
             admin: Vec::new(),
             unpushed: 0,
             remotes: false,
-            ignored: 0,
-            ignored_sample: Vec::new(),
-            ignored_digest: [0; 32],
+            ignored_carried: 0,
         }
     }
 
@@ -4223,78 +4336,85 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // R-N83 (b): ignored files inside a clean nest are custody: never carried,
-    // never a refusal, always counted and (up to a sample) named in the
-    // receipt, and part of the key so a change among them is visible.
+    // R-N89 (supersedes R-N83 b): ignored files inside a clean nest are
+    // carried exactly as the checkout's own ignored files are, counted in the
+    // receipt, part of the key through their seats, and written back under
+    // the nest path on restore. A rebuildable root inside the nest is still
+    // omitted and recorded. Contents are compared, never printed.
     #[test]
-    fn ignored_files_in_a_clean_nest_are_custody_named_and_keyed() {
+    fn ignored_files_in_a_clean_nest_are_carried_and_restored() {
         let root = fresh("bulkload-ignored-in-nest");
         let source = root.join("outer");
         committed(&source, b"outer");
         let nest = source.join("vendor/inner");
         fs::create_dir_all(&nest).unwrap();
-        fs::write(nest.join(".gitignore"), b"*.log\n/build/\n").unwrap();
+        fs::write(nest.join(".gitignore"), b"*.log\n/build/\n/target/\n").unwrap();
         committed(&nest, b"inner");
         fs::create_dir_all(nest.join("build/deep")).unwrap();
-        fs::write(nest.join("a.log"), b"log").unwrap();
-        fs::write(nest.join("odd\n.log"), b"log").unwrap();
-        fs::write(nest.join("build/x.o"), b"obj").unwrap();
-        fs::write(nest.join("build/deep/y.o"), b"obj").unwrap();
+        fs::create_dir_all(nest.join("target/debug")).unwrap();
+        let carried: [(&str, &[u8]); 4] = [
+            ("a.log", b"log"),
+            ("odd\n.log", b"newline name"),
+            ("build/x.o", b"obj"),
+            ("build/deep/y.o", b"deeper obj"),
+        ];
+        for (path, bytes) in carried {
+            fs::write(nest.join(path), bytes).unwrap();
+        }
+        std::os::unix::fs::symlink("a.log", nest.join("link.log")).unwrap();
+        fs::write(nest.join("target/debug/artifact"), vec![7u8; 4096]).unwrap();
 
-        let custody = nested_repositories(&source).unwrap();
-        let [found] = custody.as_slice() else {
-            unreachable!("one nest: {custody:?}");
-        };
-        assert_eq!(found.ignored, 4);
-        assert_eq!(
-            found.ignored_sample,
-            vec![
-                b"a.log".to_vec(),
-                b"build/deep/y.o".to_vec(),
-                b"build/x.o".to_vec(),
-                b"odd\n.log".to_vec(),
-            ]
-        );
-        assert_ne!(found.ignored_digest, [0; 32]);
-        let line = found.receipt_line();
-        assert_eq!(line.lines().count(), 1);
-        assert!(line.contains(
-            " ignored-not-carried=4 ignored=\"a.log\" ignored=\"build/deep/y.o\" \
-             ignored=\"build/x.o\" ignored=\"odd\\n.log\""
-        ));
-        assert!(!line.contains("ignored-unlisted"));
-
-        // Any change among ignored entries moves the key.
         let key = reusable_capture_key(&source).unwrap();
         assert_eq!(key, reusable_capture_key(&source).unwrap());
         fs::write(nest.join("a.log"), b"longer log").unwrap();
         assert_ne!(key, reusable_capture_key(&source).unwrap());
+        // Rebuildable churn inside the nest does not move the key.
         let key = reusable_capture_key(&source).unwrap();
-        fs::write(nest.join("b.log"), b"log").unwrap();
-        assert_ne!(key, reusable_capture_key(&source).unwrap());
+        fs::write(nest.join("target/debug/artifact"), vec![8u8; 8192]).unwrap();
+        assert_eq!(key, reusable_capture_key(&source).unwrap());
 
-        // Past the sample the total is still stated, with the unlisted rest.
-        for index in 0..10 {
-            fs::write(nest.join(format!("many-{index:02}.log")), b"log").unwrap();
-        }
-        let custody = nested_repositories(&source).unwrap();
-        let found = custody.first().unwrap();
-        assert_eq!(found.ignored, 15);
-        assert_eq!(found.ignored_sample.len(), NESTED_IGNORED_SAMPLE);
-        assert!(found
-            .receipt_line()
-            .contains(" ignored-not-carried=15 ignored=\"a.log\" "));
-        assert!(found.receipt_line().ends_with(" ignored-unlisted=7"));
-
-        // Not carried, not refused.
         let capture = root.join("capture");
         let export =
             export_repository_with_policy(&source, &capture, None, CapturePolicy::default())
                 .unwrap();
-        assert_eq!(export.nested_repositories, custody);
-        let carried = carried_paths(&capture.join("repository.git"));
-        assert!(!carried.contains(".log"));
-        assert!(!carried.contains("x.o"));
+        let [nested] = export.nested_repositories.as_slice() else {
+            unreachable!("one nest");
+        };
+        assert_eq!(nested.ignored_carried, 5);
+        assert!(nested.receipt_line().ends_with(" ignored-carried=5"));
+        assert_eq!(nested.receipt_line().lines().count(), 1);
+        assert_eq!(
+            export
+                .omitted
+                .iter()
+                .map(|omission| omission.rel_path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"vendor/inner/target".as_slice()]
+        );
+        let private = capture.join("repository.git");
+        let paths = carried_paths(&private);
+        assert!(paths.contains("vendor/inner/build/deep/y.o"));
+        assert!(paths.contains("vendor/inner/link.log"));
+        assert!(!paths.contains("target"));
+        assert!(!paths.contains("vendor/inner/tracked"));
+        assert!(!paths.contains(".gitignore"));
+
+        let restored = root.join("restored");
+        restore_bundle(&export.bundle, &restored, "neo").unwrap();
+        let back = restored.join("vendor/inner");
+        for (path, _) in carried {
+            assert!(
+                fs::read(back.join(path)).unwrap() == fs::read(nest.join(path)).unwrap(),
+                "an ignored nest file did not round-trip"
+            );
+        }
+        assert_eq!(
+            fs::read_link(back.join("link.log")).unwrap(),
+            Path::new("a.log")
+        );
+        assert!(!back.join("target").exists());
+        assert!(!back.join("tracked").exists());
+        assert!(!back.join(".git").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4545,7 +4665,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
         assert_eq!(
             line,
-            "nested-repository path=\"odd\\n\\\"name\\xff\" kind=Directory gitdir=Directory admin=\"\" head=unborn unpushed=all(0) remotes=none ignored-not-carried=0"
+            "nested-repository path=\"odd\\n\\\"name\\xff\" kind=Directory gitdir=Directory admin=\"\" head=unborn unpushed=all(0) remotes=none ignored-carried=0"
         );
         let gitlink = NestedRepository {
             rel_path: b"lib/vendor".to_vec(),
@@ -4555,9 +4675,7 @@ mod tests {
             admin: Vec::new(),
             unpushed: 0,
             remotes: false,
-            ignored: 0,
-            ignored_sample: Vec::new(),
-            ignored_digest: [0; 32],
+            ignored_carried: 0,
         };
         assert_eq!(
             gitlink.receipt_line(),
@@ -4637,7 +4755,7 @@ mod tests {
             .first()
             .unwrap()
             .receipt_line()
-            .ends_with(" unpushed=all(1) remotes=none ignored-not-carried=0"));
+            .ends_with(" unpushed=all(1) remotes=none ignored-carried=0"));
         assert!(nested_worktrees(&source).unwrap().is_empty());
         let key = reusable_capture_key(&source).unwrap();
         assert_eq!(key, reusable_capture_key(&source).unwrap());
@@ -4809,9 +4927,7 @@ mod tests {
             admin: Vec::new(),
             unpushed: 0,
             remotes: false,
-            ignored: 0,
-            ignored_sample: Vec::new(),
-            ignored_digest: [0; 32],
+            ignored_carried: 0,
         };
         let (_, before_index, gitlinks) = source_index(&source).unwrap();
         assert_eq!(gitlinks, vec![gitlink.clone()]);
@@ -5821,6 +5937,41 @@ mod review_pr53b {
         } else {
             assert!(v.starts_with("CUSTODY"), "{v}");
         }
+    }
+
+    // R-N89: the reviewer's credential case. `.env` and untracked notes in a
+    // nest whose info/exclude is `*` are ignored, so the nest is clean; both
+    // are carried and round-trip byte-identical. Nothing prints contents.
+    #[test]
+    fn rv_ignored_secret_in_nest_is_carried_and_round_trips() {
+        let (root, outer, inner) = outer_with_pushed_nest("ignored");
+        fs::create_dir_all(inner.join(".git/info")).unwrap();
+        fs::write(inner.join(".git/info/exclude"), b"*\n").unwrap();
+        fs::write(inner.join(".env"), format!("TOK{}=unique-credential", "EN")).unwrap();
+        fs::create_dir(inner.join("notes")).unwrap();
+        fs::write(inner.join("notes/todo.md"), b"unique untracked work").unwrap();
+        let v = verdict(&outer);
+        assert!(v.starts_with("CUSTODY") && v.contains(" ignored-carried=2"));
+        assert!(!v.contains("unique-credential") && !v.contains("unique untracked work"));
+        let capture = root.join("capture");
+        let export = export_repository(&outer, &capture).unwrap();
+        let carried = String::from_utf8(g(
+            &capture.join("repository.git"),
+            &["ls-tree", "-r", "--name-only", "refs/carry-export/worktree"],
+        ))
+        .unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&export, &restored, "neo").unwrap();
+        let same = |path: &str| {
+            fs::read(restored.join("vendor/inner").join(path)).unwrap()
+                == fs::read(inner.join(path)).unwrap()
+        };
+        let (env, notes) = (same(".env"), same("notes/todo.md"));
+        fs::remove_dir_all(root).unwrap();
+        assert!(carried.contains("vendor/inner/.env"));
+        assert!(carried.contains("vendor/inner/notes/todo.md"));
+        assert!(env, ".env did not round-trip");
+        assert!(notes, "notes did not round-trip");
     }
 
     // N4: filter drivers from the nest's own config must not run during the

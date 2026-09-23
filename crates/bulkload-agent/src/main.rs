@@ -82,9 +82,12 @@ BOUNDARIES:
     its size as custody, and carries every other untracked and ignored file.
     --include-rebuildable carries the rebuildable set too, at full fidelity.
     A foreign repository nested in a checkout, or a gitlink, is custody named
-    per nest (path, HEAD, unpushed commits) on git-export stderr and in every
-    estate receipt, never carried; a nest with any staged, unstaged or
-    untracked change, or with outer-tracked paths under it, refuses (R-N73).
+    per nest (path, admin, HEAD, unpushed commits, carried-ignored count) on
+    git-export stderr and in every estate receipt; its tracked content and
+    history are its own item and are not carried, its ignored files are
+    (R-N89). A nest with any staged, unstaged or untracked change, hidden
+    index flags, a stash, a detached-only commit, an operation in progress,
+    filter commands, or outer-tracked paths under it refuses (R-N73, R-N83).
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
 ";
