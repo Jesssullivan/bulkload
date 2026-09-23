@@ -143,10 +143,14 @@ pub fn copy(
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
     let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair()?;
+    // Test-only hang guard. It must exceed the slowest single socket stall in
+    // the suite: the 64 MiB lockstep test blocks one side while the other
+    // persists, fully syncs and re-reads a whole file, which took over 20 s
+    // on neo under load and surfaced as EAGAIN (errno 35) from the timeout.
     #[cfg(test)]
     for stream in [&sender, &receiver] {
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(20)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(300)))?;
     }
     std::thread::scope(|scope| -> Result<TransferStats> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
