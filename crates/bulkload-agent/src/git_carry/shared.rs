@@ -43,7 +43,7 @@ pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
     if !boundary.is_empty() {
         super::metadata(&private, "shallow-frontier-v1", &boundary)?;
     }
-    capture_refs(&repo, &private, &inventory)?;
+    capture_refs(&private, &inventory, &stashes)?;
     set_ref(&private, "refs/carry-export/shared-base-head", &head)?;
     let bundle = capture.join("base.bundle");
     write_bundle(&private, &bundle, None)?;

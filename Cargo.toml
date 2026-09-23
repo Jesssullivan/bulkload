@@ -41,3 +41,13 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# The crash harness (bulkload-agent `fault-injection`) and the transfer tests
+# chunk and hash 64 MiB+ fixtures many times over; unoptimized CDC and BLAKE3
+# dominate their runtime. Optimizing these two leaf crates keeps debug code
+# (and its overflow checks) for the workspace while keeping CI time bounded.
+[profile.dev.package.fastcdc]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
