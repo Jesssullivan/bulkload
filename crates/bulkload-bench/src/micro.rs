@@ -11,7 +11,18 @@
 //! - `flush`: `fsync`, `F_BARRIERFSYNC` and `F_FULLFSYNC` cost on `--dir` as a
 //!   function of dirty bytes (1, 16, 64, 256 MiB).
 //! - `durable`: `pwrite` of `--bytes` (default the R23 corpus size) plus
-//!   `F_BARRIERFSYNC` or `F_FULLFSYNC` on `--dir`: the durable-write floor.
+//!   `F_BARRIERFSYNC` or `F_FULLFSYNC` on `--dir`: the single-file,
+//!   single-flush durable-write floor. It repeats one 8 MiB block.
+//! - `durable-corpus`: the corpus-shaped floor (R-N87). One file per regular
+//!   file of `--source`, at the real sizes, each written with `pwrite` and
+//!   flushed on its own (`F_FULLFSYNC`, or the `F_BARRIERFSYNC` variant), then
+//!   every created directory and the parent are flushed with the same kind.
+//!   Variants are interleaved within each repetition, in an order that
+//!   rotates per repetition. `--read-source` includes reading the source
+//!   bytes; without it the writer repeats one 8 MiB block. Source page-cache
+//!   residency (`mincore`) is reported before every sample. Whether
+//!   `F_FULLFSYNC` reaches media on a given enclosure is not proven by this
+//!   benchmark.
 //!
 //! CPU items (`cdc`, `blake3`, `socket`) run once per core class. On Darwin a
 //! thread asks for P-cores with `QOS_CLASS_USER_INTERACTIVE` and for E-cores
@@ -27,7 +38,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
@@ -49,6 +60,16 @@ enum Name {
     Socket,
     Flush,
     Durable,
+    DurableCorpus,
+}
+
+/// Per-file flush kind for `durable-corpus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CorpusVariant {
+    /// `F_FULLFSYNC` per file and per directory.
+    Full,
+    /// `F_BARRIERFSYNC` per file and per directory.
+    Barrier,
 }
 
 /// Core class requested through Darwin `QoS`.
@@ -104,6 +125,18 @@ struct MicroCli {
     /// Threads for the E-class aggregate row (neo, A18 Pro: 4).
     #[arg(long, default_value_t = 4)]
     e_cores: usize,
+    /// Corpus whose regular-file sizes shape `durable-corpus` (read-only).
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// `durable-corpus`: read the source bytes and write them (timed).
+    #[arg(long)]
+    read_source: bool,
+    /// `durable-corpus` variants, interleaved within each repetition.
+    #[arg(long, value_enum, num_args = 1.., default_values_t = [CorpusVariant::Full, CorpusVariant::Barrier])]
+    variant: Vec<CorpusVariant>,
+    /// `durable-corpus` writer threads; files are striped across them.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 }
 
 /// Run `bulkload-bench micro …`; `args` begins with the word `micro`.
@@ -122,6 +155,7 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
         Name::Socket => socket(&cli),
         Name::Flush => flush(&cli),
         Name::Durable => durable(&cli),
+        Name::DurableCorpus => durable_corpus(&cli),
     }
 }
 
@@ -756,6 +790,302 @@ fn durable(cli: &MicroCli) -> io::Result<()> {
     Ok(())
 }
 
+// --- (e') corpus-shaped durable floor (R-N87) ------------------------------
+
+/// One regular file of the shaping corpus: relative path and size.
+struct Shape {
+    relative: PathBuf,
+    size: u64,
+}
+
+/// Regular files under `root`, sorted by path. Only metadata is read.
+fn corpus_shape(root: &Path) -> io::Result<(Vec<Shape>, Vec<PathBuf>)> {
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        for entry in fs::read_dir(root.join(&relative))? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let child = relative.join(entry.file_name());
+            if kind.is_dir() {
+                directories.push(child.clone());
+                pending.push(child);
+            } else if kind.is_file() {
+                files.push(Shape {
+                    relative: child,
+                    size: entry.metadata()?.len(),
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    directories.sort();
+    Ok((files, directories))
+}
+
+/// Resident and total pages of `path` in the page cache (`mincore`).
+fn residency(path: &Path) -> io::Result<(u64, u64)> {
+    let file = File::open(path)?;
+    let length = usize_bytes(file.metadata()?.len())?;
+    if length == 0 {
+        return Ok((0, 0));
+    }
+    // SAFETY: sysconf has no memory effects; _SC_PAGESIZE is always valid.
+    let page =
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).map_err(io::Error::other)?;
+    let pages = length.div_ceil(page.max(1));
+    let mut vector = vec![0_u8; pages];
+    // SAFETY: a read-only shared mapping of an open descriptor for exactly its
+    // length. Nothing reads or writes through it; it is unmapped below.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if address == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `address`/`length` describe the live mapping created above, and
+    // `vector` holds one writable byte per page of it. mincore faults nothing in.
+    let status = unsafe { libc::mincore(address, length, vector.as_mut_ptr().cast()) };
+    let queried = if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    // SAFETY: unmaps exactly the mapping created above; it is not used again.
+    unsafe { libc::munmap(address, length) };
+    queried?;
+    let resident = vector.iter().filter(|byte| **byte & 1 != 0).count();
+    Ok((resident as u64, pages as u64))
+}
+
+/// Page-cache residency of every shaping file, as a fraction.
+fn corpus_residency(source: &Path, files: &[Shape]) -> io::Result<f64> {
+    let mut resident = 0_u64;
+    let mut total = 0_u64;
+    for shape in files {
+        let (hit, pages) = residency(&source.join(&shape.relative))?;
+        resident += hit;
+        total += pages;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Ok(if total == 0 {
+        1.0
+    } else {
+        resident as f64 / total as f64
+    })
+}
+
+#[derive(Default)]
+struct CorpusTimes {
+    read: Duration,
+    write: Duration,
+    file_flush: Duration,
+}
+
+/// Write (and optionally read) the files assigned to one writer, flushing each.
+fn write_corpus_files(
+    source: &Path,
+    destination: &Path,
+    files: &[&Shape],
+    block: &[u8],
+    read_source: bool,
+    kind: Flush,
+) -> io::Result<CorpusTimes> {
+    let mut times = CorpusTimes::default();
+    let mut buffer = vec![0_u8; WRITE_BLOCK];
+    for shape in files {
+        let mut input = if read_source {
+            Some(File::open(source.join(&shape.relative))?)
+        } else {
+            None
+        };
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination.join(&shape.relative))?;
+        let mut offset = 0_u64;
+        while offset < shape.size {
+            let count = usize_bytes((shape.size - offset).min(WRITE_BLOCK as u64))?;
+            let data = if let Some(input) = input.as_mut() {
+                let started = Instant::now();
+                let slice = buffer
+                    .get_mut(..count)
+                    .ok_or_else(|| io::Error::other("read buffer bounds"))?;
+                input.read_exact(slice)?;
+                times.read += started.elapsed();
+                &*slice
+            } else {
+                block.get(..count).unwrap_or(block)
+            };
+            let started = Instant::now();
+            output.write_all_at(data, offset)?;
+            times.write += started.elapsed();
+            offset += count as u64;
+        }
+        let started = Instant::now();
+        flush_once(&output, kind)?;
+        times.file_flush += started.elapsed();
+    }
+    Ok(times)
+}
+
+struct CorpusSample {
+    times: CorpusTimes,
+    dir_flush: Duration,
+    total: Duration,
+}
+
+fn corpus_sample(
+    cli: &MicroCli,
+    source: &Path,
+    shape: &(Vec<Shape>, Vec<PathBuf>),
+    root: &Path,
+    kind: Flush,
+) -> io::Result<CorpusSample> {
+    let (files, directories) = shape;
+    let block = random_bytes(WRITE_BLOCK, 0xc0de);
+    let jobs = cli.jobs.clamp(1, 16);
+    let started = Instant::now();
+    fs::DirBuilder::new().mode(0o700).create(root)?;
+    for directory in directories {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join(directory))?;
+    }
+    let times = std::thread::scope(|scope| -> io::Result<CorpusTimes> {
+        let mut handles = Vec::with_capacity(jobs);
+        for job in 0..jobs {
+            let assigned: Vec<&Shape> = files.iter().skip(job).step_by(jobs).collect();
+            let block = &block;
+            handles.push(scope.spawn(move || {
+                write_corpus_files(source, root, &assigned, block, cli.read_source, kind)
+            }));
+        }
+        let mut sum = CorpusTimes::default();
+        let mut failure = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(times)) => {
+                    sum.read += times.read;
+                    sum.write += times.write;
+                    sum.file_flush += times.file_flush;
+                }
+                Ok(Err(error)) => failure = Some(error),
+                Err(_) => failure = Some(io::Error::other("corpus writer panicked")),
+            }
+        }
+        failure.map_or(Ok(sum), Err)
+    })?;
+    let flushing = Instant::now();
+    for directory in directories.iter().rev() {
+        flush_once(&File::open(root.join(directory))?, kind)?;
+    }
+    flush_once(&File::open(root)?, kind)?;
+    flush_once(&File::open(root.parent().unwrap_or(root))?, kind)?;
+    let dir_flush = flushing.elapsed();
+    Ok(CorpusSample {
+        times,
+        dir_flush,
+        total: started.elapsed(),
+    })
+}
+
+fn summary(values: &mut [f64]) -> (f64, f64, f64) {
+    values.sort_by(f64::total_cmp);
+    let min = values.first().copied().unwrap_or(0.0);
+    let max = values.last().copied().unwrap_or(0.0);
+    (min, median(values), max)
+}
+
+fn durable_corpus(cli: &MicroCli) -> io::Result<()> {
+    let dir = volume_dir(cli)?;
+    let source = fs::canonicalize(
+        cli.source
+            .as_ref()
+            .ok_or_else(|| io::Error::other("--source is required for durable-corpus"))?,
+    )?;
+    if dir.starts_with(&source) || source.starts_with(&dir) {
+        return Err(io::Error::other("--dir and --source must be disjoint"));
+    }
+    let shape = corpus_shape(&source)?;
+    let bytes = shape.0.iter().map(|file| file.size).sum::<u64>();
+    let mut variants = cli.variant.clone();
+    variants.dedup();
+    let kinds: Vec<Flush> = variants
+        .iter()
+        .map(|variant| match variant {
+            CorpusVariant::Full => Flush::Full,
+            CorpusVariant::Barrier => Flush::Barrier,
+        })
+        .collect();
+    println!(
+        "micro_assumptions name=durable-corpus dir={} source={} files={} directories={} bytes={bytes} read_source={} jobs={} write_block={WRITE_BLOCK} payload={} page_cache=not-dropped dest=fresh-directory-per-sample drain=untimed-f_fullfsync-before-sample file_flush=per-file dir_flush=every-created-directory-plus-parent order=rotating-per-rep cleanup=untimed-unlink media_durability_of_f_fullfsync=unproven-on-this-enclosure",
+        dir.display(),
+        source.display(),
+        shape.0.len(),
+        shape.1.len(),
+        cli.read_source,
+        cli.jobs.clamp(1, 16),
+        if cli.read_source {
+            "source-bytes"
+        } else {
+            "one-repeated-8mib-random-block"
+        },
+    );
+    let mut totals: Vec<Vec<f64>> = vec![Vec::new(); kinds.len()];
+    for rep in 0..cli.reps {
+        for step in 0..kinds.len() {
+            let index = (rep + step) % kinds.len();
+            let Some(kind) = kinds.get(index).copied() else {
+                continue;
+            };
+            drain(&dir)?;
+            let resident = corpus_residency(&source, &shape.0)?;
+            let root = dir.join(format!(
+                ".bulkload-micro-corpus-{}-{rep}-{step}",
+                std::process::id()
+            ));
+            let measured = corpus_sample(cli, &source, &shape, &root, kind);
+            let removed = fs::remove_dir_all(&root);
+            let sample = measured?;
+            removed?;
+            let total = millis(sample.total);
+            if let Some(list) = totals.get_mut(index) {
+                list.push(total);
+            }
+            println!(
+                "micro name=durable-corpus variant={} rep={rep} order={step} files={} bytes={bytes} read_source={} source_resident_fraction_before={resident:.4} read_ms={:.3} write_ms={:.3} file_flush_ms={:.3} dir_flush_ms={:.3} total_ms={total:.3}",
+                kind.label(),
+                shape.0.len(),
+                cli.read_source,
+                millis(sample.times.read),
+                millis(sample.times.write),
+                millis(sample.times.file_flush),
+                millis(sample.dir_flush),
+            );
+        }
+    }
+    for (kind, list) in kinds.iter().zip(totals.iter_mut()) {
+        let (min, middle, max) = summary(list);
+        println!(
+            "micro_summary name=durable-corpus variant={} reps={} read_source={} min_ms={min:.3} median_ms={middle:.3} max_ms={max:.3}",
+            kind.label(),
+            list.len(),
+            cli.read_source,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +1116,57 @@ mod tests {
         ]))?;
         assert_eq!(fs::read_dir(dir.path())?.count(), 0);
         assert!(run(&args(&["micro", "flush"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn residency_counts_pages_of_a_file() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("resident");
+        fs::write(&path, random_bytes(3 * 16384 + 1, 3))?;
+        let (resident, pages) = residency(&path)?;
+        assert!(pages >= 1);
+        assert!(resident <= pages);
+        fs::write(dir.path().join("empty"), b"")?;
+        assert_eq!(residency(&dir.path().join("empty"))?, (0, 0));
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn durable_corpus_mirrors_shape_and_leaves_no_scratch() -> io::Result<()> {
+        let source = tempfile::tempdir()?;
+        fs::create_dir(source.path().join("nested"))?;
+        fs::write(source.path().join("a"), random_bytes(70_000, 1))?;
+        fs::write(source.path().join("nested/b"), random_bytes(1_000, 2))?;
+        fs::write(source.path().join("nested/empty"), b"")?;
+        let (files, directories) = corpus_shape(source.path())?;
+        assert_eq!(files.len(), 3);
+        assert_eq!(directories, vec![PathBuf::from("nested")]);
+        let target = tempfile::tempdir()?;
+        let dir = target
+            .path()
+            .to_str()
+            .ok_or_else(|| io::Error::other("path"))?;
+        let src = source
+            .path()
+            .to_str()
+            .ok_or_else(|| io::Error::other("path"))?;
+        for extra in [&[][..], &["--read-source", "--jobs", "2"][..]] {
+            let mut words = vec![
+                "micro",
+                "durable-corpus",
+                "--dir",
+                dir,
+                "--source",
+                src,
+                "--reps",
+                "2",
+            ];
+            words.extend_from_slice(extra);
+            run(&args(&words))?;
+        }
+        assert_eq!(fs::read_dir(target.path())?.count(), 0);
         Ok(())
     }
 
