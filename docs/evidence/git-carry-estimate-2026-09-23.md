@@ -4,8 +4,8 @@ Lane W6-M0 of Bulkload M2 (bulkload#48, Linear TIN-4545). Ruling R-N60 sets
 this as the measurement baseline for negotiated thin packs. Rulings R-N74
 (the thin-pack gate metric) and R-N75 (refuse destinations whose refs do not
 prove their history) followed the PR #55 review, and this page was re-measured
-under them. R-N97 then replaced the equal-count half of the R-N74 gate: the
-estimate is an upper bound, and exactness is checked against `git fetch`.
+under them. R-N97 then replaced the equal-count half of the R-N74 gate. R-N113
+fixed M1's first-round have set and the exactness oracle.
 
 ## Verdict
 
@@ -20,14 +20,29 @@ objects (`missing_bytes_disk`) is 15.049 MB. The thin pack is smaller because it
 deltas against objects sting already holds. crs310-8g-2s-in shows this most
 clearly: 0.449 MB thin against 3.550 MB stored.
 
-**The W6 M1 gate is now (R-N97):** for the same source and destination state,
-sent bytes ≤ 1.1× `missing_thin_pack_bytes`, and sent objects ≤
-`missing_objects`. The estimate is an upper bound: it models the first
-negotiation round only, and ancestor probing (`GitHaveQuery`) can only shrink
-the pack. Exactness is checked against Git itself: on every fixture, M1's sent
-object set must equal what a real `git fetch` with the same haves sends. The
-M1 sender must pin `pack.useSparse=false` and `pack.useBitmaps=false`, as the
-estimate does.
+**The W6 M1 gate (R-N97, R-N113):**
+
+- **Bound:** for the same source and destination state, sent bytes ≤ 1.1×
+  `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`.
+- **Haves:** M1's first round sends *exactly* the destination's held tips
+  (every destination tip the source holds) as haves.
+- **Oracle:** the exactness oracle is upload-pack run over exactly that have
+  set, not `git fetch`'s newest-first negotiation. The estimate equals it up to
+  have order: dropping a have implied by a child have gives upload-pack's
+  largest pack.
+- **Extra haves can enlarge a shallow pack.** upload-pack drops a have that
+  another have implies, and the shallow walk marks only the trees of the haves
+  it keeps. In reviewer fixture A3, offering the intermediate parent too grew
+  the pack from 232 B to 3,919 B. Ancestor probing (`GitHaveQuery`) must not
+  add haves to a shallow destination's first round.
+- **Pins:** the M1 sender must pin, as the estimate does:
+  - `pack.useSparse=false`
+  - `pack.useBitmaps=false`
+  - `pack.threads=2`
+  - `pack.windowMemory=64m`
+
+  A bitmapped sender that left bitmaps on would pack *fewer* objects than the
+  walk (W6 M1 spike, bulkload#64), so the estimate stays an upper bound for it.
 
 The cohort-1 history on disk is 1,467.49 MB (informational), so the carry
 moves 0.58 % of it. No pair was refused (R-N75): blahaj is shallow on both
@@ -134,9 +149,9 @@ so its row mixes new source state with the corrected model. blahaj details:
   | This verb: upload-pack's shallow model | **32** | **14,826** |
   | Every held tip kept as a have, `--shallow` | 30 | 14,644 |
 
-  The last model is what upload-pack sends if the client offers every
-  parent before its child. The verb's figure is the upper bound across have
-  orders (R-N97).
+  The last model is what upload-pack sends over every held tip when each
+  parent arrives before its child. The verb's figure is upload-pack's largest
+  pack over the held tips, across have orders (R-N113).
 - **Earlier figure:** the r2 review's 20 objects / 10,146 B was measured on
   the pre-commit state, so it is not comparable.
 - **No writes:** a scan after the run found no file under blahaj's git dir
@@ -168,8 +183,10 @@ so its row mixes new source state with the corrected model. blahaj details:
 
   glorious.build's other 15 are sting-native branches, such as
   `codex/pretext-scan-integration-proof`. The estimate does not probe the
-  ancestors of unknown tips (`GitHaveQuery` belongs to M1), so this is the
-  first-round, conservative figure.
+  ancestors of unknown tips (`GitHaveQuery` belongs to M1). This is the
+  first-round figure over exactly the held tips (R-N113). Extra haves change
+  the result: they shrink a non-shallow pack, and they can enlarge a shallow
+  one.
 - **blahaj** is shallow on both sides at the same frontier, `bf9acf31`, so
   R-N75 lets it estimate. A differing frontier would refuse with
   `GIT_HAVES_UNPROVABLE`.
@@ -242,14 +259,17 @@ The verb uses every destination ref, as the v2 negotiation does.
 
 ## Reading the result for M1
 
-- **Gate (R-N97, replacing the equal-count half of R-N74):**
+- **Gate (R-N97, R-N113):**
   - For the same source and destination state, sent bytes ≤ 1.1×
     `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`.
     `missing_thin_pack_objects` always equals `missing_objects`.
-  - Exactness is checked against Git, not against the estimate: on every
-    fixture, M1's sent object set must equal a real `git fetch` with the same
-    haves.
-  - The M1 sender pins `pack.useSparse=false` and `pack.useBitmaps=false`.
+  - M1's first round sends exactly the held tips as haves.
+  - On every fixture, M1's sent object set must equal what upload-pack sends
+    over exactly that have set. That is the oracle, not `git fetch`: in
+    reviewer fixture B, `git fetch` stops negotiating before it offers an old
+    held tip and sends more.
+  - The M1 sender pins `pack.useSparse=false`, `pack.useBitmaps=false`,
+    `pack.threads=2` and `pack.windowMemory=64m`.
   - Measure both sides in the same window: bulkload, glorious.build and blahaj
     moved between the runs on this page.
 - `missing_bytes_disk` and `source_history_bytes` are informational. A stored

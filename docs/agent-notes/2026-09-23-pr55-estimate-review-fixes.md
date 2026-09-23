@@ -42,3 +42,18 @@
 - **Build:** own `CARGO_TARGET_DIR`
   (`cargo-target-bulkload-m2-w6-estimate`), so there is no shared-target
   staleness.
+
+## r3 (same day): BLOCK at `7680da6` on the upper-bound claim
+
+- **R-N113:** M1's first round sends exactly the held tips as haves. The
+  exactness oracle is upload-pack over exactly that set; the tests use a Rust
+  port of the reviewer's `oracle_upload_pack.py`.
+- **Correction to r2's claim:** "ancestor probing can only shrink the pack" was
+  false for shallow destinations. An extra have can enlarge the pack (fixture
+  A3: 232 B → 3,919 B). The module doc and the evidence doc are corrected.
+- **Fixtures A3 and B** are ported as regression tests. Per the coordinator,
+  the parent-drop rule stays; R3-3 (`merge-base --independent`) was dropped.
+- **R3-2 redaction:** all 11 leaks are fixed, and a PEM rule is added. The
+  U+0085 path refusal code is deferred as cosmetic.
+- **R3-4:** M1 must pin `pack.threads` and `pack.windowMemory`.
+- **Spike #64:** a bitmapped sender packs fewer objects than the walk.
