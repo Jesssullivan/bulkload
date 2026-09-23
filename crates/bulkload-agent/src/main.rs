@@ -642,6 +642,12 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     for (path, code) in &stats.refusals {
         eprintln!("refused {}: {code}", path.escape_ascii());
     }
+    if stats.temporaries_removed > 0 {
+        eprintln!("temporaries-removed {}", stats.temporaries_removed);
+    }
+    for path in &stats.temporaries_left {
+        eprintln!("temporary-left {}", path.escape_ascii());
+    }
     if stats.refusals.is_empty() {
         Ok(())
     } else {
@@ -768,6 +774,10 @@ fn walk_command(root: &Path) -> Result<()> {
     let outcome = walk::walk(&options, &mut cache)?;
     println!("rows                     {}", outcome.rows.len());
     println!("refusals                 {}", outcome.refusals.len());
+    println!(
+        "engine_temporaries       {}",
+        outcome.engine_temporaries.len()
+    );
     println!("seats_seen               {}", outcome.stats.seats_seen);
     println!("bytes_seen               {}", outcome.stats.bytes_seen);
     println!("fresh_skipped            {}", outcome.stats.fresh_skipped);

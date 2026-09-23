@@ -63,12 +63,16 @@
 //! | `materialize.after_link` | the final name linked to the synced temporary; parent not synced |
 //! | `materialize.after_parent_sync` | the link durable; the temporary name still present |
 //!
+//! Every temporary one of these leaves carries the destination store's tag and
+//! is removed by the next invocation's sweep; see `materialize`.
+//!
 //! Directory publication, in `Destination::directory` and `finish_directories`:
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `directory.after_mkdir` | a new 0700 directory with no pending-directory record |
-//! | `directory.after_pending_record` | the 0700 directory and its pending record |
+//! | `directory.after_intent` | a pending-directory intent record and no directory |
+//! | `directory.after_mkdir` | a new 0700 directory whose intent record names no inode yet |
+//! | `directory.after_pending_record` | the 0700 directory and its record bound to that inode |
 //! | `directory.before_complete` | the final mode applied and synced; the pending record still present |
 //!
 //! Protocol boundaries, in `transfer`:
@@ -142,6 +146,8 @@ pub enum Point {
     MaterializeAfterLink,
     /// `materialize.after_parent_sync`
     MaterializeAfterParentSync,
+    /// `directory.after_intent`
+    DirectoryAfterIntent,
     /// `directory.after_mkdir`
     DirectoryAfterMkdir,
     /// `directory.after_pending_record`
@@ -168,7 +174,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::PublishSourceAfterAppend,
         Self::PublishSourceAfterPackSync,
         Self::PublishSourceAfterLocationInsert,
@@ -185,6 +191,7 @@ impl Point {
         Self::MaterializeAfterTempSync,
         Self::MaterializeAfterLink,
         Self::MaterializeAfterParentSync,
+        Self::DirectoryAfterIntent,
         Self::DirectoryAfterMkdir,
         Self::DirectoryAfterPendingRecord,
         Self::DirectoryBeforeComplete,
@@ -222,6 +229,7 @@ impl Point {
             Self::MaterializeAfterTempSync => "materialize.after_temp_sync",
             Self::MaterializeAfterLink => "materialize.after_link",
             Self::MaterializeAfterParentSync => "materialize.after_parent_sync",
+            Self::DirectoryAfterIntent => "directory.after_intent",
             Self::DirectoryAfterMkdir => "directory.after_mkdir",
             Self::DirectoryAfterPendingRecord => "directory.after_pending_record",
             Self::DirectoryBeforeComplete => "directory.before_complete",

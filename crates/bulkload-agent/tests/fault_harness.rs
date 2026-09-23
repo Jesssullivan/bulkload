@@ -14,6 +14,9 @@
 //!   hashes to the committed source manifest for that path;
 //! - **I2** no destination leaf under a final name holds partial content, and
 //!   `.bulkload-*` temporaries are the only extra names;
+//! - **I4** (R-N79) after the resume no `.bulkload-*` temporary remains: the
+//!   sweep removed exactly the ones the crash left and recorded none as
+//!   ambiguous;
 //! - **I3** the resume reads exactly the source bytes of files that had neither
 //!   an output record nor a committed capture before the crash, so every
 //!   committed file costs 0 source bytes;
@@ -38,10 +41,11 @@
 //! the v3 engine breaks today (R-N86). They are listed, not fixed, and never
 //! count as coverage:
 //!
-//! - `directory_after_mkdir`: a crash between `mkdirat` and the pending
-//!   directory record never converges.
 //! - `live_writer_*_leaves_no_source_index`: a refused capture leaves the
 //!   victim's chunks and committed `chunk_locations` rows in the source store.
+//!
+//! Every `materialize.*` point must leave at least one temporary at the crash,
+//! so I4 is exercised, not vacuous, at each of them.
 //!
 //! # Live writer
 //!
@@ -71,8 +75,10 @@ use std::time::{Duration, Instant};
 use bulkload_agent::fault::{
     parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV,
 };
+use bulkload_agent::freshness::NullCache;
 use bulkload_agent::transfer::{copy, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
+use bulkload_agent::walk::{walk, WalkOptions};
 use bulkload_proto::{BulkloadRefusal, RowSchema};
 
 /// `transfer_store::PERSIST_BATCH` (crate-private): chunks per durable batch.
@@ -568,6 +574,26 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     assert_i1(&format!("{label} resumed"), &scratch, &after);
     let temporaries = assert_i2(&format!("{label} resumed"), &scratch);
     assert_complete(&label, &scratch, fixture, &files, &after);
+    // I4: the sweep leaves no temporary behind and removes only the crash's.
+    if point.name().starts_with("materialize.") {
+        assert!(
+            crash_temporaries >= 1,
+            "{label}: a materialize crash must leave a temporary for I4 to sweep"
+        );
+    }
+    assert_eq!(
+        temporaries, 0,
+        "{label} I4: a temporary survived the resume"
+    );
+    assert_eq!(
+        resumed.temporaries_removed, crash_temporaries as u64,
+        "{label} I4: the sweep must remove exactly the crash's temporaries"
+    );
+    assert!(
+        resumed.temporaries_left.is_empty(),
+        "{label} I4: nothing here is ambiguous, yet {:?} was left",
+        resumed.temporaries_left
+    );
     println!(
         "{label}: outputs_before={} captures_before={} temporaries_at_crash={crash_temporaries} \
          resume_completed={} resume_reused={} resume_source_bytes={} resume_bytes_received={} \
@@ -646,6 +672,8 @@ scenarios! {
     materialize_after_temp_sync_mid => MaterializeAfterTempSync: 25, WITH_REFUSAL;
     materialize_after_link_mid => MaterializeAfterLink: 25, WITH_REFUSAL;
     materialize_after_parent_sync_mid => MaterializeAfterParentSync: 25, WITH_REFUSAL;
+    directory_after_intent => DirectoryAfterIntent: 1, NO_REFUSAL;
+    directory_after_mkdir => DirectoryAfterMkdir: 1, NO_REFUSAL;
     directory_after_pending_record => DirectoryAfterPendingRecord: 1, NO_REFUSAL;
     directory_before_complete => DirectoryBeforeComplete: 1, NO_REFUSAL;
     serve_after_publish_group_first => ServeAfterPublishGroup: 1, WITH_REFUSAL;
@@ -693,7 +721,7 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
 
 /// Points whose only crash-resume scenario is an `#[ignore]`d known-violation
 /// test. They are listed here and never counted as coverage.
-const KNOWN_VIOLATIONS: [Point; 1] = [Point::DirectoryAfterMkdir];
+const KNOWN_VIOLATIONS: [Point; 0] = [];
 
 /// Every point is exercised by a passing (non-ignored) scenario in the
 /// `scenarios!` table, or is listed in [`KNOWN_VIOLATIONS`] — never both.
@@ -732,19 +760,81 @@ fn every_fault_point_has_a_scenario() {
     }
 }
 
-/// VIOLATION in the v3 engine (TIN-4546), recorded rather than fixed.
-///
-/// `Destination::directory` creates the directory 0700 with `mkdirat`, then
-/// records ownership with `pending_directory`. A crash between the two leaves
-/// a 0700 directory with no pending record. On resume `mkdirat` meets EEXIST,
-/// finds no record, compares 0700 with the source mode and refuses the
-/// directory `GIT_DESTINATION_OCCUPIED`. The refusal also blocks
-/// `finish_directories` for the whole run, so the carry never converges and
-/// the directory keeps mode 0700. I1/I2/I3 still hold; convergence does not.
+/// R-N79: after `materialize.after_link` the orphan is a second hard link to a
+/// published output. A walk of the crashed destination records it and never
+/// carries it, onward carry included; the resume unlinks the temporary name
+/// alone, and the published name keeps its inode and content.
 #[test]
-#[ignore = "v3 violation: crash between mkdirat and the pending-directory record never converges"]
-fn directory_after_mkdir() {
-    crash_resume(Point::DirectoryAfterMkdir, 1, NO_REFUSAL);
+fn materialize_after_link_sweeps_only_the_temporary_name() {
+    let label = format!("{}:25", Point::MaterializeAfterLink.name());
+    let scratch = Scratch::new("after-link-sweep");
+    populate(&scratch.source(), WITH_REFUSAL);
+    crash_child(&scratch, Point::MaterializeAfterLink, &label);
+
+    let destination = scratch.destination();
+    let crashed = tree(&destination);
+    let orphans: Vec<(&Vec<u8>, &fs::Metadata)> = crashed
+        .iter()
+        .filter(|(path, _)| is_temporary(path))
+        .collect();
+    assert_eq!(orphans.len(), 1, "{label}: exactly one orphan");
+    let (orphan, orphan_meta) = orphans[0];
+    assert_eq!(
+        orphan_meta.nlink(),
+        2,
+        "{label}: the orphan is a second link"
+    );
+    let published: Vec<&Vec<u8>> = crashed
+        .iter()
+        .filter(|(path, metadata)| {
+            !is_temporary(path) && metadata.is_file() && metadata.ino() == orphan_meta.ino()
+        })
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(published.len(), 1, "{label}: one published name shares it");
+    let published = published[0].clone();
+
+    // No walk carries the orphan: the census records it instead of a row.
+    let census = walk(
+        &WalkOptions::new(fs::canonicalize(&destination).unwrap()),
+        &mut NullCache,
+    )
+    .unwrap();
+    assert!(
+        census.rows.iter().all(|row| !is_temporary(&row.rel_path)),
+        "{label}: the walk offered a temporary as a row"
+    );
+    assert_eq!(census.engine_temporaries, vec![orphan.clone()]);
+    let onward = scratch.base.join("onward");
+    fs::create_dir(&onward).unwrap();
+    let carried = copy(
+        &destination,
+        &onward,
+        &scratch.base.join("onward-source-state"),
+        &scratch.base.join("onward-destination-state"),
+    )
+    .unwrap();
+    assert!(carried.refusals.is_empty(), "{:?}", carried.refusals);
+    assert!(
+        tree(&onward).keys().all(|path| !is_temporary(path)),
+        "{label}: an onward carry planted the orphan"
+    );
+
+    let resumed = scratch.run();
+    assert_eq!(resumed.temporaries_removed, 1);
+    assert!(resumed.temporaries_left.is_empty());
+    assert!(fs::symlink_metadata(destination.join(relative(orphan))).is_err());
+    let kept = fs::symlink_metadata(destination.join(relative(&published))).unwrap();
+    assert_eq!(
+        kept.ino(),
+        orphan_meta.ino(),
+        "{label}: published inode replaced"
+    );
+    assert_eq!(kept.nlink(), 1, "{label}: the orphan link was not removed");
+    assert_eq!(
+        digest(&destination.join(relative(&published))),
+        digest(&scratch.source().join(relative(&published))),
+    );
 }
 
 #[derive(Clone, Copy, Debug)]

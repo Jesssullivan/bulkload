@@ -1,6 +1,32 @@
 //! Descriptor-relative, no-clobber output publication.
+//!
+//! # Temporaries
+//!
+//! [`Destination::file`] writes each output under a temporary name in the
+//! output's own directory, links the final name to it and unlinks it. The name
+//! is `.bulkload-<tag>-<pid>-<n>`: `<tag>` is 16 lowercase hex digits derived
+//! from the destination store's random authority, so only a process holding
+//! that store can produce it. A crash inside `file` leaves the name behind;
+//! after `materialize.after_link` it is a second hard link to the published
+//! output.
+//!
+//! A later invocation removes such a name only when every check holds (R-N79):
+//!
+//! - it sits in a directory this state is materializing into (the root, or an
+//!   existing directory row of the carry), swept while the store's exclusive
+//!   publisher is held, so no temporary of this store is in flight;
+//! - the leaf matches the grammar exactly and carries this store's tag;
+//! - `fstatat(AT_SYMLINK_NOFOLLOW)`, relative to that directory's descriptor,
+//!   reports a regular file owned by the effective uid.
+//!
+//! Removal is `unlinkat` of the temporary name alone, relative to the same
+//! descriptor, so a published name sharing its inode is never touched. A
+//! grammar match that fails any check (another store's tag, the untagged form
+//! earlier engines generated, a symlink, a directory, another owner) is left
+//! in place and reported by [`Destination::swept`]. A name outside the grammar
+//! is not a temporary at all and is never considered.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{File, Permissions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -10,19 +36,85 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::freshness::StatIdentity;
-use crate::transfer_store::{Manifest, Store};
+use crate::transfer_store::{Manifest, PendingDirectory, Store};
 use crate::{BulkloadRefusal, Result, RowSchema};
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// Prefix of every temporary name [`Destination::file`] publishes through.
+pub const TEMPORARY_PREFIX: &[u8] = b".bulkload-";
+/// Hex digits in a temporary's store tag.
+const TAG_HEX: usize = 16;
+/// Key-derivation context for the temporary tag.
+const TAG_CONTEXT: &str = "bulkload 2026-09-23 materialize temporary tag v1";
+
+/// A leaf name in the temporary-name grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryName {
+    /// `.bulkload-<16 hex>-<pid>-<n>`, carrying one store's tag.
+    Tagged([u8; TAG_HEX]),
+    /// `.bulkload-<pid>-<n>`, the untagged form earlier engines generated.
+    Untagged,
+}
+
+/// Classify `leaf` under the temporary-name grammar; `None` for any name
+/// the materializer never generates.
+#[must_use]
+pub fn temporary_name(leaf: &[u8]) -> Option<TemporaryName> {
+    let rest = leaf.strip_prefix(TEMPORARY_PREFIX)?;
+    let digits =
+        |part: &[u8]| (1..=20).contains(&part.len()) && part.iter().all(u8::is_ascii_digit);
+    let mut parts = rest.split(|byte| *byte == b'-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(tag), Some(pid), Some(serial), None)
+            if digits(pid)
+                && digits(serial)
+                && tag
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)) =>
+        {
+            tag.try_into().ok().map(TemporaryName::Tagged)
+        }
+        (Some(pid), Some(serial), None, None) if digits(pid) && digits(serial) => {
+            Some(TemporaryName::Untagged)
+        }
+        _ => None,
+    }
+}
+
+/// The tag this destination store's temporaries carry.
+pub(crate) fn temporary_tag(authority: &[u8; 32]) -> [u8; TAG_HEX] {
+    use std::fmt::Write as _;
+    let mut tag = String::with_capacity(TAG_HEX);
+    for byte in blake3::derive_key(TAG_CONTEXT, authority)
+        .iter()
+        .take(TAG_HEX / 2)
+    {
+        let _ = write!(tag, "{byte:02x}");
+    }
+    tag.as_bytes().try_into().unwrap_or([b'0'; TAG_HEX])
+}
+
+/// What the temporary sweep did in this invocation.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    /// Temporaries of this store removed by name.
+    pub removed: u64,
+    /// Grammar matches left in place because they failed a check, by
+    /// destination-relative path.
+    pub left: Vec<Vec<u8>>,
+}
 
 /// An opened destination root; descendants never traverse symlinks.
 pub struct Destination {
     root: File,
     path: PathBuf,
-    directories: Vec<PendingDirectory>,
+    tag: [u8; TAG_HEX],
+    directories: Vec<OwnedDirectory>,
+    swept: Sweep,
 }
 
-struct PendingDirectory {
+struct OwnedDirectory {
     path: Vec<u8>,
     mode: u32,
     dev: u64,
@@ -31,17 +123,36 @@ struct PendingDirectory {
 }
 
 impl Destination {
-    /// Open an existing destination directory without following its final link.
+    /// Open an existing destination directory without following its final
+    /// link, naming temporaries with `store`'s tag.
     ///
     /// # Errors
-    /// Refuses a missing root or symlink root.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Refuses a missing root or symlink root, or a store without authority.
+    pub fn open(path: &Path, store: &Store) -> Result<Self> {
         let root = open_dir(libc::AT_FDCWD, &cstring(path.as_os_str().as_bytes())?)?;
         Ok(Self {
             root,
             path: std::fs::canonicalize(path)?,
+            tag: temporary_tag(&store.authority()?),
             directories: Vec::new(),
+            swept: Sweep::default(),
         })
+    }
+
+    /// Remove this store's orphaned temporaries from the root. Call only
+    /// while the store's exclusive publisher is held.
+    ///
+    /// # Errors
+    /// Refuses an unreadable root directory.
+    pub fn sweep_root(&mut self) -> Result<()> {
+        let root = self.root.try_clone()?;
+        self.sweep(&root, &[])
+    }
+
+    /// What the temporary sweep has done so far.
+    #[must_use]
+    pub const fn swept(&self) -> &Sweep {
+        &self.swept
     }
 
     /// Canonical destination root for completion-store namespacing.
@@ -65,20 +176,35 @@ impl Destination {
 
     /// Create a directory, retaining an existing directory's metadata.
     ///
+    /// The pending-directory intent is durable before `mkdirat` (R-N78), so a
+    /// crash at any point leaves either no directory, or a directory with a
+    /// record naming it. A resume adopts an existing directory only when its
+    /// record owns it: the inode it was bound to, or, for an intent never
+    /// bound, the exact shape `mkdirat` produced (mode 0700, owned by this
+    /// user) at the recorded path. A directory with no record keeps the old
+    /// rule and fails closed on a divergent mode. An existing directory is
+    /// swept of this store's orphaned temporaries; see the module docs.
+    ///
     /// # Errors
     /// Refuses non-directory conflicts and divergent existing modes.
     pub fn directory(&mut self, row: &RowSchema, store: &Store, authority: &[u8]) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         let key = postcard::to_stdvec(&(authority, &row.rel_path))?;
         let mode = row.mode & 0o7777;
+        if stat_at(parent.as_raw_fd(), &leaf)?.is_some() {
+            let record = store.directory_record(&key)?;
+            return self.existing_directory(row, &parent, &leaf, key, record, store);
+        }
+        store.record_directory_intent(&key, mode)?;
+        fault_point!(DirectoryAfterIntent);
         // SAFETY: both descriptors and the NUL-terminated leaf remain valid.
         let created = unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) };
         if created == 0 {
             fault_point!(DirectoryAfterMkdir);
             let metadata = open_dir(parent.as_raw_fd(), &leaf)?.metadata()?;
-            store.pending_directory(&key, metadata.dev(), metadata.ino(), mode, true)?;
+            store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
             fault_point!(DirectoryAfterPendingRecord);
-            self.directories.push(PendingDirectory {
+            self.directories.push(OwnedDirectory {
                 path: row.rel_path.clone(),
                 mode,
                 dev: metadata.dev(),
@@ -89,21 +215,96 @@ impl Destination {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
+        // The leaf appeared after the existence check, so this invocation did
+        // not create it; its intent must never let a resume adopt it.
+        store.complete_directory(&key)?;
         if error.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(error.into());
         }
-        let existing = open_dir(parent.as_raw_fd(), &leaf)?;
+        self.existing_directory(row, &parent, &leaf, key, None, store)
+    }
+
+    fn existing_directory(
+        &mut self,
+        row: &RowSchema,
+        parent: &File,
+        leaf: &CString,
+        key: Vec<u8>,
+        record: Option<PendingDirectory>,
+        store: &Store,
+    ) -> Result<()> {
+        let mode = row.mode & 0o7777;
+        let existing = open_dir(parent.as_raw_fd(), leaf)?;
+        self.sweep(&existing, &row.rel_path)?;
         let metadata = existing.metadata()?;
-        if store.pending_directory(&key, metadata.dev(), metadata.ino(), mode, false)? {
-            self.directories.push(PendingDirectory {
+        let (dev, ino) = (metadata.dev(), metadata.ino());
+        let owned = match record {
+            Some(PendingDirectory::Created {
+                dev: recorded_dev,
+                ino: recorded_ino,
+                mode: recorded_mode,
+            }) => recorded_dev == dev && recorded_ino == ino && recorded_mode == mode,
+            Some(PendingDirectory::Intent {
+                mode: recorded_mode,
+            }) => {
+                recorded_mode == mode
+                    && metadata.mode() & 0o7777 == 0o700
+                    && metadata.uid() == effective_uid()
+            }
+            None => false,
+        };
+        if owned {
+            if matches!(record, Some(PendingDirectory::Intent { .. })) {
+                store.record_directory_created(&key, dev, ino, mode)?;
+            }
+            self.directories.push(OwnedDirectory {
                 path: row.rel_path.clone(),
                 mode,
-                dev: metadata.dev(),
-                ino: metadata.ino(),
+                dev,
+                ino,
                 key,
             });
         } else if metadata.mode() & 0o7777 != mode {
             return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        Ok(())
+    }
+
+    /// Unlink this store's orphaned temporaries directly inside `directory`,
+    /// by name and relative to its descriptor; record every other grammar
+    /// match and leave it alone. See the module docs.
+    fn sweep(&mut self, directory: &File, rel_dir: &[u8]) -> Result<()> {
+        let euid = effective_uid();
+        let mut removed = false;
+        for (name, kind) in temporary_candidates(directory)? {
+            let mut rel_path = rel_dir.to_vec();
+            if !rel_path.is_empty() {
+                rel_path.push(b'/');
+            }
+            rel_path.extend_from_slice(name.as_bytes());
+            if kind != TemporaryName::Tagged(self.tag) {
+                self.swept.left.push(rel_path);
+                continue;
+            }
+            let Some(stat) = stat_at(directory.as_raw_fd(), &name)? else {
+                continue;
+            };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_uid != euid {
+                self.swept.left.push(rel_path);
+                continue;
+            }
+            // SAFETY: descriptor and NUL-terminated name are valid. With flags
+            // 0 `unlinkat` removes this one name and never a directory; the
+            // inode survives under any other name linked to it.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+                self.swept.removed += 1;
+                removed = true;
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                self.swept.left.push(rel_path);
+            }
+        }
+        if removed {
+            directory.sync_all()?;
         }
         Ok(())
     }
@@ -184,14 +385,17 @@ impl Destination {
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => (),
             Err(error) => return Err(error),
         }
-        let temporary = cstring(
+        let mut temporary = TEMPORARY_PREFIX.to_vec();
+        temporary.extend_from_slice(&self.tag);
+        temporary.extend_from_slice(
             format!(
-                ".bulkload-{}-{}",
+                "-{}-{}",
                 std::process::id(),
                 NEXT_FILE.fetch_add(1, Ordering::Relaxed)
             )
             .as_bytes(),
-        )?;
+        );
+        let temporary = cstring(&temporary)?;
         // SAFETY: parent descriptor and path are valid; mode accompanies O_CREAT.
         let fd = unsafe {
             libc::openat(
@@ -307,6 +511,95 @@ fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Resu
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     Ok(identity)
+}
+
+/// `fstatat` without following a final symlink; `None` when the name is absent.
+fn stat_at(parent: i32, name: &CStr) -> Result<Option<libc::stat>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: name is NUL-terminated and `stat` is writable for one struct.
+    let result = unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        // SAFETY: a successful fstatat initialized the whole struct.
+        return Ok(Some(unsafe { stat.assume_init() }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(None)
+    } else {
+        Err(error.into())
+    }
+}
+
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
+    unsafe { libc::geteuid() }
+}
+
+/// Every entry directly inside `directory` whose name is in the temporary
+/// grammar. Reads through a fresh descriptor for `.`, so the caller's
+/// descriptor keeps its own offset and nothing is resolved through a path.
+fn temporary_candidates(directory: &File) -> Result<Vec<(CString, TemporaryName)>> {
+    // SAFETY: "." is NUL-terminated; a successful descriptor is owned here.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is an open directory descriptor; fdopendir takes it over.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so fd is still owned here and closed once.
+        unsafe { libc::close(fd) };
+        return Err(error.into());
+    }
+    let mut found = Vec::new();
+    let listed = loop {
+        clear_errno();
+        // SAFETY: stream is a live directory stream owned by this function.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            break match error.raw_os_error() {
+                Some(0) | None => Ok(()),
+                Some(_) => Err(error),
+            };
+        }
+        // SAFETY: readdir returned a live entry whose NUL-terminated d_name
+        // stays valid until the next readdir on this stream; it is copied first.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if let Some(kind) = temporary_name(name.to_bytes()) {
+            found.push((name.to_owned(), kind));
+        }
+    };
+    // SAFETY: closes the stream, and the descriptor it owns, exactly once.
+    unsafe { libc::closedir(stream) };
+    listed?;
+    Ok(found)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clear_errno() {
+    // SAFETY: __errno_location returns this thread's errno slot, valid for writes.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clear_errno() {
+    // SAFETY: __error returns this thread's errno slot, valid for writes.
+    unsafe { *libc::__error() = 0 };
 }
 
 fn open_dir(parent: i32, name: &CString) -> Result<File> {

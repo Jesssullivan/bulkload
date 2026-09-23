@@ -11,6 +11,18 @@
 //!
 //! Refusals are forward-progressing: an unreadable or unportable seat is
 //! recorded as a typed refusal and the walk continues.
+//!
+//! # Engine temporaries
+//!
+//! A regular file whose leaf is in the materializer's exact temporary-name
+//! grammar (`materialize::temporary_name`) is never a row. It is recorded in
+//! [`WalkOutcome::engine_temporaries`] instead, so no walk carries one (R-N79).
+//! Such a file is only ever what a crashed publication left: a partial or
+//! complete copy of another output, and after `materialize.after_link` a second
+//! hard link to it. It holds no state of its own, so carrying it would plant a
+//! duplicate under a meaningless name. The match is the generated grammar, not
+//! the `.bulkload-` prefix, and only regular files: any other name or kind is
+//! payload and is carried as before.
 
 use std::path::{Path, PathBuf};
 
@@ -94,6 +106,9 @@ pub struct WalkOutcome {
     pub rows: Vec<RowSchema>,
     /// One entry per declined seat.
     pub refusals: Vec<RefusedSeat>,
+    /// Regular files in the materializer's temporary-name grammar, by
+    /// relative path. Recorded, never carried; see the module docs.
+    pub engine_temporaries: Vec<Vec<u8>>,
     /// Counters for the pass.
     pub stats: WalkStats,
 }
@@ -159,13 +174,12 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
         if !options.cross_device && device_of(&meta) != root_dev {
             continue;
         }
-
-        let mut row = row_from_metadata(rel_path, &meta);
-        if row.kind == FileKind::Symlink {
-            row.link_target = std::fs::read_link(path)
-                .ok()
-                .map(|target| os_bytes(target.as_os_str()));
+        if is_engine_temporary(path, &meta) {
+            outcome.engine_temporaries.push(rel_path);
+            continue;
         }
+
+        let mut row = seat_row(path, rel_path, &meta);
 
         outcome.stats.seats_seen += 1;
         if row.kind == FileKind::Regular {
@@ -218,6 +232,25 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
 
     complete_hashes(&mut outcome, &to_hash, cache)?;
     Ok(outcome)
+}
+
+/// A regular file in the materializer's temporary-name grammar.
+fn is_engine_temporary(path: &Path, meta: &std::fs::Metadata) -> bool {
+    meta.is_file()
+        && path.file_name().is_some_and(|leaf| {
+            crate::materialize::temporary_name(leaf.as_encoded_bytes()).is_some()
+        })
+}
+
+/// The row for one seat, with a symlink's literal target.
+fn seat_row(path: &Path, rel_path: Vec<u8>, meta: &std::fs::Metadata) -> RowSchema {
+    let mut row = row_from_metadata(rel_path, meta);
+    if row.kind == FileKind::Symlink {
+        row.link_target = std::fs::read_link(path)
+            .ok()
+            .map(|target| os_bytes(target.as_os_str()));
+    }
+    row
 }
 
 fn complete_hashes<C: FreshnessCache>(
