@@ -1,5 +1,5 @@
 {
-  description = "Bulkload product contract and CI validation";
+  description = "Bulkload: live-host estate mover (Rust agent, wire protocol, benchmark) and its CI validation";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -20,6 +20,12 @@
             (python312.withPackages (pythonPackages: [ pythonPackages.pyyaml ]))
             ruff
             shellcheck
+            # Rust workspace gates (just rust-check). The toolchain comes from
+            # the pinned nixpkgs so the flake keeps a single audited input.
+            cargo
+            clippy
+            rustc
+            rustfmt
           ];
         };
       });

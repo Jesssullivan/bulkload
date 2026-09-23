@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bulkload-proto",
+    "crates/bulkload-agent",
+    "crates/bulkload-bench",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+authors = ["Jess Sullivan"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jesssullivan/bulkload"
+rust-version = "1.93"
+
+# The agent half is held to a deliberately small dependency set; the
+# `dep_graph` integration test in bulkload-agent enforces the wall.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+rayon = { version = "1" }
+blake3 = { version = "1" }
+fastcdc = { version = "3" }
+libc = { version = "0.2" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ignore = { version = "0.4" }
+crc32c = { version = "0.6" }
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = { version = "3" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

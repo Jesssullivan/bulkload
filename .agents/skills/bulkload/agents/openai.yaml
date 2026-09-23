@@ -1,4 +1,4 @@
 interface:
   display_name: "Bulkload"
-  short_description: "Continue a live dev-seat migration through TCFS"
-  default_prompt: "Use $bulkload to inspect the TCFS Rust migration carrier and complete working continuity while preserving both hosts’ unique state."
+  short_description: "Move a live development estate between hosts with the bulkload engine"
+  default_prompt: "Use $bulkload to inspect the bulkload Rust engine and its evidence, and continue the estate move while preserving both hosts' unique state."

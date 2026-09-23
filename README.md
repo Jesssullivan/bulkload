@@ -1,22 +1,33 @@
 # bulkload
 
-Bulkload means continuing work on another dev machine while both hosts keep
-working: Git, worktrees, agent history and configuration, credentials, dots and
-SQLite, with no lost unique content.
+A live-host estate mover: it carries Git repositories and worktrees, agent
+history and configuration, credentials, dotfiles and SQLite state from one
+development machine to another while both keep working, without losing unique
+content and without re-reading what the destination already holds.
 
-The Python ceremony engine is removed; its source remains in Git history.
-Implementation continues in [tummycrypt PR #592](https://github.com/Jesssullivan/tummycrypt/pull/592).
-That M0/M1 carrier does not establish a completed M2 migration or runtime adoption.
+## Status
 
-[The product contract](docs/design.md) defines completion.
-[R25](https://github.com/Jesssullivan/bulkload/issues/34) requires incremental
-resume without halting writers and measured comparison with rclone before
-claiming acceleration.
+The Rust engine works end to end (walk, framed chunk transport over ssh,
+resumable state on both ends, Git capture and import, typed refusals) and has
+moved real estate between hosts. It does not yet meet its performance bar:
+on the R23 corpus (242.6 MB, 23 files) the native initial copy took
+3,015 ms against rclone's 601 ms
+([evidence](docs/evidence/r23-2026-09-18.md)). The M2 engine work that
+addresses this is tracked in Linear project "Bulkload M2: SLO engine" and
+issues #42–#49.
 
-Keep the [week review](docs/WEEK-REVIEW-20260829.md),
-[rulings ledger](docs/wayfinding-20260829/rulings-ledger.md) and
-[dialog record](docs/wayfinding-20260829/dialogs-interviews.md) as historical evidence.
-Their superseded instructions and dated status are not current authority.
+## Build and test
 
-just check validates the remaining repository and CI contracts via Bazel.
-//:bulkload is a documentation bundle, not a migration executable.
+```bash
+nix develop            # toolchain, linters
+just rust-check        # fmt, clippy -D warnings, tests
+cargo build --release -p bulkload-agent -p bulkload-bench
+target/release/bulkload-agent        # prints the verb list
+target/release/bulkload-bench --help
+```
+
+## Documents
+
+- [Product contract](docs/design.md)
+- [Product bar, R25](https://github.com/Jesssullivan/bulkload/issues/34)
+- [Measured evidence](docs/evidence/)

@@ -1,4 +1,4 @@
-"""Documentation and remaining repository/CI contract checks."""
+"""Repository and CI contract checks; the Rust workspace builds with cargo (just rust-check)."""
 
 load("@rules_python//python:defs.bzl", "py_test")
 

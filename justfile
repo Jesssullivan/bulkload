@@ -37,11 +37,18 @@ secrets-scan-history:
     cd {{ root }} && command -v gitleaks >/dev/null 2>&1
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
+# Rust gates for the workspace (fmt, clippy with warnings denied, tests
+# including the agent's dependency-wall test).
+rust-check:
+    cd {{ root }} && cargo fmt --all -- --check
+    cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
+    cd {{ root }} && cargo test --workspace --locked
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
 # Source gates owned by this repository's development shell.
-check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir
+check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir rust-check
 
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.

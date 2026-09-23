@@ -26,24 +26,60 @@ signal a process" line below.
   entry before ending. Ticket descriptions are never rewritten, only
   superseded by dated comments.
 
-The Python migration engine is retired. Implementation belongs to the TCFS Rust
-workspace in [tummycrypt PR #592](https://github.com/Jesssullivan/tummycrypt/pull/592).
-M0/M1 work is not a completed M2 mover. Read docs/design.md for the product contract.
-Historical rulings and interviews are evidence, not current operational status.
+## Repository
+
+This repository is bulkload: a live-host estate mover in Rust. It is its own
+project and shares no code with TCFS (tummycrypt); it may carry TCFS data
+(R-N53, 2026-09-23). The Python engine, the stillness ceremony and the
+installer are retired and are not recreated.
+
+- `crates/bulkload-proto`: wire frames, row schema, refusal taxonomy.
+- `crates/bulkload-agent`: walk, chunk transport, Git estate carry, SQLite
+  provider-state composition, handoff probes.
+- `crates/bulkload-bench`: the R23 benchmark against rclone.
+
+Product bar: [#34](https://github.com/Jesssullivan/bulkload/issues/34) (R25).
+Current engineering work: Linear project "Bulkload M2: SLO engine"
+(P-TIN-177) and GitHub issues #42–#49. [docs/design.md](docs/design.md) is
+the product contract; `docs/evidence/` holds measured results and the
+historical rulings ledger (evidence, not current instructions).
+
+## Engine rules
+
+- Performance is the bar (R23, R-N57): the engine must beat rclone on the
+  R23 gates, measured by `bulkload-bench` with 3-rep A/B medians.
+- Unsafe-first (R-N54): raw syscalls, zero-copy and reused buffers are the
+  default design choice. Every `unsafe` block carries a `// SAFETY:` comment.
+- R25 (R-N58): never re-read a byte the destination already holds durably,
+  and never re-read a seat whose stat identity is unchanged. Resume must be
+  measurable with `source_bytes_read` counters.
+- Durability: a record is never committed before the bytes it describes are
+  durable. Refusals are values, never panics (R33 lint wall in each crate).
+- Dependency wall: the agent must not depend on tokio, opendal, reqwest, ring
+  or tonic (`crates/bulkload-agent/tests/dep_graph.rs`). Fix a violation by
+  removing the dependency, not by widening the list.
+
+## Estate rules
 
 - Keep all operator and agent sessions running. Never signal a process.
 - Include Git, agents, credentials, dots, SQLite and worktrees. Preserve both
-  hosts’ unique state; an unresolved state class is not an implicit exclusion.
+  hosts' unique state; an unresolved state class is not an implicit exclusion.
 - Git-aware union preserves refs, objects, real stashes, indexes, working bytes
   and worktree administration without changing an active checkout.
 - Carry account credentials privately; preserve destination machine identity
   and Home Manager authority. Never print credentials.
-- Capture SQLite through its backup API; never copy live WAL/SHM bytes or replace
-  a database with unique rows. Preserve conflicts for explicit resolution.
+- Capture SQLite through its backup API; never copy live WAL/SHM bytes or
+  replace a database with unique rows. Preserve conflicts for explicit
+  resolution.
 - Reclaim only proven redundant data after preserving unique content.
-- Do not recreate the Python engine, stillness ceremony or installer.
-- Use existing registered checks and apply_patch; stage explicit paths.
-- CI remains on GloriousFlywheel tinyland-nix. Keep .bazelrc.flywheel endpoint-free.
+- Estate operations are frozen until the M2 gates pass (R-N56).
 
-just check validates repository and CI contracts. //:bulkload packages documents,
-not an executable. Rust tests and benchmarks belong in the TCFS workspace.
+## Validation
+
+`just check` runs the repository contract checks and `just rust-check`
+(`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`). CI remains on GloriousFlywheel tinyland-nix; keep
+`.bazelrc.flywheel` endpoint-free. Changing `flake.nix`, the public-read guard
+or its composite action requires updating the pinned digests in
+`scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.
+Stage explicit paths.

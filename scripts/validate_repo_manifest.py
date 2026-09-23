@@ -68,8 +68,8 @@ def validate(value: Any) -> None:
     boundaries = value["boundaries"]
     required_boundaries = {
         "default_read_only": True,
-        "runtime": "retired-python",
-        "implementation_repository": "Jesssullivan/tummycrypt",
+        "runtime": "rust",
+        "implementation_repository": "Jesssullivan/bulkload",
         "preserves_unique_state": True,
         "signals_processes": False,
         "owns_home_manager_activation": False,
@@ -104,8 +104,8 @@ def self_test() -> None:
         },
         "boundaries": {
             "default_read_only": True,
-            "runtime": "retired-python",
-            "implementation_repository": "Jesssullivan/tummycrypt",
+            "runtime": "rust",
+            "implementation_repository": "Jesssullivan/bulkload",
             "preserves_unique_state": True,
             "signals_processes": False,
             "owns_home_manager_activation": False,

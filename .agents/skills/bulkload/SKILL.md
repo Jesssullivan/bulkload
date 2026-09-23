@@ -1,24 +1,21 @@
 ---
 name: bulkload
-description: Continue a live dev-seat migration through TCFS while preserving both hosts’ unique Git and agent state.
+description: Move a live development estate (Git, worktrees, agent state, dots, SQLite) between hosts with the bulkload Rust engine while preserving both hosts' unique state.
 ---
 
 # Bulkload
 
-The Python engine and its installer are retired. Do not invoke the former
-capture/plan/stage/apply/verify/rollback ceremony.
-
-Implementation is in [tummycrypt PR #592](https://github.com/Jesssullivan/tummycrypt/pull/592).
-Inspect its current Rust commands and readiness before acting; M0/M1 code is
-not a completed mover.
+The engine is this repository's Rust workspace: `bulkload-agent` (verbs:
+run it with no arguments for the list) and `bulkload-bench`. Read
+`AGENTS.md` and `docs/design.md` before acting.
 
 Keep writers running. Include Git, agents, credentials, dots, worktrees and
-SQLite; preserve unique content on both hosts and destination machine identity.
-Git needs union of refs, objects, stashes, indexes, dirt and administration.
-SQLite needs backup-API capture and explicit composition, never raw WAL/SHM copy
-or replacement of unique rows. Preserve Home Manager links and credential privacy.
+SQLite; preserve unique content on both hosts and destination machine
+identity. Git needs union of refs, objects, stashes, indexes, dirt and
+administration. SQLite needs backup-API capture and explicit composition,
+never a raw WAL/SHM copy or replacement of unique rows. Preserve Home Manager
+links and credential privacy.
 
-Verify working continuity on Sting and keep unresolved coverage visible.
-Reclaim only proven redundant content. Do not add ceremony scripts or harnesses.
-The [R25 product bar](https://github.com/Jesssullivan/bulkload/issues/34) requires
-incremental resume and measured improvement over rclone on the real corpus.
+Estate operations are frozen until the M2 performance gates pass (R-N56);
+engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
+performance claim must come from `bulkload-bench` evidence.
