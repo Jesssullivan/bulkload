@@ -152,14 +152,18 @@ fn commit_tree(private: &Path, tree: &str, label: &str) -> Result<String> {
 // Build a raw tree without running attributes/filters or starting Git per file.
 fn capture_tree(private: &Path, repo: &Path, _index: &Path) -> Result<String> {
     let rows = filesystem_rows(repo)?;
-    let (tree, _) = raw_tree::capture(private, repo, &rows)?;
-    if rows != filesystem_rows(repo)? {
+    let pass = raw_tree::capture(private, repo, &rows, &raw_tree::Reuse::new())?;
+    // Verification, not capture: a destination changing under the audit is
+    // never tolerated as drift, exactly as before drift tolerance existed.
+    if !pass.drift.is_empty() || rows != filesystem_rows(repo)? {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    Ok(tree)
+    Ok(pass.tree)
 }
 
-fn capture_refs(repo: &Path, private: &Path, inventory: &str) -> Result<()> {
+// `stash` is the reflog read with the carried authority, never re-read here:
+// the bundle carries exactly the stash commits the snapshot saw.
+fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
     let mut pending = std::collections::BTreeMap::new();
     for line in inventory.lines() {
         let (value, name) = line
@@ -181,18 +185,13 @@ fn capture_refs(repo: &Path, private: &Path, inventory: &str) -> Result<()> {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
     }
-    let stash = output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]));
-    if let Ok(stash) = stash {
-        let stash = String::from_utf8(stash).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-        for value in stash.lines() {
-            if !oid(value) {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            let name = format!("refs/carry-export/stashes/{value}");
-            pending.entry(name).or_insert_with(|| value.to_owned());
+    let stash = std::str::from_utf8(stash).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    for value in stash.lines() {
+        if !oid(value) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
         }
-    } else if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        let name = format!("refs/carry-export/stashes/{value}");
+        pending.entry(name).or_insert_with(|| value.to_owned());
     }
     // One create-only Git transaction instead of one process per ref. NUL
     // framing preserves legal quote characters without command interpolation.
@@ -238,6 +237,371 @@ pub fn common_repository(repo: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(common)?)
 }
 
+/// The typed inputs of a reusable capture key.
+///
+/// The key is an opaque digest and cannot say *what* moved. These parts can, so
+/// a caller re-reading them after a pass can tell drift it may tolerate (the ref
+/// inventory and the worktree census: what a sibling agent lane or a build tool
+/// produces) from Git authority it must refuse (HEAD, the index, configuration,
+/// the shallow boundary, nested worktree custody, the omitted rebuildable roots).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyParts {
+    repo: Vec<u8>,
+    common: Vec<u8>,
+    inventory: String,
+    head: String,
+    symbolic: Vec<u8>,
+    index: Vec<u8>,
+    exclude: Vec<u8>,
+    stash: Vec<u8>,
+    rows: Vec<crate::RowSchema>,
+    configuration: Vec<(String, Vec<u8>)>,
+    boundary: Vec<u8>,
+    nested: Vec<NestedWorktree>,
+    omitted: Vec<Vec<u8>>,
+    identities: Vec<(u64, u64)>,
+}
+
+/// Reusable-key domain for the authority digest of a capture's key parts.
+const CAPTURE_AUTHORITY_DOMAIN: &[u8] = b"tcfs-git-capture-authority-v1\0";
+
+fn framed(hash: &mut blake3::Hasher, bytes: &[u8]) -> Result<()> {
+    hash.update(
+        &u64::try_from(bytes.len())
+            .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+            .to_le_bytes(),
+    );
+    hash.update(bytes);
+    Ok(())
+}
+
+impl KeyParts {
+    /// The reusable capture key these parts hash to.
+    ///
+    /// The domain tag, the input order, the u64-length framing and the
+    /// present-only sidecar domains are exactly what they were before drift
+    /// tolerance existed, so retained captures of unchanged checkouts keep their
+    /// keys bit-for-bit and are never re-done.
+    ///
+    /// # Errors
+    /// Refuses inputs too large to frame or encode.
+    pub fn digest(&self) -> Result<[u8; 32]> {
+        let rows = postcard::to_allocvec(&self.rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let configuration =
+            postcard::to_allocvec(&self.configuration).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tcfs-git-reusable-capture-v1\0");
+        for bytes in [
+            self.repo.as_slice(),
+            self.common.as_slice(),
+            self.inventory.as_bytes(),
+            self.head.as_bytes(),
+            &self.symbolic,
+            &self.index,
+            &self.exclude,
+            &self.stash,
+            &rows,
+            &configuration,
+            &self.boundary,
+        ] {
+            framed(&mut hash, bytes)?;
+        }
+        // A sidecar, hashed only when present: repos without nested worktrees keep
+        // their existing keys, so retained captures are not re-done for a schema.
+        if !self.nested.is_empty() {
+            let nested =
+                postcard::to_allocvec(&self.nested).map_err(|_| BulkloadRefusal::FrameCodec)?;
+            hash.update(NESTED_WORKTREES_DOMAIN);
+            framed(&mut hash, &nested)?;
+        }
+        // A sidecar, hashed only when present, and only the omitted roots -- never
+        // their sizes. A repository with no omission keeps the key it already had,
+        // and a build writing inside an omitted root cannot move this key, which is
+        // the whole point: rebuildable churn must not refuse a 40-minute capture.
+        if !self.omitted.is_empty() {
+            let omitted =
+                postcard::to_allocvec(&self.omitted).map_err(|_| BulkloadRefusal::FrameCodec)?;
+            hash.update(REBUILDABLE_DOMAIN);
+            framed(&mut hash, &omitted)?;
+        }
+        for (dev, ino) in &self.identities {
+            for value in [i128::from(*dev), i128::from(*ino)] {
+                hash.update(&value.to_le_bytes());
+            }
+        }
+        Ok(*hash.finalize().as_bytes())
+    }
+
+    /// Digest of every key input outside the two drift-tolerant ones.
+    ///
+    /// Two passes with equal authority differ, if at all, only in the ref
+    /// inventory and the worktree census. A later pass with the same authority
+    /// as a retained drifted capture extends that capture: it re-reads exactly
+    /// the seats whose identity moved and reuses every other blob (R25).
+    ///
+    /// # Errors
+    /// Refuses inputs too large to frame or encode.
+    pub fn authority(&self) -> Result<[u8; 32]> {
+        let configuration =
+            postcard::to_allocvec(&self.configuration).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let nested =
+            postcard::to_allocvec(&self.nested).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let omitted =
+            postcard::to_allocvec(&self.omitted).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let identities =
+            postcard::to_allocvec(&self.identities).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(CAPTURE_AUTHORITY_DOMAIN);
+        for bytes in [
+            self.repo.as_slice(),
+            self.common.as_slice(),
+            self.head.as_bytes(),
+            &self.symbolic,
+            &self.index,
+            &self.exclude,
+            &self.stash,
+            &configuration,
+            &self.boundary,
+            &nested,
+            &omitted,
+            &identities,
+        ] {
+            framed(&mut hash, bytes)?;
+        }
+        Ok(*hash.finalize().as_bytes())
+    }
+
+    /// Whether every key input outside the two drift-tolerant ones is unchanged.
+    ///
+    /// The ref inventory and the worktree census are the concurrency classes a
+    /// sibling agent lane or a build tool produces. Everything else moving is
+    /// Git authority changing under the capture and stays a refusal (R-N30).
+    #[must_use]
+    pub fn drift_only(&self, other: &Self) -> bool {
+        self.repo == other.repo
+            && self.common == other.common
+            && self.head == other.head
+            && self.symbolic == other.symbolic
+            && self.index == other.index
+            && self.exclude == other.exclude
+            && self.stash == other.stash
+            && self.configuration == other.configuration
+            && self.boundary == other.boundary
+            && self.nested == other.nested
+            && self.omitted == other.omitted
+            && self.identities == other.identities
+    }
+
+    /// Whether any seat in this census is racy against a pass that began at
+    /// `started_ns`: its mtime or ctime is at or after that start less
+    /// [`RACY_GRANULARITY_NS`], or later than `now_ns`.
+    ///
+    /// An equal key is a stat-identity claim about every seat at once. A racy
+    /// seat can be rewritten at the same size inside one timestamp tick without
+    /// moving the key, so a capture with one is never reused whole (R-N76).
+    /// `now_ns` is this pass's own clock reading: a seat stamped later than
+    /// it is from the future and racy too.
+    #[must_use]
+    pub fn racy_since(&self, started_ns: i128, now_ns: i128) -> bool {
+        self.rows.iter().any(|row| racy(row, started_ns, now_ns))
+    }
+
+    /// Whether any seat is stamped later than `now_ns`, this pass's own clock.
+    ///
+    /// Such a seat is racy on every pass until the clock passes its stamp, so
+    /// it blocks every whole-capture reuse; the receipt names it (round-3 N5).
+    #[must_use]
+    pub fn stamped_after(&self, now_ns: i128) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.mtime_ns > now_ns || row.ctime_ns > now_ns)
+    }
+
+    /// Whether these parts name exactly the authority an export carried.
+    #[must_use]
+    pub fn carries(&self, carried: &CarriedAuthority) -> bool {
+        self.head == carried.head
+            && self.symbolic == carried.symbolic
+            && self.index == carried.index
+            && self.exclude == carried.exclude
+            && self.stash == carried.stash
+            && self.configuration == carried.configuration
+            && self.boundary == carried.boundary
+    }
+
+    /// Everything that moved across a whole capture: between these pre-pass
+    /// parts and the inventory `export` snapshotted, under the export itself
+    /// (already in [`Export::drift`]), between the export's last ref read and
+    /// `later`, and between these parts and `later` directly.
+    ///
+    /// The export's own window is not the capture's. A ref deleted before the
+    /// export's snapshot and re-created after its last ref read leaves `self`
+    /// equal to `later`, yet the bundle lacks it; only comparing the keyed
+    /// inventories with the export's own names it (R-N72).
+    ///
+    /// Git authority is never drift. HEAD, the symbolic HEAD, the index, the
+    /// exclude file, the stash reflog, the configuration or the shallow
+    /// frontier that moved away and back between a key and the export's
+    /// snapshot or end, leaving the two keys equal, still refuses: the bundle
+    /// carries what the source held at neither key.
+    ///
+    /// # Errors
+    /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] unless both key parts
+    /// name exactly the authority the export carried, as
+    /// [`KeyParts::drift_to`] does, and on malformed inventories.
+    pub fn drift_across(&self, export: &Export, later: &Self) -> Result<CaptureDrift> {
+        if !self.carries(&export.authority) || !later.carries(&export.authority) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        let mut drift = self.drift_to(later)?;
+        drift.extend(reference_drift(&self.inventory, &export.refs_before)?);
+        drift.extend(reference_drift(&export.refs_after, &later.inventory)?);
+        drift.seal()?;
+        Ok(drift)
+    }
+
+    /// Everything that moved between these pre-pass parts and `later`, the
+    /// parts re-read after the pass.
+    ///
+    /// An export takes its own ref and census snapshot, later than a caller's
+    /// pre-pass key. A ref deleted in between is invisible to the export, yet
+    /// the pre-pass key still names it. The result is empty exactly when the
+    /// two parts are equal, and only then may the pre-pass key be recorded as
+    /// a clean reuse key; otherwise the capture is recorded as drifted, and a
+    /// later pass must re-capture or extend it, never reuse it (R-N72).
+    ///
+    /// Seats compare on the whole census row here, directory timestamps
+    /// included: the pre-pass key hashes every field of every row.
+    ///
+    /// # Errors
+    /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] when anything outside
+    /// the ref inventory and the worktree census moved, or when the parts
+    /// differ in a way no drift row can name.
+    pub fn drift_to(&self, later: &Self) -> Result<CaptureDrift> {
+        if !self.drift_only(later) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        let mut drift = CaptureDrift::default();
+        drift.extend(reference_drift(&self.inventory, &later.inventory)?);
+        drift.extend(seat_drift_by(&self.rows, &later.rows, |a, b| a == b));
+        drift.seal()?;
+        // Fail closed: a key that moved must name what moved.
+        if drift.is_empty() != (self == later) {
+            return Err(BulkloadRefusal::GitAuthorityChanged);
+        }
+        Ok(drift)
+    }
+}
+
+/// The Git authority one capture carries: HEAD, the symbolic HEAD, the index
+/// bytes, the exclude file, the stash reflog, the configuration files and the
+/// shallow frontier.
+///
+/// The reusable key hashes exactly these values, and an export carries exactly
+/// the values it read once, at its snapshot. A caller compares them with its
+/// pre- and post-pass key parts: authority that moved away and back between
+/// those reads is a stale bundle behind an equal key (R-N72).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedAuthority {
+    head: String,
+    symbolic: Vec<u8>,
+    index: Vec<u8>,
+    exclude: Vec<u8>,
+    stash: Vec<u8>,
+    configuration: Vec<(String, Vec<u8>)>,
+    boundary: Vec<u8>,
+}
+
+// One read of the authority a key hashes and an export carries. The stash
+// reflog is read only when `inventory` lists refs/stash, exactly as the key
+// always read it. No census walk.
+fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
+    let head = text(git(repo).args(["rev-parse", "--verify", "HEAD"]))?;
+    let symbolic = git(repo).args(["symbolic-ref", "-q", "HEAD"]).output()?;
+    if !symbolic.status.success() && symbolic.status.code() != Some(1) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let (_, index) = source_index(repo)?;
+    let exclude_path = text(git(repo).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "info/exclude",
+    ]))?;
+    let exclude = match fs::read(exclude_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
+        output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
+    } else {
+        Vec::new()
+    };
+    Ok(CarriedAuthority {
+        head,
+        symbolic: symbolic.stdout,
+        index,
+        exclude,
+        stash,
+        configuration: source_configuration(repo)?,
+        boundary: shallow::frontier(repo)?,
+    })
+}
+
+/// The typed inputs of the reusable capture key for `repo`, default policy.
+///
+/// # Errors
+/// Refuses unsupported source indexes, filesystem seats or Git state.
+pub fn capture_key_parts(repo: &Path) -> Result<KeyParts> {
+    capture_key_parts_with_policy(repo, CapturePolicy::default())
+}
+
+/// [`capture_key_parts`] under an explicit capture policy.
+///
+/// This reads Git metadata and filesystem metadata, not ordinary file contents.
+///
+/// # Errors
+/// Refuses unsupported source indexes, filesystem seats or Git state.
+pub fn capture_key_parts_with_policy(repo: &Path, policy: CapturePolicy) -> Result<KeyParts> {
+    use std::os::unix::ffi::OsStrExt;
+    let repo = fs::canonicalize(repo)?;
+    let common = common_repository(&repo)?;
+    let inventory = refs(&repo)?;
+    let authority = read_authority(&repo, &inventory)?;
+    let CarriedAuthority {
+        head,
+        symbolic,
+        index,
+        exclude,
+        stash,
+        configuration,
+        boundary,
+    } = authority;
+    let census = capture_census(&repo, &common, policy)?;
+    let mut identities = Vec::with_capacity(2);
+    for directory in [&repo, &common] {
+        let identity = crate::freshness::StatIdentity::from_metadata(&fs::metadata(directory)?);
+        identities.push((identity.dev, identity.ino));
+    }
+    Ok(KeyParts {
+        repo: repo.as_os_str().as_bytes().to_vec(),
+        common: common.as_os_str().as_bytes().to_vec(),
+        inventory,
+        head,
+        symbolic,
+        index,
+        exclude,
+        stash,
+        rows: census.rows,
+        configuration,
+        boundary,
+        nested: census.nested_worktrees,
+        omitted: census.omitted,
+        identities,
+    })
+}
+
 /// Identity of a reusable capture, including new transit refs and full census.
 ///
 /// This reads Git metadata and filesystem metadata, not ordinary file contents.
@@ -260,94 +624,7 @@ pub fn reusable_capture_key(repo: &Path) -> Result<[u8; 32]> {
 /// # Errors
 /// Refuses unsupported source indexes, filesystem seats or Git state.
 pub fn reusable_capture_key_with_policy(repo: &Path, policy: CapturePolicy) -> Result<[u8; 32]> {
-    use std::os::unix::ffi::OsStrExt;
-    let repo = fs::canonicalize(repo)?;
-    let common = common_repository(&repo)?;
-    let inventory = refs(&repo)?;
-    let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let symbolic = git(&repo).args(["symbolic-ref", "-q", "HEAD"]).output()?;
-    if !symbolic.status.success() && symbolic.status.code() != Some(1) {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    let (_, index) = source_index(&repo)?;
-    let exclude_path = text(git(&repo).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?;
-    let exclude = match fs::read(exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        output(git(&repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
-    } else {
-        Vec::new()
-    };
-    let census = capture_census(&repo, &common, policy)?;
-    let rows = postcard::to_allocvec(&census.rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
-    let configuration = postcard::to_allocvec(&source_configuration(&repo)?)
-        .map_err(|_| BulkloadRefusal::FrameCodec)?;
-    let boundary = shallow::frontier(&repo)?;
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"tcfs-git-reusable-capture-v1\0");
-    for bytes in [
-        repo.as_os_str().as_bytes(),
-        common.as_os_str().as_bytes(),
-        inventory.as_bytes(),
-        head.as_bytes(),
-        &symbolic.stdout,
-        &index,
-        &exclude,
-        &stash,
-        &rows,
-        &configuration,
-        &boundary,
-    ] {
-        hash.update(
-            &u64::try_from(bytes.len())
-                .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-                .to_le_bytes(),
-        );
-        hash.update(bytes);
-    }
-    // A sidecar, hashed only when present: repos without nested worktrees keep
-    // their existing keys, so retained captures are not re-done for a schema.
-    if !census.nested_worktrees.is_empty() {
-        let nested = postcard::to_allocvec(&census.nested_worktrees)
-            .map_err(|_| BulkloadRefusal::FrameCodec)?;
-        hash.update(NESTED_WORKTREES_DOMAIN);
-        hash.update(
-            &u64::try_from(nested.len())
-                .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-                .to_le_bytes(),
-        );
-        hash.update(&nested);
-    }
-    // A sidecar, hashed only when present, and only the omitted roots -- never
-    // their sizes. A repository with no omission keeps the key it already had,
-    // and a build writing inside an omitted root cannot move this key, which is
-    // the whole point: rebuildable churn must not refuse a 40-minute capture.
-    if !census.omitted.is_empty() {
-        let omitted =
-            postcard::to_allocvec(&census.omitted).map_err(|_| BulkloadRefusal::FrameCodec)?;
-        hash.update(REBUILDABLE_DOMAIN);
-        hash.update(
-            &u64::try_from(omitted.len())
-                .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-                .to_le_bytes(),
-        );
-        hash.update(&omitted);
-    }
-    for directory in [&repo, &common] {
-        let identity = crate::freshness::StatIdentity::from_metadata(&fs::metadata(directory)?);
-        for value in [i128::from(identity.dev), i128::from(identity.ino)] {
-            hash.update(&value.to_le_bytes());
-        }
-    }
-    Ok(*hash.finalize().as_bytes())
+    capture_key_parts_with_policy(repo, policy)?.digest()
 }
 
 /// Reconstruct a missing index from a same-HEAD capture without touching payload.
@@ -376,8 +653,9 @@ fn repair_missing_index_inner(
     before_publish: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let staged = stage_bundle(bundle)?;
+    let bundle = staged.path();
     let repo = fs::canonicalize(repo)?;
-    let bundle = fs::canonicalize(bundle)?;
     let admin = PathBuf::from(text(git(&repo).args(["rev-parse", "--absolute-git-dir"]))?);
     let index = PathBuf::from(text(git(&repo).args([
         "rev-parse",
@@ -398,7 +676,7 @@ fn repair_missing_index_inner(
         require_missing(&admin.join(name))?;
     }
     let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let heads = shallow::headers(&repo, &bundle)?;
+    let heads = shallow::headers(&repo, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -434,7 +712,7 @@ fn repair_missing_index_inner(
     fs::File::open(receipt.join("original-administration.postcard"))?.sync_all()?;
     fs::File::open(&receipt)?.sync_all()?;
     fs::File::open(&receipt_parent)?.sync_all()?;
-    import_bundle(&repo, &bundle, source)?;
+    import_verified(&repo, bundle, source)?;
     let staged_entries = output(git(&repo).args(["ls-tree", "-r", "-z", &find("staged")?]))?;
     if staged_entries
         .split(|b| *b == 0)
@@ -558,13 +836,20 @@ fn admin_controls(admin: &Path) -> Result<Vec<(String, Option<Vec<u8>>)>> {
 /// populated submodules (which require their own capture). On refusal the
 /// private capture is retained for diagnosis; source state is never changed.
 pub fn export_repository(repo: &Path, capture: &Path) -> Result<PathBuf> {
-    Ok(export_repository_inner(repo, capture, None, CapturePolicy::default())?.bundle)
+    Ok(refusing_drift(export_repository_inner(
+        repo,
+        capture,
+        &ExportOptions::default(),
+    )?)?
+    .bundle)
 }
 
 /// Export one worktree under an explicit capture policy and prerequisite.
 ///
 /// The returned [`Export`] names every omitted rebuildable root and its
 /// measured size, which is the same custody the bundle's metadata ref carries.
+/// Drift under the pass is still a refusal here; [`export_repository_with_drift`]
+/// is the tolerant entry point.
 ///
 /// # Errors
 /// Refuses everything [`export_repository`] refuses, plus invalid prerequisites.
@@ -574,7 +859,15 @@ pub fn export_repository_with_policy(
     prerequisite: Option<&Path>,
     policy: CapturePolicy,
 ) -> Result<Export> {
-    export_repository_inner(repo, capture, prerequisite, policy)
+    refusing_drift(export_repository_inner(
+        repo,
+        capture,
+        &ExportOptions {
+            prerequisite,
+            policy,
+            reuse: None,
+        },
+    )?)
 }
 
 /// Export workspace state without repacking a shared base's commit closure.
@@ -589,14 +882,54 @@ pub fn export_repository_with_prerequisite(
     capture: &Path,
     base: &Path,
 ) -> Result<PathBuf> {
-    Ok(export_repository_inner(repo, capture, Some(base), CapturePolicy::default())?.bundle)
+    Ok(refusing_drift(export_repository_inner(
+        repo,
+        capture,
+        &ExportOptions {
+            prerequisite: Some(base),
+            policy: CapturePolicy::default(),
+            reuse: None,
+        },
+    )?)?
+    .bundle)
+}
+
+/// Export one worktree and all repository refs, tolerating concurrent drift.
+///
+/// Refs appearing, moving or disappearing in the shared ref store, and worktree
+/// seats appearing, changing or vanishing under the byte pass, are reported as
+/// [`Export::drift`] instead of refusing the capture (R25: the host need not
+/// halt agent work or git work). A drifted seat's bytes are carried by neither
+/// the worktree tree nor `filesystem-v1`; the drift list is the statement that
+/// they are absent, and the next pass re-reads exactly those seats (R-N28).
+/// Git authority moving -- HEAD, the index, configuration, the shallow
+/// boundary, nested worktree custody, the omitted rebuildable roots -- is still
+/// a refusal (R-N30).
+///
+/// # Errors
+/// Refuses changing Git authority, unsupported Git or filesystem state, invalid
+/// prerequisites, and drift larger than [`DRIFT_ROW_LIMIT`].
+pub fn export_repository_with_drift(
+    repo: &Path,
+    capture: &Path,
+    options: &ExportOptions<'_>,
+) -> Result<Export> {
+    export_repository_inner(repo, capture, options)
+}
+
+// The pre-drift contract for callers that never asked for tolerance.
+fn refusing_drift(export: Export) -> Result<Export> {
+    if export.drift.is_empty() {
+        Ok(export)
+    } else {
+        Err(BulkloadRefusal::GitAuthorityChanged)
+    }
 }
 
 fn export_repository_inner(
     repo: &Path,
     capture: &Path,
-    prerequisite: Option<&Path>,
-    policy: CapturePolicy,
+    options: &ExportOptions<'_>,
 ) -> Result<Export> {
     use std::os::unix::fs::DirBuilderExt;
     let repo = fs::canonicalize(repo)?;
@@ -605,57 +938,56 @@ fn export_repository_inner(
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
+    #[cfg(test)]
+    mid_pass::fire(&repo, mid_pass::Stage::Snapshot);
+    // Before the census, so every seat the census stamps is judged against it.
+    let started_ns = pass_start_ns();
     let before_refs = refs(&repo)?;
-    let configuration = source_configuration(&repo)?;
-    let boundary = shallow::frontier(&repo)?;
+    // Read once and carried exactly: nothing below re-reads HEAD, the symbolic
+    // HEAD, the index, exclude, the stash reflog, configuration or the frontier
+    // for the bundle's content, only to compare at the end of the pass.
+    let authority = read_authority(&repo, &before_refs)?;
     let common = common_repository(&repo)?;
-    let census = capture_census(&repo, &common, policy)?;
+    let census = capture_census(&repo, &common, options.policy)?;
     let seats = &census.rows;
-    let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
-    let (index_path, before_index) = source_index(&repo)?;
-    let private = prepare_private(&repo, &capture)?;
-    capture_refs(&repo, &private, &before_refs)?;
-    set_ref(&private, "refs/carry-export/head", &head)?;
-    let symbolic_head = text(git(&repo).args(["symbolic-ref", "-q", "HEAD"])).unwrap_or_default();
-    metadata(&private, "head-symbolic", symbolic_head.as_bytes())?;
-    let exclude_path = PathBuf::from(text(git(&repo).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?);
-    let exclude = match fs::read(exclude_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    metadata(&private, "exclude", &exclude)?;
-    if !boundary.is_empty() {
-        metadata(&private, "shallow-frontier-v1", &boundary)?;
-    }
-    metadata(
-        &private,
-        "configuration-v1",
-        &postcard::to_allocvec(&configuration).map_err(|_| BulkloadRefusal::FrameCodec)?,
-    )?;
+    let private = carry_authority(&repo, &capture, &before_refs, &authority)?;
     let index = capture.join("index");
-    fs::write(&index, &before_index)?;
+    fs::write(&index, &authority.index)?;
     let staged = text(snapshot_command(&private, &repo, &index).arg("write-tree"))?;
     set_ref(
         &private,
         "refs/carry-export/staged",
         &commit_tree(&private, &staged, "bulkload staged tree")?,
     )?;
-    let (tree, _) = raw_tree::capture(&private, &repo, seats)?;
-    if before_refs != refs(&repo)?
-        || configuration != source_configuration(&repo)?
-        || boundary != shallow::frontier(&repo)?
-        || before_index != fs::read(index_path)?
-        || head != text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?
-        || census != capture_census(&repo, &common, policy)?
+    #[cfg(test)]
+    mid_pass::fire(&repo, mid_pass::Stage::BytePass);
+    // Seats a retained capture already holds at this exact identity are emitted
+    // by object name. Nothing is opened for them and no source byte is re-read.
+    let (reuse, reuse_unavailable) = offered_reuse(
+        &private,
+        options.reuse,
+        &authority.boundary,
+        seats,
+        started_ns,
+    )?;
+    let pass = raw_tree::capture(&private, &repo, seats, &reuse)?;
+    let after = capture_census(&repo, &common, options.policy)?;
+    // Git authority moving under the capture is never drift. The nested
+    // worktree census is compared apart from the seats precisely because it
+    // carries each nested HEAD, which must keep its refusal; so is the omitted
+    // set, because it is a key input a rebuild can move.
+    let refs_after = refs(&repo)?;
+    if !authority_held(&repo, &authority, &refs_after)?
+        || census.nested_worktrees != after.nested_worktrees
+        || census.omitted != after.omitted
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
+    let drift = observed_drift(pass.drift, &before_refs, &refs_after, seats, &after.rows)?;
+    // A seat whose identity moved only after its bytes were streamed is already
+    // in the tree; withdraw it rather than present bytes the pass cannot vouch for.
+    let withdrawn = drift.withdrawn(seats);
+    let tree = raw_tree::prune(&private, &pass.tree, &withdrawn)?;
     set_ref(
         &private,
         "refs/carry-export/worktree",
@@ -665,10 +997,17 @@ fn export_repository_inner(
             "bulkload worktree including untracked and ignored files",
         )?,
     )?;
+    // filesystem-v1 must never name a seat whose bytes were not captured: a
+    // restore replays it as a mode and shape claim about the restored payload.
+    let absent: std::collections::BTreeSet<&[u8]> = withdrawn.iter().map(Vec::as_slice).collect();
+    let carried: Vec<&crate::RowSchema> = seats
+        .iter()
+        .filter(|row| !absent.contains(row.rel_path.as_slice()))
+        .collect();
     metadata(
         &private,
         "filesystem-v1",
-        &postcard::to_allocvec(seats).map_err(|_| BulkloadRefusal::FrameCodec)?,
+        &postcard::to_allocvec(&carried).map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
     // Typed custody for registered worktrees nested inside this checkout. Their
     // bytes are captured as their own estate items; this manifest names them so
@@ -693,10 +1032,396 @@ fn export_repository_inner(
             &postcard::to_allocvec(&omitted).map_err(|_| BulkloadRefusal::FrameCodec)?,
         )?;
     }
+    mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    shared::write_bundle(&private, &bundle, prerequisite)?;
+    shared::write_bundle(&private, &bundle, options.prerequisite)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
-    Ok(Export { bundle, omitted })
+    #[cfg(test)]
+    mid_pass::fire(&repo, mid_pass::Stage::AfterPass);
+    Ok(Export {
+        bundle,
+        omitted,
+        drift,
+        bytes_read: pass.bytes_read,
+        started_ns,
+        reuse_unavailable,
+        refs_before: before_refs,
+        refs_after,
+        authority,
+    })
+}
+
+// In-band, emitted only when the pass raced something: a clean capture's ref
+// set, and therefore its bundle, is exactly what it was before drift tolerance
+// existed. Every restore and import verb reads this marker back and refuses
+// the bundle with CAPTURE_DRIFTED, whatever sidecars exist.
+fn mark_drift(private: &Path, drift: &CaptureDrift) -> Result<()> {
+    if drift.is_empty() {
+        return Ok(());
+    }
+    metadata(
+        private,
+        CAPTURE_DRIFT_METADATA,
+        &postcard::to_allocvec(drift).map_err(|_| BulkloadRefusal::FrameCodec)?,
+    )
+}
+
+// HEAD, the symbolic head, the exclude file, the shallow frontier and the
+// configuration: administration every capture carries, before the byte pass.
+fn capture_administration(private: &Path, authority: &CarriedAuthority) -> Result<()> {
+    // Exactly the bytes the snapshot read; the metadata holds the ref name
+    // without the trailing newline, as it always did.
+    let symbolic = std::str::from_utf8(&authority.symbolic)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        .trim_end();
+    metadata(private, "head-symbolic", symbolic.as_bytes())?;
+    metadata(private, "exclude", &authority.exclude)?;
+    if !authority.boundary.is_empty() {
+        metadata(private, "shallow-frontier-v1", &authority.boundary)?;
+    }
+    metadata(
+        private,
+        "configuration-v1",
+        &postcard::to_allocvec(&authority.configuration)
+            .map_err(|_| BulkloadRefusal::FrameCodec)?,
+    )
+}
+
+// Everything one pass observed moving: what the byte pass saw seat by seat,
+// what the ref store did, and what the post-pass census says about the seats.
+fn observed_drift(
+    in_pass: Vec<DriftRow>,
+    refs_before: &str,
+    refs_after: &str,
+    seats_before: &[crate::RowSchema],
+    seats_after: &[crate::RowSchema],
+) -> Result<CaptureDrift> {
+    let mut drift = CaptureDrift::default();
+    drift.extend(in_pass);
+    drift.extend(reference_drift(refs_before, refs_after)?);
+    drift.extend(seat_drift(seats_before, seats_after));
+    drift.seal()?;
+    Ok(drift)
+}
+
+/// Wall-clock nanoseconds since the epoch.
+///
+/// This is the reference a pass judges racy seats against. A clock before the
+/// epoch yields zero, which makes every seat racy: the failure mode is a
+/// re-read, never a stale reuse.
+#[must_use]
+pub fn pass_start_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i128::try_from(elapsed.as_nanos()).unwrap_or(0))
+}
+
+// What a pass may reuse from the retained capture it was offered, if any.
+fn offered_reuse(
+    private: &Path,
+    offered: Option<RetainedCapture<'_>>,
+    boundary: &[u8],
+    seats: &[crate::RowSchema],
+    now_ns: i128,
+) -> Result<(raw_tree::Reuse, Option<ReuseUnavailable>)> {
+    Ok(match offered {
+        None => (raw_tree::Reuse::new(), None),
+        // Shallow custody carries no worktree tree; say so rather than
+        // silently re-reading every seat.
+        Some(_) if !boundary.is_empty() => {
+            (raw_tree::Reuse::new(), Some(ReuseUnavailable::Shallow))
+        }
+        Some(retained) => match reusable_blobs(private, &retained, seats, now_ns)? {
+            Ok(reuse) => (reuse, None),
+            Err(why) => (raw_tree::Reuse::new(), Some(why)),
+        },
+    })
+}
+
+/// Whether a bundle's own headers carry the in-band drift marker.
+///
+/// A capture that drifted under its export omits the drifted seats' bytes; the
+/// marker is the bundle's own statement of that, independent of any corpus
+/// sidecar. A plain bundle lists `refs/carry-export/capture-drift-v1`; a
+/// shallow envelope lifts it into its headers as `shallow-drift-v1`. Only the
+/// headers are read: no pack is fetched and nothing is written.
+fn drift_marked(heads: &str) -> bool {
+    let plain = format!("refs/carry-export/{CAPTURE_DRIFT_METADATA}");
+    heads.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(_, name)| name == plain || name == shallow::DRIFT_MARKER)
+    })
+}
+
+/// A bundle staged for one restore or import: a private copy whose headers
+/// were checked for the drift marker, and the only path the verb reads.
+///
+/// Checking one path and importing it again later is a window in which the
+/// file can be replaced. The copy lives in a directory this process created
+/// exclusively (mode 0700, named by a process-wide counter, never reused);
+/// the check and every later read see the same bytes. On APFS, btrfs and XFS
+/// the copy is a clone. The directory is removed when the stage is dropped.
+#[derive(Debug)]
+pub struct StagedBundle {
+    directory: PathBuf,
+    bundle: PathBuf,
+}
+
+impl StagedBundle {
+    /// The staged copy every later read of this verb uses.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.bundle
+    }
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        // Best effort: a leftover private copy is disk, never custody.
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Stage `bundle` privately and refuse it if it carries the drift marker.
+///
+/// # Errors
+/// Refuses [`BulkloadRefusal::CaptureDrifted`] for a marked bundle, and
+/// unreadable or malformed bundles.
+pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let source = fs::canonicalize(bundle)?;
+    let directory = loop {
+        let candidate = std::env::temp_dir().join(format!(
+            "bulkload-staged-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let staged = StagedBundle {
+        bundle: directory.join("capture.bundle"),
+        directory,
+    };
+    fs::copy(&source, &staged.bundle)?;
+    let heads = text(
+        git(&staged.directory)
+            .args(["bundle", "list-heads"])
+            .arg(&staged.bundle),
+    )?;
+    if drift_marked(&heads) {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
+    #[cfg(test)]
+    mid_pass::fire(&source, mid_pass::Stage::BundleChecked);
+    Ok(staged)
+}
+
+// A private repository holding the snapshot's refs and exactly the authority
+// the snapshot read, before any worktree byte is captured.
+fn carry_authority(
+    repo: &Path,
+    capture: &Path,
+    inventory: &str,
+    authority: &CarriedAuthority,
+) -> Result<PathBuf> {
+    let private = prepare_private(repo, capture)?;
+    // prepare_private installs the frontier it read; it must be the carried one.
+    if shallow::frontier(&private)? != authority.boundary {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    capture_refs(&private, inventory, &authority.stash)?;
+    set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    capture_administration(&private, authority)?;
+    Ok(private)
+}
+
+// The whole carried authority, re-read against the same inventory rule the
+// snapshot used: a stash reflog rewritten under refs/stash, a symbolic HEAD or
+// an exclude file moving under the pass all refuse.
+fn authority_held(repo: &Path, carried: &CarriedAuthority, inventory: &str) -> Result<bool> {
+    Ok(read_authority(repo, inventory)? == *carried)
+}
+
+/// Transient refs a retained capture is fetched under. Never carried on.
+const REUSE_NAMESPACE: &str = "refs/carry-reuse/";
+
+/// Blobs a retained capture of this same checkout already holds.
+///
+/// Only seats whose `StatIdentity` is unchanged since that capture qualify:
+/// exactly the freshness tuple `RowSchema::stat_identity` documents, and only
+/// when the retained row was not racy (see [`RACY_GRANULARITY_NS`]). A seat
+/// that drifted in the retained pass is absent from its tree and is therefore
+/// read again here, which is the whole point of the incremental pass (R-N28).
+///
+/// A retained capture that cannot be fetched or decoded degrades to no reuse:
+/// the pass reads every seat, and the result says why. Whatever happened, every
+/// `refs/carry-reuse/*` ref is deleted before this returns, so the bundle this
+/// pass writes with `--all` can never carry them; if that cannot be proved,
+/// this refuses.
+fn reusable_blobs(
+    private: &Path,
+    retained: &RetainedCapture<'_>,
+    seats: &[crate::RowSchema],
+    now_ns: i128,
+) -> Result<std::result::Result<raw_tree::Reuse, ReuseUnavailable>> {
+    let attempt = retained_blobs(private, retained, seats, now_ns);
+    clear_reuse_refs(private)?;
+    Ok(attempt.map_err(|_| ReuseUnavailable::RetainedUnreadable))
+}
+
+// Delete every transient reuse ref itself (never what a symbolic one names),
+// then prove none remains. Any failure is the private repository's ref
+// inventory not being what the capture requires: GIT_INVENTORY_MALFORMED.
+fn clear_reuse_refs(private: &Path) -> Result<()> {
+    let listed = |private: &Path| -> Result<String> {
+        text(
+            git(private)
+                .args(["for-each-ref", "--format=%(refname)"])
+                .arg(REUSE_NAMESPACE),
+        )
+    };
+    for name in listed(private)?.lines() {
+        output(git(private).args(["update-ref", "--no-deref", "-d", name]))?;
+    }
+    if !listed(private)?.is_empty() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(())
+}
+
+fn retained_blobs(
+    private: &Path,
+    retained: &RetainedCapture<'_>,
+    seats: &[crate::RowSchema],
+    now_ns: i128,
+) -> Result<raw_tree::Reuse> {
+    use bulkload_proto::FileKind;
+    use std::process::Stdio;
+    let mut reuse = raw_tree::Reuse::new();
+    if !git(private)
+        .args(["fetch", "--no-tags", "--quiet"])
+        .arg(retained.bundle)
+        .args([
+            "+refs/carry-export/worktree:refs/carry-reuse/worktree",
+            "+refs/carry-export/filesystem-v1:refs/carry-reuse/filesystem-v1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success()
+    {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let held: Vec<crate::RowSchema> = postcard::from_bytes(&output(
+        git(private).args(["show", "refs/carry-reuse/filesystem-v1:value"]),
+    )?)
+    .map_err(|_| BulkloadRefusal::FrameCodec)?;
+    let held: std::collections::BTreeMap<&[u8], &crate::RowSchema> = held
+        .iter()
+        .map(|row| (row.rel_path.as_slice(), row))
+        .collect();
+    let current: std::collections::BTreeMap<&[u8], &crate::RowSchema> = seats
+        .iter()
+        .map(|row| (row.rel_path.as_slice(), row))
+        .collect();
+    #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax, not interpolation.
+    let entries =
+        output(git(private).args(["ls-tree", "-r", "-z", "refs/carry-reuse/worktree^{tree}"]))?;
+    for entry in entries.split(|byte| *byte == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let (header, path) = entry.split_at(tab);
+        let path = path
+            .get(1..)
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header =
+            std::str::from_utf8(header).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let mut fields = header.split(' ');
+        let (Some(mode), Some("blob"), Some(object)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        };
+        if !oid(object) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let (Some(row), Some(before)) = (current.get(path), held.get(path)) else {
+            continue;
+        };
+        if row.kind == FileKind::Regular
+            && !racy(before, retained.started_ns, now_ns)
+            && seat_equivalent(before, row)
+            && raw_tree::mode_of(row)? == mode
+        {
+            reuse.insert(path.to_vec(), object.to_owned());
+        }
+    }
+    Ok(reuse)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod mid_pass {
+    //! Test-only injection points inside one export, keyed by the captured
+    //! checkout so parallel tests never fire each other's hooks.
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Where in the export an armed hook runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Stage {
+        /// Before the export takes its own ref and census snapshot: the window
+        /// between a caller's pre-pass key and the export's snapshot.
+        Snapshot,
+        /// After the census and ref snapshot, before the byte pass.
+        BytePass,
+        /// After the export's last ref read, before it returns: the window
+        /// between the export's snapshot and a caller's post-pass key.
+        AfterPass,
+        /// Fired by the estate after a capture record is written and before a
+        /// stale drift record is retired.
+        RecordWritten,
+        /// Keyed by a bundle, not a checkout: after its drift check, before a
+        /// restore reads it again.
+        BundleChecked,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static ARMED: Mutex<Vec<(PathBuf, Stage, Hook)>> = Mutex::new(Vec::new());
+
+    pub fn arm(repo: &Path, hook: impl FnOnce() + Send + 'static) {
+        arm_at(repo, Stage::BytePass, hook);
+    }
+
+    pub fn arm_at(repo: &Path, stage: Stage, hook: impl FnOnce() + Send + 'static) {
+        let repo = std::fs::canonicalize(repo).expect("armed checkout exists");
+        ARMED
+            .lock()
+            .expect("hooks")
+            .push((repo, stage, Box::new(hook)));
+    }
+
+    pub fn fire(repo: &Path, stage: Stage) {
+        let hook = {
+            let mut armed = ARMED.lock().expect("hooks");
+            armed
+                .iter()
+                .position(|(path, armed_stage, _)| path == repo && *armed_stage == stage)
+                .map(|index| armed.remove(index).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Directory names whose contents a capture omits, at any depth below a root.
@@ -788,13 +1513,110 @@ pub struct RebuildableOmission {
     pub entries: u64,
 }
 
-/// A completed export: the bundle, and the custody for what it did not carry.
+/// What a capture may exclude, may reuse and must not carry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExportOptions<'a> {
+    /// A shared base bundle whose commit closure this capture may exclude.
+    pub prerequisite: Option<&'a Path>,
+    /// Which rebuildable roots become custody instead of seats.
+    pub policy: CapturePolicy,
+    /// A retained capture of this same checkout whose blobs may be reused.
+    ///
+    /// Every seat whose `StatIdentity` is unchanged since that capture, and
+    /// was not racy when it was taken, is emitted by object name instead of
+    /// being opened: the R25 never-rewalk clause, measured by
+    /// [`Export::bytes_read`].
+    pub reuse: Option<RetainedCapture<'a>>,
+}
+
+/// A retained capture offered for blob reuse, with the instant its pass began.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainedCapture<'a> {
+    /// The retained, verified capture bundle.
+    pub bundle: &'a Path,
+    /// [`Export::started_ns`] of the pass that wrote `bundle`.
+    pub started_ns: i128,
+}
+
+/// Timestamp granularity the racy-seat guard allows for, in nanoseconds.
+///
+/// Two seconds covers the coarsest filesystem a checkout may sit on (FAT and
+/// SMB at 2 s; HFS+, ext3 and many NFS servers at 1 s) and the jiffy-coarse
+/// clock Linux stamps inodes with. The cost of erring wide is one re-read of a
+/// seat written in the two seconds before a pass.
+pub const RACY_GRANULARITY_NS: i128 = 2_000_000_000;
+
+// Racy, exactly as Git defines it for its index: a seat stamped at or after
+// the capture pass start, less one timestamp tick, can be rewritten at the same
+// size in that same tick without its StatIdentity moving. Its identity
+// therefore cannot vouch for the captured bytes, and it is never reused by
+// identity; the next pass reads it again. A seat stamped later than this
+// pass's own clock reading comes from a clock this pass cannot order against,
+// and fails closed as racy too.
+const fn racy(row: &crate::RowSchema, started_ns: i128, now_ns: i128) -> bool {
+    let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
+    row.mtime_ns >= window
+        || row.ctime_ns >= window
+        || row.mtime_ns > now_ns
+        || row.ctime_ns > now_ns
+}
+
+/// Why a pass that was offered a retained capture read every seat anyway.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseUnavailable {
+    /// The checkout is shallow: its bundle is shallow-graph custody, which
+    /// carries no worktree tree to reuse blobs from.
+    Shallow,
+    /// The retained capture could not be fetched or decoded. Its transient
+    /// refs were deleted and the pass read every seat.
+    RetainedUnreadable,
+    /// The retained capture predates the recorded pass start, so no seat in it
+    /// can be proved free of racy timestamps.
+    PassStartUnrecorded,
+    /// A seat is stamped later than this pass's own clock, so it is racy on
+    /// every pass and the whole capture is never reused until the clock passes
+    /// its stamp. Other seats may still be reused one by one.
+    FutureStamp,
+}
+
+impl ReuseUnavailable {
+    /// The receipt value, as in `reuse_unavailable=shallow`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Shallow => "shallow",
+            Self::RetainedUnreadable => "retained-unreadable",
+            Self::PassStartUnrecorded => "pass-start-unrecorded",
+            Self::FutureStamp => "future-stamp",
+        }
+    }
+}
+
+/// A completed export: the bundle, the custody for what it did not carry, what
+/// raced it, and what it had to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Export {
     /// The written and verified capture bundle.
     pub bundle: PathBuf,
     /// Rebuildable roots omitted from the capture, with measured sizes.
     pub omitted: Vec<RebuildableOmission>,
+    /// Refs and seats that changed under the pass. Empty is the ordinary case.
+    pub drift: CaptureDrift,
+    /// Bytes streamed from source file descriptors during this pass.
+    pub bytes_read: u64,
+    /// Wall-clock nanoseconds since the epoch, taken before the census. A
+    /// retained capture's seats stamped within [`RACY_GRANULARITY_NS`] of this
+    /// instant are racy and never reused by identity.
+    pub started_ns: i128,
+    /// Set when a retained capture was offered and no blob could be reused.
+    pub reuse_unavailable: Option<ReuseUnavailable>,
+    /// The ref inventory this export snapshotted and carried.
+    pub refs_before: String,
+    /// The ref inventory this export read last, after its byte pass.
+    pub refs_after: String,
+    /// The Git authority this export read once and carried.
+    pub authority: CarriedAuthority,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -905,6 +1727,243 @@ const NESTED_WORKTREES_METADATA: &str = "nested-worktrees-v1";
 const NESTED_WORKTREES_DOMAIN: &[u8] = b"tcfs-git-nested-worktrees-v1\0";
 /// Largest `.git` gitdir-pointer file this census will read.
 const GITDIR_POINTER_LIMIT: u64 = 64 * 1024;
+
+/// Metadata ref naming the refs and seats that drifted under one capture pass.
+const CAPTURE_DRIFT_METADATA: &str = "capture-drift-v1";
+/// Largest drift list a single capture may report.
+///
+/// Unbounded drift is indistinguishable from a rebuild of the checkout and must
+/// never be silently truncated into a capture that claims to be complete.
+pub const DRIFT_ROW_LIMIT: usize = 65_536;
+
+/// What changed under a capture pass that did not have to refuse.
+///
+/// Ref and seat drift are the two concurrency classes an agent lane produces:
+/// a sibling worktree creating branches in the shared ref store, and a build
+/// tool rewriting a file between the census and its byte pass. Neither is
+/// corruption and neither is Git authority moving under the capture.
+#[non_exhaustive]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum DriftKind {
+    /// A ref absent from the pre-pass inventory appeared.
+    RefAdded,
+    /// A ref in the pre-pass inventory moved to another object.
+    RefChanged,
+    /// A ref in the pre-pass inventory was deleted.
+    RefRemoved,
+    /// A seat absent from the pre-pass census appeared.
+    SeatAdded,
+    /// A seat's identity changed under the pass; the capture does not vouch
+    /// for its bytes.
+    SeatChanged,
+    /// A seat in the pre-pass census was removed.
+    SeatRemoved,
+}
+
+impl DriftKind {
+    /// Whether this row names a filesystem seat rather than a ref.
+    #[must_use]
+    pub const fn is_seat(self) -> bool {
+        matches!(
+            self,
+            Self::SeatAdded | Self::SeatChanged | Self::SeatRemoved
+        )
+    }
+
+    // Whether the named seat was in the census yet its bytes are absent.
+    const fn withdraws_payload(self) -> bool {
+        matches!(self, Self::SeatChanged | Self::SeatRemoved)
+    }
+}
+
+/// One drifted ref or seat.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DriftRow {
+    /// What kind of drift this is.
+    pub kind: DriftKind,
+    /// Refname for ref kinds, checkout-relative path for seat kinds, raw bytes.
+    pub name: Vec<u8>,
+}
+
+impl DriftRow {
+    pub(crate) fn seat(kind: DriftKind, name: &[u8]) -> Self {
+        Self {
+            kind,
+            name: name.to_vec(),
+        }
+    }
+
+    fn reference(kind: DriftKind, name: &str) -> Self {
+        Self {
+            kind,
+            name: name.as_bytes().to_vec(),
+        }
+    }
+
+    /// One receipt line. Debug-escaped: receipts must not carry raw newlines.
+    #[must_use]
+    #[allow(clippy::unnecessary_debug_formatting)] // Escaping is the point.
+    pub fn display(&self) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        format!(
+            "{:?} {:?}",
+            self.kind,
+            Path::new(std::ffi::OsStr::from_bytes(&self.name))
+        )
+    }
+}
+
+/// Everything one capture pass observed changing under it.
+///
+/// An empty list is the ordinary case and is never carried, hashed or written:
+/// a checkout nothing raced against produces exactly the bundle it produced
+/// before drift tolerance existed. Drift is never part of the reusable key; it
+/// describes a pass, not a repository state.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureDrift {
+    /// Drifted refs and seats, sorted by (kind, name), deduplicated.
+    pub rows: Vec<DriftRow>,
+}
+
+impl CaptureDrift {
+    /// Whether this pass raced against nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// How many refs and seats drifted.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// One receipt line per drifted ref and seat.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.rows.iter().map(DriftRow::display).collect()
+    }
+
+    /// Seats whose bytes this capture deliberately does not carry.
+    ///
+    /// Directories hold no bytes and are never withdrawn from the restored
+    /// shape; a seat that appeared mid-pass was never in the census at all.
+    #[must_use]
+    pub fn withdrawn(&self, seats: &[crate::RowSchema]) -> Vec<Vec<u8>> {
+        use bulkload_proto::FileKind;
+        let directories: std::collections::BTreeSet<&[u8]> = seats
+            .iter()
+            .filter(|row| row.kind == FileKind::Directory)
+            .map(|row| row.rel_path.as_slice())
+            .collect();
+        self.rows
+            .iter()
+            .filter(|row| {
+                row.kind.withdraws_payload() && !directories.contains(row.name.as_slice())
+            })
+            .map(|row| row.name.clone())
+            .collect()
+    }
+
+    fn extend(&mut self, rows: impl IntoIterator<Item = DriftRow>) {
+        self.rows.extend(rows);
+    }
+
+    /// Fold in drift observed over a wider window than the export's own.
+    ///
+    /// # Errors
+    /// Refuses drift larger than [`DRIFT_ROW_LIMIT`].
+    pub(crate) fn merge(&mut self, other: Self) -> Result<()> {
+        self.rows.extend(other.rows);
+        self.seal()
+    }
+
+    // Deterministic order, exactly as the census sorts its seats, and a hard
+    // budget: drift larger than the cap is a rebuild, not a captured pass.
+    fn seal(&mut self) -> Result<()> {
+        self.rows.sort_unstable();
+        self.rows.dedup();
+        if self.rows.len() > DRIFT_ROW_LIMIT {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        Ok(())
+    }
+}
+
+// Keyed on refname: a lane creating branches in a shared ref store is drift,
+// never a refusal. HEAD is not in `for-each-ref` and keeps its own comparison.
+fn reference_drift(before: &str, after: &str) -> Result<Vec<DriftRow>> {
+    let index = |inventory: &str| -> Result<std::collections::BTreeMap<String, String>> {
+        inventory
+            .lines()
+            .map(|line| {
+                line.split_once(' ')
+                    .map(|(value, name)| (name.to_owned(), value.to_owned()))
+                    .ok_or(BulkloadRefusal::GitInventoryMalformed)
+            })
+            .collect()
+    };
+    let (before, after) = (index(before)?, index(after)?);
+    let mut rows = Vec::new();
+    for (name, value) in &before {
+        match after.get(name) {
+            None => rows.push(DriftRow::reference(DriftKind::RefRemoved, name)),
+            Some(current) if current != value => {
+                rows.push(DriftRow::reference(DriftKind::RefChanged, name));
+            }
+            Some(_) => (),
+        }
+    }
+    for name in after.keys().filter(|name| !before.contains_key(*name)) {
+        rows.push(DriftRow::reference(DriftKind::RefAdded, name));
+    }
+    Ok(rows)
+}
+
+// Directories carry no bytes and their timestamps move whenever any child is
+// created or removed, so they drift only on kind, mode or link target. Regular
+// files and symlinks drift on the full StatIdentity the freshness cache keys on.
+fn seat_equivalent(a: &crate::RowSchema, b: &crate::RowSchema) -> bool {
+    use bulkload_proto::FileKind;
+    a.kind == b.kind
+        && a.mode == b.mode
+        && a.link_target == b.link_target
+        && (a.kind == FileKind::Directory
+            || (a.stat_identity() == b.stat_identity() && a.nlink == b.nlink))
+}
+
+fn seat_drift(before: &[crate::RowSchema], after: &[crate::RowSchema]) -> Vec<DriftRow> {
+    seat_drift_by(before, after, seat_equivalent)
+}
+
+fn seat_drift_by(
+    before: &[crate::RowSchema],
+    after: &[crate::RowSchema],
+    same: impl Fn(&crate::RowSchema, &crate::RowSchema) -> bool,
+) -> Vec<DriftRow> {
+    fn index(rows: &[crate::RowSchema]) -> std::collections::BTreeMap<&[u8], &crate::RowSchema> {
+        rows.iter()
+            .map(|row| (row.rel_path.as_slice(), row))
+            .collect()
+    }
+    let (before, after) = (index(before), index(after));
+    let mut rows = Vec::new();
+    for (path, row) in &before {
+        match after.get(path) {
+            None => rows.push(DriftRow::seat(DriftKind::SeatRemoved, path)),
+            Some(current) if !same(row, current) => {
+                rows.push(DriftRow::seat(DriftKind::SeatChanged, path));
+            }
+            Some(_) => (),
+        }
+    }
+    for path in after.keys().filter(|path| !before.contains_key(*path)) {
+        rows.push(DriftRow::seat(DriftKind::SeatAdded, path));
+    }
+    rows
+}
 
 /// A registered linked worktree of the same repository nested inside the checkout.
 ///
@@ -1271,6 +2330,20 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
 /// Refuses invalid source names, non-export bundle refs, collisions or invalid
 /// bundles. A failed fetch may leave unreachable objects, never changed HEAD.
 pub fn import_bundle(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
+    import_staged(repo, &stage_bundle(bundle)?, source)
+}
+
+/// [`import_bundle`] from a bundle this process already staged and checked.
+///
+/// # Errors
+/// As [`import_bundle`].
+pub fn import_staged(repo: &Path, staged: &StagedBundle, source: &str) -> Result<usize> {
+    import_verified(repo, staged.path(), source)
+}
+
+// `import_bundle` for a verb that already staged and checked its bundle, and
+// reads only the staged copy.
+pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
@@ -1449,7 +2522,7 @@ fn prepare_attachment(
             ])
             .arg(&private),
     )?;
-    import_bundle(&private, &retained, source)?;
+    import_verified(&private, &retained, source)?;
     let heads = shallow::headers(&private, &retained)?;
     let head = capture_revision(&heads, "head")?;
     let symbolic = text(git(&private).args([
@@ -1650,7 +2723,7 @@ fn prepare_linked_attachment(
 ) -> Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let retained = receipt.join("capture.bundle");
-    import_bundle(repository, &retained, source)?;
+    import_verified(repository, &retained, source)?;
     let head = capture_revision(heads, "head")?;
     let symbolic = text(git(private).args([
         "show",
@@ -1806,6 +2879,8 @@ fn attach_payload(
     receipt: &Path,
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let staged = stage_bundle(bundle)?;
+    let bundle = staged.path();
     let destination = fs::canonicalize(destination)?;
     let repository = repository.map(fs::canonicalize).transpose()?;
     let common = repository.as_deref().map(common_repository).transpose()?;
@@ -1949,23 +3024,32 @@ pub fn restore_bundle_configured(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    restore_staged(&stage_bundle(bundle)?, destination, source, mapping)
+}
+
+/// [`restore_bundle_configured`] from a bundle this process already staged.
+///
+/// # Errors
+/// As [`restore_bundle_configured`].
+pub fn restore_staged(
+    staged: &StagedBundle,
+    destination: &Path,
+    source: &str,
+    mapping: Option<(&Path, &Path)>,
+) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let bundle = fs::canonicalize(bundle)?;
+    let bundle = staged.path();
     fs::DirBuilder::new().mode(0o700).create(destination)?;
     let destination = fs::canonicalize(destination)?;
     // Read bundle headers without assuming the destination's object format.
-    let heads = text(
-        git(&destination)
-            .args(["bundle", "list-heads"])
-            .arg(&bundle),
-    )?;
+    let heads = text(git(&destination).args(["bundle", "list-heads"]).arg(bundle))?;
     if !shallow::is_custody(&heads) {
         capture_revision(&heads, "configuration-v1")?;
     }
     let format = bundle_object_format(&heads)?;
     output(git(&destination).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_bundle(&destination, &bundle, source)?;
-    let heads = shallow::headers(&destination, &bundle)?;
+    import_verified(&destination, bundle, source)?;
+    let heads = shallow::headers(&destination, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -2022,8 +3106,22 @@ pub fn restore_linked(
     destination: &Path,
     source: &str,
 ) -> Result<()> {
+    restore_linked_staged(&stage_bundle(bundle)?, repository, destination, source)
+}
+
+/// [`restore_linked`] from a bundle this process already staged and checked.
+///
+/// # Errors
+/// As [`restore_linked`].
+pub fn restore_linked_staged(
+    staged: &StagedBundle,
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
@@ -2037,10 +3135,9 @@ pub fn restore_linked(
             .file_name()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     );
-    let bundle = fs::canonicalize(bundle)?;
     let repository = fs::canonicalize(repository)?;
-    import_bundle(&repository, &bundle, source)?;
-    let heads = shallow::headers(&repository, &bundle)?;
+    import_verified(&repository, bundle, source)?;
+    let heads = shallow::headers(&repository, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -3277,5 +4374,893 @@ mod tests {
         assert!(carried.contains("dist/kept"));
         assert!(carried.contains("bazel-out"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- drift tolerance (R25, bulkload #34; R-N28/R-N30/R-N72; R-N29 deferred to bulkload#48) ----
+
+    fn drift_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-drift-{name}-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        committed_repository(&source, b"tracked bytes at census");
+        fs::write(source.join(".gitignore"), b"ignored\n").unwrap();
+        fs::write(source.join("ignored"), b"ignored but carried").unwrap();
+        fs::create_dir(source.join("dir")).unwrap();
+        fs::write(source.join("dir/untracked"), b"untracked payload").unwrap();
+        (root, source)
+    }
+
+    fn drift_ref_present(private: &Path) -> bool {
+        git(private)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/carry-export/{CAPTURE_DRIFT_METADATA}"),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn drift_sidecar(private: &Path) -> CaptureDrift {
+        postcard::from_bytes(
+            &output(git(private).args([
+                "show",
+                &format!("refs/carry-export/{CAPTURE_DRIFT_METADATA}:value"),
+            ]))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn row(kind: DriftKind, name: &[u8]) -> DriftRow {
+        DriftRow {
+            kind,
+            name: name.to_vec(),
+        }
+    }
+
+    // Refusal #2 of 9/21-22: four sibling-worktree lanes created branches in
+    // the shared ref store while a capture was in flight.
+    #[test]
+    fn refs_created_elsewhere_during_capture_are_drift_not_refusal() {
+        let (root, source) = drift_fixture("refs-elsewhere");
+        let head = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let index_before = fs::read(source.join(".git/index")).unwrap();
+        let (lane, tip) = (source.clone(), head.clone());
+        mid_pass::arm(&source, move || {
+            for number in 0..4 {
+                output(git(&lane).args(["update-ref", &format!("refs/heads/lane-{number}"), &tip]))
+                    .unwrap();
+            }
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            (0..4)
+                .map(|number| row(
+                    DriftKind::RefAdded,
+                    format!("refs/heads/lane-{number}").as_bytes()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            head,
+            text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap()
+        );
+        assert_eq!(index_before, fs::read(source.join(".git/index")).unwrap());
+        output(git(&source).args(["bundle", "verify"]).arg(&export.bundle)).unwrap();
+        let private = capture.join("repository.git");
+        assert_eq!(drift_sidecar(&private), export.drift);
+        // The lanes' refs were not in the captured inventory and are not in the bundle.
+        let heads = text(
+            git(&source)
+                .args(["bundle", "list-heads"])
+                .arg(&export.bundle),
+        )
+        .unwrap();
+        assert!(!heads.contains("lane-"));
+        // The pre-drift contract is untouched for callers that never asked for tolerance.
+        let again = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&again).args(["update-ref", "refs/heads/lane-4", "HEAD"])).unwrap();
+        });
+        assert!(matches!(
+            export_repository(&source, &root.join("strict")),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Refusal #1 of 9/21-22: cargo rewrote .rustc_info.json between the census
+    // and that seat's byte pass.
+    #[test]
+    fn a_file_rewritten_during_the_raw_pass_is_drift_not_refusal() {
+        let (root, source) = drift_fixture("file-rewritten");
+        let rewritten = source.join("tracked");
+        mid_pass::arm(&source, move || {
+            fs::write(&rewritten, b"{\"rustc\":1,\"rewritten\":true}").unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::SeatChanged, b"tracked")]
+        );
+        let private = capture.join("repository.git");
+        // Absent from the tree and from filesystem-v1: the drift list is the
+        // statement that the seat's bytes are not here (R-N28).
+        assert!(!carried_paths(&private)
+            .lines()
+            .any(|path| path == "tracked"));
+        assert!(!manifest_paths(&private).contains(&b"tracked".to_vec()));
+        assert!(carried_paths(&private).contains("dir/untracked"));
+        assert!(manifest_paths(&private).contains(&b"ignored".to_vec()));
+        output(git(&private).args(["fsck", "--strict", "--no-dangling"])).unwrap();
+        output(git(&source).args(["bundle", "verify"]).arg(&export.bundle)).unwrap();
+        assert_eq!(drift_sidecar(&private), export.drift);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The operator-requested test: a build truncating a tracked file, an agent
+    // creating a new file, and a lane creating a branch, all under one pass.
+    #[test]
+    fn concurrent_ref_creation_and_file_mutation_during_one_capture_succeed_with_drift() {
+        let (root, source) = drift_fixture("concurrent");
+        let inside = source.clone();
+        mid_pass::arm(&source, move || {
+            fs::write(inside.join("tracked"), b"").unwrap();
+            fs::write(inside.join("dir/appeared"), b"created mid-pass").unwrap();
+            output(git(&inside).args(["update-ref", "refs/heads/concurrent-lane", "HEAD"]))
+                .unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![
+                row(DriftKind::RefAdded, b"refs/heads/concurrent-lane"),
+                row(DriftKind::SeatAdded, b"dir/appeared"),
+                row(DriftKind::SeatChanged, b"tracked"),
+            ]
+        );
+        assert_eq!(export.drift.len(), 3);
+        output(git(&source).args(["bundle", "verify"]).arg(&export.bundle)).unwrap();
+        // Capture never writes the source: it is exactly its post-mutation state.
+        assert_eq!(fs::read(source.join("tracked")).unwrap(), b"");
+        assert_eq!(
+            fs::read(source.join("dir/appeared")).unwrap(),
+            b"created mid-pass"
+        );
+        assert_eq!(
+            text(git(&source).args(["rev-parse", "--verify", "refs/heads/concurrent-lane"]))
+                .unwrap(),
+            text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap()
+        );
+        let private = capture.join("repository.git");
+        let carried = carried_paths(&private);
+        assert!(!carried.lines().any(|path| path == "tracked"));
+        assert!(!carried.contains("appeared"));
+        assert!(carried.contains("dir/untracked"));
+        // The bundle is not complete, and says so in-band: no restore verb
+        // presents it as a workspace (re-review finding 3).
+        let restored = root.join("restored");
+        assert!(matches!(
+            restore_bundle(&export.bundle, &restored, "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        assert!(!restored.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // (a)/(b) tolerance must not leak into HEAD (R-N30).
+    #[test]
+    fn head_moving_during_capture_still_refuses() {
+        let (root, source) = drift_fixture("head-moves");
+        let inside = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "committed mid-pass",
+            ]))
+            .unwrap();
+        });
+        assert!(matches!(
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Separability from the index (R-N30): HEAD pinned, index rewritten.
+    #[test]
+    fn index_rewritten_during_capture_still_refuses() {
+        let (root, source) = drift_fixture("index-rewritten");
+        let head = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let inside = source.clone();
+        mid_pass::arm(&source, move || {
+            fs::write(inside.join("staged-mid-pass"), b"added to the index").unwrap();
+            output(git(&inside).args(["add", "staged-mid-pass"])).unwrap();
+        });
+        assert!(matches!(
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        assert_eq!(
+            head,
+            text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The Census split holds: a nested worktree's HEAD is custody, not seats,
+    // and it moving under the pass is still a refusal.
+    #[test]
+    fn nested_worktree_head_moving_during_capture_still_refuses() {
+        let (root, source) = drift_fixture("nested-head");
+        let nested = source.join(".claude/worktrees/agent-x");
+        fs::create_dir_all(source.join(".claude/worktrees")).unwrap();
+        output(
+            git(&source)
+                .args(["worktree", "add", "-b", "agent-x"])
+                .arg(&nested),
+        )
+        .unwrap();
+        assert_eq!(nested_worktrees(&source).unwrap().len(), 1);
+        let inside = nested;
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "agent committed mid-pass",
+            ]))
+            .unwrap();
+        });
+        assert!(matches!(
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The no-invalidation proof for every retained bundle: a clean capture has
+    // exactly the ref set it had before drift tolerance existed, no drift ref,
+    // and a deterministic shape across passes.
+    #[test]
+    fn a_clean_capture_emits_no_drift_ref_and_keeps_the_pre_change_bundle_shape() {
+        let (root, source) = drift_fixture("clean");
+        let symbolic = text(git(&source).args(["symbolic-ref", "HEAD"])).unwrap();
+        let mut expected: Vec<String> = [
+            "configuration-v1",
+            "exclude",
+            "filesystem-v1",
+            "head",
+            "head-symbolic",
+            "staged",
+            "worktree",
+        ]
+        .iter()
+        .map(|name| format!("refs/carry-export/{name}"))
+        .chain(std::iter::once(format!("refs/carry-export/{symbolic}")))
+        .collect();
+        expected.sort();
+        let key = reusable_capture_key(&source).unwrap();
+        let mut shapes = Vec::new();
+        for pass in ["first", "second"] {
+            let capture = root.join(pass);
+            let export =
+                export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+            assert!(export.drift.is_empty());
+            let private = capture.join("repository.git");
+            assert!(!drift_ref_present(&private));
+            let names: Vec<String> = refs(&private)
+                .unwrap()
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().1.to_owned())
+                .collect();
+            assert_eq!(names, expected);
+            let heads: Vec<String> = text(
+                git(&source)
+                    .args(["bundle", "list-heads"])
+                    .arg(&export.bundle),
+            )
+            .unwrap()
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().1.to_owned())
+            .collect();
+            assert_eq!(heads, expected);
+            shapes.push((
+                text(git(&private).args(["rev-parse", "refs/carry-export/worktree^{tree}"]))
+                    .unwrap(),
+                output(git(&private).args(["show", "refs/carry-export/filesystem-v1:value"]))
+                    .unwrap(),
+                export.bytes_read,
+            ));
+        }
+        assert_eq!(shapes.first(), shapes.last());
+        assert_eq!(key, reusable_capture_key(&source).unwrap());
+        assert_eq!(
+            key,
+            legacy::reusable_capture_key_with_policy(&source, CapturePolicy::default()).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Unbounded drift is a rebuild, never a silently truncated drift list.
+    #[test]
+    fn drift_beyond_the_row_budget_refuses() {
+        let (root, source) = drift_fixture("budget");
+        fs::create_dir(source.join("burst")).unwrap();
+        let burst = source.join("burst");
+        mid_pass::arm(&source, move || {
+            for number in 0..=DRIFT_ROW_LIMIT {
+                fs::File::create(burst.join(format!("{number}"))).unwrap();
+            }
+        });
+        assert!(matches!(
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            Err(BulkloadRefusal::BudgetExceeded)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ENOENT is drift; EACCES is a real IO fault that tolerance must not swallow.
+    #[test]
+    fn a_seat_deleted_mid_pass_is_drift_but_an_unreadable_seat_still_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, source) = drift_fixture("deleted-vs-unreadable");
+        fs::write(source.join("doomed"), b"gone before its byte pass").unwrap();
+        fs::write(source.join("locked"), b"unreadable before its byte pass").unwrap();
+        let doomed = source.join("doomed");
+        mid_pass::arm(&source, move || fs::remove_file(&doomed).unwrap());
+        let export =
+            export_repository_with_drift(&source, &root.join("deleted"), &ExportOptions::default())
+                .unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::SeatRemoved, b"doomed")]
+        );
+        assert!(!manifest_paths(&root.join("deleted/repository.git")).contains(&b"doomed".to_vec()));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root (as on the Linux CI runner) reads a mode-000 file, so an
+            // unreadable seat cannot be produced by permissions; the refusal
+            // half of this test only has meaning for an unprivileged user.
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let locked = source.join("locked");
+        let lock = locked.clone();
+        mid_pass::arm(&source, move || {
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        let refused = export_repository_with_drift(
+            &source,
+            &root.join("unreadable"),
+            &ExportOptions::default(),
+        );
+        assert!(matches!(refused, Err(BulkloadRefusal::Io(Some(_)))));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn held_census(private: &Path) -> Vec<crate::RowSchema> {
+        postcard::from_bytes(
+            &output(git(private).args(["show", "refs/carry-export/filesystem-v1:value"])).unwrap(),
+        )
+        .unwrap()
+    }
+
+    // R-N72 (TIN-4540) finding 2: racy timestamps, exactly as in Git. A seat
+    // rewritten at the same size within one timestamp tick of the capture
+    // keeps its whole StatIdentity on a coarse-timestamp filesystem, so its
+    // identity cannot tell the new bytes from the captured ones. Deterministic
+    // (re-review finding 7): the retained pass start and this pass's clock are
+    // injected relative to the seat's own stamps, never read off the wall.
+    #[test]
+    fn a_same_size_rewrite_in_the_capture_tick_is_never_reused_by_identity() {
+        let (root, source) = drift_fixture("racy");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        // The census exactly as a coarse-timestamp filesystem reports it after
+        // the rewrite below: every seat at the identity the capture holds.
+        let held = held_census(&root.join("first/repository.git"));
+        let tracked = held.iter().find(|row| row.rel_path == b"tracked").unwrap();
+        let stamp = tracked.mtime_ns.max(tracked.ctime_ns);
+        fs::write(source.join("tracked"), b"TRACKED BYTES AT CENSUS").unwrap();
+        let second = root.join("second");
+        fs::create_dir(&second).unwrap();
+        let private = prepare_private(&source, &second).unwrap();
+        let reuse_at = |started_ns: i128, now_ns: i128| {
+            let retained = RetainedCapture {
+                bundle: &first.bundle,
+                started_ns,
+            };
+            reusable_blobs(&private, &retained, &held, now_ns)
+                .unwrap()
+                .unwrap()
+        };
+        let later = stamp + 60 * RACY_GRANULARITY_NS;
+        // Stamped in the tick the retained pass started in: racy.
+        assert!(
+            !reuse_at(stamp, later).contains_key(b"tracked".as_slice()),
+            "a racy seat is never reused by stat identity"
+        );
+        assert!(!reuse_at(stamp + RACY_GRANULARITY_NS, later).contains_key(b"tracked".as_slice()));
+        // Stamped well before the pass start: reused on identity alone. The
+        // guard is Git's racy check, not a blanket disable of R25 reuse.
+        assert!(reuse_at(later, later).contains_key(b"tracked".as_slice()));
+        // Re-review finding 5: a stamp later than this pass's own clock comes
+        // from a clock the pass cannot order against, and fails closed.
+        assert!(!reuse_at(later, stamp - 1).contains_key(b"tracked".as_slice()));
+        assert!(!refs(&private).unwrap().contains(REUSE_NAMESPACE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 4: a retained capture that cannot be decoded
+    // costs only the optimization. Its refs/carry-reuse/* refs are deleted
+    // before the pass continues, so `bundle create --all` never carries them.
+    #[test]
+    fn an_undecodable_retained_capture_degrades_to_no_reuse_and_leaks_no_refs() {
+        let (root, source) = drift_fixture("undecodable-retained");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        let retained = root.join("first/repository.git");
+        output(git(&retained).args(["update-ref", "-d", "refs/carry-export/filesystem-v1"]))
+            .unwrap();
+        metadata(&retained, "filesystem-v1", b"\xff not a postcard census").unwrap();
+        let corrupt = root.join("corrupt.bundle");
+        output(
+            git(&retained)
+                .args(["bundle", "create"])
+                .arg(&corrupt)
+                .arg("--all"),
+        )
+        .unwrap();
+        let capture = root.join("second");
+        let export = export_repository_with_drift(
+            &source,
+            &capture,
+            &ExportOptions {
+                reuse: Some(RetainedCapture {
+                    bundle: &corrupt,
+                    started_ns: first.started_ns,
+                }),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            export.reuse_unavailable,
+            Some(ReuseUnavailable::RetainedUnreadable)
+        );
+        assert_eq!(
+            export.bytes_read, first.bytes_read,
+            "degraded to a full read"
+        );
+        assert!(!refs(&capture.join("repository.git"))
+            .unwrap()
+            .contains("refs/carry-reuse/"));
+        let heads = text(
+            git(&source)
+                .args(["bundle", "list-heads"])
+                .arg(&export.bundle),
+        )
+        .unwrap();
+        assert!(!heads.contains("refs/carry-reuse/"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 1, the reviewer's reproduction: the export's
+    // own snapshot cannot see a ref deleted before it, but the pre- and
+    // post-pass key parts can, and only equal parts are a clean reuse key.
+    #[test]
+    fn a_ref_deleted_before_the_export_snapshot_is_key_drift() {
+        let (root, source) = drift_fixture("adv-stale-key");
+        output(git(&source).args(["checkout", "-q", "-b", "side"])).unwrap();
+        fs::write(source.join("side-only"), b"unique").unwrap();
+        output(git(&source).args(["add", "side-only"])).unwrap();
+        output(git(&source).args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "side"]))
+            .unwrap();
+        let side = text(git(&source).args(["rev-parse", "side"])).unwrap();
+        output(git(&source).args(["checkout", "-q", "-"])).unwrap();
+        let pre = capture_key_parts(&source).unwrap();
+        let recorded_key = pre.digest().unwrap();
+        output(git(&source).args(["update-ref", "-d", "refs/heads/side"])).unwrap();
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        let post = capture_key_parts(&source).unwrap();
+        assert!(pre.drift_only(&post));
+        assert!(export.drift.is_empty(), "the export alone cannot see it");
+        assert_eq!(
+            pre.drift_to(&post).unwrap().rows,
+            vec![row(DriftKind::RefRemoved, b"refs/heads/side")]
+        );
+        assert!(post.drift_to(&post).unwrap().is_empty());
+        // Why the pre-pass key must never be recorded as clean here: the
+        // branch's return at the same commit reproduces it exactly.
+        output(git(&source).args(["update-ref", "refs/heads/side", &side])).unwrap();
+        assert_eq!(reusable_capture_key(&source).unwrap(), recorded_key);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 (TIN-4540) finding 4: a shallow checkout's bundle is shallow-graph
+    // custody with no worktree tree to reuse, so the pass says so.
+    #[test]
+    fn a_shallow_checkout_reports_reuse_unavailable_instead_of_silently_rereading() {
+        let root = std::env::temp_dir().join(format!(
+            "bulkload-drift-shallow-reuse-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let full = root.join("full");
+        committed_repository(&full, b"first");
+        fs::write(full.join("tracked"), b"second").unwrap();
+        output(git(&full).args(["-c", "commit.gpgsign=false", "commit", "-qam", "second"]))
+            .unwrap();
+        let source = root.join("shallow");
+        output(
+            git(&root)
+                .args(["clone", "-q", "--depth=1", "--no-local"])
+                .arg(format!("file://{}", full.display()))
+                .arg(&source),
+        )
+        .unwrap();
+        output(git(&source).args([
+            "config",
+            "remote.origin.url",
+            "https://example.test/shallow.git",
+        ]))
+        .unwrap();
+        fs::write(source.join("untracked"), b"untracked payload").unwrap();
+        assert!(!shallow::frontier(&source).unwrap().is_empty());
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        assert_eq!(first.reuse_unavailable, None, "no reuse was offered");
+        let second = export_repository_with_drift(
+            &source,
+            &root.join("second"),
+            &ExportOptions {
+                reuse: Some(RetainedCapture {
+                    bundle: &first.bundle,
+                    // Settled: nothing is racy, so shallow is the only reason.
+                    started_ns: first.started_ns + 60 * RACY_GRANULARITY_NS,
+                }),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.reuse_unavailable, Some(ReuseUnavailable::Shallow));
+        assert_eq!(second.bytes_read, first.bytes_read);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn drift_refused<T>(result: Result<T>) -> bool {
+        result.err() == Some(BulkloadRefusal::CaptureDrifted)
+    }
+
+    // R-N72 re-review finding 3: CAPTURE_DRIFTED is not an estate-only rule.
+    // Every restore and import verb refuses a bundle carrying the in-band
+    // capture-drift-v1 marker, before it writes anything.
+    #[test]
+    fn every_restore_and_import_verb_refuses_a_drift_marked_bundle() {
+        let (root, source) = drift_fixture("marked-verbs");
+        let lane = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&lane).args(["update-ref", "refs/heads/lane", "HEAD"])).unwrap();
+        });
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        assert!(!export.drift.is_empty());
+        let bundle = export.bundle.as_path();
+        let repo = root.join("repo");
+        committed_repository(&repo, b"an unrelated repository");
+        let inventory = refs(&repo).unwrap();
+        let at = |name: &str| root.join(name);
+        assert!(drift_refused(restore_bundle(
+            bundle,
+            &at("restored"),
+            "neo"
+        )));
+        assert!(
+            !at("restored").exists(),
+            "refused before the destination exists"
+        );
+        assert!(drift_refused(restore_linked(
+            bundle,
+            &repo,
+            &at("linked"),
+            "neo"
+        )));
+        assert!(drift_refused(import_bundle(&repo, bundle, "neo")));
+        assert!(drift_refused(repair_missing_index(
+            bundle,
+            &repo,
+            "neo",
+            &at("repair-receipt")
+        )));
+        assert!(drift_refused(attach_matching_payload(
+            bundle,
+            &repo,
+            &at("attached"),
+            "neo",
+            &at("attach-receipt")
+        )));
+        assert!(drift_refused(attach_standalone_payload(
+            bundle,
+            &at("standalone"),
+            "neo",
+            &at("standalone-receipt"),
+            &at("origin-from"),
+            &at("origin-to")
+        )));
+        assert!(drift_refused(registered::restore(
+            bundle,
+            &repo,
+            &at("registered"),
+            &at("admin"),
+            "neo",
+            &at("registered-receipt")
+        )));
+        for name in [
+            "linked",
+            "repair-receipt",
+            "attached",
+            "attach-receipt",
+            "standalone",
+            "standalone-receipt",
+            "registered",
+            "registered-receipt",
+        ] {
+            assert!(!at(name).exists(), "{name} was written before the refusal");
+        }
+        assert_eq!(
+            refs(&repo).unwrap(),
+            inventory,
+            "the repository is untouched"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Finding 3, shallow custody: the marker rides inside the envelope's
+    // inventory, and the restore still refuses before it writes anything.
+    #[test]
+    fn a_drift_marked_shallow_bundle_refuses_to_restore() {
+        let root = std::env::temp_dir().join(format!(
+            "bulkload-drift-shallow-marked-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let full = root.join("full");
+        committed_repository(&full, b"first");
+        fs::write(full.join("tracked"), b"second").unwrap();
+        output(git(&full).args(["-c", "commit.gpgsign=false", "commit", "-qam", "second"]))
+            .unwrap();
+        let source = root.join("shallow");
+        output(
+            git(&root)
+                .args(["clone", "-q", "--depth=1", "--no-local"])
+                .arg(format!("file://{}", full.display()))
+                .arg(&source),
+        )
+        .unwrap();
+        output(git(&source).args([
+            "config",
+            "remote.origin.url",
+            "https://example.test/shallow.git",
+        ]))
+        .unwrap();
+        let lane = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&lane).args(["update-ref", "refs/heads/lane", "HEAD"])).unwrap();
+        });
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        assert!(!export.drift.is_empty());
+        // Round-3 N2: the marker is visible from the envelope's own headers,
+        // so the check never has to fetch the shallow pack.
+        let heads = text(
+            git(&root)
+                .args(["bundle", "list-heads"])
+                .arg(&export.bundle),
+        )
+        .unwrap();
+        assert!(
+            heads
+                .lines()
+                .any(|line| line.ends_with("refs/carry-export/shallow-drift-v1")),
+            "{heads}"
+        );
+        let restored = root.join("restored");
+        assert!(drift_refused(restore_bundle(
+            &export.bundle,
+            &restored,
+            "neo"
+        )));
+        assert!(!restored.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 re-review finding 8: clearing the transient reuse refs deletes the
+    // refs themselves, never what a symbolic one points at, and a ref that
+    // cannot be deleted refuses with a Git inventory code.
+    #[test]
+    fn clearing_reuse_refs_never_follows_a_symbolic_ref_and_refuses_as_git_inventory() {
+        let (root, source) = drift_fixture("clear-reuse");
+        let capture = root.join("private");
+        fs::create_dir(&capture).unwrap();
+        let private = prepare_private(&source, &capture).unwrap();
+        let head = text(git(&source).args(["rev-parse", "HEAD"])).unwrap();
+        set_ref(&private, "refs/heads/keep", &head).unwrap();
+        output(git(&private).args(["symbolic-ref", "refs/carry-reuse/sym", "refs/heads/keep"]))
+            .unwrap();
+        clear_reuse_refs(&private).unwrap();
+        assert!(
+            output(git(&private).args(["show-ref", "--verify", "refs/heads/keep"])).is_ok(),
+            "a ref outside the reuse namespace was deleted through a symbolic ref"
+        );
+        assert!(!private.join("refs/carry-reuse/sym").exists());
+        set_ref(&private, "refs/carry-reuse/worktree", &head).unwrap();
+        fs::write(private.join("refs/carry-reuse/worktree.lock"), b"").unwrap();
+        assert!(matches!(
+            clear_reuse_refs(&private),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-3 N4: the drift check and the restore must read the same bytes. A
+    // bundle swapped for a drift-marked one after its check is never the one
+    // restored.
+    #[test]
+    fn a_bundle_swapped_after_its_drift_check_is_never_the_one_restored() {
+        let (root, source) = drift_fixture("swap-after-check");
+        let clean =
+            export_repository_with_drift(&source, &root.join("clean"), &ExportOptions::default())
+                .unwrap();
+        let lane = source.clone();
+        mid_pass::arm(&source, move || {
+            fs::write(lane.join("tracked"), b"rewritten mid-pass").unwrap();
+        });
+        let marked =
+            export_repository_with_drift(&source, &root.join("marked"), &ExportOptions::default())
+                .unwrap();
+        assert!(!marked.drift.is_empty());
+        let offered = root.join("offered.bundle");
+        fs::copy(&clean.bundle, &offered).unwrap();
+        let (from, to) = (marked.bundle, offered.clone());
+        mid_pass::arm_at(&offered, mid_pass::Stage::BundleChecked, move || {
+            fs::copy(&from, &to).unwrap();
+        });
+        let restored = root.join("restored");
+        restore_bundle(&offered, &restored, "neo").unwrap();
+        assert_eq!(
+            fs::read(restored.join("tracked")).unwrap(),
+            b"tracked bytes at census",
+            "the restored bytes are the checked bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) mod legacy {
+    //! The reusable-key derivation exactly as it was before drift tolerance
+    //! (PR #597 head, 7b017af), kept verbatim so tests can prove that
+    //! `KeyParts::digest` is bit-identical and retained captures stay reused.
+    use super::{
+        capture_census, common_repository, git, output, refs, shallow, source_configuration,
+        source_index, text, CapturePolicy, NESTED_WORKTREES_DOMAIN, REBUILDABLE_DOMAIN,
+    };
+    use crate::{BulkloadRefusal, Result};
+    use std::fs;
+    use std::path::Path;
+
+    pub fn reusable_capture_key_with_policy(
+        repo: &Path,
+        policy: CapturePolicy,
+    ) -> Result<[u8; 32]> {
+        use std::os::unix::ffi::OsStrExt;
+        let repo = fs::canonicalize(repo)?;
+        let common = common_repository(&repo)?;
+        let inventory = refs(&repo)?;
+        let head = text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))?;
+        let symbolic = git(&repo).args(["symbolic-ref", "-q", "HEAD"]).output()?;
+        if !symbolic.status.success() && symbolic.status.code() != Some(1) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let (_, index) = source_index(&repo)?;
+        let exclude_path = text(git(&repo).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ]))?;
+        let exclude = match fs::read(exclude_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
+            output(git(&repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
+        } else {
+            Vec::new()
+        };
+        let census = capture_census(&repo, &common, policy)?;
+        let rows = postcard::to_allocvec(&census.rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let configuration = postcard::to_allocvec(&source_configuration(&repo)?)
+            .map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let boundary = shallow::frontier(&repo)?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tcfs-git-reusable-capture-v1\0");
+        for bytes in [
+            repo.as_os_str().as_bytes(),
+            common.as_os_str().as_bytes(),
+            inventory.as_bytes(),
+            head.as_bytes(),
+            &symbolic.stdout,
+            &index,
+            &exclude,
+            &stash,
+            &rows,
+            &configuration,
+            &boundary,
+        ] {
+            hash.update(
+                &u64::try_from(bytes.len())
+                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                    .to_le_bytes(),
+            );
+            hash.update(bytes);
+        }
+        if !census.nested_worktrees.is_empty() {
+            let nested = postcard::to_allocvec(&census.nested_worktrees)
+                .map_err(|_| BulkloadRefusal::FrameCodec)?;
+            hash.update(NESTED_WORKTREES_DOMAIN);
+            hash.update(
+                &u64::try_from(nested.len())
+                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                    .to_le_bytes(),
+            );
+            hash.update(&nested);
+        }
+        if !census.omitted.is_empty() {
+            let omitted =
+                postcard::to_allocvec(&census.omitted).map_err(|_| BulkloadRefusal::FrameCodec)?;
+            hash.update(REBUILDABLE_DOMAIN);
+            hash.update(
+                &u64::try_from(omitted.len())
+                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                    .to_le_bytes(),
+            );
+            hash.update(&omitted);
+        }
+        for directory in [&repo, &common] {
+            let identity = crate::freshness::StatIdentity::from_metadata(&fs::metadata(directory)?);
+            for value in [i128::from(identity.dev), i128::from(identity.ino)] {
+                hash.update(&value.to_le_bytes());
+            }
+        }
+        Ok(*hash.finalize().as_bytes())
     }
 }
