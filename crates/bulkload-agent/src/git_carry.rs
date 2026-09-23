@@ -1017,6 +1017,36 @@ pub struct NestedRepository {
     pub head_oid: Option<String>,
     /// What the on-disk `.git` is; [`GitdirKind::None`] for a gitlink.
     pub gitdir_kind: GitdirKind,
+    /// Commits reachable from the nest's local branches and from none of its
+    /// remote-tracking refs: work that exists only in this nest. Always 0 for
+    /// a gitlink, and 0 when [`Self::remotes`] is false (there is nothing to
+    /// compare against, which the receipt says as `remotes=none`).
+    pub unpushed: u64,
+    /// Whether the nest has any configured remote. Always false for a gitlink.
+    pub remotes: bool,
+}
+
+impl NestedRepository {
+    /// One receipt line naming this nest.
+    ///
+    /// The path is byte-escaped (`\n`, `\"`, `\xNN`) inside quotes, so a
+    /// newline or quote in a directory name can never forge a second line.
+    #[must_use]
+    pub fn receipt_line(&self) -> String {
+        let path = self.rel_path.escape_ascii();
+        let head = self.head_oid.as_deref().unwrap_or("unborn");
+        match self.kind {
+            NestedRepositoryKind::Gitlink => {
+                format!("nested-repository path=\"{path}\" kind=Gitlink head={head}")
+            }
+            NestedRepositoryKind::Directory => format!(
+                "nested-repository path=\"{path}\" kind=Directory gitdir={:?} head={head} unpushed={} remotes={}",
+                self.gitdir_kind,
+                self.unpushed,
+                if self.remotes { "yes" } else { "none" },
+            ),
+        }
+    }
 }
 
 /// Foreign repositories nested inside `repo`, and gitlinks in its index.
@@ -1094,6 +1124,9 @@ fn nested_head(directory: &Path) -> Result<Option<String>> {
 //   gitlink at exactly the nest path (a populated submodule) is the one
 //   permitted entry; any other tracked path under it would be dropped from
 //   the capture, since nothing below a nest is walked.
+// - B3: the nest is clean: `status --porcelain=v2 --untracked-files=all` is
+//   empty, so its worktree is exactly its HEAD and nothing below it is lost
+//   by not walking it. Its unpushed count is recorded with its HEAD.
 fn foreign_nest(
     root: &Path,
     directory: &Path,
@@ -1113,12 +1146,47 @@ fn foreign_nest(
     if tracked_under(root, &rel_path)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // `--no-optional-locks` (from `git()`) keeps status from refreshing the
+    // nest's index: the census never writes to a repository it only names.
+    let status = output(git(directory).args([
+        "--git-dir=.git",
+        "--work-tree=.",
+        "status",
+        "--porcelain=v2",
+        "--untracked-files=all",
+    ]))?;
+    if !status.is_empty() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let (unpushed, remotes) = unpushed_commits(directory)?;
     Ok(NestedRepository {
         rel_path,
         kind: NestedRepositoryKind::Directory,
         head_oid: nested_head(directory)?,
         gitdir_kind,
+        unpushed,
+        remotes,
     })
+}
+
+// Commits reachable from the nest's local branches and from none of its
+// remote-tracking refs, and whether it has any remote at all. With no remote
+// the count is 0 by definition and the flag says so.
+fn unpushed_commits(directory: &Path) -> Result<(u64, bool)> {
+    if output(git(directory).args(["--git-dir=.git", "remote"]))?.is_empty() {
+        return Ok((0, false));
+    }
+    let count = text(git(directory).args([
+        "--git-dir=.git",
+        "rev-list",
+        "--count",
+        "--branches",
+        "--not",
+        "--remotes",
+    ]))?
+    .parse::<u64>()
+    .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    Ok((count, true))
 }
 
 // Whether the enclosing repository's index holds any path at or below `rel`
@@ -1513,6 +1581,8 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
             kind: NestedRepositoryKind::Gitlink,
             head_oid: Some(value.to_owned()),
             gitdir_kind: GitdirKind::None,
+            unpushed: 0,
+            remotes: false,
         });
     }
     gitlinks.sort();
@@ -3240,6 +3310,8 @@ mod tests {
             kind: NestedRepositoryKind::Directory,
             head_oid: head,
             gitdir_kind: GitdirKind::Directory,
+            unpushed: 0,
+            remotes: false,
         }
     }
 
@@ -3446,6 +3518,126 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // R-N73 B3: a foreign nest whose worktree differs from its HEAD, staged or
+    // not, is not custody. Its bytes would not be carried, so it refuses.
+    #[test]
+    fn a_dirty_nest_refuses() {
+        let root = fresh("bulkload-dirty-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        assert_eq!(
+            nested_repositories(&source).unwrap(),
+            vec![directory_nest(b"vendor/inner", Some(head_of(&nest)))]
+        );
+        fs::write(nest.join("tracked"), b"unstaged edit").unwrap();
+        refuses_everywhere(&source, &root.join("capture-unstaged"));
+        output(git(&nest).args(["add", "tracked"])).unwrap();
+        refuses_everywhere(&source, &root.join("capture-staged"));
+        output(git(&nest).args(["reset", "-q", "--hard"])).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B3: untracked files make a nest dirty. (Ignored files are not
+    // "untracked" to `git status` and do not; the ruling names status.)
+    #[test]
+    fn a_nest_with_untracked_files_refuses() {
+        let root = fresh("bulkload-untracked-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        fs::create_dir_all(nest.join("deep/er")).unwrap();
+        fs::write(nest.join("deep/er/new"), b"only here").unwrap();
+        refuses_everywhere(&source, &root.join("capture"));
+        fs::remove_dir_all(nest.join("deep")).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B3: a clean nest with local commits no remote-tracking ref holds
+    // is custody, and the custody (and its receipt line) counts them.
+    #[test]
+    fn a_clean_nest_with_unpushed_commits_is_custody_and_names_the_count() {
+        let root = fresh("bulkload-unpushed-nest");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        output(git(&nest).args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/inner.git",
+        ]))
+        .unwrap();
+        let pushed = head_of(&nest);
+        output(git(&nest).args(["update-ref", "refs/remotes/origin/main", &pushed])).unwrap();
+        for step in ["one", "two"] {
+            fs::write(nest.join("tracked"), step).unwrap();
+            output(git(&nest).args(["add", "tracked"])).unwrap();
+            commit(&nest, step);
+        }
+        let expected = vec![NestedRepository {
+            unpushed: 2,
+            remotes: true,
+            ..directory_nest(b"vendor/inner", Some(head_of(&nest)))
+        }];
+        assert_eq!(nested_repositories(&source).unwrap(), expected);
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_policy(&source, &capture, None, CapturePolicy::default())
+                .unwrap();
+        assert_eq!(export.nested_repositories, expected);
+        assert_eq!(
+            nested_sidecar(&capture.join("repository.git")),
+            Some(expected.clone())
+        );
+        let line = expected[0].receipt_line();
+        assert!(line.contains("path=\"vendor/inner\""));
+        assert!(line.contains(" unpushed=2 remotes=yes"));
+        // Pushing moves the key: unpushed is custody, not decoration.
+        let key = reusable_capture_key(&source).unwrap();
+        output(git(&nest).args(["update-ref", "refs/remotes/origin/main", &head_of(&nest)]))
+            .unwrap();
+        assert_ne!(key, reusable_capture_key(&source).unwrap());
+        assert_eq!(nested_repositories(&source).unwrap()[0].unpushed, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B3 / F8: a nest with no remote says so, and a path holding a
+    // newline or a quote renders as one escaped line.
+    #[test]
+    fn nest_receipt_lines_escape_paths_and_say_when_there_is_no_remote() {
+        let nest = NestedRepository {
+            rel_path: b"odd\n\"name\xff".to_vec(),
+            ..directory_nest(b"", None)
+        };
+        let line = nest.receipt_line();
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(
+            line,
+            "nested-repository path=\"odd\\n\\\"name\\xff\" kind=Directory gitdir=Directory head=unborn unpushed=0 remotes=none"
+        );
+        let gitlink = NestedRepository {
+            rel_path: b"lib/vendor".to_vec(),
+            kind: NestedRepositoryKind::Gitlink,
+            head_oid: Some("0".repeat(40)),
+            gitdir_kind: GitdirKind::None,
+            unpushed: 0,
+            remotes: false,
+        };
+        assert_eq!(
+            gitlink.receipt_line(),
+            format!(
+                "nested-repository path=\"lib/vendor\" kind=Gitlink head={}",
+                "0".repeat(40)
+            )
+        );
+    }
+
     // R-N73 F7: a `.git` DIRECTORY whose common directory is this repository
     // (a hand-built `commondir` administration) is not foreign custody. The
     // pointer-file branch already refused this; the directory branch did not.
@@ -3502,18 +3694,29 @@ mod tests {
         .unwrap();
         assert!(module.join(".git").is_dir());
 
-        assert_eq!(
-            nested_repositories(&source).unwrap(),
-            vec![directory_nest(rel, Some(head_of(&module)))]
-        );
+        // Cache-like and clean: custody, with no remote to compare against.
+        let custody = nested_repositories(&source).unwrap();
+        assert_eq!(custody, vec![directory_nest(rel, Some(head_of(&module)))]);
+        assert!(custody[0]
+            .receipt_line()
+            .ends_with(" unpushed=0 remotes=none"));
         assert!(nested_worktrees(&source).unwrap().is_empty());
         let key = reusable_capture_key(&source).unwrap();
         assert_eq!(key, reusable_capture_key(&source).unwrap());
-        // Nested payload is not this item's census; the nested HEAD is.
+        // R-N73: custody only while the nest is clean. Dirty or untracked
+        // nested bytes are not carried, so the capture refuses rather than
+        // lose them; the nested HEAD moving is a new key.
         fs::write(module.join("tracked"), b"changed nested bytes").unwrap();
         fs::write(module.join("untracked"), b"more nested bytes").unwrap();
-        assert_eq!(key, reusable_capture_key(&source).unwrap());
+        assert_eq!(
+            reusable_capture_key(&source),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
         output(git(&module).args(["add", "."])).unwrap();
+        assert_eq!(
+            reusable_capture_key(&source),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
         output(git(&module).args(["-c", "commit.gpgsign=false", "commit", "-m", "moved"])).unwrap();
         assert_ne!(key, reusable_capture_key(&source).unwrap());
         let key = reusable_capture_key(&source).unwrap();
@@ -3565,13 +3768,17 @@ mod tests {
         for rel in &nests[1..] {
             let nest = source.join(std::str::from_utf8(rel).unwrap());
             committed_repository(&nest, b"gtest");
+            // Committed, so the nest stays clean (R-N73) and still holds bytes
+            // the enclosing census must never list.
             fs::write(nest.join("sentinel"), b"never a seat of the enclosing item").unwrap();
+            output(git(&nest).args(["add", "sentinel"])).unwrap();
+            output(git(&nest).args(["-c", "commit.gpgsign=false", "commit", "-m", "s"])).unwrap();
         }
-        // An unborn HEAD (init, no commit) is custody with no oid, not a refusal.
+        // An unborn HEAD (init, no commit, no files) is clean custody with no
+        // oid, not a refusal.
         let unborn = source.join(std::str::from_utf8(nests[0]).unwrap());
         fs::create_dir_all(&unborn).unwrap();
         output(git(&unborn).args(["init", "--template="])).unwrap();
-        fs::write(unborn.join("sentinel"), b"unborn").unwrap();
         fs::write(source.join("build/tests_build/CMakeCache.txt"), b"carried").unwrap();
 
         let custody = nested_repositories(&source).unwrap();
@@ -3652,6 +3859,8 @@ mod tests {
             kind: NestedRepositoryKind::Gitlink,
             head_oid: Some(commit.clone()),
             gitdir_kind: GitdirKind::None,
+            unpushed: 0,
+            remotes: false,
         };
         let (_, before_index, gitlinks) = source_index(&source).unwrap();
         assert_eq!(gitlinks, vec![gitlink.clone()]);
@@ -3832,6 +4041,8 @@ mod tests {
         assert!(own.join(".git").is_file());
         assert!(foreign.join(".git").is_file());
         fs::write(foreign.join("sentinel"), b"belongs to other").unwrap();
+        output(git(&foreign).args(["add", "sentinel"])).unwrap();
+        output(git(&foreign).args(["-c", "commit.gpgsign=false", "commit", "-m", "s"])).unwrap();
 
         assert_eq!(
             nested_worktrees(&source).unwrap(),
@@ -3846,6 +4057,8 @@ mod tests {
             kind: NestedRepositoryKind::Directory,
             head_oid: Some(head_of(&foreign)),
             gitdir_kind: GitdirKind::PointerFile,
+            unpushed: 0,
+            remotes: false,
         }];
         assert_eq!(nested_repositories(&source).unwrap(), expected);
         let capture = root.join("capture");
@@ -3895,6 +4108,11 @@ mod tests {
         fs::create_dir_all(db.join("deep/er")).unwrap();
         fs::write(db.join("deep/er/leaf"), b"below a nest").unwrap();
         fs::write(checkout.join("pyproject.toml"), b"below a nest").unwrap();
+        // Committed: a cache checkout is custody only while clean (R-N73).
+        for nest in [&db, &checkout] {
+            output(git(nest).args(["add", "."])).unwrap();
+            output(git(nest).args(["-c", "commit.gpgsign=false", "commit", "-m", "s"])).unwrap();
+        }
         fs::write(source.join(".tmp/uv-cache/CACHEDIR.TAG"), b"carried").unwrap();
 
         let common = common_repository(&source).unwrap();
