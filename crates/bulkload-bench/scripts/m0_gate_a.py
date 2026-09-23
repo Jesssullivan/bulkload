@@ -14,11 +14,18 @@ Arms:
 Order: first, `--warmup` repetitions (default 1) run every arm once. Their
 rows say warmup=1 and they are left out of every summary. Each measured
 repetition then runs every arm once, in the order of one row of a Williams
-design. With an even arm count, that is an n x n Latin square balanced for
-first-order carry-over. With an odd count, it is the 2n-row design. Every
-row logs its sequence. The default repetition count is the smallest multiple
-of the design length that is at least 7: 8 for four arms, 10 for five.
-balanced=1 in the header means the count is a multiple of the design length.
+design: an n x n square for an even arm count, the 2n-row design for an
+odd one. The balance is within-row Williams only: inside each row every
+ordered pair of adjacent arms occurs equally often over the design, and
+every arm occupies every position equally often. The pairs across row
+boundaries (the last arm of one row followed by the first arm of the next,
+and warm-up into rep 0) are unbalanced. W3 options, if that matters: a
+serially balanced sequence, or a washout arm between rows. Every row logs
+its sequence. The default repetition count is the smallest multiple of the
+design length that is at least 7: 8 for four arms, 10 for five.
+balanced=1 in the header means the count is a multiple of the design length,
+which is within-row balance only. Fewer than 7 repetitions is refused unless
+the override is set; min_reps_met=0|1 is on the header either way.
 
 Every floor sample reads the source (--read-source) and writes one file per
 corpus file at its real size. Each file gets its own flush, and the created
@@ -26,12 +33,23 @@ directories and the parent get the same kind. The page cache is never
 dropped. Before every arm, rclone included, the script logs source
 page-cache residency (`bulkload-bench micro residency`) outside timing.
 
-Gating (R-N81): a row is gated only if the host is on AC power with
-load1 < 2.5 at that row AND the override is off. Without the override the
-script refuses to start on a host that fails that check. With
-M0_ALLOW_UNGATED=1 it runs anyway for a rehearsal. Then every line carries
-ungated_override=1, every row says gated=0, and the compare line says
-all_rows_gated=0, whatever the host conditions were.
+Gating (R-N81): a measured row is gated only if all three hold:
+  - the host is on AC power with load1 < 2.5 just before the arm;
+  - the host is still on AC power just after the arm;
+  - the override is off.
+Load1 is checked before each arm only. Power is re-sampled after each arm
+and once more after the last arm, before the compare line; the compare line
+prints that final power as final_power. Warm-up rows always print gated=0.
+Without the override the script refuses to start on a host that fails the
+before-arm check. With M0_ALLOW_UNGATED=1 (exactly "1") it runs anyway for a
+rehearsal. Then every line carries ungated_override=1, every row says
+gated=0, and the compare line says all_rows_gated=0, whatever the host
+conditions were.
+
+Statistics: summary and compare lines carry gated_reps. When an arm has any
+gated rows, its min/median/max are over the gated rows only (stats_over=
+gated). Otherwise they are over all measured rows (stats_over=all), which
+can only be a rehearsal or a failed run.
 
 Timing asymmetry (on the compare line as well):
   floor  = the benchmark's in-process total_ms: from creating the destination
@@ -88,7 +106,12 @@ ASYMMETRY = (
 
 
 def williams(count: int) -> list[list[int]]:
-    """Williams design rows over `count` arms (first-order carry-over balanced)."""
+    """Williams design rows over `count` arms.
+
+    Within-row balance only: across the design, each ordered pair of adjacent
+    arms inside a row occurs equally often, and each arm occupies each
+    position equally often. Pairs across row boundaries are not balanced.
+    """
     first = [0]
     low, high = 1, count - 1
     take_low = True
@@ -248,9 +271,14 @@ def main(argv: list[str]) -> int:
     args = parse(argv)
     arms = BASE_ARMS + ([JOBS4_ARM] if args.floor_jobs4 else [])
     design = williams(len(arms))
-    reps = args.reps or len(design) * math.ceil(MIN_REPS / len(design))
+    reps = (
+        args.reps
+        if args.reps is not None
+        else len(design) * math.ceil(MIN_REPS / len(design))
+    )
     if reps < 1 or args.warmup < 0:
         raise SystemExit("REPS must be at least 1 and --warmup at least 0")
+    min_reps_met = reps >= MIN_REPS
     corpus = args.corpus.resolve(strict=True)
     for executable in (args.bench, args.rclone):
         if not (executable.is_file() and os.access(executable, os.X_OK)):
@@ -262,6 +290,10 @@ def main(argv: list[str]) -> int:
     override = int(ungated)
     load1, power, host_ok = conditions()
     preflight_gated = host_ok and not ungated
+    if not min_reps_met and not ungated:
+        raise SystemExit(
+            f"refusing: REPS={reps} < {MIN_REPS} (M0_ALLOW_UNGATED=1 for a rehearsal)"
+        )
     if not host_ok and not ungated:
         raise SystemExit(
             f"refusing: power={power} load1={load1:.2f}; R-N81 needs AC power and "
@@ -275,13 +307,14 @@ def main(argv: list[str]) -> int:
         f"corpus={corpus} files={len(shape)} bytes={sum(s for _, s in shape)} "
         f"work={work} reps={reps} warmup={args.warmup} arms={','.join(arms)} "
         f"order=williams design_rows={len(design)} "
-        f"balanced={int(reps % len(design) == 0)} floor_read_source=1 "
+        f"balanced={int(reps % len(design) == 0)} balance=within-row-only "
+        f"min_reps_met={int(min_reps_met)} floor_read_source=1 "
         f"page_cache=not-dropped preflight_load1={load1:.2f} "
         f"preflight_power={power} preflight_gated={int(preflight_gated)} "
         f"ungated_override={override} rclone_flags={','.join(RCLONE_FLAGS)}",
         flush=True,
     )
-    samples: dict[str, list[float]] = {arm: [] for arm in arms}
+    samples: dict[str, list[tuple[float, bool]]] = {arm: [] for arm in arms}
     all_gated = preflight_gated
     schedule = [(True, w, design[0]) for w in range(args.warmup)] + [
         (False, r, design[r % len(design)]) for r in range(reps)
@@ -290,39 +323,55 @@ def main(argv: list[str]) -> int:
         sequence = [arms[index] for index in row]
         tag = f"warmup{rep}" if warmup else f"rep{rep}"
         for step, arm in enumerate(sequence):
-            load1, power, host_ok = conditions()
-            gated = host_ok and not ungated
+            load1, power, before_ok = conditions()
             resident = residency(args.bench, corpus)
             elapsed, jobs, detail = run_arm(
                 arm, args.bench, args.rclone, corpus, work, tag
             )
+            # Load1 is a before-arm check only; power is re-sampled after.
+            power_after = conditions()[1]
+            after_power_ok = power_after == "ac"
+            gated = before_ok and after_power_ok and not ungated and not warmup
             if not warmup:
                 all_gated = all_gated and gated
-                samples[arm].append(elapsed)
+                samples[arm].append((elapsed, gated))
             print(
                 f"gate_a_sample arm={arm} warmup={int(warmup)} rep={rep} "
                 f"order={step} sequence={','.join(sequence)} jobs={jobs} "
                 f"elapsed_ms={elapsed:.3f} source_resident_fraction_before={resident} "
-                f"load1={load1:.2f} power={power} gated={int(gated)} "
-                f"ungated_override={override} {detail}",
+                f"load1={load1:.2f} power={power} power_after={power_after} "
+                f"gated={int(gated)} ungated_override={override} {detail}",
                 flush=True,
             )
+    final_power = conditions()[1]
+    all_gated = all_gated and final_power == "ac" and not ungated
+    chosen: dict[str, tuple[list[float], str, int]] = {}
     for arm in arms:
-        values = samples[arm]
+        gated_values = [value for value, ok in samples[arm] if ok]
+        if gated_values:
+            chosen[arm] = (gated_values, "gated", len(gated_values))
+        else:
+            chosen[arm] = ([value for value, _ in samples[arm]], "all", 0)
+        values, over, gated_reps = chosen[arm]
         print(
-            f"gate_a_summary arm={arm} reps={len(values)} "
+            f"gate_a_summary arm={arm} reps={len(samples[arm])} "
+            f"gated_reps={gated_reps} stats_over={over} "
             f"jobs={4 if arm == JOBS4_ARM or arm.startswith('rclone') else 1} "
             f"min_ms={min(values):.3f} median_ms={statistics.median(values):.3f} "
             f"max_ms={max(values):.3f} warmup_excluded={args.warmup} "
             f"ungated_override={override}",
             flush=True,
         )
-    floor_median = statistics.median(samples["floor-full"])
-    rclone_median = statistics.median(samples["rclone-shipped"])
+    floor_values, floor_over, floor_gated = chosen["floor-full"]
+    rclone_values, rclone_over, rclone_gated = chosen["rclone-shipped"]
+    floor_median = statistics.median(floor_values)
+    rclone_median = statistics.median(rclone_values)
     print(
         f"gate_a_compare floor_full_median_ms={floor_median:.3f} "
         f"rclone_shipped_median_ms={rclone_median:.3f} "
         f"floor_below_rclone={int(floor_median < rclone_median)} "
+        f"floor_gated_reps={floor_gated} rclone_gated_reps={rclone_gated} "
+        f"stats_over={floor_over},{rclone_over} final_power={final_power} "
         f"all_rows_gated={int(all_gated)} ungated_override={override} "
         f"caveat=asymmetric-timing:{ASYMMETRY}",
         flush=True,
