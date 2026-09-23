@@ -74,6 +74,37 @@ historical rulings ledger (evidence, not current instructions).
 - Reclaim only proven redundant data after preserving unique content.
 - Estate operations are frozen until the M2 gates pass (R-N56).
 
+## Agent lanes
+
+- A guard-hook refusal stops the lane. Report it verbatim and run nothing
+  more, not even a corrected marker placement, until the operator rules
+  (R-N12, R-N80).
+- Keep process-control words out of command text. The repo's pre-commit
+  process-safety audit is the authoritative wording check (R-N92). If a
+  self-audit that searched for those words is refused, drop the audit and
+  continue. Any other refusal still stops the lane (R-N101).
+- Never check whether a PID is alive. Wait only on your own background
+  tasks' notifications, or on files (R-N104).
+- Never bypass git hooks from the shell (`core.hooksPath`, `--no-verify`).
+  Only the product's own cargo tests may disable hooks, and only in fixture
+  repos they create and destroy (R-N98).
+- Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
+  directory lets one lane test another lane's binaries.
+- Local cargo builds on neo carry the inline
+  `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"` prefix as the first token.
+- A gated benchmark sample is recorded only on AC power with a 1-minute
+  load under 2.5. Every sample row records power and load (R-N81). The
+  coordinator holds the other lanes quiet while gated samples run (R-N91).
+
+## Durable notes
+
+Every session writes one entry in `docs/agent-notes/`, named
+`YYYY-MM-DD-<lane>.md` (R-N13, R-N84). An entry records what was done,
+the rulings it cites, the PRs and shas it produced, and what is still open.
+Distilled facts and rulings also go on the owning Linear issue. Nothing
+durable is left in `/tmp` or a harness scratchpad. Delete entries that are
+no longer true (R-N55).
+
 ## Validation
 
 `just check` runs the repository contract checks and `just rust-check`
