@@ -5,7 +5,8 @@ this as the measurement baseline for negotiated thin packs. Rulings R-N74
 (the thin-pack gate metric) and R-N75 (refuse destinations whose refs do not
 prove their history) followed the PR #55 review, and this page was re-measured
 under them. R-N97 then replaced the equal-count half of the R-N74 gate. R-N113
-fixed M1's first-round have set and the exactness oracle.
+fixed M1's first-round have set and the exactness oracle, and R-N116 fixed the
+order of those haves: ancestors first.
 
 ## Verdict
 
@@ -14,27 +15,35 @@ count of the thin pack that `pack-objects --stdout --thin --revs
 --delta-base-offset` builds for the missing set, counted in flight and never
 written. The negotiation model is upload-pack's: sparse edges and bitmaps
 pinned off, and, for a shallow destination, upload-pack's shallow-client
-invocation. Against sting's current refs, neo is missing **3,938 objects**, and
+invocation. Against sting's current refs, neo is missing **3,936 objects**, and
 their thin pack is **8.531 MB**. The informational stored size of the same
 objects (`missing_bytes_disk`) is 15.049 MB. The thin pack is smaller because it sends
 deltas against objects sting already holds. crs310-8g-2s-in shows this most
 clearly: 0.449 MB thin against 3.550 MB stored.
 
-**The W6 M1 gate (R-N97, R-N113):**
+**The W6 M1 gate (R-N97, R-N113, R-N116):**
 
 - **Bound:** for the same source and destination state, sent bytes ≤ 1.1×
   `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`.
 - **Haves:** M1's first round sends *exactly* the destination's held tips
-  (every destination tip the source holds) as haves.
+  (every destination tip the source holds) as haves, in topological order,
+  ancestors first. upload-pack then keeps every have as an exclusion and
+  returns its smallest pack.
 - **Oracle:** the exactness oracle is upload-pack run over exactly that have
-  set, not `git fetch`'s newest-first negotiation. The estimate equals it up to
-  have order: dropping a have implied by a child have gives upload-pack's
-  largest pack.
-- **Extra haves can enlarge a shallow pack.** upload-pack drops a have that
-  another have implies, and the shallow walk marks only the trees of the haves
-  it keeps. In reviewer fixture A3, offering the intermediate parent too grew
-  the pack from 232 B to 3,919 B. Ancestor probing (`GitHaveQuery`) must not
-  add haves to a shallow destination's first round.
+  list, in that order, not `git fetch`'s newest-first negotiation. The
+  estimate equals it.
+- **Shallow rule:** a shallow destination must be shallow at the source's
+  frontier (R-N75). The request carries its `shallow <oid>` lines, and
+  upload-pack packs with `--shallow`, which marks the trees of every have.
+- **Order matters for a shallow destination.** upload-pack drops a have whose
+  child it has already seen, and the dropped have's tree is then no longer
+  excluded. In reviewer fixture P1 the pack is 162 B ancestors first and
+  3,889 B child first.
+- **Extra haves.** For a shallow destination, an extra intermediate have can
+  make upload-pack drop the have it implies. In fixture A3 that grew the pack
+  from 232 B to 3,919 B. Ancestor probing (`GitHaveQuery`) must not add haves
+  to a shallow destination's first round. Extra haves can shrink a
+  non-shallow pack.
 - **Pins:** the M1 sender must pin, as the estimate does:
   - `pack.useSparse=false`
   - `pack.useBitmaps=false`
@@ -106,7 +115,7 @@ clone.
 | DarwinNicUtil | 1.07 | 416 | 65 | 56 | 9 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | MassageIthaca | 199.37 | 21,443 | 1,793 | 1,787 | 6 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | account-controller | 1.53 | 832 | 32 | 22 | 10 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| blahaj ¹ | 34.13 | 39,797 | 2,281 | 1,784 | 497 | 4 | 32 | **0.015** | 32 | 0.050 | 5 / 19 / 8 / 0 |
+| blahaj ¹ | 34.13 | 39,797 | 2,281 | 1,784 | 497 | 4 | 30 | **0.015** | 30 | 0.050 | 5 / 17 / 8 / 0 |
 | bulkload | 7.81 | 2,723 | 78 | 68 | 10 | 2 | 672 | **0.426** | 672 | 1.909 | 115 / 335 / 221 / 1 |
 | ci-templates | 5.05 | 2,091 | 213 | 182 | 31 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | claude-kvm | 205.06 | 2,013 | 32 | 26 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
@@ -129,31 +138,30 @@ clone.
 | printstack | 1.75 | 2,624 | 30 | 25 | 5 | 2 | 10 | **0.025** | 10 | 0.070 | 2 / 4 / 4 / 0 |
 | asfirewire-legalab | 45.02 | 19,483 | 61 | 60 | 1 | 0 | 2,234 | **1.258** | 2,234 | 1.587 | 140 / 1098 / 996 / 0 |
 | crs310-8g-2s-in | 7.51 | 6,015 | 273 | 273 | 0 | 1 | 614 | **0.449** | 614 | 3.550 | 66 / 267 / 281 / 0 |
-| **Total (26)** | **1,467.49** | **350,563** | **6,906** | **6,052** | **854** | **22** | **3,938** | **8.531** | **3,938** | **15.049** | 370 / 1918 / 1649 / 1 |
+| **Total (26)** | **1,467.49** | **350,563** | **6,906** | **6,052** | **854** | **22** | **3,936** | **8.531** | **3,936** | **15.049** | 370 / 1916 / 1649 / 1 |
 
-¹ **blahaj was re-run alone** at 19:29:25Z–19:29:42Z after the PR #55 r2
-review fixes. It reran with the release binary built from `66bce2f`:
-upload-pack's shallow-client model and the flag pins. The other 25
-rows are from the 17:56Z run. neo's blahaj gained 2 commits between the runs,
-so its row mixes new source state with the corrected model. blahaj details:
+¹ **blahaj was re-run alone** at 22:03:07Z–22:03:27Z, after the PR #55 r4
+fixes, with the release binary built from `89e572c`. That binary uses every
+held tip as a have, ancestors first (R-N116), upload-pack's shallow-client
+model and the flag pins. The other 25 rows are from the 17:56Z run.
 
+- **Result:** 30 objects, 14,644 B (the missing set's stored size is
+  49,830 B, informational).
 - **Shallow:** both sides are shallow at the same frontier (`bf9acf31`).
-- **Haves:** 296 of its 1,784 held tips were left out as haves, because
-  another held tip is their child (`haves_implied_by_a_child_have`).
-- **The three models, all computed read-only on the same neo state against
-  the same sting tips:**
+- **Haves:** all 1,784 held tips are haves.
+- **Earlier models on the same neo state** (neo's blahaj has not moved since
+  19:29Z; sting's tips were read again in this run):
 
   | Model | Objects | Thin-pack bytes |
   |---|---:|---:|
   | Old verb: plain walk, all haves | 48 | 17,686 |
-  | This verb: upload-pack's shallow model | **32** | **14,826** |
-  | Every held tip kept as a have, `--shallow` | 30 | 14,644 |
+  | r2 verb: parent-drop rule (upload-pack's largest pack) | 32 | 14,826 |
+  | **r4 verb: every held tip, ancestors first (R-N116)** | **30** | **14,644** |
 
-  The last model is what upload-pack sends over every held tip when each
-  parent arrives before its child. The verb's figure is upload-pack's largest
-  pack over the held tips, across have orders (R-N113).
-- **Earlier figure:** the r2 review's 20 objects / 10,146 B was measured on
-  the pre-commit state, so it is not comparable.
+  The r4 figure equals the r2 read-only computation of "every held tip kept
+  as a have, `--shallow`".
+- **Earlier figure:** the r2 review's 20 objects / 10,146 B was measured on an
+  earlier source state, so it is not comparable.
 - **No writes:** a scan after the run found no file under blahaj's git dir
   newer than the start of the run, on neo or on sting.
 
@@ -184,9 +192,9 @@ so its row mixes new source state with the corrected model. blahaj details:
   glorious.build's other 15 are sting-native branches, such as
   `codex/pretext-scan-integration-proof`. The estimate does not probe the
   ancestors of unknown tips (`GitHaveQuery` belongs to M1). This is the
-  first-round figure over exactly the held tips (R-N113). Extra haves change
-  the result: they shrink a non-shallow pack, and they can enlarge a shallow
-  one.
+  first-round figure over exactly the held tips, ancestors first (R-N113,
+  R-N116). Extra haves change the result: they can shrink a non-shallow pack,
+  and they can enlarge a shallow one.
 - **blahaj** is shallow on both sides at the same frontier, `bf9acf31`, so
   R-N75 lets it estimate. A differing frontier would refuse with
   `GIT_HAVES_UNPROVABLE`.
@@ -259,13 +267,15 @@ The verb uses every destination ref, as the v2 negotiation does.
 
 ## Reading the result for M1
 
-- **Gate (R-N97, R-N113):**
+- **Gate (R-N97, R-N113, R-N116):**
   - For the same source and destination state, sent bytes ≤ 1.1×
     `missing_thin_pack_bytes`, and sent objects ≤ `missing_objects`.
     `missing_thin_pack_objects` always equals `missing_objects`.
-  - M1's first round sends exactly the held tips as haves.
+  - M1's first round sends exactly the held tips as haves, ancestors first.
+  - A shallow destination must be at the source's frontier, and the request
+    carries its `shallow` lines.
   - On every fixture, M1's sent object set must equal what upload-pack sends
-    over exactly that have set. That is the oracle, not `git fetch`: in
+    over exactly that have list, in that order. That is the oracle, not `git fetch`: in
     reviewer fixture B, `git fetch` stops negotiating before it offers an old
     held tip and sends more.
   - The M1 sender pins `pack.useSparse=false`, `pack.useBitmaps=false`,

@@ -57,3 +57,17 @@
   U+0085 path refusal code is deferred as cosmetic.
 - **R3-4:** M1 must pin `pack.threads` and `pack.windowMemory`.
 - **Spike #64:** a bitmapped sender packs fewer objects than the walk.
+
+## r4 (same day): BLOCK at `6f3d9dc`
+
+- **R-N116:** M1 sends every held tip, ancestors first. The estimate dropped
+  the parent-drop rule and equals upload-pack over that list exactly. It was
+  checked on fixtures P1 (four seeds), M, F, A3 and B, and on the reviewer's
+  `n4_oracle.sh`, where every fixture except the deferred S1 matches.
+- **blahaj:** re-run alone at 22:03Z, read-only: 30 objects, 14,644 B. A
+  scan found no writes on neo or sting.
+- **R4-3 and R4-4 redaction:** fixed and covered by regression cases.
+- **Deferred:**
+  - R4-2: a shallow source with a non-shallow destination over-estimates.
+  - base64 with no key word.
+  - the U+0085 path refusal code.
