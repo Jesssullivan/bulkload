@@ -26,3 +26,19 @@ takes the per-seat extend path. Tests:
 records keep their bit-identical key and are re-captured once
 (`retained_captures_from_before_this_change_keep_their_key_and_recapture_once`).
 Tests that expect a Hit now wait out the 2 s racy window with `settle()`.
+
+## Re-review of 5305b36 (R-N72, TIN-4540)
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| 1 HIGH ref A to B to A across the two unguarded windows | `Export::refs_before`/`refs_after`; `KeyParts::drift_across` requires pre == export-before and export-after == post | `a_ref_deleted_and_recreated_across_both_unguarded_windows_is_drift` |
+| 2 MED-HIGH missing sidecar fails open | Key drift and export drift split; a drifted record's key is poisoned; apply refuses on the in-band marker | `deleting_the_drift_sidecar_never_lets_an_export_drifted_capture_apply`, `deleting_the_drift_sidecar_never_makes_a_drifted_capture_a_hit`, `a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies`, `two_state_dirs_sharing_a_corpus_fail_closed_on_interleaved_records` |
+| 3 MED only estate-apply guarded | `refuse_drift_marked` at the entry of every restore/import verb (shallow custody probed in a removed scratch repo) | `every_restore_and_import_verb_refuses_a_drift_marked_bundle`, `a_drift_marked_shallow_bundle_refuses_to_restore` |
+| 4 whole-capture racy guard | R-N76 commit; now also judged against the pass's own clock | R-N76 tests |
+| 5 LOW wall-clock reference | Seats stamped later than the pass's clock are racy; NFS/NTP skew noted in design.md | `a_same_size_rewrite_in_the_capture_tick_is_never_reused_by_identity` (future-clock assertion) |
+| 6 LOW | Fixed by the split in 2 | as 2 |
+| 7 LOW timing-dependent racy test | Pass start and clock injected relative to the seat's own stamps | same test, now deterministic |
+| 8 LOW wrong refusal code | `GIT_INVENTORY_MALFORMED`; deletion uses `--no-deref` (a symbolic reuse ref deleted its target before) | `clearing_reuse_refs_never_follows_a_symbolic_ref_and_refuses_as_git_inventory` |
+
+Gates run with `CARGO_TARGET_DIR` inside this worktree after the #53 lane
+reported a shared target dir.

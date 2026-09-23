@@ -38,18 +38,28 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
 - The pass window runs from the pre-pass key to the post-pass key, not only
-  across the export's own snapshot. A capture is reuse-eligible only when its
-  pre- and post-pass key parts are exactly equal. Any difference is recorded
-  as drift in the corpus `{bundle}.drift` sidecar, and a drifted capture is
-  never a reuse hit: a later pass re-captures or extends it (R-N72).
-- A drifted capture omits the drifted seats' bytes. Apply refuses it with
-  `CAPTURE_DRIFTED` before any journal or destination is touched. The next
-  capture pass extends it (`capture-extended-from-drift`), and only a clean
-  capture applies. R-N29 (apply proceeds on an occupied destination, recording
-  uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+  across the export's own snapshot. A capture is clean only when the
+  pre-pass key parts, the export's own before and after ref inventories, and
+  the post-pass key parts all agree; a ref that vanishes before the export's
+  snapshot and returns after its last ref read is drift (R-N72).
+- There are two drift classes. Export drift moved under the export itself:
+  the bundle omits the drifted seats' bytes and carries the in-band
+  `refs/carry-export/capture-drift-v1` marker. Every restore and import verb
+  (estate-apply, `git-restore`, `git-restore-linked`, `git-import`,
+  `git-repair-missing-index`, both `git-attach-*` verbs and
+  `git-restore-registered-payload`) refuses a marked bundle with
+  `CAPTURE_DRIFTED` before it writes anything, whether or not any corpus
+  sidecar exists. Key drift moved only outside the export's window: the
+  bundle is a coherent snapshot of the export's own view and applies.
+- A drifted capture of either class records a poisoned key that no census
+  hashes to, so it is never a reuse hit, even if its `{bundle}.drift` sidecar
+  is lost or two state directories sharing one corpus interleave their
+  records. The sidecar is the receipt's statement of what moved, not the
+  guard. The next capture pass extends it (`capture-extended-from-drift`).
+  R-N29 (apply proceeds on an occupied destination, recording uncaptured
+  seats) is deferred to W6 git carry v2 (bulkload#48).
 - A whole capture is reused (`capture-reused-after-census`) only when its key
-  is unchanged, it recorded no drift, and no seat is racy against its recorded
-  pass start. A capture with a racy seat, or with no recorded pass start
+  is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
   instead (R-N76).
 - An incremental pass reuses a retained blob only for a seat whose stat
@@ -60,6 +70,13 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   offered says why: `reuse_unavailable=shallow`, `retained-unreadable` or
   `pass-start-unrecorded`. A retained capture that cannot be read degrades
   to a full read, and its transient refs never reach the new bundle.
+- A seat stamped later than the current pass's own clock reading is racy too
+  (fail-closed on timestamps from the future). Known limit: the racy
+  reference is the capturing host's wall clock, not the filesystem's. A
+  filesystem whose clock runs behind the host by more than the 2 s allowance
+  (an NFS or SMB server with NTP skew) can stamp a write made after the pass
+  start earlier than the window, and the guard cannot see it. Bulkload never
+  writes into a source to read the filesystem's clock.
 
 ## Performance
 

@@ -1,9 +1,9 @@
 //! Restore missing payload without replacing retained linked administration.
 
 use super::{
-    attachment_policy_matches, capture_revision, common_repository, git, import_bundle, output,
-    require_missing, restore_entries, restore_filesystem_rows, snapshot_command, sync_private_tree,
-    text, write_git_pointer, IndexReservation,
+    attachment_policy_matches, capture_revision, common_repository, git, output, require_missing,
+    restore_entries, restore_filesystem_rows, snapshot_command, sync_private_tree, text,
+    write_git_pointer, IndexReservation,
 };
 use crate::{BulkloadRefusal, Result};
 use std::fs;
@@ -113,6 +113,7 @@ pub fn restore(
     source: &str,
     receipt: &Path,
 ) -> Result<()> {
+    super::refuse_drift_marked(bundle)?;
     let repository = fs::canonicalize(repository)?;
     let common = common_repository(&repository)?;
     let admin = fs::canonicalize(admin)?;
@@ -171,7 +172,7 @@ pub fn restore(
     fs::copy(bundle, receipt.join("capture.bundle"))?;
     sync_private_tree(&receipt)?;
     fs::File::open(&receipt_parent)?.sync_all()?;
-    import_bundle(&repository, &receipt.join("capture.bundle"), source)?;
+    super::import_verified(&repository, &receipt.join("capture.bundle"), source)?;
     let heads = super::shallow::headers(&repository, &receipt.join("capture.bundle"))?;
     let head = capture_revision(&heads, "head")?;
     let staged = capture_revision(&heads, "staged")?;

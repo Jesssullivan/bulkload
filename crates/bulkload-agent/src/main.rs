@@ -90,8 +90,10 @@ BOUNDARIES:
     start) and reuses every other blob (capture-extended-from-drift,
     source_bytes_read). A pass reusing nothing it was offered says why:
     reuse_unavailable=shallow|retained-unreadable|pass-start-unrecorded.
-    estate-apply refuses a drifted capture with CAPTURE_DRIFTED; run
-    estate-capture again first. HEAD, index, config, shallow or
+    A bundle that drifted under its export carries an in-band marker, and
+    estate-apply and every git-restore/import/attach/repair verb refuse it
+    with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
+    config, shallow or
     nested-worktree changes under a pass still refuse GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
     handoff-verify probes; it never signals a child process (R-N11).

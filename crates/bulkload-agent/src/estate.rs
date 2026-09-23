@@ -412,7 +412,7 @@ fn retained_capture(
     // which re-reads exactly the racy seats (R-N76).
     let settled = recorded
         .as_ref()
-        .is_some_and(|recorded| !parts.racy_since(recorded.started_ns));
+        .is_some_and(|recorded| !parts.racy_since(recorded.started_ns, git_carry::pass_start_ns()));
     if previous.key == key && drift.is_empty() && settled {
         if git_carry::shared::requires_base(&bundle)? {
             let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
@@ -431,6 +431,16 @@ fn retained_capture(
         started_ns: recorded.map(|recorded| recorded.started_ns),
         extends,
     })
+}
+
+// The key a drifted capture records: derived from the pre-pass key under its
+// own domain, so no census ever hashes to it and the record can never be a
+// reuse hit, whatever happens to its drift sidecar (R-N72).
+fn poisoned(key: [u8; 32]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"bulkload-capture-drifted-v1\0");
+    hash.update(&key);
+    *hash.finalize().as_bytes()
 }
 
 // Without a recorded pass start no retained seat can be proved non-racy.
@@ -506,16 +516,24 @@ fn capture_item(
     )?;
     // Not an opaque key comparison. Anything outside the ref inventory and the
     // worktree census moving is Git authority changing under the capture and
-    // still refuses (R-N30). Within them, the export's own snapshot is later
-    // than the pre-pass key: a ref deleted in between is invisible to it. The
-    // pass is clean only when the pre- and post-pass parts are exactly equal;
-    // any difference is drift recorded with the capture, so the pre-pass key
-    // it records can never be a reuse hit (R-N72).
+    // still refuses (R-N30). Within them, the export's own window is not the
+    // capture's: a ref can vanish before the export's snapshot and return
+    // after its last ref read. The pass is clean only when the pre-pass parts,
+    // the export's inventories and the post-pass parts all agree (R-N72).
+    //
+    // Two drift classes. Export drift moved under the export itself; the
+    // bundle carries the in-band capture-drift-v1 marker and every restore
+    // and import verb refuses it. Key drift moved only outside the export's
+    // window; the bundle is a coherent snapshot of the export's own view and
+    // applies. Either way the recorded key is poisoned, so a lost or
+    // interleaved sidecar can never make a drifted capture a reuse hit.
+    let key_drift = parts.drift_across(
+        &export,
+        &git_carry::capture_key_parts_with_policy(&item.source, policy)?,
+    )?;
     let mut drift = export.drift;
-    drift.merge(parts.drift_to(&git_carry::capture_key_parts_with_policy(
-        &item.source,
-        policy,
-    )?)?)?;
+    drift.merge(key_drift)?;
+    let recorded_key = if drift.is_empty() { key } else { poisoned(key) };
     let bundle = export.bundle;
     let digest = hash_file(&bundle)?;
     let name = format!(
@@ -553,19 +571,24 @@ fn capture_item(
             started_ns: export.started_ns,
         },
     )?;
-    // The pre-pass key is recorded, as it always was. When the pass drifted,
-    // the drift sidecar written above keeps it from ever being a reuse hit;
-    // the next pass re-reads exactly the drifted and racy seats and reuses
-    // every other blob.
+    // A clean pass records its key, as it always did. A drifted pass records
+    // a poisoned key no census can hash to, so the record itself, not the
+    // sidecar, keeps it from ever being a reuse hit; the next pass re-reads
+    // exactly the drifted and racy seats and reuses every other blob.
     write(
         &record,
         &Capture {
-            key,
+            key: recorded_key,
             bundle: name,
             digest,
             identity: crate::freshness::StatIdentity::from_metadata(&metadata),
         },
     )?;
+    #[cfg(test)]
+    git_carry::mid_pass::fire(
+        &fs::canonicalize(&item.source)?,
+        git_carry::mid_pass::Stage::RecordWritten,
+    );
     if drift.is_empty() && drift_sidecar.try_exists()? {
         // A clean pass can reproduce a drifted pass's bundle byte for byte
         // when the drift lay only before the export's snapshot. Retire the
@@ -814,14 +837,14 @@ fn apply_item(
     if !filename(&captured.bundle) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
-    // A drifted capture does not hold the drifted seats' bytes. Apply refuses
-    // it, fail-closed, before any journal or destination is touched; the next
-    // capture pass extends it clean. R-N29 (apply proceeds on an occupied
-    // destination, recording uncaptured seats) is deferred to W6 git carry v2
-    // (bulkload#48).
-    if !retained_drift(corpus, &captured.bundle)?.is_empty() {
-        return Err(BulkloadRefusal::CaptureDrifted);
-    }
+    // A capture that drifted under its export does not hold the drifted
+    // seats' bytes. Its bundle says so in-band, and apply refuses it on that
+    // marker, fail-closed, before any base import, journal or destination is
+    // touched, whether or not the corpus sidecar survived; the next capture
+    // pass extends it clean. Key-only drift leaves a coherent snapshot, which
+    // applies. R-N29 (apply proceeds on an occupied destination, recording
+    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+    git_carry::refuse_drift_marked(&corpus.join(&captured.bundle))?;
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -1367,6 +1390,214 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_nanos(
             u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
         ));
+    }
+
+    fn drift_sidecar(plan: &Path, corpus: &Path) -> PathBuf {
+        let item = id(inspect(plan).unwrap().first().unwrap()).unwrap();
+        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
+        corpus.join(format!("{}.drift", record.bundle))
+    }
+
+    fn recorded_heads(plan: &Path, corpus: &Path, source: &Path) -> String {
+        let item = id(inspect(plan).unwrap().first().unwrap()).unwrap();
+        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
+        let heads = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["bundle", "list-heads"])
+            .arg(corpus.join(&record.bundle))
+            .output()
+            .unwrap();
+        String::from_utf8(heads.stdout).unwrap()
+    }
+
+    fn update_ref_at(repo: &Path, stage: git_carry::mid_pass::Stage, args: &[&str]) {
+        let inside = fs::canonicalize(repo).unwrap();
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        git_carry::mid_pass::arm_at(repo, stage, move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(&inside, &args);
+        });
+    }
+
+    // R-N72 re-review finding 1: a ref deleted before the export's snapshot
+    // and re-created after its last ref read leaves the pre- and post-pass
+    // keys equal, yet the bundle lacks the ref. Only comparing the keyed
+    // inventories with the export's own catches the round trip.
+    #[test]
+    fn a_ref_deleted_and_recreated_across_both_unguarded_windows_is_drift() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, _, plan, corpus) = drifting_plan("aba");
+        let state = root.join("state");
+        git(&source, &["branch", "side"]);
+        let tip = rev_parse(&source, "side");
+        settle();
+        update_ref_at(
+            &source,
+            Stage::Snapshot,
+            &["update-ref", "-d", "refs/heads/side"],
+        );
+        update_ref_at(
+            &source,
+            Stage::AfterPass,
+            &["update-ref", "refs/heads/side", &tip],
+        );
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(rev_parse(&source, "side"), tip, "the source is back at A");
+        let (outcome, _, drift, _) = first.first().unwrap();
+        assert_eq!(*outcome, "captured-with-drift");
+        assert!(drift.contains(&"RefRemoved \"refs/heads/side\"".to_owned()));
+        settle();
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_ne!(second.first().unwrap().0, "capture-reused-after-census");
+        assert!(recorded_heads(&plan, &corpus, &source)
+            .lines()
+            .any(|line| line.starts_with(&tip) && line.ends_with("refs/heads/side")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 re-review finding 2: the sidecar is not the guard. A capture that
+    // drifted under its export carries the in-band capture-drift-v1 marker,
+    // and apply refuses on the marker even when the sidecar is gone.
+    #[test]
+    fn deleting_the_drift_sidecar_never_lets_an_export_drifted_capture_apply() {
+        let (root, source, target, plan, corpus) = drifting_plan("sidecar-apply");
+        let state = root.join("state");
+        arm_drift(&source);
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(first.first().unwrap().0, "captured-with-drift");
+        fs::remove_file(drift_sidecar(&plan, &corpus)).unwrap();
+        let refused = Mutex::new(Vec::new());
+        let result = apply(&plan, &corpus, &root.join("applied"), "neo", 2, &|row| {
+            refused
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            *refused.lock().unwrap(),
+            vec![("refused", Some("CAPTURE_DRIFTED".to_owned()))]
+        );
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 re-review finding 2: a drifted capture records a poisoned key, so
+    // losing its sidecar can never turn it into a whole-capture reuse. Both
+    // drift classes: in-band export drift, and key-only drift the export
+    // never saw.
+    #[test]
+    fn deleting_the_drift_sidecar_never_makes_a_drifted_capture_a_hit() {
+        use git_carry::mid_pass::Stage;
+        for class in ["export", "key"] {
+            let (root, source, _, plan, corpus) = drifting_plan(&format!("sidecar-hit-{class}"));
+            let state = root.join("state");
+            let head = rev_parse(&source, "HEAD");
+            if class == "export" {
+                update_ref_at(
+                    &source,
+                    Stage::BytePass,
+                    &["update-ref", "refs/heads/lane", &head],
+                );
+            } else {
+                git(&source, &["branch", "gone"]);
+                update_ref_at(
+                    &source,
+                    Stage::Snapshot,
+                    &["update-ref", "-d", "refs/heads/gone"],
+                );
+            }
+            settle();
+            let first = receipts(&plan, &state, &corpus).unwrap();
+            assert_eq!(first.first().unwrap().0, "captured-with-drift", "{class}");
+            // The source returns exactly to the state the pre-pass key names.
+            if class == "export" {
+                git(&source, &["update-ref", "-d", "refs/heads/lane"]);
+            } else {
+                git(&source, &["update-ref", "refs/heads/gone", &head]);
+            }
+            fs::remove_file(drift_sidecar(&plan, &corpus)).unwrap();
+            settle();
+            let second = receipts(&plan, &state, &corpus).unwrap();
+            assert_ne!(
+                second.first().unwrap().0,
+                "capture-reused-after-census",
+                "{class}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    // R-N72 re-review finding 2: key-only drift (the export saw nothing move)
+    // leaves the bundle a coherent snapshot of the export's own view. It is
+    // never reused whole, but it applies.
+    #[test]
+    fn a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, target, plan, corpus) = drifting_plan("key-only-applies");
+        let state = root.join("state");
+        git(&source, &["branch", "gone"]);
+        update_ref_at(
+            &source,
+            Stage::Snapshot,
+            &["update-ref", "-d", "refs/heads/gone"],
+        );
+        let first = receipts(&plan, &state, &corpus).unwrap();
+        let (outcome, _, drift, _) = first.first().unwrap();
+        assert_eq!(*outcome, "captured-with-drift");
+        assert_eq!(*drift, vec!["RefRemoved \"refs/heads/gone\"".to_owned()]);
+        apply(&plan, &corpus, &root.join("applied"), "neo", 2, &|_| Ok(())).unwrap();
+        assert_eq!(fs::read(target.join("small")).unwrap(), b"small untracked");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N72 re-review finding 2: two state directories sharing one corpus are
+    // not serialized by the per-state-dir lock. Interleave them so a drifted
+    // record from one lands between another's clean record and its stale
+    // drift-record retirement; the corpus must still never reuse a bundle
+    // that lacks a keyed ref.
+    #[test]
+    fn two_state_dirs_sharing_a_corpus_fail_closed_on_interleaved_records() {
+        use git_carry::mid_pass::Stage;
+        let (root, source, _, plan, corpus) = drifting_plan("two-states");
+        let (state_a, state_b) = (root.join("state-a"), root.join("state-b"));
+        let head = rev_parse(&source, "HEAD");
+        settle();
+        let (inside, plan_a, corpus_a, state_a_hook) = (
+            fs::canonicalize(&source).unwrap(),
+            plan.clone(),
+            corpus.clone(),
+            state_a.clone(),
+        );
+        let tip = head.clone();
+        // B captures the checkout without `gone`, cleanly. After B's record is
+        // written, A captures from the state its key names (with `gone`), but
+        // `gone` vanishes before A's export snapshot: A's bundle is B's bundle
+        // byte for byte, and A's drift is key-only.
+        git_carry::mid_pass::arm_at(&source, Stage::RecordWritten, move || {
+            git(&inside, &["update-ref", "refs/heads/gone", &tip]);
+            update_ref_at(
+                &inside,
+                Stage::Snapshot,
+                &["update-ref", "-d", "refs/heads/gone"],
+            );
+            settle();
+            let rows = receipts(&plan_a, &state_a_hook, &corpus_a).unwrap();
+            assert_eq!(rows.first().unwrap().0, "captured-with-drift");
+        });
+        let b = receipts(&plan, &state_b, &corpus).unwrap();
+        assert_eq!(b.first().unwrap().0, "captured");
+        // The source returns to the state A's pre-pass key names.
+        git(&source, &["update-ref", "refs/heads/gone", &head]);
+        settle();
+        let next = receipts(&plan, &state_a, &corpus).unwrap();
+        assert_ne!(next.first().unwrap().0, "capture-reused-after-census");
+        assert!(recorded_heads(&plan, &corpus, &source)
+            .lines()
+            .any(|line| line.ends_with("refs/heads/gone")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     // R-N76 (TIN-4540): a whole-capture reuse is a stat-identity reuse of
