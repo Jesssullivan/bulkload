@@ -44,7 +44,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bulkload_agent::fault::{parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE};
+use bulkload_agent::fault::{
+    parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV,
+};
 use bulkload_agent::transfer::{copy, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
 use bulkload_proto::{BulkloadRefusal, RowSchema};
@@ -341,7 +343,7 @@ fn source_files(scratch: &Scratch) -> BTreeMap<Vec<u8>, u64> {
 }
 
 /// Run one armed child `copy` to its fault point.
-fn crash_child(scratch: &Scratch, label: &str) {
+fn crash_child(scratch: &Scratch, point: Point, label: &str) {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -356,6 +358,7 @@ fn crash_child(scratch: &Scratch, label: &str) {
         ])
         .env(CHILD_ENV, &scratch.base)
         .env(FAULT_ENV, label)
+        .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
         .output()
         .unwrap();
     assert_eq!(
@@ -364,6 +367,28 @@ fn crash_child(scratch: &Scratch, label: &str) {
         "{label}: the child must stop at its fault point (status {:?}, stderr {})",
         child.status,
         String::from_utf8_lossy(&child.stderr)
+    );
+    assert_receipt(scratch, point);
+}
+
+/// The crash landed at `point`, and a publication point in the store it names.
+fn assert_receipt(scratch: &Scratch, point: Point) {
+    let receipt = fs::read_to_string(scratch.base.join("receipt")).unwrap();
+    let mut lines = receipt.lines();
+    assert_eq!(lines.next(), Some(point.name()), "receipt point");
+    let store = if point.name().starts_with("publish.source.") {
+        Some(scratch.source_state())
+    } else if point.name().starts_with("publish.destination.") {
+        Some(scratch.destination_state())
+    } else {
+        None
+    };
+    let expected = store.map(|store| fs::canonicalize(store).unwrap().display().to_string());
+    assert_eq!(
+        lines.next().map(str::to_owned),
+        expected,
+        "{}: crash receipt names the wrong store",
+        point.name()
     );
 }
 
@@ -402,7 +427,7 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    crash_child(&scratch, &label);
+    crash_child(&scratch, point, &label);
 
     let before = crash_state(&scratch);
     assert_i1(&label, &scratch, &before);
@@ -508,18 +533,30 @@ macro_rules! scenarios {
 }
 
 scenarios! {
-    publish_after_append_first => PublishAfterAppend: 1, WITH_REFUSAL;
-    publish_after_append_mid => PublishAfterAppend: 30, WITH_REFUSAL;
-    publish_after_pack_sync_first => PublishAfterPackSync: 1, WITH_REFUSAL;
-    publish_after_pack_sync_mid => PublishAfterPackSync: 30, WITH_REFUSAL;
-    publish_after_location_insert_first => PublishAfterLocationInsert: 1, WITH_REFUSAL;
-    publish_after_location_insert_mid => PublishAfterLocationInsert: 20, WITH_REFUSAL;
-    publish_after_manifest_insert_first => PublishAfterManifestInsert: 1, WITH_REFUSAL;
-    publish_after_manifest_insert_mid => PublishAfterManifestInsert: 20, WITH_REFUSAL;
-    publish_before_commit_first => PublishBeforeCommit: 1, WITH_REFUSAL;
-    publish_before_commit_mid => PublishBeforeCommit: 20, WITH_REFUSAL;
-    publish_after_commit_first => PublishAfterCommit: 1, WITH_REFUSAL;
-    publish_after_commit_mid => PublishAfterCommit: 20, WITH_REFUSAL;
+    publish_source_after_append_first => PublishSourceAfterAppend: 1, WITH_REFUSAL;
+    publish_source_after_append_mid => PublishSourceAfterAppend: 8, WITH_REFUSAL;
+    publish_source_after_pack_sync_first => PublishSourceAfterPackSync: 1, WITH_REFUSAL;
+    publish_source_after_pack_sync_mid => PublishSourceAfterPackSync: 8, WITH_REFUSAL;
+    publish_source_after_location_insert_first => PublishSourceAfterLocationInsert: 1, WITH_REFUSAL;
+    publish_source_after_location_insert_mid => PublishSourceAfterLocationInsert: 8, WITH_REFUSAL;
+    publish_source_after_manifest_insert_first => PublishSourceAfterManifestInsert: 1, WITH_REFUSAL;
+    publish_source_after_manifest_insert_mid => PublishSourceAfterManifestInsert: 8, WITH_REFUSAL;
+    publish_source_before_commit_first => PublishSourceBeforeCommit: 1, WITH_REFUSAL;
+    publish_source_before_commit_mid => PublishSourceBeforeCommit: 8, WITH_REFUSAL;
+    publish_source_after_commit_first => PublishSourceAfterCommit: 1, WITH_REFUSAL;
+    publish_source_after_commit_mid => PublishSourceAfterCommit: 8, WITH_REFUSAL;
+    publish_destination_after_append_first => PublishDestinationAfterAppend: 1, WITH_REFUSAL;
+    publish_destination_after_append_mid => PublishDestinationAfterAppend: 30, WITH_REFUSAL;
+    publish_destination_after_pack_sync_first => PublishDestinationAfterPackSync: 1, WITH_REFUSAL;
+    publish_destination_after_pack_sync_mid => PublishDestinationAfterPackSync: 30, WITH_REFUSAL;
+    publish_destination_after_location_insert_first => PublishDestinationAfterLocationInsert: 1, WITH_REFUSAL;
+    publish_destination_after_location_insert_mid => PublishDestinationAfterLocationInsert: 20, WITH_REFUSAL;
+    publish_destination_after_manifest_insert_first => PublishDestinationAfterManifestInsert: 1, WITH_REFUSAL;
+    publish_destination_after_manifest_insert_mid => PublishDestinationAfterManifestInsert: 20, WITH_REFUSAL;
+    publish_destination_before_commit_first => PublishDestinationBeforeCommit: 1, WITH_REFUSAL;
+    publish_destination_before_commit_mid => PublishDestinationBeforeCommit: 20, WITH_REFUSAL;
+    publish_destination_after_commit_first => PublishDestinationAfterCommit: 1, WITH_REFUSAL;
+    publish_destination_after_commit_mid => PublishDestinationAfterCommit: 20, WITH_REFUSAL;
     materialize_after_temp_write_first => MaterializeAfterTempWrite: 1, WITH_REFUSAL;
     materialize_after_temp_write_mid => MaterializeAfterTempWrite: 25, WITH_REFUSAL;
     materialize_after_temp_sync_mid => MaterializeAfterTempSync: 25, WITH_REFUSAL;
@@ -556,8 +593,8 @@ fn fault_names_round_trip_and_are_unique() {
 #[test]
 fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(
-        parse("publish.after_commit"),
-        Some((Point::PublishAfterCommit, 1))
+        parse("publish.source.after_commit"),
+        Some((Point::PublishSourceAfterCommit, 1))
     );
     assert_eq!(
         parse("receive.after_applied:7"),
@@ -566,6 +603,7 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(parse("receive.after_applied:0"), None);
     assert_eq!(parse("receive.after_applied:x"), None);
     assert_eq!(parse("receive.after_aplied"), None);
+    assert_eq!(parse("publish.after_commit"), None);
     assert_eq!(parse(""), None);
 }
 

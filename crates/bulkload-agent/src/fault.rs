@@ -15,9 +15,23 @@
 //! The process only ever terminates itself. Nothing here sends a signal to any
 //! process, this one included (R-N11).
 //!
-//! This models a process crash, not a power cut: bytes the kernel already
-//! accepted survive in the page cache whether or not they were synced.
-//! Power-loss replay is a separate harness.
+//! # What `_exit` can and cannot prove
+//!
+//! This models a **process crash only**. Bytes the kernel already accepted
+//! survive in the page cache whether or not they were synced, so a harness
+//! built on these points **cannot detect a missing or misplaced fsync**. It
+//! does detect ordering bugs visible without power loss, such as a record
+//! committed before its data is written, a final name exposed before its
+//! content is complete, or a resume that cannot adopt what a crash left.
+//! Power-loss coverage is the remaining W7 follow-up: a syscall-log
+//! (ALICE-style) crash-state checker, or dm-log-writes replay.
+//!
+//! # Crash receipt
+//!
+//! With `BULKLOAD_FAULT_RECEIPT=<path>` set, the process writes the armed
+//! point's name, and for publication points the canonical store root on a
+//! second line, to `<path>` just before it exits. Harnesses use it to check
+//! which store a crash landed in.
 //!
 //! An `BULKLOAD_FAULT` value that names no point, or has an `nth` of zero or a
 //! non-number, ends the process at the first fault point it reaches with
@@ -26,17 +40,19 @@
 //! # Fault points
 //!
 //! Store publication, in `StorePublisher::publish_group`. The source capture
-//! publisher and the destination chunk publisher share this code, so a hit
-//! count spans both sides of a local `copy`.
+//! publisher and the destination chunk publisher share this code but not these
+//! points: each stage exists once per store, `publish.source.<stage>` and
+//! `publish.destination.<stage>`, so an `nth` hit always lands in a known
+//! store. A crash receipt (below) also records that store's root.
 //!
-//! | Name | Crash leaves |
-//! |------|--------------|
-//! | `publish.after_append` | chunk bytes appended to `chunks.pack`, not synced, not indexed |
-//! | `publish.after_pack_sync` | pack tail synced, not indexed |
-//! | `publish.after_location_insert` | open transaction with chunk locations (hot journal) |
-//! | `publish.after_manifest_insert` | open transaction with locations and captures (hot journal) |
-//! | `publish.before_commit` | the whole group staged, `COMMIT` not issued (hot journal) |
-//! | `publish.after_commit` | the group committed, no acknowledgement sent |
+//! | Stage | Crash leaves (in the named store) |
+//! |-------|-----------------------------------|
+//! | `after_append` | chunk bytes appended to `chunks.pack`, not synced, not indexed |
+//! | `after_pack_sync` | pack tail synced, not indexed |
+//! | `after_location_insert` | open transaction with chunk locations (hot journal) |
+//! | `after_manifest_insert` | open transaction with locations and captures (hot journal) |
+//! | `before_commit` | the whole group staged, `COMMIT` not issued (hot journal) |
+//! | `after_commit` | the group committed, no acknowledgement sent |
 //!
 //! Output publication, in `Destination::file`:
 //!
@@ -88,21 +104,36 @@ pub const FAULT_EXIT_CODE: i32 = 86;
 /// Exit status of a process whose `BULKLOAD_FAULT` value is malformed.
 pub const FAULT_SPEC_INVALID_EXIT_CODE: i32 = 87;
 
+/// Optional path the process writes its crash receipt to before exiting.
+pub const FAULT_RECEIPT_ENV: &str = "BULKLOAD_FAULT_RECEIPT";
+
 /// A named crash point in the durability path. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Point {
-    /// `publish.after_append`
-    PublishAfterAppend,
-    /// `publish.after_pack_sync`
-    PublishAfterPackSync,
-    /// `publish.after_location_insert`
-    PublishAfterLocationInsert,
-    /// `publish.after_manifest_insert`
-    PublishAfterManifestInsert,
-    /// `publish.before_commit`
-    PublishBeforeCommit,
-    /// `publish.after_commit`
-    PublishAfterCommit,
+    /// `publish.source.after_append`
+    PublishSourceAfterAppend,
+    /// `publish.source.after_pack_sync`
+    PublishSourceAfterPackSync,
+    /// `publish.source.after_location_insert`
+    PublishSourceAfterLocationInsert,
+    /// `publish.source.after_manifest_insert`
+    PublishSourceAfterManifestInsert,
+    /// `publish.source.before_commit`
+    PublishSourceBeforeCommit,
+    /// `publish.source.after_commit`
+    PublishSourceAfterCommit,
+    /// `publish.destination.after_append`
+    PublishDestinationAfterAppend,
+    /// `publish.destination.after_pack_sync`
+    PublishDestinationAfterPackSync,
+    /// `publish.destination.after_location_insert`
+    PublishDestinationAfterLocationInsert,
+    /// `publish.destination.after_manifest_insert`
+    PublishDestinationAfterManifestInsert,
+    /// `publish.destination.before_commit`
+    PublishDestinationBeforeCommit,
+    /// `publish.destination.after_commit`
+    PublishDestinationAfterCommit,
     /// `materialize.after_temp_write`
     MaterializeAfterTempWrite,
     /// `materialize.after_temp_sync`
@@ -137,13 +168,19 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 21] = [
-        Self::PublishAfterAppend,
-        Self::PublishAfterPackSync,
-        Self::PublishAfterLocationInsert,
-        Self::PublishAfterManifestInsert,
-        Self::PublishBeforeCommit,
-        Self::PublishAfterCommit,
+    pub const ALL: [Self; 27] = [
+        Self::PublishSourceAfterAppend,
+        Self::PublishSourceAfterPackSync,
+        Self::PublishSourceAfterLocationInsert,
+        Self::PublishSourceAfterManifestInsert,
+        Self::PublishSourceBeforeCommit,
+        Self::PublishSourceAfterCommit,
+        Self::PublishDestinationAfterAppend,
+        Self::PublishDestinationAfterPackSync,
+        Self::PublishDestinationAfterLocationInsert,
+        Self::PublishDestinationAfterManifestInsert,
+        Self::PublishDestinationBeforeCommit,
+        Self::PublishDestinationAfterCommit,
         Self::MaterializeAfterTempWrite,
         Self::MaterializeAfterTempSync,
         Self::MaterializeAfterLink,
@@ -165,12 +202,22 @@ impl Point {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::PublishAfterAppend => "publish.after_append",
-            Self::PublishAfterPackSync => "publish.after_pack_sync",
-            Self::PublishAfterLocationInsert => "publish.after_location_insert",
-            Self::PublishAfterManifestInsert => "publish.after_manifest_insert",
-            Self::PublishBeforeCommit => "publish.before_commit",
-            Self::PublishAfterCommit => "publish.after_commit",
+            Self::PublishSourceAfterAppend => "publish.source.after_append",
+            Self::PublishSourceAfterPackSync => "publish.source.after_pack_sync",
+            Self::PublishSourceAfterLocationInsert => "publish.source.after_location_insert",
+            Self::PublishSourceAfterManifestInsert => "publish.source.after_manifest_insert",
+            Self::PublishSourceBeforeCommit => "publish.source.before_commit",
+            Self::PublishSourceAfterCommit => "publish.source.after_commit",
+            Self::PublishDestinationAfterAppend => "publish.destination.after_append",
+            Self::PublishDestinationAfterPackSync => "publish.destination.after_pack_sync",
+            Self::PublishDestinationAfterLocationInsert => {
+                "publish.destination.after_location_insert"
+            }
+            Self::PublishDestinationAfterManifestInsert => {
+                "publish.destination.after_manifest_insert"
+            }
+            Self::PublishDestinationBeforeCommit => "publish.destination.before_commit",
+            Self::PublishDestinationAfterCommit => "publish.destination.after_commit",
             Self::MaterializeAfterTempWrite => "materialize.after_temp_write",
             Self::MaterializeAfterTempSync => "materialize.after_temp_sync",
             Self::MaterializeAfterLink => "materialize.after_link",
@@ -235,6 +282,27 @@ fn terminate(code: i32) -> ! {
 
 /// Record one hit of `point`; the armed `nth` hit ends the process.
 pub fn hit(point: Point) {
+    hit_at(point, None);
+}
+
+/// [`hit`] for a point inside a store; the receipt names `store`.
+pub fn hit_in(point: Point, store: &Path) {
+    hit_at(point, Some(store));
+}
+
+fn receipt(point: Point, store: Option<&Path>) {
+    if let Some(path) = std::env::var_os(FAULT_RECEIPT_ENV) {
+        let mut body = format!("{}\n", point.name());
+        if let Some(store) = store {
+            body.push_str(&store.display().to_string());
+            body.push('\n');
+        }
+        // Best effort: the page cache outlives `_exit`, no sync is needed.
+        let _ = std::fs::write(path, body);
+    }
+}
+
+fn hit_at(point: Point, store: Option<&Path>) {
     match armed() {
         Armed::Invalid => {
             eprintln!("bulkload-agent: {FAULT_ENV} names no fault point");
@@ -242,6 +310,7 @@ pub fn hit(point: Point) {
         }
         Armed::Point(armed, nth) if *armed == point => {
             if HITS.fetch_add(1, Ordering::SeqCst).saturating_add(1) == *nth {
+                receipt(point, store);
                 terminate(FAULT_EXIT_CODE);
             }
         }

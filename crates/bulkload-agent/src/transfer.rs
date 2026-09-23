@@ -34,7 +34,7 @@ use bulkload_proto::FileKind;
 use crate::freshness::{NullCache, StatIdentity};
 use crate::materialize::Destination;
 use crate::transfer_store::{
-    row_key, Manifest, PreparedEvent, Store, StorePublisher, PERSIST_BATCH,
+    row_key, Manifest, PreparedEvent, PublisherSide, Store, StorePublisher, PERSIST_BATCH,
 };
 use crate::walk::{walk, WalkOptions};
 use crate::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
@@ -194,7 +194,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         meta.dev(),
         meta.ino(),
     ))?;
-    let mut publisher = store.publisher()?;
+    let mut publisher = store.publisher(PublisherSide::Source)?;
     write_frame(
         output,
         FrameKind::TransferStart {
@@ -453,7 +453,7 @@ pub fn receive<R: Read, W: Write>(
         target_meta.dev(),
         target_meta.ino(),
     ))?;
-    let mut publisher = store.publisher()?;
+    let mut publisher = store.publisher(PublisherSide::Destination)?;
     let mut stats = TransferStats::default();
     let mut rows = 0;
     loop {

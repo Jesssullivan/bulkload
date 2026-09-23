@@ -54,21 +54,42 @@ fn inject_fault(point: PublishFault) -> Result<()> {
     Ok(())
 }
 
+// A publication crash point is named per store: the source capture publisher
+// and the destination chunk publisher hit `publish.source.*` and
+// `publish.destination.*` respectively, and the crash receipt records the
+// store root that was being written.
+#[cfg(feature = "fault-injection")]
+macro_rules! publication_crash {
+    ($publisher:expr, $source:ident, $destination:ident) => {{
+        let publisher = &$publisher;
+        let point = match publisher.side {
+            PublisherSide::Source => $crate::fault::Point::$source,
+            PublisherSide::Destination => $crate::fault::Point::$destination,
+        };
+        $crate::fault::hit_in(point, publisher.store.root());
+    }};
+}
+
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! publication_crash {
+    ($publisher:expr, $source:ident, $destination:ident) => {{}};
+}
+
 // Each publication point is both a unit-test refusal hook (`PublishFault`, the
-// thread-local error path) and a crash point (`fault_point!`, which under the
-// `fault-injection` feature can end the process there).
+// thread-local error path) and a crash point (`publication_crash!`, which under
+// the `fault-injection` feature can end the process there).
 #[cfg(test)]
 macro_rules! publication_fault {
-    ($point:ident, $crash:ident) => {{
-        fault_point!($crash);
+    ($publisher:expr, $point:ident, $source:ident, $destination:ident) => {{
+        publication_crash!($publisher, $source, $destination);
         inject_fault(PublishFault::$point)?;
     }};
 }
 
 #[cfg(not(test))]
 macro_rules! publication_fault {
-    ($point:ident, $crash:ident) => {{
-        fault_point!($crash);
+    ($publisher:expr, $point:ident, $source:ident, $destination:ident) => {{
+        publication_crash!($publisher, $source, $destination);
     }};
 }
 
@@ -208,11 +229,23 @@ impl Drop for Exclusive {
     }
 }
 
+/// Which side of a transfer a publisher writes for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublisherSide {
+    /// The serving side's capture store.
+    Source,
+    /// The receiving side's chunk store.
+    Destination,
+}
+
 /// Exclusive owner of pack offsets and durable capture publication.
 pub(crate) struct StorePublisher<'a> {
     store: &'a Store,
     pack: fs::File,
     _exclusive: Exclusive,
+    // Read only by the `fault-injection` crash points.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+    side: PublisherSide,
 }
 
 /// A private, source-bound transfer state directory.
@@ -291,8 +324,8 @@ impl Store {
     }
 
     /// Acquire the nonblocking single-writer guard and reconcile the pack tail.
-    pub(crate) fn publisher(&self) -> Result<StorePublisher<'_>> {
-        StorePublisher::open(self)
+    pub(crate) fn publisher(&self, side: PublisherSide) -> Result<StorePublisher<'_>> {
+        StorePublisher::open(self, side)
     }
 
     /// Canonical state root, used to reject recursive self-capture.
@@ -588,7 +621,7 @@ impl Store {
 }
 
 impl StorePublisher<'_> {
-    fn open(store: &Store) -> Result<StorePublisher<'_>> {
+    fn open(store: &Store, role: PublisherSide) -> Result<StorePublisher<'_>> {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -642,6 +675,7 @@ impl StorePublisher<'_> {
             store,
             pack,
             _exclusive: exclusive,
+            side: role,
         })
     }
 
@@ -713,11 +747,21 @@ impl StorePublisher<'_> {
             locations.push((digest, offset, data.len()));
         }
         PACK_APPEND_NS.fetch_add(nanos(append_started), Ordering::Relaxed);
-        publication_fault!(AfterAppend, PublishAfterAppend);
+        publication_fault!(
+            self,
+            AfterAppend,
+            PublishSourceAfterAppend,
+            PublishDestinationAfterAppend
+        );
         if !locations.is_empty() {
             timed_sync(&self.pack, &FILE_SYNCS, &FILE_SYNC_NS)?;
         }
-        publication_fault!(AfterSync, PublishAfterPackSync);
+        publication_fault!(
+            self,
+            AfterSync,
+            PublishSourceAfterPackSync,
+            PublishDestinationAfterPackSync
+        );
         Ok(locations)
     }
 
@@ -751,7 +795,12 @@ impl StorePublisher<'_> {
                     )
                     .map_err(sqlite_error)?;
             }
-            publication_fault!(AfterLocationInsert, PublishAfterLocationInsert);
+            publication_fault!(
+                self,
+                AfterLocationInsert,
+                PublishSourceAfterLocationInsert,
+                PublishDestinationAfterLocationInsert
+            );
             for event in events {
                 if let PreparedEvent::Complete { key, manifest, .. } = event {
                     self.store
@@ -764,7 +813,12 @@ impl StorePublisher<'_> {
                         .map_err(sqlite_error)?;
                 }
             }
-            publication_fault!(AfterManifestInsert, PublishAfterManifestInsert);
+            publication_fault!(
+                self,
+                AfterManifestInsert,
+                PublishSourceAfterManifestInsert,
+                PublishDestinationAfterManifestInsert
+            );
             Ok(())
         })();
         if let Err(error) = persisted {
@@ -779,12 +833,21 @@ impl StorePublisher<'_> {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
-        fault_point!(PublishAfterCommit);
+        publication_crash!(
+            self,
+            PublishSourceAfterCommit,
+            PublishDestinationAfterCommit
+        );
         Ok(())
     }
 
     fn commit(&self) -> Result<()> {
-        publication_fault!(BeforeCommit, PublishBeforeCommit);
+        publication_fault!(
+            self,
+            BeforeCommit,
+            PublishSourceBeforeCommit,
+            PublishDestinationBeforeCommit
+        );
         self.store
             .conn
             .execute_batch("COMMIT")
@@ -1025,7 +1088,7 @@ mod tests {
                 },
             ],
         };
-        let mut publisher = store.publisher()?;
+        let mut publisher = store.publisher(PublisherSide::Source)?;
         let acknowledgements = publisher.publish_group(vec![
             PreparedEvent::Chunks {
                 capture_id: 1,
@@ -1080,9 +1143,9 @@ mod tests {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
         let store = Store::open(&state)?;
-        let publisher = store.publisher()?;
+        let publisher = store.publisher(PublisherSide::Source)?;
         let contender = Store::open(&state)?;
-        assert!(contender.publisher().is_err());
+        assert!(contender.publisher(PublisherSide::Source).is_err());
         drop(publisher);
         drop(contender);
         drop(store);
@@ -1094,7 +1157,7 @@ mod tests {
         pack.sync_all()?;
         drop(pack);
         let reopened = Store::open(&state)?;
-        let reconciled = reopened.publisher()?;
+        let reconciled = reopened.publisher(PublisherSide::Source)?;
         assert_eq!(fs::metadata(state.join("chunks.pack"))?.len(), 0);
         drop(reconciled);
         Ok(())
@@ -1106,7 +1169,7 @@ mod tests {
         let state = root.0.join("state");
         let store = Store::open(&state)?;
         let (events, _) = publication(b"indexed content");
-        let mut publisher = store.publisher()?;
+        let mut publisher = store.publisher(PublisherSide::Source)?;
         publisher.publish_group(events)?;
         drop(publisher);
         drop(store);
@@ -1116,7 +1179,7 @@ mod tests {
             .set_len(0)?;
         let reopened = Store::open(&state)?;
         assert!(matches!(
-            reopened.publisher(),
+            reopened.publisher(PublisherSide::Source),
             Err(BulkloadRefusal::DigestMismatch)
         ));
         Ok(())
@@ -1135,7 +1198,7 @@ mod tests {
             let state = root.0.join("state");
             let store = Store::open(&state)?;
             let (events, manifest) = publication(b"fault recovery content");
-            let mut publisher = store.publisher()?;
+            let mut publisher = store.publisher(PublisherSide::Source)?;
             PUBLISH_FAULT.with(|active| active.set(fault));
             assert!(matches!(
                 publisher.publish_group(events),
@@ -1147,7 +1210,7 @@ mod tests {
             drop(store);
 
             let reopened = Store::open(&state)?;
-            let mut publisher = reopened.publisher()?;
+            let mut publisher = reopened.publisher(PublisherSide::Source)?;
             assert_eq!(fs::metadata(state.join("chunks.pack"))?.len(), 0);
             let (retry, _) = publication(b"fault recovery content");
             let acknowledgements = publisher.publish_group(retry)?;
