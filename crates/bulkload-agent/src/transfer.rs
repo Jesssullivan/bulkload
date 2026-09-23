@@ -28,8 +28,8 @@ static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static TRANSFER_NS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
 
-use tcfs_bulkload_proto::frame::{ChunkSpec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
-use tcfs_bulkload_proto::FileKind;
+use bulkload_proto::frame::{ChunkSpec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
+use bulkload_proto::FileKind;
 
 use crate::freshness::{NullCache, StatIdentity};
 use crate::materialize::Destination;

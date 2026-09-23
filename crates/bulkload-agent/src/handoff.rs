@@ -29,8 +29,8 @@
 //! This module never signals a child process. Timeouts prefer each tool's own
 //! flag (`--request-timeout=5s`, `-o ConnectTimeout=5`); where a tool has none,
 //! [`run`] polls `try_wait` against a wall clock and, on expiry, *detaches* the
-//! child onto a reaper thread that only waits on it. There is no `kill`, no
-//! `libc::kill`, and no signal of any kind in this file.
+//! child onto a reaper thread that only waits on it. There is no `kill`, no // agent-process-safety: allow (prose asserting absence of process control)
+//! `libc::kill`, and no signal of any kind in this file. // agent-process-safety: allow (prose asserting absence of process control)
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tcfs_bulkload_proto::{BulkloadRefusal, Result};
+use bulkload_proto::{BulkloadRefusal, Result};
 
 /// The receipt schema identity. Stable once a milestone ships.
 pub const SCHEMA: &str = "tcfs.bulkload.handoff.v1";

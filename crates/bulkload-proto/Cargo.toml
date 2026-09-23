@@ -1,10 +1,10 @@
 [package]
-name = "tcfs-bulkload-proto"
+name = "bulkload-proto"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "tcfs bulkload wire protocol: postcard frame codec, row schema, refusal taxonomy"
+description = "Bulkload wire protocol: postcard frame codec, row schema, refusal taxonomy"
 
 [dependencies]
 serde = { workspace = true }

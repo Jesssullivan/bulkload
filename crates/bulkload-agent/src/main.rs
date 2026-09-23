@@ -9,16 +9,16 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-use tcfs_bulkload_agent::freshness::{Freshness, FreshnessCache as _, MemoryCache, StatIdentity};
-use tcfs_bulkload_agent::hash;
-use tcfs_bulkload_agent::walk::{self, HashPolicy, WalkOptions};
-use tcfs_bulkload_proto::{BulkloadRefusal, FileKind, Frame, FrameKind, Result, RowSchema};
+use bulkload_agent::freshness::{Freshness, FreshnessCache as _, MemoryCache, StatIdentity};
+use bulkload_agent::hash;
+use bulkload_agent::walk::{self, HashPolicy, WalkOptions};
+use bulkload_proto::{BulkloadRefusal, FileKind, Frame, FrameKind, Result, RowSchema};
 
 const USAGE: &str = "\
-tcfs-bulkload-agent -- ordinary-file transport and offline SQLite composition
+bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
-    tcfs-bulkload-agent <SUBCOMMAND>
+    bulkload-agent <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -30,7 +30,7 @@ SUBCOMMANDS:
     copy SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores
     pull HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
-                Native SSH pull; remote tcfs-bulkload-agent must be installed
+                Native SSH pull; remote bulkload-agent must be installed
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR
                 Archive refs/stashes and staged/worktree trees in a bundle
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
             if let Some(path) = args.next() {
                 walk_command(Path::new(&path))
             } else {
-                eprintln!("tcfs-bulkload-agent: walk requires a PATH\n\n{USAGE}");
+                eprintln!("bulkload-agent: walk requires a PATH\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
             | "estate-apply"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
-        Some("serve") => tcfs_bulkload_agent::transfer::serve(
+        Some("serve") => bulkload_agent::transfer::serve(
             &mut std::io::stdin().lock(),
             &mut std::io::stdout().lock(),
         ),
@@ -126,7 +126,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some(other) => {
-            eprintln!("tcfs-bulkload-agent: unknown subcommand {other:?}\n\n{USAGE}");
+            eprintln!("bulkload-agent: unknown subcommand {other:?}\n\n{USAGE}");
             return ExitCode::from(2);
         }
         None => {
@@ -138,7 +138,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
-            eprintln!("tcfs-bulkload-agent: refused: {refusal}");
+            eprintln!("bulkload-agent: refused: {refusal}");
             ExitCode::FAILURE
         }
     }
@@ -155,7 +155,7 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             .get(3)
             .and_then(|value| value.to_str())
             .ok_or(BulkloadRefusal::PathNotPortable)?;
-        tcfs_bulkload_agent::git_carry::restore_linked(path(0)?, path(1)?, path(2)?, source)?;
+        bulkload_agent::git_carry::restore_linked(path(0)?, path(1)?, path(2)?, source)?;
         println!("linked restoration complete");
         return Ok(());
     }
@@ -165,12 +165,12 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(2)
                 .and_then(|value| value.to_str())
                 .ok_or(BulkloadRefusal::PathNotPortable)?;
-            tcfs_bulkload_agent::git_carry::restore_bundle(path(0)?, path(1)?, source)?;
+            bulkload_agent::git_carry::restore_bundle(path(0)?, path(1)?, source)?;
             println!("{}", path(1)?.display());
             Ok(())
         }
         "git-export" if args.len() == 2 => {
-            let bundle = tcfs_bulkload_agent::git_carry::export_repository(path(0)?, path(1)?)?;
+            let bundle = bulkload_agent::git_carry::export_repository(path(0)?, path(1)?)?;
             println!("{}", bundle.display());
             Ok(())
         }
@@ -179,22 +179,17 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(2)
                 .and_then(|value| value.to_str())
                 .ok_or(BulkloadRefusal::PathNotPortable)?;
-            let count = tcfs_bulkload_agent::git_carry::import_bundle(path(0)?, path(1)?, source)?;
+            let count = bulkload_agent::git_carry::import_bundle(path(0)?, path(1)?, source)?;
             println!("{count}");
             Ok(())
         }
         "copy" if args.len() == 4 => {
-            let stats =
-                tcfs_bulkload_agent::transfer::copy(path(0)?, path(1)?, path(2)?, path(3)?)?;
+            let stats = bulkload_agent::transfer::copy(path(0)?, path(1)?, path(2)?, path(3)?)?;
             report_transfer(&stats)
         }
         "pull" if (5..=7).contains(&args.len()) => pull_command(args),
         "snapshot" if (2..=3).contains(&args.len()) => {
-            tcfs_bulkload_agent::provider_sqlite::snapshot(
-                path(0)?,
-                path(1)?,
-                steps(args.get(2))?,
-            )?;
+            bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
             Ok(())
         }
@@ -203,7 +198,7 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(3)
                 .and_then(|value| value.to_str())
                 .ok_or(BulkloadRefusal::PathNotPortable)?;
-            let stats = tcfs_bulkload_agent::provider_sqlite::compose_snapshots(
+            let stats = bulkload_agent::provider_sqlite::compose_snapshots(
                 path(0)?,
                 path(1)?,
                 path(2)?,
@@ -222,11 +217,11 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(3)
                 .and_then(|value| value.to_str())
                 .ok_or(BulkloadRefusal::PathNotPortable)?;
-            let mapping = tcfs_bulkload_agent::provider_sqlite::PathMapping {
+            let mapping = bulkload_agent::provider_sqlite::PathMapping {
                 source_home: path(4)?,
                 destination_home: path(5)?,
             };
-            let stats = tcfs_bulkload_agent::provider_sqlite::compose_state_snapshots(
+            let stats = bulkload_agent::provider_sqlite::compose_state_snapshots(
                 path(0)?,
                 path(1)?,
                 path(2)?,
@@ -258,7 +253,7 @@ fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
         .get(2)
         .and_then(|value| value.to_str())
         .ok_or(BulkloadRefusal::PathNotPortable)?;
-    tcfs_bulkload_agent::git_carry::repair_missing_index(path(0)?, path(1)?, source, path(3)?)?;
+    bulkload_agent::git_carry::repair_missing_index(path(0)?, path(1)?, source, path(3)?)?;
     println!("missing index repaired; payload parity not asserted");
     Ok(())
 }
@@ -276,7 +271,7 @@ fn registered_command(args: &[std::ffi::OsString]) -> Result<()> {
         .get(4)
         .and_then(|arg| arg.to_str())
         .ok_or(BulkloadRefusal::PathNotPortable)?;
-    tcfs_bulkload_agent::git_carry::registered::restore(
+    bulkload_agent::git_carry::registered::restore(
         path(0)?,
         path(1)?,
         path(2)?,
@@ -300,7 +295,7 @@ fn attach_standalone_command(args: &[std::ffi::OsString]) -> Result<()> {
         .get(2)
         .and_then(|value| value.to_str())
         .ok_or(BulkloadRefusal::PathNotPortable)?;
-    tcfs_bulkload_agent::git_carry::attach_standalone_payload(
+    bulkload_agent::git_carry::attach_standalone_payload(
         path(0)?,
         path(1)?,
         source,
@@ -325,7 +320,7 @@ fn attach_payload_command(args: &[std::ffi::OsString]) -> Result<()> {
         .get(3)
         .and_then(|value| value.to_str())
         .ok_or(BulkloadRefusal::PathNotPortable)?;
-    tcfs_bulkload_agent::git_carry::attach_matching_payload(
+    bulkload_agent::git_carry::attach_matching_payload(
         path(0)?,
         path(1)?,
         path(2)?,
@@ -339,7 +334,7 @@ fn attach_payload_command(args: &[std::ffi::OsString]) -> Result<()> {
 // Escaped paths are intentional: receipts must not permit embedded newlines.
 #[allow(clippy::unnecessary_debug_formatting)]
 fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
-    use tcfs_bulkload_agent::estate;
+    use bulkload_agent::estate;
     let path = |i| {
         args.get(i)
             .map(Path::new)
@@ -427,7 +422,7 @@ fn apply_state_command(args: &[std::ffi::OsString]) -> Result<()> {
         .ok_or(BulkloadRefusal::FieldDomainViolation)?
         .parse()
         .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
-    tcfs_bulkload_agent::provider_sqlite::online::apply_state_candidate(
+    bulkload_agent::provider_sqlite::online::apply_state_candidate(
         path(0)?,
         path(1)?,
         path(2)?,
@@ -462,7 +457,7 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
             .parse()
             .map_err(|_| BulkloadRefusal::FieldDomainViolation)
     };
-    let mapping = tcfs_bulkload_agent::provider_sqlite::PathMapping {
+    let mapping = bulkload_agent::provider_sqlite::PathMapping {
         source_home: path(1)?,
         destination_home: path(2)?,
     };
@@ -472,7 +467,7 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
     let zstd = args
         .get(6)
         .map_or_else(|| Path::new("/usr/bin/zstd"), Path::new);
-    let receipt = |report: &tcfs_bulkload_agent::provider_sqlite::hydrate::Hydrated| -> Result<()> {
+    let receipt = |report: &bulkload_agent::provider_sqlite::hydrate::Hydrated| -> Result<()> {
         let mut output = std::io::stdout().lock();
         writeln!(
             output,
@@ -487,7 +482,7 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
         output.flush()?;
         Ok(())
     };
-    let reports = tcfs_bulkload_agent::provider_sqlite::hydrate::hydrate_state(
+    let reports = bulkload_agent::provider_sqlite::hydrate::hydrate_state(
         path(0)?,
         &mapping,
         number(3)?,
@@ -508,7 +503,7 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
     };
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let remote = match args.get(5) {
-        None => "tcfs-bulkload-agent",
+        None => "bulkload-agent",
         Some(value) => {
             let value = value.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
             if !Path::new(value).is_absolute()
@@ -540,7 +535,7 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
     let result = {
         let mut output = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
-        tcfs_bulkload_agent::transfer::receive(
+        bulkload_agent::transfer::receive(
             &mut input,
             &mut output,
             path(1)?,
@@ -567,7 +562,7 @@ fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
     })
 }
 
-fn report_transfer(stats: &tcfs_bulkload_agent::transfer::TransferStats) -> Result<()> {
+fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={}",
         stats.completed,
@@ -595,7 +590,7 @@ fn report_transfer(stats: &tcfs_bulkload_agent::transfer::TransferStats) -> Resu
 /// handoff needs the measurements more than a clean exit. `--json PATH` writes
 /// the machine-readable receipt beside it.
 fn handoff_command(args: &[std::ffi::OsString]) -> Result<()> {
-    use tcfs_bulkload_agent::handoff;
+    use bulkload_agent::handoff;
 
     let mut options = handoff::Options::from_environment();
     let mut state_root = std::env::temp_dir();
@@ -648,7 +643,7 @@ fn seconds(value: &std::ffi::OsString) -> Result<std::time::Duration> {
 }
 
 fn selftest() -> Result<()> {
-    println!("tcfs-bulkload-agent selftest");
+    println!("bulkload-agent selftest");
 
     let path = scratch_path("selftest");
     let payload = b"tcfs bulkload M1 selftest payload";
@@ -738,7 +733,7 @@ fn row_for(len: usize, meta: &std::fs::Metadata, digest: [u8; 32]) -> RowSchema 
 
 fn scratch_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("tcfs-bulkload-agent-{name}-{}", std::process::id()));
+    path.push(format!("bulkload-agent-{name}-{}", std::process::id()));
     path
 }
 

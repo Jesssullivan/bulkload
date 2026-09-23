@@ -5,12 +5,6 @@
 //! `(dev, ino, size, mtime_ns, ctime_ns)` tuple that decides whether a seat
 //! may be skipped on resume.
 //!
-//! Why a local trait: `tcfs-sync` grows its own `freshness.rs` (PR #586), but
-//! the agent half must not depend on `tcfs-sync` -- that crate pulls tokio and
-//! the whole sync stack straight through the R34 dependency wall. The trait
-//! keeps M3 unblocked: when #586 lands, an adapter in the *daemon* half
-//! implements this trait over it, and nothing in the agent changes.
-//!
 //! Both R25 headline metrics fall out of this seam. A cache that reports
 //! `Fresh` for a seat whose bytes did not change is what drives
 //! `bytes_reread_on_resume` to zero; a cache consulted once per seat is what
@@ -18,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use tcfs_bulkload_proto::{BulkloadRefusal, Result, RowSchema};
+use bulkload_proto::{BulkloadRefusal, Result, RowSchema};
 
 /// The identity tuple a freshness decision is keyed on.
 ///
@@ -420,10 +414,8 @@ mod tests {
 
     #[test]
     fn sqlite_completion_survives_reopen_with_full_width_identity() {
-        let path = std::env::temp_dir().join(format!(
-            "tcfs-bulkload-completion-{}.sqlite",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bulkload-completion-{}.sqlite", std::process::id()));
         let id = StatIdentity {
             ino: u64::MAX,
             mtime_ns: i128::MAX,

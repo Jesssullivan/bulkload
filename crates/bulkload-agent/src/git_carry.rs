@@ -764,9 +764,9 @@ fn nested_worktree(root: &Path, directory: &Path, common: &Path) -> Result<Optio
 }
 
 fn filesystem_census(root: &Path, common: Option<&Path>) -> Result<Census> {
+    use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    use tcfs_bulkload_proto::FileKind;
     let mut pending = vec![root.to_path_buf()];
     let mut rows = Vec::new();
     let mut nested_worktrees = Vec::new();
@@ -835,9 +835,9 @@ fn filesystem_census(root: &Path, common: Option<&Path>) -> Result<Census> {
 }
 
 fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
+    use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use tcfs_bulkload_proto::FileKind;
     let bytes = output(git(destination).args(["show", &format!("{revision}:value")]))?;
     let rows: Vec<crate::RowSchema> =
         postcard::from_bytes(&bytes).map_err(|_| BulkloadRefusal::FrameCodec)?;
@@ -1131,7 +1131,7 @@ fn bundle_object_format(heads: &str) -> Result<&'static str> {
 }
 
 fn payload_shape_equal(a: &[crate::RowSchema], b: &[crate::RowSchema]) -> bool {
-    use tcfs_bulkload_proto::FileKind;
+    use bulkload_proto::FileKind;
     a.len() == b.len()
         && a.iter().zip(b).all(|(a, b)| {
             a.rel_path == b.rel_path

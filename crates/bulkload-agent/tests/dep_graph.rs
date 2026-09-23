@@ -52,7 +52,7 @@ fn agent_dependency_graph_has_no_forbidden_crates() {
         .args([
             "tree",
             "-p",
-            "tcfs-bulkload-agent",
+            "bulkload-agent",
             "-e",
             "normal",
             "--prefix",
@@ -93,7 +93,7 @@ fn agent_dependency_graph_has_no_forbidden_crates() {
     violations.dedup();
     assert!(
         violations.is_empty(),
-        "tcfs-bulkload-agent must not depend on {FORBIDDEN:?}, but its graph contains:\n  {}\n\n\
+        "bulkload-agent must not depend on {FORBIDDEN:?}, but its graph contains:\n  {}\n\n\
          full tree:\n{stdout}",
         violations.join("\n  ")
     );
@@ -117,8 +117,8 @@ fn forbidden_matcher_is_neither_too_broad_nor_too_narrow() {
     assert_eq!(package_name("├── serde v1.0.210"), Some("serde"));
     assert_eq!(package_name("│   └── tokio v1.40.0 (*)"), Some("tokio"));
     assert_eq!(
-        package_name("tcfs-bulkload-agent v0.12.14"),
-        Some("tcfs-bulkload-agent")
+        package_name("bulkload-agent v0.12.14"),
+        Some("bulkload-agent")
     );
     assert_eq!(package_name("   "), None);
 }

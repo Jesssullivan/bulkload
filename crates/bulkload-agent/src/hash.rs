@@ -1,9 +1,8 @@
 //! Content hashing and chunking for the agent half.
 //!
-//! Files are opened with `O_NOFOLLOW | O_CLOEXEC`, mirroring the Python
-//! engine's open flags: a seat the walker classified as a regular file must
-//! still be a regular file when its bytes are read, or the read is refused
-//! rather than followed somewhere else.
+//! Files are opened with `O_NOFOLLOW | O_CLOEXEC`: a seat the walker
+//! classified as a regular file must still be a regular file when its bytes
+//! are read, or the read is refused rather than followed somewhere else.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -12,7 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
-use tcfs_bulkload_proto::{BulkloadRefusal, Result};
+use bulkload_proto::{BulkloadRefusal, Result};
 
 use crate::freshness::StatIdentity;
 
@@ -159,10 +158,7 @@ mod tests {
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "tcfs-bulkload-agent-test-{}-{name}",
-            std::process::id()
-        ));
+        dir.push(format!("bulkload-agent-test-{}-{name}", std::process::id()));
         dir
     }
 
@@ -224,7 +220,7 @@ mod tests {
         std::fs::write(&path, b"after and larger").unwrap();
         assert_eq!(
             super::hash_file_checked(&path, &identity),
-            Err(tcfs_bulkload_proto::BulkloadRefusal::SourceChangedAfterSnapshot)
+            Err(bulkload_proto::BulkloadRefusal::SourceChangedAfterSnapshot)
         );
         std::fs::remove_file(path).unwrap();
     }

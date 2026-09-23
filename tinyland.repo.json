@@ -3,7 +3,7 @@
   "repo": {
     "name": "bulkload",
     "github": "Jesssullivan/bulkload",
-    "description": "Bulkload product contract; implementation in the TCFS Rust workspace"
+    "description": "Live-host estate mover: Rust agent, wire protocol and benchmark"
   },
   "taxonomy": {
     "primary_role": "private-migration-tooling",
@@ -31,8 +31,8 @@
   },
   "boundaries": {
     "default_read_only": true,
-    "runtime": "retired-python",
-    "implementation_repository": "Jesssullivan/tummycrypt",
+    "runtime": "rust",
+    "implementation_repository": "Jesssullivan/bulkload",
     "preserves_unique_state": true,
     "signals_processes": false,
     "owns_home_manager_activation": false

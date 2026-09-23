@@ -1,6 +1,6 @@
 //! Native ordinary-file transport and offline provider composition on Unix.
 //!
-//! # Scope (plan workstream G, R32-R35)
+//! # Scope
 //!
 //! The agent walks a corpus, transfers verified chunks in bounded frames,
 //! preserves divergent destinations, and composes retained `SQLite` candidates.
@@ -12,10 +12,9 @@
 //!
 //! # Freshness
 //!
-//! The walker is written against the local [`freshness::FreshnessCache`]
-//! trait rather than any concrete cache. PR #586 lands a `freshness.rs` in
-//! `tcfs-sync`; the trait here keeps M3 unblocked either way and lets the M0
-//! bench swap in a null cache.
+//! The walker is written against the [`freshness::FreshnessCache`] trait
+//! rather than any concrete cache, so callers choose a persistent, in-memory
+//! or null cache.
 
 pub mod estate;
 pub mod freshness;
@@ -28,4 +27,4 @@ pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
 
-pub use tcfs_bulkload_proto::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
+pub use bulkload_proto::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};

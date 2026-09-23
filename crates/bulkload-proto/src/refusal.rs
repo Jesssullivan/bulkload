@@ -1,23 +1,8 @@
 //! The bulkload refusal taxonomy.
 //!
-//! # Provenance
-//!
-//! The Python engine at `bulkload-refactor/.agents/skills/bulkload/scripts/
-//! bulkload_lib/{scanner,executor,model}.py` does not carry machine-readable
-//! refusal *codes*: it raises `BulkloadError("<prose>")` with several hundred
-//! distinct human-readable messages. The names below are a faithful port of
-//! the refusal *families* those messages fall into, grouped so that each
-//! variant covers one class of prose refusal:
-//!
-//! | variant family        | representative Python prose                       |
-//! |-----------------------|---------------------------------------------------|
-//! | `SnapshotCustody*`    | "live snapshot custody is unavailable"             |
-//! | `Digest*`             | "`AgentCaptureV4` catalog digest mismatch"           |
-//! | `Git*`                | "Git authority changed during live snapshot"       |
-//! | `Sqlite*`             | "`SQLite` `quick_check` failed"                        |
-//! | `Path*`               | "control and format characters are forbidden ..."  |
-//! | `Rollback*`           | "rollback end-state differs from its exact ..."    |
-//! | `Budget*`             | "`SQLite` row capture budget exceeded"               |
+//! Each variant has a stable machine-readable code, and variants are grouped
+//! into families by prefix: `SnapshotCustody*`, `Digest*`, `Git*`,
+//! `Sqlite*`, `Path*`, `Rollback*` and `Budget*`.
 //!
 //! Every variant is a *refusal*: the operation did not complete. Earlier durable
 //! progress or prepared state can remain; inspect its receipts before retrying.
@@ -27,9 +12,9 @@ use core::fmt;
 
 /// A bulkload refusal.
 ///
-/// Ported from the Python engine's `BulkloadError` prose families -- see the
-/// module docs for the mapping. Variants are non-exhaustive on purpose: the
-/// M2/M3 lanes will grow this set as more of the engine is rebuilt.
+/// Variants are grouped into families (see the module docs) and are
+/// non-exhaustive on purpose: new refusal classes are added as values, never
+/// as panics.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BulkloadRefusal {

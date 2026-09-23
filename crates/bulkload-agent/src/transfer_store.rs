@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use bulkload_proto::frame::ChunkSpec;
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
-use tcfs_bulkload_proto::frame::ChunkSpec;
 
 use crate::freshness::StatIdentity;
 use crate::{BulkloadRefusal, Result, RowSchema};

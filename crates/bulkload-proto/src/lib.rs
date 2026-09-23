@@ -1,7 +1,7 @@
-//! Shared wire types for the tcfs bulkload rebuild (plan workstream G, R32-R35).
+//! Shared wire types for bulkload.
 //!
-//! This crate is the contract between the thin darwin-side agent
-//! (`tcfs-bulkload-agent`) and whatever consumes its stream. It holds three
+//! This crate is the contract between the two ends of a bulkload session
+//! (`bulkload-agent` running as source and as destination). It holds three
 //! things and deliberately nothing else:
 //!
 //! * [`frame`] -- the postcard frame codec skeleton.

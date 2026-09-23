@@ -9,7 +9,7 @@ use std::process::Stdio;
 
 use super::{git, output, safe_destination, text};
 use crate::{BulkloadRefusal, Result, RowSchema};
-use tcfs_bulkload_proto::FileKind;
+use bulkload_proto::FileKind;
 
 // Git fast-import accepts C-quoted arbitrary byte paths. Quote every byte in
 // octal, including spaces, newlines, quotes, backslashes and non-UTF8 bytes.

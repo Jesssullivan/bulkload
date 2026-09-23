@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
+use bulkload_agent::freshness::NullCache;
+use bulkload_agent::transfer::{self, TransferTiming};
+use bulkload_agent::transfer_store::ChunkTiming;
+use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
+use bulkload_proto::{FileKind, Frame, FrameKind, RowSchema};
 use clap::{Parser, ValueEnum};
-use tcfs_bulkload_agent::freshness::NullCache;
-use tcfs_bulkload_agent::transfer::{self, TransferTiming};
-use tcfs_bulkload_agent::transfer_store::ChunkTiming;
-use tcfs_bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
-use tcfs_bulkload_proto::{FileKind, Frame, FrameKind, RowSchema};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Arm {

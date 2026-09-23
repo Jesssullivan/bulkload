@@ -2,9 +2,8 @@
 //!
 //! Wire format is deliberately boring: a 4-byte big-endian body length
 //! followed by a postcard-serialised [`Frame`]. Length-prefixing keeps a
-//! corrupt or truncated stream from being silently re-synchronised mid-record
-//! -- the Python engine's "turning one refused object into a desynchronised
-//! batch" hazard, refused here as [`BulkloadRefusal::FrameCodec`].
+//! corrupt or truncated stream from being silently re-synchronised
+//! mid-record; such a stream is refused as [`BulkloadRefusal::FrameCodec`].
 
 use serde::{Deserialize, Serialize};
 

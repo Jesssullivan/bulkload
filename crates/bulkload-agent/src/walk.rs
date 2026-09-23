@@ -10,13 +10,12 @@
 //!   [`Freshness::Fresh`] contributes zero bytes to `bytes_reread_on_resume`.
 //!
 //! Refusals are forward-progressing: an unreadable or unportable seat is
-//! recorded and the walk continues, matching the Python engine's
-//! "every refusal is silent and forward-progressing" contract.
+//! recorded as a typed refusal and the walk continues.
 
 use std::path::{Path, PathBuf};
 
+use bulkload_proto::{BulkloadRefusal, FileKind, Result, RowSchema};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use tcfs_bulkload_proto::{BulkloadRefusal, FileKind, Result, RowSchema};
 
 use crate::freshness::{Freshness, FreshnessCache, StatIdentity};
 use crate::hash;
@@ -340,7 +339,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use tcfs_bulkload_proto::FileKind;
+    use bulkload_proto::FileKind;
 
     use super::{walk, HashPolicy, WalkOptions};
     use crate::freshness::MemoryCache;
@@ -352,7 +351,7 @@ mod tests {
     impl Corpus {
         fn new(name: &str) -> Self {
             let mut root = std::env::temp_dir();
-            root.push(format!("tcfs-bulkload-walk-{}-{name}", std::process::id()));
+            root.push(format!("bulkload-walk-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("nested")).unwrap();
             std::fs::write(root.join("a.txt"), b"alpha").unwrap();
@@ -476,7 +475,7 @@ mod tests {
     #[test]
     fn refused_hash_never_records_completion() {
         use crate::freshness::{FreshnessCache, StatIdentity};
-        use tcfs_bulkload_proto::Result;
+        use bulkload_proto::Result;
         struct RemovedDuringLookup {
             path: PathBuf,
         }

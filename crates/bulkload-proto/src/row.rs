@@ -23,9 +23,9 @@ pub enum FileKind {
 
 /// One scanned filesystem row.
 ///
-/// Paths travel as raw bytes, not `String`: darwin hands out non-UTF-8 names
-/// and the Python engine's `PATH_NOT_PORTABLE` refusal is a policy decision
-/// made *after* the bytes are captured, not a decoding accident.
+/// Paths travel as raw bytes, not `String`: darwin hands out non-UTF-8 names,
+/// and `PathNotPortable` is a policy decision made *after* the bytes are
+/// captured, not a decoding accident.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowSchema {
     /// Path relative to the corpus root, as raw OS bytes.

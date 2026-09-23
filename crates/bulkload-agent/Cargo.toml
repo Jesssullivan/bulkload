@@ -1,5 +1,5 @@
 [package]
-name = "tcfs-bulkload-agent"
+name = "bulkload-agent"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,16 +7,16 @@ license.workspace = true
 description = "Native resumable file transport, Git estate carry, and provider-state composition"
 
 [[bin]]
-name = "tcfs-bulkload-agent"
+name = "bulkload-agent"
 path = "src/main.rs"
 
 # R34 dependency wall. This list is closed: the `dep_graph` integration test
 # asserts that tokio, opendal, reqwest, ring and tonic are absent from
-# `cargo tree -p tcfs-bulkload-agent -e normal`. Adding an async runtime, an
+# `cargo tree -p bulkload-agent -e normal`. Adding an async runtime, an
 # object-store abstraction, an HTTP client or a TLS stack to the agent half is
 # a design change, not a dependency bump -- take it back to the plan first.
 [dependencies]
-tcfs-bulkload-proto = { path = "../tcfs-bulkload-proto" }
+bulkload-proto = { path = "../bulkload-proto" }
 rayon = { workspace = true }
 blake3 = { workspace = true }
 fastcdc = { workspace = true }

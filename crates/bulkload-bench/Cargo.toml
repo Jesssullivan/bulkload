@@ -1,19 +1,19 @@
 [package]
-name = "tcfs-bulkload-bench"
+name = "bulkload-bench"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "tcfs bulkload real local copy/resume comparison with rclone"
+description = "Bulkload real local copy/resume comparison with rclone"
 publish = false
 
 [[bin]]
-name = "tcfs-bulkload-bench"
+name = "bulkload-bench"
 path = "src/main.rs"
 
 [dependencies]
-tcfs-bulkload-agent = { path = "../tcfs-bulkload-agent" }
-tcfs-bulkload-proto = { path = "../tcfs-bulkload-proto" }
+bulkload-agent = { path = "../bulkload-agent" }
+bulkload-proto = { path = "../bulkload-proto" }
 blake3.workspace = true
 clap = { workspace = true }
 libc.workspace = true
