@@ -25,9 +25,11 @@ const CAPTURE_QUEUE: usize = CAPTURE_WORKERS * 2;
 // Captured chunks held in memory for sending; beyond this a capture's chunks
 // are read back from the sealed pack instead.
 const RETAIN_BYTES: u64 = 512 * 1024 * 1024;
-// Files whose chunks stay readable through an open descriptor for reuse
-// before their group commits.
-const SESSION_FILES: usize = 256;
+// At most this many files keep an open descriptor for chunk reuse before
+// their group commits; fewer when the descriptor budget is smaller.
+const SESSION_FILES: u64 = 256;
+// Outputs held open while one manifest is filled from committed hints.
+const HINT_FILES: usize = 16;
 // Manifests are bounded separately. The existing full census remains O(N).
 const MAX_MANIFEST_CHUNKS: usize = 131_072;
 
@@ -304,6 +306,9 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
             },
         )?;
     }
+    // Every capture of this transfer is committed, or the transfer fails,
+    // before the receiver is told the source is done.
+    committer.sync()?;
     write_frame(
         output,
         FrameKind::TransferDone {
@@ -604,6 +609,25 @@ fn send_content<R: Read, W: Write>(
     Ok(())
 }
 
+/// The destination's committer, sized to the descriptor budget: a quarter
+/// for session reuse, a quarter for staged files queued or grouped for
+/// commit, which hold one descriptor each.
+fn publication_committer(state: &Path, budget: u64) -> Result<Committer<PublishSink>> {
+    let staged = (budget / 8).clamp(2, crate::io::durable::GROUP_FILES);
+    Committer::spawn_with(
+        PublishSink::new(
+            Store::open(state)?
+                .with_side(Side::Destination)
+                .into_publisher()?,
+        )?,
+        crate::io::durable::Limits {
+            group_files: staged,
+            queue_depth: usize::try_from(staged).unwrap_or(1),
+            ..crate::io::durable::Limits::default()
+        },
+    )
+}
+
 /// Receive an ordinary-file carry without replacing divergent outputs.
 ///
 /// # Errors
@@ -621,11 +645,8 @@ pub fn receive<R: Read, W: Write>(
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    let committer = Committer::spawn(PublishSink::new(
-        Store::open(destination_state)?
-            .with_side(Side::Destination)
-            .into_publisher()?,
-    ))?;
+    let budget = crate::io::limits::descriptor_budget();
+    let committer = publication_committer(destination_state, budget)?;
     write_frame(
         output,
         FrameKind::TransferOpen {
@@ -643,7 +664,7 @@ pub fn receive<R: Read, W: Write>(
         target_meta.dev(),
         target_meta.ino(),
     ))?;
-    let mut session = SessionChunks::default();
+    let mut session = SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES));
     let mut stats = TransferStats::default();
     let mut rows = 0;
     loop {
@@ -753,17 +774,27 @@ fn prepare_row(
 }
 
 /// Chunks this session wrote into outputs that may not have committed yet,
-/// readable through the open file. Bounded to [`SESSION_FILES`] files; older
-/// files are found through their committed hints instead.
-#[derive(Default)]
+/// readable through the open file. Bounded by the descriptor budget and
+/// [`SESSION_FILES`]; older files are found through their committed hints.
 struct SessionChunks {
     files: HashMap<u64, Arc<std::fs::File>>,
     order: VecDeque<(u64, Vec<[u8; 32]>)>,
     index: HashMap<[u8; 32], (u64, u64, u64)>,
     next: u64,
+    capacity: usize,
 }
 
 impl SessionChunks {
+    fn with_capacity(files: u64) -> Self {
+        Self {
+            files: HashMap::new(),
+            order: VecDeque::new(),
+            index: HashMap::new(),
+            next: 0,
+            capacity: usize::try_from(files).unwrap_or(1),
+        }
+    }
+
     fn insert(&mut self, file: Arc<std::fs::File>, hints: &[ChunkHint]) {
         let slot = self.next;
         self.next = self.next.wrapping_add(1);
@@ -780,7 +811,7 @@ impl SessionChunks {
         }
         self.files.insert(slot, file);
         self.order.push_back((slot, owned));
-        while self.order.len() > SESSION_FILES {
+        while self.order.len() > self.capacity {
             if let Some((evicted, digests)) = self.order.pop_front() {
                 self.files.remove(&evicted);
                 for digest in digests {
@@ -850,13 +881,16 @@ fn receive_content<R: Read, W: Write>(
                     digests: Vec::new(),
                 },
             )?;
-            verify_existing(file, row, &manifest).and_then(|identity| {
-                context.committer.submit(Publication::Adopted(OutputRecord {
-                    key,
-                    rel_path: row.rel_path.clone(),
-                    identity,
-                    hints: Vec::new(),
-                }))
+            verify_existing(&file, row, &manifest).and_then(|identity| {
+                context.committer.submit(Publication::Adopted {
+                    record: OutputRecord {
+                        key,
+                        rel_path: row.rel_path.clone(),
+                        identity,
+                        hints: Vec::new(),
+                    },
+                    file,
+                })
             })
         }
         Plan::Write(staging) => {
@@ -1009,13 +1043,20 @@ fn local_chunk(
     }
     if let Some(hint) = context.store.output_chunk(digest)? {
         if hint.size == size {
-            let file = outputs
-                .entry(hint.path.clone())
-                .or_insert_with(|| context.target.open_output(&hint.path).ok());
-            if let Some(data) = file
-                .as_ref()
-                .and_then(|file| read_verified(file, hint.offset, size, digest))
-            {
+            let found = if let Some(file) = outputs.get(&hint.path) {
+                file.as_ref()
+                    .and_then(|file| read_verified(file, hint.offset, size, digest))
+            } else {
+                let file = context.target.open_output(&hint.path).ok();
+                let found = file
+                    .as_ref()
+                    .and_then(|file| read_verified(file, hint.offset, size, digest));
+                if outputs.len() < HINT_FILES {
+                    outputs.insert(hint.path.clone(), file);
+                }
+                found
+            };
+            if let Some(data) = found {
                 return Ok(Some(data));
             }
         }

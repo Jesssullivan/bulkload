@@ -8,13 +8,14 @@ use std::ffi::CStr;
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
-/// `fdatasync`: the file's data and the metadata needed to read it back are
-/// durable when this returns.
+/// `fsync`: the file's data and all of its metadata, including a mode set
+/// with `fchmod` after the last write, are durable when this returns.
+/// `fdatasync` would not carry the mode, so it is not used as a seal.
 ///
 /// # Errors
 /// Returns the flush failure.
 pub fn barrier(file: &File) -> std::io::Result<()> {
-    file.sync_data()
+    file.sync_all()
 }
 
 /// `fsync` on a directory descriptor, making its entries durable.

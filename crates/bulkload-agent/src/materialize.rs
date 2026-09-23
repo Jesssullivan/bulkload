@@ -21,9 +21,13 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 pub struct Destination {
     root: File,
     path: PathBuf,
+    /// The most recent staged file's parent, shared by its siblings so each
+    /// directory costs one descriptor rather than one per file.
+    last_parent: std::cell::RefCell<Option<(Vec<u8>, Arc<File>)>>,
     directories: Vec<PendingDirectory>,
-    /// A directory entry was sealed by barrier only and awaits a full flush.
-    unflushed: bool,
+    /// Devices holding a directory entry sealed by barrier only, awaiting a
+    /// full flush, each with one descriptor on it.
+    unflushed: std::collections::HashMap<u64, File>,
 }
 
 struct PendingDirectory {
@@ -44,8 +48,9 @@ impl Destination {
         Ok(Self {
             root,
             path: std::fs::canonicalize(path)?,
+            last_parent: std::cell::RefCell::new(None),
             directories: Vec::new(),
-            unflushed: false,
+            unflushed: std::collections::HashMap::new(),
         })
     }
 
@@ -89,7 +94,7 @@ impl Destination {
                 key,
             });
             crate::io::durable::seal_dir(&parent)?;
-            self.unflushed = true;
+            self.note_unflushed(parent);
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -117,6 +122,11 @@ impl Destination {
     /// # Errors
     /// Refuses changed/removed directories and failed durable metadata writes.
     pub fn finish_directories(&mut self, store: &Store) -> Result<()> {
+        if self.directories.is_empty() {
+            return Ok(());
+        }
+        let store_device = std::fs::metadata(store.root())?.dev();
+        let mut opened = Vec::with_capacity(self.directories.len());
         for pending in self.directories.iter().rev() {
             let (parent, leaf) = self.parent(&pending.path)?;
             let directory = open_dir(parent.as_raw_fd(), &leaf)?;
@@ -126,29 +136,48 @@ impl Destination {
             }
             directory.set_permissions(Permissions::from_mode(pending.mode))?;
             crate::io::durable::seal_dir(&directory)?;
+            opened.push(directory);
+        }
+        for directory in opened {
+            self.note_unflushed(directory);
+        }
+        // The completion commits below drain only the store's device; every
+        // other device this session sealed is fully flushed first.
+        let others: Vec<u64> = self
+            .unflushed
+            .keys()
+            .copied()
+            .filter(|device| *device != store_device)
+            .collect();
+        for device in others {
+            if let Some(handle) = self.unflushed.remove(&device) {
+                full_flush_counted(&handle)?;
+            }
+        }
+        for pending in self.directories.iter().rev() {
             store.complete_directory(&pending.key)?;
             counters::bump(Counter::DirectoriesFinished);
         }
-        if !self.directories.is_empty() {
-            // Each completion commit above was a full flush issued after every
-            // barrier of this session.
-            self.unflushed = false;
-        }
+        // What remains is on the store's device, which the commits drained.
+        self.unflushed.clear();
         Ok(())
     }
 
-    /// End a session: when a directory or symlink was sealed only by a
-    /// barrier, issue the session's one full flush on the root so those
-    /// entries reach stable media.
+    fn note_unflushed(&mut self, directory: File) {
+        if let Ok(metadata) = directory.metadata() {
+            self.unflushed.entry(metadata.dev()).or_insert(directory);
+        }
+    }
+
+    /// End a session: fully flush each device that still holds a directory
+    /// or symlink entry sealed only by a barrier, so those entries reach
+    /// stable media.
     ///
     /// # Errors
     /// Returns the flush failure.
     pub fn flush_session(&mut self) -> Result<()> {
-        if self.unflushed {
-            counters::timed(Counter::FlushFull, Counter::FlushFullNs, || {
-                crate::io::sys::full_flush(&self.root)
-            })?;
-            self.unflushed = false;
+        for (_, handle) in self.unflushed.drain() {
+            full_flush_counted(&handle)?;
         }
         Ok(())
     }
@@ -169,7 +198,7 @@ impl Destination {
             unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
         if result == 0 {
             crate::io::durable::seal_dir(&parent)?;
-            self.unflushed = true;
+            self.note_unflushed(parent);
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -214,7 +243,7 @@ impl Destination {
     /// # Errors
     /// Refuses an unsafe ancestor or a failed create.
     pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
-        let (parent, leaf) = self.parent(&row.rel_path)?;
+        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
         let temporary = cstring(
             format!(
                 ".bulkload-{}-{}",
@@ -255,6 +284,31 @@ impl Destination {
         open_regular(&parent, &leaf)
     }
 
+    fn shared_parent(&self, path: &[u8]) -> Result<(Arc<File>, CString)> {
+        let directory = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .and_then(|end| path.get(..end))
+            .unwrap_or_default();
+        if let Some((cached, parent)) = self.last_parent.borrow().as_ref() {
+            if cached.as_slice() == directory {
+                let leaf = path
+                    .get(directory.len()..)
+                    .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest))
+                    .ok_or(BulkloadRefusal::PathEscapesRoot)?;
+                if leaf.is_empty() || leaf == b"." || leaf == b".." {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
+                }
+                return Ok((Arc::clone(parent), cstring(leaf)?));
+            }
+        }
+        let (parent, leaf) = self.parent(path)?;
+        let parent = Arc::new(parent);
+        self.last_parent
+            .replace(Some((directory.to_vec(), Arc::clone(&parent))));
+        Ok((parent, leaf))
+    }
+
     fn parent(&self, path: &[u8]) -> Result<(File, CString)> {
         let mut parts = path.split(|byte| *byte == b'/').peekable();
         let mut directory = self.root.try_clone()?;
@@ -275,7 +329,7 @@ impl Destination {
 /// A destination file written under a private temporary name, published
 /// by a [`PublishSink`] once its data is sealed.
 pub(crate) struct StagedFile {
-    parent: File,
+    parent: Arc<File>,
     temporary: CString,
     leaf: CString,
     file: Arc<File>,
@@ -297,7 +351,7 @@ impl StagedFile {
 
     /// Seal the data, then rename into place without replacing anything.
     /// The identity is taken from the open file after the rename.
-    fn publish(self) -> Result<(StatIdentity, File)> {
+    fn publish(self) -> Result<(StatIdentity, Arc<File>)> {
         if let Err(error) = crate::io::durable::seal_file(&self.file) {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(error.into());
@@ -320,6 +374,14 @@ impl StagedFile {
     }
 }
 
+fn full_flush_counted(handle: &File) -> Result<()> {
+    Ok(counters::timed(
+        Counter::FlushFull,
+        Counter::FlushFullNs,
+        || crate::io::sys::full_flush(handle),
+    )?)
+}
+
 fn unlink(parent: &File, name: &CString) -> Result<()> {
     // SAFETY: parent descriptor and NUL-terminated name remain valid; flag 0
     // removes only a non-directory entry.
@@ -336,8 +398,9 @@ pub(crate) enum Publication {
         staged: StagedFile,
         record: PendingOutput,
     },
-    /// An existing output already verified against its manifest.
-    Adopted(OutputRecord),
+    /// An existing output already verified against its manifest, with the
+    /// descriptor it was verified through.
+    Adopted { record: OutputRecord, file: File },
 }
 
 /// The record for a staged file, completed with its identity once published.
@@ -353,16 +416,78 @@ pub(crate) struct PendingOutput {
 /// group in one transaction.
 pub(crate) struct PublishSink {
     publisher: StorePublisher,
+    /// Device of the store. Its commit's full flush drains only this device.
+    store_device: u64,
     outcomes: Vec<(Vec<u8>, Result<()>)>,
 }
 
 impl PublishSink {
     /// `publisher` holds the destination store's single-writer guard.
-    pub(crate) const fn new(publisher: StorePublisher) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Refuses if the store root cannot be stat'ed.
+    pub(crate) fn new(publisher: StorePublisher) -> Result<Self> {
+        let store_device = std::fs::metadata(publisher.store().root())?.dev();
+        Ok(Self {
             publisher,
+            store_device,
             outcomes: Vec::new(),
+        })
+    }
+
+    /// Treat the store as if it lived on `device` (tests of the
+    /// cross-device flush without a second volume).
+    #[cfg(test)]
+    const fn assume_store_device(mut self, device: u64) -> Self {
+        self.store_device = device;
+        self
+    }
+}
+
+/// One descriptor per device a group touched, for its full flush.
+#[derive(Default)]
+struct TouchedDevices {
+    directories: Vec<Arc<File>>,
+    seen: std::collections::HashSet<(u64, u64)>,
+    devices: std::collections::HashMap<u64, Arc<File>>,
+}
+
+impl TouchedDevices {
+    fn directory(&mut self, directory: Arc<File>) {
+        if let Ok(metadata) = directory.metadata() {
+            self.devices
+                .entry(metadata.dev())
+                .or_insert_with(|| Arc::clone(&directory));
+            if !self.seen.insert((metadata.dev(), metadata.ino())) {
+                return;
+            }
         }
+        self.directories.push(directory);
+    }
+
+    fn file(&mut self, file: Arc<File>) {
+        if let Ok(metadata) = file.metadata() {
+            self.devices.entry(metadata.dev()).or_insert(file);
+        }
+    }
+
+    /// Seal every touched directory once, then, in group mode, fully flush
+    /// each touched device other than `store_device`: the store commit that
+    /// follows drains only its own device. Returns the devices flushed.
+    fn seal(&self, store_device: u64) -> Result<usize> {
+        for directory in &self.directories {
+            crate::io::durable::seal_dir(directory)?;
+        }
+        let mut flushed = 0;
+        if crate::io::durable::durability() == crate::io::durable::Durability::Group {
+            for (device, handle) in &self.devices {
+                if *device != store_device {
+                    full_flush_counted(handle)?;
+                    flushed += 1;
+                }
+            }
+        }
+        Ok(flushed)
     }
 }
 
@@ -374,25 +499,18 @@ impl crate::io::durable::GroupSink for PublishSink {
     fn weight(item: &Publication) -> (u64, u64) {
         match item {
             Publication::Staged { record, .. } => (1, record.size),
-            Publication::Adopted(_) => (1, 0),
+            Publication::Adopted { .. } => (1, 0),
         }
     }
 
     fn commit(&mut self, items: Vec<Publication>) {
         let mut records = Vec::with_capacity(items.len());
-        let mut directories: Vec<File> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut touched = TouchedDevices::default();
         for item in items {
             match item {
                 Publication::Staged { staged, record } => match staged.publish() {
                     Ok((identity, parent)) => {
-                        if let Ok(metadata) = parent.metadata() {
-                            if seen.insert((metadata.dev(), metadata.ino())) {
-                                directories.push(parent);
-                            }
-                        } else {
-                            directories.push(parent);
-                        }
+                        touched.directory(parent);
                         records.push(OutputRecord {
                             key: record.key,
                             rel_path: record.rel_path,
@@ -402,16 +520,22 @@ impl crate::io::durable::GroupSink for PublishSink {
                     }
                     Err(refusal) => self.outcomes.push((record.rel_path, Err(refusal))),
                 },
-                Publication::Adopted(record) => records.push(record),
+                Publication::Adopted { record, file } => {
+                    touched.file(Arc::new(file));
+                    records.push(record);
+                }
             }
         }
-        let sealed = directories.iter().try_for_each(|directory| {
-            crate::io::durable::seal_dir(directory).map_err(BulkloadRefusal::from)
-        });
-        let committed = sealed.and_then(|()| self.publisher.store().commit_outputs(&records));
+        let committed = touched
+            .seal(self.store_device)
+            .and_then(|_| self.publisher.store().commit_outputs(&records));
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        None
     }
 
     fn finish(self) -> Self::Report {
@@ -426,10 +550,11 @@ impl crate::io::durable::GroupSink for PublishSink {
 /// # Errors
 /// Refuses a size, mode or digest difference, or a change while reading.
 pub(crate) fn verify_existing(
-    mut file: File,
+    file: &File,
     row: &RowSchema,
     manifest: &Manifest,
 ) -> Result<StatIdentity> {
+    let mut file = file;
     file.rewind()?;
     let before = file.metadata()?;
     if before.len() != row.size || before.mode() & 0o7777 != row.mode & 0o7777 {
@@ -528,7 +653,8 @@ mod tests {
         let staged = target.stage(&row)?;
         (&**staged.file()).write_all(b"ours")?;
         std::fs::write(destination.join("file"), b"theirs")?;
-        let mut sink = PublishSink::new(Store::open(&base.join("state"))?.into_publisher()?);
+        let mut sink = PublishSink::new(Store::open(&base.join("state"))?.into_publisher()?)?
+            .assume_store_device(u64::MAX);
         sink.commit(vec![Publication::Staged {
             staged,
             record: PendingOutput {
@@ -551,6 +677,21 @@ mod tests {
         );
         assert_eq!(kept, b"theirs");
         assert_eq!(listed, 1, "the temporary name is removed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_fully_flushes_each_touched_device_the_store_is_not_on() -> Result<()> {
+        let directory = Arc::new(File::open(std::env::temp_dir())?);
+        let device = directory.metadata()?.dev();
+        let mut touched = TouchedDevices::default();
+        touched.directory(Arc::clone(&directory));
+        touched.directory(directory);
+        assert_eq!(touched.directories.len(), 1, "one seal per directory");
+        // Same device as the store: its commit drains the device.
+        assert_eq!(touched.seal(device)?, 0);
+        // Store elsewhere (PR #59 review): one full flush on this device.
+        assert_eq!(touched.seal(device.wrapping_add(1))?, 1);
         Ok(())
     }
 }

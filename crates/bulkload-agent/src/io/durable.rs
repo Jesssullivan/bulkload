@@ -5,16 +5,20 @@
 //! [`GROUP_IDLE`] without a new item. For each group the sink:
 //!
 //! 1. seals every file's data with [`seal_file`]: `F_BARRIERFSYNC` on Darwin,
-//!    `fdatasync` on Linux, or a full flush under [`Durability::Strict`];
+//!    `fsync` elsewhere, or a full flush under [`Durability::Strict`];
 //! 2. publishes and seals each touched directory once with [`seal_dir`];
-//! 3. commits the group's records in one `SQLite` WAL transaction. With
-//!    `synchronous=FULL` and `fullfsync=ON` that commit's `F_FULLFSYNC` is the
-//!    group's only device-cache flush.
+//! 3. fully flushes each touched device other than the store's own;
+//! 4. commits the group's records in one `SQLite` WAL transaction. With
+//!    `synchronous=FULL` and `fullfsync=ON` that commit's `F_FULLFSYNC`
+//!    drains the store's device, which is the only device-cache flush a
+//!    group needs when its files share that device.
 //!
 //! The load-bearing order is data before record: a record never commits
-//! before the bytes it describes are sealed. Dropping a [`Committer`] closes
-//! and commits whatever is pending, so an interrupted transfer keeps the work
-//! it finished.
+//! before the bytes it describes are sealed and, on another device, flushed.
+//! A sink that fails stops the committer's callers at their next
+//! [`Committer::submit`] or [`Committer::sync`]. Dropping a [`Committer`]
+//! closes and commits whatever is pending, so an interrupted transfer keeps
+//! the work it finished.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -32,7 +36,7 @@ pub const GROUP_BYTES: u64 = 256 * 1024 * 1024;
 /// Close a group after this long without a new item.
 pub const GROUP_IDLE: Duration = Duration::from_millis(20);
 /// Queued items before [`Committer::submit`] blocks the producer.
-const QUEUE_DEPTH: usize = 64;
+pub const QUEUE_DEPTH: usize = 64;
 
 /// How each file is made durable before its record commits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -168,9 +172,35 @@ pub trait GroupSink: Send + 'static {
     /// Seal, publish and commit one closed group, in that order.
     fn commit(&mut self, items: Vec<Self::Item>);
 
+    /// The failure that stops this sink, once one group has failed.
+    fn failure(&self) -> Option<BulkloadRefusal>;
+
     /// Called once after the last group has committed.
     fn finish(self) -> Self::Report;
 }
+
+/// Group-close and queue limits for one [`Committer`].
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Close a group once it holds this many files.
+    pub group_files: u64,
+    /// Close a group once it holds this many payload bytes.
+    pub group_bytes: u64,
+    /// Queued items before [`Committer::submit`] blocks the producer.
+    pub queue_depth: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            group_files: GROUP_FILES,
+            group_bytes: GROUP_BYTES,
+            queue_depth: QUEUE_DEPTH,
+        }
+    }
+}
+
+type Failure = std::sync::Arc<std::sync::Mutex<Option<BulkloadRefusal>>>;
 
 enum Message<T> {
     Item(T),
@@ -181,6 +211,7 @@ enum Message<T> {
 pub struct Committer<S: GroupSink> {
     sender: Option<SyncSender<Message<S::Item>>>,
     handle: Option<JoinHandle<S::Report>>,
+    failure: Failure,
 }
 
 impl<S: GroupSink> Committer<S> {
@@ -189,21 +220,42 @@ impl<S: GroupSink> Committer<S> {
     /// # Errors
     /// Refuses if the thread cannot be spawned.
     pub fn spawn(sink: S) -> Result<Self> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        Self::spawn_with(sink, Limits::default())
+    }
+
+    /// Start the committer thread for `sink` with explicit `limits`.
+    ///
+    /// # Errors
+    /// Refuses if the thread cannot be spawned.
+    pub fn spawn_with(sink: S, limits: Limits) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(limits.queue_depth.max(1));
+        let failure = Failure::default();
+        let shared = Failure::clone(&failure);
         let handle = std::thread::Builder::new()
             .name("bulkload-commit".to_owned())
-            .spawn(move || run(sink, &receiver))?;
+            .spawn(move || run(sink, &receiver, limits, &shared))?;
         Ok(Self {
             sender: Some(sender),
             handle: Some(handle),
+            failure,
         })
     }
 
-    /// Queue one item. Blocks while [`QUEUE_DEPTH`] items are waiting.
+    fn failed(&self) -> Result<()> {
+        self.failure
+            .lock()
+            .map_or(Err(BulkloadRefusal::Io(None)), |failure| {
+                failure.clone().map_or(Ok(()), Err)
+            })
+    }
+
+    /// Queue one item. Blocks while the queue is full.
     ///
     /// # Errors
-    /// Refuses if the committer thread has stopped.
+    /// Returns the sink's failure once a group has failed, or refuses if the
+    /// committer thread has stopped.
     pub fn submit(&self, item: S::Item) -> Result<()> {
+        self.failed()?;
         self.sender
             .as_ref()
             .ok_or(BulkloadRefusal::Io(None))?
@@ -214,15 +266,18 @@ impl<S: GroupSink> Committer<S> {
     /// Close the open group now and wait until it has committed.
     ///
     /// # Errors
-    /// Refuses if the committer thread has stopped.
+    /// Returns the sink's failure if this or an earlier group failed, or
+    /// refuses if the committer thread has stopped.
     pub fn sync(&self) -> Result<()> {
+        self.failed()?;
         let (ack, done) = std::sync::mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .ok_or(BulkloadRefusal::Io(None))?
             .send(Message::Sync(ack))
             .map_err(|_| BulkloadRefusal::Io(None))?;
-        done.recv().map_err(|_| BulkloadRefusal::Io(None))
+        done.recv().map_err(|_| BulkloadRefusal::Io(None))?;
+        self.failed()
     }
 
     /// Commit everything pending, stop the thread and return its report.
@@ -263,7 +318,7 @@ impl<T> OpenGroup<T> {
         }
     }
 
-    fn close<S: GroupSink<Item = T>>(&mut self, sink: &mut S) {
+    fn close<S: GroupSink<Item = T>>(&mut self, sink: &mut S, failure: &Failure) {
         if self.items.is_empty() {
             return;
         }
@@ -271,10 +326,20 @@ impl<T> OpenGroup<T> {
         self.files = 0;
         self.bytes = 0;
         sink.commit(std::mem::take(&mut self.items));
+        if let Some(refusal) = sink.failure() {
+            if let Ok(mut shared) = failure.lock() {
+                shared.get_or_insert(refusal);
+            }
+        }
     }
 }
 
-fn run<S: GroupSink>(mut sink: S, receiver: &Receiver<Message<S::Item>>) -> S::Report {
+fn run<S: GroupSink>(
+    mut sink: S,
+    receiver: &Receiver<Message<S::Item>>,
+    limits: Limits,
+    failure: &Failure,
+) -> S::Report {
     let mut group = OpenGroup::new();
     loop {
         let message = if group.items.is_empty() {
@@ -286,7 +351,7 @@ fn run<S: GroupSink>(mut sink: S, receiver: &Receiver<Message<S::Item>>) -> S::R
             match receiver.recv_timeout(GROUP_IDLE) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
-                    group.close(&mut sink);
+                    group.close(&mut sink, failure);
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -298,17 +363,17 @@ fn run<S: GroupSink>(mut sink: S, receiver: &Receiver<Message<S::Item>>) -> S::R
                 group.files = group.files.saturating_add(files);
                 group.bytes = group.bytes.saturating_add(bytes);
                 group.items.push(item);
-                if group.files >= GROUP_FILES || group.bytes >= GROUP_BYTES {
-                    group.close(&mut sink);
+                if group.files >= limits.group_files || group.bytes >= limits.group_bytes {
+                    group.close(&mut sink, failure);
                 }
             }
             Message::Sync(ack) => {
-                group.close(&mut sink);
+                group.close(&mut sink, failure);
                 let _ = ack.send(());
             }
         }
     }
-    group.close(&mut sink);
+    group.close(&mut sink, failure);
     sink.finish()
 }
 
@@ -331,6 +396,10 @@ mod tests {
             if let Ok(mut groups) = self.0.lock() {
                 groups.push(items);
             }
+        }
+
+        fn failure(&self) -> Option<BulkloadRefusal> {
+            None
         }
 
         fn finish(self) -> usize {

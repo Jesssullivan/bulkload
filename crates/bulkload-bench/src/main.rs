@@ -971,6 +971,7 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
 
 fn run(cli: &Cli) -> io::Result<()> {
     bulkload_agent::io::durable::set_durability(cli.durability);
+    let _ = bulkload_agent::io::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
     let mut fixture = seed_fixture(&sealed_source, &work)?;
     let rclone_identity = cli

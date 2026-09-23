@@ -13,7 +13,9 @@
 //! Flush kinds are mutually exclusive:
 //! - `flush_full`: `File::sync_all` on a regular file. On Darwin the standard
 //!   library implements it as `fcntl(F_FULLFSYNC)`.
-//! - `flush_barrier`: `fcntl(F_BARRIERFSYNC)` (Darwin only).
+//! - `flush_barrier`: a per-file seal: `fcntl(F_BARRIERFSYNC)` on Darwin,
+//!   `fsync` elsewhere (group commit), or `sync_data` from [`sync_barrier`]
+//!   off Darwin.
 //! - `flush_fdatasync`: `File::sync_data` on a regular file. On Darwin the
 //!   standard library implements it as `fcntl(F_FULLFSYNC)` too.
 //! - `flush_dir`: a full sync of a directory descriptor (`sync_all`, which is

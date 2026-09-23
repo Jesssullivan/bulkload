@@ -990,9 +990,11 @@ impl StorePublisher {
 /// chunk locations and the captures that reference them.
 pub(crate) struct PackSink {
     publisher: StorePublisher,
-    /// Appended but unindexed chunks, by digest, with the capture that
-    /// appended them. A location is indexed only with a completed capture.
-    pending: HashMap<[u8; 32], (usize, Location)>,
+    /// Appended but unindexed chunks, by digest, with every unfinished
+    /// capture that holds them: the one that appended the bytes and any whose
+    /// copy was deduplicated against it. A location is indexed only with a
+    /// completed capture, and forgotten only once no capture holds it.
+    pending: HashMap<[u8; 32], (Location, HashSet<usize>)>,
     failed: Option<BulkloadRefusal>,
 }
 
@@ -1018,8 +1020,11 @@ impl PackSink {
             match item {
                 PackItem::Chunks { capture_id, chunks } => {
                     for (digest, data) in chunks {
-                        if let Some(location) = self.publisher.append(&digest, &data)? {
-                            self.pending.insert(digest, (capture_id, location));
+                        if let Some((_, holders)) = self.pending.get_mut(&digest) {
+                            holders.insert(capture_id);
+                        } else if let Some(location) = self.publisher.append(&digest, &data)? {
+                            self.pending
+                                .insert(digest, (location, HashSet::from([capture_id])));
                         }
                     }
                 }
@@ -1027,20 +1032,20 @@ impl PackSink {
                     // Index every chunk this capture names that is still
                     // pending, whichever capture appended it first.
                     for chunk in &manifest.chunks {
-                        if let Some((_, location)) = self.pending.remove(&chunk.digest) {
+                        if let Some((location, _)) = self.pending.remove(&chunk.digest) {
                             locations.push(location);
                         }
                     }
                     captures.push((key, manifest));
                 }
                 PackItem::Refused { capture_id } => {
-                    let dropped: Vec<_> = self
-                        .pending
-                        .iter()
-                        .filter(|(_, (owner, _))| *owner == capture_id)
-                        .map(|(digest, _)| *digest)
-                        .collect();
-                    for digest in dropped {
+                    let mut orphaned = Vec::new();
+                    for (digest, (_, holders)) in &mut self.pending {
+                        if holders.remove(&capture_id) && holders.is_empty() {
+                            orphaned.push(*digest);
+                        }
+                    }
+                    for digest in orphaned {
                         self.pending.remove(&digest);
                         self.publisher.forget(&digest);
                     }
@@ -1090,6 +1095,10 @@ impl crate::io::durable::GroupSink for PackSink {
                 self.failed = Some(refusal);
             }
         }
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        self.failed.clone()
     }
 
     fn finish(self) -> Result<()> {
@@ -1406,6 +1415,114 @@ mod tests {
         sink.publish(retry)?;
         drop(sink);
         assert!(Store::open(&state)?.chunk(&digest)?.is_some());
+        Ok(())
+    }
+
+    fn single(data: &Arc<Vec<u8>>) -> ([u8; 32], Manifest) {
+        let digest = crate::hash::hash_bytes(data);
+        (
+            digest,
+            Manifest {
+                digest,
+                chunks: vec![ChunkSpec {
+                    digest,
+                    size: data.len() as u64,
+                }],
+            },
+        )
+    }
+
+    /// PR #59 review: two concurrent captures share a chunk; the first
+    /// appender is refused, the second completes. The survivor must commit
+    /// with its chunk indexed.
+    #[test]
+    fn a_refused_first_appender_does_not_strand_a_sharing_capture() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let data = Arc::new(b"chunk shared by two concurrent captures".to_vec());
+        let (digest, manifest) = single(&data);
+        let mut sink = pack_sink(&state)?;
+        sink.publish(vec![
+            PackItem::Chunks {
+                capture_id: 1,
+                chunks: vec![(digest, Arc::clone(&data))],
+            },
+            PackItem::Chunks {
+                capture_id: 2,
+                chunks: vec![(digest, Arc::clone(&data))],
+            },
+            PackItem::Refused { capture_id: 1 },
+            PackItem::Capture {
+                key: b"two".to_vec(),
+                manifest,
+            },
+        ])?;
+        drop(sink);
+        let store = Store::open(&state)?;
+        assert!(store.capture(b"two")?.is_some());
+        assert!(store.chunk(&digest)?.is_some());
+        Ok(())
+    }
+
+    /// PR #59 review: the same race through the committer must not poison
+    /// the sink for later, unrelated groups.
+    #[test]
+    fn a_shared_chunk_race_leaves_later_groups_committing() -> Result<()> {
+        use crate::io::durable::Committer;
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let shared = Arc::new(b"shared".to_vec());
+        let (shared_digest, shared_manifest) = single(&shared);
+        let later = Arc::new(b"a later, unrelated file".to_vec());
+        let (later_digest, later_manifest) = single(&later);
+        let committer = Committer::spawn(pack_sink(&state)?)?;
+        for capture_id in [1, 2] {
+            committer.submit(PackItem::Chunks {
+                capture_id,
+                chunks: vec![(shared_digest, Arc::clone(&shared))],
+            })?;
+        }
+        committer.submit(PackItem::Refused { capture_id: 1 })?;
+        committer.submit(PackItem::Capture {
+            key: b"two".to_vec(),
+            manifest: shared_manifest,
+        })?;
+        committer.sync()?;
+        committer.submit(PackItem::Chunks {
+            capture_id: 3,
+            chunks: vec![(later_digest, Arc::clone(&later))],
+        })?;
+        committer.submit(PackItem::Capture {
+            key: b"later".to_vec(),
+            manifest: later_manifest,
+        })?;
+        committer.sync()?;
+        assert!(Store::open(&state)?.capture(b"later")?.is_some());
+        committer.finish()?
+    }
+
+    /// A failed group stops the committer's callers at once: `sync` and
+    /// every later `submit` return the sink's failure.
+    #[test]
+    fn a_failed_group_is_returned_by_sync_and_submit() -> Result<()> {
+        use crate::io::durable::Committer;
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let (_, orphan) = single(&Arc::new(b"never appended".to_vec()));
+        let committer = Committer::spawn(pack_sink(&state)?)?;
+        committer.submit(PackItem::Capture {
+            key: b"orphan".to_vec(),
+            manifest: orphan,
+        })?;
+        assert_eq!(committer.sync(), Err(BulkloadRefusal::SealedObjectMissing));
+        assert_eq!(
+            committer.submit(PackItem::Refused { capture_id: 0 }),
+            Err(BulkloadRefusal::SealedObjectMissing)
+        );
+        assert_eq!(
+            committer.finish()?,
+            Err(BulkloadRefusal::SealedObjectMissing)
+        );
         Ok(())
     }
 

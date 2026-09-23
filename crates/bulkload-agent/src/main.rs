@@ -98,6 +98,8 @@ COUNTERS:
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
+    // macOS starts at 256 open files; take the hard limit the host allows.
+    let _ = bulkload_agent::io::limits::raise_descriptor_limit();
     let mut args = match durability_flag(std::env::args_os().skip(1).collect()) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {

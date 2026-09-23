@@ -5,6 +5,7 @@
 //! comment. [`durable`] builds group commit on top of them.
 
 pub mod durable;
+pub mod limits;
 
 #[cfg(target_vendor = "apple")]
 #[path = "sys_darwin.rs"]
