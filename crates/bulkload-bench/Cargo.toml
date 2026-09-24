@@ -16,6 +16,7 @@ bulkload-agent = { path = "../bulkload-agent" }
 bulkload-proto = { path = "../bulkload-proto" }
 blake3.workspace = true
 clap = { workspace = true }
+fastcdc.workspace = true
 libc.workspace = true
 postcard.workspace = true
 
