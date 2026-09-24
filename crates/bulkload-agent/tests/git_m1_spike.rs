@@ -8,7 +8,8 @@
 //!
 //! Questions (numbers in docs/evidence/w6-m1-spike-2026-09-23.md):
 //! 1. `rev-list --objects-edge | pack-objects --stdout` (list mode, `-<oid>`
-//!    edge lines) against #55's revs-mode `missing_thin_pack_bytes`.
+//!    edge lines) against upload-pack given exactly the held tips as haves,
+//!    ancestors first (R-N113, R-N116), and #55's `missing_thin_pack_bytes`.
 //! 2. Self-contained thin segments, their byte cost and the resume claim.
 //! 3. receive-pack's tmp-objdir quarantine, the refs-only connectivity check,
 //!    `.idx`-last migration and one `update-ref --stdin -z` transaction.
@@ -20,9 +21,10 @@
 //! `cargo test -p bulkload-agent --test git_m1_spike -- --nocapture` to see
 //! them.
 //!
-//! #55's hardened invocation (`git_carry/estimate.rs::hardened` and
-//! `thin_pack`) is reproduced here from a read of its branch, not
-//! cherry-picked, so this file depends on nothing unmerged.
+//! #55's hardened invocation, pack pins, estimate (`thin_pack`) and
+//! upload-pack oracle (`upload_pack_oracle`, `ancestors_first`) at bb6efa7
+//! are reproduced here from a read of its branch, not cherry-picked, so this
+//! file depends on nothing unmerged.
 
 #![allow(
     clippy::unwrap_used,
@@ -75,13 +77,14 @@ enum Objects<'a> {
 ///
 /// It is `git()` from `git_carry.rs` plus #55's `hardened()` additions
 /// (`maintenance.auto=false`, `GIT_NO_LAZY_FETCH=1`, `GIT_OPTIONAL_LOCKS=0`)
-/// and #55's `pack.useSparse=false` and `pack.useBitmaps=false` (re-review). The difference from `git()` is the
+/// and #55's pack pins (below). The difference from `git()` is the
 /// explicit [`Objects`] scope: the three quarantine variables are stripped
 /// like every other redirecting variable and then set only from the typed
 /// scope, never inherited.
 ///
-/// `pack.threads=1` (not `git()`'s 2) so pack bytes are a function of the
-/// object list alone; Q1 measures 2 as well.
+/// The pack pins are #55's at bb6efa7, canonical for M1: `pack.useSparse`
+/// and `pack.useBitmaps` off, `pack.threads=2`, `pack.windowMemory=64m`. The
+/// sender, the estimate and the upload-pack oracle all run under them.
 fn git_in(repo: &Path, objects: Objects<'_>) -> Command {
     let mut command = Command::new("git");
     for key in STRIPPED {
@@ -99,7 +102,7 @@ fn git_in(repo: &Path, objects: Objects<'_>) -> Command {
             "-c",
             "maintenance.auto=false",
             "-c",
-            "pack.threads=1",
+            "pack.threads=2",
             "-c",
             "pack.windowMemory=64m",
             "-c",
@@ -303,8 +306,14 @@ fn push(source: &Path, destination: &Path, oid: &str, reference: &str) {
     run(command, "push");
 }
 
-fn objects_dir(bare: &Path) -> PathBuf {
-    bare.join("objects")
+/// `repo`'s object directory, bare or not.
+fn objects_dir(repo: &Path) -> PathBuf {
+    let dotgit = repo.join(".git");
+    if dotgit.is_dir() {
+        dotgit.join("objects")
+    } else {
+        repo.join("objects")
+    }
 }
 
 fn loose_path(bare: &Path, oid: &str) -> PathBuf {
@@ -376,36 +385,53 @@ fn missing(source: &Path, request: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The destination shape that selects the edge rule (R-N97). upload-pack
-/// passes `--shallow` to pack-objects for a shallow client, and `--shallow`
-/// selects `--objects-edge-aggressive`; a full client gets `--objects-edge`.
+/// The destination shape that selects the edge rule. upload-pack passes
+/// `--shallow` to pack-objects for a shallow client, and `--shallow` selects
+/// `--objects-edge-aggressive`; a full client gets `--objects-edge`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
     Full,
     Shallow,
 }
 
-/// #55's `missing_thin_pack_bytes`, reproduced from its `thin_pack()`: revs
-/// mode, `--thin`, `--missing=allow-any`, `pack.useSparse=false`, plus the
-/// re-review pins (`pack.useBitmaps=false` from [`git_in`], and `--shallow`
-/// for a shallow destination).
-fn oracle_pack(source: &Path, request: &str, threads: u8, shape: Shape) -> Vec<u8> {
+impl Shape {
+    const fn of(shallow: &[String]) -> Self {
+        if shallow.is_empty() {
+            Self::Full
+        } else {
+            Self::Shallow
+        }
+    }
+}
+
+/// #55's `missing_thin_pack_bytes` at bb6efa7 (`thin_pack()`): revs mode,
+/// `--thin`, `--missing=allow-any`, with [`git_in`]'s pins (`useSparse` and
+/// `useBitmaps` off, `pack.threads=2`, `pack.windowMemory=64m`). For a shallow
+/// destination it runs as upload-pack does: `--shallow-file ''`, one
+/// `--shallow <oid>` line per frontier commit, and `--shallow`.
+fn estimate_pack(source: &Path, request: &str, shallow: &[String]) -> Vec<u8> {
     let mut command = git(source);
-    command
-        .args(["-c", &format!("pack.threads={threads}")])
-        .args([
-            "pack-objects",
-            "--stdout",
-            "--thin",
-            "--revs",
-            "--delta-base-offset",
-            "--missing=allow-any",
-            "-q",
-        ]);
-    if shape == Shape::Shallow {
+    let mut input = String::new();
+    if !shallow.is_empty() {
+        command.args(["--shallow-file", ""]);
+        for oid in shallow {
+            let _ = writeln!(input, "--shallow {oid}");
+        }
+    }
+    input.push_str(request);
+    command.args([
+        "pack-objects",
+        "--stdout",
+        "--thin",
+        "--revs",
+        "--delta-base-offset",
+        "--missing=allow-any",
+        "-q",
+    ]);
+    if !shallow.is_empty() {
         command.arg("--shallow");
     }
-    ok(feed(command, request.as_bytes()), "pack-objects --revs")
+    ok(feed(command, input.as_bytes()), "pack-objects --revs")
 }
 
 /// The plan's object list: `rev-list --objects-edge[-aggressive]
@@ -437,6 +463,8 @@ fn edge_list(source: &Path, request: &str, shape: Shape) -> EdgeList {
     };
     let mut command = git(source);
     command.args(["rev-list", edge, "--missing=allow-any", "--stdin"]);
+    // Lossy on purpose: the spike's fixture paths are ASCII. A product list
+    // must treat these lines as bytes (non-UTF-8 paths are legal in Git).
     let out = String::from_utf8(ok(feed(command, request.as_bytes()), "rev-list edge")).unwrap();
     let (edges, objects) = out
         .lines()
@@ -445,52 +473,20 @@ fn edge_list(source: &Path, request: &str, shape: Shape) -> EdgeList {
     EdgeList { edges, objects }
 }
 
-/// Exact reachability, `wants` minus everything the haves reach:
-/// `rev-list --objects --use-bitmap-index`. With a bitmap this is what
-/// upload-pack sends; without one it is the ordinary walk.
-fn exact(source: &Path, request: &str) -> BTreeSet<String> {
-    let mut command = git(source);
-    command.args([
-        "rev-list",
-        "--objects",
-        "--no-object-names",
-        "--use-bitmap-index",
-        "--stdin",
-    ]);
-    let out = ok(feed(command, request.as_bytes()), "rev-list exact");
-    String::from_utf8(out)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The sender's list: the edge list restricted to the exact set. Returns the
-/// list and how many walk objects the exact set dropped.
-fn plan(source: &Path, request: &str, shape: Shape) -> (EdgeList, usize) {
-    let mut list = edge_list(source, request, shape);
-    let keep = exact(source, request);
-    let before = list.objects.len();
-    list.objects.retain(|l| keep.contains(oid_of(l)));
-    let dropped = before - list.objects.len();
-    (list, dropped)
-}
-
 /// List mode. `--thin` is NOT passed: in pack-objects `--thin` switches on the
 /// internal rev-list, which would read these lines as revisions (`fatal: not a
-/// rev '-<oid>'`). Thinness comes from the `-<oid>` lines, which pack-objects
-/// turns into preferred bases.
-fn list_pack(source: &Path, lines: &[String], threads: u8) -> Vec<u8> {
+/// rev '-<oid>'`, asserted in `q1_list_mode_rejects_thin`). Thinness comes
+/// from the `-<oid>` lines, which pack-objects turns into preferred bases.
+/// The sender sends the whole walk: no bitmap trim (R-N113, #55 pins).
+fn list_pack(source: &Path, lines: &[String]) -> Vec<u8> {
     let mut command = git(source);
-    command
-        .args(["-c", &format!("pack.threads={threads}")])
-        .args([
-            "pack-objects",
-            "--stdout",
-            "--delta-base-offset",
-            "--missing=allow-any",
-            "-q",
-        ]);
+    command.args([
+        "pack-objects",
+        "--stdout",
+        "--delta-base-offset",
+        "--missing=allow-any",
+        "-q",
+    ]);
     let mut input = String::new();
     for line in lines {
         input.push_str(line);
@@ -499,88 +495,145 @@ fn list_pack(source: &Path, lines: &[String], threads: u8) -> Vec<u8> {
     ok(feed(command, input.as_bytes()), "pack-objects list")
 }
 
-/// A plain Git for the real-fetch oracle: the redirecting environment,
-/// hooks, global config and auto-maintenance are fenced off, but no `pack.*`
-/// pin is set, so upload-pack packs with Git's defaults.
-fn vanilla(repo: &Path) -> Command {
-    let mut command = Command::new("git");
-    for key in STRIPPED {
-        command.env_remove(key);
-    }
-    command
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "maintenance.auto=false",
-            "-c",
-            "fetch.writeCommitGraph=false",
-            "-C",
-        ])
-        .arg(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    command
+fn pkt_line(out: &mut Vec<u8>, line: &str) {
+    out.extend_from_slice(format!("{:04x}", line.len() + 4).as_bytes());
+    out.extend_from_slice(line.as_bytes());
 }
 
-/// What a real `git fetch` sends for `wants` to a copy of `destination`
-/// (whose refs are the haves): the received pack, captured verbatim with
-/// `GIT_TRACE_PACKFILE`. Empty when the fetch receives no pack.
-fn fetched_pack(scratch: &Scratch, source: &Path, destination: &Path, wants: &[String]) -> Vec<u8> {
-    let copy = scratch.path("fetch-copy.git");
-    copy_dir(destination, &copy);
-    let mut refs = String::new();
-    for (i, want) in wants.iter().enumerate() {
-        let _ = writeln!(refs, "create refs/m1-want/{i} {want}");
+/// R-N113's exactness oracle, as #55 bb6efa7's `upload_pack_oracle`:
+/// `upload-pack --stateless-rpc` (protocol v2) given exactly `haves`, in that
+/// order, plus the destination's `shallow` lines, under [`git_in`]'s pins.
+/// Returns the pack it streams on sideband 1 (empty when it sends none).
+fn upload_pack(source: &Path, wants: &[String], haves: &[String], shallow: &[String]) -> Vec<u8> {
+    let mut request = Vec::new();
+    pkt_line(&mut request, "command=fetch\n");
+    request.extend_from_slice(b"0001");
+    for line in ["thin-pack\n", "ofs-delta\n", "no-progress\n"] {
+        pkt_line(&mut request, line);
     }
-    ok(
-        feed(args(source, ["update-ref", "--stdin"]), refs.as_bytes()),
-        "want refs",
-    );
-    let trace = scratch.path("fetch.pack");
-    let mut command = vanilla(&copy);
+    for oid in shallow {
+        pkt_line(&mut request, &format!("shallow {oid}\n"));
+    }
+    for oid in wants {
+        pkt_line(&mut request, &format!("want {oid}\n"));
+    }
+    for oid in haves {
+        pkt_line(&mut request, &format!("have {oid}\n"));
+    }
+    pkt_line(&mut request, "done\n");
+    request.extend_from_slice(b"0000");
+    let mut command = git(source);
     command
-        .args(["fetch", "-q", "--no-tags"])
-        .arg(format!("file://{}", source.display()))
-        .arg("refs/m1-want/*:refs/m1-fetched/*")
-        .env("GIT_TRACE_PACKFILE", &trace);
-    run(command, "real fetch");
-    let mut drop = String::new();
-    for i in 0..wants.len() {
-        let _ = writeln!(drop, "delete refs/m1-want/{i}");
+        .args(["upload-pack", "--stateless-rpc", "."])
+        .env("GIT_PROTOCOL", "version=2");
+    let answer = ok(feed(command, &request), "upload-pack");
+    let mut rest = &answer[..];
+    let mut in_pack = false;
+    let mut pack = Vec::new();
+    while rest.len() >= 4 {
+        let length = usize::from_str_radix(std::str::from_utf8(&rest[..4]).unwrap(), 16).unwrap();
+        if length < 4 {
+            rest = &rest[4..];
+            if length == 0 && in_pack {
+                break;
+            }
+            continue;
+        }
+        let payload = &rest[4..length];
+        rest = &rest[length..];
+        if in_pack {
+            assert_ne!(
+                payload[0],
+                3,
+                "upload-pack error: {}",
+                String::from_utf8_lossy(&payload[1..])
+            );
+            if payload[0] == 1 {
+                pack.extend_from_slice(&payload[1..]);
+            }
+        } else if payload == b"packfile\n" {
+            in_pack = true;
+        }
     }
-    ok(
-        feed(args(source, ["update-ref", "--stdin"]), drop.as_bytes()),
-        "drop want refs",
-    );
-    let pack = fs::read(&trace).unwrap_or_default();
-    let _ = fs::remove_file(&trace);
-    let _ = fs::remove_dir_all(&copy);
     pack
 }
 
-fn copy_dir(from: &Path, to: &Path) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
+/// Every ref tip and `HEAD` of `repo`.
+fn tips_of(repo: &Path) -> BTreeSet<String> {
+    let mut tips: BTreeSet<String> = text(
+        args(repo, ["for-each-ref", "--format=%(objectname)"]),
+        "for-each-ref",
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    let head = args(repo, ["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .unwrap();
+    if head.status.success() {
+        tips.insert(String::from_utf8_lossy(&head.stdout).trim().to_owned());
     }
+    tips
+}
+
+/// R-N113: the held tips, every destination tip the source holds.
+fn held_tips(source: &Path, destination: &Path) -> Vec<String> {
+    tips_of(destination)
+        .into_iter()
+        .filter(|tip| has_object(source, tip))
+        .collect()
+}
+
+/// R-N116: `held` ordered ancestors first (topological order over the peeled
+/// commits), so upload-pack keeps every have. Child first, it drops a parent
+/// have it has already seen implied (fixture P1).
+fn ancestors_first(source: &Path, held: &[String]) -> Vec<String> {
+    let mut peeled: Vec<(String, String)> = held
+        .iter()
+        .map(|tip| {
+            let commit = text(
+                args(
+                    source,
+                    ["rev-parse", "--verify", "-q", &format!("{tip}^{{commit}}")],
+                ),
+                "peel",
+            );
+            (tip.clone(), commit)
+        })
+        .collect();
+    if peeled.is_empty() {
+        return Vec::new();
+    }
+    let mut command = git(source);
+    command.args(["rev-list", "--topo-order", "--reverse"]);
+    for (_, commit) in &peeled {
+        command.arg(commit);
+    }
+    let order: Vec<String> = text(command, "topo order")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    peeled.sort_by_key(|(_, commit)| order.iter().position(|value| value == commit));
+    peeled.into_iter().map(|(tip, _)| tip).collect()
+}
+
+/// The shallow frontier of `repo` (bare or not), sorted.
+fn shallow_of(repo: &Path) -> Vec<String> {
+    let mut frontier: Vec<String> = fs::read_to_string(repo.join(".git/shallow"))
+        .or_else(|_| fs::read_to_string(repo.join("shallow")))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    frontier.sort();
+    frontier
 }
 
 /// The oids a thin pack carries: index it with `--fix-thin` into a throwaway
 /// quarantine on `destination` and keep the objects whose offset lies inside
 /// the received bytes (`--fix-thin` appends its bases after them).
 fn carried(destination: &Path, pack: &[u8]) -> BTreeSet<String> {
-    if pack.is_empty() || header_count(pack) == 0 {
+    if pack_count(pack) == 0 {
         return BTreeSet::new();
     }
     let quarantine = Quarantine::open(destination);
@@ -609,6 +662,15 @@ fn header_count(pack: &[u8]) -> u32 {
     u32::from_be_bytes(pack[8..12].try_into().unwrap())
 }
 
+/// Object count; an empty stream (no pack sent) counts 0.
+fn pack_count(pack: &[u8]) -> u32 {
+    if pack.is_empty() {
+        0
+    } else {
+        header_count(pack)
+    }
+}
+
 /// Object count of a v2 `.idx` (fanout[255]).
 fn idx_count(idx: &Path) -> u32 {
     let bytes = fs::read(idx).unwrap();
@@ -622,6 +684,7 @@ fn idx_count(idx: &Path) -> u32 {
 /// Why an ingest stopped. Nothing is published in any of these cases.
 #[derive(Debug)]
 enum Refused {
+    Preflight(String),
     Segment(usize, String),
     Connectivity(String),
     Refs(String),
@@ -631,6 +694,7 @@ impl Refused {
     /// The stage that refused and Git's own words.
     fn describe(&self) -> String {
         match self {
+            Self::Preflight(detail) => format!("preflight: {detail}"),
             Self::Segment(index, detail) => format!("segment[{index}]: {detail}"),
             Self::Connectivity(detail) => format!("connectivity: {detail}"),
             Self::Refs(detail) => format!("refs: {detail}"),
@@ -790,9 +854,58 @@ fn drop_keeps(repo: &Path, hashes: &[String]) {
     }
 }
 
-/// The whole destination sequence: every segment into one quarantine, the
-/// connectivity check, migration, one ref transaction, then the `.keep`s go.
+/// R-N75 held-tip closure preflight, mandatory before any segment is indexed:
+/// `rev-list --objects --missing=print` over the held tips under
+/// `GIT_NO_LAZY_FETCH` (from [`git_in`]). Fails closed: any `?` line, a
+/// non-zero exit, or unreadable output refuses. The connectivity check alone
+/// trusts existing refs and would publish a ref whose closure is broken
+/// (`q3_held_tip_closure_preflight_is_mandatory`).
+fn preflight(repo: &Path, held: &[String]) -> Result<(), String> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    let mut command = git(repo);
+    command.args([
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--missing=print",
+        "--stdin",
+    ]);
+    let mut input = held.join("\n");
+    input.push('\n');
+    let output = feed(command, input.as_bytes());
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let Ok(listing) = String::from_utf8(output.stdout) else {
+        return Err("unreadable rev-list output".to_owned());
+    };
+    let absent: Vec<&str> = listing.lines().filter(|l| l.starts_with('?')).collect();
+    if absent.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("held-tip closure incomplete: {absent:?}"))
+    }
+}
+
+/// The whole destination sequence: the R-N75 preflight over the held tips,
+/// then [`land`].
 fn ingest(
+    repo: &Path,
+    held: &[String],
+    segments: &[Vec<u8>],
+    tips: &[String],
+    updates: &[Update],
+) -> Result<Vec<String>, Refused> {
+    preflight(repo, held).map_err(Refused::Preflight)?;
+    land(repo, segments, tips, updates)
+}
+
+/// Every segment into one quarantine, the connectivity check, migration, one
+/// ref transaction, then the `.keep`s go. No preflight: callers other than
+/// [`ingest`] exist only to show what the preflight prevents.
+fn land(
     repo: &Path,
     segments: &[Vec<u8>],
     tips: &[String],
@@ -822,85 +935,74 @@ fn ingest(
 }
 
 // ---------------------------------------------------------------------------
-// Q1: pack-objects list mode with edges, judged against a real fetch (R-N97)
+// Q1: list mode with edges, judged against upload-pack (R-N113, R-N116)
 // ---------------------------------------------------------------------------
 
 struct Case<'a> {
     name: &'a str,
-    scratch: &'a Scratch,
     source: &'a Path,
     destination: &'a Path,
     wants: &'a [String],
-    haves: &'a [String],
-    shape: Shape,
 }
 
-/// One Q1 case. Gate (R-N74 as amended by R-N97): the sent object set equals
-/// what a real `git fetch` with the same haves sends; sent objects <= the
-/// estimate's; sent bytes <= 1.1x `missing_thin_pack_bytes`. Then the pack is
-/// ingested through the quarantine.
-fn q1_case(case: &Case<'_>) {
+/// What one Q1 case measured.
+struct Measured {
+    sent: usize,
+    oracle_child_first: usize,
+}
+
+/// One Q1 case. M1's first round (R-N113) offers exactly the held tips as
+/// haves, ancestors first (R-N116), plus the destination's shallow lines.
+/// Gate: the list-mode pack carries exactly the set upload-pack sends for
+/// that request; sent objects <= the estimate's; sent bytes <= 1.1x
+/// `missing_thin_pack_bytes`. The pack is then ingested with the preflight.
+fn q1_case(case: &Case<'_>) -> Measured {
     let name = case.name;
-    let request = request(case.wants, case.haves);
-    let walk = missing(case.source, &request);
-    assert!(
-        walk.iter().all(|l| !l.starts_with('?')),
-        "{name}: complete source"
-    );
-
-    let estimate = oracle_pack(case.source, &request, 1, case.shape);
-    let estimate2 = oracle_pack(case.source, &request, 2, case.shape);
-    let (list, dropped) = plan(case.source, &request, case.shape);
-    let listed = list_pack(case.source, &list.lines(), 1);
-    let listed2 = list_pack(case.source, &list.lines(), 2);
-    let fetched = fetched_pack(case.scratch, case.source, case.destination, case.wants);
-
-    let sent = carried(case.destination, &listed);
-    let by_fetch = carried(case.destination, &fetched);
-    assert_eq!(
-        sent,
-        list.oids(),
-        "{name}: the pack carries exactly the list"
-    );
-    assert_eq!(sent, by_fetch, "{name}: R-N97 sent set == real fetch set");
-    assert_eq!(carried(case.destination, &listed2), sent, "{name}: t2 set");
-    let count = header_count(&listed);
-    assert!(
-        count <= header_count(&estimate),
-        "{name}: R-N97 count bound"
-    );
-    assert!(
-        listed.len() * 10 <= estimate.len() * 11,
-        "{name}: byte gate"
-    );
-    assert!(
-        listed2.len() * 10 <= estimate2.len() * 11,
-        "{name}: byte gate t2"
-    );
-    if count == header_count(&estimate) {
-        assert_eq!(listed, estimate, "{name}: same set gives the same bytes");
+    let held = held_tips(case.source, case.destination);
+    let haves = ancestors_first(case.source, &held);
+    let child_first: Vec<String> = haves.iter().rev().cloned().collect();
+    let shallow = shallow_of(case.destination);
+    let shape = Shape::of(&shallow);
+    if shape == Shape::Shallow {
+        assert_eq!(shallow_of(case.source), shallow, "{name}: R-N75 frontier");
     }
-    let fetch_count = if fetched.is_empty() {
-        0
-    } else {
-        header_count(&fetched)
-    };
+    let request = request(case.wants, &haves);
+    let walk = missing(case.source, &request);
+    assert!(walk.iter().all(|l| !l.starts_with('?')), "{name}: complete");
+
+    let estimate = estimate_pack(case.source, &request, &shallow);
+    let list = edge_list(case.source, &request, shape);
+    let sent = list_pack(case.source, &list.lines());
+    let oracle = upload_pack(case.source, case.wants, &haves, &shallow);
+    let reversed = upload_pack(case.source, case.wants, &child_first, &shallow);
+
+    let sent_set = carried(case.destination, &sent);
+    let oracle_set = carried(case.destination, &oracle);
+    assert_eq!(sent_set, list.oids(), "{name}: the pack carries the list");
+    assert_eq!(
+        sent_set, oracle_set,
+        "{name}: R-N113 sent set == upload-pack"
+    );
+    let count = pack_count(&sent);
+    assert!(count <= pack_count(&estimate), "{name}: object bound");
+    assert!(sent.len() * 10 <= estimate.len() * 11, "{name}: byte gate");
     println!(
-        "m1 q1 case={name} shape={:?} walk_objects={} estimate_objects={} estimate_bytes={} \
-         sent_objects={count} sent_bytes={} fetch_objects={fetch_count} fetch_bytes={} \
-         sent_set_eq_fetch=true exact_dropped={dropped} edges={} byte_equal_estimate={} \
-         estimate_bytes_t2={} sent_bytes_t2={} byte_equal_estimate_t2={}",
-        case.shape,
+        "m1 q1 case={name} shape={shape:?} held={} wants={} walk_objects={} \
+         estimate_objects={} estimate_bytes={} sent_objects={count} sent_bytes={} \
+         oracle_objects={} oracle_bytes={} sent_set_eq_oracle=true sent_bytes_eq_oracle={} \
+         child_first_objects={} child_first_bytes={} edges={}",
+        haves.len(),
+        case.wants.len(),
         walk.len(),
-        header_count(&estimate),
+        pack_count(&estimate),
         estimate.len(),
-        listed.len(),
-        fetched.len(),
+        sent.len(),
+        pack_count(&oracle),
+        oracle.len(),
+        sent == oracle,
+        pack_count(&reversed),
+        reversed.len(),
         list.edges.len(),
-        listed == estimate,
-        estimate2.len(),
-        listed2.len(),
-        listed2 == estimate2,
     );
 
     let before = packs(case.destination).len();
@@ -910,7 +1012,7 @@ fn q1_case(case: &Case<'_>) {
         .enumerate()
         .map(|(i, oid)| Update::Create(format!("refs/carry/v1/spike/{name}/{i}"), oid.clone()))
         .collect();
-    let hashes = ingest(case.destination, &[listed], case.wants, &updates)
+    let hashes = ingest(case.destination, &held, &[sent], case.wants, &updates)
         .unwrap_or_else(|e| panic!("{name}: ingest refused: {}", e.describe()));
     let idx = objects_dir(case.destination)
         .join("pack")
@@ -923,7 +1025,13 @@ fn q1_case(case: &Case<'_>) {
         String::from_utf8_lossy(&fsck.stderr)
     );
     assert_eq!(packs(case.destination).len(), before + 1);
-    println!("m1 q1 case={name} ingest=ok fix_thin_appended_bases={appended} fsck=clean");
+    println!(
+        "m1 q1 case={name} ingest=ok preflight=ok fix_thin_appended_bases={appended} fsck=clean"
+    );
+    Measured {
+        sent: sent_set.len(),
+        oracle_child_first: carried(case.destination, &reversed).len(),
+    }
 }
 
 fn delta_history(repo: &Path, seed: u64, files: usize, rounds: usize) -> Vec<String> {
@@ -978,6 +1086,30 @@ fn clone(scratch: &Scratch, origin: &Path, name: &str, depth: Option<u32>, bare:
     scratch.path(name)
 }
 
+/// A commit with a distinct date, `n` minutes after a fixed epoch.
+fn dated(repo: &Path, file: &str, content: &str, n: u64) -> String {
+    write(repo, file, content.as_bytes());
+    run(args(repo, ["add", "-A"]), "add");
+    let date = format!("{} +0000", 1_790_000_000 + n * 60);
+    let mut command = git(repo);
+    command
+        .args(["commit", "-q", "--allow-empty", "-m", file])
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date);
+    run(command, "commit");
+    rev(repo, "HEAD")
+}
+
+fn noise(seed: u64, count: usize) -> String {
+    lines(&mut Rng(seed.wrapping_mul(2_654_435_761) + 1), count).concat()
+}
+
+/// Source tips the destination does not hold: the R-N113 wants.
+fn unheld(source: &Path, destination: &Path) -> Vec<String> {
+    let held: BTreeSet<String> = held_tips(source, destination).into_iter().collect();
+    tips_of(source).difference(&held).cloned().collect()
+}
+
 #[test]
 fn q1_delta_heavy() {
     let scratch = Scratch::new("q1-delta");
@@ -986,12 +1118,9 @@ fn q1_delta_heavy() {
     let destination = destination_at(&scratch, &source, &commits[4]);
     q1_case(&Case {
         name: "delta-heavy",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: std::slice::from_ref(&commits[12]),
-        haves: std::slice::from_ref(&commits[4]),
-        shape: Shape::Full,
     });
 }
 
@@ -1022,12 +1151,9 @@ fn q1_rename_heavy() {
     let destination = destination_at(&scratch, &source, &base);
     q1_case(&Case {
         name: "rename-heavy",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &[tip],
-        haves: &[base],
-        shape: Shape::Full,
     });
 }
 
@@ -1055,12 +1181,9 @@ fn q1_tag_only() {
     ];
     q1_case(&Case {
         name: "tag-only",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &wants,
-        haves: &[tip],
-        shape: Shape::Full,
     });
 }
 
@@ -1092,12 +1215,9 @@ fn q1_submodule_gitlink() {
     let destination = destination_at(&scratch, &source, &base);
     q1_case(&Case {
         name: "submodule-gitlink",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &[tip],
-        haves: &[base],
-        shape: Shape::Full,
     });
 }
 
@@ -1110,7 +1230,6 @@ fn q1_matching_shallow_frontier() {
     let destination = clone(&scratch, &origin, "destination.git", Some(3), true);
     let frontier = fs::read(source.join(".git/shallow")).unwrap();
     assert_eq!(frontier, fs::read(destination.join("shallow")).unwrap());
-    let have = rev(&destination, "refs/heads/main");
     let mut rng = Rng(17);
     for i in 0..3 {
         write(
@@ -1123,12 +1242,9 @@ fn q1_matching_shallow_frontier() {
     let tip = rev(&source, "HEAD");
     q1_case(&Case {
         name: "matching-shallow",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &[tip],
-        haves: &[have],
-        shape: Shape::Shallow,
     });
     // The destination's frontier is untouched by ingest.
     assert_eq!(frontier, fs::read(destination.join("shallow")).unwrap());
@@ -1137,12 +1253,11 @@ fn q1_matching_shallow_frontier() {
 /// A want that forks below the have and takes the have's tree: the edge is
 /// the fork point, not the have, so `--objects-edge` counts objects only the
 /// have's tree holds. `--objects-edge-aggressive` also marks the have's tree.
-fn fork_below_have(scratch: &Scratch, depth: Option<u32>) -> (PathBuf, PathBuf, String, String) {
+fn fork_below_have(scratch: &Scratch, depth: Option<u32>) -> (PathBuf, PathBuf, String) {
     let origin = scratch.init("origin", false);
     delta_history(&origin, 19, 3, 8);
     let source = clone(scratch, &origin, "source", depth, false);
     let destination = clone(scratch, &origin, "destination.git", depth, true);
-    let have = rev(&destination, "refs/heads/main");
     run(
         args(&source, ["checkout", "-q", "-b", "side", "HEAD~1"]),
         "checkout",
@@ -1154,57 +1269,223 @@ fn fork_below_have(scratch: &Scratch, depth: Option<u32>) -> (PathBuf, PathBuf, 
     commit_all(&source, "side takes main's tree");
     write(&source, "side.txt", b"side\n");
     let want = commit_all(&source, "side work");
-    (source, destination, want, have)
+    (source, destination, want)
 }
 
 #[test]
 fn q1_fork_below_have_full_destination() {
     let scratch = Scratch::new("q1-fork-full");
-    let (source, destination, want, have) = fork_below_have(&scratch, None);
+    let (source, destination, want) = fork_below_have(&scratch, None);
     q1_case(&Case {
         name: "fork-below-have-full",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &[want],
-        haves: &[have],
-        shape: Shape::Full,
     });
 }
 
-/// Re-review pin: a shallow destination needs `--shallow` /
-/// `--objects-edge-aggressive`, as upload-pack does. The plain edge rule
-/// over-counts here.
+/// #55 pin: a shallow destination needs `--shallow` / aggressive edges, as
+/// upload-pack does. The plain edge rule over-counts here.
 #[test]
 fn q1_fork_below_have_shallow_destination() {
     let scratch = Scratch::new("q1-fork-shallow");
-    let (source, destination, want, have) = fork_below_have(&scratch, Some(3));
-    let request = request(std::slice::from_ref(&want), std::slice::from_ref(&have));
+    let (source, destination, want) = fork_below_have(&scratch, Some(3));
+    let held = held_tips(&source, &destination);
+    let request = request(std::slice::from_ref(&want), &held);
     let plain = edge_list(&source, &request, Shape::Full).objects.len();
     let aggressive = edge_list(&source, &request, Shape::Shallow).objects.len();
-    let unpinned = header_count(&oracle_pack(&source, &request, 1, Shape::Full));
+    let unpinned = header_count(&estimate_pack(&source, &request, &[]));
     println!(
-        "m1 q1 case=fork-below-have-shallow objects_edge={plain} objects_edge_aggressive={aggressive} \
-         estimate_without_shallow_pin={unpinned}"
+        "m1 q1 case=fork-below-have-shallow objects_edge={plain} \
+         objects_edge_aggressive={aggressive} estimate_without_shallow_form={unpinned}"
     );
     assert!(aggressive < plain, "the plain edge rule over-counts");
     q1_case(&Case {
         name: "fork-below-have-shallow",
-        scratch: &scratch,
         source: &source,
         destination: &destination,
         wants: &[want],
-        haves: &[have],
-        shape: Shape::Shallow,
     });
 }
 
-/// Re-review pin: `pack.useBitmaps=false`. A reverted blob is reachable from
+/// Reviewer fixture B (#55 bb6efa7 R3-1): a full destination with two held
+/// tips, `main` and an unrelated old `local` line. Both are haves (R-N113).
+#[test]
+fn q1_fixture_b_two_held_tips() {
+    let scratch = Scratch::new("q1-fixture-b");
+    let origin = scratch.init("origin", false);
+    dated(&origin, "base.txt", "base", 1);
+    run(
+        args(&origin, ["checkout", "-q", "-b", "feature"]),
+        "checkout",
+    );
+    dated(&origin, "f.txt", &noise(31, 2000), 2);
+    run(args(&origin, ["checkout", "-q", "main"]), "checkout");
+    for i in 1..=5 {
+        dated(&origin, &format!("m{i}.txt"), &format!("m{i}"), 100 + i);
+    }
+    let source = clone(&scratch, &origin, "source.git", None, true);
+    let destination = clone(&scratch, &origin, "destination", None, false);
+    let root = text(
+        args(&destination, ["rev-list", "--max-parents=0", "HEAD"]),
+        "root",
+    );
+    run(
+        args(&destination, ["checkout", "-q", "-b", "local", &root]),
+        "checkout",
+    );
+    for i in 1..=20 {
+        dated(&destination, &format!("l{i}.txt"), &format!("l{i}"), 10 + i);
+    }
+    run(args(&destination, ["checkout", "-q", "main"]), "checkout");
+    let work = clone(&scratch, &origin, "work", None, false);
+    run(
+        args(&work, ["merge", "-q", "--no-edit", "origin/feature"]),
+        "merge",
+    );
+    let merged = rev(&work, "HEAD");
+    let mut fetch = git(&source);
+    fetch
+        .args(["fetch", "-q"])
+        .arg(&work)
+        .arg(format!("{merged}:refs/heads/merged"));
+    run(fetch, "fetch");
+    run(
+        args(&source, ["update-ref", "-d", "refs/heads/feature"]),
+        "delete",
+    );
+    assert!(
+        held_tips(&source, &destination).len() >= 2,
+        "multi-held-tip"
+    );
+    let wants = unheld(&source, &destination);
+    q1_case(&Case {
+        name: "fixture-b",
+        source: &source,
+        destination: &destination,
+        wants: &wants,
+    });
+}
+
+/// Reviewer fixture P1 (R-N116): a shallow destination holding a commit and
+/// its parent. Ancestors first, upload-pack keeps both haves; child first it
+/// drops the parent, stops marking its tree and sends the re-added blob.
+#[test]
+fn q1_fixture_p1_have_order_matters() {
+    for seed in 1..=2_u64 {
+        let scratch = Scratch::new("q1-fixture-p1");
+        let origin = scratch.init("origin", false);
+        dated(&origin, "base.txt", &format!("base{seed}"), 1);
+        let boundary = dated(&origin, "keep.txt", &noise(80 + seed, 50), 2);
+        let parent = dated(&origin, "g.txt", &noise(82, 400), 3);
+        run(args(&origin, ["branch", "old", &parent]), "branch");
+        run(args(&origin, ["rm", "-q", "g.txt"]), "rm");
+        dated(&origin, "rm.txt", "rm", 4);
+        let source = clone(&scratch, &origin, "source", None, false);
+        let destination = clone(&scratch, &origin, "destination", None, false);
+        for repo in [&source, &destination] {
+            fs::write(repo.join(".git/shallow"), format!("{boundary}\n")).unwrap();
+        }
+        run(
+            args(&destination, ["branch", "-q", "old", "origin/old"]),
+            "branch",
+        );
+        dated(&source, "g.txt", &noise(82, 400), 6);
+        assert_eq!(held_tips(&source, &destination).len(), 2, "multi-held-tip");
+        let wants = unheld(&source, &destination);
+        let measured = q1_case(&Case {
+            name: &format!("fixture-p1-seed{seed}"),
+            source: &source,
+            destination: &destination,
+            wants: &wants,
+        });
+        assert!(
+            measured.oracle_child_first > measured.sent,
+            "child-first haves send more ({} vs {})",
+            measured.oracle_child_first,
+            measured.sent
+        );
+    }
+}
+
+/// Why `pack.useBitmaps=false` is pinned: a reverted blob is reachable from
 /// the haves only through an older commit, so the walk counts it and a
-/// bitmap does not. With the bitmap on, #55's pack no longer matches its walk.
+/// bitmap does not. The pinned sender, the estimate and the pinned oracle all
+/// send the walk (4 objects); an unpinned bitmap pack has 3.
 #[test]
 fn q1_bitmap_source() {
     let scratch = Scratch::new("q1-bitmap");
+    let (source, have, want) = bitmap_source(&scratch);
+    let destination = destination_at(&scratch, &source, &have);
+    let request = request(std::slice::from_ref(&want), std::slice::from_ref(&have));
+    let walk = missing(&source, &request).len();
+    let unpinned = unpinned_bitmap_count(&source, &request);
+    println!(
+        "m1 q1 case=bitmap-source walk_objects={walk} unpinned_bitmap_pack_objects={unpinned}"
+    );
+    assert!(unpinned < u32::try_from(walk).unwrap(), "bitmap < walk");
+    let measured = q1_case(&Case {
+        name: "bitmap-source",
+        source: &source,
+        destination: &destination,
+        wants: &[want],
+    });
+    assert_eq!(measured.sent, walk, "the pinned sender sends the walk");
+}
+
+/// Why the `--use-bitmap-index` trim (withdrawn plan change 3) is unsound:
+/// for a shallow destination the reverted blob is reachable only from the
+/// have's parent, which the destination does not hold. The exact set drops
+/// the blob; the untrimmed pinned sender carries it and ingest publishes.
+#[test]
+fn q1_bitmap_source_shallow_destination() {
+    let scratch = Scratch::new("q1-bitmap-shallow");
+    let (source, have, want) = bitmap_source(&scratch);
+    // A depth-1 clone at `have`, then the source is made shallow at the same
+    // frontier (R-N75).
+    run(args(&source, ["branch", "at-have", &have]), "branch");
+    let mut command = git(&scratch.root);
+    command
+        .args([
+            "clone", "-q", "--bare", "--depth", "1", "--branch", "at-have",
+        ])
+        .arg(format!("file://{}", source.display()))
+        .arg("destination.git");
+    run(command, "shallow clone");
+    run(args(&source, ["branch", "-D", "at-have"]), "branch -D");
+    let destination = scratch.path("destination.git");
+    let reverted = text(
+        args(&source, ["rev-parse", &format!("{want}:f.txt")]),
+        "blob",
+    );
+    assert!(!has_object(&destination, &reverted));
+    let request = request(std::slice::from_ref(&want), std::slice::from_ref(&have));
+    // The trim as withdrawn plan change 3 specified it, on the complete
+    // (bitmapped) source, then again once the source takes the frontier.
+    let trim_full = bitmap_exact(&source, &request).contains(&reverted);
+    fs::write(source.join(".git/shallow"), format!("{have}\n")).unwrap();
+    let trim_shallow = bitmap_exact(&source, &request).contains(&reverted);
+    let measured = q1_case(&Case {
+        name: "bitmap-source-shallow-destination",
+        source: &source,
+        destination: &destination,
+        wants: &[want],
+    });
+    println!(
+        "m1 q1 case=bitmap-source-shallow-destination trim_keeps_needed_blob_full_source={trim_full} \
+         trim_keeps_needed_blob_shallow_source={trim_shallow} sent_objects={}",
+        measured.sent
+    );
+    assert!(!trim_full, "the withdrawn trim drops a needed blob");
+    assert!(
+        has_object(&destination, &reverted),
+        "untrimmed sender carried it"
+    );
+}
+
+/// Source with c1 (f = original), c2 (f changed; the have), c3 (f reverted,
+/// h added; the want), repacked with a bitmap. Returns (source, have, want).
+fn bitmap_source(scratch: &Scratch) -> (PathBuf, String, String) {
     let source = scratch.init("source", false);
     let mut rng = Rng(23);
     let original = lines(&mut rng, 800).concat();
@@ -1225,11 +1506,29 @@ fn q1_bitmap_source() {
         })
         .count();
     assert_eq!(bitmaps, 1, "the source has a bitmap");
-    let destination = destination_at(&scratch, &source, &have);
-    let request = request(std::slice::from_ref(&want), std::slice::from_ref(&have));
-    let walk = missing(&source, &request).len();
-    let mut unpinned = git(&source);
-    unpinned.args([
+    (source, have, want)
+}
+
+/// `rev-list --objects --use-bitmap-index`: the withdrawn trim's set.
+fn bitmap_exact(source: &Path, request: &str) -> BTreeSet<String> {
+    let mut command = git(source);
+    command.args([
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--use-bitmap-index",
+        "--stdin",
+    ]);
+    String::from_utf8(ok(feed(command, request.as_bytes()), "bitmap exact"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn unpinned_bitmap_count(source: &Path, request: &str) -> u32 {
+    let mut command = git(source);
+    command.args([
         "-c",
         "pack.useBitmaps=true",
         "pack-objects",
@@ -1239,25 +1538,36 @@ fn q1_bitmap_source() {
         "--delta-base-offset",
         "-q",
     ]);
-    let unpinned = header_count(&ok(feed(unpinned, request.as_bytes()), "unpinned"));
-    println!(
-        "m1 q1 case=bitmap-source walk_objects={walk} estimate_without_bitmap_pin={unpinned} \
-         exact_objects={}",
-        exact(&source, &request).len()
+    header_count(&ok(feed(command, request.as_bytes()), "unpinned"))
+}
+
+/// Plan change 1: list mode cannot take `--thin`.
+#[test]
+fn q1_list_mode_rejects_thin() {
+    let scratch = Scratch::new("q1-thin");
+    let source = scratch.init("source", false);
+    let commits = delta_history(&source, 3, 2, 2);
+    let request = request(
+        std::slice::from_ref(&commits[2]),
+        std::slice::from_ref(&commits[0]),
     );
-    assert!(
-        unpinned < u32::try_from(walk).unwrap(),
-        "bitmap and walk disagree"
-    );
-    q1_case(&Case {
-        name: "bitmap-source",
-        scratch: &scratch,
-        source: &source,
-        destination: &destination,
-        wants: &[want],
-        haves: &[have],
-        shape: Shape::Full,
-    });
+    let list = edge_list(&source, &request, Shape::Full);
+    assert!(!list.edges.is_empty());
+    let mut input = list.lines().join("\n");
+    input.push('\n');
+    let mut command = git(&source);
+    command.args([
+        "pack-objects",
+        "--stdout",
+        "--thin",
+        "--delta-base-offset",
+        "-q",
+    ]);
+    let output = feed(command, input.as_bytes());
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    println!("m1 q1 case=list-mode-with-thin refused={stderr:?}");
+    assert!(!output.status.success());
+    assert!(stderr.contains("not a rev"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1579,7 @@ struct Sized {
     line: String,
     rank: u8,
     path: String,
+    basename: String,
     disk: u64,
 }
 
@@ -1297,28 +1608,44 @@ fn annotate(source: &Path, list: &EdgeList) -> Vec<Sized> {
             };
             let disk = fields.next().unwrap().parse().unwrap();
             let path = line.split_once(' ').map_or("", |(_, p)| p).to_owned();
+            let basename = path.rsplit('/').next().unwrap_or("").to_owned();
             Sized {
                 line: line.clone(),
                 rank,
                 path,
+                basename,
                 disk,
             }
         })
         .collect()
 }
 
+/// How the object list is ordered before it is cut.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    /// As `rev-list` emits it.
+    RevList,
+    /// (type, path): superseded; renamed lineages scatter.
+    TypePath,
+    /// (type, basename, path): plan change 5. One file's versions stay
+    /// together across directory renames, like pack-objects' name hash.
+    TypeBasename,
+}
+
 /// Cut the list into segments of at most `cap` stored bytes (a single larger
-/// object gets a segment of its own). `grouped` first orders by (type, path),
-/// so the versions of one path share a segment and can delta within it.
-fn cut(objects: &[Sized], cap: u64, grouped: bool) -> Vec<Vec<String>> {
-    let mut order: Vec<&Sized> = objects.iter().collect();
-    if grouped {
-        order.sort_by(|a, b| (a.rank, &a.path).cmp(&(b.rank, &b.path)));
+/// object gets a segment of its own), after ordering it by `order`.
+fn cut(objects: &[Sized], cap: u64, order: Order) -> Vec<Vec<String>> {
+    let mut sorted: Vec<&Sized> = objects.iter().collect();
+    match order {
+        Order::RevList => {}
+        Order::TypePath => sorted.sort_by(|a, b| (a.rank, &a.path).cmp(&(b.rank, &b.path))),
+        Order::TypeBasename => sorted
+            .sort_by(|a, b| (a.rank, &a.basename, &a.path).cmp(&(b.rank, &b.basename, &b.path))),
     }
     let mut segments: Vec<Vec<String>> = Vec::new();
     let mut current = Vec::new();
     let mut size = 0_u64;
-    for object in order {
+    for object in sorted {
         if !current.is_empty() && size + object.disk > cap {
             segments.push(std::mem::take(&mut current));
             size = 0;
@@ -1365,7 +1692,7 @@ fn reload(path: &Path) -> (Vec<String>, Vec<Vec<String>>) {
 
 fn segment_pack(source: &Path, edges: &[String], segment: &[String]) -> Vec<u8> {
     let lines: Vec<String> = edges.iter().chain(segment).cloned().collect();
-    list_pack(source, &lines, 1)
+    list_pack(source, &lines)
 }
 
 struct Segmented {
@@ -1375,6 +1702,28 @@ struct Segmented {
     tip: String,
     list: EdgeList,
     single: Vec<u8>,
+}
+
+/// A destination holding `base`, and the list and single pack for `tip`.
+fn segmented(scratch: Scratch, source: PathBuf, base: &str, tip: String) -> Segmented {
+    run(args(&source, ["repack", "-adq"]), "repack");
+    let destination = scratch.init("destination.git", true);
+    push(&source, &destination, base, "refs/heads/main");
+    let request = request(std::slice::from_ref(&tip), &[base.to_owned()]);
+    let list = edge_list(&source, &request, Shape::Full);
+    let single = list_pack(&source, &list.lines());
+    assert_eq!(
+        pack_count(&single),
+        pack_count(&estimate_pack(&source, &request, &[]))
+    );
+    Segmented {
+        scratch,
+        source,
+        destination,
+        tip,
+        list,
+        single,
+    }
 }
 
 /// Delta-heavy text plus incompressible blobs; the destination holds only the
@@ -1389,64 +1738,118 @@ fn segmented_fixture() -> Segmented {
         commit_all(&source, &format!("binary {i}"));
     }
     let tip = rev(&source, "HEAD");
-    run(args(&source, ["repack", "-adq"]), "repack");
-    let destination = scratch.init("destination.git", true);
-    push(&source, &destination, &commits[0], "refs/heads/main");
-    let request = request(
-        std::slice::from_ref(&tip),
-        std::slice::from_ref(&commits[0]),
-    );
-    let list = edge_list(&source, &request, Shape::Full);
-    let single = oracle_pack(&source, &request, 1, Shape::Full);
-    assert_eq!(single, list_pack(&source, &list.lines(), 1));
-    Segmented {
-        scratch,
-        source,
-        destination,
-        tip,
-        list,
-        single,
+    segmented(scratch, source, &commits[0], tip)
+}
+
+/// The reviewer's rename-lineage fixture: the same delta history, with the
+/// directory renamed every third round, so one file's versions carry
+/// different paths but the same basename.
+fn rename_lineage_fixture() -> Segmented {
+    let scratch = Scratch::new("q2-rename-lineages");
+    let source = scratch.init("source", false);
+    let mut rng = Rng(29);
+    let files = 8;
+    let mut contents: Vec<Vec<String>> = (0..files).map(|_| lines(&mut rng, 1500)).collect();
+    let mut dir = "d00".to_owned();
+    for (i, content) in contents.iter().enumerate() {
+        write(
+            &source,
+            &format!("{dir}/file{i}.txt"),
+            content.concat().as_bytes(),
+        );
     }
+    let base = commit_all(&source, "base");
+    for round in 1..=30 {
+        if round % 3 == 0 {
+            let next = format!("d{round:02}");
+            run(args(&source, ["mv", &dir, &next]), "mv");
+            dir = next;
+        }
+        for _ in 0..3 {
+            let file = rng.below(files);
+            for _ in 0..40 {
+                let line = rng.below(1500);
+                contents[file][line] = format!("edit {round} {:016x}\n", rng.next());
+            }
+            write(
+                &source,
+                &format!("{dir}/file{file}.txt"),
+                contents[file].concat().as_bytes(),
+            );
+        }
+        commit_all(&source, &format!("round {round}"));
+    }
+    let tip = rev(&source, "HEAD");
+    segmented(scratch, source, &base, tip)
 }
 
 const CAP: u64 = 64 * 1024;
 
+/// Cut, pack each segment and ingest it alone; returns (segmented bytes,
+/// segment count, largest segment).
+fn segment_cost(fixture: &Segmented, name: &str, cap: u64, order: Order) -> (usize, usize, usize) {
+    let objects = annotate(&fixture.source, &fixture.list);
+    let total = u32::try_from(objects.len()).unwrap();
+    let segments = cut(&objects, cap, order);
+    let mut bytes = 0_usize;
+    let mut counted = 0_u32;
+    let mut largest = 0_usize;
+    for (k, segment) in segments.iter().enumerate() {
+        let pack = segment_pack(&fixture.source, &fixture.list.edges, segment);
+        counted += header_count(&pack);
+        bytes += pack.len();
+        largest = largest.max(pack.len());
+        // Alone: a fresh quarantine whose only alternate is the destination's
+        // store (no other segment is visible).
+        let quarantine = Quarantine::open(&fixture.destination);
+        let result = quarantine.index(&pack);
+        quarantine.abandon();
+        assert!(
+            result.is_ok(),
+            "{name} segment {k} ({order:?}) alone: {result:?}"
+        );
+    }
+    assert_eq!(counted, total, "segments partition the object list");
+    let single = fixture.single.len();
+    println!(
+        "m1 q2 fixture={name} order={order:?} cap_bytes={cap} objects={total} segments={} \
+         single_pack_bytes={single} segmented_bytes={bytes} overhead_pct={:.1} \
+         largest_segment_bytes={largest} each_alone=ok",
+        segments.len(),
+        percent(bytes, single),
+    );
+    (bytes, segments.len(), largest)
+}
+
 #[test]
 fn q2_segments_are_self_contained_and_cost_is_measured() {
     let fixture = segmented_fixture();
-    let objects = annotate(&fixture.source, &fixture.list);
-    let total = u32::try_from(objects.len()).unwrap();
-    for grouped in [false, true] {
-        let segments = cut(&objects, CAP, grouped);
-        let mut bytes = 0_usize;
-        let mut counted = 0_u32;
-        let mut largest = 0_usize;
-        for (k, segment) in segments.iter().enumerate() {
-            let pack = segment_pack(&fixture.source, &fixture.list.edges, segment);
-            counted += header_count(&pack);
-            bytes += pack.len();
-            largest = largest.max(pack.len());
-            // Alone: a fresh quarantine whose only alternate is the
-            // destination's store (no other segment is visible).
-            let quarantine = Quarantine::open(&fixture.destination);
-            let result = quarantine.index(&pack);
-            quarantine.abandon();
-            assert!(
-                result.is_ok(),
-                "segment {k} (grouped={grouped}) alone: {result:?}"
-            );
-        }
-        assert_eq!(counted, total, "segments partition the object list");
-        let single = fixture.single.len();
-        println!(
-            "m1 q2 order={} cap_bytes={CAP} objects={total} segments={} single_pack_bytes={single} \
-             segmented_bytes={bytes} overhead_pct={:.1} largest_segment_bytes={largest} \
-             each_alone=ok",
-            if grouped { "type-path" } else { "rev-list" },
-            segments.len(),
-            percent(bytes, single),
-        );
-        assert!(segments.len() >= 3, "fixture yields several segments");
+    let (rev_list, count, _) = segment_cost(&fixture, "delta", CAP, Order::RevList);
+    let (type_path, _, _) = segment_cost(&fixture, "delta", CAP, Order::TypePath);
+    let (basename, _, largest) = segment_cost(&fixture, "delta", CAP, Order::TypeBasename);
+    assert!(count >= 3, "fixture yields several segments");
+    assert!(
+        basename < rev_list && type_path < rev_list,
+        "grouping helps"
+    );
+    // Observation: the cap is on stored size, so a segment may overshoot it.
+    println!(
+        "m1 q2 fixture=delta cap_overshoot_bytes={}",
+        largest.saturating_sub(usize::try_from(CAP).unwrap())
+    );
+}
+
+/// Plan change 5: (type, basename, path), not (type, path), once a directory
+/// is renamed.
+#[test]
+fn q2_rename_lineages_need_basename_order() {
+    let fixture = rename_lineage_fixture();
+    for cap in [CAP, CAP / 2] {
+        let (rev_list, _, _) = segment_cost(&fixture, "rename-lineages", cap, Order::RevList);
+        let (type_path, _, _) = segment_cost(&fixture, "rename-lineages", cap, Order::TypePath);
+        let (basename, _, _) = segment_cost(&fixture, "rename-lineages", cap, Order::TypeBasename);
+        assert!(basename < type_path, "basename order beats (type, path)");
+        assert!(basename < rev_list, "basename order beats rev-list order");
     }
 }
 
@@ -1460,18 +1863,21 @@ fn percent(value: usize, base: usize) -> f64 {
 fn q2_resume_regenerates_only_later_segments() {
     let fixture = segmented_fixture();
     let objects = annotate(&fixture.source, &fixture.list);
-    let segments = cut(&objects, CAP, true);
+    let segments = cut(&objects, CAP, Order::TypeBasename);
     let list_file = fixture.scratch.path("pack-0001.list");
     persist(&list_file, &fixture.list.edges, &segments);
     let (edges, reloaded) = reload(&list_file);
     assert_eq!(reloaded, segments);
     let n = reloaded.len();
     let k = n / 2;
+    assert!(k >= 1 && k < n, "a middle segment fails");
     let first: Vec<Vec<u8>> = reloaded
         .iter()
         .map(|s| segment_pack(&fixture.source, &edges, s))
         .collect();
 
+    let held = held_tips(&fixture.source, &fixture.destination);
+    preflight(&fixture.destination, &held).unwrap();
     let quarantine = Quarantine::open(&fixture.destination);
     let mut hashes = Vec::new();
     for pack in &first[..k] {
@@ -1481,10 +1887,15 @@ fn q2_resume_regenerates_only_later_segments() {
     let broken = &first[k][..first[k].len() / 2];
     let failure = quarantine.index(broken).unwrap_err();
     let leftovers = quarantine.leftovers();
+    assert!(
+        leftovers.iter().any(|n| n.starts_with("tmp_pack_")),
+        "a failed index-pack leaves tmp_pack_*: {leftovers:?}"
+    );
     // Not all objects are in: the refs-only check refuses the tip.
     let incomplete = quarantine.connected(std::slice::from_ref(&fixture.tip));
     assert!(incomplete.is_err(), "check refuses a partial segment set");
     quarantine.sweep();
+    assert!(quarantine.leftovers().is_empty(), "swept before resume");
 
     // Resume from the persisted list: regenerate k.. only.
     let (edges, reloaded) = reload(&list_file);
@@ -1516,10 +1927,14 @@ fn q2_resume_regenerates_only_later_segments() {
         String::from_utf8_lossy(&fsck.stderr)
     );
     let total: usize = first.iter().map(Vec::len).sum();
+    assert!(regenerated < total, "only later segments were regenerated");
+    // Observation, not asserted: byte identity of regenerated segments holds
+    // only for the same git build and pack.threads (plan change 6).
     println!(
         "m1 q2 resume segments={n} failed_at={k} leftovers_after_failure={leftovers:?} \
          index_pack_error={failure:?} regenerated_segments={} regenerated_bytes={regenerated} \
-         total_bytes={total} regenerated_identical={identical} fsck=clean",
+         total_bytes={total} regenerated_identical={identical}/{} fsck=clean",
+        n - k,
         n - k,
     );
 }
@@ -1529,9 +1944,10 @@ fn q2_resume_regenerates_only_later_segments() {
 // ---------------------------------------------------------------------------
 
 /// Source chain base <- p <- x <- s. The destination holds `base` under
-/// `refs/heads/main`; `p` and `x` are pushed under a temp ref which is then
-/// deleted, so they are present but unreferenced (a `GitHaveQuery` answers
-/// yes for `x`).
+/// `refs/heads/main` (its one held tip); `p` and `x` are pushed under a temp
+/// ref which is then deleted, so they are present but unreferenced. Offering
+/// `x` as a have goes beyond R-N113's first round (exactly the held tips): it
+/// models a later `GitHaveQuery` answer, which these negative cases guard.
 struct Chain {
     _scratch: Scratch,
     source: PathBuf,
@@ -1584,7 +2000,11 @@ fn plan_with_x(chain: &Chain) -> Vec<u8> {
         &[chain.base.clone(), chain.x.clone()],
     );
     let list = edge_list(&chain.source, &request, Shape::Full);
-    list_pack(&chain.source, &list.lines(), 1)
+    list_pack(&chain.source, &list.lines())
+}
+
+fn held(chain: &Chain) -> Vec<String> {
+    held_tips(&chain.source, &chain.destination)
 }
 
 #[test]
@@ -1595,10 +2015,12 @@ fn q3_have_from_refs_publishes() {
         std::slice::from_ref(&chain.base),
     );
     let list = edge_list(&chain.source, &request, Shape::Full);
-    let pack = list_pack(&chain.source, &list.lines(), 1);
+    let pack = list_pack(&chain.source, &list.lines());
     let before = packs(&chain.destination).len();
+    assert_eq!(held(&chain), vec![chain.base.clone()]);
     let hashes = ingest(
         &chain.destination,
+        &held(&chain),
         &[pack],
         std::slice::from_ref(&chain.s),
         &[Update::Create(STATE.into(), chain.s.clone())],
@@ -1623,6 +2045,7 @@ fn q3_deleted_parent_never_publishes() {
     let before = packs(&chain.destination).len();
     let refused = ingest(
         &chain.destination,
+        &held(&chain),
         &[pack],
         std::slice::from_ref(&chain.s),
         &[Update::Create(STATE.into(), chain.s.clone())],
@@ -1648,6 +2071,7 @@ fn q3_prune_after_have_query_never_publishes() {
     let before = packs(&chain.destination).len();
     let refused = ingest(
         &chain.destination,
+        &held(&chain),
         &[pack],
         std::slice::from_ref(&chain.s),
         &[Update::Create(STATE.into(), chain.s.clone())],
@@ -1666,32 +2090,61 @@ fn q3_prune_after_have_query_never_publishes() {
     );
 }
 
-/// "Trusts only refs" is literal: an object missing under an existing ref is
-/// not detected by the check. That is R-N75's and a preflight fsck's job.
+/// Plan change 7 (review B3): under R-N113 the have IS a held tip. When its
+/// closure is already damaged, the sender excludes the missing blob, the
+/// refs-only connectivity check trusts the ref, and without the preflight
+/// the new ref is published with a broken closure. The preflight refuses
+/// before anything is indexed.
 #[test]
-fn q3_check_trusts_ref_closures() {
-    let chain = chain();
-    // x now sits under a ref, but its parent p (loose) is gone.
-    run(
-        args(&chain.destination, ["update-ref", "refs/heads/x", &chain.x]),
-        "ref x",
-    );
-    fs::remove_file(loose_path(&chain.destination, &chain.p)).unwrap();
-    let pack = plan_with_x(&chain);
-    let quarantine = Quarantine::open(&chain.destination);
-    let indexed = quarantine.index(&pack);
-    let check = quarantine.connected(std::slice::from_ref(&chain.s));
-    quarantine.abandon();
-    assert!(indexed.is_ok());
+fn q3_held_tip_closure_preflight_is_mandatory() {
+    let mut refusals = Vec::new();
+    let mut published_broken = false;
+    for with_preflight in [false, true] {
+        let scratch = Scratch::new("q3-held-closure");
+        let source = scratch.init("source", false);
+        write(&source, "a.txt", b"steady content that never changes\n");
+        write(&source, "b.txt", b"b1\n");
+        commit_all(&source, "c1");
+        write(&source, "b.txt", b"b2\n");
+        let held_tip = commit_all(&source, "c2");
+        write(&source, "b.txt", b"b3\n");
+        let want = commit_all(&source, "c3");
+        let destination = destination_at(&scratch, &source, &held_tip);
+        let a = text(
+            args(&source, ["rev-parse", &format!("{held_tip}:a.txt")]),
+            "a",
+        );
+        fs::remove_file(loose_path(&destination, &a)).unwrap();
+        let held = held_tips(&source, &destination);
+        assert_eq!(held, vec![held_tip.clone()]);
+        let request = request(std::slice::from_ref(&want), &held);
+        let list = edge_list(&source, &request, Shape::Full);
+        assert!(!list.oids().contains(&a), "the sender trusts the held tip");
+        let pack = list_pack(&source, &list.lines());
+        let updates = [Update::Create(STATE.into(), want.clone())];
+        let wants = std::slice::from_ref(&want);
+        if with_preflight {
+            let before = packs(&destination).len();
+            let refused = ingest(&destination, &held, &[pack], wants, &updates).unwrap_err();
+            assert!(matches!(refused, Refused::Preflight(_)), "{refused:?}");
+            assert!(state_absent(&destination));
+            assert_eq!(packs(&destination).len(), before, "nothing indexed");
+            assert!(no_incoming(&destination));
+            refusals.push(refused.describe());
+        } else {
+            land(&destination, &[pack], wants, &updates).unwrap();
+            published_broken = !state_absent(&destination) && !fsck(&destination).status.success();
+        }
+    }
     assert!(
-        check.is_ok(),
-        "refs are trusted, their closure is not audited"
+        published_broken,
+        "without the preflight a broken ref is published"
     );
-    assert!(
-        !fsck(&chain.destination).status.success(),
-        "fsck does see it"
+    println!(
+        "m1 q3 case=held-tip-closure-damaged without_preflight=published-broken-ref(fsck fails) \
+         with_preflight={:?} published=no",
+        refusals.first().unwrap_or(&String::new())
     );
-    println!("m1 q3 case=corrupt-ref-closure connectivity=ok(trusted-ref) fsck=fails");
 }
 
 #[test]
@@ -1873,6 +2326,33 @@ fn octopus(parents: usize) {
     assert!(fsck_ok && graph_ok && verify_ok && gc_ok && after_gc_ok);
     assert_eq!(count, (parents + 1).to_string());
     assert_eq!(parent_line.split(' ').count(), parents + 1);
+    octopus_fetch(&scratch, &source, parents);
+}
+
+/// Review M4: a plain `git fetch` of S into a fresh repository, then
+/// `gc --aggressive`, `fsck` and `commit-graph verify`.
+fn octopus_fetch(scratch: &Scratch, source: &Path, parents: usize) {
+    let fetched = scratch.init("fetched.git", true);
+    let mut fetch = git(&fetched);
+    fetch
+        .args(["fetch", "-q", "--no-tags"])
+        .arg(format!("file://{}", source.display()))
+        .arg("refs/carry/v1/spike/octopus/state:refs/carry/v1/spike/octopus/state");
+    let (fetch_ok, fetch_ms) = timed(fetch);
+    let (aggressive_ok, aggressive_ms) =
+        timed(args(&fetched, ["gc", "--aggressive", "--prune=now", "-q"]));
+    let fsck_ok = fsck(&fetched).status.success();
+    let (graph_ok, _) = timed(args(
+        &fetched,
+        ["commit-graph", "write", "--reachable", "--no-progress"],
+    ));
+    let (verify_ok, _) = timed(args(&fetched, ["commit-graph", "verify", "--no-progress"]));
+    println!(
+        "m1 q4 parents={parents} fetch={fetch_ok} fetch_ms={fetch_ms} \
+         gc_aggressive={aggressive_ok} gc_aggressive_ms={aggressive_ms} fsck_after_aggressive={fsck_ok} \
+         commit_graph_after_aggressive={graph_ok} commit_graph_verify={verify_ok}"
+    );
+    assert!(fetch_ok && aggressive_ok && fsck_ok && graph_ok && verify_ok);
 }
 
 #[test]
@@ -1935,20 +2415,7 @@ fn q5_fast_import_references_alternate_object_without_copying() {
     );
     assert_eq!(read, "only in the live store");
     // Neither the blob nor the tree is in P's packs or loose store.
-    let mut in_private = Vec::new();
-    for pack in packs(&private) {
-        let idx = pack.with_extension("idx");
-        let listing = ok(
-            feed(args(&private, ["show-index"]), &fs::read(&idx).unwrap()),
-            "show-index",
-        );
-        in_private.push(String::from_utf8(listing).unwrap());
-    }
-    let copied = in_private
-        .iter()
-        .any(|l| l.contains(&blob) || l.contains(&tree))
-        || loose_path(&private, &blob).exists()
-        || loose_path(&private, &tree).exists();
+    let copied = owns(&private, &blob) || owns(&private, &tree);
     assert!(!copied, "fast-import referenced, did not copy");
     assert!(
         fsck(&private).status.success(),
@@ -1973,10 +2440,38 @@ fn q5_fast_import_references_alternate_object_without_copying() {
     assert!(!refused.status.success());
     let refusal = String::from_utf8_lossy(&refused.stderr);
     let first = refusal.lines().next().unwrap_or("").to_owned();
+    // Plan change 8: P copies what its ledger ref pins before publishing it.
+    // P's default gc repacks local objects only and copies nothing;
+    // `repack -a -d` without `-l` copies from the alternate.
+    run(args(&private, ["gc", "-q", "--prune=now"]), "P gc");
+    let after_gc = owns(&private, &blob) || owns(&private, &tree);
+    run(args(&private, ["repack", "-a", "-d", "-q"]), "P repack -a");
+    let after_repack = owns(&private, &blob) && owns(&private, &tree);
+    fs::remove_file(objects_dir(&private).join("info/alternates")).unwrap();
+    let self_contained = fsck(&private).status.success();
     println!(
         "m1 q5 fast_import_alternate_blob=ok alternate_tree=ok copied=no fsck_with_alternates=clean \
-         fsck_without_alternates=fails absent_oid_refused={first:?}"
+         fsck_without_alternates=fails absent_oid_refused={first:?} p_gc_copies={after_gc} \
+         p_repack_a_copies={after_repack} fsck_after_copy_without_alternates={self_contained}"
     );
+    assert!(!after_gc, "a default gc in P does not copy");
+    assert!(
+        after_repack && self_contained,
+        "repack -a copies; P then owns them"
+    );
+}
+
+/// Whether `repo` holds `oid` itself (loose or in its own packs), ignoring
+/// alternates.
+fn owns(repo: &Path, oid: &str) -> bool {
+    if loose_path(repo, oid).exists() {
+        return true;
+    }
+    packs(repo).iter().any(|pack| {
+        let idx = fs::read(pack.with_extension("idx")).unwrap();
+        let listing = ok(feed(args(repo, ["show-index"]), &idx), "show-index");
+        String::from_utf8(listing).unwrap().contains(oid)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2054,7 +2549,7 @@ fn q6_unchanged_rerun_is_byte_identical_empty_pack_and_verify_only() {
     let request = request(std::slice::from_ref(&second), std::slice::from_ref(&first));
     let list = edge_list(&source, &request, Shape::Full);
     assert!(list.objects.is_empty(), "nothing to send");
-    let empty = list_pack(&source, &list.lines(), 1);
+    let empty = list_pack(&source, &list.lines());
     assert_eq!(header_count(&empty), 0);
     let ref_file_before = fs::metadata(destination.join(reference))
         .ok()
