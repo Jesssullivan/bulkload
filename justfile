@@ -38,18 +38,67 @@ secrets-scan-history:
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
-# including the agent's dependency-wall test). The last two lines lint and run
-# the W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature. The harness build goes to its own target dir, so
-# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
-# The feature clippy pass stays in the shared dir: it only type-checks and
-# writes no executables.
+# including the agent's dependency-wall test). The io layer's syscall trace
+# (R-N88) is linted, and its crash-state proofs run with `io-trace` on, ahead
+# of the workspace tests so no unrelated failure can hide them; the partial-
+# write proof sets a process-wide RLIMIT_FSIZE, so it runs alone. The W7 fault
+# harness is not here: it runs in its own CI gate (`just fault-harness`,
+# R-N122).
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
+    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
+    cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && cargo test --workspace --locked
+
+# P5 partial-write proof (#69). It sets a process-wide RLIMIT_FSIZE, so it runs
+# alone, and it acts only when BULKLOAD_IO_PARTIAL_WRITE_ALONE is set. A skipped
+# proof still reports `1 passed`, so this recipe fails unless the proof really
+# ran: on a cargo failure, on SKIPPED, or on anything but one `1 passed; 0
+# failed` result (R-N122).
+io-partial-write-alone:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    status=0
+    output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?
+    printf '%s\n' "$output"
+    if [[ $status -ne 0 ]]; then
+        echo "io-partial-write-alone: cargo test failed with status $status" >&2
+        exit "$status"
+    fi
+    if [[ $output == *SKIPPED* ]]; then
+        echo "io-partial-write-alone: the P5 proof skipped itself" >&2
+        exit 1
+    fi
+    results=$(grep -c '^test result: ' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 1 passed; 0 failed;' <<<"$output" || true)
+    proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced \.\.\. ok$' <<<"$output" || true)
+    if [[ $results -ne 1 || $passed -ne 1 ]]; then
+        echo "io-partial-write-alone: expected exactly one '1 passed; 0 failed' result" >&2
+        exit 1
+    fi
+    if [[ $proved -ne 1 ]]; then
+        echo "io-partial-write-alone: the passing test was not the P5 proof" >&2
+        exit 1
+    fi
+
+# W7 crash-resume and live-writer harness, which needs the agent's
+# `fault-injection` feature. CI runs it as the separate `fault-harness`
+# terminal gate, in parallel with the source gate and under its own 15-minute
+# cap (R-N122). The harness build goes to its own target dir, so
+# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
+# The feature clippy pass stays in the shared dir: it only type-checks and
+# writes no executables.
+fault-harness:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
+
+# Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
+# current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
+bench-io-chunker:
+    cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
@@ -61,6 +110,7 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 # wrapper for the Bazel graph.
 check:
     cd {{ root }} && nix develop .#default --command just check-source
+    cd {{ root }} && nix develop .#default --command just fault-harness
     cd {{ root }} && just test
 
 # Source-only local gate. It may not be cited as cache or runner proof.
@@ -70,12 +120,17 @@ check-local: check-source test-local
 # scanners; the pinned GloriousFlywheel shell owns the front door and Bazel.
 ci-source: check-source secrets-scan-history
 
+# The CI `fault-harness` terminal gate (R-N122); the composite action execs it
+# inside the repo flake, like `ci-source`.
+ci-fault-harness: fault-harness
+
 # CI is fail-closed on the fleet-managed GloriousFlywheel profile and drives
 # every Bazel target through the canonical cache-backed wrapper.
 ci:
     cd {{ root }} && just flywheel-verify
     cd {{ root }} && just flake-check
     cd {{ root }} && nix develop .#default --command just ci-source
+    cd {{ root }} && nix develop .#default --command just ci-fault-harness
     cd {{ root }} && just flywheel-build //:bulkload
     cd {{ root }} && just flywheel-test //:tests
 

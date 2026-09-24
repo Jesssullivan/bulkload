@@ -241,7 +241,17 @@ case "${BULKLOAD_EVENT_NAME:-}" in
       "${BULKLOAD_HEAD_REPOSITORY:-}" \
       "${BULKLOAD_REPOSITORY:-}"
     ;;
-  *) die "event is outside the reviewed push/pull_request inventory" ;;
+  merge_group)
+    # Merge queue (R-N124): the queued commit lives in this repository on a
+    # gh-readonly-queue ref for main, and it never uploads Bazel results.
+    require_equal \
+      "merge-group repository" \
+      "${BULKLOAD_HEAD_REPOSITORY:-}" \
+      "${BULKLOAD_REPOSITORY:-}"
+    [[ "${BULKLOAD_REF:-}" == refs/heads/gh-readonly-queue/main/* ]] ||
+      die "merge-group ref is outside the main merge queue"
+    ;;
+  *) die "event is outside the reviewed push/pull_request/merge_group inventory" ;;
 esac
 
 [[ "${BULKLOAD_EXPECTED_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || die "expected SHA is not canonical"

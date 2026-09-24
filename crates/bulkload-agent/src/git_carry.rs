@@ -18,6 +18,7 @@ use std::process::{Command, Output};
 use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
+pub mod estimate;
 mod raw_tree;
 pub mod registered;
 mod shallow;

@@ -106,6 +106,12 @@ pub enum BulkloadRefusal {
     /// Carries the nest's path relative to the enclosing checkout;
     /// [`fmt::Display`] prints it escaped.
     GitNestCarrierRefused(Vec<u8>),
+    /// A path given as a repository is not that repository's root: Git would
+    /// resolve it to an enclosing repository, or to none at all.
+    GitRepositoryNotAtPath,
+    /// A destination's refs do not prove it holds their history: it is a
+    /// partial clone, or shallow at a frontier other than the source's (R-N75).
+    GitHavesUnprovable,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -184,6 +190,8 @@ impl BulkloadRefusal {
             Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
+            Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
+            Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -272,6 +280,8 @@ mod tests {
             BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
+            BulkloadRefusal::GitRepositoryNotAtPath,
+            BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
