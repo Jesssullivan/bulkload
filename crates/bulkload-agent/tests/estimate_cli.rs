@@ -228,8 +228,25 @@ fn assert_no_echo(state: &Path, payloads: &[(Vec<u8>, String)], stdout: &str, st
             }
         }
     }
+    // The verb's stderr is its refusal line and the M2 W2 counters line
+    // (`counters verb=... side=... scope=process <name>=<number> ...`), which
+    // carries only the verb's own measurements.
     for line in stderr.lines() {
-        assert_eq!(line, "bulkload-agent: refused: GIT_UNAVAILABLE", "{stderr}");
+        if let Some(fields) =
+            line.strip_prefix("counters verb=git-carry-estimate side=local scope=process ")
+        {
+            for field in fields.split(' ') {
+                let (name, value) = field.split_once('=').unwrap();
+                assert!(
+                    name.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "{line}"
+                );
+                assert!(value.bytes().all(|b| b.is_ascii_digit()), "{line}");
+            }
+        } else {
+            assert_eq!(line, "bulkload-agent: refused: GIT_UNAVAILABLE", "{stderr}");
+        }
     }
 }
 
