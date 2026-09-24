@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gate: [source, build, test]
+        gate: [source, build, test, fault-harness]
     env:
       BASH_ENV: /dev/null
       ENV: /dev/null
