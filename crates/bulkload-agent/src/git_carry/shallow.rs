@@ -178,6 +178,12 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     }
     ensure_custody_objects(repository, bundle, value)?;
     let (boundary, inventory, pack_oid) = custody_manifest(repository, value)?;
+    // The header marker is the fast path; the inner inventory is the truth. An
+    // envelope written before the marker was lifted, or re-enveloped without
+    // it, still refuses here, before its pack is indexed (round-4 R1).
+    if super::drift_marked(&inventory) {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
     validate_frontier(&boundary)?;
     if boundary.is_empty() || !oid(&pack_oid) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
