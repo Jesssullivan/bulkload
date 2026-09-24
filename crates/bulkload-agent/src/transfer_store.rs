@@ -70,6 +70,30 @@ macro_rules! publication_crash {
     }};
 }
 
+/// Record this group's composition for a crash receipt: its capture ids,
+/// sorted and distinct, and the chunk payloads it carries.
+#[cfg(feature = "fault-injection")]
+fn note_group(events: &[PreparedEvent]) -> crate::fault::GroupNote {
+    let mut ids: Vec<usize> = events
+        .iter()
+        .map(|event| match event {
+            PreparedEvent::Chunks { capture_id, .. }
+            | PreparedEvent::Complete { capture_id, .. }
+            | PreparedEvent::Refused { capture_id, .. } => *capture_id,
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let chunks = events
+        .iter()
+        .map(|event| match event {
+            PreparedEvent::Chunks { chunks, .. } => chunks.len(),
+            PreparedEvent::Complete { .. } | PreparedEvent::Refused { .. } => 0,
+        })
+        .sum();
+    crate::fault::note_group(&ids, chunks)
+}
+
 #[cfg(not(feature = "fault-injection"))]
 macro_rules! publication_crash {
     ($publisher:expr, $source:ident, $destination:ident) => {{}};
@@ -246,6 +270,21 @@ pub(crate) struct StorePublisher<'a> {
     // Read only by the `fault-injection` crash points.
     #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     side: PublisherSide,
+}
+
+/// An unfinished directory this state created, keyed by its row.
+///
+/// Committed once the directory exists under a tagged temporary name and its
+/// parent is synced, before it is renamed into place (R-N102), and deleted
+/// once the final mode is durable. It names an inode, never just a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDirectory {
+    /// Device of the created directory.
+    pub dev: u64,
+    /// Inode of the created directory.
+    pub ino: u64,
+    /// The final mode `finish_directories` applies.
+    pub mode: u32,
 }
 
 /// A private, source-bound transfer state directory.
@@ -440,29 +479,37 @@ impl Store {
         Ok(())
     }
 
-    /// Remember an unfinished directory by inode and its intended mode.
+    /// Bind a pending directory to the inode this state created.
     ///
     /// # Errors
     /// Refuses persistence failures.
-    pub fn pending_directory(
+    pub fn record_directory_created(
         &self,
         key: &[u8],
         dev: u64,
         ino: u64,
         mode: u32,
-        record: bool,
-    ) -> Result<bool> {
-        let identity = postcard::to_stdvec(&(dev, ino, mode))?;
-        if record {
-            self.conn
-                .execute(
-                    "INSERT INTO directories VALUES (?1, ?2)
-                ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                    (key, &identity),
-                )
-                .map_err(sqlite_error)?;
-            return Ok(true);
-        }
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO directories VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                (
+                    key,
+                    postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?,
+                ),
+            )
+            .map_err(sqlite_error)?;
+        Ok(())
+    }
+
+    /// The unfinished-directory record for `key`, if any.
+    ///
+    /// # Errors
+    /// Refuses database failures, and refuses a record this engine cannot
+    /// decode exactly with [`BulkloadRefusal::SchemaMismatch`], so an
+    /// unreadable record never grants ownership.
+    pub fn directory_record(&self, key: &[u8]) -> Result<Option<PendingDirectory>> {
         let found: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -472,7 +519,45 @@ impl Store {
             )
             .optional()
             .map_err(sqlite_error)?;
-        Ok(found == Some(identity))
+        found
+            .map(|bytes| match postcard::take_from_bytes(&bytes) {
+                Ok((record, [])) => Ok(record),
+                _ => Err(BulkloadRefusal::SchemaMismatch),
+            })
+            .transpose()
+    }
+
+    /// Clear every pending record bound to `(dev, ino)`, once that inode is
+    /// gone, so a recycled inode number can never inherit its ownership.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn clear_directories_bound_to(&self, dev: u64, ino: u64) -> Result<()> {
+        let bound: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT key, identity FROM directories")
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            let mut bound = Vec::new();
+            for row in rows {
+                let (key, identity) = row.map_err(sqlite_error)?;
+                if let Ok((record, [])) = postcard::take_from_bytes::<PendingDirectory>(&identity) {
+                    if record.dev == dev && record.ino == ino {
+                        bound.push(key);
+                    }
+                }
+            }
+            bound
+        };
+        for key in bound {
+            self.complete_directory(&key)?;
+        }
+        Ok(())
     }
 
     /// Retire pending ownership after directory metadata is durable.
@@ -891,6 +976,8 @@ impl StorePublisher<'_> {
             return Ok(Vec::new());
         }
         PUBLISH_GROUPS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "fault-injection")]
+        let _note = note_group(&events);
         let missing = self.missing_chunks(&events)?;
         let locations = self.append_chunks(missing)?;
         self.commit_group(&locations, &events)?;
