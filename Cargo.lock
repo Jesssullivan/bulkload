@@ -154,6 +154,7 @@ dependencies = [
  "bulkload-agent",
  "bulkload-proto",
  "clap",
+ "fastcdc",
  "libc",
  "postcard",
  "tempfile",
