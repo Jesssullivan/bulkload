@@ -11,7 +11,25 @@
 //!
 //! Refusals are forward-progressing: an unreadable or unportable seat is
 //! recorded as a typed refusal and the walk continues.
+//!
+//! # Engine temporaries
+//!
+//! A regular file whose leaf is in the materializer's *tagged* file-temporary
+//! grammar, and an empty directory in its tagged directory-temporary grammar
+//! (`materialize::temporary_name`), is never a row. It is recorded in
+//! [`WalkOutcome::engine_temporaries`] instead, so no walk carries one (R-N79).
+//! Such a name is only ever what a crashed publication left: a partial or
+//! complete copy of another output (after `materialize.after_link` a second
+//! hard link to it), or an empty directory that was never renamed into place.
+//! It holds no state of its own.
+//!
+//! Only the tagged grammar is excluded: a 16-hex-digit store tag plus
+//! canonical decimals is not a name a person or another tool picks. The
+//! untagged form (`.bulkload-<n>-<n>`) is indistinguishable from payload
+//! such as `.bulkload-2026-09`, so it is carried like any file. So is every
+//! other kind, and a tagged directory that holds anything.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use bulkload_proto::{BulkloadRefusal, FileKind, Result, RowSchema};
@@ -94,6 +112,9 @@ pub struct WalkOutcome {
     pub rows: Vec<RowSchema>,
     /// One entry per declined seat.
     pub refusals: Vec<RefusedSeat>,
+    /// Regular files in the materializer's temporary-name grammar, by
+    /// relative path. Recorded, never carried; see the module docs.
+    pub engine_temporaries: Vec<Vec<u8>>,
     /// Counters for the pass.
     pub stats: WalkStats,
 }
@@ -159,13 +180,12 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
         if !options.cross_device && device_of(&meta) != root_dev {
             continue;
         }
-
-        let mut row = row_from_metadata(rel_path, &meta);
-        if row.kind == FileKind::Symlink {
-            row.link_target = std::fs::read_link(path)
-                .ok()
-                .map(|target| os_bytes(target.as_os_str()));
+        if meta.is_file() && temporary_kind(path) == Some(FileKind::Regular) {
+            outcome.engine_temporaries.push(rel_path);
+            continue;
         }
+
+        let mut row = seat_row(path, rel_path, &meta);
 
         outcome.stats.seats_seen += 1;
         if row.kind == FileKind::Regular {
@@ -217,7 +237,65 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
     }
 
     complete_hashes(&mut outcome, &to_hash, cache)?;
+    drop_empty_temporary_directories(&mut outcome);
     Ok(outcome)
+}
+
+/// The kind a leaf names in the materializer's *tagged* temporary grammar:
+/// `Regular` for a file temporary, `Directory` for a directory temporary.
+/// `None` for anything else, the untagged form included.
+fn temporary_kind(path: &Path) -> Option<FileKind> {
+    use crate::materialize::{temporary_name, TemporaryName};
+    match temporary_name(path.file_name()?.as_encoded_bytes())? {
+        TemporaryName::File(_) => Some(FileKind::Regular),
+        TemporaryName::Directory(_) => Some(FileKind::Directory),
+        TemporaryName::Untagged => None,
+    }
+}
+
+/// Record, and drop from the rows, each directory named as a tagged directory
+/// temporary that nothing was found beneath. A non-empty one stays a row.
+fn drop_empty_temporary_directories(outcome: &mut WalkOutcome) {
+    let candidates: Vec<Vec<u8>> = outcome
+        .rows
+        .iter()
+        .filter(|row| {
+            row.kind == FileKind::Directory
+                && temporary_kind(Path::new(std::ffi::OsStr::from_bytes(&row.rel_path)))
+                    == Some(FileKind::Directory)
+        })
+        .map(|row| row.rel_path.clone())
+        .collect();
+    let beneath = |directory: &[u8], path: &[u8]| {
+        path.len() > directory.len()
+            && path.starts_with(directory)
+            && path.get(directory.len()) == Some(&b'/')
+    };
+    for directory in &candidates {
+        let occupied = outcome
+            .rows
+            .iter()
+            .map(|row| row.rel_path.as_slice())
+            .chain(outcome.refusals.iter().map(|seat| seat.rel_path.as_slice()))
+            .any(|path| beneath(directory, path));
+        if !occupied {
+            outcome.rows.retain(|row| row.rel_path != *directory);
+            outcome.engine_temporaries.push(directory.clone());
+            // Not a seat: an excluded temporary counts nowhere (N7).
+            outcome.stats.seats_seen = outcome.stats.seats_seen.saturating_sub(1);
+        }
+    }
+}
+
+/// The row for one seat, with a symlink's literal target.
+fn seat_row(path: &Path, rel_path: Vec<u8>, meta: &std::fs::Metadata) -> RowSchema {
+    let mut row = row_from_metadata(rel_path, meta);
+    if row.kind == FileKind::Symlink {
+        row.link_target = std::fs::read_link(path)
+            .ok()
+            .map(|target| os_bytes(target.as_os_str()));
+    }
+    row
 }
 
 fn complete_hashes<C: FreshnessCache>(
@@ -508,5 +586,44 @@ mod tests {
         assert_eq!(result.stats.bytes_read, 0);
         assert_eq!(result.stats.files_statted_twice, 0);
         assert!(result.rows.iter().all(|row| row.blake3.is_none()));
+    }
+    #[test]
+    fn tagged_temporaries_are_recorded_not_seats() {
+        let corpus = Corpus::new("temporaries");
+        let empty = ".bulkload-0123456789abcdef-d-1-2";
+        let held = ".bulkload-0123456789abcdef-d-1-3";
+        let file = ".bulkload-0123456789abcdef-1-4";
+        std::fs::create_dir(corpus.root.join(empty)).unwrap();
+        std::fs::create_dir(corpus.root.join(held)).unwrap();
+        std::fs::write(corpus.root.join(held).join("kept"), b"k").unwrap();
+        std::fs::write(corpus.root.join(file), b"orphan").unwrap();
+        std::fs::write(corpus.root.join(".bulkload-12-9"), b"untagged").unwrap();
+        let outcome = walk(
+            &WalkOptions::new(corpus.root.clone()),
+            &mut MemoryCache::new(),
+        )
+        .unwrap();
+        let mut recorded = outcome.engine_temporaries.clone();
+        recorded.sort();
+        let mut expected = vec![empty.as_bytes().to_vec(), file.as_bytes().to_vec()];
+        expected.sort();
+        assert_eq!(recorded, expected);
+        let rows: Vec<&[u8]> = outcome
+            .rows
+            .iter()
+            .map(|row| row.rel_path.as_slice())
+            .collect();
+        assert!(
+            rows.contains(&held.as_bytes()),
+            "a non-empty directory is carried"
+        );
+        assert!(
+            rows.contains(&b".bulkload-12-9".as_slice()),
+            "untagged is payload"
+        );
+        // Seats: a.txt, nested, nested/b.txt, the held directory and its file,
+        // and the untagged file. Neither excluded temporary counts (N7).
+        assert_eq!(outcome.stats.seats_seen, rows.len() as u64);
+        assert_eq!(outcome.stats.seats_seen, 6);
     }
 }

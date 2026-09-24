@@ -632,15 +632,32 @@ fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
 
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
-        "completed={} reused={} bytes_received={} source_bytes_read={} refusals={}",
+        "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
+         source_engine_temporaries={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
         stats.source_bytes_read,
-        stats.refusals.len()
+        stats.refusals.len(),
+        stats.source_engine_temporaries.len()
     );
     for (path, code) in &stats.refusals {
         eprintln!("refused {}: {code}", path.escape_ascii());
+    }
+    if stats.temporaries_removed > 0 {
+        eprintln!("temporaries-removed {}", stats.temporaries_removed);
+    }
+    for path in &stats.temporaries_left {
+        eprintln!("temporary-left {}", path.escape_ascii());
+    }
+    for path in &stats.source_engine_temporaries {
+        eprintln!("source-engine-temporary {}", path.escape_ascii());
+    }
+    for path in &stats.directories_fallback {
+        eprintln!(
+            "directory-created-by-mkdir-fallback {}",
+            path.escape_ascii()
+        );
     }
     if stats.refusals.is_empty() {
         Ok(())
@@ -768,6 +785,10 @@ fn walk_command(root: &Path) -> Result<()> {
     let outcome = walk::walk(&options, &mut cache)?;
     println!("rows                     {}", outcome.rows.len());
     println!("refusals                 {}", outcome.refusals.len());
+    println!(
+        "engine_temporaries       {}",
+        outcome.engine_temporaries.len()
+    );
     println!("seats_seen               {}", outcome.stats.seats_seen);
     println!("bytes_seen               {}", outcome.stats.bytes_seen);
     println!("fresh_skipped            {}", outcome.stats.fresh_skipped);
