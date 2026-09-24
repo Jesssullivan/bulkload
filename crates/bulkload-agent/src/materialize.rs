@@ -126,19 +126,23 @@ impl Destination {
             return Ok(());
         }
         let store_device = std::fs::metadata(store.root())?.dev();
-        let mut opened = Vec::with_capacity(self.directories.len());
-        for pending in self.directories.iter().rev() {
-            let (parent, leaf) = self.parent(&pending.path)?;
+        // One descriptor at a time: each directory is closed once sealed,
+        // except the one `note_unflushed` keeps per device for its flush.
+        for index in (0..self.directories.len()).rev() {
+            let Some(pending) = self.directories.get(index) else {
+                continue;
+            };
+            let (path, dev, ino, mode) =
+                (pending.path.clone(), pending.dev, pending.ino, pending.mode);
+            let (parent, leaf) = self.parent(&path)?;
             let directory = open_dir(parent.as_raw_fd(), &leaf)?;
+            drop(parent);
             let metadata = directory.metadata()?;
-            if metadata.dev() != pending.dev || metadata.ino() != pending.ino {
+            if metadata.dev() != dev || metadata.ino() != ino {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
-            directory.set_permissions(Permissions::from_mode(pending.mode))?;
+            directory.set_permissions(Permissions::from_mode(mode))?;
             crate::io::durable::seal_dir(&directory)?;
-            opened.push(directory);
-        }
-        for directory in opened {
             self.note_unflushed(directory);
         }
         // The completion commits below drain only the store's device; every
