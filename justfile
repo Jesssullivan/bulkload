@@ -49,8 +49,40 @@ rust-check:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
-    cd {{ root }} && BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture
+    cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && cargo test --workspace --locked
+
+# P5 partial-write proof (#69). It sets a process-wide RLIMIT_FSIZE, so it runs
+# alone, and it acts only when BULKLOAD_IO_PARTIAL_WRITE_ALONE is set. A skipped
+# proof still reports `1 passed`, so this recipe fails unless the proof really
+# ran: on a cargo failure, on SKIPPED, or on anything but one `1 passed; 0
+# failed` result (R-N122).
+io-partial-write-alone:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    status=0
+    output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?
+    printf '%s\n' "$output"
+    if [[ $status -ne 0 ]]; then
+        echo "io-partial-write-alone: cargo test failed with status $status" >&2
+        exit "$status"
+    fi
+    if [[ $output == *SKIPPED* ]]; then
+        echo "io-partial-write-alone: the P5 proof skipped itself" >&2
+        exit 1
+    fi
+    results=$(grep -c '^test result: ' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 1 passed; 0 failed;' <<<"$output" || true)
+    proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced \.\.\. ok$' <<<"$output" || true)
+    if [[ $results -ne 1 || $passed -ne 1 ]]; then
+        echo "io-partial-write-alone: expected exactly one '1 passed; 0 failed' result" >&2
+        exit 1
+    fi
+    if [[ $proved -ne 1 ]]; then
+        echo "io-partial-write-alone: the passing test was not the P5 proof" >&2
+        exit 1
+    fi
 
 # W7 crash-resume and live-writer harness, which needs the agent's
 # `fault-injection` feature. CI runs it as the separate `fault-harness`
@@ -78,6 +110,7 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 # wrapper for the Bazel graph.
 check:
     cd {{ root }} && nix develop .#default --command just check-source
+    cd {{ root }} && nix develop .#default --command just fault-harness
     cd {{ root }} && just test
 
 # Source-only local gate. It may not be cited as cache or runner proof.

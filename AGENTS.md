@@ -107,9 +107,9 @@ no longer true (R-N55).
 
 ## Validation
 
-`just check` runs the repository contract checks and `just rust-check`
+`just check` runs the repository contract checks, `just rust-check`
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`). CI remains on GloriousFlywheel tinyland-nix; keep
+`cargo test --workspace`) and the W7 fault harness (`just fault-harness`). CI remains on GloriousFlywheel tinyland-nix; keep
 `.bazelrc.flywheel` endpoint-free. Changing `flake.nix`, the public-read guard
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.
