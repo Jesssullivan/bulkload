@@ -71,3 +71,23 @@
   - R4-2: a shallow source with a non-shallow destination over-estimates.
   - base64 with no key word.
   - the U+0085 path refusal code.
+
+## r5 (2026-09-24): BLOCK at `bb6efa7` on two redaction regressions and one doc paragraph
+
+- **R5-A:** a whole token prefix followed by a separator (`ghp_`, `AKIA`,
+  `github_pat_`, `glpat-`, `xoxb-`) now redacts the next word too.
+- **R5-B:** a short key whose separator is its own word (`pass : x`,
+  `pwd = x`, `{"pwd" : "x"}`) redacts the separator and the value. `auth` and
+  `key` also accept `:`.
+- **R5-C:** the docs say a have is dropped only out of ancestors-first order
+  (fixture A3X: 232 B ancestors first).
+- **R5-F:** the 22:03Z blahaj raw output was lost in the neo crash, before it
+  was persisted. blahaj was re-run alone, read-only, at 01:34Z. The raw
+  output is now in the evidence doc: 31 objects / 15,584 B, no writes on
+  either side.
+- **Deferred:**
+  - R5-D: `exit code=128` is over-redacted.
+  - R5-E: `jess:1234/5678@host`.
+  - the three-word NBSP split.
+  - `pass`+NEL.
+  - R4-2.

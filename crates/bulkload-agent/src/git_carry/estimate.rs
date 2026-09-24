@@ -45,13 +45,16 @@
 //! frontier (R-N75), the request carries its `shallow <oid>` lines, and
 //! upload-pack packs with `--shallow`, marking the trees of every have.
 //!
-//! Order matters because upload-pack drops a have whose child it has already
-//! seen. For a shallow destination that shrinks the exclusion: offered child
-//! first, the parent's tree is no longer marked (reviewer fixture P1: 162 B
+//! Order matters because upload-pack drops a have only when it arrives after
+//! a have that implies it (its child), that is, out of ancestors-first order.
+//! Ancestors first, nothing is dropped. Child first, a shallow destination
+//! loses the parent's tree from the exclusion (reviewer fixture P1: 162 B
 //! ancestors first, 3,889 B child first). Haves beyond the held tips are not
-//! free either: an extra intermediate have makes upload-pack drop the have it
-//! implies, so it can *enlarge* a shallow pack (fixture A3: 232 B with the
-//! held tips, 3,919 B once the parent is offered too). Extra haves can shrink
+//! free either: offered out of ancestors-first order (as `git fetch` offers
+//! them, newest first), an extra intermediate have makes upload-pack drop the
+//! have it implies, which can *enlarge* a shallow pack (fixture A3: 232 B with
+//! the held tips, 3,919 B once `git fetch` offers the parent too). Offered
+//! ancestors first, the same extra have drops nothing (fixture A3X: 232 B). Extra haves can shrink
 //! a non-shallow pack. Ancestor probing (`GitHaveQuery`) must therefore not
 //! add haves to a shallow destination's first round.
 //!
@@ -333,6 +336,13 @@ fn redact_words(words: &[&str]) -> Vec<String> {
             }
             continue;
         }
+        if spaced_short_key(&lower, words.get(index + 1).copied()) {
+            // `pass : x`, `pwd = x`, `{"pwd" : "x"}`: the separator word and
+            // the value after it are redacted through `pending`.
+            redacted.push(REDACTED.to_owned());
+            pending = 1;
+            continue;
+        }
         if let Some(value) = sensitive_key(&lower) {
             redacted.push(REDACTED.to_owned());
             // `Authorization: Bearer x` and `authorization=Basic x`.
@@ -351,9 +361,10 @@ fn redact_words(words: &[&str]) -> Vec<String> {
             continue;
         };
         let joined = format!("{first}{second}");
-        if TOKEN_PREFIXES.iter().any(|prefix| {
-            joined.contains(prefix) && !first.contains(prefix) && !second.contains(prefix)
-        }) {
+        if TOKEN_PREFIXES
+            .iter()
+            .any(|prefix| prefix_reaches_boundary(&joined, first, prefix))
+        {
             for at in [index, index + 1] {
                 if let Some(slot) = redacted.get_mut(at) {
                     REDACTED.clone_into(slot);
@@ -362,6 +373,40 @@ fn redact_words(words: &[&str]) -> Vec<String> {
         }
     }
     redacted
+}
+
+/// Whether a token `prefix` in `joined` (`first` then the next word) runs up
+/// to, or across, the boundary between the words: `gh` / `p_x` split by a
+/// separator, `ghp_` / `x` with the whole prefix before it, or `xoxb-` / `x`
+/// with a few token characters after the prefix. The token body is then the
+/// next word.
+fn prefix_reaches_boundary(joined: &str, first: &str, prefix: &str) -> bool {
+    joined.match_indices(prefix).any(|(at, _)| {
+        let end = at + prefix.len();
+        at < first.len()
+            && first.len() <= end + 4
+            && first
+                .get(end..)
+                .unwrap_or("")
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    })
+}
+
+/// A short key (`pass`, `pwd`, `sig`, `signature`, `cookie`, `auth`, `key`,
+/// `code`, `session`, `sid`) standing alone, quoted or not, whose separator
+/// is the next word (`pass : x`, `pwd = x`, `{"pwd" : "x"}`).
+fn spaced_short_key(lower: &str, next: Option<&str>) -> bool {
+    let bare = lower.trim_matches(['{', '[', '(', '"', '\'', ',']);
+    let separator = next.and_then(|word| word.chars().next());
+    SECRET_KEYS.iter().any(|(key, follow)| {
+        bare == *key
+            && match follow {
+                Follow::Any => false,
+                Follow::Separator => matches!(separator, Some(':' | '=')),
+                Follow::Equals => separator == Some('='),
+            }
+    })
 }
 
 /// Where a secret key's value is.
@@ -380,39 +425,42 @@ enum Follow {
     /// `:` or `=`: short words like `pass` or `signature` are ordinary
     /// English until a separator makes them a key.
     Separator,
-    /// `=` only: query and cookie keys (`?code=`, `session=`).
+    /// `=` only: query and cookie keys (`?code=`, `session=`), which appear
+    /// with `:` in ordinary text (`exit code: 128`).
     Equals,
 }
 
+/// Secret key words and what must follow each for it to name a secret.
+const SECRET_KEYS: [(&str, Follow); 24] = [
+    ("password", Follow::Any),
+    ("passwd", Follow::Any),
+    ("passphrase", Follow::Any),
+    ("token", Follow::Any),
+    ("secret", Follow::Any),
+    ("authorization", Follow::Any),
+    ("bearer", Follow::Any),
+    ("api_key", Follow::Any),
+    ("apikey", Follow::Any),
+    ("api-key", Follow::Any),
+    ("credential", Follow::Any),
+    ("private_key", Follow::Any),
+    ("access_key", Follow::Any),
+    ("x-amz-signature", Follow::Any),
+    ("pass", Follow::Separator),
+    ("pwd", Follow::Separator),
+    ("sig", Follow::Separator),
+    ("signature", Follow::Separator),
+    ("cookie", Follow::Separator),
+    ("auth", Follow::Separator),
+    ("key", Follow::Separator),
+    ("code", Follow::Equals),
+    ("session", Follow::Equals),
+    ("sid", Follow::Equals),
+];
+
 /// The value's place when `lower` names a secret at a word boundary.
 fn sensitive_key(lower: &str) -> Option<KeyValue> {
-    const KEYS: [(&str, Follow); 24] = [
-        ("password", Follow::Any),
-        ("passwd", Follow::Any),
-        ("passphrase", Follow::Any),
-        ("token", Follow::Any),
-        ("secret", Follow::Any),
-        ("authorization", Follow::Any),
-        ("bearer", Follow::Any),
-        ("api_key", Follow::Any),
-        ("apikey", Follow::Any),
-        ("api-key", Follow::Any),
-        ("credential", Follow::Any),
-        ("private_key", Follow::Any),
-        ("access_key", Follow::Any),
-        ("x-amz-signature", Follow::Any),
-        ("pass", Follow::Separator),
-        ("pwd", Follow::Separator),
-        ("sig", Follow::Separator),
-        ("signature", Follow::Separator),
-        ("cookie", Follow::Separator),
-        ("auth", Follow::Equals),
-        ("key", Follow::Equals),
-        ("code", Follow::Equals),
-        ("session", Follow::Equals),
-        ("sid", Follow::Equals),
-    ];
-    KEYS.iter().find_map(|(key, follow)| {
+    SECRET_KEYS.iter().find_map(|(key, follow)| {
         lower.match_indices(key).find_map(|(at, _)| {
             let before = lower.get(..at).and_then(|head| head.chars().next_back());
             let tail = lower.get(at + key.len()..).unwrap_or("");
@@ -2758,6 +2806,7 @@ mod tests {
     /// values, `pwd`/`pass`/`cookie`/`sig`/`x-amz-signature`, Unicode format
     /// and invisible separators, `/` in a URL password).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn redaction_r3_probes_leak_nothing() {
         let cases: &[(&[u8], &str)] = &[
             (b"Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
@@ -2827,6 +2876,40 @@ mod tests {
             (b"https://h/x?key=s3cr3tvalue", "s3cr3tvalue"),
             (b"https://h/x?code=s3cr3tvalue", "s3cr3tvalue"),
             (b"session=s3cr3tvalue", "s3cr3tvalue"),
+            // R5-A: a whole token prefix, then a separator, then the body.
+            ("ghp_\u{a0}abcdef0123456789".as_bytes(), "abcdef0123456789"),
+            (
+                "ghp_\u{2028}abcdef0123456789".as_bytes(),
+                "abcdef0123456789",
+            ),
+            ("ghp_\u{85}abcdef0123456789".as_bytes(), "abcdef0123456789"),
+            (b"ghp_\x00abcdef0123456789", "abcdef0123456789"),
+            (b"ghp_\x1babcdef0123456789", "abcdef0123456789"),
+            (b"remote: ghp_ abcdef0123456789", "abcdef0123456789"),
+            (b"ghp_\nabcdef0123456789", "abcdef0123456789"),
+            ("AKIA\u{a0}IOSFODNN7EXAMPLE".as_bytes(), "IOSFODNN7EXAMPLE"),
+            (
+                "github_pat_\u{2003}11ABCDEFG0123456789".as_bytes(),
+                "11ABCDEFG0123456789",
+            ),
+            ("glpat-\u{85}s3cr3tvalue0123".as_bytes(), "s3cr3tvalue0123"),
+            (
+                "xoxb-\u{a0}123456789012-s3cr3tv".as_bytes(),
+                "123456789012-s3cr3tv",
+            ),
+            // R5-B: a short key whose separator is its own word.
+            (b"pass : hunter2", "hunter2"),
+            (b"pwd = hunter2", "hunter2"),
+            (b"sig = s3cr3tvalue", "s3cr3tvalue"),
+            (b"signature : s3cr3tvalue", "s3cr3tvalue"),
+            (b"Cookie : abc123s3cr3t", "abc123s3cr3t"),
+            (b"{\"pwd\" : \"hunter2\"}", "hunter2"),
+            (b"{\"pass\": \"hunter2\"}", "hunter2"),
+            ("pass\u{a0}:\u{a0}hunter2".as_bytes(), "hunter2"),
+            (b"pass\n:\nhunter2", "hunter2"),
+            (b"session = s3cr3tvalue", "s3cr3tvalue"),
+            (b"auth: s3cr3tvalue", "s3cr3tvalue"),
+            (b"API key: s3cr3tvalue", "s3cr3tvalue"),
         ];
         for (input, secret) in cases {
             let out = detail(input).unwrap_or_default();
