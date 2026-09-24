@@ -166,12 +166,22 @@ pub enum Qos {
     Background,
 }
 
+/// Hex digits in a destination store's temporary tag.
+pub const TEMP_TAG_HEX: usize = 16;
+
+/// A destination store's temporary tag: 16 lowercase hex digits, as
+/// `materialize::temporary_tag` derives it from the store's authority. Named
+/// temporaries carry it so the store's sweep (R-N79) covers them.
+pub type TempTag = [u8; TEMP_TAG_HEX];
+
 /// A staged file that is not yet visible under its final name.
 ///
 /// On Linux it is an `O_TMPFILE` inode with no name at all, so a crash leaves
 /// no orphan; a file system without `O_TMPFILE`, or a process without
 /// `/proc/self/fd`, gets a named temporary instead. On Darwin it is always a
-/// named temporary (`O_EXCL`, private mode). The staged file remembers the
+/// named temporary (`O_EXCL`, private mode) named `.bulkload-<tag>-<pid>-<n>`
+/// in the materializer's grammar, so a crash leaves nothing the store's
+/// sweep does not recognize. The staged file remembers the
 /// directory it was created in, and [`TempFile::publish`] consumes it and
 /// never replaces an existing name.
 #[derive(Debug)]
@@ -199,17 +209,19 @@ pub struct PublishError {
 }
 
 impl TempFile {
-    /// Stage a new file in `dir` with permission bits `mode`. The directory
+    /// Stage a new file in `dir` with permission bits `mode`; a named
+    /// temporary carries the destination store's `tag`. The directory
     /// descriptor is duplicated and kept for [`TempFile::publish`].
     ///
     /// # Errors
-    /// Returns the `openat` or descriptor-duplication failure.
-    pub fn create(dir: impl AsFd, mode: u32) -> std::io::Result<Self> {
+    /// `InvalidInput` for a malformed tag; otherwise the `openat` or
+    /// descriptor-duplication failure.
+    pub fn create(dir: impl AsFd, mode: u32, tag: &TempTag) -> std::io::Result<Self> {
         let dir = dir.as_fd();
         let (fd, kind) = if let Some(fd) = sys::open_tmpfile(dir, mode)? {
             (fd, Staged::Anonymous)
         } else {
-            let (fd, name) = sys::create_temp_named(dir, mode)?;
+            let (fd, name) = sys::create_temp_named(dir, mode, tag)?;
             (fd, Staged::Named(name))
         };
         Ok(Self {

@@ -732,13 +732,14 @@ mod recorded {
             let _attached = recorder.attach();
             let data = CString::new("data").unwrap();
             if named {
-                let (fd, name) = sys::create_temp_named(&root, 0o600).unwrap();
+                let (fd, name) =
+                    sys::create_temp_named(&root, 0o600, &crate::io::tests::TAG).unwrap();
                 sys::pwrite_all(&fd, NEW, 0).unwrap();
                 seal(&fd, file, false);
                 sys::rename_noreplace(&root, &name, &data).unwrap();
                 anonymous = false;
             } else {
-                let temp = TempFile::create(&root, 0o600).unwrap();
+                let temp = TempFile::create(&root, 0o600, &crate::io::tests::TAG).unwrap();
                 anonymous = temp.is_anonymous();
                 sys::pwrite_all(temp.fd(), NEW, 0).unwrap();
                 seal(temp.fd(), file, false);

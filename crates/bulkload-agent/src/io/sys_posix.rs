@@ -170,20 +170,32 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Create a private named temporary in `dir` (`O_EXCL`), retrying on a name
 /// collision. Returns the descriptor and the name.
 ///
+/// The name is `.bulkload-<tag>-<pid>-<n>`, the materializer's file-temporary
+/// grammar (`materialize::temporary_name`), carrying the destination store's
+/// `tag`. The store's sweep therefore recognizes and removes a W4 temporary
+/// that a crash left behind, exactly as it does its own.
+///
 /// # Errors
-/// Returns the `openat` failure, or `AlreadyExists` after 64 collisions.
-pub fn create_temp_named(dir: impl AsFd, mode: u32) -> io::Result<(OwnedFd, CString)> {
+/// `InvalidInput` for a tag that is not 16 lowercase hex digits; otherwise
+/// the `openat` failure, or `AlreadyExists` after 64 collisions.
+pub fn create_temp_named(
+    dir: impl AsFd,
+    mode: u32,
+    tag: &super::TempTag,
+) -> io::Result<(OwnedFd, CString)> {
+    if !tag
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(invalid_input());
+    }
     let dir = dir.as_fd();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
     for _ in 0..64 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            ".bulkload-tmp.{}.{sequence}.{nanos:08x}",
-            std::process::id()
-        );
-        let name = super::c_name(name.as_bytes())?;
+        let mut name = crate::materialize::TEMPORARY_PREFIX.to_vec();
+        name.extend_from_slice(tag);
+        name.extend_from_slice(format!("-{}-{sequence}", std::process::id()).as_bytes());
+        let name = super::c_name(&name)?;
         match create_excl_at(dir, &name, mode) {
             Ok(fd) => return Ok((fd, name)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

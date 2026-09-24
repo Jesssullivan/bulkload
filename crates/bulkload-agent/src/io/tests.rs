@@ -21,6 +21,9 @@ use std::path::Path;
 
 use super::{sys, OpenMode, TempFile};
 
+/// A store tag for tests, in `materialize::temporary_tag`'s alphabet.
+pub const TAG: super::TempTag = *b"0123456789abcdef";
+
 fn c(name: &str) -> CString {
     CString::new(name).unwrap()
 }
@@ -226,7 +229,7 @@ fn preallocation_and_read_advice_keep_the_size() {
 fn temp_files_publish_without_clobbering() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = sys::open_root(dir.path()).unwrap();
-    let temp = TempFile::create(&root, 0o600).unwrap();
+    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
     eprintln!("staged anonymous={}", temp.is_anonymous());
     if temp.is_anonymous() {
         assert_eq!(
@@ -241,7 +244,7 @@ fn temp_files_publish_without_clobbering() {
     sys::barrier_dir(&root).unwrap();
     assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"staged");
 
-    let second = TempFile::create(&root, 0o600).unwrap();
+    let second = TempFile::create(&root, 0o600, &TAG).unwrap();
     sys::pwrite_all(second.fd(), b"other", 0).unwrap();
     let clobber = second.publish(&c("final")).unwrap_err();
     assert_eq!(clobber.error.kind(), ErrorKind::AlreadyExists);
@@ -255,12 +258,50 @@ fn temp_files_publish_without_clobbering() {
 fn named_temp_fallback_is_private_and_exclusive() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = sys::open_root(dir.path()).unwrap();
-    let (fd, name) = sys::create_temp_named(&root, 0o600).unwrap();
+    let (fd, name) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
     let stat = sys::fstatat_nofollow(&root, &name).unwrap();
     assert_eq!(stat.node, sys::fstat(&fd).unwrap().node);
     assert_eq!(stat.permissions(), 0o600);
-    let (_, other) = sys::create_temp_named(&root, 0o600).unwrap();
+    let (_, other) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
     assert_ne!(name, other);
+}
+
+/// Review #10: named temporaries use the materializer's file-temporary
+/// grammar with the store's tag, so #60's sweep recognizes them. Checked with
+/// the materializer's own parser.
+#[test]
+fn named_temporaries_follow_the_materializer_grammar() {
+    use crate::materialize::{temporary_name, TemporaryName};
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = sys::open_root(dir.path()).unwrap();
+    for _ in 0..3 {
+        let (_, name) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
+        assert_eq!(
+            temporary_name(name.to_bytes()),
+            Some(TemporaryName::File(TAG)),
+            "{name:?}"
+        );
+    }
+    for bad in [
+        *b"0123456789ABCDEF",
+        *b"0123456789abcde-",
+        *b"0123456789abcdeg",
+    ] {
+        let refused = sys::create_temp_named(&root, 0o600, &bad).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    }
+    // A staged TempFile that falls back to a name carries the same grammar.
+    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
+    if !temp.is_anonymous() {
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().all(|leaf| {
+            temporary_name(std::os::unix::ffi::OsStrExt::as_bytes(leaf.as_os_str()))
+                == Some(TemporaryName::File(TAG))
+        }));
+    }
 }
 
 /// A scratch directory on tmpfs (`/dev/shm`), where Linux supports
@@ -293,7 +334,7 @@ fn linux_o_tmpfile_publishes_through_proc_self_fd() {
         return;
     };
     let root = sys::open_root(dir.path()).unwrap();
-    let temp = TempFile::create(&root, 0o600).unwrap();
+    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
     assert!(temp.is_anonymous(), "tmpfs supports O_TMPFILE");
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     sys::pwrite_all(temp.fd(), b"anonymous", 0).unwrap();
@@ -437,7 +478,7 @@ mod traced {
         let attached = recorder.attach();
         let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o777)).unwrap();
         sys::mkdirat(&root, &c("d"), 0o777).unwrap();
-        let temp = TempFile::create(&root, 0o777).unwrap();
+        let temp = TempFile::create(&root, 0o777, &TAG).unwrap();
         drop(attached);
         let file_mode = sys::fstat(&fd).unwrap().permissions();
         let dir_mode = sys::fstatat_nofollow(&root, &c("d")).unwrap().permissions();
