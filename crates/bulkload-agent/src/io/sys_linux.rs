@@ -35,33 +35,49 @@ pub fn full_flush(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Rename `from` to `to` inside `directory` without replacing an existing `to`.
-///
-/// Uses `renameat2(RENAME_NOREPLACE)`; a file system without it gets
-/// `linkat` followed by `unlinkat`, which is also no-clobber.
+/// Rename `from` to `to` inside `directory` atomically, failing with `EEXIST`
+/// rather than replacing an existing `to` (`renameat2(RENAME_NOREPLACE)`).
 ///
 /// # Errors
-/// Returns the rename failure; an occupied target is `EEXIST`.
-pub fn rename_noreplace(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+/// Returns the rename failure; an occupied target is `EEXIST`, and a kernel
+/// or file system without it reports `EINVAL` or `ENOSYS`.
+pub fn rename_exclusive(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let fd = directory.as_raw_fd();
-        // SAFETY: `fd` is owned by `directory` for the duration of the call,
-        // and both names are NUL-terminated C strings that outlive it.
-        let renamed =
-            unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) };
+        let fd = libc::c_long::from(directory.as_raw_fd());
+        // SAFETY: renameat2 reads two NUL-terminated names relative to a
+        // descriptor owned by `directory` for the duration of the call; the
+        // raw syscall avoids depending on a libc wrapper.
+        let renamed = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                fd,
+                from.as_ptr(),
+                fd,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
         if renamed == 0 {
             return Ok(());
         }
-        let error = std::io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
-            return Err(error);
-        }
+        Err(std::io::Error::last_os_error())
     }
-    link_then_unlink(directory, from, to)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (directory, from, to);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
 
-fn link_then_unlink(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+/// Link `from` to `to` inside `directory`, then remove `from`.
+///
+/// No-clobber (`linkat` fails with `EEXIST`), but two directory operations
+/// rather than one: the fallback where no exclusive rename is offered.
+///
+/// # Errors
+/// Returns the failed link or unlink.
+pub fn link_then_unlink(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
     let fd = directory.as_raw_fd();
     // SAFETY: `fd` is owned by `directory` for the duration of the call, both
     // names are NUL-terminated and outlive it, and flag 0 never follows links.

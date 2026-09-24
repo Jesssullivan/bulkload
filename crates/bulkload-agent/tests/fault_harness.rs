@@ -11,7 +11,9 @@
 //! crash state and runs `copy` again, clean and in process, and asserts:
 //!
 //! - **I1** every recorded output's file has its recorded stat identity and
-//!   hashes to the committed source manifest for that path;
+//!   the source's content, and hashes to the committed source manifest for
+//!   that path when one exists (the source sends before its capture commits,
+//!   so an output may be recorded before its capture);
 //! - **I2** no destination leaf under a final name holds partial content, and
 //!   `.bulkload-*` temporaries are the only extra names;
 //! - **I3** the resume reads exactly the source bytes of files that had neither

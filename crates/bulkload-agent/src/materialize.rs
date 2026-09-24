@@ -230,15 +230,15 @@ impl Destination {
         Ok(())
     }
 
-    /// An existing regular output at `row`'s path, opened without following
-    /// any link, or `None` when the path is free.
+    /// An existing regular output at `row`'s path with its parent directory,
+    /// opened without following any link, or `None` when the path is free.
     ///
     /// # Errors
     /// Refuses a conflicting node or unsafe ancestor.
-    pub(crate) fn existing(&self, row: &RowSchema) -> Result<Option<File>> {
-        let (parent, leaf) = self.parent(&row.rel_path)?;
+    pub(crate) fn existing(&self, row: &RowSchema) -> Result<Option<(File, Arc<File>)>> {
+        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
         match open_regular(&parent, &leaf) {
-            Ok(file) => Ok(Some(file)),
+            Ok(file) => Ok(Some((file, parent))),
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
             Err(error) => Err(error),
         }
@@ -364,8 +364,7 @@ impl StagedFile {
             return Err(error.into());
         }
         fault_point!(MaterializeAfterTempSeal);
-        if let Err(error) =
-            crate::io::sys::rename_noreplace(&self.parent, &self.temporary, &self.leaf)
+        if let Err(error) = crate::io::publish_noreplace(&self.parent, &self.temporary, &self.leaf)
         {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -408,8 +407,13 @@ pub(crate) enum Publication {
         record: PendingOutput,
     },
     /// An existing output already verified against its manifest, with the
-    /// descriptor it was verified through.
-    Adopted { record: OutputRecord, file: File },
+    /// descriptor it was verified through and its parent directory. Its data
+    /// and entry are sealed like a written file's before the record commits.
+    Adopted {
+        record: OutputRecord,
+        file: File,
+        parent: Arc<File>,
+    },
 }
 
 /// The record for a staged file, completed with its identity once published.
@@ -474,12 +478,6 @@ impl TouchedDevices {
         self.directories.push(directory);
     }
 
-    fn file(&mut self, file: Arc<File>) {
-        if let Ok(metadata) = file.metadata() {
-            self.devices.entry(metadata.dev()).or_insert(file);
-        }
-    }
-
     /// Seal every touched directory once, then, in group mode, fully flush
     /// each touched device other than `store_device`: the store commit that
     /// follows drains only its own device. Returns the devices flushed.
@@ -529,10 +527,17 @@ impl crate::io::durable::GroupSink for PublishSink {
                     }
                     Err(refusal) => self.outcomes.push((record.rel_path, Err(refusal))),
                 },
-                Publication::Adopted { record, file } => {
-                    touched.file(Arc::new(file));
-                    records.push(record);
-                }
+                Publication::Adopted {
+                    record,
+                    file,
+                    parent,
+                } => match crate::io::durable::seal_file(&file) {
+                    Ok(()) => {
+                        touched.directory(parent);
+                        records.push(record);
+                    }
+                    Err(error) => self.outcomes.push((record.rel_path, Err(error.into()))),
+                },
             }
         }
         let committed = touched.seal(self.store_device).and_then(|_| {
@@ -709,6 +714,73 @@ mod tests {
         assert_eq!(touched.seal(device)?, 0);
         // Store elsewhere (PR #59 review): one full flush on this device.
         assert_eq!(touched.seal(device.wrapping_add(1))?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_falls_back_to_link_where_exclusive_rename_is_unsupported() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-rename-fallback-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(source.join("free"), b"ours")?;
+        std::fs::write(source.join("taken"), b"ours")?;
+        let rows = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows;
+        std::fs::write(destination.join("taken"), b"theirs")?;
+        let target = Destination::open(&destination)?;
+        let mut publications = Vec::new();
+        for row in &rows {
+            let staged = target.stage(row)?;
+            (&**staged.file()).write_all(b"ours")?;
+            publications.push(Publication::Staged {
+                staged,
+                record: PendingOutput {
+                    key: row.rel_path.clone(),
+                    rel_path: row.rel_path.clone(),
+                    size: 4,
+                    hints: Vec::new(),
+                },
+            });
+        }
+        let before = counters::Counters::snapshot();
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        crate::io::force_rename_unsupported(true);
+        sink.commit(publications);
+        crate::io::force_rename_unsupported(false);
+        let mut report = sink.finish();
+        report.sort_by(|left, right| left.0.cmp(&right.0));
+        let fallbacks = counters::Counters::snapshot()
+            .since(before)
+            .get(Counter::PublishLinkFallback);
+        let free = std::fs::read(destination.join("free"))?;
+        let taken = std::fs::read(destination.join("taken"))?;
+        let listed = std::fs::read_dir(&destination)?.count();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [
+                (b"free".to_vec(), Ok(())),
+                (
+                    b"taken".to_vec(),
+                    Err(BulkloadRefusal::GitDestinationOccupied)
+                ),
+            ]
+        );
+        assert!(fallbacks >= 1, "the fallback path is recorded");
+        assert_eq!(free, b"ours");
+        assert_eq!(taken, b"theirs", "the fallback never replaces");
+        assert_eq!(listed, 2, "no temporary is left behind");
         Ok(())
     }
 }

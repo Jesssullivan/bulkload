@@ -111,6 +111,7 @@ counters! {
     // Group commit (io::durable) and transport tuning.
     DurableGroups => "durable_groups",
     TransportTuned => "transport_buffers_raised",
+    PublishLinkFallback => "publish_link_fallback",
     // SQLite commits, by kind. Autocommit statements count as one commit each.
     SqliteSchema => "sqlite_schema_commits",
     SqliteGroupSource => "sqlite_group_source_commits",

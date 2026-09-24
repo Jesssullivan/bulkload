@@ -133,6 +133,17 @@ fn w3_engine_properties() {
     assert_eq!((adopted.source_bytes_read, adopted.bytes_received), (0, 0));
     assert_eq!(counted.get(Counter::DestVerifyRead), payload);
     assert_eq!(counted.get(Counter::FilesMaterialized), 0);
+    // Adopted outputs are sealed, and their directory too, before the record.
+    assert!(
+        counted.get(Counter::FlushBarrier) >= 4,
+        "{}",
+        counted.render()
+    );
+    assert!(
+        counted.get(Counter::FlushDirBarrier) >= 1,
+        "{}",
+        counted.render()
+    );
 
     // Strict: a full flush per file in place of the barrier.
     set_durability(Durability::Strict);

@@ -51,18 +51,40 @@ pub fn full_flush(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Rename `from` to `to` inside `directory`, failing with `EEXIST` rather than
-/// replacing an existing `to` (`renameatx_np(RENAME_EXCL)`).
+/// Rename `from` to `to` inside `directory` atomically, failing with `EEXIST`
+/// rather than replacing an existing `to` (`renameatx_np(RENAME_EXCL)`).
 ///
 /// # Errors
-/// Returns the rename failure; an occupied target is `EEXIST`.
-pub fn rename_noreplace(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+/// Returns the rename failure; an occupied target is `EEXIST`, and a file
+/// system without exclusive rename reports `ENOTSUP` or `EINVAL`.
+pub fn rename_exclusive(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
     let fd = directory.as_raw_fd();
     // SAFETY: `fd` is owned by `directory` for the duration of the call, and
     // both names are NUL-terminated C strings that outlive it.
     let renamed =
         unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) };
     if renamed != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Link `from` to `to` inside `directory`, then remove `from`.
+///
+/// No-clobber (`linkat` fails with `EEXIST`), but two directory operations
+/// rather than one: the fallback where no exclusive rename is offered.
+///
+/// # Errors
+/// Returns the failed link or unlink.
+pub fn link_then_unlink(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    let fd = directory.as_raw_fd();
+    // SAFETY: `fd` is owned by `directory` for the duration of the call, both
+    // names are NUL-terminated and outlive it, and flag 0 never follows links.
+    if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above; `from` is the private temporary name just linked.
+    if unsafe { libc::unlinkat(fd, from.as_ptr(), 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())

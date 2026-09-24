@@ -86,8 +86,9 @@
 //!
 //! Group commit closes a group by count, size or idle time, so how many
 //! groups a run has depends on timing. With [`GROUP_FILES_ENV`] set to `N`,
-//! every committer closes a group at `N` files, which makes `nth` hits of the
-//! group points reproducible.
+//! every committer closes a group at `N` files. Only `N = 1` makes `nth` hits
+//! of the group points exact: with a larger `N` the idle timeout can still
+//! close a group early.
 //!
 //! # Live-writer hook
 //!

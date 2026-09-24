@@ -829,7 +829,7 @@ impl SessionChunks {
 /// How the destination will satisfy one manifest.
 enum Plan {
     Refuse(BulkloadRefusal),
-    Adopt(std::fs::File),
+    Adopt(std::fs::File, Arc<std::fs::File>),
     Write(Staging),
 }
 
@@ -873,7 +873,7 @@ fn receive_content<R: Read, W: Write>(
             )?;
             Err(refusal)
         }
-        Plan::Adopt(file) => {
+        Plan::Adopt(file, parent) => {
             write_frame(
                 output,
                 FrameKind::WantChunks {
@@ -889,6 +889,7 @@ fn receive_content<R: Read, W: Write>(
                         hints: Vec::new(),
                     },
                     file,
+                    parent,
                 })
             })
         }
@@ -999,7 +1000,7 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
         return Plan::Refuse(BulkloadRefusal::DigestMismatch);
     }
     match context.target.existing(row) {
-        Ok(Some(file)) => return Plan::Adopt(file),
+        Ok(Some((file, parent))) => return Plan::Adopt(file, parent),
         Ok(None) => (),
         Err(refusal) => return Plan::Refuse(refusal),
     }
