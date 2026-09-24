@@ -548,6 +548,35 @@ impl FileSizeLimit {
         check(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit) })?;
         Ok(guard)
     }
+
+    /// The current `RLIMIT_FSIZE` as `(soft, hard)`.
+    ///
+    /// # Errors
+    /// Returns the `getrlimit` failure.
+    pub fn current() -> io::Result<(u64, u64)> {
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `now` is a live, exclusively borrowed `rlimit`.
+        check(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut now) })?;
+        Ok((now.rlim_cur, now.rlim_max))
+    }
+
+    /// Whether `SIGXFSZ` is currently ignored.
+    ///
+    /// # Errors
+    /// Returns the `sigaction` failure.
+    pub fn sigxfsz_ignored() -> io::Result<bool> {
+        let mut now = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: a null new-action pointer only queries; `now` is a live
+        // local of type `sigaction` that the kernel fills.
+        check(unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), now.as_mut_ptr()) })?;
+        // SAFETY: `sigaction` returned 0, so it filled `now`, which was
+        // zero-initialized in any case.
+        let now = unsafe { now.assume_init() };
+        Ok(now.sa_sigaction == libc::SIG_IGN)
+    }
 }
 
 #[cfg(all(test, feature = "io-trace"))]
