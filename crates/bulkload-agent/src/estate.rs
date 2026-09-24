@@ -325,7 +325,7 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
         Plan::default()
     };
     let mut identities = std::collections::HashSet::new();
-    let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut targets: Vec<((PathBuf, bool), PathBuf)> = Vec::new();
     // Round 4 N4: targets compare in canonical, case-folded form.
     for previous in &contents.items {
         identities.insert(id(previous)?);
@@ -365,10 +365,18 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
 // item, restored where it was). Component-wise, never string prefixes. The
 // targets are `target_key` forms (round 4 N4); when those are case-folded the
 // source relation is compared case-folded too.
-fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) -> bool {
+fn overlapping(
+    (target, folded): &(PathBuf, bool),
+    source: &Path,
+    (other, other_folded): &(PathBuf, bool),
+    other_source: &Path,
+) -> bool {
     if target == other {
         return true;
     }
+    // R5-3: the source relation is compared case-folded only when both
+    // target keys were folded; otherwise exactly (folding can only relax it).
+    let both_folded = *folded && *other_folded;
     let nested = |inner: &Path, inner_source: &Path, outer: &Path, outer_source: &Path| {
         inner
             .strip_prefix(outer)
@@ -376,7 +384,11 @@ fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) 
             .filter(|relative| !relative.as_os_str().is_empty())
             .map(|relative| {
                 let joined = outer_source.join(relative);
-                joined != inner_source && fold(&joined) != fold(inner_source)
+                if both_folded {
+                    fold(&joined) != fold(inner_source)
+                } else {
+                    joined != inner_source
+                }
             })
     };
     nested(target, source, other, other_source)
@@ -390,7 +402,7 @@ fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) 
 // popped, a trailing slash ignored); and on a case-insensitive volume the
 // whole path is ASCII case-folded. A Unicode case or normalisation variant
 // that slips through meets the restore's typed GIT_DESTINATION_OCCUPIED.
-fn target_key(target: &Path) -> Result<PathBuf> {
+fn target_key(target: &Path) -> Result<(PathBuf, bool)> {
     use std::path::Component;
     let components: Vec<Component<'_>> = target.components().collect();
     for existing in (1..=components.len()).rev() {
@@ -408,7 +420,11 @@ fn target_key(target: &Path) -> Result<PathBuf> {
                 Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
             }
         }
-        return Ok(if insensitive { fold(&key) } else { key });
+        return Ok(if insensitive {
+            (fold(&key), true)
+        } else {
+            (key, false)
+        });
     }
     Err(BulkloadRefusal::PathNotAbsolute)
 }
@@ -442,8 +458,8 @@ fn case_insensitive(path: &Path) -> bool {
 // Elsewhere there is no volume-wide query (ext4 casefold is per directory,
 // vfat folds everywhere), so probe read-only: find the deepest component of
 // `path` whose name has an ASCII letter, and ask whether its case-flipped
-// spelling names the same inode. Nothing is created. No such component, or a
-// flipped name that does not resolve, means case-sensitive.
+// spelling names the same inode. Nothing is created. A flipped name that is
+// absent means case-sensitive; anything unanswerable means insensitive.
 #[cfg(not(target_os = "macos"))]
 fn case_insensitive(path: &Path) -> bool {
     probe_case_insensitive(path)
@@ -452,11 +468,25 @@ fn case_insensitive(path: &Path) -> bool {
 fn probe_case_insensitive(path: &Path) -> bool {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
+    // R5-7: every unanswerable case answers insensitive, which can only add
+    // overlap refusals: a path that does not resolve, a walk that reaches the
+    // root without a lettered name, a lookup that fails for any reason but
+    // absence, and a walk that would cross a device boundary (the parent
+    // directory would answer for another volume).
+    let Ok(mut meta) = fs::symlink_metadata(path) else {
+        return true;
+    };
     let mut current = path.to_path_buf();
     loop {
         let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
-            return false;
+            return true;
         };
+        let Ok(parent_meta) = fs::symlink_metadata(parent) else {
+            return true;
+        };
+        if parent_meta.dev() != meta.dev() {
+            return true;
+        }
         let bytes = name.as_bytes();
         if bytes.iter().any(u8::is_ascii_alphabetic) {
             let flipped: Vec<u8> = bytes
@@ -470,15 +500,14 @@ fn probe_case_insensitive(path: &Path) -> bool {
                 })
                 .collect();
             let variant = parent.join(std::ffi::OsString::from_vec(flipped));
-            return match (
-                fs::symlink_metadata(&current),
-                fs::symlink_metadata(variant),
-            ) {
-                (Ok(real), Ok(folded)) => real.dev() == folded.dev() && real.ino() == folded.ino(),
-                _ => false,
+            return match fs::symlink_metadata(variant) {
+                Ok(folded) => folded.dev() == meta.dev() && folded.ino() == meta.ino(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
             };
         }
         current = parent.to_path_buf();
+        meta = parent_meta;
     }
 }
 
@@ -1199,7 +1228,19 @@ fn apply_item(
     // only copy this apply reads: the marker check, the digest (computed while
     // copying) and the restore all see the same bytes (round-3 N4), and the
     // restore verbs below do not check again.
-    let staged = git_carry::stage_bundle(&corpus.join(&captured.bundle))?;
+    // R5-4: a carrier bundle the record names but the corpus no longer holds
+    // is a typed refusal, never a bare IO errno.
+    let published = corpus.join(&captured.bundle);
+    if !published.try_exists()? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    let staged = git_carry::stage_bundle(&published).map_err(|error| {
+        if error == BulkloadRefusal::Io(Some(libc::ENOENT)) {
+            BulkloadRefusal::SealedObjectMissing
+        } else {
+            error
+        }
+    })?;
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
@@ -1276,14 +1317,14 @@ pub fn apply(
         let depth = match &item.workspace {
             None => 0,
             Some(workspace) => {
-                let key = target_key(workspace)?;
+                let (key, _) = target_key(workspace)?;
                 let mut depth = 0;
                 for other in contents
                     .items
                     .iter()
                     .filter_map(|other| other.workspace.as_ref())
                 {
-                    let other = target_key(other)?;
+                    let (other, _) = target_key(other)?;
                     if key.starts_with(&other) && key != other {
                         depth += 1;
                     }
@@ -2919,5 +2960,112 @@ mod tests {
             vec![Some(BulkloadRefusal::GitDestinationOccupied.to_string())]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// #53 round-5 reviewer probes of 895cd8a's read-only case probe (R-N114),
+// kept as regression tests. The case-sensitive directory comes from RV5_CS
+// (an hdiutil case-sensitive APFS image), its mount root from RV5_CS_ROOT;
+// those probes skip when unset. Under R5-7 an unanswerable probe (a missing
+// path, or a walk that would cross a device boundary) answers insensitive,
+// which can only add overlap refusals; the two probes that asserted the
+// opposite now assert that.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53e_probe {
+    use super::*;
+
+    fn cs() -> Option<(PathBuf, PathBuf)> {
+        Some((
+            fs::canonicalize(std::env::var_os("RV5_CS")?).ok()?,
+            fs::canonicalize(std::env::var_os("RV5_CS_ROOT")?).ok()?,
+        ))
+    }
+
+    fn scratch(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(format!("rv5p-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    // A symlinked nearest existing ancestor: target_key resolves it, so the
+    // probe sees the real directory on the real volume.
+    #[test]
+    fn rv5_probe_symlinked_ancestor_is_resolved_before_probing() {
+        let Some((cs, _)) = cs() else { return };
+        let root = scratch(&cs, "symlink");
+        let real = root.join("Real");
+        fs::create_dir(&real).unwrap();
+        let tmp = scratch(&std::env::temp_dir(), "symlink-ci");
+        std::os::unix::fs::symlink(&real, tmp.join("Link")).unwrap();
+        let (key, _) = target_key(&tmp.join("Link/Sub/Leaf")).unwrap();
+        let (probe_real, probe_link) = (
+            probe_case_insensitive(&real),
+            probe_case_insensitive(&tmp.join("Link")),
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&tmp).unwrap();
+        eprintln!("key={key:?} probe(real on cs)={probe_real} probe(link on ci)={probe_link}");
+        assert_eq!(
+            key,
+            real.join("Sub/Leaf"),
+            "not folded: the real volume is case-sensitive"
+        );
+        assert!(!probe_real);
+    }
+
+    // A case-flipped name that exists as a different entry on a case-sensitive
+    // volume is a different inode: still case-sensitive.
+    #[test]
+    fn rv5_probe_flipped_name_existing_as_another_entry() {
+        let Some((cs, _)) = cs() else { return };
+        let root = scratch(&cs, "flipped");
+        fs::create_dir(root.join("Tgt")).unwrap();
+        fs::create_dir(root.join("tGT")).unwrap();
+        fs::write(root.join("File"), b"a").unwrap();
+        fs::write(root.join("fILE"), b"b").unwrap();
+        let dirs = probe_case_insensitive(&root.join("Tgt"));
+        let files = probe_case_insensitive(&root.join("File"));
+        // A hard link under the flipped name (files only) is the same inode.
+        fs::remove_file(root.join("fILE")).unwrap();
+        fs::hard_link(root.join("File"), root.join("fILE")).unwrap();
+        let hardlinked = probe_case_insensitive(&root.join("File"));
+        fs::remove_dir_all(&root).unwrap();
+        eprintln!("dirs={dirs} files={files} hardlinked={hardlinked}");
+        assert!(!dirs && !files);
+    }
+
+    // A component that does not exist yet: nothing resolves, no fold, and
+    // target_key probes only its existing ancestor.
+    #[test]
+    fn rv5_probe_missing_component() {
+        let tmp = scratch(&std::env::temp_dir(), "missing");
+        let missing = probe_case_insensitive(&tmp.join("NotThere"));
+        let (key, _) = target_key(&tmp.join("NotThere/Deeper")).unwrap();
+        let ci = probe_case_insensitive(&tmp);
+        fs::remove_dir_all(&tmp).unwrap();
+        eprintln!("missing={missing} tmp-probe={ci} key={key:?}");
+        // R5-7: nothing resolves, so the probe cannot answer: insensitive.
+        assert!(missing);
+    }
+
+    // A letterless directory directly under a case-sensitive volume's mount
+    // root, whose mount point sits on a case-insensitive parent: the nearest
+    // lettered component is the mount point, looked up in the parent volume.
+    #[test]
+    fn rv5_probe_across_a_mount_boundary() {
+        let Some((_, cs_root)) = cs() else { return };
+        let letterless = cs_root.join("1234");
+        fs::create_dir_all(&letterless).unwrap();
+        let probed = probe_case_insensitive(&letterless);
+        let at_root = probe_case_insensitive(&cs_root);
+        eprintln!(
+            "probe(cs_root/1234)={probed} probe(cs_root)={at_root} (volume is case-sensitive)"
+        );
+        // R5-7: the walk would look the mount point up in the parent volume,
+        // which answers for the wrong volume. It stops at the device change
+        // and fails toward detecting overlap instead.
+        assert!(probed && at_root);
     }
 }
