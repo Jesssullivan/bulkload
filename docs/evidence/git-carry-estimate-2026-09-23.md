@@ -45,9 +45,9 @@ clearly: 0.449 MB thin against 3.550 MB stored.
   upload-pack drop the have it implies. In fixture A3 that grew the pack from
   232 B to 3,919 B. Offered ancestors first, the same extra have drops
   nothing: fixture A3X, which also holds the intermediate commit, is 232 B.
-  Any haves added by ancestor probing (`GitHaveQuery`) in a shallow
-  destination's first round must keep the ancestors-first order. Extra haves
-  can shrink a non-shallow pack.
+  Extra haves can shrink a non-shallow pack. Ancestor probing must not add
+  haves to the first round (R-N113: exactly the held tips); any haves in
+  later rounds must keep ancestors-first order.
 - **Pins:** the M1 sender must pin, as the estimate does:
   - `pack.useSparse=false`
   - `pack.useBitmaps=false`

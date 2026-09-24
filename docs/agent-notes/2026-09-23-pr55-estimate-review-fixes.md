@@ -91,3 +91,30 @@
   - the three-word NBSP split.
   - `pass`+NEL.
   - R4-2.
+
+## r6 (2026-09-24): BLOCK at `2eabcd5`; R-N121 "classify, don't echo"
+
+- **Heuristic redaction is deleted:** `detail()`, `redact*`,
+  `prefix_reaches_boundary`, `spaced_short_key` and their tests.
+- **What a refusal prints now:** `refused=`, `refused_reason=` (own
+  vocabulary), `stderr_class=` (closed set: `not_a_repository`, `auth_failed`,
+  `host_unreachable`, `timeout`, `bad_object`, `other`) and `stderr_blake3=`.
+  No field of `Refused` holds printable stderr, and its `Debug` omits the raw
+  bytes.
+- **Raw bytes:** `--state-dir DIR` writes them to `DIR/stderr/<blake3>.log`,
+  created with `O_CREAT|O_EXCL` at mode 0600 (directory 0700), and prints
+  `stderr_file=`. A planted file or symlink there is refused. Without
+  `--state-dir`, nothing is written.
+- **Tests:**
+  - classification on real git and OpenSSH messages;
+  - the private file's mode, contents, reuse and symlink refusal;
+  - the full r3–r6 corpus in-process (`tests/stderr_corpus`, about 2,600
+    probes, each with a canary);
+  - an end-to-end sample (every e2e and keep probe, plus 1 in 80 of the
+    rest) through the binary with a fake `git` (local) and a fake `ssh`
+    (remote). Output keys, class, digest, file mode and file bytes are
+    checked, and no canary or secret appears in stdout or stderr.
+- **Why a sample end to end:** neo spawned processes about 10× slower than
+  normal after the crash (about 1 s per verb run), so the full corpus goes
+  through the CLI only as a sample; the in-process test covers all of it.
+- **R6-C:** one sentence in both docs.

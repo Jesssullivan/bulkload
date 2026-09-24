@@ -54,9 +54,10 @@
 //! them, newest first), an extra intermediate have makes upload-pack drop the
 //! have it implies, which can *enlarge* a shallow pack (fixture A3: 232 B with
 //! the held tips, 3,919 B once `git fetch` offers the parent too). Offered
-//! ancestors first, the same extra have drops nothing (fixture A3X: 232 B). Extra haves can shrink
-//! a non-shallow pack. Ancestor probing (`GitHaveQuery`) must therefore not
-//! add haves to a shallow destination's first round.
+//! ancestors first, the same extra have drops nothing (fixture A3X: 232 B).
+//! Extra haves can shrink a non-shallow pack. Ancestor probing must not add
+//! haves to the first round (R-N113: exactly the held tips); any haves in
+//! later rounds must keep ancestors-first order.
 //!
 //! The pack also depends on `pack.threads` and `pack.windowMemory`, which
 //! [`git`] pins to 2 and 64m for every call; the M1 sender must pin them the
@@ -169,26 +170,254 @@ fn remote_path(path: &str) -> bool {
         })
 }
 
-/// A refusal plus, when a child process explained it, a bounded and redacted
-/// excerpt of that child's standard error.
+/// A refusal, why the verb itself refused (when it did), and, when a child
+/// process explained it, a classification of that child's standard error.
+///
+/// R-N121: stderr is classified, never echoed. No field of a `Refused`, and so
+/// no receipt or output line, carries any byte of a child's stderr: only a
+/// class from a closed set, the BLAKE3 digest of the raw bytes, and, when the
+/// caller persists them, the path of a private 0600 file that holds them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
     /// The typed refusal; its code is the stable identity.
     pub refusal: BulkloadRefusal,
-    /// At most [`DETAIL_LIMIT`] printable characters, one line, with URL
-    /// credentials and token-shaped words removed.
-    pub detail: Option<String>,
+    /// The verb's own reason, from a fixed vocabulary, when it has one.
+    pub reason: Option<&'static str>,
+    /// The child's stderr, classified and digested; the raw bytes are only
+    /// reachable through [`Refused::persist_stderr`].
+    pub stderr: Option<StderrReceipt>,
+}
+
+/// A child's stderr as a receipt may show it: class and digest only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StderrReceipt {
+    /// Closed-set classification of the raw bytes.
+    pub class: StderrClass,
+    /// BLAKE3 of the raw bytes, lowercase hex.
+    pub blake3: String,
+    raw: Vec<u8>,
+}
+
+impl fmt::Debug for StderrReceipt {
+    // The raw bytes never reach a formatter, not even `{:?}`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StderrReceipt")
+            .field("class", &self.class)
+            .field("blake3", &self.blake3)
+            .field("bytes", &self.raw.len())
+            .finish()
+    }
+}
+
+impl StderrReceipt {
+    /// Classify and digest `raw`; `None` when the child wrote nothing.
+    #[must_use]
+    pub fn new(raw: &[u8]) -> Option<Self> {
+        if raw.is_empty() {
+            return None;
+        }
+        Some(Self {
+            class: StderrClass::of(raw),
+            blake3: blake3::hash(raw).to_hex().to_string(),
+            raw: raw.to_vec(),
+        })
+    }
+}
+
+/// What a child's stderr says, from a closed set (R-N121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrClass {
+    /// The path is not a repository, or the remote repository is absent.
+    NotARepository,
+    /// ssh or HTTP authentication, or host-key verification, failed.
+    AuthFailed,
+    /// The host could not be resolved or reached.
+    HostUnreachable,
+    /// A connection or operation timed out.
+    Timeout,
+    /// Git reported a missing, bad or corrupt object.
+    BadObject,
+    /// Anything else.
+    Other,
+}
+
+impl StderrClass {
+    /// The stable code printed as `stderr_class=`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotARepository => "not_a_repository",
+            Self::AuthFailed => "auth_failed",
+            Self::HostUnreachable => "host_unreachable",
+            Self::Timeout => "timeout",
+            Self::BadObject => "bad_object",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify raw stderr by the phrases real git and OpenSSH print. The
+    /// first class whose pattern matches wins; the order puts timeouts ahead
+    /// of the unreachable-host phrases they share a line with.
+    #[must_use]
+    pub fn of(raw: &[u8]) -> Self {
+        const PATTERNS: [(StderrClass, &[&str]); 5] = [
+            (
+                StderrClass::Timeout,
+                &["timed out", "timeout, server", "connection timeout"],
+            ),
+            (
+                StderrClass::HostUnreachable,
+                &[
+                    "could not resolve hostname",
+                    "could not resolve host",
+                    "name or service not known",
+                    "nodename nor servname provided",
+                    "temporary failure in name resolution",
+                    "no route to host",
+                    "network is unreachable",
+                    "connection refused",
+                    "connection closed by remote host",
+                    "connection reset by peer",
+                ],
+            ),
+            (
+                StderrClass::AuthFailed,
+                &[
+                    "permission denied (publickey",
+                    "permission denied, please try again",
+                    "authentication failed",
+                    "host key verification failed",
+                    "could not read username",
+                    "could not read password",
+                    "too many authentication failures",
+                    "no supported authentication methods",
+                ],
+            ),
+            (
+                StderrClass::NotARepository,
+                &[
+                    "not a git repository",
+                    "does not appear to be a git repository",
+                    "repository not found",
+                    "no such file or directory",
+                ],
+            ),
+            (
+                StderrClass::BadObject,
+                &[
+                    "bad object",
+                    "bad revision",
+                    "missing object",
+                    "object not found",
+                    "is corrupt",
+                    "unable to read",
+                    "invalid object",
+                    "did not receive expected object",
+                ],
+            ),
+        ];
+        let text = String::from_utf8_lossy(raw).to_lowercase();
+        PATTERNS
+            .iter()
+            .find(|(_, phrases)| phrases.iter().any(|phrase| text.contains(phrase)))
+            .map_or(Self::Other, |(class, _)| *class)
+    }
 }
 
 impl Refused {
-    const fn new(refusal: BulkloadRefusal, detail: Option<String>) -> Self {
-        Self { refusal, detail }
+    const fn new(refusal: BulkloadRefusal) -> Self {
+        Self {
+            refusal,
+            reason: None,
+            stderr: None,
+        }
+    }
+
+    const fn because(refusal: BulkloadRefusal, reason: &'static str) -> Self {
+        Self {
+            refusal,
+            reason: Some(reason),
+            stderr: None,
+        }
+    }
+
+    fn with_stderr(refusal: BulkloadRefusal, raw: &[u8]) -> Self {
+        Self {
+            refusal,
+            reason: None,
+            stderr: StderrReceipt::new(raw),
+        }
+    }
+
+    /// Receipt lines: `refused=`, then `refused_reason=`, `stderr_class=` and
+    /// `stderr_blake3=` when present, then `stderr_file=` for `stored`. None
+    /// carries a byte of stderr.
+    #[must_use]
+    pub fn lines(&self, stored: Option<&Path>) -> Vec<String> {
+        let mut lines = vec![format!("refused={}", self.refusal.code())];
+        if let Some(reason) = self.reason {
+            lines.push(format!("refused_reason={reason}"));
+        }
+        if let Some(stderr) = &self.stderr {
+            lines.push(format!("stderr_class={}", stderr.class.code()));
+            lines.push(format!("stderr_blake3={}", stderr.blake3));
+        }
+        if let Some(path) = stored {
+            lines.push(format!("stderr_file={}", path.display()));
+        }
+        lines
+    }
+
+    /// Write the raw stderr to `<state_dir>/stderr/<blake3>.log`, created with
+    /// `O_CREAT|O_EXCL` at mode 0600 (the directory at 0700), and return its
+    /// path. Nothing is written without stderr. A file already at that path
+    /// is accepted only if it is a regular file holding exactly these bytes.
+    ///
+    /// # Errors
+    /// Refuses a `stderr` path that is not a real directory, a pre-existing
+    /// file that does not hold these bytes, or any I/O failure.
+    pub fn persist_stderr(&self, state_dir: &Path) -> Result<Option<PathBuf>> {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        let Some(stderr) = &self.stderr else {
+            return Ok(None);
+        };
+        let directory = state_dir.join("stderr");
+        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        let path = directory.join(format!("{}.log", stderr.blake3));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(&stderr.raw)?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if !metadata.file_type().is_file()
+                    || blake3::hash(&std::fs::read(&path)?).to_hex().as_str() != stderr.blake3
+                {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Some(path))
     }
 }
 
 impl From<BulkloadRefusal> for Refused {
     fn from(refusal: BulkloadRefusal) -> Self {
-        Self::new(refusal, None)
+        Self::new(refusal)
     }
 }
 
@@ -200,332 +429,15 @@ impl From<std::io::Error> for Refused {
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.detail {
-            Some(detail) => write!(f, "{}: {detail}", self.refusal),
-            None => write!(f, "{}", self.refusal),
+        write!(f, "{}", self.refusal)?;
+        if let Some(reason) = self.reason {
+            write!(f, " ({reason})")?;
         }
-    }
-}
-
-/// Longest stderr excerpt a [`Refused`] carries, in characters.
-pub const DETAIL_LIMIT: usize = 240;
-
-const REDACTED: &str = "[redacted]";
-
-/// One line of at most [`DETAIL_LIMIT`] characters from a child's stderr.
-///
-/// Before redaction, every whitespace or control character (ASCII or Unicode:
-/// NBSP, EM SPACE, U+2028, NUL, BS, DEL, ...) becomes a space, so it separates
-/// a key from its value, and every invisible or format (`Cf`) character is
-/// dropped, so it cannot split a word. A token prefix split across two words
-/// (`gh p_...`) redacts both.
-fn detail(stderr: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(stderr);
-    let cleaned: String = text
-        .chars()
-        .filter_map(|c| {
-            if invisible(c) {
-                None
-            } else if c.is_whitespace() || c.is_control() {
-                Some(' ')
-            } else {
-                Some(c)
-            }
-        })
-        .collect();
-    let words: Vec<&str> = cleaned.split(' ').filter(|word| !word.is_empty()).collect();
-    let line = redact_words(&words).join(" ");
-    if line.is_empty() {
-        return None;
-    }
-    let mut bounded: String = line.chars().take(DETAIL_LIMIT).collect();
-    if line.chars().count() > DETAIL_LIMIT {
-        bounded.push_str("...");
-    }
-    Some(bounded)
-}
-
-/// Unicode format (`Cf`) and other invisible characters: soft hyphen, Arabic
-/// and Syriac format marks, Mongolian vowel separator, zero-width and bidi
-/// marks, word joiners and invisible operators, the byte-order mark,
-/// interlinear annotation marks, and the shorthand, musical and tag format
-/// blocks.
-const fn invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{600}'..='\u{605}'
-            | '\u{61c}'
-            | '\u{6dd}'
-            | '\u{70f}'
-            | '\u{890}'..='\u{891}'
-            | '\u{8e2}'
-            | '\u{115f}'..='\u{1160}'
-            | '\u{17b4}'..='\u{17b5}'
-            | '\u{180b}'..='\u{180f}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{3164}'
-            | '\u{fe00}'..='\u{fe0f}'
-            | '\u{feff}'
-            | '\u{ffa0}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{110bd}'
-            | '\u{110cd}'
-            | '\u{13430}'..='\u{1343f}'
-            | '\u{1bca0}'..='\u{1bca3}'
-            | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0000}'..='\u{e0fff}'
-    )
-}
-
-/// Words whose value, inline or in the next word, is an authorization scheme
-/// followed by the credential itself (`Bearer`, `Bearer:`, `basic=`).
-fn scheme_word(value: &str) -> bool {
-    matches!(
-        value.trim_matches(['"', '\'', ',', ';', ':', '=']),
-        "bearer" | "basic" | "digest" | "token" | "negotiate"
-    )
-}
-
-const TOKEN_PREFIXES: [&str; 8] = [
-    "ghp_",
-    "gho_",
-    "ghs_",
-    "ghu_",
-    "github_pat_",
-    "glpat-",
-    "xox",
-    "AKIA",
-];
-
-/// Index of the word where a PEM header (`-----BEGIN`) starts, even when a
-/// line break or spaces split it (`-----BEG` / `IN`, `----- BEGIN`).
-fn pem_start(words: &[&str]) -> Option<usize> {
-    let mut squashed = String::new();
-    let mut starts = Vec::with_capacity(words.len());
-    for word in words {
-        starts.push(squashed.len());
-        squashed.push_str(&word.to_ascii_lowercase());
-    }
-    let at = squashed.find("-----begin")?;
-    starts.iter().rposition(|start| *start <= at)
-}
-
-/// Redact credential-shaped words, the value after a key such as
-/// `password:`, `token =` or `Authorization: Bearer`, everything from a PEM
-/// header on, and token prefixes split across two words.
-fn redact_words(words: &[&str]) -> Vec<String> {
-    let pem = pem_start(words);
-    let mut redacted = Vec::with_capacity(words.len());
-    let mut pending = 0_u8;
-    for (index, word) in words.iter().enumerate() {
-        let lower = word.to_ascii_lowercase();
-        if pem.is_some_and(|start| index >= start) {
-            redacted.push(REDACTED.to_owned());
-            continue;
+        if let Some(stderr) = &self.stderr {
+            write!(f, " [stderr {} {}]", stderr.class.code(), stderr.blake3)?;
         }
-        if pending > 0 {
-            pending -= 1;
-            redacted.push(REDACTED.to_owned());
-            // `key = value`, `key : value` and `Authorization: Bearer value`
-            // carry the value one word further on.
-            if lower.trim_matches([':', '=']).is_empty() || scheme_word(&lower) {
-                pending = 1;
-            }
-            continue;
-        }
-        if spaced_short_key(&lower, words.get(index + 1).copied()) {
-            // `pass : x`, `pwd = x`, `{"pwd" : "x"}`: the separator word and
-            // the value after it are redacted through `pending`.
-            redacted.push(REDACTED.to_owned());
-            pending = 1;
-            continue;
-        }
-        if let Some(value) = sensitive_key(&lower) {
-            redacted.push(REDACTED.to_owned());
-            // `Authorization: Bearer x` and `authorization=Basic x`.
-            if match value {
-                KeyValue::Next => true,
-                KeyValue::Inline(inline) => scheme_word(&inline),
-            } {
-                pending = 1;
-            }
-            continue;
-        }
-        redacted.push(redact(word));
+        Ok(())
     }
-    for (index, pair) in words.windows(2).enumerate() {
-        let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else {
-            continue;
-        };
-        let joined = format!("{first}{second}");
-        if TOKEN_PREFIXES
-            .iter()
-            .any(|prefix| prefix_reaches_boundary(&joined, first, prefix))
-        {
-            for at in [index, index + 1] {
-                if let Some(slot) = redacted.get_mut(at) {
-                    REDACTED.clone_into(slot);
-                }
-            }
-        }
-    }
-    redacted
-}
-
-/// Whether a token `prefix` in `joined` (`first` then the next word) runs up
-/// to, or across, the boundary between the words: `gh` / `p_x` split by a
-/// separator, `ghp_` / `x` with the whole prefix before it, or `xoxb-` / `x`
-/// with a few token characters after the prefix. The token body is then the
-/// next word.
-fn prefix_reaches_boundary(joined: &str, first: &str, prefix: &str) -> bool {
-    joined.match_indices(prefix).any(|(at, _)| {
-        let end = at + prefix.len();
-        at < first.len()
-            && first.len() <= end + 4
-            && first
-                .get(end..)
-                .unwrap_or("")
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-    })
-}
-
-/// A short key (`pass`, `pwd`, `sig`, `signature`, `cookie`, `auth`, `key`,
-/// `code`, `session`, `sid`) standing alone, quoted or not, whose separator
-/// is the next word (`pass : x`, `pwd = x`, `{"pwd" : "x"}`).
-fn spaced_short_key(lower: &str, next: Option<&str>) -> bool {
-    let bare = lower.trim_matches(['{', '[', '(', '"', '\'', ',']);
-    let separator = next.and_then(|word| word.chars().next());
-    SECRET_KEYS.iter().any(|(key, follow)| {
-        bare == *key
-            && match follow {
-                Follow::Any => false,
-                Follow::Separator => matches!(separator, Some(':' | '=')),
-                Follow::Equals => separator == Some('='),
-            }
-    })
-}
-
-/// Where a secret key's value is.
-enum KeyValue {
-    /// In the next word (`password: x`, `token x`).
-    Next,
-    /// In the same word (`password=x`, `"token":"x"`).
-    Inline(String),
-}
-
-/// What must follow a key for it to name a secret.
-#[derive(Clone, Copy)]
-enum Follow {
-    /// Anything: `password hunter2` redacts `hunter2`.
-    Any,
-    /// `:` or `=`: short words like `pass` or `signature` are ordinary
-    /// English until a separator makes them a key.
-    Separator,
-    /// `=` only: query and cookie keys (`?code=`, `session=`), which appear
-    /// with `:` in ordinary text (`exit code: 128`).
-    Equals,
-}
-
-/// Secret key words and what must follow each for it to name a secret.
-const SECRET_KEYS: [(&str, Follow); 24] = [
-    ("password", Follow::Any),
-    ("passwd", Follow::Any),
-    ("passphrase", Follow::Any),
-    ("token", Follow::Any),
-    ("secret", Follow::Any),
-    ("authorization", Follow::Any),
-    ("bearer", Follow::Any),
-    ("api_key", Follow::Any),
-    ("apikey", Follow::Any),
-    ("api-key", Follow::Any),
-    ("credential", Follow::Any),
-    ("private_key", Follow::Any),
-    ("access_key", Follow::Any),
-    ("x-amz-signature", Follow::Any),
-    ("pass", Follow::Separator),
-    ("pwd", Follow::Separator),
-    ("sig", Follow::Separator),
-    ("signature", Follow::Separator),
-    ("cookie", Follow::Separator),
-    ("auth", Follow::Separator),
-    ("key", Follow::Separator),
-    ("code", Follow::Equals),
-    ("session", Follow::Equals),
-    ("sid", Follow::Equals),
-];
-
-/// The value's place when `lower` names a secret at a word boundary.
-fn sensitive_key(lower: &str) -> Option<KeyValue> {
-    SECRET_KEYS.iter().find_map(|(key, follow)| {
-        lower.match_indices(key).find_map(|(at, _)| {
-            let before = lower.get(..at).and_then(|head| head.chars().next_back());
-            let tail = lower.get(at + key.len()..).unwrap_or("");
-            if before.is_some_and(|c| c.is_ascii_alphanumeric())
-                || tail.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            {
-                return None;
-            }
-            let rest = tail.trim_start_matches(['"', '\'']);
-            let separator = rest.chars().next();
-            let accepted = match follow {
-                Follow::Any => true,
-                Follow::Separator => matches!(separator, Some(':' | '=')),
-                Follow::Equals => separator == Some('='),
-            };
-            if !accepted {
-                return None;
-            }
-            let separated = rest.trim_start_matches([':', '=']);
-            let value = separated.trim_matches(['"', '\'', ',', ';', '}', '{']);
-            if separated.len() == rest.len() || value.is_empty() {
-                return Some(KeyValue::Next);
-            }
-            Some(KeyValue::Inline(value.to_owned()))
-        })
-    })
-}
-
-/// Drop anything credential-shaped from one word of diagnostic text.
-fn redact(word: &str) -> String {
-    if TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix)) {
-        return REDACTED.to_owned();
-    }
-    if let Some((scheme, rest)) = word.split_once("://") {
-        if let Some((userinfo, host)) = rest.rsplit_once('@') {
-            if url_credential(userinfo) {
-                return format!("{scheme}://{REDACTED}@{host}");
-            }
-        }
-        return word.to_owned();
-    }
-    // Schemeless `user:password@host`: userinfo holding a `:` is a secret;
-    // scp-style `git@host:path` is not.
-    if let Some((user, host)) = word.rsplit_once('@') {
-        let start = user
-            .rfind(['\'', '"', '(', '<', '[', '=', ','])
-            .map_or(0, |at| at + 1);
-        let (prefix, userinfo) = user.split_at(start);
-        if userinfo.contains(':') {
-            return format!("{prefix}{REDACTED}@{host}");
-        }
-    }
-    word.to_owned()
-}
-
-/// Whether the text between `://` and a URL's last `@` is userinfo. A bare
-/// token (no `/`) is; so is `user:password`, even when the password holds a
-/// `/`. `host/@scope` and `host:443/@scope` are a path after a host and port.
-fn url_credential(userinfo: &str) -> bool {
-    let Some((authority, _)) = userinfo.split_once('/') else {
-        return true;
-    };
-    authority
-        .split_once(':')
-        .is_some_and(|(_, after)| !after.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Object count and stored bytes of one Git object type.
@@ -713,16 +625,16 @@ pub fn estimate(
         }
     };
     if offer.partial {
-        return Err(Refused::new(
+        return Err(Refused::because(
             BulkloadRefusal::GitHavesUnprovable,
-            Some("destination is a partial clone".to_owned()),
+            "destination_partial_clone",
         ));
     }
     let shallow = !offer.shallow.is_empty();
     if shallow && offer.shallow != own.shallow {
-        return Err(Refused::new(
+        return Err(Refused::because(
             BulkloadRefusal::GitHavesUnprovable,
-            Some("destination is shallow at a frontier other than the source's".to_owned()),
+            "destination_shallow_frontier_differs",
         ));
     }
     let repo = Repository {
@@ -738,12 +650,9 @@ pub fn estimate(
     wants.extend(stash.iter().cloned());
     let closure = walk(&repo, &revisions(&wants, &[]), false)?;
     if !own.partial && closure.unavailable > 0 {
-        return Err(Refused::new(
+        return Err(Refused::because(
             BulkloadRefusal::GitInventoryMalformed,
-            Some(format!(
-                "source is not a partial clone but lacks {} objects its refs reach",
-                closure.unavailable
-            )),
+            "source_lacks_reachable_objects",
         ));
     }
     // A fetch never wants what the destination already holds.
@@ -987,7 +896,7 @@ fn run_probe(command: &mut Command) -> std::result::Result<Probe, Refused> {
         Some(_) => Some(BulkloadRefusal::GitInventoryMalformed),
     };
     if let Some(refusal) = refusal {
-        return Err(Refused::new(refusal, detail(&result.stderr)));
+        return Err(Refused::with_stderr(refusal, &result.stderr));
     }
     // A child that answered in full read its whole script.
     written.map_err(|_| BulkloadRefusal::Io(None))??;
@@ -2084,10 +1993,11 @@ mod tests {
         assert_eq!(result.thin_pack.objects, 4);
     }
 
-    /// F11: ssh gets a connect timeout, and a failed probe carries a bounded,
-    /// credential-free excerpt of the child's stderr.
+    /// F11, R-N121: ssh gets a connect timeout and keepalives, and a failed
+    /// probe's stderr is classified and digested, never echoed: no receipt
+    /// line, `Display` or `Debug` of the refusal holds a byte of it.
     #[test]
-    fn remote_failures_carry_bounded_redacted_stderr() {
+    fn remote_failures_are_classified_not_echoed() {
         let ssh = ssh_command("sting", "true");
         let args: Vec<_> = ssh.get_args().collect();
         assert_eq!(
@@ -2102,35 +2012,50 @@ mod tests {
                 "true"
             ]
         );
+        let raw = "ssh: connect to host sting port 22: Connection timed out\nfetch https://jess:hunter2@example.org/r ghp_abc token=xyzzy\n";
         let mut failing = Command::new("sh");
         failing.args([
             "-c",
-            "cat >/dev/null; printf 'ssh: connect to host sting port 22: Connection timed out\\nfetch https://jess:hunter2@example.org/r ghp_abc token=xyz\\n' >&2; head -c 4000 /dev/zero | tr '\\0' x >&2; exit 255",
+            &format!("cat >/dev/null; printf '%s' '{raw}' >&2; exit 255"),
         ]);
         let refused = run_probe(&mut failing).unwrap_err();
         assert_eq!(refused.refusal, BulkloadRefusal::GitUnavailable);
-        let detail = refused.detail.unwrap();
-        assert!(
-            detail.starts_with("ssh: connect to host sting port 22: Connection timed out"),
-            "{detail}"
+        let stderr = refused.stderr.clone().unwrap();
+        assert_eq!(stderr.class, StderrClass::Timeout);
+        assert_eq!(
+            stderr.blake3,
+            blake3::hash(raw.as_bytes()).to_hex().to_string()
         );
-        assert!(
-            detail.contains("https://[redacted]@example.org/r"),
-            "{detail}"
-        );
-        for secret in ["hunter2", "ghp_abc", "xyz", "jess:"] {
-            assert!(!detail.contains(secret), "{detail}");
+        let shown = format!("{}\n{refused}\n{refused:?}", refused.lines(None).join("\n"));
+        for secret in ["hunter2", "ghp_abc", "xyzzy", "jess", "Connection", "sting"] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
         }
-        assert!(detail.chars().count() <= DETAIL_LIMIT + 3);
-        assert!(!detail.contains('\n'));
         let mut malformed = Command::new("sh");
-        malformed.args(["-c", "cat >/dev/null; echo 'fatal: bad object' >&2; exit 1"]);
+        malformed.args([
+            "-c",
+            "cat >/dev/null; echo 'fatal: bad object 0123abcd' >&2; exit 1",
+        ]);
         let refused = run_probe(&mut malformed).unwrap_err();
         assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
-        assert_eq!(refused.detail.as_deref(), Some("fatal: bad object"));
         assert_eq!(
-            refused.to_string(),
-            "GIT_INVENTORY_MALFORMED: fatal: bad object"
+            refused.stderr.as_ref().map(|s| s.class),
+            Some(StderrClass::BadObject)
+        );
+        let lines = refused.lines(None);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("refused=GIT_INVENTORY_MALFORMED")
+        );
+        assert!(lines.iter().any(|line| line == "stderr_class=bad_object"));
+        assert!(!lines.join("\n").contains("0123abcd"));
+        // A child that says nothing leaves no stderr fields.
+        let mut silent = Command::new("sh");
+        silent.args(["-c", "cat >/dev/null; exit 1"]);
+        let refused = run_probe(&mut silent).unwrap_err();
+        assert!(refused.stderr.is_none());
+        assert_eq!(
+            refused.lines(None),
+            vec!["refused=GIT_INVENTORY_MALFORMED".to_owned()]
         );
     }
 
@@ -2500,28 +2425,6 @@ mod tests {
         assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
     }
 
-    /// N6: control characters are dropped before redaction, the value after a
-    /// spaced key is redacted, and schemeless `user:pw@host` is redacted.
-    #[test]
-    fn redaction_covers_spaced_keys_schemeless_userinfo_and_split_tokens() {
-        let spaced = detail(
-            b"fatal: auth failed; password: hunter2 Authorization: Bearer eyJhbGciOi.secretpart token = s3cr3t",
-        )
-        .unwrap();
-        for secret in ["hunter2", "eyJhbGciOi.secretpart", "s3cr3t"] {
-            assert!(!spaced.contains(secret), "{spaced}");
-        }
-        assert!(spaced.starts_with("fatal: auth failed;"), "{spaced}");
-        let schemeless = detail(b"could not read from jess:hunter2@example.org:repo.git").unwrap();
-        assert!(!schemeless.contains("hunter2"), "{schemeless}");
-        assert!(!schemeless.contains("jess:"), "{schemeless}");
-        assert!(schemeless.contains("@example.org:repo.git"), "{schemeless}");
-        let kept = detail(b"ssh: git@github.com:org/repo.git denied").unwrap();
-        assert!(kept.contains("git@github.com:org/repo.git"), "{kept}");
-        let split = detail(b"x gh\x1bp_abcdef0123456789 y").unwrap();
-        assert!(!split.contains("abcdef0123456789"), "{split}");
-    }
-
     // ---- PR #55 review r3 (R-N113) -----------------------------------------
 
     fn pkt_line(out: &mut Vec<u8>, line: &str) {
@@ -2802,192 +2705,6 @@ mod tests {
         assert!(fetched.bytes > oracle.bytes, "{fetched:?} vs {oracle:?}");
     }
 
-    /// R3-2: redaction probes from the r3 review (bearer/basic/digest inline
-    /// values, `pwd`/`pass`/`cookie`/`sig`/`x-amz-signature`, Unicode format
-    /// and invisible separators, `/` in a URL password).
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn redaction_r3_probes_leak_nothing() {
-        let cases: &[(&[u8], &str)] = &[
-            (b"Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
-            (
-                b"authorization:Bearer eyJhbGciOiJIUzI1NiJ9.payload",
-                "eyJhbGciOiJIUzI1NiJ9.payload",
-            ),
-            (b"Authorization=Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
-            (
-                b"token:Bearer eyJhbGciOiJIUzI1NiJ9.payload",
-                "eyJhbGciOiJIUzI1NiJ9.payload",
-            ),
-            (b"authorization=digest s3cr3tvalue", "s3cr3tvalue"),
-            (br#"{"token":"s3cr3tvalue"}"#, "s3cr3tvalue"),
-            (br#"{"token": "s3cr3tvalue"}"#, "s3cr3tvalue"),
-            (br#"{"access_token" : "s3cr3tvalue"}"#, "s3cr3tvalue"),
-            (
-                b"GET https://h/x?access_token=s3cr3tvalue&x=1",
-                "s3cr3tvalue",
-            ),
-            (b"GET https://h/x?sig=s3cr3tvalue&se=1", "s3cr3tvalue"),
-            (
-                b"GET https://h/x?X-Amz-Signature=deadbeefcafe",
-                "deadbeefcafe",
-            ),
-            (b"pwd=hunter2", "hunter2"),
-            (b"pass: hunter2", "hunter2"),
-            (b"Cookie: session=hunter2", "hunter2"),
-            (b"sig=hunter2", "hunter2"),
-            (b"x-amz-signature: deadbeefcafe", "deadbeefcafe"),
-            (b"PRIVATE-TOKEN: glsecretvalue", "glsecretvalue"),
-            (b"password:\nhunter2", "hunter2"),
-            (b"line one\r\ntoken =\n  s3cr3tvalue", "s3cr3tvalue"),
-            (b"https://jess:hun/ter2@example.org/r", "hun/ter2"),
-            (b"https://jess:hunter2@example.org/r", "hunter2"),
-            (
-                "x gh\u{2028}p_abcdef0123456789 y".as_bytes(),
-                "abcdef0123456789",
-            ),
-            (
-                "x gh\u{200b}p_abcdef0123456789 y".as_bytes(),
-                "abcdef0123456789",
-            ),
-            (
-                "x gh\u{202e}p_abcdef0123456789 y".as_bytes(),
-                "abcdef0123456789",
-            ),
-            (
-                "x ghp\u{0085}_abcdef0123456789 y".as_bytes(),
-                "abcdef0123456789",
-            ),
-            ("pass\u{feff}word: hunter2".as_bytes(), "hunter2"),
-            (b"secret\xff=hunter2", "hunter2"),
-            // R4-3: whitespace and controls separate key from value.
-            ("fatal: password\u{a0}hunter2".as_bytes(), "hunter2"),
-            ("token\u{2003}hunter2".as_bytes(), "hunter2"),
-            ("password\u{2028}hunter2".as_bytes(), "hunter2"),
-            (b"passwd\0hunter2", "hunter2"),
-            (b"password\x08hunter2", "hunter2"),
-            (b"password\x7fhunter2", "hunter2"),
-            (
-                b"Authorization: Bearer: eyJhbGciOiJIUzI1NiJ9sekrit",
-                "eyJhbGciOiJIUzI1NiJ9sekrit",
-            ),
-            // R4-4: query keys, split and spaced PEM headers.
-            (b"https://h/x?auth=s3cr3tvalue", "s3cr3tvalue"),
-            (b"https://h/x?key=s3cr3tvalue", "s3cr3tvalue"),
-            (b"https://h/x?code=s3cr3tvalue", "s3cr3tvalue"),
-            (b"session=s3cr3tvalue", "s3cr3tvalue"),
-            // R5-A: a whole token prefix, then a separator, then the body.
-            ("ghp_\u{a0}abcdef0123456789".as_bytes(), "abcdef0123456789"),
-            (
-                "ghp_\u{2028}abcdef0123456789".as_bytes(),
-                "abcdef0123456789",
-            ),
-            ("ghp_\u{85}abcdef0123456789".as_bytes(), "abcdef0123456789"),
-            (b"ghp_\x00abcdef0123456789", "abcdef0123456789"),
-            (b"ghp_\x1babcdef0123456789", "abcdef0123456789"),
-            (b"remote: ghp_ abcdef0123456789", "abcdef0123456789"),
-            (b"ghp_\nabcdef0123456789", "abcdef0123456789"),
-            ("AKIA\u{a0}IOSFODNN7EXAMPLE".as_bytes(), "IOSFODNN7EXAMPLE"),
-            (
-                "github_pat_\u{2003}11ABCDEFG0123456789".as_bytes(),
-                "11ABCDEFG0123456789",
-            ),
-            ("glpat-\u{85}s3cr3tvalue0123".as_bytes(), "s3cr3tvalue0123"),
-            (
-                "xoxb-\u{a0}123456789012-s3cr3tv".as_bytes(),
-                "123456789012-s3cr3tv",
-            ),
-            // R5-B: a short key whose separator is its own word.
-            (b"pass : hunter2", "hunter2"),
-            (b"pwd = hunter2", "hunter2"),
-            (b"sig = s3cr3tvalue", "s3cr3tvalue"),
-            (b"signature : s3cr3tvalue", "s3cr3tvalue"),
-            (b"Cookie : abc123s3cr3t", "abc123s3cr3t"),
-            (b"{\"pwd\" : \"hunter2\"}", "hunter2"),
-            (b"{\"pass\": \"hunter2\"}", "hunter2"),
-            ("pass\u{a0}:\u{a0}hunter2".as_bytes(), "hunter2"),
-            (b"pass\n:\nhunter2", "hunter2"),
-            (b"session = s3cr3tvalue", "s3cr3tvalue"),
-            (b"auth: s3cr3tvalue", "s3cr3tvalue"),
-            (b"API key: s3cr3tvalue", "s3cr3tvalue"),
-        ];
-        for (input, secret) in cases {
-            let out = detail(input).unwrap_or_default();
-            assert!(
-                !out.contains(secret),
-                "leak: {:?} -> {out:?}",
-                String::from_utf8_lossy(input)
-            );
-        }
-    }
-
-    /// R4-4: a PEM block redacts from its header on, even with the header
-    /// split across lines, written with spaces, or ending in CRLF.
-    #[test]
-    fn redaction_covers_pem_blocks() {
-        // PEM headers are assembled at run time so no key-shaped literal sits
-        // in the source for secret scanners to flag.
-        let dashes = "-".repeat(5);
-        for (input, secret) in [
-            (
-                format!(
-                    "{dashes}BEGIN OPENSSH {} KEY{dashes} b3BlbnNzaC1rZXktdjEAAAAA",
-                    "PRIVATE"
-                ),
-                "b3BlbnNzaC1rZXktdjEAAAAA",
-            ),
-            (
-                format!(
-                    "{dashes}BEG\nIN RSA {} KEY{dashes}\nMIIEowIBAAKCAQEAxq9Zbody",
-                    "PRIVATE"
-                ),
-                "MIIEowIBAAKCAQEAxq9Zbody",
-            ),
-            (
-                format!(
-                    "{dashes} BEGIN {} KEY {dashes}\nMIIEowIBAAKCAQEAxq9Zbody",
-                    "PRIVATE"
-                ),
-                "MIIEowIBAAKCAQEAxq9Zbody",
-            ),
-            (
-                format!(
-                    "{dashes}BEGIN OPENSSH {} KEY{dashes}\r\nb3BlbnNzaC1rZXktdjEAAAAA\r\n",
-                    "PRIVATE"
-                ),
-                "b3BlbnNzaC1rZXktdjEAAAAA",
-            ),
-        ] {
-            let out = detail(input.as_bytes()).unwrap_or_default();
-            assert!(!out.contains(secret), "leak: {input:?} -> {out:?}");
-        }
-    }
-
-    /// R4-4: ordinary diagnostics survive redaction unchanged.
-    #[test]
-    fn redaction_keeps_ordinary_diagnostics() {
-        let kept = detail(b"ssh: connect to host sting port 22: Connection timed out").unwrap();
-        assert_eq!(
-            kept,
-            "ssh: connect to host sting port 22: Connection timed out"
-        );
-        let kept = detail(b"fatal: bypass passed; design signed https://h/@scope/pkg").unwrap();
-        assert_eq!(
-            kept,
-            "fatal: bypass passed; design signed https://h/@scope/pkg"
-        );
-        // R4-4: short keys need `=` or `:`; a port is not a password.
-        for keep in [
-            "hint: pass --force to override",
-            "error: no signature found",
-            "gpg: Signature made Tue 23 Sep",
-            "fetch https://host:443/@scope/pkg",
-            "exit status 128",
-        ] {
-            assert_eq!(detail(keep.as_bytes()).unwrap(), keep);
-        }
-    }
-
     // ---- PR #55 review r4 (R-N116) -----------------------------------------
 
     /// R-N116, reviewer fixture P1: shallow destination holding a parent P
@@ -3108,5 +2825,100 @@ mod tests {
         let oracle = upload_pack_oracle(&source, &wants, &haves, &shallow_of(&destination));
         assert_eq!(result.thin_pack, oracle);
         assert_eq!(result.destination_shallow_count, 2);
+    }
+
+    // ---- R-N121: classify, don't echo ---------------------------------------
+
+    /// R-N121: real git and OpenSSH messages map to the closed class set.
+    #[test]
+    fn stderr_is_classified_from_real_messages() {
+        for (raw, class) in [
+            ("fatal: not a git repository (or any of the parent directories): .git\n", StderrClass::NotARepository),
+            ("fatal: '/srv/fast-local/jess/git/x' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n", StderrClass::NotARepository),
+            ("ERROR: Repository not found.\nfatal: Could not read from remote repository.\n", StderrClass::NotARepository),
+            ("bash: line 1: cd: /srv/x: No such file or directory\n", StderrClass::NotARepository),
+            ("jess@sting: Permission denied (publickey,password).\n", StderrClass::AuthFailed),
+            ("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.\n", StderrClass::AuthFailed),
+            ("remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", StderrClass::AuthFailed),
+            ("fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", StderrClass::AuthFailed),
+            ("Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures\n", StderrClass::AuthFailed),
+            ("ssh: Could not resolve hostname nosuch.invalid: nodename nor servname provided, or not known\n", StderrClass::HostUnreachable),
+            ("ssh: Could not resolve hostname nosuch.invalid: Name or service not known\n", StderrClass::HostUnreachable),
+            ("ssh: connect to host 10.0.0.9 port 22: No route to host\n", StderrClass::HostUnreachable),
+            ("ssh: connect to host sting port 22: Connection refused\n", StderrClass::HostUnreachable),
+            ("kex_exchange_identification: Connection closed by remote host\n", StderrClass::HostUnreachable),
+            ("ssh: connect to host sting port 22: Operation timed out\n", StderrClass::Timeout),
+            ("ssh: connect to host sting port 22: Connection timed out\n", StderrClass::Timeout),
+            ("Timeout, server sting not responding.\n", StderrClass::Timeout),
+            ("fatal: bad object 7c3f9e0d1a2b3c4d5e6f708192a3b4c5d6e7f809\n", StderrClass::BadObject),
+            ("error: object file .git/objects/ab/cdef is empty\nfatal: loose object abcdef (stored in .git/objects/ab/cdef) is corrupt\n", StderrClass::BadObject),
+            ("fatal: missing object 7c3f9e0d for refs/heads/main\n", StderrClass::BadObject),
+            ("fatal: bad revision 'HEAD^{commit}'\n", StderrClass::BadObject),
+            ("warning: redirecting to https://example.org/r.git/\n", StderrClass::Other),
+            ("\u{0}\u{1b}[0m binary noise \u{ff}\n", StderrClass::Other),
+        ] {
+            assert_eq!(StderrClass::of(raw.as_bytes()), class, "{raw:?}");
+        }
+        assert!(StderrReceipt::new(b"").is_none());
+        let codes: BTreeSet<&str> = [
+            StderrClass::NotARepository,
+            StderrClass::AuthFailed,
+            StderrClass::HostUnreachable,
+            StderrClass::Timeout,
+            StderrClass::BadObject,
+            StderrClass::Other,
+        ]
+        .iter()
+        .map(|class| class.code())
+        .collect();
+        assert_eq!(codes.len(), 6);
+    }
+
+    /// R-N121: the raw stderr goes to `<state>/stderr/<blake3>.log`, created
+    /// exclusively at 0600 in a 0700 directory, byte for byte; a second
+    /// refusal with the same bytes reuses it, and a planted file or symlink
+    /// at that path is refused, never followed or overwritten.
+    #[test]
+    fn raw_stderr_is_kept_in_a_private_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new("stderr-file");
+        let state = fixture.root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let raw: &[u8] = b"fatal: password: hunter2\n\xff\x00\x1b[0m binary\n";
+        let refused = Refused::with_stderr(BulkloadRefusal::GitUnavailable, raw);
+        let path = refused.persist_stderr(&state).unwrap().unwrap();
+        let digest = blake3::hash(raw).to_hex().to_string();
+        assert_eq!(path, state.join("stderr").join(format!("{digest}.log")));
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let mode = std::fs::metadata(state.join("stderr"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!path.to_string_lossy().contains("hunter2"));
+        let lines = refused.lines(Some(&path));
+        assert!(lines.contains(&format!("stderr_file={}", path.display())));
+        assert!(!lines.join("\n").contains("hunter2"));
+        // Same bytes again: the existing file is accepted as is.
+        assert_eq!(refused.persist_stderr(&state).unwrap(), Some(path.clone()));
+        // A different file at that path is refused, not overwritten.
+        std::fs::write(&path, b"planted").unwrap();
+        assert!(refused.persist_stderr(&state).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"planted");
+        // A symlink at that path is refused, not followed.
+        std::fs::remove_file(&path).unwrap();
+        let target = fixture.root.join("elsewhere");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(refused.persist_stderr(&state).is_err());
+        assert!(!target.exists());
+        // No stderr: nothing is written.
+        let other = fixture.root.join("state-empty");
+        std::fs::create_dir(&other).unwrap();
+        let silent = Refused::from(BulkloadRefusal::GitUnavailable);
+        assert_eq!(silent.persist_stderr(&other).unwrap(), None);
+        assert!(!other.join("stderr").exists());
     }
 }

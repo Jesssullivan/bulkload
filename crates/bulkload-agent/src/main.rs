@@ -34,12 +34,15 @@ SUBCOMMANDS:
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
-    git-carry-estimate SOURCE_REPO DEST [SOURCE_REPO DEST ...]
+    git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
                 Read-only: report what git carry v2 would move from SOURCE_REPO
                 to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes);
                 missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
                 partial or differently-shallow DEST (R-N75); a refused pair
-                prints refused=CODE and the verb exits nonzero
+                prints refused=CODE and the verb exits nonzero. A child's
+                stderr is never printed (R-N121): only stderr_class= and
+                stderr_blake3=, plus stderr_file= when --state-dir keeps the
+                raw bytes in DIR/stderr/<blake3>.log (mode 0600)
     estate-add PLAN SOURCE_REPO DEST_REPO [ABSENT_WORKSPACE]
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
@@ -302,11 +305,21 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 // Read-only on both sides: no fetch, no object or ref write (R-N60 baseline).
 //
 // Each pair prints one whole block, built before any of it is written. A
-// refused pair prints `refused=CODE` (and `refused_detail=` when a child
-// process explained it) in place of its measurements; later pairs still run,
-// and the verb exits nonzero with the first refusal (F13).
+// refused pair prints `refused=CODE` in place of its measurements, with
+// `refused_reason=`, `stderr_class=` and `stderr_blake3=` when present; later
+// pairs still run, and the verb exits nonzero with the first refusal (F13).
+// A child's stderr is classified, never echoed (R-N121). With `--state-dir`,
+// its raw bytes go to a private 0600 file whose path is printed as
+// `stderr_file=`; without it nothing is written.
 fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::git_carry::estimate::{estimate, Destination, Refused};
+    let (state_dir, args) = match args {
+        [flag, dir, rest @ ..] if flag == "--state-dir" => (Some(Path::new(dir)), rest),
+        _ => (None, args),
+    };
+    if state_dir.is_some_and(|dir| !dir.is_dir()) {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     }
@@ -327,22 +340,35 @@ fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
         match outcome {
             Ok(estimate) => block.extend(estimate.lines()),
             Err(refused) => {
-                block.push(format!("refused={}", refused.refusal.code()));
-                if let Some(detail) = &refused.detail {
-                    block.push(format!("refused_detail={detail}"));
-                }
+                let stored = match state_dir.map(|dir| refused.persist_stderr(dir)) {
+                    Some(Ok(path)) => path,
+                    Some(Err(error)) => {
+                        block.extend(refused.lines(None));
+                        block.push(format!("stderr_file_refused={}", error.code()));
+                        first.get_or_insert(refused.refusal);
+                        emit(&mut stdout, index, &block)?;
+                        continue;
+                    }
+                    None => None,
+                };
+                block.extend(refused.lines(stored.as_deref()));
                 first.get_or_insert(refused.refusal);
             }
         }
-        if index > 0 {
-            writeln!(stdout)?;
-        }
-        for line in block {
-            writeln!(stdout, "{line}")?;
-        }
-        stdout.flush()?;
+        emit(&mut stdout, index, &block)?;
     }
     first.map_or(Ok(()), Err)
+}
+
+fn emit(stdout: &mut impl std::io::Write, index: usize, block: &[String]) -> Result<()> {
+    if index > 0 {
+        writeln!(stdout)?;
+    }
+    for line in block {
+        writeln!(stdout, "{line}")?;
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
