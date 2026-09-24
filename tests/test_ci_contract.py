@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "aca1a6076902895b7a5a96208bef9e4e65e646c70799114ddeac2c0c0e4a7017"
+WORKFLOW_SHA256 = "6b3df5845e5f33c4d6acdabcd912898846d69695930373ff14bca7f8152f61f2"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -24,8 +24,8 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "c54d6f1418ce1abaf34daaf889b7757d5cf635c6924fe871e6472d9f36115762"
-GUARD_SHA256 = "ba46969b7826d64d9493d38b865e264cb78c47d2269f0f66e08a171f8acd9535"
+ACTION_SHA256 = "2cd1796c907f46d55af04b66d0f2f1c53211c78e80a092787a23edc06aa39ee1"
+GUARD_SHA256 = "825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f"
 FAULT_HARNESS_STEP_SHA256 = (
     "fc226b95e6553343298eb65a434df43ec6a07fdda7821b47a66e0ecff06a1bbe"
 )
@@ -49,8 +49,30 @@ FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
 EXPECTED_SHA_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.sha || github.sha }}"
+    "github.event.pull_request.head.sha || "
+    "github.event_name == 'merge_group' && "
+    "github.event.merge_group.head_sha || github.sha }}"
 )
+# The audited trigger inventory (R-N124): main pushes and release tags, pull
+# requests, and the main merge queue. Nothing else may start CI.
+WORKFLOW_TRIGGERS = (
+    "on:\n"
+    "  push:\n"
+    "    branches: [main]\n"
+    '    tags: ["v*"]\n'
+    "  pull_request:\n"
+    "  merge_group:\n"
+    "    types: [checks_requested]\n"
+    "\n"
+    "permissions:\n"
+)
+# Every guard invocation runs the digest-checked bytes as a `-c` argument. A
+# stdin pipe (`printf | bash -s`) raced the guard's early `exit` and failed with
+# a broken pipe when the reader closed before the writer finished.
+GUARD_INVOCATION = (
+    '/bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard'
+)
+
 HEAD_REPOSITORY_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name || github.repository }}"
@@ -120,6 +142,13 @@ PINNED_JUST_RECIPES = {
         (
             "cd {{ root }} && cargo fmt --all -- --check",
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
+            "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked "
+            "--features io-trace -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features "
+            "io-trace io::",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features "
+            "io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored "
+            "--exact --test-threads=1",
             "cd {{ root }} && cargo test --workspace --locked",
         ),
     ),
@@ -256,6 +285,15 @@ def validate_job_routing(workflow: str) -> None:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
     if workflow.count("matrix:") != 1 or workflow.count(MATRIX_GATE_EXPRESSION) != 2:
         raise ContractError("terminal gate matrix authority escaped its audited scope")
+
+    if workflow.count(WORKFLOW_TRIGGERS) != 1 or not workflow.startswith(
+        "name: CI\n\n" + WORKFLOW_TRIGGERS
+    ):
+        raise ContractError("workflow trigger inventory drifted")
+    if re.search(
+        r"(?m)^\s*(?:pull_request_target|workflow_run|workflow_dispatch)\s*:", workflow
+    ):
+        raise ContractError("workflow must not add an unaudited trigger")
 
     if re.search(
         r"(?mi)^\s*(?:continue-on-error|\"continue-on-error\"|'continue-on-error')\s*:",
@@ -1160,8 +1198,8 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "      id: authority",
         "      id: bazel-build-authority",
         "      id: bazel-test-authority",
-        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- preflight",
-        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- enforce",
+        f"        {GUARD_INVOCATION} preflight",
+        f"        {GUARD_INVOCATION} enforce",
         '        [[ "$(nix config show store)" == local ]]',
         '        [[ "$(nix config show allow-symlinked-store)" == false ]]',
         '        [[ "$(nix eval --raw --expr builtins.storeDir)" == /nix/store ]]',
@@ -1567,12 +1605,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     )
     if action.count(digest_check) != 4:
         raise ContractError("every captured guard must have an external digest check")
-    if (
-        action.count(
-            "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel"
-        )
-        != 2
-    ):
+    if action.count(f"        {GUARD_INVOCATION} bazel") != 2:
         raise ContractError("each Bazel invocation needs an immediate authority guard")
     if (
         action.count(
@@ -1585,18 +1618,16 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("Bazel executor input must remain empty")
 
     snapshot = action.index("- name: Snapshot the exact public-read guard")
-    preflight = action.index("/bin/bash --noprofile --norc -p -s -- preflight")
+    preflight = action.index(f"{GUARD_INVOCATION} preflight")
     setup = action.index(f"uses: {nix_setup}")
-    enforce = action.index("/bin/bash --noprofile --norc -p -s -- enforce")
+    enforce = action.index(f"{GUARD_INVOCATION} enforce")
     effective_nix = action.index(
         "\n    - name: Verify effective Nix client authority\n"
     )
     source = action.index("\n    - name: Run repository-owned source gates\n")
     bazel_guards = [
         match.start()
-        for match in re.finditer(
-            re.escape("/bin/bash --noprofile --norc -p -s -- bazel"), action
-        )
+        for match in re.finditer(re.escape(f"{GUARD_INVOCATION} bazel"), action)
     ]
     bazel_actions = [
         match.start()
@@ -2148,11 +2179,27 @@ class CiContractTest(unittest.TestCase):
                 )
                 self.assertEqual(selected[-1], TERMINAL_CONSUMERS[gate])
 
-    def test_workflow_gate_cap_and_failure_suppression_mutations_fail_closed(
+    def test_workflow_triggers_cap_and_failure_suppression_mutations_fail_closed(
         self,
     ) -> None:
         cap = "    timeout-minutes: 15\n"
+        queue = "  merge_group:\n    types: [checks_requested]\n"
         variants = [
+            self.workflow.replace(queue, "", 1),
+            self.workflow.replace(
+                queue, "  merge_group:\n    types: [checks_requested, destroyed]\n", 1
+            ),
+            self.workflow.replace(queue, queue + "  workflow_dispatch:\n", 1),
+            self.workflow.replace(queue, queue + "  pull_request_target:\n", 1),
+            self.workflow.replace(
+                "    branches: [main]\n", "    branches: ['**']\n", 1
+            ),
+            self.workflow.replace(
+                "github.event_name == 'merge_group' && "
+                "github.event.merge_group.head_sha || ",
+                "",
+                1,
+            ),
             self.workflow.replace(cap, "    timeout-minutes: 30\n", 1),
             self.workflow.replace(cap, "", 1),
             self.workflow.replace(cap, cap + "    continue-on-error: true\n", 1),
@@ -2725,15 +2772,16 @@ class CiContractTest(unittest.TestCase):
                 1,
             ),
             self.action.replace(
-                "/bin/bash --noprofile --norc -p -s -- preflight",
+                f"{GUARD_INVOCATION} preflight",
                 '/bin/bash --noprofile --norc -p "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
                 1,
             ),
             self.action.replace(
-                "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel\n",
-                "",
+                f"{GUARD_INVOCATION} preflight",
+                "printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- preflight",
                 1,
             ),
+            self.action.replace(f"        {GUARD_INVOCATION} bazel\n", "", 1),
             self.action.replace(GUARD_SHA256, "0" * 64, 1),
             self.action.replace(
                 "        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}",
@@ -3020,13 +3068,16 @@ class CiContractTest(unittest.TestCase):
             def run_guard(
                 mode: str, env: dict[str, str], *, check: bool = True
             ) -> subprocess.CompletedProcess[str]:
+                # Exactly the action's invocation: the guard bytes as `-c`.
                 result = subprocess.run(
                     [
                         "/bin/bash",
                         "--noprofile",
                         "--norc",
                         "-p",
-                        str(self.root / GUARD_PATH),
+                        "-c",
+                        (self.root / GUARD_PATH).read_text(encoding="utf-8"),
+                        "bulkload-public-read-guard",
                         mode,
                     ],
                     check=False,
@@ -3189,6 +3240,33 @@ class CiContractTest(unittest.TestCase):
             )
             run_guard("preflight", main_env)
             run_guard("enforce", main_env)
+
+            queue_ref = "refs/heads/gh-readonly-queue/main/pr-67-" + "a" * 40
+            queue_env = dict(base_env)
+            queue_env.update(
+                {
+                    "BULKLOAD_EVENT_NAME": "merge_group",
+                    "BULKLOAD_REF": queue_ref,
+                    "GITHUB_EVENT_NAME": "merge_group",
+                    "GITHUB_REF": queue_ref,
+                }
+            )
+            run_guard("preflight", queue_env)
+            run_guard("enforce", queue_env)
+            for key, value in (
+                ("BULKLOAD_UPLOAD_BAZEL_RESULTS", "true"),
+                ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
+                ("BULKLOAD_REF", "refs/heads/gh-readonly-queue/other/pr-1-x"),
+                ("BULKLOAD_REF", "refs/heads/main"),
+            ):
+                unsafe_env = dict(queue_env)
+                unsafe_env[key] = value
+                if key == "BULKLOAD_REF":
+                    unsafe_env["GITHUB_REF"] = value
+                with self.subTest(merge_group=key, value=value):
+                    self.assertNotEqual(
+                        run_guard("enforce", unsafe_env, check=False).returncode, 0
+                    )
 
             for key, value in (
                 ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
