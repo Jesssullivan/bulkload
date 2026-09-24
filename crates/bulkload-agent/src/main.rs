@@ -87,6 +87,22 @@ BOUNDARIES:
     any depth when Git tracks nothing beneath it, records each omitted root and
     its size as custody, and carries every other untracked and ignored file.
     --include-rebuildable carries the rebuildable set too, at full fidelity.
+    estate-capture tolerates refs and worktree seats moving under a pass (R25):
+    the item reports outcome=captured-with-drift with reason=drift=N, the N
+    rows ride in the CORPUS {bundle}.drift sidecar (the bundle's
+    refs/carry-export/capture-drift-v1 names the export's share), drifted
+    seats are omitted from the bundle, and the next estate-capture re-reads
+    exactly those seats plus any racy seat (stamped within 2 s of the pass
+    start) and reuses every other blob (capture-extended-from-drift,
+    source_bytes_read). A pass reusing nothing it was offered says why:
+    reuse_unavailable=shallow|retained-unreadable|pass-start-unrecorded|
+    future-stamp.
+    A bundle that drifted under its export carries an in-band marker, and
+    estate-apply and every git-restore/import/attach/repair verb refuse it
+    with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
+    config, shallow or
+    nested-worktree changes under a pass still refuse GIT_AUTHORITY_CHANGED;
+    git-export never tolerates drift.
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
 ";
@@ -438,11 +454,20 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
     };
     let receipt = |row: &estate::Receipt| {
         let mut output = std::io::stdout().lock();
-        writeln!(
+        write!(
             output,
-            "item={} source={:?} outcome={} reason={:?}",
-            row.item, row.source, row.outcome, row.reason
+            "item={} source={:?} outcome={} reason={:?} source_bytes_read={}",
+            row.item, row.source, row.outcome, row.reason, row.bytes_read
         )?;
+        if let Some(why) = row.reuse_unavailable {
+            write!(output, " reuse_unavailable={why}")?;
+        }
+        writeln!(output)?;
+        // One line per drifted ref or seat, after the item line, so a clean
+        // item stays one line.
+        for line in &row.drift {
+            writeln!(output, "item={} drift={line}", row.item)?;
+        }
         output.flush()?;
         Ok(())
     };

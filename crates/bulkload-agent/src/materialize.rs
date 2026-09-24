@@ -74,8 +74,10 @@ impl Destination {
         // SAFETY: both descriptors and the NUL-terminated leaf remain valid.
         let created = unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) };
         if created == 0 {
+            fault_point!(DirectoryAfterMkdir);
             let metadata = open_dir(parent.as_raw_fd(), &leaf)?.metadata()?;
             store.pending_directory(&key, metadata.dev(), metadata.ino(), mode, true)?;
+            fault_point!(DirectoryAfterPendingRecord);
             self.directories.push(PendingDirectory {
                 path: row.rel_path.clone(),
                 mode,
@@ -120,6 +122,7 @@ impl Destination {
             }
             directory.set_permissions(Permissions::from_mode(pending.mode))?;
             directory.sync_all()?;
+            fault_point!(DirectoryBeforeComplete);
             store.complete_directory(&pending.key)?;
         }
         Ok(())
@@ -217,7 +220,9 @@ impl Destination {
             if linked != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
+            fault_point!(MaterializeAfterLink);
             parent.sync_all()?;
+            fault_point!(MaterializeAfterParentSync);
             Ok(())
         });
         // SAFETY: remove only the unique temporary name created above.
@@ -273,8 +278,10 @@ fn write_chunks(
     if size != row.size || *hasher.finalize().as_bytes() != manifest.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
+    fault_point!(MaterializeAfterTempWrite);
     file.set_permissions(Permissions::from_mode(row.mode & 0o7777))?;
     file.sync_all()?;
+    fault_point!(MaterializeAfterTempSync);
     Ok(())
 }
 
