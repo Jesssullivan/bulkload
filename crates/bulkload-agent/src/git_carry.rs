@@ -2612,9 +2612,12 @@ fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
     )
 }
 
-// R-N115: the first gitlink in a nest's index whose path holds a `.git` (a
-// populated submodule of the nest). Its status would recurse into another
-// repository's config and worktree, and its bytes are nobody's seats.
+// R-N115 (round 4 N1): the first gitlink in a nest's index whose path holds
+// anything but an empty directory: a populated submodule, a repository, files
+// left under an unpopulated gitlink, or a file or symlink at the path. Git's
+// status never descends a gitlink path, so nothing there is dirt, ignored or
+// a seat: it would be carried by nobody. Only absence or an empty directory
+// (what `git clone` without --recurse-submodules leaves) passes.
 fn nest_populated_submodule(directory: &Path) -> Result<Option<Vec<u8>>> {
     use std::os::unix::ffi::OsStrExt;
     let staged = output(git(directory).args(["--git-dir=.git", "ls-files", "-z", "--stage"]))?;
@@ -2628,11 +2631,13 @@ fn nest_populated_submodule(directory: &Path) -> Result<Option<Vec<u8>>> {
             .and_then(|tab| entry.get(tab + 1..))
             .filter(|path| !path.is_empty())
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        match fs::symlink_metadata(
-            directory
-                .join(std::ffi::OsStr::from_bytes(path))
-                .join(".git"),
-        ) {
+        let seat = directory.join(std::ffi::OsStr::from_bytes(path));
+        match fs::symlink_metadata(&seat) {
+            Ok(meta) if meta.is_dir() => {
+                if fs::read_dir(&seat)?.next().is_some() {
+                    return Ok(Some(path.to_vec()));
+                }
+            }
             Ok(_) => return Ok(Some(path.to_vec())),
             Err(error)
                 if matches!(
@@ -5959,6 +5964,55 @@ mod tests {
             "GIT_NEST_POPULATED_SUBMODULE path=\"vendor/inner/odd\\nsub\""
         );
         assert_eq!(markers_fired(&markers), Vec::<std::ffi::OsString>::new());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round 4 N1 (R-N115): a gitlink path inside a nest may hold nothing or an
+    // empty directory. A file left under it, a repository under it, or a file
+    // or symlink at it refuses by name; none of it would be carried by anyone.
+    #[test]
+    fn a_nest_gitlink_path_holding_anything_but_an_empty_directory_refuses_by_name() {
+        let root = fresh("bulkload-nest-gitlink-seat");
+        let source = root.join("outer");
+        committed(&source, b"outer");
+        let nest = source.join("vendor/inner");
+        committed(&nest, b"inner");
+        let head = head_of(&nest);
+        output(git(&nest).args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},s"),
+        ]))
+        .unwrap();
+        commit(&nest, "gitlink s");
+        let expected = BulkloadRefusal::GitNestPopulatedSubmodule(b"vendor/inner/s".to_vec());
+        // Absent: status reports the submodule deleted, which is dirt.
+        assert_eq!(
+            nested_repositories(&source),
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        );
+        // An empty directory, as a clone without --recurse-submodules leaves.
+        fs::create_dir(nest.join("s")).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
+        // A file left under it.
+        fs::write(nest.join("s/leftover"), b"only copy").unwrap();
+        refuses_everywhere_with(&source, &root.join("capture-file-under"), &expected);
+        fs::remove_file(nest.join("s/leftover")).unwrap();
+        // A whole repository under it.
+        committed(&nest.join("s/deep"), b"deep");
+        refuses_everywhere_with(&source, &root.join("capture-repo-under"), &expected);
+        fs::remove_dir_all(nest.join("s")).unwrap();
+        // A file at the gitlink path itself.
+        fs::write(nest.join("s"), b"a file where the submodule was").unwrap();
+        refuses_everywhere_with(&source, &root.join("capture-file-at"), &expected);
+        fs::remove_file(nest.join("s")).unwrap();
+        // A symlink at the gitlink path, never followed.
+        std::os::unix::fs::symlink(&root, nest.join("s")).unwrap();
+        refuses_everywhere_with(&source, &root.join("capture-link-at"), &expected);
+        fs::remove_file(nest.join("s")).unwrap();
+        fs::create_dir(nest.join("s")).unwrap();
+        assert_eq!(nested_repositories(&source).unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9519,5 +9573,664 @@ mod review_pr53c {
             captured.is_ok()
         );
         assert!(restored, "{rows:?}");
+    }
+}
+
+// The #53 round-4 adversarial review of dcfee46 (R-N73, R-N114, R-N115,
+// TIN-4540), kept as regression tests. Each `rv4_*` asserts the behaviour the
+// rulings require. Fixtures carry no credential-shaped literal (R-N117).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_pr53d {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn g(repo: &Path, args: &[&str]) -> Vec<u8> {
+        let out = git(repo)
+            .args([
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rv53d-{name}-{}", std::process::id()));
+        if root.exists() {
+            let _ = std::process::Command::new("chmod")
+                .args(["-R", "u+rwx"])
+                .arg(&root)
+                .status();
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+rwx"])
+            .arg(root)
+            .status();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn init(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        g(repo, &["init", "--template=", "-b", "main"]);
+    }
+
+    fn commit_all(repo: &Path, message: &str) {
+        g(repo, &["add", "-A"]);
+        g(repo, &["commit", "-q", "-m", message]);
+    }
+
+    fn pushed(inner: &Path) {
+        g(inner, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    fn head(repo: &Path) -> String {
+        String::from_utf8(g(repo, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    // outer/file tracked; outer/vendor/inner a clean nest pushed to origin/main.
+    fn outer_with_nest(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = fresh(name);
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let inner = outer.join("vendor/inner");
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        commit_all(&inner, "v1");
+        g(
+            &inner,
+            &["remote", "add", "origin", "https://example.invalid/i.git"],
+        );
+        pushed(&inner);
+        (root, outer, inner)
+    }
+
+    fn upstream(root: &Path, name: &str) -> PathBuf {
+        let up = root.join(name);
+        init(&up);
+        fs::write(up.join("u"), name.as_bytes()).unwrap();
+        commit_all(&up, name);
+        up
+    }
+
+    fn verdict(outer: &Path) -> String {
+        match nested_repositories(outer) {
+            Ok(n) => format!(
+                "CUSTODY {:?}",
+                n.iter()
+                    .map(NestedRepository::receipt_line)
+                    .collect::<Vec<_>>()
+            ),
+            Err(e) => format!("REFUSED {e:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------- R-N115
+    // A nest's UNPOPULATED gitlink directory: Git's status never descends a
+    // gitlink path, so files under it (and a whole repository under it) are
+    // neither dirt nor ignored. The census calls the nest clean and names
+    // nothing below it; `nest_populated_submodule` looks only at `<gitlink>/.git`.
+    fn nest_with_unpopulated_gitlink(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, outer, inner) = outer_with_nest(name);
+        let up = upstream(&root, "up");
+        g(
+            &inner,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},s", head(&up)),
+            ],
+        );
+        g(&inner, &["commit", "-q", "-m", "gitlink s"]);
+        pushed(&inner);
+        fs::create_dir(inner.join("s")).unwrap();
+        (root, outer, inner)
+    }
+
+    #[test]
+    fn rv4_file_inside_a_nests_unpopulated_gitlink_dir_is_not_silently_dropped() {
+        let (root, outer, inner) = nest_with_unpopulated_gitlink("unpop-file");
+        let baseline = verdict(&outer);
+        fs::write(inner.join("s/leftover.txt"), b"rv4 unique bytes").unwrap();
+        let v = verdict(&outer);
+        let census = capture_census(
+            &outer,
+            &common_repository(&outer).unwrap(),
+            CapturePolicy::default(),
+        );
+        let carried = census.as_ref().is_ok_and(|census| {
+            census
+                .rows
+                .iter()
+                .any(|row| row.rel_path == b"vendor/inner/s/leftover.txt")
+        });
+        cleanup(&root);
+        eprintln!("baseline: {baseline}\nwith leftover: {v}\ncarried as seat: {carried}");
+        assert!(
+            v.starts_with("REFUSED") || carried,
+            "a file below the nest's unpopulated gitlink is neither refused nor carried: {v}"
+        );
+    }
+
+    #[test]
+    fn rv4_repository_inside_a_nests_unpopulated_gitlink_dir_is_refused_by_name() {
+        let (root, outer, inner) = nest_with_unpopulated_gitlink("unpop-repo");
+        let deep = inner.join("s/deep");
+        init(&deep);
+        fs::write(deep.join("d"), b"rv4 unpushed work").unwrap();
+        commit_all(&deep, "only copy");
+        let v = verdict(&outer);
+        cleanup(&root);
+        eprintln!("repo under unpopulated gitlink: {v}");
+        assert!(
+            v.starts_with("REFUSED"),
+            "a repository (with unpushed history) below the nest's unpopulated gitlink is custody-clean: {v}"
+        );
+    }
+
+    #[test]
+    fn rv4_populated_submodule_at_a_nested_path_refuses_naming_it() {
+        let (root, outer, inner) = outer_with_nest("sub-deep-path");
+        let up = upstream(&root, "up");
+        g(
+            &inner,
+            &["submodule", "add", "-q", up.to_str().unwrap(), "lib/s"],
+        );
+        g(&inner, &["commit", "-q", "-m", "sub"]);
+        pushed(&inner);
+        let result = nested_repositories(&outer);
+        cleanup(&root);
+        assert_eq!(
+            result.map(|_| ()),
+            Err(BulkloadRefusal::GitNestPopulatedSubmodule(
+                b"vendor/inner/lib/s".to_vec()
+            ))
+        );
+    }
+
+    #[test]
+    fn rv4_populated_submodule_two_levels_down_refuses() {
+        let (root, outer, inner) = outer_with_nest("sub-two-levels");
+        let leaf = upstream(&root, "leaf");
+        let mid = upstream(&root, "mid");
+        g(
+            &mid,
+            &["submodule", "add", "-q", leaf.to_str().unwrap(), "t"],
+        );
+        g(&mid, &["commit", "-q", "-m", "t"]);
+        g(
+            &inner,
+            &["submodule", "add", "-q", mid.to_str().unwrap(), "s"],
+        );
+        g(&inner, &["commit", "-q", "-m", "s"]);
+        g(
+            &inner,
+            &["submodule", "update", "-q", "--init", "--recursive"],
+        );
+        pushed(&inner);
+        let v = verdict(&outer);
+        cleanup(&root);
+        assert!(v.starts_with("REFUSED"), "{v}");
+    }
+
+    // -------------------------------------------------------------------- B1
+    // Every attribute source status reads must be seen by the census.
+    fn attr_case(name: &str, setup: impl FnOnce(&Path, &Path)) -> String {
+        let (root, outer, inner) = outer_with_nest(name);
+        fs::create_dir_all(inner.join("sub")).unwrap();
+        fs::write(inner.join("sub/a.c"), b"a\n").unwrap();
+        commit_all(&inner, "sub");
+        pushed(&inner);
+        setup(&root, &inner);
+        let v = verdict(&outer);
+        cleanup(&root);
+        v
+    }
+
+    #[test]
+    fn rv4_attribute_sources_all_refuse() {
+        let mut results = Vec::new();
+        results.push((
+            "subdir .gitattributes",
+            attr_case("attr-subdir", |_, inner| {
+                fs::write(inner.join("sub/.gitattributes"), b"*.c ident\n").unwrap();
+                commit_all(inner, "attrs");
+                pushed(inner);
+            }),
+        ));
+        results.push((
+            "info/attributes",
+            attr_case("attr-info", |_, inner| {
+                fs::create_dir_all(inner.join(".git/info")).unwrap();
+                fs::write(inner.join(".git/info/attributes"), b"* eol=crlf\n").unwrap();
+            }),
+        ));
+        results.push((
+            "nest core.attributesFile",
+            attr_case("attr-file", |root, inner| {
+                let file = root.join("attributes");
+                fs::write(&file, b"*.c text\n").unwrap();
+                g(
+                    inner,
+                    &["config", "core.attributesFile", file.to_str().unwrap()],
+                );
+            }),
+        ));
+        results.push((
+            "macro attribute",
+            attr_case("attr-macro", |_, inner| {
+                fs::write(
+                    inner.join(".gitattributes"),
+                    b"[attr]conv text eol=lf\n*.c conv\n",
+                )
+                .unwrap();
+                commit_all(inner, "macro");
+                pushed(inner);
+            }),
+        ));
+        results.push((
+            "attr.tree",
+            attr_case("attr-tree", |_, inner| {
+                let blob = String::from_utf8(
+                    input(
+                        git(inner).args(["hash-object", "-w", "--stdin"]),
+                        b"*.c ident\n",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let tree = String::from_utf8(
+                    input(
+                        git(inner).args(["mktree"]),
+                        format!("100644 blob {}\t.gitattributes\n", blob.trim()).as_bytes(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                g(inner, &["config", "attr.tree", tree.trim()]);
+            }),
+        ));
+        results.push((
+            "include.path",
+            attr_case("attr-include", |root, inner| {
+                let attrs = root.join("attributes");
+                fs::write(&attrs, b"*.c working-tree-encoding=UTF-16\n").unwrap();
+                let include = root.join("include");
+                fs::write(
+                    &include,
+                    format!("[core]\n\tattributesFile = {}\n", attrs.display()),
+                )
+                .unwrap();
+                g(
+                    inner,
+                    &["config", "include.path", include.to_str().unwrap()],
+                );
+            }),
+        ));
+        for (case, v) in &results {
+            eprintln!("{case}: {v}");
+        }
+        assert!(
+            results.iter().all(|(_, v)| v.starts_with("REFUSED")),
+            "{results:#?}"
+        );
+    }
+
+    // Config scopes: config.worktree and include files set the overridden keys.
+    fn config_case(name: &str, setup: impl FnOnce(&Path, &Path)) -> String {
+        let (root, outer, inner) = outer_with_nest(name);
+        setup(&root, &inner);
+        let v = verdict(&outer);
+        cleanup(&root);
+        v
+    }
+
+    #[test]
+    fn rv4_overridden_keys_in_every_config_scope_cannot_hide_an_edit() {
+        let mut results = Vec::new();
+        results.push((
+            "config.worktree core.fileMode=false + chmod",
+            config_case("cfg-worktree", |_, inner| {
+                g(inner, &["config", "extensions.worktreeConfig", "true"]);
+                g(inner, &["config", "--worktree", "core.fileMode", "false"]);
+                fs::set_permissions(inner.join("lib.c"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }),
+        ));
+        results.push((
+            "include core.autocrlf=true + CRLF edit",
+            config_case("cfg-include-crlf", |root, inner| {
+                let include = root.join("include");
+                fs::write(&include, b"[core]\n\tautocrlf = true\n").unwrap();
+                g(
+                    inner,
+                    &["config", "include.path", include.to_str().unwrap()],
+                );
+                fs::write(inner.join("lib.c"), b"v1").unwrap();
+                fs::write(inner.join("crlf.txt"), b"line\n").unwrap();
+                commit_all(inner, "lf");
+                pushed(inner);
+                fs::write(inner.join("crlf.txt"), b"line\r\n").unwrap();
+            }),
+        ));
+        results.push((
+            "includeIf core.ignoreStat=true + edit",
+            config_case("cfg-includeif", |root, inner| {
+                let include = root.join("include");
+                fs::write(&include, b"[core]\n\tignoreStat = true\n").unwrap();
+                g(
+                    inner,
+                    &[
+                        "config",
+                        "includeIf.gitdir:**/inner/.git.path",
+                        include.to_str().unwrap(),
+                    ],
+                );
+                g(inner, &["update-index", "--really-refresh"]);
+                fs::write(inner.join("lib.c"), b"v2-longer").unwrap();
+            }),
+        ));
+        results.push((
+            "config.worktree core.symlinks=false + link replaced by file",
+            config_case("cfg-symlinks", |_, inner| {
+                std::os::unix::fs::symlink("lib.c", inner.join("link")).unwrap();
+                commit_all(inner, "link");
+                pushed(inner);
+                g(inner, &["config", "extensions.worktreeConfig", "true"]);
+                g(inner, &["config", "--worktree", "core.symlinks", "false"]);
+                fs::remove_file(inner.join("link")).unwrap();
+                fs::write(inner.join("link"), b"lib.c").unwrap();
+            }),
+        ));
+        for (case, v) in &results {
+            eprintln!("{case}: {v}");
+        }
+        assert!(
+            results.iter().all(|(_, v)| v.starts_with("REFUSED")),
+            "{results:#?}"
+        );
+    }
+
+    // -------------------------------------------------------------------- B2
+    // An `AD` submodule (added, then its directory removed) restores to the
+    // same status; a directory nest with carried ignored files restores clean.
+    #[test]
+    fn rv4_ad_state_submodule_restores_its_own_status() {
+        let root = fresh("ad-state");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let up = upstream(&root, "up");
+        g(
+            &outer,
+            &["submodule", "add", "-q", up.to_str().unwrap(), "sub"],
+        );
+        fs::remove_dir_all(outer.join("sub")).unwrap();
+        let before = String::from_utf8(g(&outer, &["status", "--porcelain"])).unwrap();
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        );
+        let (restored_ok, after, sub_exists) = match export {
+            Ok(export) => {
+                let restored = root.join("restored");
+                let r = restore_bundle(&export.bundle, &restored, "neo");
+                let after = if r.is_ok() {
+                    String::from_utf8(g(&restored, &["status", "--porcelain"])).unwrap()
+                } else {
+                    format!("{r:?}")
+                };
+                (r.is_ok(), after, restored.join("sub").exists())
+            }
+            Err(e) => (false, format!("export {e:?}"), false),
+        };
+        cleanup(&root);
+        eprintln!("before=[{before}] after=[{after}] sub_exists={sub_exists}");
+        assert!(restored_ok, "{after}");
+        assert_eq!(before, after);
+        assert!(!sub_exists, "restore invented the AD submodule's directory");
+    }
+
+    #[test]
+    fn rv4_populated_submodule_with_ignored_file_restores_clean() {
+        let root = fresh("sub-ignored");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        commit_all(&outer, "outer");
+        let up = upstream(&root, "up");
+        g(
+            &outer,
+            &["submodule", "add", "-q", up.to_str().unwrap(), "sub"],
+        );
+        g(&outer, &["commit", "-q", "-m", "sub"]);
+        let sub = outer.join("sub");
+        g(
+            &sub,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/u.git",
+            ],
+        );
+        g(&sub, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let exclude = String::from_utf8(g(
+            &sub,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+        ))
+        .unwrap();
+        fs::create_dir_all(Path::new(exclude.trim()).parent().unwrap()).unwrap();
+        fs::write(exclude.trim(), b"notes.txt\n").unwrap();
+        fs::write(sub.join("notes.txt"), b"rv4 ignored in sub").unwrap();
+        let export = export_repository_with_policy(
+            &outer,
+            &root.join("capture"),
+            None,
+            CapturePolicy::default(),
+        )
+        .unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&export.bundle, &restored, "neo").unwrap();
+        let notes = fs::read(restored.join("sub/notes.txt")).ok();
+        let status = String::from_utf8(g(&restored, &["status", "--porcelain"])).unwrap();
+        cleanup(&root);
+        assert_eq!(notes.as_deref(), Some(&b"rv4 ignored in sub"[..]));
+        assert!(status.is_empty(), "{status}");
+    }
+
+    // -------------------------------------------------------------------- B4
+    // A nest HEAD that moves A -> B before the export and back B -> A after it:
+    // the pre- and post-pass keys agree, the bundle names B. Must refuse.
+    #[test]
+    fn rv4_nest_head_aba_around_the_export_refuses() {
+        use crate::estate;
+        let (root, outer, inner) = outer_with_nest("aba");
+        let a = head(&inner);
+        let plan = root.join("plan");
+        estate::add(&plan, &outer, &root.join("dest"), None).unwrap();
+        let moved = inner.clone();
+        mid_pass::arm_at(&outer, mid_pass::Stage::Snapshot, move || {
+            fs::write(moved.join("lib.c"), b"v2").unwrap();
+            g(&moved, &["commit", "-q", "-am", "B"]);
+        });
+        let back = inner;
+        mid_pass::arm_at(&outer, mid_pass::Stage::AfterPass, move || {
+            g(&back, &["reset", "-q", "--hard", &a]);
+        });
+        let rows = std::sync::Mutex::new(Vec::new());
+        let result = estate::capture(
+            &plan,
+            &root.join("state"),
+            &root.join("corpus"),
+            1,
+            &|row| {
+                rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                Ok(())
+            },
+        );
+        cleanup(&root);
+        let rows = rows.into_inner().unwrap();
+        assert!(result.is_err(), "{rows:?}");
+        assert_eq!(
+            rows,
+            vec![(
+                "refused",
+                Some(BulkloadRefusal::GitAuthorityChanged.to_string())
+            )]
+        );
+    }
+
+    // ---------------------------------------------------------------- R-N114
+    type Rows = Vec<(String, Option<String>, Vec<String>)>;
+
+    fn estate_run(
+        root: &Path,
+        items: &[(&Path, &Path)],
+        jobs: usize,
+    ) -> (Vec<Result<()>>, Rows, Rows) {
+        use crate::estate;
+        let plan = root.join("plan");
+        let added: Vec<Result<()>> = items
+            .iter()
+            .map(|(source, target)| estate::add(&plan, source, target, Some(target)))
+            .collect();
+        let capture_rows = std::sync::Mutex::new(Vec::new());
+        let apply_rows = std::sync::Mutex::new(Vec::new());
+        if plan.exists() {
+            let _ = estate::capture(
+                &plan,
+                &root.join("state"),
+                &root.join("corpus"),
+                jobs,
+                &|row| {
+                    capture_rows.lock().unwrap().push((
+                        row.outcome.to_owned(),
+                        row.reason.clone(),
+                        row.nested.clone(),
+                    ));
+                    Ok(())
+                },
+            );
+            let _ = estate::apply(
+                &plan,
+                &root.join("corpus"),
+                &root.join("applied"),
+                "neo",
+                jobs,
+                &|row| {
+                    apply_rows.lock().unwrap().push((
+                        row.outcome.to_owned(),
+                        row.reason.clone(),
+                        row.nested.clone(),
+                    ));
+                    Ok(())
+                },
+            );
+        }
+        (
+            added,
+            capture_rows.into_inner().unwrap(),
+            apply_rows.into_inner().unwrap(),
+        )
+    }
+
+    fn bare_errno(rows: &Rows) -> bool {
+        rows.iter()
+            .any(|row| row.1.as_deref().is_some_and(|r| r.starts_with("IO")))
+    }
+
+    #[test]
+    fn rv4_nest_item_listed_before_the_outer_restores_with_two_jobs() {
+        let (root, outer, inner) = outer_with_nest("order-rev");
+        let target = root.join("target");
+        let nest_target = target.join("vendor/inner");
+        let (added, cap, app) = estate_run(&root, &[(&inner, &nest_target), (&outer, &target)], 2);
+        let restored = nest_target.join(".git").exists() && target.join("file").exists();
+        cleanup(&root);
+        eprintln!("added={added:?}\ncapture={cap:#?}\napply={app:#?}");
+        assert!(added.iter().all(Result::is_ok));
+        assert!(restored, "{app:#?}");
+        assert!(cap.iter().chain(&app).all(|row| row.0 != "refused"));
+    }
+
+    #[test]
+    fn rv4_dotdot_target_inside_the_outer_is_refused_or_typed() {
+        let (root, outer, inner) = outer_with_nest("dotdot-target");
+        let target = root.join("target");
+        let other = upstream(&root, "other");
+        // Lexically outside target/, physically target/file: the outer's seat.
+        let sneaky = root.join("elsewhere/../target/file");
+        fs::create_dir(root.join("elsewhere")).unwrap();
+        let (added, _cap, app) = estate_run(&root, &[(&outer, &target), (&other, &sneaky)], 1);
+        let _ = inner;
+        cleanup(&root);
+        eprintln!("added={added:?}\napply={app:#?}");
+        let refused_at_add = added
+            .get(1)
+            .is_some_and(|r| *r == Err(BulkloadRefusal::GitDestinationOccupied));
+        assert!(
+            refused_at_add || !bare_errno(&app),
+            "dot-dot overlap: bare errno at apply: {app:#?}"
+        );
+    }
+
+    #[test]
+    fn rv4_component_prefix_and_trailing_slash() {
+        use crate::estate;
+        let (root, outer, inner) = outer_with_nest("prefix");
+        let other = upstream(&root, "other");
+        let target = root.join("T");
+        let plan = root.join("plan");
+        estate::add(&plan, &outer, &target, Some(&target)).unwrap();
+        // T/vendor2 is inside T at a place no nest lives: refused.
+        let inside = estate::add(
+            &plan,
+            &other,
+            &root.join("T/vendor2"),
+            Some(&root.join("T/vendor2")),
+        );
+        // T2 is a sibling, not inside T: accepted.
+        let sibling = estate::add(&plan, &other, &root.join("T2"), Some(&root.join("T2")));
+        // The nest at its own place, with a trailing slash: accepted.
+        let slash = PathBuf::from(format!("{}/", root.join("T/vendor/inner").display()));
+        let nest = estate::add(&plan, &inner, &slash, Some(&slash));
+        cleanup(&root);
+        assert_eq!(inside, Err(BulkloadRefusal::GitDestinationOccupied));
+        assert_eq!(sibling, Ok(()));
+        assert_eq!(nest, Ok(()));
     }
 }

@@ -92,9 +92,10 @@ pub enum BulkloadRefusal {
     /// that can hide an edit from its status (R-N73). Carries the path
     /// relative to the captured checkout; [`fmt::Display`] prints it escaped.
     GitNestConversionAttribute(Vec<u8>),
-    /// A nested repository holds a populated submodule of its own (R-N115).
-    /// Carries the submodule's path relative to the captured checkout;
-    /// [`fmt::Display`] prints it escaped.
+    /// A nested repository holds a populated submodule of its own, or anything
+    /// but an empty directory at one of its gitlink paths (R-N115). Carries
+    /// the gitlink's path relative to the captured checkout; [`fmt::Display`]
+    /// prints it escaped.
     GitNestPopulatedSubmodule(Vec<u8>),
 
     // ---- sqlite -----------------------------------------------------------
