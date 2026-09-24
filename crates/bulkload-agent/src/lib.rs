@@ -47,6 +47,7 @@ macro_rules! fault_mid_read {
     ($first:expr, $path:expr) => {{}};
 }
 
+pub mod counters;
 pub mod estate;
 #[cfg(feature = "fault-injection")]
 pub mod fault;

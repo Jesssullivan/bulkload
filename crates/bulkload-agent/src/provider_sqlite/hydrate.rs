@@ -1,4 +1,5 @@
 //! Bounded, additive hydration of retained compressed provider rollouts.
+use crate::counters::CountedSync as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
@@ -170,7 +171,7 @@ fn hydrate_one(
                 output
                     .write_all(data)
                     .map_err(|_| BulkloadRefusal::Io(None))?;
-                hash.update(data);
+                crate::counters::update(&mut hash, crate::counters::Counter::HashOther, data);
                 bytes += count as u64;
             }
             Ok(())
@@ -184,7 +185,9 @@ fn hydrate_one(
         {
             return Err(BulkloadRefusal::SqliteStateChanged);
         }
-        output.sync_all().map_err(|_| BulkloadRefusal::Io(None))?;
+        output
+            .sync_file_counted()
+            .map_err(|_| BulkloadRefusal::Io(None))?;
         let published = match fs::hard_link(&temporary, raw) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -192,7 +195,7 @@ fn hydrate_one(
         };
         if published {
             fs::File::open(raw.parent().ok_or(BulkloadRefusal::Io(None))?)
-                .and_then(|parent| parent.sync_all())
+                .and_then(|parent| parent.sync_dir_counted())
                 .map_err(|_| BulkloadRefusal::Io(None))?;
         }
         Ok(Hydrated {

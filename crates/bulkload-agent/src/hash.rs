@@ -13,6 +13,7 @@ use std::path::Path;
 
 use bulkload_proto::{BulkloadRefusal, Result};
 
+use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
 
 /// Read buffer size. Large enough to keep blake3's SIMD lanes busy without
@@ -113,7 +114,8 @@ fn hash_open_file(
         }
         *bytes_read = bytes_read.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         let filled = buf.get(..read).ok_or(BulkloadRefusal::Io(None))?;
-        hasher.update(filled);
+        counters::add_len(Counter::HashFileRead, read);
+        counters::update(&mut hasher, Counter::HashFile, filled);
     }
     *metadata_checks += 1;
     if StatIdentity::from_metadata(&file.metadata()?) != *expected {
@@ -125,7 +127,7 @@ fn hash_open_file(
 /// blake3 of an in-memory buffer.
 #[must_use]
 pub fn hash_bytes(data: &[u8]) -> [u8; 32] {
-    *blake3::hash(data).as_bytes()
+    counters::hash(Counter::HashOther, data)
 }
 
 /// CRC32-C of an in-memory buffer.

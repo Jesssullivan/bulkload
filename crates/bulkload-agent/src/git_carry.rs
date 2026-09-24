@@ -6,6 +6,7 @@
 //! separately; this is not Git administration reconstruction. Capture is
 //! optimistic, not an atomic filesystem snapshot.
 
+use crate::counters::CountedSync as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -709,9 +710,9 @@ fn repair_missing_index_inner(
         postcard::to_allocvec(&(head.clone(), true, &controls))
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
-    fs::File::open(receipt.join("original-administration.postcard"))?.sync_all()?;
-    fs::File::open(&receipt)?.sync_all()?;
-    fs::File::open(&receipt_parent)?.sync_all()?;
+    fs::File::open(receipt.join("original-administration.postcard"))?.sync_file_counted()?;
+    fs::File::open(&receipt)?.sync_dir_counted()?;
+    fs::File::open(&receipt_parent)?.sync_dir_counted()?;
     import_verified(&repo, bundle, source)?;
     let staged_entries = output(git(&repo).args(["ls-tree", "-r", "-z", &find("staged")?]))?;
     if staged_entries
@@ -727,8 +728,8 @@ fn repair_missing_index_inner(
             .args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]),
     )?;
     fs::set_permissions(&private_index, fs::Permissions::from_mode(0o600))?;
-    fs::File::open(&private_index)?.sync_all()?;
-    fs::File::open(&receipt)?.sync_all()?;
+    fs::File::open(&private_index)?.sync_file_counted()?;
+    fs::File::open(&receipt)?.sync_dir_counted()?;
     let reservation = IndexReservation::acquire(admin.join("index.lock"))?;
     let current_identity = crate::freshness::StatIdentity::from_metadata(&fs::metadata(&admin)?);
     if (admin_identity.dev, admin_identity.ino) != (current_identity.dev, current_identity.ino)
@@ -744,7 +745,7 @@ fn repair_missing_index_inner(
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
     fs::hard_link(&private_index, &index)?;
-    fs::File::open(&admin)?.sync_all()?;
+    fs::File::open(&admin)?.sync_dir_counted()?;
     if text(git(&repo).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
@@ -784,7 +785,8 @@ impl IndexReservation {
             return Err(BulkloadRefusal::GitAuthorityChanged);
         }
         fs::remove_file(&self.path)?;
-        fs::File::open(self.path.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?)?.sync_all()?;
+        fs::File::open(self.path.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?)?
+            .sync_dir_counted()?;
         Ok(())
     }
 
@@ -2252,7 +2254,7 @@ fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
                     return Err(BulkloadRefusal::GitInventoryMalformed);
                 }
                 file.set_permissions(fs::Permissions::from_mode(row.mode & 0o777))?;
-                file.sync_all()?;
+                file.sync_file_counted()?;
             }
             FileKind::Symlink if fs::symlink_metadata(&path)?.is_symlink() => {
                 if row.link_target.as_deref() != Some(fs::read_link(&path)?.as_os_str().as_bytes())
@@ -2280,7 +2282,7 @@ fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(path)?;
         directory.set_permissions(fs::Permissions::from_mode(row.mode & 0o777))?;
-        directory.sync_all()?;
+        directory.sync_dir_counted()?;
     }
     // These flush payload entry creation, not the separate Git administration
     // or receipt transactions, which retain their own durability boundaries.
@@ -2294,7 +2296,7 @@ fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(path)?
-            .sync_all()?;
+            .sync_dir_counted()?;
     }
     Ok(())
 }
@@ -2564,12 +2566,12 @@ fn sync_private_tree(root: &Path) -> Result<()> {
         if entry.file_type()?.is_dir() {
             sync_private_tree(&entry.path())?;
         } else if entry.file_type()?.is_file() {
-            fs::File::open(entry.path())?.sync_all()?;
+            fs::File::open(entry.path())?.sync_file_counted()?;
         } else {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
     }
-    fs::File::open(root)?.sync_all()?;
+    fs::File::open(root)?.sync_dir_counted()?;
     Ok(())
 }
 
@@ -2871,7 +2873,7 @@ fn prepare_linked_attachment(
     // Native administrative locking prevents prune before pointer publication.
     fs::write(admin.join("locked"), b"bulkload attachment preparation\n")?;
     sync_private_tree(&admin)?;
-    fs::File::open(admin.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_all()?;
+    fs::File::open(admin.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
     Ok(admin)
 }
 
@@ -3003,7 +3005,7 @@ fn attach_payload(
         postcard::to_allocvec(&before).map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
     sync_private_tree(&receipt)?;
-    fs::File::open(&receipt_parent)?.sync_all()?;
+    fs::File::open(&receipt_parent)?.sync_dir_counted()?;
     let admin = if let Some(repository) = &repository {
         prepare_linked_attachment(repository, &destination, source, &receipt, &private, &heads)?
     } else {
@@ -3013,7 +3015,7 @@ fn attach_payload(
     };
     let pointer = write_git_pointer(&receipt, &admin)?;
     sync_private_tree(&receipt)?;
-    fs::File::open(&receipt_parent)?.sync_all()?;
+    fs::File::open(&receipt_parent)?.sync_dir_counted()?;
     let current_root = fs::metadata(&destination)?;
     if root.dev() != current_root.dev()
         || root.ino() != current_root.ino()
@@ -3032,7 +3034,7 @@ fn attach_payload(
     }
     // Atomic create-only publication cannot overwrite another writer's .git.
     fs::hard_link(pointer, destination.join(".git"))?;
-    fs::File::open(&destination)?.sync_all()?;
+    fs::File::open(&destination)?.sync_dir_counted()?;
     if filesystem_rows(&destination)? != before
         || &common_repository(&destination)? != common.as_ref().unwrap_or(&private)
         || repository
@@ -3047,7 +3049,7 @@ fn attach_payload(
     if repository.is_some() {
         fs::remove_file(admin.join("locked"))?;
     }
-    fs::File::open(admin)?.sync_all()?;
+    fs::File::open(admin)?.sync_dir_counted()?;
     Ok(())
 }
 
@@ -3379,7 +3381,7 @@ fn restore_entry(
             } else {
                 0o644
             }))?;
-            file.sync_all()?;
+            file.sync_file_counted()?;
         }
         _ => return Err(BulkloadRefusal::GitInventoryMalformed),
     }
