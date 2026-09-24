@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "2c6bc4b88c4a777c957980f26fa19efb833bb20f29ab75bba6c1d64b06d16ffe"
+WORKFLOW_SHA256 = "aca1a6076902895b7a5a96208bef9e4e65e646c70799114ddeac2c0c0e4a7017"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -24,8 +24,11 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "2012114906f3a1d6e05adb9c475120c51d940ef09a45ff4b5f870f6cc2ecfe5b"
+ACTION_SHA256 = "c54d6f1418ce1abaf34daaf889b7757d5cf635c6924fe871e6472d9f36115762"
 GUARD_SHA256 = "ba46969b7826d64d9493d38b865e264cb78c47d2269f0f66e08a171f8acd9535"
+FAULT_HARNESS_STEP_SHA256 = (
+    "fc226b95e6553343298eb65a434df43ec6a07fdda7821b47a66e0ecff06a1bbe"
+)
 SOURCE_GATE_STEP_SHA256 = (
     "96893435532ebb5d5e4b53e813e2069a28c8c23303a70c1bb9b1a9fb4071bdf2"
 )
@@ -61,17 +64,19 @@ UPLOAD_EXPRESSION = (
     "&& 'true' || 'false' }}"
 )
 MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
-TERMINAL_GATES = ("source", "build", "test")
+TERMINAL_GATES = ("source", "build", "test", "fault-harness")
 TERMINAL_CONSUMERS = {
     "source": "Run repository-owned source gates",
     "build": "Build the Bulkload documentation through the public Flywheel action",
     "test": "Test the complete Bulkload Bazel graph through the public Flywheel action",
+    "fault-harness": "Run the repository-owned fault harness",
 }
 ACTION_STEP_GATES = {
     "Revalidate immutable Bazel build authority": "build",
     TERMINAL_CONSUMERS["build"]: "build",
     "Revalidate immutable Bazel test authority": "test",
     TERMINAL_CONSUMERS["test"]: "test",
+    TERMINAL_CONSUMERS["fault-harness"]: "fault-harness",
     TERMINAL_CONSUMERS["source"]: "source",
 }
 JOB_FENCED_ACTION_ENV = {
@@ -183,7 +188,7 @@ def validate_job_routing(workflow: str) -> None:
         "    strategy:\n"
         "      fail-fast: false\n"
         "      matrix:\n"
-        "        gate: [source, build, test]\n"
+        "        gate: [source, build, test, fault-harness]\n"
     )
     if workflow.count(matrix) != 1:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
@@ -370,6 +375,7 @@ def validate_terminal_consumer_paths(action: str) -> None:
     ]
     expected_paths = {
         "source": [*common, TERMINAL_CONSUMERS["source"]],
+        "fault-harness": [*common, TERMINAL_CONSUMERS["fault-harness"]],
         "build": [
             *common,
             "Revalidate immutable Bazel build authority",
@@ -877,6 +883,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "Build the Bulkload documentation through the public Flywheel action",
         "Revalidate immutable Bazel test authority",
         "Test the complete Bulkload Bazel graph through the public Flywheel action",
+        "Run the repository-owned fault harness",
         "Run repository-owned source gates",
     ]
     if step_names != expected_step_names:
@@ -926,6 +933,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             "env",
             "with",
         ),
+        "Run the repository-owned fault harness": ("if", "shell", "env", "run"),
         "Run repository-owned source gates": ("if", "shell", "env", "run"),
     }
     for name in expected_step_names:
@@ -1012,6 +1020,29 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     ):
         raise ContractError("source gate must not define wrappers or detach failures")
 
+    # The fault-harness gate (R-N122) is the audited source step with exactly
+    # three substitutions: its name, its gate condition and its just recipe.
+    harness_step = extract_action_step(action, TERMINAL_CONSUMERS["fault-harness"])
+    if exact_digest and sha256(harness_step) != FAULT_HARNESS_STEP_SHA256:
+        raise ContractError("repository fault-harness step mapping drifted")
+    derived_harness_step = (
+        source_gate_step.replace(
+            f"    - name: {TERMINAL_CONSUMERS['source']}\n",
+            f"    - name: {TERMINAL_CONSUMERS['fault-harness']}\n",
+            1,
+        )
+        .replace(
+            "      if: ${{ inputs.gate == 'source' }}\n",
+            "      if: ${{ inputs.gate == 'fault-harness' }}\n",
+            1,
+        )
+        .replace(source_exec, "          .#default --command just ci-fault-harness", 1)
+    )
+    if harness_step != derived_harness_step + "\n":
+        raise ContractError(
+            "fault-harness gate must be the audited source step with its own recipe"
+        )
+
     nix_setup = (
         "tinyland-inc/ci-templates/.github/actions/nix-setup@" + CI_TEMPLATES_REV
     )
@@ -1048,7 +1079,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     required = (
         "        BULKLOAD_GATE: ${{ inputs.gate }}",
         '        case "$BULKLOAD_GATE" in',
-        "          source | build | test) ;;",
+        "          source | build | test | fault-harness) ;;",
         "        attic-cache: main",
         "      id: guard-snapshot",
         "      id: authority",
@@ -1081,7 +1112,6 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "        actual_public_keys=$(nix config show trusted-public-keys | tr ' ' '\\n' | sed '/^$/d' | LC_ALL=C sort)",
         '        expected_public_keys=$(printf \'%s\\n\' "$ATTIC_PUBLIC_KEY" "$nixos_public_key" | LC_ALL=C sort)',
         '        [[ "$actual_public_keys" == "$expected_public_keys" ]]',
-        "        exec nix develop --no-write-lock-file --ignore-environment \\",
         "        command: build",
         "        targets: //:bulkload",
         "        command: test",
@@ -1090,6 +1120,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     for declaration in required:
         if action.count(declaration) != 1:
             raise ContractError(f"local action contract drifted: {declaration.strip()}")
+    # Once in each repository consumer: the fault-harness and source gates.
+    if (
+        action.count(
+            "        exec nix develop --no-write-lock-file --ignore-environment \\"
+        )
+        != 2
+    ):
+        raise ContractError("repository consumer exec inventory drifted")
 
     reviewed_env_steps = expected_step_names[1:]
     environment = {
@@ -1195,6 +1233,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         for key, value in captured_bazel_context.items()
         if not key.startswith("BULKLOAD_CAPTURED_") and key != "ATTIC_SERVER"
     }
+    # The fault-harness and source gates are the two repository consumers; they
+    # share one exact environment.
+    repository_consumer_context = {
+        "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
+        "ATTIC_CACHE": "main",
+        "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
+        "ATTIC_PUBLIC_READ_SITE": "bulkload-ci",
+    }
     exact_extras = {
         reviewed_env_steps[0]: {},
         reviewed_env_steps[1]: guard_context,
@@ -1217,12 +1263,8 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             "BULKLOAD_BAZEL_PHASE": "test",
         },
         reviewed_env_steps[8]: bazel_consumer_context,
-        reviewed_env_steps[9]: {
-            "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
-            "ATTIC_CACHE": "main",
-            "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
-            "ATTIC_PUBLIC_READ_SITE": "bulkload-ci",
-        },
+        reviewed_env_steps[9]: repository_consumer_context,
+        reviewed_env_steps[10]: repository_consumer_context,
     }
     for name, env in environment.items():
         extras = exact_extras[name]
@@ -1329,6 +1371,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         reviewed_env_steps[7]: common_home,
         reviewed_env_steps[8]: "${{ steps.bazel-test-authority.outputs.bazel_home }}",
         reviewed_env_steps[9]: source_home,
+        reviewed_env_steps[10]: source_home,
     }
     for name in reviewed_env_steps:
         env = environment[name]
@@ -1363,6 +1406,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             8
         ]: "${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}",
         reviewed_env_steps[9]: source_home,
+        reviewed_env_steps[10]: source_home,
     }
     expected_test_tmpdirs = {name: '""' for name in reviewed_env_steps}
     expected_test_tmpdirs[reviewed_env_steps[6]] = (
@@ -1428,7 +1472,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         ):
             raise ContractError(f"local action {name} captured Nix config drifted")
 
-    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 8:
+    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 9:
         raise ContractError(
             "every direct shell boundary must use absolute privileged non-profile Bash"
         )
@@ -2008,6 +2052,15 @@ class CiContractTest(unittest.TestCase):
                 "Revalidate immutable Bazel test authority",
                 TERMINAL_CONSUMERS["test"],
             ],
+            "fault-harness": [
+                "Validate the terminal gate selection",
+                "Snapshot the exact public-read guard",
+                "Preflight raw runner endpoint authority",
+                "Discover sanctioned runner endpoint authority",
+                "Enforce the discovered public-read boundary",
+                "Verify effective Nix client authority",
+                TERMINAL_CONSUMERS["fault-harness"],
+            ],
         }
         all_consumers = set(TERMINAL_CONSUMERS.values())
         for gate in TERMINAL_GATES:
@@ -2020,16 +2073,45 @@ class CiContractTest(unittest.TestCase):
                 )
                 self.assertEqual(selected[-1], TERMINAL_CONSUMERS[gate])
 
+    def test_fault_harness_gate_mutations_fail_closed(self) -> None:
+        harness_exec = "          .#default --command just ci-fault-harness"
+        harness_condition = "      if: ${{ inputs.gate == 'fault-harness' }}\n"
+        variants = [
+            self.action.replace(
+                harness_exec, "          .#default --command just rust-check", 1
+            ),
+            self.action.replace(harness_exec, harness_exec + "\n        /bin/true", 1),
+            self.action.replace(harness_condition, "", 1),
+            self.action.replace(
+                harness_condition, "      if: ${{ inputs.gate == 'source' }}\n", 1
+            ),
+            self.action.replace(
+                "          source | build | test | fault-harness) ;;",
+                "          source | build | test) ;;",
+                1,
+            ),
+            self.action.replace(
+                "        --keep XDG_STATE_HOME \\\n" + harness_exec,
+                harness_exec,
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, self.action)
+                with self.assertRaises(ContractError):
+                    validate_local_action(unsafe, exact_digest=False)
+
     def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
         workflow_variants = [
             self.workflow.replace(
+                "        gate: [source, build, test, fault-harness]",
                 "        gate: [source, build, test]",
-                "        gate: [source, build]",
                 1,
             ),
             self.workflow.replace(
-                "        gate: [source, build, test]",
-                "        gate: [build, source, test]",
+                "        gate: [source, build, test, fault-harness]",
+                "        gate: [build, source, test, fault-harness]",
                 1,
             ),
             self.workflow.replace("      fail-fast: false", "      fail-fast: true", 1),
