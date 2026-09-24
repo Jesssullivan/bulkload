@@ -45,6 +45,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::counters::{self, CountedSync as _, Counter};
 use crate::freshness::StatIdentity;
 use crate::transfer_store::{Manifest, PendingDirectory, Store};
 use crate::{BulkloadRefusal, Result, RowSchema};
@@ -278,7 +279,7 @@ impl Destination {
         let bound = open_dir(parent.as_raw_fd(), &temporary)
             .and_then(|created| Ok(created.metadata()?))
             .and_then(|metadata| {
-                parent.sync_all()?;
+                parent.sync_dir_counted()?;
                 store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
                 Ok(metadata)
             });
@@ -302,7 +303,7 @@ impl Destination {
             });
         }
         fault_point!(DirectoryAfterRename);
-        parent.sync_all()?;
+        parent.sync_dir_counted()?;
         self.created.renamed += 1;
         self.directories.push(OwnedDirectory {
             path: row.rel_path.clone(),
@@ -344,7 +345,7 @@ impl Destination {
         }
         fault_point!(DirectoryAfterFallbackMkdir);
         let metadata = open_dir(parent.as_raw_fd(), leaf)?.metadata()?;
-        parent.sync_all()?;
+        parent.sync_dir_counted()?;
         store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
         self.created.fallback.push(row.rel_path.clone());
         self.directories.push(OwnedDirectory {
@@ -461,7 +462,7 @@ impl Destination {
             }
         }
         if removed {
-            directory.sync_all()?;
+            directory.sync_dir_counted()?;
         }
         Ok(())
     }
@@ -479,9 +480,10 @@ impl Destination {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
             directory.set_permissions(Permissions::from_mode(pending.mode))?;
-            directory.sync_all()?;
+            directory.sync_dir_counted()?;
             fault_point!(DirectoryBeforeComplete);
             store.complete_directory(&pending.key)?;
+            counters::bump(Counter::DirectoriesFinished);
         }
         Ok(())
     }
@@ -501,7 +503,7 @@ impl Destination {
         let result =
             unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
         if result == 0 {
-            parent.sync_all()?;
+            parent.sync_dir_counted()?;
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -572,7 +574,7 @@ impl Destination {
                 return Err(std::io::Error::last_os_error().into());
             }
             fault_point!(MaterializeAfterLink);
-            parent.sync_all()?;
+            parent.sync_dir_counted()?;
             fault_point!(MaterializeAfterParentSync);
             Ok(())
         });
@@ -582,6 +584,7 @@ impl Destination {
             return Err(std::io::Error::last_os_error().into());
         }
         result?;
+        counters::bump(Counter::FilesMaterialized);
         verify_existing(file, row, manifest)
     }
 
@@ -612,7 +615,7 @@ fn write_chunks(
     let mut size = 0_u64;
     for chunk in &manifest.chunks {
         let data = store
-            .chunk(&chunk.digest)?
+            .chunk_for(&chunk.digest, Counter::DestMaterializePackRead)?
             .ok_or(BulkloadRefusal::SealedObjectMissing)?;
         if data.len() as u64 != chunk.size {
             return Err(BulkloadRefusal::DigestMismatch);
@@ -623,15 +626,16 @@ fn write_chunks(
         if size > row.size {
             return Err(BulkloadRefusal::DigestMismatch);
         }
-        hasher.update(&data);
+        counters::update(&mut hasher, Counter::HashMaterializeFile, &data);
         file.write_all(&data)?;
+        counters::add_len(Counter::DestMaterializeWrite, data.len());
     }
     if size != row.size || *hasher.finalize().as_bytes() != manifest.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
     fault_point!(MaterializeAfterTempWrite);
     file.set_permissions(Permissions::from_mode(row.mode & 0o7777))?;
-    file.sync_all()?;
+    file.sync_file_counted()?;
     fault_point!(MaterializeAfterTempSync);
     Ok(())
 }
@@ -650,7 +654,12 @@ fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Resu
         if read == 0 {
             break;
         }
-        hasher.update(buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?);
+        counters::add_len(Counter::DestVerifyRead, read);
+        counters::update(
+            &mut hasher,
+            Counter::HashVerifyExisting,
+            buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?,
+        );
     }
     if *hasher.finalize().as_bytes() != manifest.digest
         || StatIdentity::from_metadata(&file.metadata()?) != identity
