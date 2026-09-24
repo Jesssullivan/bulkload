@@ -126,3 +126,38 @@
 - **Write scan:** nothing on sting. On neo, only glorious.build's files from
   another session's commit at 03:45:30Z (reflog `commit:`), about 90 s
   before its pair ran.
+
+## r7 (2026-09-24): BLOCK at `b561d76` on B1 and B2 (R-N121)
+
+- **B1:** the private store works on file descriptors
+  (`git_carry/estimate/stderr_store.rs`).
+  - The state dir's parent is canonicalized, then walked from `/` with
+    `O_DIRECTORY|O_NOFOLLOW`. The state dir and `stderr/` must each be a real
+    directory owned by the euid, with no group or other bits and no ACL (macOS
+    `acl_get_fd_np`; Linux POSIX ACL xattrs).
+  - Captures stream into an `O_CREAT|O_EXCL|O_NOFOLLOW` temporary, set to 0600
+    with `fchmod`, then `linkat` to the digest name.
+  - A reused file must be regular, owned by the euid, 0600, `nlink` 1, with no
+    ACL and the same keyed digest.
+  - The reviewer's T2–T11 repros are unit tests; T3/T4 (ACL) run on macOS
+    only.
+- **B2:** `LC_ALL=C LANGUAGE=` is set on every local child, on ssh and in the
+  remote `env`. The classifier ignores `setlocale` lines and matches "No such
+  file or directory" only after git's "cannot change to '" or the shell's
+  ": cd: ".
+  - Test: an invalid LC_ALL/LANG with a too-old Git gets no stderr class.
+- **D1:** a state dir inside the source or a local destination is refused
+  `SNAPSHOT_ROOTS_OVERLAP` (`refused_reason=state_dir_inside_repository`).
+  The check runs before any probe on the named paths, and after the probe on
+  its root, git dir and common dir. The probe now prints `root` and
+  `common`. Limitation: if the source probe itself fails, a state dir inside
+  a git dir that lies outside the named source can still receive that
+  probe's stderr.
+- **D3:** stderr is read as a stream. At most 1 MiB is held for
+  classification; with a store every byte goes to the file and the digest.
+- **D4:** the digest is keyed BLAKE3 with a random 32-byte key kept at
+  `DIR/stderr/key` (0600). The output key is now `stderr_keyed_blake3=`.
+  Without `--state-dir`, no digest is printed.
+- **D5:** the doc comment and the evidence doc's Git-version sentence are
+  fixed.
+- **Deferred:** D2, D6, D7.

@@ -40,9 +40,11 @@ SUBCOMMANDS:
                 missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
                 partial or differently-shallow DEST (R-N75); a refused pair
                 prints refused=CODE and the verb exits nonzero. A child's
-                stderr is never printed (R-N121): only stderr_class= and
-                stderr_blake3=, plus stderr_file= when --state-dir keeps the
-                raw bytes in DIR/stderr/<blake3>.log (mode 0600)
+                stderr is never printed (R-N121): only stderr_class=, plus
+                stderr_keyed_blake3= and stderr_file= when --state-dir keeps
+                the raw bytes in DIR/stderr/<digest>.log (mode 0600). DIR
+                must be yours, mode 0700 or tighter, no ACL, and outside
+                every SOURCE_REPO and local DEST
     estate-add PLAN SOURCE_REPO DEST_REPO [ABSENT_WORKSPACE]
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
@@ -306,20 +308,19 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 //
 // Each pair prints one whole block, built before any of it is written. A
 // refused pair prints `refused=CODE` in place of its measurements, with
-// `refused_reason=`, `stderr_class=` and `stderr_blake3=` when present; later
+// `refused_reason=`, `stderr_class=` and the store's fields when present; later
 // pairs still run, and the verb exits nonzero with the first refusal (F13).
 // A child's stderr is classified, never echoed (R-N121). With `--state-dir`,
 // its raw bytes go to a private 0600 file whose path is printed as
-// `stderr_file=`; without it nothing is written.
+// `stderr_file=`, with a digest keyed by the state dir's key; without it,
+// nothing is written and no digest is printed.
 fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
-    use bulkload_agent::git_carry::estimate::{estimate, Destination, Refused};
+    use bulkload_agent::git_carry::estimate::{estimate_with, Destination, Refused, StderrStore};
     let (state_dir, args) = match args {
         [flag, dir, rest @ ..] if flag == "--state-dir" => (Some(Path::new(dir)), rest),
         _ => (None, args),
     };
-    if state_dir.is_some_and(|dir| !dir.is_dir()) {
-        return Err(BulkloadRefusal::PathNotAbsolute);
-    }
+    let store = state_dir.map(StderrStore::open).transpose()?;
     if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     }
@@ -336,22 +337,11 @@ fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
         ];
         let outcome = Destination::parse(destination)
             .map_err(Refused::from)
-            .and_then(|destination| estimate(source, &destination));
+            .and_then(|destination| estimate_with(source, &destination, store.as_ref()));
         match outcome {
             Ok(estimate) => block.extend(estimate.lines()),
             Err(refused) => {
-                let stored = match state_dir.map(|dir| refused.persist_stderr(dir)) {
-                    Some(Ok(path)) => path,
-                    Some(Err(error)) => {
-                        block.extend(refused.lines(None));
-                        block.push(format!("stderr_file_refused={}", error.code()));
-                        first.get_or_insert(refused.refusal);
-                        emit(&mut stdout, index, &block)?;
-                        continue;
-                    }
-                    None => None,
-                };
-                block.extend(refused.lines(stored.as_deref()));
+                block.extend(refused.lines());
                 first.get_or_insert(refused.refusal);
             }
         }

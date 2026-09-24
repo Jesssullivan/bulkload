@@ -96,8 +96,11 @@ clone.
     counter
 - **Hardening:** every Git call on either host runs with
   `GIT_NO_LAZY_FETCH=1`, `--no-optional-locks`, `-c maintenance.auto=false`,
-  `-c gc.auto=0` and `-c core.hooksPath=/dev/null`. The probe refuses Git older
-  than 2.44 (neo 2.52.0, sting 2.54.0).
+  `-c gc.auto=0` and `-c core.hooksPath=/dev/null`. The probe accepts only
+  a Git that honours `GIT_NO_LAZY_FETCH`: 2.45.0 or later, or a patched
+  backport (2.44.1+, 2.43.4+, 2.42.2+, 2.41.1+, 2.40.2+, 2.39.4+); any other
+  or unparseable version is refused (neo 2.52.0, sting 2.54.0). Every child
+  runs with `LC_ALL=C` (R-N121, B2).
 - **No writes on either host.** After the run, `find` of every repository's
   git dir for files newer than the start of the window found:
   - **sting:** nothing.

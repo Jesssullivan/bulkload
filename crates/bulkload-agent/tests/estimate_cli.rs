@@ -106,14 +106,15 @@ fn a_refused_pair_prints_its_own_line_and_the_rest_are_still_measured() {
 }
 
 /// Keys a refused block may carry (R-N121): none holds stderr bytes.
-const REFUSED_KEYS: [&str; 7] = [
+const REFUSED_KEYS: [&str; 8] = [
     "source",
     "destination",
     "refused",
     "refused_reason",
     "stderr_class",
-    "stderr_blake3",
+    "stderr_keyed_blake3",
     "stderr_file",
+    "stderr_file_refused",
 ];
 
 const CLASSES: [&str; 6] = [
@@ -136,6 +137,22 @@ fn scratch(name: &str) -> Root {
     )));
     std::fs::create_dir_all(&root.0).unwrap();
     root
+}
+
+/// A private (0700) state dir, as `--state-dir` requires.
+fn state_dir(parent: &Path, name: &str) -> PathBuf {
+    let state = parent.join(name);
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    state
+}
+
+/// The digest key the verb made in `state`.
+fn key(state: &Path) -> [u8; 32] {
+    std::fs::read(state.join("stderr/key"))
+        .unwrap()
+        .try_into()
+        .unwrap()
 }
 
 fn script(path: &Path, body: &str) {
@@ -177,17 +194,21 @@ fn assert_no_echo(state: &Path, payloads: &[(Vec<u8>, String)], stdout: &str, st
         .filter(|block| !block.is_empty())
         .collect();
     assert_eq!(blocks.len(), payloads.len());
+    let key = key(state);
     for (block, (payload, _)) in blocks.iter().zip(payloads) {
-        let digest = blake3::hash(payload).to_hex().to_string();
+        let digest = blake3::keyed_hash(&key, payload).to_hex().to_string();
         for line in block.lines() {
             let (key, value) = line.split_once('=').unwrap();
             assert!(REFUSED_KEYS.contains(&key), "unexpected line {line:?}");
             match key {
                 "refused" => assert_eq!(value, "GIT_UNAVAILABLE"),
                 "stderr_class" => assert!(CLASSES.contains(&value), "{line}"),
-                "stderr_blake3" => assert_eq!(value, digest),
+                "stderr_keyed_blake3" => assert_eq!(value, digest),
                 "stderr_file" => {
-                    let file = state.join("stderr").join(format!("{digest}.log"));
+                    let file = std::fs::canonicalize(state)
+                        .unwrap()
+                        .join("stderr")
+                        .join(format!("{digest}.log"));
                     assert_eq!(Path::new(value), file);
                     assert_eq!(std::fs::read(&file).unwrap(), *payload);
                     let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
@@ -196,7 +217,7 @@ fn assert_no_echo(state: &Path, payloads: &[(Vec<u8>, String)], stdout: &str, st
                 _ => {}
             }
         }
-        assert!(block.contains("\nstderr_blake3="), "{block}");
+        assert!(block.contains("\nstderr_keyed_blake3="), "{block}");
         assert!(block.contains("\nstderr_file="), "{block}");
     }
     for text in [stdout, stderr] {
@@ -225,23 +246,39 @@ fn payloads() -> Vec<(String, Vec<u8>, String)> {
         .collect()
 }
 
-/// R-N121, full corpus: for every r3–r6 probe, the refusal built from its
-/// stderr (the path every child failure takes) prints only R-N121 lines, and
+/// R-N121, full corpus: every r3–r6 probe is kept through a real store and
+/// classified; the refusal built from it prints only R-N121 lines, and
 /// neither those lines, `Display` nor `Debug` hold its canary or secret.
 #[test]
 fn no_corpus_probe_reaches_a_refusal_line() {
-    use bulkload_agent::git_carry::estimate::{Refused, StderrReceipt};
+    use bulkload_agent::git_carry::estimate::{
+        Refused, StderrClass, StderrReceipt, StderrStore, CLASSIFY_LIMIT,
+    };
     use bulkload_agent::BulkloadRefusal;
+    let root = scratch("corpus");
+    let state = state_dir(&root.0, "state");
+    let store = StderrStore::open(&state).unwrap();
+    let key = key(&state);
     let payloads = payloads();
     assert!(payloads.len() > 2000, "{}", payloads.len());
-    let stored = Path::new("/state/stderr/0000.log");
     for (group, input, secret) in &payloads {
+        let mut capture = store.capture().unwrap();
+        capture.write(input).unwrap();
+        let (digest, file) = store.commit(capture).unwrap();
+        assert_eq!(digest, blake3::keyed_hash(&key, input).to_hex().to_string());
+        assert_eq!(std::fs::read(&file).unwrap(), *input);
+        let head = &input[..input.len().min(CLASSIFY_LIMIT)];
         let refused = Refused {
             refusal: BulkloadRefusal::GitUnavailable,
             reason: None,
-            stderr: StderrReceipt::new(input),
+            stderr: Some(StderrReceipt {
+                class: StderrClass::of(head),
+                keyed_blake3: Some(digest.clone()),
+                file: Some(file),
+                file_refused: None,
+            }),
         };
-        let lines = refused.lines(Some(stored));
+        let lines = refused.lines();
         for line in &lines {
             let (key, value) = line.split_once('=').unwrap();
             assert!(REFUSED_KEYS.contains(&key), "{group}: {line:?}");
@@ -254,8 +291,49 @@ fn no_corpus_probe_reaches_a_refusal_line() {
         if secret.chars().count() >= 6 {
             assert!(!shown.contains(secret.as_str()), "{group}: secret echoed");
         }
-        assert!(shown.contains(&blake3::hash(input).to_hex().to_string()));
+        assert!(shown.contains(&digest));
     }
+}
+
+/// B2: under an invalid locale the shell would warn through `setlocale`
+/// ("... No such file or directory"). Every child runs with `LC_ALL=C`, so
+/// a Git that is too old (no stderr of its own) is refused without any
+/// stderr class, and never as `not_a_repository`.
+#[test]
+fn an_invalid_locale_never_classifies_a_refusal() {
+    let root = scratch("locale");
+    let source = repo(&root.0, "source");
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let bin = root.0.join("old-git");
+    std::fs::create_dir(&bin).unwrap();
+    script(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'git version 2.44.0'; exit 0; fi\nexec '{}' \"$@\"\n",
+            real.trim()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let result = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env("PATH", path)
+        .env("LC_ALL", "xx_XX.UTF-8")
+        .env("LANG", "xx_XX.UTF-8")
+        .env("LANGUAGE", "xx")
+        .arg("git-carry-estimate")
+        .arg(&source)
+        .arg(&source)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("\nrefused=GIT_UNAVAILABLE"), "{stdout}");
+    assert!(!stdout.contains("stderr_class="), "{stdout}");
 }
 
 /// R-N121, end to end: probes fed as a fake `git`'s stderr (local probe) and
@@ -290,8 +368,7 @@ fn no_stderr_byte_reaches_any_output_line() {
             "#!/bin/sh\nn=$(cat '{dir}/counter')\necho $((n + 1)) > '{dir}/counter'\ncat '{dir}/payload-'\"$n\" >&2\nexit 1\n"
         ),
     );
-    let state = root.0.join("state-local");
-    std::fs::create_dir(&state).unwrap();
+    let state = state_dir(&root.0, "state-local");
     let pairs: Vec<(PathBuf, String)> = (0..chosen.len())
         .map(|_| (source.clone(), source.display().to_string()))
         .collect();
@@ -307,8 +384,7 @@ fn no_stderr_byte_reaches_any_output_line() {
             "#!/bin/sh\neval \"last=\\${{$#}}\"\nn=${{last##*/}}\nn=${{n%\\'}}\ncat '{dir}/payload-'\"$n\" >&2\nexit 255\n"
         ),
     );
-    let state = root.0.join("state-remote");
-    std::fs::create_dir(&state).unwrap();
+    let state = state_dir(&root.0, "state-remote");
     let pairs: Vec<(PathBuf, String)> = (0..chosen.len())
         .map(|index| (source.clone(), format!("fakehost:/srv/r/{index}")))
         .collect();

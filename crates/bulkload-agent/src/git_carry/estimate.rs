@@ -89,6 +89,9 @@ use std::process::{Command, Stdio};
 use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
+mod stderr_store;
+pub use stderr_store::{Capture, StderrStore, CLASSIFY_LIMIT};
+
 /// Where the destination's offer is read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
@@ -175,53 +178,30 @@ fn remote_path(path: &str) -> bool {
 ///
 /// R-N121: stderr is classified, never echoed. No field of a `Refused`, and so
 /// no receipt or output line, carries any byte of a child's stderr: only a
-/// class from a closed set, the BLAKE3 digest of the raw bytes, and, when the
-/// caller persists them, the path of a private 0600 file that holds them.
+/// class from a closed set and, when a [`StderrStore`] kept the raw bytes, a
+/// keyed digest and the path of the private file that holds them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
     /// The typed refusal; its code is the stable identity.
     pub refusal: BulkloadRefusal,
     /// The verb's own reason, from a fixed vocabulary, when it has one.
     pub reason: Option<&'static str>,
-    /// The child's stderr, classified and digested; the raw bytes are only
-    /// reachable through [`Refused::persist_stderr`].
+    /// The child's stderr, classified (and, with a store, digested and kept).
     pub stderr: Option<StderrReceipt>,
 }
 
-/// A child's stderr as a receipt may show it: class and digest only.
-#[derive(Clone, PartialEq, Eq)]
+/// A child's stderr as a receipt may show it. It holds no stderr bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StderrReceipt {
-    /// Closed-set classification of the raw bytes.
+    /// Closed-set classification of the first [`CLASSIFY_LIMIT`] bytes.
     pub class: StderrClass,
-    /// BLAKE3 of the raw bytes, lowercase hex.
-    pub blake3: String,
-    raw: Vec<u8>,
-}
-
-impl fmt::Debug for StderrReceipt {
-    // The raw bytes never reach a formatter, not even `{:?}`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StderrReceipt")
-            .field("class", &self.class)
-            .field("blake3", &self.blake3)
-            .field("bytes", &self.raw.len())
-            .finish()
-    }
-}
-
-impl StderrReceipt {
-    /// Classify and digest `raw`; `None` when the child wrote nothing.
-    #[must_use]
-    pub fn new(raw: &[u8]) -> Option<Self> {
-        if raw.is_empty() {
-            return None;
-        }
-        Some(Self {
-            class: StderrClass::of(raw),
-            blake3: blake3::hash(raw).to_hex().to_string(),
-            raw: raw.to_vec(),
-        })
-    }
+    /// Keyed BLAKE3 of the whole stream, with the store's key; `None`
+    /// without a store (R-N121: an unkeyed digest could confirm a guess).
+    pub keyed_blake3: Option<String>,
+    /// The private file that holds the raw bytes.
+    pub file: Option<PathBuf>,
+    /// Why the store could not keep them, when it could not.
+    pub file_refused: Option<BulkloadRefusal>,
 }
 
 /// What a child's stderr says, from a closed set (R-N121).
@@ -255,9 +235,12 @@ impl StderrClass {
         }
     }
 
-    /// Classify raw stderr by the phrases real git and OpenSSH print. The
-    /// first class whose pattern matches wins; the order puts timeouts ahead
-    /// of the unreachable-host phrases they share a line with.
+    /// Classify raw stderr by the phrases real git and OpenSSH print in the
+    /// C locale, which every child runs under (`LC_ALL=C`). The first class
+    /// whose pattern matches wins; the order puts timeouts ahead of the
+    /// unreachable-host phrases they share a line with. Lines from a shell's
+    /// `setlocale` warning are ignored, and "No such file or directory" only
+    /// counts after git's or the shell's change-directory failure.
     #[must_use]
     pub fn of(raw: &[u8]) -> Self {
         const PATTERNS: [(StderrClass, &[&str]); 5] = [
@@ -299,7 +282,8 @@ impl StderrClass {
                     "not a git repository",
                     "does not appear to be a git repository",
                     "repository not found",
-                    "no such file or directory",
+                    "fatal: cannot change to '",
+                    ": cd: ",
                 ],
             ),
             (
@@ -316,7 +300,12 @@ impl StderrClass {
                 ],
             ),
         ];
-        let text = String::from_utf8_lossy(raw).to_lowercase();
+        let text: String = String::from_utf8_lossy(raw)
+            .to_lowercase()
+            .lines()
+            .filter(|line| !line.contains("setlocale"))
+            .collect::<Vec<_>>()
+            .join("\n");
         PATTERNS
             .iter()
             .find(|(_, phrases)| phrases.iter().any(|phrase| text.contains(phrase)))
@@ -341,77 +330,28 @@ impl Refused {
         }
     }
 
-    fn with_stderr(refusal: BulkloadRefusal, raw: &[u8]) -> Self {
-        Self {
-            refusal,
-            reason: None,
-            stderr: StderrReceipt::new(raw),
-        }
-    }
-
-    /// Receipt lines: `refused=`, then `refused_reason=`, `stderr_class=` and
-    /// `stderr_blake3=` when present, then `stderr_file=` for `stored`. None
-    /// carries a byte of stderr.
+    /// Receipt lines: `refused=`, then `refused_reason=`, `stderr_class=`,
+    /// `stderr_keyed_blake3=`, `stderr_file=` and `stderr_file_refused=` when
+    /// present. None carries a byte of stderr.
     #[must_use]
-    pub fn lines(&self, stored: Option<&Path>) -> Vec<String> {
+    pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!("refused={}", self.refusal.code())];
         if let Some(reason) = self.reason {
             lines.push(format!("refused_reason={reason}"));
         }
         if let Some(stderr) = &self.stderr {
             lines.push(format!("stderr_class={}", stderr.class.code()));
-            lines.push(format!("stderr_blake3={}", stderr.blake3));
-        }
-        if let Some(path) = stored {
-            lines.push(format!("stderr_file={}", path.display()));
+            if let Some(digest) = &stderr.keyed_blake3 {
+                lines.push(format!("stderr_keyed_blake3={digest}"));
+            }
+            if let Some(file) = &stderr.file {
+                lines.push(format!("stderr_file={}", file.display()));
+            }
+            if let Some(refusal) = &stderr.file_refused {
+                lines.push(format!("stderr_file_refused={}", refusal.code()));
+            }
         }
         lines
-    }
-
-    /// Write the raw stderr to `<state_dir>/stderr/<blake3>.log`, created with
-    /// `O_CREAT|O_EXCL` at mode 0600 (the directory at 0700), and return its
-    /// path. Nothing is written without stderr. A file already at that path
-    /// is accepted only if it is a regular file holding exactly these bytes.
-    ///
-    /// # Errors
-    /// Refuses a `stderr` path that is not a real directory, a pre-existing
-    /// file that does not hold these bytes, or any I/O failure.
-    pub fn persist_stderr(&self, state_dir: &Path) -> Result<Option<PathBuf>> {
-        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-        let Some(stderr) = &self.stderr else {
-            return Ok(None);
-        };
-        let directory = state_dir.join("stderr");
-        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
-            return Err(BulkloadRefusal::PathEscapesRoot);
-        }
-        let path = directory.join(format!("{}.log", stderr.blake3));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(&stderr.raw)?;
-                file.sync_all()?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if !metadata.file_type().is_file()
-                    || blake3::hash(&std::fs::read(&path)?).to_hex().as_str() != stderr.blake3
-                {
-                    return Err(BulkloadRefusal::PathEscapesRoot);
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(Some(path))
     }
 }
 
@@ -434,7 +374,7 @@ impl fmt::Display for Refused {
             write!(f, " ({reason})")?;
         }
         if let Some(stderr) = &self.stderr {
-            write!(f, " [stderr {} {}]", stderr.class.code(), stderr.blake3)?;
+            write!(f, " [stderr {}]", stderr.class.code())?;
         }
         Ok(())
     }
@@ -600,28 +540,70 @@ impl CarryEstimate {
 /// root, a destination whose refs do not prove their history (R-N75), a
 /// non-partial source that cannot reach an object its refs name, an
 /// unreachable remote, or Git output that is not the shape these commands
-/// promise. A refusal raised by a child process carries a bounded excerpt of
-/// its stderr.
+/// promise. A refusal raised by a child process carries only the class of
+/// its stderr (R-N121); see [`estimate_with`] to keep the raw bytes.
 pub fn estimate(
     source: &Path,
     destination: &Destination,
 ) -> std::result::Result<CarryEstimate, Refused> {
+    estimate_with(source, destination, None)
+}
+
+/// [`estimate`], keeping a refused probe's raw stderr in `store`.
+///
+/// The store's state dir must lie outside the source and a local
+/// destination: their work trees and git dirs (D1: a read-only verb never
+/// writes into a corpus).
+///
+/// # Errors
+/// As [`estimate`], and `SNAPSHOT_ROOTS_OVERLAP` for a state dir inside
+/// either repository.
+pub fn estimate_with(
+    source: &Path,
+    destination: &Destination,
+    store: Option<&StderrStore>,
+) -> std::result::Result<CarryEstimate, Refused> {
     if has_control(source.as_os_str()) {
         return Err(BulkloadRefusal::PathNotPortable.into());
     }
-    let own = run_probe(&mut local_probe(source))?;
+    let inside =
+        |paths: &[&Path]| store.is_some_and(|store| paths.iter().any(|path| store.is_inside(path)));
+    let overlap = || {
+        Refused::because(
+            BulkloadRefusal::SnapshotRootsOverlap,
+            "state_dir_inside_repository",
+        )
+    };
+    let local = match destination {
+        Destination::Local(path) => Some(path.as_path()),
+        Destination::Remote { .. } => None,
+    };
+    // Before any child runs, as the operator named them.
+    if inside(&[source]) || local.is_some_and(|path| inside(&[path])) {
+        return Err(overlap());
+    }
+    // A git dir outside the named source is only known once the probe
+    // answers; a probe that fails first can still keep its stderr there.
+    let own = run_probe(&mut local_probe(source), store)?;
+    if inside(&[&own.root, &own.git_dir, &own.common]) {
+        return Err(overlap());
+    }
     let offer = match destination {
         Destination::Local(path) => {
             if has_control(path.as_os_str()) {
                 return Err(BulkloadRefusal::PathNotPortable.into());
             }
-            run_probe(&mut local_probe(path))?
+            let offer = run_probe(&mut local_probe(path), store)?;
+            if inside(&[&offer.root, &offer.git_dir, &offer.common]) {
+                return Err(overlap());
+            }
+            offer
         }
         Destination::Remote { host, path } => {
             if !remote_host(host) || !remote_path(path) || !path.starts_with('/') {
                 return Err(BulkloadRefusal::PathNotPortable.into());
             }
-            run_probe(&mut ssh_command(host, &remote_command(path)))?
+            run_probe(&mut ssh_command(host, &remote_command(path)), store)?
         }
     };
     if offer.partial {
@@ -704,7 +686,9 @@ fn hardened(repository: &Repository) -> Command {
         .args(["-c", "maintenance.auto=false"])
         .env("GIT_CEILING_DIRECTORIES", &repository.ceiling)
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "");
     command
 }
 
@@ -716,6 +700,8 @@ struct Probe {
     partial: bool,
     git_dir: PathBuf,
     ceiling: PathBuf,
+    root: PathBuf,
+    common: PathBuf,
 }
 
 /// Exit status of [`PROBE_SCRIPT`] when its argument is not a repository root.
@@ -734,7 +720,7 @@ const PROBE_GIT_TOO_OLD: i32 = 5;
 /// carrying one oid each, then `end`.
 pub const PROBE_SCRIPT: &str = r#"set -eu
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
-export GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+export GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null LC_ALL=C LANGUAGE=
 g() { git --no-optional-locks -c maintenance.auto=false -c gc.auto=0 -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
 version=$(git version) || exit 5
 case "$version" in 'git version '*) version=${version#git version } ;; *) exit 5 ;; esac
@@ -775,6 +761,7 @@ fi
 gitdir=$(g -C "$root" rev-parse --absolute-git-dir)
 case "$gitdir" in ''|*[[:cntrl:]]*) exit 4 ;; esac
 common=$(g -C "$root" rev-parse --path-format=absolute --git-common-dir)
+case "$common" in ''|*[[:cntrl:]]*) exit 4 ;; esac
 shallow=$(g -C "$root" rev-parse --path-format=absolute --git-path shallow)
 objects=$(g -C "$root" rev-parse --path-format=absolute --git-path objects)
 partial=0
@@ -818,6 +805,8 @@ promisor_packs() {
 promisor_packs "$objects" 0
 printf 'gitdir %s\n' "$gitdir"
 printf 'ceiling %s\n' "$GIT_CEILING_DIRECTORIES"
+printf 'root %s\n' "$root"
+printf 'common %s\n' "$common"
 printf 'partial %s\n' "$partial"
 if [ -e "$shallow" ]; then
   while IFS= read -r line || [ -n "$line" ]; do printf 'shallow %s\n' "$line"; done < "$shallow"
@@ -848,7 +837,10 @@ fn local_probe(repository: &Path) -> Command {
     ] {
         command.env_remove(key);
     }
-    command.env("GIT_NO_LAZY_FETCH", "1");
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "");
     command
 }
 
@@ -864,6 +856,7 @@ fn ssh_command(host: &str, command: &str) -> Command {
         host,
         command,
     ]);
+    ssh.env("LC_ALL", "C").env("LANGUAGE", "");
     ssh
 }
 
@@ -871,36 +864,123 @@ fn ssh_command(host: &str, command: &str) -> Command {
 /// variable in any shell, and single quotes mean the same thing to POSIX sh
 /// and fish for the [`remote_path`] character set.
 fn remote_command(path: &str) -> String {
-    format!("env GIT_NO_LAZY_FETCH=1 bash -s -- '{path}'")
+    format!("env LC_ALL=C LANGUAGE= GIT_NO_LAZY_FETCH=1 bash -s -- '{path}'")
 }
 
 /// Run the probe with [`PROBE_SCRIPT`] on stdin and parse its answer.
-fn run_probe(command: &mut Command) -> std::result::Result<Probe, Refused> {
-    let mut child = command
+///
+/// The child's stderr is read as a stream: its first [`CLASSIFY_LIMIT`]
+/// bytes are kept for classification, and, with a `store`, every byte goes
+/// to a private capture and the keyed digest (D3: nothing is buffered
+/// without bound). A refused probe keeps the capture; a successful one
+/// discards it.
+fn run_probe(
+    command: &mut Command,
+    store: Option<&StderrStore>,
+) -> std::result::Result<Probe, Refused> {
+    let capture = store.map(StderrStore::capture).transpose()?;
+    let spawned = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| BulkloadRefusal::GitUnavailable)?;
-    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
-    let (written, result) = std::thread::scope(|scope| {
+        .spawn();
+    let Ok(mut child) = spawned else {
+        if let (Some(store), Some(capture)) = (store, capture) {
+            store.discard(capture);
+        }
+        return Err(BulkloadRefusal::GitUnavailable.into());
+    };
+    let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        child.wait()?;
+        if let (Some(store), Some(capture)) = (store, capture) {
+            store.discard(capture);
+        }
+        return Err(BulkloadRefusal::Io(None).into());
+    };
+    let (written, drained, answer) = std::thread::scope(|scope| {
         let writer = scope.spawn(move || stdin.write_all(PROBE_SCRIPT.as_bytes()));
-        let result = child.wait_with_output();
-        (writer.join(), result)
+        let reader = scope.spawn(move || drain(stderr, capture));
+        let mut answer = Vec::new();
+        let read = stdout.read_to_end(&mut answer).map(|_| answer);
+        (writer.join(), reader.join(), read)
     });
-    let result = result?;
-    let refusal = match result.status.code() {
+    let status = child.wait()?;
+    let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::Io(None))?;
+    let refusal = match status.code() {
         Some(0) => None,
         Some(PROBE_NOT_A_REPOSITORY) => Some(BulkloadRefusal::GitRepositoryNotAtPath),
         Some(PROBE_GIT_TOO_OLD | 255) | None => Some(BulkloadRefusal::GitUnavailable),
         Some(_) => Some(BulkloadRefusal::GitInventoryMalformed),
     };
-    if let Some(refusal) = refusal {
-        return Err(Refused::with_stderr(refusal, &result.stderr));
+    let Some(refusal) = refusal else {
+        if let (Some(store), Some(capture)) = (store, capture) {
+            store.discard(capture);
+        }
+        // A child that answered in full read its whole script.
+        written.map_err(|_| BulkloadRefusal::Io(None))??;
+        return Ok(parse_probe(&answer?)?);
+    };
+    let mut receipt = StderrReceipt {
+        class: StderrClass::of(&head),
+        keyed_blake3: None,
+        file: None,
+        file_refused: capture_error,
+    };
+    match (store, capture) {
+        (Some(store), Some(capture)) if total > 0 && receipt.file_refused.is_none() => {
+            match store.commit(capture) {
+                Ok((digest, file)) => {
+                    receipt.keyed_blake3 = Some(digest);
+                    receipt.file = Some(file);
+                }
+                Err(error) => receipt.file_refused = Some(error),
+            }
+        }
+        (Some(store), Some(capture)) => store.discard(capture),
+        _ => {}
     }
-    // A child that answered in full read its whole script.
-    written.map_err(|_| BulkloadRefusal::Io(None))??;
-    Ok(parse_probe(&result.stdout)?)
+    Err(Refused {
+        refusal,
+        reason: None,
+        stderr: (total > 0).then_some(receipt),
+    })
+}
+
+type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal>);
+
+/// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
+/// them all, and stream them all into `capture`. A capture write failure is
+/// recorded, and the stream is still drained so the child never blocks.
+fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
+    let mut head = Vec::new();
+    let mut total = 0_u64;
+    let mut failure = None;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                failure.get_or_insert_with(|| BulkloadRefusal::from(error));
+                break;
+            }
+        };
+        let chunk = buffer.get(..read).unwrap_or_default();
+        let room = CLASSIFY_LIMIT.saturating_sub(head.len()).min(chunk.len());
+        head.extend_from_slice(chunk.get(..room).unwrap_or_default());
+        total += u64::try_from(read).unwrap_or(u64::MAX);
+        if failure.is_none() {
+            if let Some(capture) = capture.as_mut() {
+                if let Err(error) = capture.write(chunk) {
+                    failure = Some(error);
+                }
+            }
+        }
+    }
+    (head, total, capture, failure)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<Probe> {
@@ -909,6 +989,8 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
     let mut partial = None;
     let mut git_dir = None;
     let mut ceiling = None;
+    let mut root = None;
+    let mut common = None;
     let mut ended = false;
     for line in text.lines() {
         if ended {
@@ -930,6 +1012,12 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
             Some(("ceiling", value)) if value.starts_with('/') && ceiling.is_none() => {
                 ceiling = Some(PathBuf::from(value));
             }
+            Some(("root", value)) if value.starts_with('/') && root.is_none() => {
+                root = Some(PathBuf::from(value));
+            }
+            Some(("common", value)) if value.starts_with('/') && common.is_none() => {
+                common = Some(PathBuf::from(value));
+            }
             None if line == "end" => ended = true,
             _ => return Err(BulkloadRefusal::GitInventoryMalformed),
         }
@@ -940,6 +1028,8 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
     probe.partial = partial.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     probe.git_dir = git_dir.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     probe.ceiling = ceiling.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    probe.root = root.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    probe.common = common.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     Ok(probe)
 }
 
@@ -1712,7 +1802,7 @@ mod tests {
         .unwrap();
         // The exact script the remote side runs, run here through `bash -s`.
         for path in [&linked, &bare] {
-            let probe = run_probe(&mut local_probe(path)).unwrap();
+            let probe = run_probe(&mut local_probe(path), None).unwrap();
             assert_eq!(
                 probe.shallow,
                 BTreeSet::from([tip.clone()]),
@@ -1804,7 +1894,7 @@ mod tests {
         }
         assert_eq!(
             remote_command("/srv/fast-local/jess/git/glorious.build"),
-            "env GIT_NO_LAZY_FETCH=1 bash -s -- '/srv/fast-local/jess/git/glorious.build'"
+            "env LC_ALL=C LANGUAGE= GIT_NO_LAZY_FETCH=1 bash -s -- '/srv/fast-local/jess/git/glorious.build'"
         );
     }
 
@@ -2018,15 +2108,14 @@ mod tests {
             "-c",
             &format!("cat >/dev/null; printf '%s' '{raw}' >&2; exit 255"),
         ]);
-        let refused = run_probe(&mut failing).unwrap_err();
+        let refused = run_probe(&mut failing, None).unwrap_err();
         assert_eq!(refused.refusal, BulkloadRefusal::GitUnavailable);
         let stderr = refused.stderr.clone().unwrap();
         assert_eq!(stderr.class, StderrClass::Timeout);
-        assert_eq!(
-            stderr.blake3,
-            blake3::hash(raw.as_bytes()).to_hex().to_string()
-        );
-        let shown = format!("{}\n{refused}\n{refused:?}", refused.lines(None).join("\n"));
+        // D4: without a store there is no digest at all.
+        assert_eq!(stderr.keyed_blake3, None);
+        assert_eq!(stderr.file, None);
+        let shown = format!("{}\n{refused}\n{refused:?}", refused.lines().join("\n"));
         for secret in ["hunter2", "ghp_abc", "xyzzy", "jess", "Connection", "sting"] {
             assert!(!shown.contains(secret), "{secret} in {shown}");
         }
@@ -2035,13 +2124,13 @@ mod tests {
             "-c",
             "cat >/dev/null; echo 'fatal: bad object 0123abcd' >&2; exit 1",
         ]);
-        let refused = run_probe(&mut malformed).unwrap_err();
+        let refused = run_probe(&mut malformed, None).unwrap_err();
         assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
         assert_eq!(
             refused.stderr.as_ref().map(|s| s.class),
             Some(StderrClass::BadObject)
         );
-        let lines = refused.lines(None);
+        let lines = refused.lines();
         assert_eq!(
             lines.first().map(String::as_str),
             Some("refused=GIT_INVENTORY_MALFORMED")
@@ -2051,10 +2140,10 @@ mod tests {
         // A child that says nothing leaves no stderr fields.
         let mut silent = Command::new("sh");
         silent.args(["-c", "cat >/dev/null; exit 1"]);
-        let refused = run_probe(&mut silent).unwrap_err();
+        let refused = run_probe(&mut silent, None).unwrap_err();
         assert!(refused.stderr.is_none());
         assert_eq!(
-            refused.lines(None),
+            refused.lines(),
             vec!["refused=GIT_INVENTORY_MALFORMED".to_owned()]
         );
     }
@@ -2086,7 +2175,7 @@ mod tests {
                 "{line}"
             );
         }
-        assert!(remote_command("/srv/r").starts_with("env GIT_NO_LAZY_FETCH=1 "));
+        assert!(remote_command("/srv/r").starts_with("env LC_ALL=C LANGUAGE= GIT_NO_LAZY_FETCH=1 "));
         let source = hardened(&Repository {
             git_dir: PathBuf::from("/probed/repo/.git"),
             ceiling: PathBuf::from("/probed"),
@@ -2215,8 +2304,10 @@ mod tests {
             )
             .unwrap();
             output(Command::new("chmod").arg("+x").arg(&wrapper)).unwrap();
-            let probe =
-                run_probe(local_probe(&repo).env("PATH", format!("{}:{path}", bin.display())));
+            let probe = run_probe(
+                local_probe(&repo).env("PATH", format!("{}:{path}", bin.display())),
+                None,
+            );
             if accepted {
                 assert!(probe.is_ok(), "[{version}] refused: {probe:?}");
             } else {
@@ -2859,7 +2950,15 @@ mod tests {
         ] {
             assert_eq!(StderrClass::of(raw.as_bytes()), class, "{raw:?}");
         }
-        assert!(StderrReceipt::new(b"").is_none());
+        // B2: a shell's setlocale warning never classifies.
+        assert_eq!(
+            StderrClass::of(b"bash: warning: setlocale: LC_ALL: cannot change locale (xx_XX.UTF-8): No such file or directory\n"),
+            StderrClass::Other
+        );
+        assert_eq!(
+            StderrClass::of(b"fatal: cannot change to '/srv/x': No such file or directory\n"),
+            StderrClass::NotARepository
+        );
         let codes: BTreeSet<&str> = [
             StderrClass::NotARepository,
             StderrClass::AuthFailed,
@@ -2874,51 +2973,214 @@ mod tests {
         assert_eq!(codes.len(), 6);
     }
 
-    /// R-N121: the raw stderr goes to `<state>/stderr/<blake3>.log`, created
-    /// exclusively at 0600 in a 0700 directory, byte for byte; a second
-    /// refusal with the same bytes reuses it, and a planted file or symlink
-    /// at that path is refused, never followed or overwritten.
-    #[test]
-    fn raw_stderr_is_kept_in_a_private_file() {
+    /// A private (0700) state dir under the fixture.
+    fn state_dir(fixture: &Fixture, name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
-        let fixture = Fixture::new("stderr-file");
-        let state = fixture.root.join("state");
+        let state = fixture.root.join(name);
         std::fs::create_dir(&state).unwrap();
-        let raw: &[u8] = b"fatal: password: hunter2\n\xff\x00\x1b[0m binary\n";
-        let refused = Refused::with_stderr(BulkloadRefusal::GitUnavailable, raw);
-        let path = refused.persist_stderr(&state).unwrap().unwrap();
-        let digest = blake3::hash(raw).to_hex().to_string();
-        assert_eq!(path, state.join("stderr").join(format!("{digest}.log")));
-        assert_eq!(std::fs::read(&path).unwrap(), raw);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let mode = std::fs::metadata(state.join("stderr"))
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        state
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
             .unwrap()
             .permissions()
             .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-        assert!(!path.to_string_lossy().contains("hunter2"));
-        let lines = refused.lines(Some(&path));
-        assert!(lines.contains(&format!("stderr_file={}", path.display())));
-        assert!(!lines.join("\n").contains("hunter2"));
-        // Same bytes again: the existing file is accepted as is.
-        assert_eq!(refused.persist_stderr(&state).unwrap(), Some(path.clone()));
-        // A different file at that path is refused, not overwritten.
-        std::fs::write(&path, b"planted").unwrap();
-        assert!(refused.persist_stderr(&state).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"planted");
-        // A symlink at that path is refused, not followed.
+            & 0o7777
+    }
+
+    /// Keep `raw` as a refused probe's stderr would be kept.
+    fn keep(store: &StderrStore, raw: &[u8]) -> Result<(String, PathBuf)> {
+        let mut capture = store.capture()?;
+        capture.write(raw)?;
+        store.commit(capture)
+    }
+
+    /// R-N121, B1, D3, D4: the raw stderr goes to `<state>/stderr/<keyed
+    /// digest>.log`, 0600 in a 0700 dir whatever the umask, byte for byte;
+    /// the digest is keyed by a 0600 key made once per state dir; the same
+    /// bytes reuse the file. A probe's stderr streams in whole, however long.
+    #[test]
+    fn raw_stderr_is_kept_in_a_private_file() {
+        let fixture = Fixture::new("stderr-file");
+        let state = state_dir(&fixture, "state");
+        let store = StderrStore::open(&state).unwrap();
+        let raw: &[u8] = b"fatal: password: hunter2\n\xff\x00\x1b[0m binary\n";
+        let (digest, path) = keep(&store, raw).unwrap();
+        // The shown path is the resolved one (macOS: /var -> /private/var).
+        let resolved = std::fs::canonicalize(&state).unwrap();
+        assert_eq!(path, resolved.join("stderr").join(format!("{digest}.log")));
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&state.join("stderr")), 0o700);
+        assert_eq!(mode(&state.join("stderr/key")), 0o600);
+        let key: [u8; 32] = std::fs::read(state.join("stderr/key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(digest, blake3::keyed_hash(&key, raw).to_hex().to_string());
+        assert_ne!(digest, blake3::hash(raw).to_hex().to_string());
+        // Same bytes, same key, in a second store: the file is reused.
+        let again = StderrStore::open(&state).unwrap();
+        assert_eq!(keep(&again, raw).unwrap(), (digest.clone(), path));
+        // Another state dir has another key, so another digest.
+        let other = StderrStore::open(&state_dir(&fixture, "other")).unwrap();
+        assert_ne!(keep(&other, raw).unwrap().0, digest);
+        // No temporaries are left behind.
+        let names: Vec<_> = std::fs::read_dir(state.join("stderr"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        // D3: 3 MiB of stderr streams whole into the file through a probe;
+        // only the first MiB is held for classification.
+        let mut long = Command::new("sh");
+        long.args([
+            "-c",
+            "cat >/dev/null; echo 'fatal: bad object x' >&2; head -c 3145728 /dev/zero >&2; exit 1",
+        ]);
+        let refused = run_probe(&mut long, Some(&store)).unwrap_err();
+        let receipt = refused.stderr.unwrap();
+        assert_eq!(receipt.class, StderrClass::BadObject);
+        let file = receipt.file.unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 3_145_728 + 20);
+        assert_eq!(
+            receipt.keyed_blake3.unwrap(),
+            blake3::keyed_hash(&key, &std::fs::read(&file).unwrap())
+                .to_hex()
+                .to_string()
+        );
+    }
+
+    /// B1: every reviewer repro of a non-private store refuses: a
+    /// world-writable state dir, a 0777 `stderr/`, a symlinked state dir or
+    /// `stderr/`, a reused file at 0644, with a second hard link, or a FIFO.
+    #[test]
+    fn a_store_that_is_not_private_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new("stderr-private");
+        let raw = b"fatal: x\n";
+        // T11: a world-writable state dir.
+        let open = state_dir(&fixture, "open");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(StderrStore::open(&open).is_err());
+        // T2: a pre-existing 0777 stderr/.
+        let loose = state_dir(&fixture, "loose");
+        std::fs::create_dir(loose.join("stderr")).unwrap();
+        std::fs::set_permissions(loose.join("stderr"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert!(StderrStore::open(&loose).is_err());
+        assert_eq!(mode(&loose.join("stderr")), 0o777);
+        // T5: the state dir is a symlink to a private dir.
+        let target = state_dir(&fixture, "target");
+        let link = fixture.root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(StderrStore::open(&link).is_err());
+        assert!(!target.join("stderr").exists());
+        // T5b: stderr/ is a symlink.
+        let pointed = state_dir(&fixture, "pointed");
+        let elsewhere = state_dir(&fixture, "elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, pointed.join("stderr")).unwrap();
+        assert!(StderrStore::open(&pointed).is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        // T6: a reused same-bytes file widened to 0644.
+        let state = state_dir(&fixture, "state");
+        let store = StderrStore::open(&state).unwrap();
+        let (_, path) = keep(&store, raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(keep(&store, raw).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(keep(&store, raw).is_ok());
+        // T7: the same file with a second hard link.
+        let copy = fixture.root.join("hardlink-copy");
+        std::fs::hard_link(&path, &copy).unwrap();
+        assert!(keep(&store, raw).is_err());
+        std::fs::remove_file(&copy).unwrap();
+        // T10: a FIFO planted at the name is refused without blocking.
         std::fs::remove_file(&path).unwrap();
-        let target = fixture.root.join("elsewhere");
-        std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(refused.persist_stderr(&state).is_err());
-        assert!(!target.exists());
-        // No stderr: nothing is written.
-        let other = fixture.root.join("state-empty");
-        std::fs::create_dir(&other).unwrap();
-        let silent = Refused::from(BulkloadRefusal::GitUnavailable);
-        assert_eq!(silent.persist_stderr(&other).unwrap(), None);
-        assert!(!other.join("stderr").exists());
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(keep(&store, raw).is_err());
+        // A different file at the name is refused, never replaced.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"planted").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(keep(&store, raw).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"planted");
+    }
+
+    /// B1 (macOS): an extended ACL on the state dir or `stderr/`, such as an
+    /// inherited "everyone allow read", refuses the store.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_store_with_an_acl_is_refused() {
+        let fixture = Fixture::new("stderr-acl");
+        let with_acl = |path: &Path, rule: &str| {
+            let status = Command::new("/bin/chmod")
+                .arg("+a")
+                .arg(rule)
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        // T3: stderr/ carries an inheritable ACL.
+        let state = state_dir(&fixture, "state");
+        std::fs::create_dir(state.join("stderr")).unwrap();
+        std::fs::set_permissions(
+            state.join("stderr"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        with_acl(&state.join("stderr"), "everyone allow read,file_inherit");
+        assert!(StderrStore::open(&state).is_err());
+        // T4: the state dir itself carries one.
+        let state = state_dir(&fixture, "parent-acl");
+        with_acl(
+            &state,
+            "everyone allow list,search,read,file_inherit,directory_inherit",
+        );
+        assert!(StderrStore::open(&state).is_err());
+        // Without an ACL the same layout opens.
+        assert!(StderrStore::open(&state_dir(&fixture, "clean")).is_ok());
+    }
+
+    /// D1: a state dir inside the source or a local destination, work tree or
+    /// git dir, refuses before anything is kept there.
+    #[test]
+    fn a_state_dir_inside_a_repository_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new("stderr-inside");
+        let source = fixture.repo("source");
+        commit(&source, "a.txt", "a");
+        let destination = fixture.repo("destination");
+        for inside in [
+            source.join("state"),
+            source.join(".git/state"),
+            destination.join("state"),
+        ] {
+            std::fs::create_dir(&inside).unwrap();
+            std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let store = StderrStore::open(&inside).unwrap();
+            let refused = estimate_with(
+                &source,
+                &Destination::Local(destination.clone()),
+                Some(&store),
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused.refusal,
+                BulkloadRefusal::SnapshotRootsOverlap,
+                "{}",
+                inside.display()
+            );
+            assert_eq!(refused.reason, Some("state_dir_inside_repository"));
+        }
+        let outside = state_dir(&fixture, "outside");
+        let store = StderrStore::open(&outside).unwrap();
+        assert!(estimate_with(&source, &Destination::Local(destination), Some(&store)).is_ok());
     }
 }
