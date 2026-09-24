@@ -986,6 +986,15 @@ fn q1_case(case: &Case<'_>) -> Measured {
     let count = pack_count(&sent);
     assert!(count <= pack_count(&estimate), "{name}: object bound");
     assert!(sent.len() * 10 <= estimate.len() * 11, "{name}: byte gate");
+    // Stronger than the gate, and held on every fixture under the pins with
+    // ancestors-first haves (R-N116): the sender's pack is byte-identical to
+    // upload-pack's, and its object count equals the estimate's.
+    assert_eq!(sent, oracle, "{name}: sent bytes == upload-pack bytes");
+    assert_eq!(
+        count,
+        pack_count(&estimate),
+        "{name}: sent objects == estimate"
+    );
     println!(
         "m1 q1 case={name} shape={shape:?} held={} wants={} walk_objects={} \
          estimate_objects={} estimate_bytes={} sent_objects={count} sent_bytes={} \
@@ -1309,7 +1318,8 @@ fn q1_fork_below_have_shallow_destination() {
 }
 
 /// Reviewer fixture B (#55 bb6efa7 R3-1): a full destination with two held
-/// tips, `main` and an unrelated old `local` line. Both are haves (R-N113).
+/// tips, `main` and `origin/feature` (its own `local` line is unknown to the
+/// source, so not held). Both held tips are haves (R-N113).
 #[test]
 fn q1_fixture_b_two_held_tips() {
     let scratch = Scratch::new("q1-fixture-b");
@@ -1989,6 +1999,7 @@ const STATE: &str = "refs/carry/v1/spike/chain/state";
 
 fn state_absent(repo: &Path) -> bool {
     !args(repo, ["rev-parse", "--verify", "-q", STATE])
+        .stdout(Stdio::null())
         .status()
         .unwrap()
         .success()
@@ -2133,7 +2144,20 @@ fn q3_held_tip_closure_preflight_is_mandatory() {
             refusals.push(refused.describe());
         } else {
             land(&destination, &[pack], wants, &updates).unwrap();
-            published_broken = !state_absent(&destination) && !fsck(&destination).status.success();
+            // The new ref's own closure lists the deleted blob as missing
+            // (fsck alone proves nothing: main's closure was already broken).
+            let mut closure = git(&destination);
+            closure.args([
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--missing=print",
+                STATE,
+            ]);
+            let closure = String::from_utf8(run(closure, "closure")).unwrap();
+            let missing_line = format!("?{a}");
+            published_broken =
+                !state_absent(&destination) && closure.lines().any(|l| l == missing_line);
         }
     }
     assert!(
@@ -2141,7 +2165,7 @@ fn q3_held_tip_closure_preflight_is_mandatory() {
         "without the preflight a broken ref is published"
     );
     println!(
-        "m1 q3 case=held-tip-closure-damaged without_preflight=published-broken-ref(fsck fails) \
+        "m1 q3 case=held-tip-closure-damaged without_preflight=published-ref-whose-closure-lists-the-missing-blob \
          with_preflight={:?} published=no",
         refusals.first().unwrap_or(&String::new())
     );
