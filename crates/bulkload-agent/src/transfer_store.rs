@@ -56,16 +56,43 @@ fn inject_fault(point: PublishFault) -> Result<()> {
     Ok(())
 }
 
+// A publication crash point is named per store: the source pack committer and
+// the destination output committer hit `publish.source.*` and
+// `publish.destination.*` respectively, and the crash receipt records the
+// store root that was being written.
+#[cfg(feature = "fault-injection")]
+macro_rules! publication_crash {
+    ($publisher:expr, $source:ident, $destination:ident) => {{
+        let publisher = &$publisher;
+        let point = match publisher.side {
+            PublisherSide::Source => $crate::fault::Point::$source,
+            PublisherSide::Destination => $crate::fault::Point::$destination,
+        };
+        $crate::fault::hit_in(point, publisher.store.root());
+    }};
+}
+
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! publication_crash {
+    ($publisher:expr, $source:ident, $destination:ident) => {{}};
+}
+
+// A source pack point is both a unit-test refusal hook (`PublishFault`, the
+// thread-local error path) and a crash point (`publication_crash!`, which under
+// the `fault-injection` feature can end the process there).
 #[cfg(test)]
 macro_rules! publication_fault {
-    ($point:ident) => {{
+    ($publisher:expr, $point:ident, $crash:ident) => {{
+        fault_point_in!($crash, $publisher.store.root());
         inject_fault(PublishFault::$point)?;
     }};
 }
 
 #[cfg(not(test))]
 macro_rules! publication_fault {
-    ($point:ident) => {{}};
+    ($publisher:expr, $point:ident, $crash:ident) => {{
+        fault_point_in!($crash, $publisher.store.root());
+    }};
 }
 
 /// Maximum buffered chunks per producer (at most 64 MiB of chunk payload).
@@ -284,22 +311,23 @@ pub(crate) struct StorePublisher {
     pack_end: u64,
     /// Digests known to be held: appended this session or found indexed.
     known: HashSet<[u8; 32]>,
+    side: PublisherSide,
     _exclusive: Exclusive,
 }
 
-/// Which protocol half owns a store, for counter attribution only.
+/// Which side of a transfer a publisher writes for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Side {
+pub(crate) enum PublisherSide {
+    /// The serving side's capture store.
     Source,
+    /// The receiving side's output store.
     Destination,
-    Unattributed,
 }
 
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
     conn: rusqlite::Connection,
-    side: Side,
 }
 
 impl Store {
@@ -370,7 +398,6 @@ impl Store {
         Ok(Self {
             root: fs::canonicalize(root)?,
             conn,
-            side: Side::Unattributed,
         })
     }
 
@@ -389,23 +416,13 @@ impl Store {
         .map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
-        Ok(Self {
-            root,
-            conn,
-            side: Side::Unattributed,
-        })
+        Ok(Self { root, conn })
     }
 
-    /// Attribute this store's pack writes and publication commits to `side`.
-    #[must_use]
-    pub(crate) const fn with_side(mut self, side: Side) -> Self {
-        self.side = side;
-        self
-    }
-
-    /// Acquire the nonblocking single-writer guard and reconcile the pack tail.
-    pub(crate) fn into_publisher(self) -> Result<StorePublisher> {
-        StorePublisher::open(self)
+    /// Acquire the nonblocking single-writer guard for `side` and reconcile
+    /// the pack tail.
+    pub(crate) fn into_publisher(self, side: PublisherSide) -> Result<StorePublisher> {
+        StorePublisher::open(self, side)
     }
 
     /// Canonical state root, used to reject recursive self-capture.
@@ -487,59 +504,6 @@ impl Store {
             .optional()
             .map_err(sqlite_error)?;
         Ok(found == Some(identity_bytes(identity)?))
-    }
-
-    /// Commit one group of published outputs and their chunk hints in a single
-    /// transaction. Callers seal every file and directory first.
-    ///
-    /// # Errors
-    /// Refuses serialization or database failures; nothing is committed then.
-    pub(crate) fn commit_outputs(&self, outputs: &[OutputRecord]) -> Result<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(sqlite_error)?;
-        let staged = (|| -> Result<()> {
-            for output in outputs {
-                self.conn
-                    .execute(
-                        "INSERT INTO outputs VALUES (?1, ?2)
-                         ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                        (&output.key, identity_bytes(&output.identity)?),
-                    )
-                    .map_err(sqlite_error)?;
-                for hint in &output.hints {
-                    self.conn
-                        .execute(
-                            "INSERT INTO output_chunks (digest, path, offset, size)
-                             VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(digest) DO UPDATE SET
-                                 path=excluded.path, offset=excluded.offset, size=excluded.size",
-                            rusqlite::params![
-                                hint.digest.as_slice(),
-                                &output.rel_path,
-                                i64::try_from(hint.offset)
-                                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
-                                i64::try_from(hint.size)
-                                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
-                            ],
-                        )
-                        .map_err(sqlite_error)?;
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = staged {
-            let _ = self.conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-        let started = Instant::now();
-        let committed = self.conn.execute_batch("COMMIT").map_err(sqlite_error);
-        counters::sqlite_commit(self.group_counter(), started, &committed);
-        if let Err(error) = committed {
-            let _ = self.conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// Where an earlier transfer wrote a chunk into a destination output. A
@@ -647,7 +611,7 @@ impl Store {
         if let Some(data) = stored {
             counters::add_len(stage, data.len());
             if data.len() > crate::hash::CDC_MAX_BYTES as usize
-                || counters::hash(self.verify_purpose(), &data) != *digest
+                || counters::hash(Self::verify_purpose(stage), &data) != *digest
             {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
@@ -673,7 +637,7 @@ impl Store {
             let mut data = vec![0_u8; size];
             pack.read_exact(&mut data)?;
             counters::add_len(stage, data.len());
-            if counters::hash(self.verify_purpose(), &data) != *digest {
+            if counters::hash(Self::verify_purpose(stage), &data) != *digest {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
             return Ok(Some(data));
@@ -681,19 +645,12 @@ impl Store {
         Self::chunk_at(&self.root, digest, stage)
     }
 
-    /// The group-commit counter for the side that owns this store.
-    const fn group_counter(&self) -> Counter {
-        match self.side {
-            Side::Source => Counter::SqliteGroupSource,
-            Side::Destination => Counter::SqliteGroupDest,
-            Side::Unattributed => Counter::SqliteGroupOther,
-        }
-    }
-
-    const fn verify_purpose(&self) -> Counter {
-        match self.side {
-            Side::Destination => Counter::HashDestReuse,
-            Side::Source | Side::Unattributed => Counter::HashStoreReadVerify,
+    /// The BLAKE3 purpose for re-verifying a chunk read under `stage`.
+    fn verify_purpose(stage: Counter) -> Counter {
+        if stage == Counter::DestLocalReuseRead {
+            Counter::HashDestReuse
+        } else {
+            Counter::HashStoreReadVerify
         }
     }
 
@@ -787,7 +744,7 @@ impl Store {
 }
 
 impl StorePublisher {
-    fn open(store: Store) -> Result<Self> {
+    fn open(store: Store, role: PublisherSide) -> Result<Self> {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -841,6 +798,7 @@ impl StorePublisher {
             pack,
             pack_end: committed_end,
             known: HashSet::new(),
+            side: role,
             _exclusive: exclusive,
         })
     }
@@ -848,6 +806,86 @@ impl StorePublisher {
     /// The store this publisher writes.
     pub(crate) const fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The group-commit counter for this publisher's side.
+    const fn group_counter(&self) -> Counter {
+        match self.side {
+            PublisherSide::Source => Counter::SqliteGroupSource,
+            PublisherSide::Destination => Counter::SqliteGroupDest,
+        }
+    }
+
+    /// Commit one group of published outputs and their chunk hints in a single
+    /// transaction. Callers seal every file and directory first.
+    ///
+    /// # Errors
+    /// Refuses serialization or database failures; nothing is committed then.
+    pub(crate) fn commit_outputs(&self, outputs: &[OutputRecord]) -> Result<()> {
+        self.store
+            .conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sqlite_error)?;
+        let staged = (|| -> Result<()> {
+            for output in outputs {
+                self.store
+                    .conn
+                    .execute(
+                        "INSERT INTO outputs VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                        (&output.key, identity_bytes(&output.identity)?),
+                    )
+                    .map_err(sqlite_error)?;
+                for hint in &output.hints {
+                    self.store
+                        .conn
+                        .execute(
+                            "INSERT INTO output_chunks (digest, path, offset, size)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(digest) DO UPDATE SET
+                                 path=excluded.path, offset=excluded.offset, size=excluded.size",
+                            rusqlite::params![
+                                hint.digest.as_slice(),
+                                &output.rel_path,
+                                i64::try_from(hint.offset)
+                                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                                i64::try_from(hint.size)
+                                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                            ],
+                        )
+                        .map_err(sqlite_error)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        publication_crash!(
+            self,
+            PublishSourceBeforeCommit,
+            PublishDestinationBeforeCommit
+        );
+        let started = Instant::now();
+        let committed = self
+            .store
+            .conn
+            .execute_batch("COMMIT")
+            .map_err(sqlite_error);
+        counters::sqlite_commit(self.group_counter(), started, &committed);
+        if committed.is_ok() {
+            publication_crash!(
+                self,
+                PublishSourceAfterCommit,
+                PublishDestinationAfterCommit
+            );
+        }
+        if let Err(error) = committed {
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Whether the pack, the index or the legacy chunk directory holds `digest`,
@@ -899,10 +937,9 @@ impl StorePublisher {
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
         self.known.insert(*digest);
         counters::add_len(
-            match self.store.side {
-                Side::Source => Counter::SourcePackWrite,
-                Side::Destination => Counter::DestPackWrite,
-                Side::Unattributed => Counter::OtherPackWrite,
+            match self.side {
+                PublisherSide::Source => Counter::SourcePackWrite,
+                PublisherSide::Destination => Counter::DestPackWrite,
             },
             data.len(),
         );
@@ -948,7 +985,7 @@ impl StorePublisher {
                     )
                     .map_err(sqlite_error)?;
             }
-            publication_fault!(AfterLocationInsert);
+            publication_fault!(self, AfterLocationInsert, PublishSourceAfterLocationInsert);
             for (key, manifest) in captures {
                 self.store
                     .conn
@@ -959,13 +996,18 @@ impl StorePublisher {
                     )
                     .map_err(sqlite_error)?;
             }
-            publication_fault!(AfterManifestInsert);
+            publication_fault!(self, AfterManifestInsert, PublishSourceAfterManifestInsert);
             Ok(())
         })();
         if let Err(error) = persisted {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
+        publication_crash!(
+            self,
+            PublishSourceBeforeCommit,
+            PublishDestinationBeforeCommit
+        );
         let commit_started = Instant::now();
         #[cfg(test)]
         let committed = inject_fault(PublishFault::BeforeCommit).and_then(|()| {
@@ -985,11 +1027,16 @@ impl StorePublisher {
             SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
             SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
         }
-        counters::sqlite_commit(self.store.group_counter(), commit_started, &committed);
+        counters::sqlite_commit(self.group_counter(), commit_started, &committed);
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
+        publication_crash!(
+            self,
+            PublishSourceAfterCommit,
+            PublishDestinationAfterCommit
+        );
         Ok(())
     }
 }
@@ -1062,11 +1109,11 @@ impl PackSink {
             }
         }
         PACK_APPEND_NS.fetch_add(nanos(append_started), Ordering::Relaxed);
-        publication_fault!(AfterAppend);
+        publication_fault!(self.publisher, AfterAppend, PublishSourceAfterAppend);
         if !locations.is_empty() {
             self.publisher.seal()?;
         }
-        publication_fault!(AfterSync);
+        publication_fault!(self.publisher, AfterSync, PublishSourceAfterPackSync);
         for (_, manifest) in &captures {
             for chunk in &manifest.chunks {
                 if chunk.size > u64::from(crate::hash::CDC_MAX_BYTES) {
@@ -1257,7 +1304,9 @@ mod tests {
     }
 
     fn pack_sink(state: &Path) -> Result<PackSink> {
-        Ok(PackSink::new(Store::open(state)?.into_publisher()?))
+        Ok(PackSink::new(
+            Store::open(state)?.into_publisher(PublisherSide::Source)?,
+        ))
     }
 
     #[test]
@@ -1546,8 +1595,10 @@ mod tests {
     fn publisher_is_exclusive_and_reconciles_unindexed_tail() -> Result<()> {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
-        let publisher = Store::open(&state)?.into_publisher()?;
-        assert!(Store::open(&state)?.into_publisher().is_err());
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Source)?;
+        assert!(Store::open(&state)?
+            .into_publisher(PublisherSide::Source)
+            .is_err());
         drop(publisher);
 
         let mut pack = OpenOptions::new()
@@ -1556,7 +1607,7 @@ mod tests {
         pack.write_all(b"unindexed tail")?;
         pack.sync_all()?;
         drop(pack);
-        let reconciled = Store::open(&state)?.into_publisher()?;
+        let reconciled = Store::open(&state)?.into_publisher(PublisherSide::Source)?;
         assert_eq!(fs::metadata(state.join("chunks.pack"))?.len(), 0);
         drop(reconciled);
         Ok(())
@@ -1575,7 +1626,7 @@ mod tests {
             .open(state.join("chunks.pack"))?
             .set_len(0)?;
         assert!(matches!(
-            Store::open(&state)?.into_publisher(),
+            Store::open(&state)?.into_publisher(PublisherSide::Source),
             Err(BulkloadRefusal::DigestMismatch)
         ));
         Ok(())
@@ -1623,7 +1674,7 @@ mod tests {
     fn output_records_and_chunk_hints_commit_together() -> Result<()> {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
-        let store = Store::open(&state)?;
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
         fs::write(&file, b"output")?;
         let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
@@ -1632,12 +1683,13 @@ mod tests {
             offset: 5,
             size: 7,
         };
-        store.commit_outputs(&[OutputRecord {
+        publisher.commit_outputs(&[OutputRecord {
             key: b"key".to_vec(),
             rel_path: b"nested/output".to_vec(),
             identity,
             hints: vec![hint],
         }])?;
+        drop(publisher);
         let reopened = Store::open(&state)?;
         assert!(reopened.output_matches(b"key", &identity)?);
         let found = reopened

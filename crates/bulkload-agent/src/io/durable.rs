@@ -230,6 +230,11 @@ impl<S: GroupSink> Committer<S> {
     /// # Errors
     /// Refuses if the thread cannot be spawned.
     pub fn spawn_with(sink: S, limits: Limits) -> Result<Self> {
+        #[cfg(feature = "fault-injection")]
+        let limits = crate::fault::group_files().map_or(limits, |group_files| Limits {
+            group_files,
+            ..limits
+        });
         let (sender, receiver) = std::sync::mpsc::sync_channel(limits.queue_depth.max(1));
         let failure = Failure::default();
         let shared = Failure::clone(&failure);

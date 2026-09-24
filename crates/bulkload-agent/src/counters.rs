@@ -80,7 +80,6 @@ counters! {
     // Bytes written, by stage.
     SourcePackWrite => "write_source_pack_bytes",
     DestPackWrite => "write_dest_pack_bytes",
-    OtherPackWrite => "write_other_pack_bytes",
     LegacyChunkWrite => "write_legacy_chunk_bytes",
     DestMaterializeWrite => "write_dest_materialize_bytes",
     // Framed transport, as seen by this process.
@@ -116,7 +115,6 @@ counters! {
     SqliteSchema => "sqlite_schema_commits",
     SqliteGroupSource => "sqlite_group_source_commits",
     SqliteGroupDest => "sqlite_group_dest_commits",
-    SqliteGroupOther => "sqlite_group_other_commits",
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
@@ -352,7 +350,6 @@ impl Counters {
             Counter::SqliteSchema,
             Counter::SqliteGroupSource,
             Counter::SqliteGroupDest,
-            Counter::SqliteGroupOther,
             Counter::SqliteRecordCapture,
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,

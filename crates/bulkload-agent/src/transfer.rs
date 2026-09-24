@@ -50,8 +50,8 @@ use crate::materialize::{
     verify_existing, Destination, PendingOutput, Publication, PublishSink, StagedFile,
 };
 use crate::transfer_store::{
-    row_key, ChunkData, ChunkHint, Manifest, OutputRecord, PackItem, PackSink, PreparedEvent, Side,
-    Store, PERSIST_BATCH,
+    row_key, ChunkData, ChunkHint, Manifest, OutputRecord, PackItem, PackSink, PreparedEvent,
+    PublisherSide, Store, PERSIST_BATCH,
 };
 use crate::walk::{walk, WalkOptions};
 use crate::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
@@ -227,7 +227,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
     };
     let root = std::fs::canonicalize(path(root))?;
     let state = path(state);
-    let store = Store::open(&state)?.with_side(Side::Source);
+    let store = Store::open(&state)?;
     if store.root().starts_with(&root) || root.starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
@@ -239,9 +239,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         meta.ino(),
     ))?;
     let committer = Committer::spawn(PackSink::new(
-        Store::open(&state)?
-            .with_side(Side::Source)
-            .into_publisher()?,
+        Store::open(&state)?.into_publisher(PublisherSide::Source)?,
     ))?;
     write_frame(
         output,
@@ -309,6 +307,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
     // Every capture of this transfer is committed, or the transfer fails,
     // before the receiver is told the source is done.
     committer.sync()?;
+    fault_point!(ServeBeforeDone);
     write_frame(
         output,
         FrameKind::TransferDone {
@@ -392,7 +391,7 @@ fn spawn_captures<'scope>(
     for _ in 0..CAPTURE_WORKERS.min(order.len()) {
         let sender = sender.clone();
         std::thread::Builder::new().spawn_scoped(scope, move || {
-            let opened = Store::open_reader(state).map(|store| store.with_side(Side::Source));
+            let opened = Store::open_reader(state);
             while let Some(index) = order.get(next.fetch_add(1, Ordering::Relaxed)).copied() {
                 let Some(row) = batch.get(index) else {
                     break;
@@ -501,9 +500,12 @@ fn send_batch<R: Read, W: Write>(
             if failure.is_some() {
                 continue;
             }
-            if let Err(error) = send_file(input, output, context, capture_id, captured, &held) {
-                next.store(order.len(), Ordering::Relaxed);
-                failure = Some(error);
+            match send_file(input, output, context, capture_id, captured, &held) {
+                Ok(()) => fault_point!(ServeAfterContent),
+                Err(error) => {
+                    next.store(order.len(), Ordering::Relaxed);
+                    failure = Some(error);
+                }
             }
         }
         if let Some(error) = failure {
@@ -615,11 +617,7 @@ fn send_content<R: Read, W: Write>(
 fn publication_committer(state: &Path, budget: u64) -> Result<Committer<PublishSink>> {
     let staged = (budget / 8).clamp(2, crate::io::durable::GROUP_FILES);
     Committer::spawn_with(
-        PublishSink::new(
-            Store::open(state)?
-                .with_side(Side::Destination)
-                .into_publisher()?,
-        )?,
+        PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?,
         crate::io::durable::Limits {
             group_files: staged,
             queue_depth: usize::try_from(staged).unwrap_or(1),
@@ -640,7 +638,7 @@ pub fn receive<R: Read, W: Write>(
     destination: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
-    let store = Store::open(destination_state)?.with_side(Side::Destination);
+    let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
@@ -686,6 +684,7 @@ pub fn receive<R: Read, W: Write>(
                         needed: needed.clone(),
                     },
                 )?;
+                fault_point!(ReceiveAfterWantFiles);
                 loop {
                     match read_frame(input)?.kind {
                         FrameKind::FileContent { index } => {
@@ -893,49 +892,7 @@ fn receive_content<R: Read, W: Write>(
                 })
             })
         }
-        Plan::Write(staging) => {
-            write_frame(
-                output,
-                FrameKind::WantChunks {
-                    digests: staging.missing.clone(),
-                },
-            )?;
-            let received = {
-                let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
-                receive_chunks(input, &staging, stats)
-            };
-            let Staging { staged, hints, .. } = staging;
-            let received = match received {
-                Ok(received) => received,
-                Err(error) => {
-                    let _ = staged.discard();
-                    return Err(error);
-                }
-            };
-            match received.and_then(|()| {
-                staged
-                    .file()
-                    .set_permissions(std::fs::Permissions::from_mode(row.mode & 0o7777))
-                    .map_err(BulkloadRefusal::from)
-            }) {
-                Ok(()) => {
-                    context.session.insert(Arc::clone(staged.file()), &hints);
-                    context.committer.submit(Publication::Staged {
-                        staged,
-                        record: PendingOutput {
-                            key,
-                            rel_path: row.rel_path.clone(),
-                            size: row.size,
-                            hints,
-                        },
-                    })
-                }
-                Err(refusal) => {
-                    let _ = staged.discard();
-                    Err(refusal)
-                }
-            }
-        }
+        Plan::Write(staging) => write_staged(input, output, context, row, key, staging, stats)?,
     };
     write_frame(
         output,
@@ -943,12 +900,72 @@ fn receive_content<R: Read, W: Write>(
             success: applied.is_ok(),
         },
     )?;
+    fault_point!(ReceiveAfterApplied);
     if let Err(refusal) = applied {
         stats
             .refusals
             .push((row.rel_path.clone(), refusal.code().to_owned()));
     }
     Ok(())
+}
+
+/// Request a staged file's missing chunks, write them, and queue the file
+/// for its group commit. The outer error is a transport fault; the inner
+/// result is this file's outcome.
+fn write_staged<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    context: &mut ReceiveContext<'_>,
+    row: &RowSchema,
+    key: Vec<u8>,
+    staging: Staging,
+    stats: &mut TransferStats,
+) -> Result<Result<()>> {
+    write_frame(
+        output,
+        FrameKind::WantChunks {
+            digests: staging.missing.clone(),
+        },
+    )?;
+    let received = {
+        let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
+        receive_chunks(input, &staging, stats)
+    };
+    let Staging { staged, hints, .. } = staging;
+    let received = match received {
+        Ok(received) => received,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    fault_point!(ReceiveAfterChunks);
+    Ok(
+        match received.and_then(|()| {
+            staged
+                .file()
+                .set_permissions(std::fs::Permissions::from_mode(row.mode & 0o7777))
+                .map_err(BulkloadRefusal::from)
+        }) {
+            Ok(()) => {
+                fault_point!(MaterializeAfterTempWrite);
+                context.session.insert(Arc::clone(staged.file()), &hints);
+                context.committer.submit(Publication::Staged {
+                    staged,
+                    record: PendingOutput {
+                        key,
+                        rel_path: row.rel_path.clone(),
+                        size: row.size,
+                        hints,
+                    },
+                })
+            }
+            Err(refusal) => {
+                let _ = staged.discard();
+                Err(refusal)
+            }
+        },
+    )
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
@@ -1215,6 +1232,7 @@ fn capture_uncached(
         crate::hash::CDC_MAX_BYTES,
     ) {
         let chunk = chunk.map_err(|_| BulkloadRefusal::Io(None))?;
+        fault_mid_read!(chunks.is_empty(), &file_path);
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }

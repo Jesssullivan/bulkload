@@ -84,8 +84,10 @@ impl Destination {
         // SAFETY: both descriptors and the NUL-terminated leaf remain valid.
         let created = unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) };
         if created == 0 {
+            fault_point!(DirectoryAfterMkdir);
             let metadata = open_dir(parent.as_raw_fd(), &leaf)?.metadata()?;
             store.pending_directory(&key, metadata.dev(), metadata.ino(), mode, true)?;
+            fault_point!(DirectoryAfterPendingRecord);
             self.directories.push(PendingDirectory {
                 path: row.rel_path.clone(),
                 mode,
@@ -158,6 +160,7 @@ impl Destination {
                 full_flush_counted(&handle)?;
             }
         }
+        fault_point!(DirectoryBeforeComplete);
         for pending in self.directories.iter().rev() {
             store.complete_directory(&pending.key)?;
             counters::bump(Counter::DirectoriesFinished);
@@ -360,6 +363,7 @@ impl StagedFile {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(error.into());
         }
+        fault_point!(MaterializeAfterTempSeal);
         if let Err(error) =
             crate::io::sys::rename_noreplace(&self.parent, &self.temporary, &self.leaf)
         {
@@ -370,6 +374,7 @@ impl StagedFile {
                 error.into()
             });
         }
+        fault_point!(MaterializeAfterRename);
         counters::bump(Counter::FilesMaterialized);
         Ok((
             StatIdentity::from_metadata(&self.file.metadata()?),
@@ -530,9 +535,13 @@ impl crate::io::durable::GroupSink for PublishSink {
                 }
             }
         }
-        let committed = touched
-            .seal(self.store_device)
-            .and_then(|_| self.publisher.store().commit_outputs(&records));
+        let committed = touched.seal(self.store_device).and_then(|_| {
+            fault_point_in!(
+                PublishDestinationAfterDirSeal,
+                self.publisher.store().root()
+            );
+            self.publisher.commit_outputs(&records)
+        });
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
@@ -632,6 +641,7 @@ fn cstring(bytes: &[u8]) -> Result<CString> {
 mod tests {
     use super::*;
     use crate::io::durable::GroupSink as _;
+    use crate::transfer_store::PublisherSide;
     use std::io::Write as _;
 
     #[test]
@@ -658,8 +668,10 @@ mod tests {
         let staged = target.stage(&row)?;
         (&**staged.file()).write_all(b"ours")?;
         std::fs::write(destination.join("file"), b"theirs")?;
-        let mut sink = PublishSink::new(Store::open(&base.join("state"))?.into_publisher()?)?
-            .assume_store_device(u64::MAX);
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?
+        .assume_store_device(u64::MAX);
         sink.commit(vec![Publication::Staged {
             staged,
             record: PendingOutput {
