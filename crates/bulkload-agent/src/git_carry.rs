@@ -2734,6 +2734,12 @@ fn nest_status(directory: &Path) -> Result<Command> {
         ("core.ignoreStat".into(), "false"),
         ("core.autocrlf".into(), "false"),
         ("core.symlinks".into(), "true"),
+        // Round 4 N2: a repository created on case-insensitive APFS keeps
+        // core.ignoreCase=true when moved to a case-sensitive volume, and
+        // status then drops an untracked file whose name case-folds to a
+        // tracked one. False fails safe on a case-insensitive volume: at
+        // worst a case difference shows as dirt and the nest refuses.
+        ("core.ignoreCase".into(), "false"),
     ];
     for name in &drivers {
         for (variable, value) in [
@@ -10232,5 +10238,34 @@ mod review_pr53d {
         assert_eq!(inside, Err(BulkloadRefusal::GitDestinationOccupied));
         assert_eq!(sibling, Ok(()));
         assert_eq!(nest, Ok(()));
+    }
+    // core.ignoreCase=true is what Git writes into every repository created on
+    // case-insensitive APFS; the repository keeps it when it is moved or
+    // restored onto a case-sensitive volume. Status then drops an untracked
+    // file whose name case-folds to a tracked one. Only meaningful on a
+    // case-sensitive TMPDIR (run with TMPDIR=<case-sensitive volume>, e.g. a
+    // case-sensitive APFS image attached with hdiutil); elsewhere it skips.
+    #[test]
+    fn rv4_core_ignorecase_true_cannot_hide_an_untracked_file() {
+        let (root, outer, inner) = outer_with_nest("ignorecase");
+        fs::write(inner.join("probe"), b"").unwrap();
+        let sensitive = fs::write(inner.join("PROBE"), b"").is_ok()
+            && fs::read_dir(&inner).unwrap().count() >= 4;
+        let _ = fs::remove_file(inner.join("probe"));
+        let _ = fs::remove_file(inner.join("PROBE"));
+        if !sensitive {
+            cleanup(&root);
+            eprintln!("SKIPPED: TMPDIR is case-insensitive");
+            return;
+        }
+        g(&inner, &["config", "core.ignoreCase", "true"]);
+        fs::write(inner.join("LIB.c"), b"rv4 untracked only copy").unwrap();
+        let v = verdict(&outer);
+        cleanup(&root);
+        eprintln!("ignorecase verdict: {v}");
+        assert!(
+            v.starts_with("REFUSED"),
+            "untracked LIB.c hidden by core.ignoreCase: {v}"
+        );
     }
 }
