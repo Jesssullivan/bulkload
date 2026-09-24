@@ -5,6 +5,7 @@ use super::{
     restore_entries, restore_filesystem_rows, snapshot_command, sync_private_tree, text,
     write_git_pointer, IndexReservation,
 };
+use crate::counters::CountedSync as _;
 use crate::{BulkloadRefusal, Result};
 use std::fs;
 use std::io::Read;
@@ -93,8 +94,8 @@ fn complete(
         postcard::to_allocvec(&(destination, admin, head, staged))
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
-    fs::File::open(path)?.sync_all()?;
-    fs::File::open(receipt)?.sync_all()?;
+    fs::File::open(path)?.sync_file_counted()?;
+    fs::File::open(receipt)?.sync_dir_counted()?;
     Ok(())
 }
 
@@ -171,7 +172,7 @@ pub fn restore(
     )?;
     fs::copy(staged.path(), receipt.join("capture.bundle"))?;
     sync_private_tree(&receipt)?;
-    fs::File::open(&receipt_parent)?.sync_all()?;
+    fs::File::open(&receipt_parent)?.sync_dir_counted()?;
     super::import_verified(&repository, &receipt.join("capture.bundle"), source)?;
     let heads = super::shallow::headers(&repository, &receipt.join("capture.bundle"))?;
     let head = capture_revision(&heads, "head")?;
@@ -185,7 +186,7 @@ pub fn restore(
     authority(&repository, &admin, &head, &staged)?;
     fs::DirBuilder::new().mode(0o700).create(&destination)?;
     let pointer = write_git_pointer(&receipt, &admin)?;
-    fs::File::open(&pointer)?.sync_all()?;
+    fs::File::open(&pointer)?.sync_file_counted()?;
     fs::hard_link(pointer, destination.join(".git"))?;
     let entries = output(git(&repository).args([
         "ls-tree",
@@ -200,14 +201,14 @@ pub fn restore(
     }
     authority(&repository, &admin, &head, &staged)?;
     attachment_policy_matches(&repository, &repository, &heads)?;
-    fs::File::open(&destination)?.sync_all()?;
+    fs::File::open(&destination)?.sync_dir_counted()?;
     reservation.release()?;
     // The completion receipt must not precede the new target directory entry.
     fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(&parent)?
-        .sync_all()?;
+        .sync_dir_counted()?;
     complete(&receipt, &destination, &admin, &head, &staged)
 }
 

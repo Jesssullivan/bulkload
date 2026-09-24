@@ -3,6 +3,7 @@
 //! This module never installs a snapshot over a live database.
 //! All tables, including unknown tables and recovery orphans, are preserved.
 
+use crate::counters::CountedSync as _;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -121,7 +122,8 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     {
         return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
     }
-    file.sync_all().map_err(|_| BulkloadRefusal::Io(None))?;
+    file.sync_file_counted()
+        .map_err(|_| BulkloadRefusal::Io(None))?;
     Ok(())
 }
 
@@ -282,7 +284,7 @@ fn compose(
     if integrity != "ok" {
         return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
     }
-    fs::File::open(output)?.sync_all()?;
+    fs::File::open(output)?.sync_file_counted()?;
     Ok(summary)
 }
 

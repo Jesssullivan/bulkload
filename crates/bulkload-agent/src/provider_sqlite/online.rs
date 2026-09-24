@@ -2,6 +2,7 @@
 //!
 //! Only a reviewed immutable candidate is accepted. No schema, migration or
 //! control-table changes are made. Callers must retain both input snapshots.
+use crate::counters::CountedSync as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::time::Duration;
@@ -249,7 +250,9 @@ fn intent_journal(live: &Path) -> Result<Connection> {
         .mode(0o600)
         .open(&path)
     {
-        Ok(file) => file.sync_all().map_err(|_| BulkloadRefusal::Io(None))?,
+        Ok(file) => file
+            .sync_file_counted()
+            .map_err(|_| BulkloadRefusal::Io(None))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata =
                 std::fs::symlink_metadata(&path).map_err(|_| BulkloadRefusal::Io(None))?;
@@ -266,7 +269,7 @@ fn intent_journal(live: &Path) -> Result<Connection> {
         .map_err(sql_refusal)?;
     connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS attempts(table_name TEXT NOT NULL,key_blob BLOB NOT NULL,PRIMARY KEY(table_name,key_blob));").map_err(sql_refusal)?;
     std::fs::File::open(path.parent().ok_or(BulkloadRefusal::Io(None))?)
-        .and_then(|directory| directory.sync_all())
+        .and_then(|directory| directory.sync_dir_counted())
         .map_err(|_| BulkloadRefusal::Io(None))?;
     Ok(connection)
 }

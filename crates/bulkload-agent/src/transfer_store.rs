@@ -13,6 +13,7 @@ use bulkload_proto::frame::ChunkSpec;
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 
+use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
 use crate::{BulkloadRefusal, Result, RowSchema};
 
@@ -145,9 +146,9 @@ pub struct ChunkTiming {
     pub publish_groups: u64,
     /// Aggregate nanoseconds spent appending payload bytes to the pack.
     pub pack_append_ns: u64,
-    /// Durable `SQLite` publication commits attempted by this process.
+    /// Successful durable `SQLite` publication commits by this process.
     pub sqlite_commits: u64,
-    /// Aggregate nanoseconds spent committing publication transactions.
+    /// Aggregate nanoseconds spent in successful publication commits.
     pub sqlite_commit_ns: u64,
 }
 
@@ -167,6 +168,24 @@ impl ChunkTiming {
             sqlite_commits: SQLITE_COMMITS.load(Ordering::Relaxed),
             sqlite_commit_ns: SQLITE_COMMIT_NS.load(Ordering::Relaxed),
         }
+    }
+
+    /// Space-separated `key=value` pairs.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "publish_groups={} pack_append_ns={} file_syncs={} file_sync_ns={} sqlite_commits={} sqlite_commit_ns={} legacy_put_calls={} legacy_put_ns={} legacy_dir_syncs={} legacy_dir_sync_ns={}",
+            self.publish_groups,
+            self.pack_append_ns,
+            self.file_syncs,
+            self.file_sync_ns,
+            self.sqlite_commits,
+            self.sqlite_commit_ns,
+            self.put_calls,
+            self.put_ns,
+            self.dir_syncs,
+            self.dir_sync_ns,
+        )
     }
 
     /// Difference from a prior snapshot after the observed operation has joined.
@@ -201,10 +220,19 @@ fn nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn timed_sync(file: &fs::File, count: &AtomicU64, time: &AtomicU64) -> std::io::Result<()> {
+fn timed_sync(
+    file: &fs::File,
+    count: &AtomicU64,
+    time: &AtomicU64,
+    directory: bool,
+) -> std::io::Result<()> {
     count.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let result = file.sync_all();
+    let result = if directory {
+        counters::sync_dir(file)
+    } else {
+        counters::sync_full(file)
+    };
     time.fetch_add(nanos(started), Ordering::Relaxed);
     result
 }
@@ -267,8 +295,8 @@ pub(crate) struct StorePublisher<'a> {
     store: &'a Store,
     pack: fs::File,
     _exclusive: Exclusive,
-    // Read only by the `fault-injection` crash points.
-    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+    // Read by the `fault-injection` crash points and by the per-side
+    // pack-write and publication-commit counters.
     side: PublisherSide,
 }
 
@@ -394,12 +422,16 @@ impl Store {
         }
         let mut random = [0_u8; 32];
         fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-        self.conn
+        let started = Instant::now();
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO settings VALUES ('authority', ?1)",
                 [random.as_slice()],
             )
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteSettings, started, &inserted);
+        inserted?;
         let bytes: Vec<u8> = self
             .conn
             .query_row(
@@ -437,13 +469,18 @@ impl Store {
     /// # Errors
     /// Refuses serialization or database failures.
     pub fn record_capture(&self, key: &[u8], value: &Manifest) -> Result<()> {
-        self.conn
+        let encoded = postcard::to_stdvec(value)?;
+        let started = Instant::now();
+        let recorded = self
+            .conn
             .execute(
                 "INSERT INTO captures VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET manifest=excluded.manifest",
-                (key, postcard::to_stdvec(value)?),
+                (key, encoded),
             )
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteRecordCapture, started, &recorded);
+        recorded?;
         Ok(())
     }
 
@@ -469,13 +506,18 @@ impl Store {
     /// # Errors
     /// Refuses database failures.
     pub fn record_output(&self, key: &[u8], identity: &StatIdentity) -> Result<()> {
-        self.conn
+        let identity = identity_bytes(identity)?;
+        let started = Instant::now();
+        let recorded = self
+            .conn
             .execute(
                 "INSERT INTO outputs VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (key, identity_bytes(identity)?),
+                (key, identity),
             )
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteRecordOutput, started, &recorded);
+        recorded?;
         Ok(())
     }
 
@@ -490,16 +532,18 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        self.conn
+        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        let started = Instant::now();
+        let recorded = self
+            .conn
             .execute(
                 "INSERT INTO directories VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (
-                    key,
-                    postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?,
-                ),
+                (key, identity),
             )
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
+        recorded?;
         Ok(())
     }
 
@@ -565,9 +609,13 @@ impl Store {
     /// # Errors
     /// Refuses persistence failures.
     pub fn complete_directory(&self, key: &[u8]) -> Result<()> {
-        self.conn
+        let started = Instant::now();
+        let completed = self
+            .conn
             .execute("DELETE FROM directories WHERE key = ?1", [key])
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteDirectoryComplete, started, &completed);
+        completed?;
         Ok(())
     }
 
@@ -576,6 +624,14 @@ impl Store {
     /// # Errors
     /// Refuses unexpected filesystem failures.
     pub fn chunk(&self, digest: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.chunk_for(digest, Counter::OtherChunkRead)
+    }
+
+    /// [`Store::chunk`], counting bytes read under the caller's `stage`.
+    ///
+    /// # Errors
+    /// Refuses unexpected filesystem failures.
+    pub fn chunk_for(&self, digest: &[u8; 32], stage: Counter) -> Result<Option<Vec<u8>>> {
         let stored: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -586,8 +642,9 @@ impl Store {
             .optional()
             .map_err(sqlite_error)?;
         if let Some(data) = stored {
+            counters::add_len(stage, data.len());
             if data.len() > crate::hash::CDC_MAX_BYTES as usize
-                || crate::hash::hash_bytes(&data) != *digest
+                || counters::hash(Counter::HashStoreReadVerify, &data) != *digest
             {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
@@ -612,15 +669,16 @@ impl Store {
             pack.seek(std::io::SeekFrom::Start(offset))?;
             let mut data = vec![0_u8; size];
             pack.read_exact(&mut data)?;
-            if crate::hash::hash_bytes(&data) != *digest {
+            counters::add_len(stage, data.len());
+            if counters::hash(Counter::HashStoreReadVerify, &data) != *digest {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
             return Ok(Some(data));
         }
-        Self::chunk_at(&self.root, digest)
+        Self::chunk_at(&self.root, digest, stage)
     }
 
-    fn chunk_at(root: &Path, digest: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    fn chunk_at(root: &Path, digest: &[u8; 32], stage: Counter) -> Result<Option<Vec<u8>>> {
         let path = root.join("chunks").join(hex(digest));
         let file = match crate::hash::open_nofollow(&path) {
             Ok(file) => file,
@@ -634,7 +692,8 @@ impl Store {
         let mut data = Vec::new();
         file.take(u64::from(crate::hash::CDC_MAX_BYTES) + 1)
             .read_to_end(&mut data)?;
-        if crate::hash::hash_bytes(&data) != *digest {
+        counters::add_len(stage, data.len());
+        if counters::hash(Counter::HashStoreReadVerify, &data) != *digest {
             return Err(BulkloadRefusal::DigestMismatch);
         }
         Ok(Some(data))
@@ -657,11 +716,11 @@ impl Store {
         PUT_CALLS.fetch_add(1, Ordering::Relaxed);
         let _timer = PutTimer(Instant::now());
         if data.len() > crate::hash::CDC_MAX_BYTES as usize
-            || crate::hash::hash_bytes(data) != *digest
+            || counters::hash(Counter::HashLegacyPut, data) != *digest
         {
             return Err(BulkloadRefusal::DigestMismatch);
         }
-        if Self::chunk_at(root, digest)?.is_some() {
+        if Self::chunk_at(root, digest, Counter::OtherChunkRead)?.is_some() {
             // A concurrent publisher may have linked the already-synced inode
             // but not yet synced its directory. Fence that link before reuse.
             if sync_directory {
@@ -669,6 +728,7 @@ impl Store {
                     &fs::File::open(root.join("chunks"))?,
                     &DIR_SYNCS,
                     &DIR_SYNC_NS,
+                    true,
                 )?;
             }
             return Ok(());
@@ -686,12 +746,14 @@ impl Store {
             .open(&staging)?;
         let result = (|| -> Result<()> {
             file.write_all(data)?;
-            timed_sync(&file, &FILE_SYNCS, &FILE_SYNC_NS)?;
+            counters::add_len(Counter::LegacyChunkWrite, data.len());
+            timed_sync(&file, &FILE_SYNCS, &FILE_SYNC_NS, false)?;
             let target = chunks.join(hex(digest));
             match fs::hard_link(&staging, &target) {
                 Ok(()) => (),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Self::chunk_at(root, digest)?.ok_or(BulkloadRefusal::DigestMismatch)?;
+                    Self::chunk_at(root, digest, Counter::OtherChunkRead)?
+                        .ok_or(BulkloadRefusal::DigestMismatch)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -699,7 +761,7 @@ impl Store {
         })();
         fs::remove_file(staging)?;
         if sync_directory {
-            timed_sync(&fs::File::open(chunks)?, &DIR_SYNCS, &DIR_SYNC_NS)?;
+            timed_sync(&fs::File::open(chunks)?, &DIR_SYNCS, &DIR_SYNC_NS, true)?;
         }
         result
     }
@@ -753,7 +815,7 @@ impl StorePublisher<'_> {
         }
         if pack_len > committed_end {
             pack.set_len(committed_end)?;
-            timed_sync(&pack, &FILE_SYNCS, &FILE_SYNC_NS)?;
+            timed_sync(&pack, &FILE_SYNCS, &FILE_SYNC_NS, false)?;
         }
         pack.seek(std::io::SeekFrom::Start(committed_end))?;
         Ok(StorePublisher {
@@ -778,7 +840,10 @@ impl StorePublisher<'_> {
                 |row| row.get(0),
             )
             .map_err(sqlite_error)?;
-        Ok(indexed || Store::chunk_at(&self.store.root, digest)?.is_some())
+        Ok(
+            indexed
+                || Store::chunk_at(&self.store.root, digest, Counter::OtherChunkRead)?.is_some(),
+        )
     }
 
     fn missing_chunks<'a>(&self, events: &'a [PreparedEvent]) -> Result<Vec<([u8; 32], &'a [u8])>> {
@@ -791,7 +856,7 @@ impl StorePublisher<'_> {
                 }
                 for (digest, data) in chunks {
                     if data.len() > crate::hash::CDC_MAX_BYTES as usize
-                        || crate::hash::hash_bytes(data) != *digest
+                        || counters::hash(Counter::HashPublishVerify, data) != *digest
                     {
                         return Err(BulkloadRefusal::DigestMismatch);
                     }
@@ -829,6 +894,13 @@ impl StorePublisher<'_> {
         for (digest, data) in missing {
             let offset = self.pack.stream_position()?;
             self.pack.write_all(data)?;
+            counters::add_len(
+                match self.side {
+                    PublisherSide::Source => Counter::SourcePackWrite,
+                    PublisherSide::Destination => Counter::DestPackWrite,
+                },
+                data.len(),
+            );
             locations.push((digest, offset, data.len()));
         }
         PACK_APPEND_NS.fetch_add(nanos(append_started), Ordering::Relaxed);
@@ -839,7 +911,7 @@ impl StorePublisher<'_> {
             PublishDestinationAfterAppend
         );
         if !locations.is_empty() {
-            timed_sync(&self.pack, &FILE_SYNCS, &FILE_SYNC_NS)?;
+            timed_sync(&self.pack, &FILE_SYNCS, &FILE_SYNC_NS, false)?;
         }
         publication_fault!(
             self,
@@ -910,10 +982,21 @@ impl StorePublisher<'_> {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
         }
-        SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
         let commit_started = Instant::now();
         let committed = self.commit();
-        SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
+        if committed.is_ok() {
+            // Successful commits only, matching `counters::sqlite_commit`.
+            SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
+            SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
+        }
+        counters::sqlite_commit(
+            match self.side {
+                PublisherSide::Source => Counter::SqlitePublishSource,
+                PublisherSide::Destination => Counter::SqlitePublishDest,
+            },
+            commit_started,
+            &committed,
+        );
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
