@@ -38,11 +38,18 @@ secrets-scan-history:
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
-# including the agent's dependency-wall test). The W7 fault harness is not
-# here: it runs in its own CI gate (`just fault-harness`, R-N122).
+# including the agent's dependency-wall test). The io layer's syscall trace
+# (R-N88) is linted, and its crash-state proofs run with `io-trace` on, ahead
+# of the workspace tests so no unrelated failure can hide them; the partial-
+# write proof sets a process-wide RLIMIT_FSIZE, so it runs alone. The W7 fault
+# harness is not here: it runs in its own CI gate (`just fault-harness`,
+# R-N122).
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
+    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1
     cd {{ root }} && cargo test --workspace --locked
 
 # W7 crash-resume and live-writer harness, which needs the agent's
@@ -55,6 +62,11 @@ rust-check:
 fault-harness:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
+
+# Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
+# current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
+bench-io-chunker:
+    cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
