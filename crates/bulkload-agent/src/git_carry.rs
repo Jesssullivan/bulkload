@@ -10550,22 +10550,52 @@ mod review_pr53d {
         assert!(!bare_errno(&app), "{app:#?}");
         assert!(app.iter().all(|row| row.0 == "refused"), "{app:#?}");
     }
+    // N4, fixed for case-sensitive volumes (CI runs as root on Linux ext4).
+    // The volume's case behaviour is probed at run time and the matching
+    // outcome asserted. Where case folds, TARGET/vendor/inner is the outer's
+    // target/vendor/inner: it must refuse at add or restore cleanly after the
+    // outer. Where case matters they are different targets and must not
+    // overlap: both are added, the outer restores, and the nest item meets a
+    // missing parent (root/TARGET/vendor) as a typed refusal, never an errno.
     #[test]
     fn rv4_case_folded_nest_target_is_refused_or_typed() {
         let (root, outer, inner) = outer_with_nest("case-target");
+        let insensitive = {
+            fs::write(root.join("probe"), b"").unwrap();
+            let folds = root.join("PROBE").exists();
+            fs::remove_file(root.join("probe")).unwrap();
+            folds
+        };
         let target = root.join("target");
-        // Same directory as target/vendor/inner on case-insensitive APFS.
         let nest_target = root.join("TARGET/vendor/inner");
         let (added, cap, app) = estate_run(&root, &[(&inner, &nest_target), (&outer, &target)], 1);
+        let outer_restored = target.join("file").exists();
         cleanup(&root);
-        eprintln!("added={added:?}\ncapture={cap:#?}\napply={app:#?}");
-        let refused_at_add = added
-            .get(1)
-            .is_some_and(|r| *r == Err(BulkloadRefusal::GitDestinationOccupied));
-        assert!(
-            refused_at_add || (!bare_errno(&app) && app.iter().all(|row| row.0 != "refused")),
-            "case-folded overlap neither refused at add nor restored cleanly: {app:#?}"
-        );
+        eprintln!("insensitive={insensitive}\nadded={added:?}\ncapture={cap:#?}\napply={app:#?}");
+        assert!(!bare_errno(&app), "{app:#?}");
+        if insensitive {
+            let refused_at_add = added
+                .get(1)
+                .is_some_and(|r| *r == Err(BulkloadRefusal::GitDestinationOccupied));
+            assert!(
+                refused_at_add || app.iter().all(|row| row.0 != "refused"),
+                "case-folded overlap neither refused at add nor restored cleanly: {app:#?}"
+            );
+        } else {
+            assert!(added.iter().all(Result::is_ok), "{added:?}");
+            assert!(outer_restored, "{app:#?}");
+            let parent_missing = BulkloadRefusal::GitDestinationParentMissing.to_string();
+            assert!(
+                app.iter().any(|row| row.0 == "workspace-restored"),
+                "{app:#?}"
+            );
+            assert!(
+                app.iter()
+                    .any(|row| row.0 == "refused"
+                        && row.1.as_deref() == Some(parent_missing.as_str())),
+                "{app:#?}"
+            );
+        }
     }
 
     // N4: a restore whose destination's parent does not exist is refused by

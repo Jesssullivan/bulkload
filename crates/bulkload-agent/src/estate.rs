@@ -419,23 +419,66 @@ fn fold(path: &Path) -> PathBuf {
     ))
 }
 
-// Whether names on the volume holding `path` compare case-insensitively. An
-// unanswerable probe is taken as insensitive: folding can only add refusals.
+// Whether names on the volume holding `path` compare case-insensitively,
+// decided at run time per volume, never assumed per platform. macOS answers
+// through pathconf(_PC_CASE_SENSITIVE); when it cannot answer, the read-only
+// probe below decides.
 #[cfg(target_os = "macos")]
 fn case_insensitive(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return true;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return probe_case_insensitive(path);
     };
-    // SAFETY: `path` is a valid NUL-terminated C string that outlives the
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
     // call; pathconf only reads it and has no other preconditions.
-    let sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
-    sensitive != 1
+    match unsafe { libc::pathconf(name.as_ptr(), libc::_PC_CASE_SENSITIVE) } {
+        1 => false,
+        0 => true,
+        _ => probe_case_insensitive(path),
+    }
 }
 
+// Elsewhere there is no volume-wide query (ext4 casefold is per directory,
+// vfat folds everywhere), so probe read-only: find the deepest component of
+// `path` whose name has an ASCII letter, and ask whether its case-flipped
+// spelling names the same inode. Nothing is created. No such component, or a
+// flipped name that does not resolve, means case-sensitive.
 #[cfg(not(target_os = "macos"))]
-const fn case_insensitive(_: &Path) -> bool {
-    false
+fn case_insensitive(path: &Path) -> bool {
+    probe_case_insensitive(path)
+}
+
+fn probe_case_insensitive(path: &Path) -> bool {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::MetadataExt;
+    let mut current = path.to_path_buf();
+    loop {
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            return false;
+        };
+        let bytes = name.as_bytes();
+        if bytes.iter().any(u8::is_ascii_alphabetic) {
+            let flipped: Vec<u8> = bytes
+                .iter()
+                .map(|b| {
+                    if b.is_ascii_lowercase() {
+                        b.to_ascii_uppercase()
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            let variant = parent.join(std::ffi::OsString::from_vec(flipped));
+            return match (
+                fs::symlink_metadata(&current),
+                fs::symlink_metadata(variant),
+            ) {
+                (Ok(real), Ok(folded)) => real.dev() == folded.dev() && real.ino() == folded.ino(),
+                _ => false,
+            };
+        }
+        current = parent.to_path_buf();
+    }
 }
 
 struct Exclusive(fs::File);
@@ -2606,6 +2649,31 @@ mod tests {
         } else {
             assert_eq!(cased, Ok(()));
         }
+    }
+
+    // Round 4 N4 on both platforms: the read-only case probe agrees with a
+    // created-file ground truth on whatever volume the test runs on (case-
+    // insensitive APFS on macOS, case-sensitive ext4 on Linux CI).
+    #[test]
+    fn the_read_only_case_probe_matches_the_volume() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-case-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let named = root.join("CaseProbe");
+        fs::create_dir(&named).unwrap();
+        fs::write(root.join("probe"), b"").unwrap();
+        let folds = root.join("PROBE").exists();
+        let probed = probe_case_insensitive(&named);
+        let digits = root.join("1234");
+        fs::create_dir(&digits).unwrap();
+        // A name with no letter is decided by its nearest lettered ancestor.
+        let through_parent = probe_case_insensitive(&digits);
+        let at_root = probe_case_insensitive(&root);
+        let platform = case_insensitive(&named);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(probed, folds);
+        assert_eq!(through_parent, at_root);
+        assert_eq!(platform, folds);
     }
 
     // B4: a nest's HEAD moving between the capture's pre-pass key and the
