@@ -14,6 +14,10 @@ use super::{git, input, oid, output, refs, text};
 use crate::{BulkloadRefusal, Result};
 
 const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
+/// Set on a shallow envelope whose capture drifted under its export. It names
+/// the custody commit, so `bundle list-heads` shows the drift without the
+/// pack ever being fetched; `unpack` refuses any envelope carrying it.
+pub(super) const DRIFT_MARKER: &str = "refs/carry-export/shallow-drift-v1";
 
 pub(super) fn frontier(repository: &Path) -> Result<Vec<u8>> {
     let path = text(git(repository).args([
@@ -97,17 +101,17 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
     let tree = std::str::from_utf8(&tree)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
         .trim();
-    super::set_ref(
-        &envelope,
-        CUSTODY,
-        &super::commit_tree(&envelope, tree, "bulkload explicit shallow graph custody")?,
-    )?;
-    output(
-        git(&envelope)
-            .args(["bundle", "create"])
-            .arg(bundle)
-            .arg(CUSTODY),
-    )?;
+    let custody = super::commit_tree(&envelope, tree, "bulkload explicit shallow graph custody")?;
+    super::set_ref(&envelope, CUSTODY, &custody)?;
+    let mut create = git(&envelope);
+    create.args(["bundle", "create"]).arg(bundle).arg(CUSTODY);
+    // The inner inventory's drift marker is lifted into the envelope headers.
+    let marker = format!(" refs/carry-export/{}", super::CAPTURE_DRIFT_METADATA);
+    if inventory.lines().any(|line| line.ends_with(&marker)) {
+        super::set_ref(&envelope, DRIFT_MARKER, &custody)?;
+        create.arg(DRIFT_MARKER);
+    }
+    output(&mut create)?;
     Ok(())
 }
 
@@ -173,6 +177,12 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     }
     ensure_custody_objects(repository, bundle, value)?;
     let (boundary, inventory, pack_oid) = custody_manifest(repository, value)?;
+    // The header marker is the fast path; the inner inventory is the truth. An
+    // envelope written before the marker was lifted, or re-enveloped without
+    // it, still refuses here, before its pack is indexed (round-4 R1).
+    if super::drift_marked(&inventory) {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
     validate_frontier(&boundary)?;
     if boundary.is_empty() || !oid(&pack_oid) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
