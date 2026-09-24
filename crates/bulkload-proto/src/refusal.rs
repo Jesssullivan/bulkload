@@ -76,6 +76,12 @@ pub enum BulkloadRefusal {
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
     GitIgnorePolicyConflict,
+    /// A path given as a repository is not that repository's root: Git would
+    /// resolve it to an enclosing repository, or to none at all.
+    GitRepositoryNotAtPath,
+    /// A destination's refs do not prove it holds their history: it is a
+    /// partial clone, or shallow at a frontier other than the source's (R-N75).
+    GitHavesUnprovable,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -147,6 +153,8 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
+            Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
+            Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -221,6 +229,8 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
+            BulkloadRefusal::GitRepositoryNotAtPath,
+            BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

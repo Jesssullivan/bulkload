@@ -34,6 +34,17 @@ SUBCOMMANDS:
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
+    git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
+                Read-only: report what git carry v2 would move from SOURCE_REPO
+                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes);
+                missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
+                partial or differently-shallow DEST (R-N75); a refused pair
+                prints refused=CODE and the verb exits nonzero. A child's
+                stderr is never printed (R-N121): only stderr_class=, plus
+                stderr_keyed_blake3= and stderr_file= when --state-dir keeps
+                the raw bytes in DIR/stderr/<digest>.log (mode 0600). DIR
+                must be yours, mode 0700 or tighter, no ACL, and outside
+                every SOURCE_REPO and local DEST
     estate-add PLAN SOURCE_REPO DEST_REPO [ABSENT_WORKSPACE]
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
@@ -139,6 +150,7 @@ fn main() -> ExitCode {
                 .unwrap_or(""),
             &args.collect::<Vec<_>>(),
         ),
+        Some("git-carry-estimate") => estimate_command(&args.collect::<Vec<_>>()),
         Some("hydrate-state") => hydrate_command(&args.collect::<Vec<_>>()),
         Some("git-repair-missing-index") => repair_index_command(&args.collect::<Vec<_>>()),
         Some("git-restore-registered-payload") => registered_command(&args.collect::<Vec<_>>()),
@@ -305,6 +317,63 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// Read-only on both sides: no fetch, no object or ref write (R-N60 baseline).
+//
+// Each pair prints one whole block, built before any of it is written. A
+// refused pair prints `refused=CODE` in place of its measurements, with
+// `refused_reason=`, `stderr_class=` and the store's fields when present; later
+// pairs still run, and the verb exits nonzero with the first refusal (F13).
+// A child's stderr is classified, never echoed (R-N121). With `--state-dir`,
+// its raw bytes go to a private 0600 file whose path is printed as
+// `stderr_file=`, with a digest keyed by the state dir's key; without it,
+// nothing is written and no digest is printed.
+fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::git_carry::estimate::{estimate_with, Destination, Refused, StderrStore};
+    let (state_dir, args) = match args {
+        [flag, dir, rest @ ..] if flag == "--state-dir" => (Some(Path::new(dir)), rest),
+        _ => (None, args),
+    };
+    let store = state_dir.map(StderrStore::open).transpose()?;
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let mut stdout = std::io::stdout().lock();
+    let mut first = None;
+    for (index, pair) in args.chunks_exact(2).enumerate() {
+        let [source, destination] = pair else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let source = Path::new(source);
+        let mut block = vec![
+            format!("source={}", source.display()),
+            format!("destination={}", Path::new(destination).display()),
+        ];
+        let outcome = Destination::parse(destination)
+            .map_err(Refused::from)
+            .and_then(|destination| estimate_with(source, &destination, store.as_ref()));
+        match outcome {
+            Ok(estimate) => block.extend(estimate.lines()),
+            Err(refused) => {
+                block.extend(refused.lines());
+                first.get_or_insert(refused.refusal);
+            }
+        }
+        emit(&mut stdout, index, &block)?;
+    }
+    first.map_or(Ok(()), Err)
+}
+
+fn emit(stdout: &mut impl std::io::Write, index: usize, block: &[String]) -> Result<()> {
+    if index > 0 {
+        writeln!(stdout)?;
+    }
+    for line in block {
+        writeln!(stdout, "{line}")?;
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
