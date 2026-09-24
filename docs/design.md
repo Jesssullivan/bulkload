@@ -42,8 +42,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   pre-pass key parts, the export's own before and after ref inventories, and
   the post-pass key parts all agree; a ref that vanishes before the export's
   snapshot and returns after its last ref read is drift (R-N72).
-- Git authority is read once per export and carried exactly: HEAD, the
-  symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
+- Git authority is read once per export and carried exactly (the index
+  checks validate a private copy of the carried bytes, never the live index):
+  HEAD, the symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
   configuration files and the shallow frontier. The export re-reads all of
   it at the end of its pass, and the capture refuses `GIT_AUTHORITY_CHANGED`
   unless both key parts name exactly what the export carried, so authority
@@ -59,8 +60,13 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   sidecar exists. A shallow envelope lifts the marker into its own headers
   (`shallow-drift-v1`), so the check reads bundle headers only and never
   fetches a pack. Each verb first stages the bundle into a private copy and
-  reads only that copy, so the checked bytes are the imported bytes (a clone
-  on APFS, btrfs and XFS; a full copy elsewhere). Key drift moved only outside the export's window: the
+  reads only that copy, so the checked bytes are the imported bytes. The
+  stage sits next to the bundle (the corpus, for an estate apply), falling
+  back to TMPDIR. It is a full copy, never a clone, hashed while it is
+  written, so apply's digest check costs no second read. A shallow envelope
+  whose inner inventory carries the marker but whose headers do not still
+  refuses when it is unpacked. Re-applying an item that is already done
+  reads its journal first and stages nothing. Key drift moved only outside the export's window: the
   bundle is a coherent snapshot of the export's own view and applies.
 - A drifted capture of either class records a poisoned key that no census
   hashes to, so it is never a reuse hit, even if its `{bundle}.drift` sidecar
