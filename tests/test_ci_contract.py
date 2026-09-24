@@ -167,8 +167,13 @@ PINNED_JUST_RECIPES = {
             "fi",
             "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
             "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
+            "proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced \\.\\.\\. ok$' <<<\"$output\" || true)",
             "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
             "    echo \"io-partial-write-alone: expected exactly one '1 passed; 0 failed' result\" >&2",
+            "    exit 1",
+            "fi",
+            "if [[ $proved -ne 1 ]]; then",
+            '    echo "io-partial-write-alone: the passing test was not the P5 proof" >&2',
             "    exit 1",
             "fi",
         ),
@@ -246,6 +251,9 @@ def validate_p5_alone(justfile: str) -> None:
         "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
         "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
         "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+        "proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced "
+        '\\.\\.\\. ok$\' <<<"$output" || true)',
+        "if [[ $proved -ne 1 ]]; then",
         "if [[ $status -ne 0 ]]; then",
     )
     for line in required:
@@ -253,10 +261,50 @@ def validate_p5_alone(justfile: str) -> None:
             raise ContractError(f"P5 must run alone and fail closed: {line}")
 
 
-def validate_just_recipes(justfile: str) -> None:
+# Top-level justfile lines that change how every recipe runs: settings,
+# exports, imports, modules, aliases and variables. A later `set
+# allow-duplicate-recipes`, a redirected `root :=` or an `export PATH := stub`
+# would rewire the pinned recipes without touching their bodies.
+JUSTFILE_TOP_LEVEL = (
+    'set shell := ["bash", "-euo", "pipefail", "-c"]',
+    'export PYTHONDONTWRITEBYTECODE := "1"',
+    "root := justfile_directory()",
+    'import? "justfile.flywheel"',
+)
+JUST_TOP_LEVEL_PATTERN = re.compile(
+    r"^(?:set|export|import|mod|alias)\b|^[A-Za-z_][A-Za-z0-9_-]*\s*:="
+)
+JUST_GLOBAL_DIRECTIVE_PATTERN = re.compile(r"^(?:set|export|import|mod|alias)\b")
+
+
+def just_top_level(justfile: str) -> tuple[str, ...]:
+    return tuple(
+        line for line in justfile.splitlines() if JUST_TOP_LEVEL_PATTERN.match(line)
+    )
+
+
+def just_header_count(justfile: str, name: str) -> int:
+    return len(re.findall(rf"(?m)^@?{re.escape(name)}(?=[\s:])", justfile))
+
+
+def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
     for name, expected in PINNED_JUST_RECIPES.items():
+        if just_header_count(justfile, name) != 1:
+            raise ContractError(f"just recipe {name} must be declared exactly once")
         if just_recipe(justfile, name) != expected:
             raise ContractError(f"just recipe {name} drifted from its pinned body")
+    if just_top_level(justfile) != JUSTFILE_TOP_LEVEL:
+        raise ContractError("justfile top-level settings or variables drifted")
+    if imported is not None:
+        # The fleet-managed import may change its own recipes, but it may not
+        # set, export, import, alias or redefine anything the gates rely on.
+        if any(
+            JUST_GLOBAL_DIRECTIVE_PATTERN.match(line) for line in imported.splitlines()
+        ):
+            raise ContractError("imported justfile must not declare global directives")
+        for name in PINNED_JUST_RECIPES:
+            if just_header_count(imported, name):
+                raise ContractError(f"imported justfile must not declare {name}")
     validate_p5_alone(justfile)
 
 
@@ -1746,6 +1794,11 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"',
         'require_equal "ref" "${BULKLOAD_REF:-}" "${GITHUB_REF:-}"',
         '"pull-request head repository"',
+        "  merge_group)\n",
+        '"merge-group repository"',
+        '[[ "${BULKLOAD_REF:-}" == refs/heads/gh-readonly-queue/main/* ]] ||',
+        'die "merge-group ref is outside the main merge queue"',
+        '*) die "event is outside the reviewed push/pull_request/merge_group inventory" ;;',
         '"$(git -C "${GITHUB_WORKSPACE:?}" rev-parse HEAD)"',
         'if [[ "$BULKLOAD_EVENT_NAME" == push && "$BULKLOAD_REF" == refs/heads/main ]]; then',
         'case "$mode" in',
@@ -2941,6 +2994,16 @@ class CiContractTest(unittest.TestCase):
                 'printf "%s\\n" "${ATTIC_SERVER:-}"',
             ),
             self.guard.replace("refs/heads/main", "refs/heads/*"),
+            self.guard.replace(
+                "refs/heads/gh-readonly-queue/main/*", "refs/heads/gh-readonly-queue/*"
+            ),
+            self.guard.replace('"merge-group repository"', '"merge-group source"'),
+            self.guard.replace(
+                'die "merge-group ref is outside the main merge queue"', "true"
+            ),
+            self.guard.replace(
+                "  merge_group)\n", "  merge_group | workflow_dispatch)\n"
+            ),
             self.guard.replace('NIX_REMOTE:-}" local', 'NIX_REMOTE:-}" daemon'),
             self.guard.replace(REVIEWED_PATH, "/tmp/unaudited:/usr/bin:/bin"),
             self.guard.replace(
@@ -3517,7 +3580,9 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("just flywheel-build //:bulkload", justfile)
         self.assertIn("just flywheel-test //:tests", justfile)
         self.assertIn("scripts/ci-public-read-guard.sh", justfile)
-        validate_just_recipes(justfile)
+        validate_just_recipes(
+            justfile, (self.root / "justfile.flywheel").read_text(encoding="utf-8")
+        )
 
     def test_pinned_just_recipe_mutations_fail_closed(self) -> None:
         justfile = (self.root / "justfile").read_text(encoding="utf-8")
@@ -3566,12 +3631,65 @@ class CiContractTest(unittest.TestCase):
                 "",
                 1,
             ),
+            justfile.replace(
+                "    if [[ $proved -ne 1 ]]; then\n", "    if false; then\n", 1
+            ),
+            justfile.replace(
+                "partial_write_prefix_is_traced \\.\\.\\. ok$'",
+                "[a-z_:]* \\.\\.\\. ok$'",
+                1,
+            ),
+            # The review's seven escapes that rewire pinned recipes without
+            # touching their bodies (R-N122, #71 review A1).
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nio-partial-write-alone *args:\n    @echo 'test result: ok. 1 passed; 0 failed;'\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nrust-check *args:\n    true\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nfault-harness *args:\n    true\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\n[private]\nio-partial-write-alone *args:\n    true\n",
+            justfile.replace(
+                "root := justfile_directory()\n",
+                "root := justfile_directory() / 'decoy'\n",
+                1,
+            ),
+            justfile.replace(
+                'export PYTHONDONTWRITEBYTECODE := "1"\n',
+                'export PYTHONDONTWRITEBYTECODE := "1"\n'
+                'export PATH := justfile_directory() / "stub" + ":" + env("PATH")\n',
+                1,
+            ),
+            justfile.replace(
+                'export PYTHONDONTWRITEBYTECODE := "1"\n',
+                'export PYTHONDONTWRITEBYTECODE := "1"\n'
+                'export RUSTFLAGS := "--cfg skip_p5"\n',
+                1,
+            ),
         ]
         for index, unsafe in enumerate(variants):
             with self.subTest(index=index):
                 self.assertNotEqual(unsafe, justfile)
                 with self.assertRaises(ContractError):
                     validate_just_recipes(unsafe)
+        imported = (self.root / "justfile.flywheel").read_text(encoding="utf-8")
+        validate_just_recipes(justfile, imported)
+        for index, unsafe_import in enumerate(
+            [
+                'export PATH := "/tmp/stub:" + env("PATH")\n' + imported,
+                "set allow-duplicate-recipes := true\n" + imported,
+                imported + "\nrust-check:\n    true\n",
+                imported + "\n@fault-harness:\n    true\n",
+                'import? "elsewhere.just"\n' + imported,
+            ]
+        ):
+            with self.subTest(imported=index):
+                with self.assertRaises(ContractError):
+                    validate_just_recipes(justfile, unsafe_import)
 
     def test_actionlint_knows_only_the_sanctioned_custom_label(self) -> None:
         config = (self.root / ".github/actionlint.yaml").read_text(encoding="utf-8")

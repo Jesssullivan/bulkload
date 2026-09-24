@@ -74,8 +74,13 @@ io-partial-write-alone:
     fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
     passed=$(grep -c '^test result: ok\. 1 passed; 0 failed;' <<<"$output" || true)
+    proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced \.\.\. ok$' <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
         echo "io-partial-write-alone: expected exactly one '1 passed; 0 failed' result" >&2
+        exit 1
+    fi
+    if [[ $proved -ne 1 ]]; then
+        echo "io-partial-write-alone: the passing test was not the P5 proof" >&2
         exit 1
     fi
 
