@@ -10268,4 +10268,68 @@ mod review_pr53d {
             "untracked LIB.c hidden by core.ignoreCase: {v}"
         );
     }
+    // A nest planned as its own item whose own capture refuses (an ignored
+    // FIFO: the outer skips the nest's seats, the nest item refuses them).
+    #[test]
+    fn rv4_nest_planned_but_refused() {
+        let (root, outer, inner) = outer_with_nest("planned-refused");
+        fs::write(inner.join(".gitignore"), b"*.fifo\nnotes.txt\n").unwrap();
+        commit_all(&inner, "ignore");
+        pushed(&inner);
+        fs::write(inner.join("notes.txt"), b"rv4 ignored only copy").unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(inner.join("p.fifo"))
+            .status()
+            .unwrap()
+            .success());
+        let target = root.join("target");
+        let nest_target = target.join("vendor/inner");
+        let (added, cap, app) = estate_run(&root, &[(&outer, &target), (&inner, &nest_target)], 1);
+        let notes_restored = nest_target.join("notes.txt").exists();
+        cleanup(&root);
+        eprintln!(
+            "added={added:?}\ncapture={cap:#?}\napply={app:#?}\nnotes restored={notes_restored}"
+        );
+        let outer_claims_carrier = cap
+            .iter()
+            .any(|row| row.0 != "refused" && row.2.iter().any(|l| l.contains("carried-by=")));
+        let nest_refused = cap.iter().any(|row| row.0 == "refused");
+        assert!(
+            !(outer_claims_carrier && nest_refused),
+            "the outer names a carrying item whose capture refused; the nest's ignored file is carried by no one"
+        );
+    }
+
+    // N5, stricter than the reviewer's probe: the outer refuses by type,
+    // naming the nest whose own capture refused, and applying the plan never
+    // surfaces a bare errno for the missing record.
+    #[test]
+    fn rv4_nest_planned_but_refused_names_the_refused_carrier() {
+        let (root, outer, inner) = outer_with_nest("planned-refused-typed");
+        fs::write(inner.join(".gitignore"), b"*.fifo\nnotes.txt\n").unwrap();
+        commit_all(&inner, "ignore");
+        pushed(&inner);
+        fs::write(inner.join("notes.txt"), b"rv4 ignored only copy").unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(inner.join("p.fifo"))
+            .status()
+            .unwrap()
+            .success());
+        let target = root.join("target");
+        let nest_target = target.join("vendor/inner");
+        let (added, cap, app) = estate_run(&root, &[(&outer, &target), (&inner, &nest_target)], 2);
+        cleanup(&root);
+        assert!(added.iter().all(Result::is_ok), "{added:?}");
+        let carrier = BulkloadRefusal::GitNestCarrierRefused(b"vendor/inner".to_vec()).to_string();
+        assert!(
+            cap.iter()
+                .any(|row| row.0 == "refused" && row.1.as_deref() == Some(carrier.as_str())),
+            "{cap:#?}"
+        );
+        assert!(!cap
+            .iter()
+            .any(|row| row.2.iter().any(|line| line.contains("carried-by="))));
+        assert!(!bare_errno(&app), "{app:#?}");
+        assert!(app.iter().all(|row| row.0 == "refused"), "{app:#?}");
+    }
 }

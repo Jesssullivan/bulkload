@@ -164,6 +164,31 @@ fn planned_nests(item: &Item, owners: &Owners) -> Vec<PathBuf> {
         .collect()
 }
 
+// R-N114, round 4 N5: a planned carrier whose own capture refused in this
+// pass carries none of its seats. Refuse by name rather than record the nest
+// as carried by it, reuse hit or not (nested items capture first).
+fn carriers_captured(
+    item: &Item,
+    planned: &[PathBuf],
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let refused = refused
+        .lock()
+        .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+    match planned.iter().find(|source| refused.contains(*source)) {
+        Some(carrier) => Err(BulkloadRefusal::GitNestCarrierRefused(
+            carrier
+                .strip_prefix(&item.source)
+                .map_err(|_| BulkloadRefusal::PathEscapesRoot)?
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        )),
+        None => Ok(()),
+    }
+}
+
 // One receipt line per nest; a nest planned as its own item is named with the
 // item that carries it (R-N114).
 fn nest_lines(item: &Item, owners: &Owners, nested: &[git_carry::NestedRepository]) -> Vec<String> {
@@ -580,10 +605,12 @@ fn capture_item(
     base: Option<&Base>,
     policy: git_carry::CapturePolicy,
     owners: &Owners,
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
     let planned = planned_nests(item, owners);
+    carriers_captured(item, &planned, refused)?;
     // The opaque key cannot say what moved. Keep its typed parts so the
     // post-capture re-read can separate tolerable drift from Git authority.
     // The parts carry the nested custody, so a reuse hit names exactly the
@@ -923,15 +950,46 @@ pub fn capture_with_policy(
     let _lock = exclusive(&state.join("estate.lock"))?;
     let groups = capture_groups(&contents)?;
     let owners = owners(&contents)?;
-    execute(
-        &contents,
-        jobs,
-        &|item| {
-            let base = group_base(item, &groups, state, corpus)?;
-            capture_item(item, state, corpus, base.as_ref(), policy, &owners)
-        },
-        &|row| emit(state, row, receipt),
-    )
+    // R-N114, round 4 N5: an item whose source lies inside another item's
+    // source captures first, level by level from the deepest, so the outer
+    // knows whether each planned carrier's own capture refused in this pass.
+    let refused = Mutex::new(std::collections::BTreeSet::new());
+    let operation = |item: &Item| {
+        let result = group_base(item, &groups, state, corpus).and_then(|base| {
+            capture_item(
+                item,
+                state,
+                corpus,
+                base.as_ref(),
+                policy,
+                &owners,
+                &refused,
+            )
+        });
+        if result.is_err() {
+            refused
+                .lock()
+                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
+                .insert(item.source.clone());
+        }
+        result
+    };
+    let mut levels = std::collections::BTreeMap::<usize, Plan>::new();
+    for item in &contents.items {
+        let depth = contents
+            .items
+            .iter()
+            .filter(|other| item.source.starts_with(&other.source) && item.source != other.source)
+            .count();
+        levels.entry(depth).or_default().items.push(item.clone());
+    }
+    let mut outcome = Ok(());
+    for level in levels.values().rev() {
+        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+            outcome = Err(error);
+        }
+    }
+    outcome
 }
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
@@ -990,7 +1048,13 @@ fn apply_item(
     owners: &Owners,
 ) -> Result<Completion> {
     let identity = id(item)?;
-    let captured: Capture = read(&corpus.join(format!("{identity}.capture")))?;
+    let record = corpus.join(format!("{identity}.capture"));
+    // Round 4 N5: an item whose capture refused has no record. That is a
+    // typed refusal, never a bare IO errno.
+    if !record.try_exists()? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    let captured: Capture = read(&record)?;
     if !filename(&captured.bundle) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
