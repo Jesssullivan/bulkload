@@ -142,32 +142,56 @@ PINNED_JUST_RECIPES = {
         (
             "cd {{ root }} && cargo fmt --all -- --check",
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
-            "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked "
-            "--features io-trace -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features "
-            "io-trace io::",
-            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features "
-            "io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored "
-            "--exact --test-threads=1",
+            "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::",
+            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
             "cd {{ root }} && cargo test --workspace --locked",
+        ),
+    ),
+    "io-partial-write-alone": (
+        "io-partial-write-alone:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "status=0",
+            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
+            "printf '%s\\n' \"$output\"",
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "io-partial-write-alone: cargo test failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "if [[ $output == *SKIPPED* ]]; then",
+            '    echo "io-partial-write-alone: the P5 proof skipped itself" >&2',
+            "    exit 1",
+            "fi",
+            "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
+            "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
+            "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+            "    echo \"io-partial-write-alone: expected exactly one '1 passed; 0 failed' result\" >&2",
+            "    exit 1",
+            "fi",
         ),
     ),
     "fault-harness": (
         "fault-harness:",
         (
-            "cd {{ root }} && cargo clippy --workspace --all-targets --locked "
-            "--features bulkload-agent/fault-injection -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --locked --features "
-            "fault-injection --target-dir target/fault --test fault_harness",
+            "cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness",
         ),
     ),
     "check-source": (
-        "check-source: repo-manifest-validate python-lint shell-lint workflow-lint "
-        "secrets-scan-dir rust-check",
+        "check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir rust-check",
         (),
     ),
-    "ci-source": ("ci-source: check-source secrets-scan-history", ()),
-    "ci-fault-harness": ("ci-fault-harness: fault-harness", ()),
+    "ci-source": (
+        "ci-source: check-source secrets-scan-history",
+        (),
+    ),
+    "ci-fault-harness": (
+        "ci-fault-harness: fault-harness",
+        (),
+    ),
     "check": (
         "check:",
         (
@@ -196,10 +220,44 @@ def just_recipe(justfile: str, name: str) -> tuple[str, tuple[str, ...]]:
     return lines[headers[0]], tuple(body)
 
 
+P5_COMMAND = (
+    "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib "
+    "--locked --features io-trace io::tests::traced::partial_write_prefix_is_traced "
+    "-- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?"
+)
+
+
+def validate_p5_alone(justfile: str) -> None:
+    """The P5 proof (#69) must really run: it skips itself and still reports
+    `1 passed` unless BULKLOAD_IO_PARTIAL_WRITE_ALONE is set, so its recipe
+    must set the variable, select the one test exactly, and reject a skip or
+    any result other than one `1 passed; 0 failed`."""
+    _, rust_check = just_recipe(justfile, "rust-check")
+    if rust_check.count(
+        "cd {{ root }} && {{ just_executable() }} io-partial-write-alone"
+    ) != 1 or any("partial_write_prefix_is_traced" in line for line in rust_check):
+        raise ContractError(
+            "rust-check must run P5 only through io-partial-write-alone"
+        )
+    _, body = just_recipe(justfile, "io-partial-write-alone")
+    required = (
+        P5_COMMAND,
+        "if [[ $output == *SKIPPED* ]]; then",
+        "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
+        "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
+        "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+        "if [[ $status -ne 0 ]]; then",
+    )
+    for line in required:
+        if body.count(line) != 1:
+            raise ContractError(f"P5 must run alone and fail closed: {line}")
+
+
 def validate_just_recipes(justfile: str) -> None:
     for name, expected in PINNED_JUST_RECIPES.items():
         if just_recipe(justfile, name) != expected:
             raise ContractError(f"just recipe {name} drifted from its pinned body")
+    validate_p5_alone(justfile)
 
 
 def sha256(source: str) -> str:
@@ -3482,6 +3540,32 @@ class CiContractTest(unittest.TestCase):
             ),
             justfile.replace("secrets-scan-dir rust-check", "secrets-scan-dir", 1),
             justfile.replace(harness_test, harness_test + " || true", 1),
+            justfile.replace(
+                "BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test", "cargo test", 1
+            ),
+            justfile.replace(
+                "-- --ignored --exact --test-threads=1 --nocapture",
+                "-- --ignored --test-threads=1 --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "-- --ignored --exact --test-threads=1 --nocapture",
+                "-- --ignored --exact --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $output == *SKIPPED* ]]; then\n", "    if false; then\n", 1
+            ),
+            justfile.replace(
+                "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+                "if [[ $passed -lt 1 ]]; then",
+                1,
+            ),
+            justfile.replace(
+                "    cd {{ root }} && {{ just_executable() }} io-partial-write-alone\n",
+                "",
+                1,
+            ),
         ]
         for index, unsafe in enumerate(variants):
             with self.subTest(index=index):
