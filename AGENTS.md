@@ -113,4 +113,6 @@ no longer true (R-N55).
 `.bazelrc.flywheel` endpoint-free. Changing `flake.nix`, the public-read guard
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.
+CI note (R-N122): the W7 fault harness (`just fault-harness`) runs as its own
+`fault-harness` terminal gate, parallel to `source`, `build` and `test`.
 Stage explicit paths.

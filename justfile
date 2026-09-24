@@ -38,16 +38,21 @@ secrets-scan-history:
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
-# including the agent's dependency-wall test). The last two lines lint and run
-# the W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature. The harness build goes to its own target dir, so
-# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
-# The feature clippy pass stays in the shared dir: it only type-checks and
-# writes no executables.
+# including the agent's dependency-wall test). The W7 fault harness is not
+# here: it runs in its own CI gate (`just fault-harness`, R-N122).
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo test --workspace --locked
+
+# W7 crash-resume and live-writer harness, which needs the agent's
+# `fault-injection` feature. CI runs it as the separate `fault-harness`
+# terminal gate, in parallel with the source gate and under its own 15-minute
+# cap (R-N122). The harness build goes to its own target dir, so
+# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
+# The feature clippy pass stays in the shared dir: it only type-checks and
+# writes no executables.
+fault-harness:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
 
@@ -70,12 +75,17 @@ check-local: check-source test-local
 # scanners; the pinned GloriousFlywheel shell owns the front door and Bazel.
 ci-source: check-source secrets-scan-history
 
+# The CI `fault-harness` terminal gate (R-N122); the composite action execs it
+# inside the repo flake, like `ci-source`.
+ci-fault-harness: fault-harness
+
 # CI is fail-closed on the fleet-managed GloriousFlywheel profile and drives
 # every Bazel target through the canonical cache-backed wrapper.
 ci:
     cd {{ root }} && just flywheel-verify
     cd {{ root }} && just flake-check
     cd {{ root }} && nix develop .#default --command just ci-source
+    cd {{ root }} && nix develop .#default --command just ci-fault-harness
     cd {{ root }} && just flywheel-build //:bulkload
     cd {{ root }} && just flywheel-test //:tests
 

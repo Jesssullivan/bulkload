@@ -3,7 +3,7 @@ description: Run one terminal Bulkload gate through the sanctioned public-read F
 
 inputs:
   gate:
-    description: "Exact terminal repository consumer: source, build, or test"
+    description: "Exact terminal repository consumer: source, build, test, or fault-harness"
     required: true
   event-name:
     description: Exact triggering event name
@@ -36,7 +36,7 @@ runs:
       run: |
         set -euo pipefail
         case "$BULKLOAD_GATE" in
-          source | build | test) ;;
+          source | build | test | fault-harness) ;;
           *) exit 1 ;;
         esac
 
@@ -870,6 +870,90 @@ runs:
         command: test
         config: flywheel
         targets: //:tests
+
+    - name: Run the repository-owned fault harness
+      if: ${{ inputs.gate == 'fault-harness' }}
+      shell: /bin/bash --noprofile --norc -p {0}
+      env:
+        PATH: ${{ steps.authority.outputs.trusted_path }}
+        HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        USER: ""
+        USERNAME: ""
+        LOGNAME: ""
+        BASH_ENV: /dev/null
+        ENV: /dev/null
+        DYLD_FALLBACK_LIBRARY_PATH: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        NIX_STORE_DIR: ""
+        NIX_STORE: ""
+        NIX_STATE_DIR: ""
+        NIX_DATA_DIR: ""
+        NIX_LOG_DIR: ""
+        NIX_CONF_DIR: ""
+        NIX_DAEMON_SOCKET_PATH: ""
+        NIX_IGNORE_SYMLINK_STORE: ""
+        NIX_LIBEXEC_DIR: ""
+        NIX_BIN_DIR: ""
+        NIX_REMOTE_SYSTEMS: ""
+        NIX_SSL_CERT_FILE: ""
+        NIX_CURL_FLAGS: ""
+        NIX_HASHED_MIRRORS: ""
+        JAVA_TOOL_OPTIONS: ""
+        JDK_JAVA_OPTIONS: ""
+        _JAVA_OPTIONS: ""
+        JAVA_HOME: ""
+        JAVACMD: ""
+        BAZEL_SH: ""
+        BAZELISK_NOJDK: ""
+        BAZELISK_CLEAN: ""
+        BAZELISK_SHUTDOWN: ""
+        USE_BAZEL_FALLBACK_VERSION: ""
+        TEST_TMPDIR: ""
+        NIX_CACHE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_DATA_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        NIX_STATE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_CACHE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_CONFIG_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_DATA_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        XDG_STATE_HOME: ${{ steps.guard-snapshot.outputs.source_runtime_home }}
+        ATTIC_TOKEN: ""
+        NIX_ACCESS_TOKENS: ""
+        NIX_USER_CONF_FILES: /dev/null
+        NETRC: /dev/null
+        NIX_CONFIG: ${{ steps.authority.outputs.nix_config }}
+        NIX_REMOTE: local
+        BAZELISK_BASE_URL: ""
+        BAZELISK_FORMAT_URL: ""
+        BAZELISK_GITHUB_TOKEN: ""
+        BAZELISK_HOME: ""
+        BAZELISK_HOME_DARWIN: ""
+        BAZELISK_HOME_LINUX: ""
+        BAZELISK_INCOMPATIBLE_FLAGS: ""
+        BAZELISK_VERIFY_SHA256: ""
+        BAZELISK_SKIP_WRAPPER: "true"
+        BAZELISK_WRAPPER_DIRECTORY: ""
+        USE_BAZEL_VERSION: ""
+        ATTIC_SERVER: ${{ steps.authority.outputs.attic_server }}
+        ATTIC_CACHE: main
+        ATTIC_PUBLIC_KEY: main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA=
+        ATTIC_PUBLIC_READ_SITE: bulkload-ci
+      run: |
+        set -euo pipefail
+        nix flake check --no-build --no-write-lock-file
+        exec nix develop --no-write-lock-file --ignore-environment \
+          --keep HOME \
+          --keep NIX_CACHE_HOME \
+          --keep NIX_CONFIG_HOME \
+          --keep NIX_DATA_HOME \
+          --keep NIX_STATE_HOME \
+          --keep XDG_CACHE_HOME \
+          --keep XDG_CONFIG_HOME \
+          --keep XDG_DATA_HOME \
+          --keep XDG_STATE_HOME \
+          .#default --command just ci-fault-harness
 
     - name: Run repository-owned source gates
       if: ${{ inputs.gate == 'source' }}
