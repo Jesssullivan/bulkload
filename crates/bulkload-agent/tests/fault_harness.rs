@@ -38,13 +38,16 @@
 //! # Known violations
 //!
 //! Tests marked `#[ignore = "known violation ..."]` assert invariants the v3
-//! engine breaks today (R-N86). They are listed in `KNOWN_VIOLATIONS`, not
-//! fixed, and never count as coverage; `every_fault_point_has_a_scenario`
-//! checks the list and the ignore attributes against each other:
+//! engine breaks today. They are listed in `KNOWN_VIOLATIONS`, not fixed,
+//! and never count as coverage. `every_fault_point_has_a_scenario` compares
+//! the list with the tests this binary reports under `--list --ignored`, and
+//! checks each listed test's ignore reason:
 //!
-//! - `live_writer_*_leaves_no_source_index` (four): a refused capture leaves
-//!   the victim's chunks and committed `chunk_locations` rows in the source
-//!   store.
+//! - `live_writer_*_leaves_no_source_index` (four, R-N86): a refused capture
+//!   leaves the victim's chunks and committed `chunk_locations` rows in the
+//!   source store.
+//! - `directory_after_fallback_mkdir` (R-N119): without a no-replace rename,
+//!   a crash between the fallback `mkdirat` and its record never converges.
 //!
 //! # Hung scenarios
 //!
@@ -88,6 +91,7 @@ use bulkload_agent::fault::{
     parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV,
 };
 use bulkload_agent::freshness::NullCache;
+use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
 use bulkload_agent::transfer::{copy, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
 use bulkload_agent::walk::{walk, WalkOptions};
@@ -95,6 +99,10 @@ use bulkload_proto::{BulkloadRefusal, RowSchema};
 
 /// `transfer_store::PERSIST_BATCH` (crate-private): chunks per durable batch.
 const PERSIST_BATCH: usize = 256;
+/// `transfer::BATCH_ROWS` (crate-private): rows offered per batch.
+const BATCH_ROWS: usize = 32;
+/// `transfer::PUBLISH_GROUP_EVENTS` (crate-private): events per source group.
+const PUBLISH_GROUP_EVENTS: usize = 9;
 /// One byte past `PERSIST_BATCH × CDC_MAX`, so the file spans several batches.
 const LARGE_BYTES: usize = PERSIST_BATCH * bulkload_agent::hash::CDC_MAX_BYTES as usize + 1;
 const SMALL_FILES: usize = 48;
@@ -445,6 +453,9 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) -> Option<String> {
         .stdin(Stdio::null())
         .env(FAULT_ENV, label)
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
+        .envs(
+            (point == Point::DirectoryAfterFallbackMkdir).then_some((RENAME_UNSUPPORTED_ENV, "1")),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -487,7 +498,8 @@ fn assert_receipt(scratch: &Scratch, point: Point) -> Option<String> {
     let receipt = fs::read_to_string(scratch.base.join("receipt")).unwrap();
     let mut lines = receipt.lines();
     assert_eq!(lines.next(), Some(point.name()), "receipt point");
-    let store = if point.name().starts_with("publish.source.") {
+    let source = point.name().starts_with("publish.source.");
+    let store = if source {
         Some(scratch.source_state())
     } else if point.name().starts_with("publish.destination.") {
         Some(scratch.destination_state())
@@ -495,25 +507,84 @@ fn assert_receipt(scratch: &Scratch, point: Point) -> Option<String> {
         None
     };
     let expected = store.map(|store| fs::canonicalize(store).unwrap().display().to_string());
-    let publication = expected.is_some();
-    assert_eq!(
-        lines.next().map(str::to_owned),
-        expected,
-        "{}: crash receipt names the wrong store",
-        point.name()
-    );
-    // A publication crash names the group it hit, so a `_mid` failure can be
-    // reproduced from its capture ids and chunk count.
-    let group = lines.next().map(str::to_owned);
-    assert_eq!(
-        group
-            .as_deref()
-            .is_some_and(|line| line.starts_with("group capture_ids=")),
-        publication,
-        "{}: crash receipt group line {group:?}",
-        point.name()
-    );
+    let mut group = None;
+    if let Some(expected) = expected {
+        assert_eq!(
+            lines.next(),
+            Some(expected.as_str()),
+            "{}: crash receipt names the wrong store",
+            point.name()
+        );
+        // The group it hit, so a `_mid` failure can be reproduced.
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("{}: publication receipt has no group line", point.name()));
+        assert_group(point, source, line);
+        group = Some(line.to_owned());
+    } else if let Some(path) = directory_path(point) {
+        assert_eq!(
+            lines.next(),
+            Some(format!("directory_create={path}").as_str()),
+            "{}: receipt names the wrong directory path",
+            point.name()
+        );
+    }
+    assert_eq!(lines.next(), None, "{}: extra receipt lines", point.name());
     group
+}
+
+/// The directory-creation path a crash at `point` must report, if any.
+const fn directory_path(point: Point) -> Option<&'static str> {
+    match point {
+        Point::DirectoryAfterMkdir
+        | Point::DirectoryAfterPendingRecord
+        | Point::DirectoryAfterRename => Some("rename"),
+        Point::DirectoryAfterFallbackMkdir => Some("fallback"),
+        _ => None,
+    }
+}
+
+/// `group capture_ids=<ids> chunks=<n>`: distinct ascending batch indices
+/// and the payload count of one publication group. A destination group is
+/// one chunk batch under capture id 0.
+fn assert_group(point: Point, source: bool, line: &str) {
+    let label = point.name();
+    let rest = line
+        .strip_prefix("group capture_ids=")
+        .unwrap_or_else(|| panic!("{label}: group line {line:?}"));
+    let (ids, chunks) = rest
+        .split_once(" chunks=")
+        .unwrap_or_else(|| panic!("{label}: group line {line:?}"));
+    let ids: Vec<usize> = ids
+        .split(',')
+        .map(|id| {
+            id.parse()
+                .unwrap_or_else(|_| panic!("{label}: id in {line:?}"))
+        })
+        .collect();
+    let chunks: usize = chunks
+        .parse()
+        .unwrap_or_else(|_| panic!("{label}: chunk count in {line:?}"));
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "{label}: capture ids not distinct and ascending: {line:?}"
+    );
+    if source {
+        assert!(
+            !ids.is_empty() && ids.iter().all(|id| *id < BATCH_ROWS),
+            "{label}: source group ids outside one batch: {line:?}"
+        );
+        assert!(
+            chunks <= PUBLISH_GROUP_EVENTS * PERSIST_BATCH,
+            "{label}: source group larger than a group can be: {line:?}"
+        );
+    } else {
+        assert_eq!(ids, vec![0], "{label}: destination group ids: {line:?}");
+        assert!(
+            chunks <= PERSIST_BATCH,
+            "{label}: destination group larger than a batch: {line:?}"
+        );
+    }
 }
 
 /// After a resume: records and names cover every source file, and a
@@ -791,10 +862,11 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
 /// The `#[ignore]` reason every known-violation test carries, verbatim prefix.
 const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 
-/// Known violations (R-N86): `#[ignore]`d tests asserting invariants the
-/// engine breaks today, with the fault point each one is the only scenario
-/// for, if any. Listed, never counted as coverage.
-const KNOWN_VIOLATIONS: [(&str, Option<Point>); 4] = [
+/// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
+/// today, with the fault point each one is the only scenario for, if any.
+/// Listed, never counted as coverage.
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 5] = [
+    // R-N86: a refused capture leaves source index residue.
     (
         "live_writer_in_place_overwrite_leaves_no_source_index",
         None,
@@ -805,20 +877,48 @@ const KNOWN_VIOLATIONS: [(&str, Option<Point>); 4] = [
         "live_writer_same_size_mtime_restored_leaves_no_source_index",
         None,
     ),
+    // R-N119: the mkdirat fallback has a crash window with no record.
+    (
+        "directory_after_fallback_mkdir",
+        Some(Point::DirectoryAfterFallbackMkdir),
+    ),
 ];
 
-/// The name of the test function an `#[ignore]` attribute at `at` applies to.
-fn ignored_test_name(source: &str, at: usize) -> &str {
-    let after = &source[at..];
-    let start = after.find("\nfn ").unwrap() + "\nfn ".len();
-    let name = &after[start..];
-    &name[..name.find('(').unwrap()]
+/// The attributes directly above `fn <name>(` (or `pub fn <name>(`): the
+/// text between the preceding item's end and the function.
+fn attributes_of<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let at = [format!("\nfn {name}("), format!("\npub fn {name}(")]
+        .iter()
+        .find_map(|needle| source.find(needle.as_str()))?;
+    let before = &source[..at];
+    let start = before.rfind("\n}").map_or(0, |end| end + 2);
+    Some(&before[start..])
+}
+
+/// Names this test binary itself reports as ignored: `--list --ignored`.
+/// Whatever form an `#[ignore]` takes (indented, same-line, `cfg_attr`),
+/// libtest is the authority on what is ignored.
+fn ignored_by_libtest() -> Vec<String> {
+    let listed = Command::new(std::env::current_exe().unwrap())
+        .args(["--list", "--ignored"])
+        .env_remove(CHILD_ENV)
+        .env_remove(FAULT_ENV)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "--list --ignored failed");
+    String::from_utf8(listed.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Every point is exercised by a passing (non-ignored) scenario in the
-/// `scenarios!` table, or is a [`KNOWN_VIOLATIONS`] point, never both. Every
-/// listed violation is an `#[ignore]`d test with the known-violation reason,
-/// and every test ignored for that reason is listed.
+/// `scenarios!` table, or is a [`KNOWN_VIOLATIONS`] point, never both. The
+/// tests libtest reports as ignored are exactly the listed violations, and
+/// each carries the known-violation reason.
 #[test]
 fn every_fault_point_has_a_scenario() {
     let source = include_str!("fault_harness.rs");
@@ -849,16 +949,23 @@ fn every_fault_point_has_a_scenario() {
         both.is_empty(),
         "known violations also claimed as coverage: {both:?}"
     );
-    // Every `#[ignore = "known violation ..."]` in this file, by test name.
-    let attribute = format!("\n{KNOWN_VIOLATION_REASON}");
-    let ignored: Vec<&str> = source
-        .match_indices(&attribute)
-        .map(|(at, _)| ignored_test_name(source, at))
+    let mut ignored = ignored_by_libtest();
+    ignored.sort();
+    let mut listed: Vec<String> = KNOWN_VIOLATIONS
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
         .collect();
+    listed.sort();
+    assert_eq!(
+        ignored, listed,
+        "ignored tests must be exactly the listed known violations"
+    );
     for (name, point) in KNOWN_VIOLATIONS {
+        let attributes = attributes_of(source, name)
+            .unwrap_or_else(|| panic!("{name}: listed but not defined here"));
         assert!(
-            ignored.contains(&name),
-            "{name}: listed as a known violation but not #[ignore]d with the reason"
+            attributes.contains(KNOWN_VIOLATION_REASON),
+            "{name}: ignored without the known-violation reason"
         );
         if let Some(point) = point {
             assert!(
@@ -868,18 +975,16 @@ fn every_fault_point_has_a_scenario() {
             );
         }
     }
-    for name in &ignored {
-        assert!(
-            KNOWN_VIOLATIONS.iter().any(|(listed, _)| listed == name),
-            "{name}: ignored as a known violation but not listed"
-        );
-    }
-    // No other ignore reason may hide a test in this harness.
-    assert_eq!(
-        source.matches("\n#[ignore").count(),
-        ignored.len(),
-        "an #[ignore] here without the known-violation reason"
-    );
+}
+
+/// Known violation (R-N119). Without a no-replace rename, a directory is
+/// created by `mkdirat` at its final name and recorded after; a crash in
+/// between leaves an unrecorded 0700 directory that the resume refuses
+/// `GIT_DESTINATION_OCCUPIED`, so the carry never converges.
+#[test]
+#[ignore = "known violation (R-N119): the mkdirat fallback leaves an unrecorded directory on a crash before its record"]
+fn directory_after_fallback_mkdir() {
+    crash_resume(Point::DirectoryAfterFallbackMkdir, 1, NO_REFUSAL);
 }
 
 /// R-N79: after `materialize.after_link` the orphan is a second hard link to a

@@ -60,6 +60,11 @@ pub struct TransferStats {
     /// Source files in the tagged temporary-name grammar that the source walk
     /// recorded and did not carry, by source-relative path.
     pub source_engine_temporaries: Vec<Vec<u8>>,
+    /// Directories created by the no-replace rename of a tagged temporary.
+    pub directories_renamed: u64,
+    /// Directories created by the plain `mkdirat` fallback, on a filesystem
+    /// without a no-replace rename (R-N119), by relative path.
+    pub directories_fallback: Vec<Vec<u8>>,
 }
 
 /// Cumulative process-scope phase counters; concurrent transfers may overlap.
@@ -529,6 +534,10 @@ pub fn receive<R: Read, W: Write>(
                 stats.source_bytes_read = source_bytes_read;
                 stats.temporaries_removed = target.swept().removed;
                 stats.temporaries_left.clone_from(&target.swept().left);
+                stats.directories_renamed = target.created().renamed;
+                stats
+                    .directories_fallback
+                    .clone_from(&target.created().fallback);
                 if stats.refusals.is_empty() {
                     target.finish_directories(&store)?;
                 }
@@ -1312,6 +1321,58 @@ mod tests {
         ] {
             assert_eq!(temporary_name(name), None, "{}", name.escape_ascii());
         }
+    }
+
+    #[test]
+    fn directories_fall_back_to_mkdir_without_a_no_replace_rename() {
+        // R-N119: the hook makes this thread's no-replace renames report
+        // EINVAL, as on a filesystem that lacks them.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::materialize::force_rename_unsupported(false);
+            }
+        }
+        let corpus = Corpus::new();
+        let source = corpus.base.join("source");
+        let destination = corpus.base.join("destination");
+        std::fs::create_dir_all(source.join("outer/inner")).unwrap();
+        std::fs::write(source.join("outer/inner/data"), b"payload").unwrap();
+        std::fs::set_permissions(source.join("outer"), std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        let first = {
+            let _restore = Restore;
+            crate::materialize::force_rename_unsupported(true);
+            corpus.run().unwrap()
+        };
+        assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+        assert_eq!(first.directories_renamed, 0);
+        assert_eq!(
+            first.directories_fallback,
+            vec![b"outer".to_vec(), b"outer/inner".to_vec()]
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("outer")).unwrap().mode() & 0o7777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::read(destination.join("outer/inner/data")).unwrap(),
+            b"payload"
+        );
+        // No directory temporary survives the fallback.
+        let leftovers: Vec<_> = std::fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.as_bytes().starts_with(b".bulkload-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // Without the hook the same shape takes the rename path.
+        let renamed = Corpus::new();
+        std::fs::create_dir(renamed.base.join("source/outer")).unwrap();
+        let stats = renamed.run().unwrap();
+        assert_eq!(stats.directories_renamed, 1);
+        assert!(stats.directories_fallback.is_empty());
     }
 
     #[test]

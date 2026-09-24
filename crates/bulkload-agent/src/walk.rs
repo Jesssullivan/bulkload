@@ -281,6 +281,8 @@ fn drop_empty_temporary_directories(outcome: &mut WalkOutcome) {
         if !occupied {
             outcome.rows.retain(|row| row.rel_path != *directory);
             outcome.engine_temporaries.push(directory.clone());
+            // Not a seat: an excluded temporary counts nowhere (N7).
+            outcome.stats.seats_seen = outcome.stats.seats_seen.saturating_sub(1);
         }
     }
 }
@@ -584,5 +586,44 @@ mod tests {
         assert_eq!(result.stats.bytes_read, 0);
         assert_eq!(result.stats.files_statted_twice, 0);
         assert!(result.rows.iter().all(|row| row.blake3.is_none()));
+    }
+    #[test]
+    fn tagged_temporaries_are_recorded_not_seats() {
+        let corpus = Corpus::new("temporaries");
+        let empty = ".bulkload-0123456789abcdef-d-1-2";
+        let held = ".bulkload-0123456789abcdef-d-1-3";
+        let file = ".bulkload-0123456789abcdef-1-4";
+        std::fs::create_dir(corpus.root.join(empty)).unwrap();
+        std::fs::create_dir(corpus.root.join(held)).unwrap();
+        std::fs::write(corpus.root.join(held).join("kept"), b"k").unwrap();
+        std::fs::write(corpus.root.join(file), b"orphan").unwrap();
+        std::fs::write(corpus.root.join(".bulkload-12-9"), b"untagged").unwrap();
+        let outcome = walk(
+            &WalkOptions::new(corpus.root.clone()),
+            &mut MemoryCache::new(),
+        )
+        .unwrap();
+        let mut recorded = outcome.engine_temporaries.clone();
+        recorded.sort();
+        let mut expected = vec![empty.as_bytes().to_vec(), file.as_bytes().to_vec()];
+        expected.sort();
+        assert_eq!(recorded, expected);
+        let rows: Vec<&[u8]> = outcome
+            .rows
+            .iter()
+            .map(|row| row.rel_path.as_slice())
+            .collect();
+        assert!(
+            rows.contains(&held.as_bytes()),
+            "a non-empty directory is carried"
+        );
+        assert!(
+            rows.contains(&b".bulkload-12-9".as_slice()),
+            "untagged is payload"
+        );
+        // Seats: a.txt, nested, nested/b.txt, the held directory and its file,
+        // and the untagged file. Neither excluded temporary counts (N7).
+        assert_eq!(outcome.stats.seats_seen, rows.len() as u64);
+        assert_eq!(outcome.stats.seats_seen, 6);
     }
 }

@@ -161,6 +161,17 @@ pub struct Destination {
     tag: [u8; TAG_HEX],
     directories: Vec<OwnedDirectory>,
     swept: Sweep,
+    created: Creation,
+}
+
+/// How this invocation created directories (R-N119).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Creation {
+    /// Directories published by the no-replace rename of a tagged temporary.
+    pub renamed: u64,
+    /// Directories created by the plain `mkdirat` fallback because the
+    /// filesystem has no atomic no-replace rename, by relative path.
+    pub fallback: Vec<Vec<u8>>,
 }
 
 struct OwnedDirectory {
@@ -185,6 +196,7 @@ impl Destination {
             tag: temporary_tag(&store.authority()?),
             directories: Vec::new(),
             swept: Sweep::default(),
+            created: Creation::default(),
         })
     }
 
@@ -202,6 +214,12 @@ impl Destination {
     #[must_use]
     pub const fn swept(&self) -> &Sweep {
         &self.swept
+    }
+
+    /// How this invocation has created directories so far.
+    #[must_use]
+    pub const fn created(&self) -> &Creation {
+        &self.created
     }
 
     /// Canonical destination root for completion-store namespacing.
@@ -249,6 +267,8 @@ impl Destination {
             return self.existing_directory(row, &parent, &leaf, &key, store);
         }
         let mode = row.mode & 0o7777;
+        #[cfg(feature = "fault-injection")]
+        crate::fault::note_directory(Some("rename"));
         let temporary = self.temporary(Some(DIRECTORY_MARK))?;
         // SAFETY: the descriptor and NUL-terminated name remain valid.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), temporary.as_ptr(), 0o700) } != 0 {
@@ -270,8 +290,11 @@ impl Destination {
             }
         };
         fault_point!(DirectoryAfterPendingRecord);
-        if let Err(error) = rename_no_replace(&parent, &temporary, &leaf) {
+        if let Err(error) = rename_publish(&parent, &temporary, &leaf) {
             discard_directory(&parent, &temporary, &key, store);
+            if rename_unsupported(&error) {
+                return self.fallback_directory(row, &parent, &leaf, key, store);
+            }
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
                 BulkloadRefusal::GitDestinationOccupied
             } else {
@@ -280,6 +303,50 @@ impl Destination {
         }
         fault_point!(DirectoryAfterRename);
         parent.sync_all()?;
+        self.created.renamed += 1;
+        self.directories.push(OwnedDirectory {
+            path: row.rel_path.clone(),
+            mode,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            key,
+        });
+        Ok(())
+    }
+
+    /// Create a directory with a plain `mkdirat` at its final name, for a
+    /// filesystem with no atomic no-replace rename (R-N119).
+    ///
+    /// `mkdirat` itself never replaces, so a taken leaf is still refused as
+    /// foreign. The cost is one crash window: a crash between `mkdirat` and
+    /// the record leaves an unrecorded 0700 directory that a resume refuses
+    /// (`directory.after_fallback_mkdir`, a listed known violation). Every
+    /// directory created this way is reported in [`Destination::created`].
+    fn fallback_directory(
+        &mut self,
+        row: &RowSchema,
+        parent: &File,
+        leaf: &CString,
+        key: Vec<u8>,
+        store: &Store,
+    ) -> Result<()> {
+        let mode = row.mode & 0o7777;
+        #[cfg(feature = "fault-injection")]
+        crate::fault::note_directory(Some("fallback"));
+        // SAFETY: the descriptor and NUL-terminated leaf remain valid.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(if error.raw_os_error() == Some(libc::EEXIST) {
+                BulkloadRefusal::GitDestinationOccupied
+            } else {
+                error.into()
+            });
+        }
+        fault_point!(DirectoryAfterFallbackMkdir);
+        let metadata = open_dir(parent.as_raw_fd(), leaf)?.metadata()?;
+        parent.sync_all()?;
+        store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
+        self.created.fallback.push(row.rel_path.clone());
         self.directories.push(OwnedDirectory {
             path: row.rel_path.clone(),
             mode,
@@ -376,6 +443,12 @@ impl Destination {
                 self.swept.left.push(rel_path);
                 continue;
             }
+            // A directory temporary was never renamed into place, so no record
+            // bound to it owns a final directory. Clear such records first:
+            // once the inode is gone its number may be reused (N3).
+            if expected == libc::S_IFDIR {
+                store.clear_directories_bound_to(stat_dev(&stat), stat_ino(&stat))?;
+            }
             // SAFETY: descriptor and NUL-terminated name are valid. `unlinkat`
             // removes this one name: with flags 0 never a directory (the inode
             // survives under any other link), with AT_REMOVEDIR only an empty
@@ -383,9 +456,6 @@ impl Destination {
             if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
                 self.swept.removed += 1;
                 removed = true;
-                if expected == libc::S_IFDIR {
-                    store.clear_directories_bound_to(stat_dev(&stat), stat_ino(&stat))?;
-                }
             } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
                 self.swept.left.push(rel_path);
             }
@@ -602,6 +672,47 @@ fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store)
     let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR) };
 }
 
+/// Environment variable that makes a fault-harness child's no-replace renames
+/// report EINVAL, forcing the `mkdirat` fallback (R-N119).
+#[cfg(feature = "fault-injection")]
+pub const RENAME_UNSUPPORTED_ENV: &str = "BULKLOAD_FAULT_RENAME_UNSUPPORTED";
+
+#[cfg(any(test, feature = "fault-injection"))]
+std::thread_local! {
+    static RENAME_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: while `on`, this thread's no-replace renames report EINVAL, as
+/// on a filesystem without them, so directory creation takes the fallback.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn force_rename_unsupported(on: bool) {
+    RENAME_UNSUPPORTED.with(|forced| forced.set(on));
+}
+
+/// The no-replace rename, behind the test hook.
+fn rename_publish(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    {
+        #[cfg(feature = "fault-injection")]
+        let from_env = std::env::var_os(RENAME_UNSUPPORTED_ENV).is_some();
+        #[cfg(not(feature = "fault-injection"))]
+        let from_env = false;
+        if from_env || RENAME_UNSUPPORTED.with(std::cell::Cell::get) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+    }
+    rename_no_replace(parent, from, to)
+}
+
+/// Whether a no-replace rename failed because this filesystem or kernel does
+/// not offer it, rather than because of the names involved.
+fn rename_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
+        })
+}
+
 /// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
 /// replacing an existing `to`.
 #[cfg(target_os = "linux")]
@@ -668,8 +779,8 @@ fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<(
     }
 }
 
-/// No atomic no-replace rename is known here, so directory creation refuses
-/// rather than risk replacing a foreign directory.
+/// No atomic no-replace rename is known here; directory creation takes the
+/// plain `mkdirat` fallback.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn rename_no_replace(_: &File, _: &CStr, _: &CStr) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))

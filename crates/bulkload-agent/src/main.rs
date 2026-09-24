@@ -653,6 +653,12 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     for path in &stats.source_engine_temporaries {
         eprintln!("source-engine-temporary {}", path.escape_ascii());
     }
+    for path in &stats.directories_fallback {
+        eprintln!(
+            "directory-created-by-mkdir-fallback {}",
+            path.escape_ascii()
+        );
+    }
     if stats.refusals.is_empty() {
         Ok(())
     } else {

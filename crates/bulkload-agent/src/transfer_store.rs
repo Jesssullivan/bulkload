@@ -73,7 +73,7 @@ macro_rules! publication_crash {
 /// Record this group's composition for a crash receipt: its capture ids,
 /// sorted and distinct, and the chunk payloads it carries.
 #[cfg(feature = "fault-injection")]
-fn note_group(events: &[PreparedEvent]) {
+fn note_group(events: &[PreparedEvent]) -> crate::fault::GroupNote {
     let mut ids: Vec<usize> = events
         .iter()
         .map(|event| match event {
@@ -91,7 +91,7 @@ fn note_group(events: &[PreparedEvent]) {
             PreparedEvent::Complete { .. } | PreparedEvent::Refused { .. } => 0,
         })
         .sum();
-    crate::fault::note_group(&ids, chunks);
+    crate::fault::note_group(&ids, chunks)
 }
 
 #[cfg(not(feature = "fault-injection"))]
@@ -977,7 +977,7 @@ impl StorePublisher<'_> {
         }
         PUBLISH_GROUPS.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "fault-injection")]
-        note_group(&events);
+        let _note = note_group(&events);
         let missing = self.missing_chunks(&events)?;
         let locations = self.append_chunks(missing)?;
         self.commit_group(&locations, &events)?;

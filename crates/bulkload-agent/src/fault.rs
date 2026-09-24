@@ -32,8 +32,11 @@
 //! point's name, and for publication points the canonical store root on a
 //! second line and the crashing group's composition on a third
 //! (`group capture_ids=<ids> chunks=<n>`), to `<path>` just before it exits.
-//! Harnesses use it to check which store a crash landed in, and to reproduce
-//! a failing `_mid` crash from the group it hit.
+//! For a directory-creation point the second line is instead the creation
+//! path in use: `directory_create=rename` or `directory_create=fallback`
+//! (R-N119). Harnesses use it to check which store a crash landed in, to
+//! reproduce a failing `_mid` crash from the group it hit, and to see which
+//! directory path a crash interrupted.
 //!
 //! An `BULKLOAD_FAULT` value that names no point, or has an `nth` of zero or a
 //! non-number, ends the process at the first fault point it reaches with
@@ -75,6 +78,7 @@
 //! | `directory.after_mkdir` | an empty 0700 `.bulkload-<tag>-d-*` temporary directory, no record |
 //! | `directory.after_pending_record` | the temporary, its parent synced, and a record bound to its inode; not renamed |
 //! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent not synced |
+//! | `directory.after_fallback_mkdir` | with no no-replace rename (R-N119): a 0700 directory under its final name, no record |
 //! | `directory.before_complete` | the final mode applied and synced; the pending record still present |
 //!
 //! Protocol boundaries, in `transfer`:
@@ -154,6 +158,8 @@ pub enum Point {
     DirectoryAfterPendingRecord,
     /// `directory.after_rename`
     DirectoryAfterRename,
+    /// `directory.after_fallback_mkdir`
+    DirectoryAfterFallbackMkdir,
     /// `directory.before_complete`
     DirectoryBeforeComplete,
     /// `serve.after_publish_group`
@@ -176,7 +182,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::PublishSourceAfterAppend,
         Self::PublishSourceAfterPackSync,
         Self::PublishSourceAfterLocationInsert,
@@ -196,6 +202,7 @@ impl Point {
         Self::DirectoryAfterMkdir,
         Self::DirectoryAfterPendingRecord,
         Self::DirectoryAfterRename,
+        Self::DirectoryAfterFallbackMkdir,
         Self::DirectoryBeforeComplete,
         Self::ServeAfterPublishGroup,
         Self::ServeAfterContent,
@@ -234,6 +241,7 @@ impl Point {
             Self::DirectoryAfterMkdir => "directory.after_mkdir",
             Self::DirectoryAfterPendingRecord => "directory.after_pending_record",
             Self::DirectoryAfterRename => "directory.after_rename",
+            Self::DirectoryAfterFallbackMkdir => "directory.after_fallback_mkdir",
             Self::DirectoryBeforeComplete => "directory.before_complete",
             Self::ServeAfterPublishGroup => "serve.after_publish_group",
             Self::ServeAfterContent => "serve.after_content",
@@ -302,17 +310,46 @@ pub fn hit_in(point: Point, store: &Path) {
 
 std::thread_local! {
     static GROUP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static DIRECTORY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
-/// Describe the publication group this thread is publishing.
+/// Clears this thread's group note when the group's publication ends.
+#[must_use = "the group note is cleared as soon as the guard is dropped"]
+pub struct GroupNote(());
+
+impl Drop for GroupNote {
+    fn drop(&mut self) {
+        GROUP.with(|group| *group.borrow_mut() = None);
+    }
+}
+
+/// Describe the publication group this thread is publishing, until the
+/// returned guard drops.
 ///
 /// A crash receipt for a publication point records it. Thread-local, because
 /// a local `copy` publishes source and destination groups on different
-/// threads.
-pub fn note_group(capture_ids: &[usize], chunks: usize) {
+/// threads; cleared per group, so no receipt names a finished group.
+pub fn note_group(capture_ids: &[usize], chunks: usize) -> GroupNote {
     let ids: Vec<String> = capture_ids.iter().map(ToString::to_string).collect();
     let description = format!("group capture_ids={} chunks={chunks}", ids.join(","));
     GROUP.with(|group| *group.borrow_mut() = Some(description));
+    GroupNote(())
+}
+
+/// Name the directory-creation path this thread is on (`rename` or
+/// `fallback`); a crash receipt for a directory-creation point records it.
+pub fn note_directory(path: Option<&'static str>) {
+    DIRECTORY.with(|directory| directory.set(path));
+}
+
+const fn creates_directory(point: Point) -> bool {
+    matches!(
+        point,
+        Point::DirectoryAfterMkdir
+            | Point::DirectoryAfterPendingRecord
+            | Point::DirectoryAfterRename
+            | Point::DirectoryAfterFallbackMkdir
+    )
 }
 
 fn receipt(point: Point, store: Option<&Path>) {
@@ -323,6 +360,12 @@ fn receipt(point: Point, store: Option<&Path>) {
             body.push('\n');
             if let Some(group) = GROUP.with(|group| group.borrow().clone()) {
                 body.push_str(&group);
+                body.push('\n');
+            }
+        } else if creates_directory(point) {
+            if let Some(directory) = DIRECTORY.with(std::cell::Cell::get) {
+                body.push_str("directory_create=");
+                body.push_str(directory);
                 body.push('\n');
             }
         }

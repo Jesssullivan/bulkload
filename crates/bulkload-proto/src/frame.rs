@@ -12,6 +12,9 @@ use crate::row::RowSchema;
 use crate::Result;
 
 /// Wire protocol version. Bump on any incompatible [`Frame`] change.
+///
+/// v4 is the v3 wire plus [`FrameKind::EngineTemporary`] (R-N118). The W4
+/// hard cut to the new transfer frames is v5.
 pub const PROTO_VERSION: u16 = 4;
 
 /// Bytes of frame header carrying the body length.
