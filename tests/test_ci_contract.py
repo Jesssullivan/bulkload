@@ -111,6 +111,68 @@ class ContractError(ValueError):
     pass
 
 
+# Exact recipe headers and bodies of the repository gates CI and `just check`
+# run (R-N122). The justfile is not digest-pinned, so emptying or rewiring one
+# of these recipes must fail here instead.
+PINNED_JUST_RECIPES = {
+    "rust-check": (
+        "rust-check:",
+        (
+            "cd {{ root }} && cargo fmt --all -- --check",
+            "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
+            "cd {{ root }} && cargo test --workspace --locked",
+        ),
+    ),
+    "fault-harness": (
+        "fault-harness:",
+        (
+            "cd {{ root }} && cargo clippy --workspace --all-targets --locked "
+            "--features bulkload-agent/fault-injection -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features "
+            "fault-injection --target-dir target/fault --test fault_harness",
+        ),
+    ),
+    "check-source": (
+        "check-source: repo-manifest-validate python-lint shell-lint workflow-lint "
+        "secrets-scan-dir rust-check",
+        (),
+    ),
+    "ci-source": ("ci-source: check-source secrets-scan-history", ()),
+    "ci-fault-harness": ("ci-fault-harness: fault-harness", ()),
+    "check": (
+        "check:",
+        (
+            "cd {{ root }} && nix develop .#default --command just check-source",
+            "cd {{ root }} && nix develop .#default --command just fault-harness",
+            "cd {{ root }} && just test",
+        ),
+    ),
+}
+
+
+def just_recipe(justfile: str, name: str) -> tuple[str, tuple[str, ...]]:
+    lines = justfile.splitlines()
+    headers = [
+        index
+        for index, line in enumerate(lines)
+        if line == name + ":" or line.startswith(name + ": ")
+    ]
+    if len(headers) != 1:
+        raise ContractError(f"just recipe {name} must be declared exactly once")
+    body = []
+    for line in lines[headers[0] + 1 :]:
+        if not line.startswith("    "):
+            break
+        body.append(line.removeprefix("    "))
+    return lines[headers[0]], tuple(body)
+
+
+def validate_just_recipes(justfile: str) -> None:
+    for name, expected in PINNED_JUST_RECIPES.items():
+        if just_recipe(justfile, name) != expected:
+            raise ContractError(f"just recipe {name} drifted from its pinned body")
+
+
 def sha256(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
@@ -194,6 +256,19 @@ def validate_job_routing(workflow: str) -> None:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
     if workflow.count("matrix:") != 1 or workflow.count(MATRIX_GATE_EXPRESSION) != 2:
         raise ContractError("terminal gate matrix authority escaped its audited scope")
+
+    if re.search(
+        r"(?mi)^\s*(?:continue-on-error|\"continue-on-error\"|'continue-on-error')\s*:",
+        workflow,
+    ):
+        raise ContractError("CI workflow must not suppress a job or step failure")
+    # The single job-level cap applies to every matrix gate (R-N122).
+    timeouts = re.findall(
+        r"(?mi)^\s*(?:timeout-minutes|\"timeout-minutes\"|'timeout-minutes')\s*:.*$",
+        workflow,
+    )
+    if timeouts != ["    timeout-minutes: 15"]:
+        raise ContractError("every terminal gate must keep the audited 15-minute cap")
 
     declarations = [
         line
@@ -2073,6 +2148,34 @@ class CiContractTest(unittest.TestCase):
                 )
                 self.assertEqual(selected[-1], TERMINAL_CONSUMERS[gate])
 
+    def test_workflow_gate_cap_and_failure_suppression_mutations_fail_closed(
+        self,
+    ) -> None:
+        cap = "    timeout-minutes: 15\n"
+        variants = [
+            self.workflow.replace(cap, "    timeout-minutes: 30\n", 1),
+            self.workflow.replace(cap, "", 1),
+            self.workflow.replace(cap, cap + "    continue-on-error: true\n", 1),
+            self.workflow.replace(cap, cap + '    "continue-on-error": true\n', 1),
+            self.workflow.replace(
+                "      - name: Bulkload public-read cache-first validation\n",
+                "      - name: Bulkload public-read cache-first validation\n"
+                "        timeout-minutes: 60\n",
+                1,
+            ),
+            self.workflow.replace(
+                "      - name: Bulkload public-read cache-first validation\n",
+                "      - name: Bulkload public-read cache-first validation\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, self.workflow)
+                with self.assertRaises(ContractError):
+                    validate_workflow(unsafe, exact_digest=False)
+
     def test_fault_harness_gate_mutations_fail_closed(self) -> None:
         harness_exec = "          .#default --command just ci-fault-harness"
         harness_condition = "      if: ${{ inputs.gate == 'fault-harness' }}\n"
@@ -3278,6 +3381,35 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("just flywheel-build //:bulkload", justfile)
         self.assertIn("just flywheel-test //:tests", justfile)
         self.assertIn("scripts/ci-public-read-guard.sh", justfile)
+        validate_just_recipes(justfile)
+
+    def test_pinned_just_recipe_mutations_fail_closed(self) -> None:
+        justfile = (self.root / "justfile").read_text(encoding="utf-8")
+        harness_test = PINNED_JUST_RECIPES["fault-harness"][1][1]
+        variants = [
+            justfile.replace(
+                "    cd {{ root }} && cargo test --workspace --locked\n", "", 1
+            ),
+            justfile.replace("    " + harness_test + "\n", "", 1),
+            justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history",
+                "ci-source: secrets-scan-history",
+                1,
+            ),
+            justfile.replace(
+                "    cd {{ root }} && nix develop .#default --command just fault-harness\n",
+                "",
+                1,
+            ),
+            justfile.replace("secrets-scan-dir rust-check", "secrets-scan-dir", 1),
+            justfile.replace(harness_test, harness_test + " || true", 1),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, justfile)
+                with self.assertRaises(ContractError):
+                    validate_just_recipes(unsafe)
 
     def test_actionlint_knows_only_the_sanctioned_custom_label(self) -> None:
         config = (self.root / ".github/actionlint.yaml").read_text(encoding="utf-8")

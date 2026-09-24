@@ -78,6 +78,7 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 # wrapper for the Bazel graph.
 check:
     cd {{ root }} && nix develop .#default --command just check-source
+    cd {{ root }} && nix develop .#default --command just fault-harness
     cd {{ root }} && just test
 
 # Source-only local gate. It may not be cited as cache or runner proof.
