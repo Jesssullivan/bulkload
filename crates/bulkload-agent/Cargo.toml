@@ -15,6 +15,10 @@ path = "src/main.rs"
 # builds only: `BULKLOAD_FAULT=<point>[:<nth>]` makes the process _exit at the
 # nth hit of a named point. Without the feature every point compiles to nothing.
 fault-injection = []
+# R-N88: record every mutating `io` syscall (write, sync, rename, link,
+# unlink, mkdir, fchmod) into a trace for the crash-state checker. Off by
+# default; with it off the recording sites compile to nothing.
+io-trace = []
 
 # Crash-resume and live-writer harness; needs the fault points compiled in.
 [[test]]
@@ -38,6 +42,10 @@ libc = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
 ignore = { workspace = true }
 crc32c = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints.clippy]
 # R33 deny-panics wall. Refusals are Results, never panics.

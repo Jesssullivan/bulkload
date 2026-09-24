@@ -38,18 +38,29 @@ secrets-scan-history:
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
-# including the agent's dependency-wall test). The last two lines lint and run
-# the W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature. The harness build goes to its own target dir, so
-# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
-# The feature clippy pass stays in the shared dir: it only type-checks and
-# writes no executables.
+# including the agent's dependency-wall test). The io layer's syscall trace
+# (R-N88) is linted, and its crash-state proofs run with `io-trace` on, ahead
+# of the workspace tests so no unrelated failure can hide them; the partial-
+# write proof sets a process-wide RLIMIT_FSIZE, so it runs alone. The last two
+# lines lint and run the W7 crash-resume and live-writer harness, which needs
+# the agent's `fault-injection` feature. The harness build goes to its own
+# target dir, so `target/debug/bulkload-agent` is never replaced by a
+# fault-enabled binary. The feature clippy passes stay in the shared dir: they
+# only type-check and write no executables.
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
+    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1
     cd {{ root }} && cargo test --workspace --locked
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
+
+# Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
+# current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
+bench-io-chunker:
+    cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
