@@ -4318,6 +4318,10 @@ pub fn restore_staged(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
+        // Round 4 N4: the enclosing item never laid the parent down.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BulkloadRefusal::GitDestinationParentMissing);
+        }
         Err(error) => return Err(error.into()),
     }
     let destination = fs::canonicalize(destination)?;
@@ -4390,6 +4394,28 @@ pub fn restore_linked(
     restore_linked_staged(&stage_bundle(bundle)?, repository, destination, source)
 }
 
+// A new linked worktree's path, with its parent canonicalized. A parent
+// that does not exist is typed, never a bare errno (round 4 N4).
+fn linked_destination(destination: &Path) -> Result<PathBuf> {
+    let parent = fs::canonicalize(
+        destination
+            .parent()
+            .ok_or(BulkloadRefusal::PathNotAbsolute)?,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BulkloadRefusal::GitDestinationParentMissing
+        } else {
+            error.into()
+        }
+    })?;
+    Ok(parent.join(
+        destination
+            .file_name()
+            .ok_or(BulkloadRefusal::PathNotAbsolute)?,
+    ))
+}
+
 /// [`restore_linked`] from a bundle this process already staged and checked.
 ///
 /// # Errors
@@ -4406,16 +4432,7 @@ pub fn restore_linked_staged(
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    let parent = fs::canonicalize(
-        destination
-            .parent()
-            .ok_or(BulkloadRefusal::PathNotAbsolute)?,
-    )?;
-    let destination = parent.join(
-        destination
-            .file_name()
-            .ok_or(BulkloadRefusal::PathNotAbsolute)?,
-    );
+    let destination = linked_destination(destination)?;
     let repository = fs::canonicalize(repository)?;
     import_verified(&repository, bundle, source)?;
     let heads = shallow::headers(&repository, bundle)?;
@@ -10331,5 +10348,38 @@ mod review_pr53d {
             .any(|row| row.2.iter().any(|line| line.contains("carried-by="))));
         assert!(!bare_errno(&app), "{app:#?}");
         assert!(app.iter().all(|row| row.0 == "refused"), "{app:#?}");
+    }
+    #[test]
+    fn rv4_case_folded_nest_target_is_refused_or_typed() {
+        let (root, outer, inner) = outer_with_nest("case-target");
+        let target = root.join("target");
+        // Same directory as target/vendor/inner on case-insensitive APFS.
+        let nest_target = root.join("TARGET/vendor/inner");
+        let (added, cap, app) = estate_run(&root, &[(&inner, &nest_target), (&outer, &target)], 1);
+        cleanup(&root);
+        eprintln!("added={added:?}\ncapture={cap:#?}\napply={app:#?}");
+        let refused_at_add = added
+            .get(1)
+            .is_some_and(|r| *r == Err(BulkloadRefusal::GitDestinationOccupied));
+        assert!(
+            refused_at_add || (!bare_errno(&app) && app.iter().all(|row| row.0 != "refused")),
+            "case-folded overlap neither refused at add nor restored cleanly: {app:#?}"
+        );
+    }
+
+    // N4: a restore whose destination's parent does not exist is refused by
+    // type, standalone or linked, never as a bare errno.
+    #[test]
+    fn rv4_missing_destination_parent_is_typed() {
+        let (root, outer, _inner) = outer_with_nest("missing-parent");
+        let bundle = export_repository(&outer, &root.join("capture")).unwrap();
+        let standalone = restore_bundle(&bundle, &root.join("absent/parent/dest"), "neo");
+        let linked = restore_linked(&bundle, &outer, &root.join("absent/parent/linked"), "neo");
+        cleanup(&root);
+        assert_eq!(
+            standalone,
+            Err(BulkloadRefusal::GitDestinationParentMissing)
+        );
+        assert_eq!(linked, Err(BulkloadRefusal::GitDestinationParentMissing));
     }
 }

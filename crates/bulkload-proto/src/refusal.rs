@@ -76,6 +76,9 @@ pub enum BulkloadRefusal {
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
     GitIgnorePolicyConflict,
+    /// A restore destination's parent directory does not exist (R-N114):
+    /// typically an enclosing item that should have created it did not.
+    GitDestinationParentMissing,
     /// A nested repository holds a stash (`refs/stash` or a non-empty stash
     /// reflog): work its enclosing capture would not carry (R-N83).
     GitNestStashed,
@@ -174,6 +177,7 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
+            Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
             Self::GitNestStashed => "GIT_NEST_STASHED",
             Self::GitNestDetachedUnreachable => "GIT_NEST_DETACHED_UNREACHABLE",
             Self::GitNestInnerRepository(_) => "GIT_NEST_INNER_REPOSITORY",
@@ -261,6 +265,7 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
+            BulkloadRefusal::GitDestinationParentMissing,
             BulkloadRefusal::GitNestStashed,
             BulkloadRefusal::GitNestDetachedUnreachable,
             BulkloadRefusal::GitNestInnerRepository(Vec::new()),

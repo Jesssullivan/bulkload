@@ -325,10 +325,11 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
     };
     let mut identities = std::collections::HashSet::new();
     let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Round 4 N4: targets compare in canonical, case-folded form.
     for previous in &contents.items {
         identities.insert(id(previous)?);
         if let Some(target) = &previous.workspace {
-            targets.push((target.clone(), previous.source.clone()));
+            targets.push((target_key(target)?, previous.source.clone()));
         }
     }
     for incoming in items {
@@ -343,13 +344,14 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
             continue;
         }
         if let Some(target) = &item.workspace {
+            let key = target_key(target)?;
             if targets
                 .iter()
-                .any(|(other, source)| overlapping(target, &item.source, other, source))
+                .any(|(other, source)| overlapping(&key, &item.source, other, source))
             {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
-            targets.push((target.clone(), item.source.clone()));
+            targets.push((key, item.source.clone()));
         }
         contents.items.push(item);
     }
@@ -359,7 +361,9 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
 // R-N114: two workspace targets collide when they are equal, or when one lies
 // inside the other anywhere but at exactly the place the inner item's source
 // lies inside the outer item's source (a nested repository planned as its own
-// item, restored where it was). Component-wise, never string prefixes.
+// item, restored where it was). Component-wise, never string prefixes. The
+// targets are `target_key` forms (round 4 N4); when those are case-folded the
+// source relation is compared case-folded too.
 fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) -> bool {
     if target == other {
         return true;
@@ -369,11 +373,69 @@ fn overlapping(target: &Path, source: &Path, other: &Path, other_source: &Path) 
             .strip_prefix(outer)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
-            .map(|relative| outer_source.join(relative) != inner_source)
+            .map(|relative| {
+                let joined = outer_source.join(relative);
+                joined != inner_source && fold(&joined) != fold(inner_source)
+            })
     };
     nested(target, source, other, other_source)
         .or_else(|| nested(other, other_source, target, source))
         .unwrap_or(false)
+}
+
+// Round 4 N4 (R-N114): a workspace target in a form two targets compare in.
+// The nearest existing ancestor is canonicalized (symlinks and `..` resolved
+// by the filesystem); the rest is appended lexically (`.` dropped, `..`
+// popped, a trailing slash ignored); and on a case-insensitive volume the
+// whole path is ASCII case-folded. A Unicode case or normalisation variant
+// that slips through meets the restore's typed GIT_DESTINATION_OCCUPIED.
+fn target_key(target: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = target.components().collect();
+    for existing in (1..=components.len()).rev() {
+        let prefix: PathBuf = components.iter().take(existing).collect();
+        let Ok(mut key) = fs::canonicalize(&prefix) else {
+            continue;
+        };
+        let insensitive = case_insensitive(&key);
+        for part in components.iter().skip(existing) {
+            match part {
+                Component::Normal(name) => key.push(name),
+                Component::ParentDir => {
+                    key.pop();
+                }
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+        return Ok(if insensitive { fold(&key) } else { key });
+    }
+    Err(BulkloadRefusal::PathNotAbsolute)
+}
+
+fn fold(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    PathBuf::from(std::ffi::OsString::from_vec(
+        path.as_os_str().as_bytes().to_ascii_lowercase(),
+    ))
+}
+
+// Whether names on the volume holding `path` compare case-insensitively. An
+// unanswerable probe is taken as insensitive: folding can only add refusals.
+#[cfg(target_os = "macos")]
+fn case_insensitive(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the
+    // call; pathconf only reads it and has no other preconditions.
+    let sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    sensitive != 1
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn case_insensitive(_: &Path) -> bool {
+    false
 }
 
 struct Exclusive(fs::File);
@@ -1158,14 +1220,26 @@ pub fn apply(
     // reported at the end, exactly as within one level.
     let mut levels = std::collections::BTreeMap::<usize, Plan>::new();
     for item in &contents.items {
-        let depth = item.workspace.as_ref().map_or(0, |workspace| {
-            contents
-                .items
-                .iter()
-                .filter_map(|other| other.workspace.as_ref())
-                .filter(|other| workspace.starts_with(other) && workspace != *other)
-                .count()
-        });
+        // Compared in target_key form (round 4 N4), so a case or `..`
+        // variant of an enclosing target still orders after it.
+        let depth = match &item.workspace {
+            None => 0,
+            Some(workspace) => {
+                let key = target_key(workspace)?;
+                let mut depth = 0;
+                for other in contents
+                    .items
+                    .iter()
+                    .filter_map(|other| other.workspace.as_ref())
+                {
+                    let other = target_key(other)?;
+                    if key.starts_with(&other) && key != other {
+                        depth += 1;
+                    }
+                }
+                depth
+            }
+        };
         levels.entry(depth).or_default().items.push(item.clone());
     }
     let mut outcome = Ok(());
@@ -2459,6 +2533,50 @@ mod tests {
             )]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round 4 N4 (R-N114): targets compare in canonical, case-folded form.
+    // A `..` target that physically lands inside another item's target, and
+    // a case variant of one on a case-insensitive volume, refuse at add; the
+    // nest at its own place in another case is accepted.
+    #[test]
+    fn overlapping_targets_compare_canonical_and_case_folded() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-fold-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template="]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        git(&other, &["init", "--template="]);
+        fs::write(other.join("file"), b"other").unwrap();
+        git(&other, &["add", "file"]);
+        git(&other, &["commit", "-m", "other"]);
+        fs::create_dir(root.join("elsewhere")).unwrap();
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        let sneaky = root.join("elsewhere/../target/file");
+        let dotdot = add(&plan, &other, &sneaky, Some(&sneaky));
+        let insensitive = {
+            fs::write(root.join("probe"), b"").unwrap();
+            let folded = root.join("PROBE").exists();
+            fs::remove_file(root.join("probe")).unwrap();
+            folded
+        };
+        let variant = root.join("TARGET/x");
+        let cased = add(&plan, &other, &variant, Some(&variant));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(dotdot, Err(BulkloadRefusal::GitDestinationOccupied));
+        if insensitive {
+            assert_eq!(cased, Err(BulkloadRefusal::GitDestinationOccupied));
+        } else {
+            assert_eq!(cased, Ok(()));
+        }
     }
 
     // B4: a nest's HEAD moving between the capture's pre-pass key and the
