@@ -114,16 +114,6 @@ fn w3_engine_properties() {
     assert_eq!((warm.reused, warm.completed), (4, 0));
     assert_eq!((warm.source_bytes_read, warm.bytes_received), (0, 0));
 
-    // A removed output is rebuilt from chunks the destination still holds in
-    // another output, re-read and re-verified through its committed hint.
-    std::fs::remove_file(base.join("destination/partial")).unwrap();
-    let (rebuilt, counted) = run(base, "destination", "destination-state");
-    same_tree(base, "destination", &names);
-    assert_eq!((rebuilt.reused, rebuilt.completed), (3, 1));
-    assert_eq!(rebuilt.source_bytes_read, 0);
-    assert!(rebuilt.bytes_received < partial.len() as u64);
-    assert!(counted.get(Counter::DestLocalReuseRead) > 0);
-
     // Adopt: identical outputs without records are verified, never re-sent.
     for name in names {
         std::fs::copy(source.join(name), base.join("adopted").join(name)).unwrap();
@@ -153,4 +143,18 @@ fn w3_engine_properties() {
     assert_eq!(strict.completed, 4);
     assert!(counted.get(Counter::FlushFull) >= 4);
     assert_eq!(counted.get(Counter::FlushBarrier), 0);
+
+    // A new file sharing a prefix with published outputs is built from their
+    // chunks, re-read and re-verified through committed hints; only its new
+    // tail crosses the wire. (Hints are keyed by digest, newest writer wins;
+    // every output holding the prefix still exists, so any hint is valid.)
+    let mut extended = shared.get(..1 << 20).unwrap().to_vec();
+    extended.extend(noise(4, 1 << 20));
+    std::fs::write(source.join("extended"), &extended).unwrap();
+    let (grown, counted) = run(base, "destination", "destination-state");
+    same_tree(base, "destination", &["extended"]);
+    assert_eq!((grown.reused, grown.completed), (4, 1));
+    assert_eq!(grown.source_bytes_read, extended.len() as u64);
+    assert!(grown.bytes_received < extended.len() as u64);
+    assert!(counted.get(Counter::DestLocalReuseRead) > 0);
 }

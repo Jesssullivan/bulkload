@@ -23,15 +23,20 @@
 //! does detect ordering bugs visible without power loss, such as a record
 //! committed before its data is written, a final name exposed before its
 //! content is complete, or a resume that cannot adopt what a crash left.
-//! Power-loss coverage is the remaining W7 follow-up: a syscall-log
-//! (ALICE-style) crash-state checker, or dm-log-writes replay.
+//! Power-loss coverage is the remaining W7 follow-up (R-N88, tracked on #49):
+//! a syscall-log (ALICE-style) crash-state checker, or dm-log-writes replay.
 //!
 //! # Crash receipt
 //!
 //! With `BULKLOAD_FAULT_RECEIPT=<path>` set, the process writes the armed
 //! point's name, and for publication points the canonical store root on a
-//! second line, to `<path>` just before it exits. Harnesses use it to check
-//! which store a crash landed in.
+//! second line and the crashing group's composition on a third
+//! (`group capture_ids=<ids> chunks=<n>`), to `<path>` just before it exits.
+//! For a directory-creation point the second line is instead the creation
+//! path in use: `directory_create=rename` or `directory_create=fallback`
+//! (R-N119). Harnesses use it to check which store a crash landed in, to
+//! reproduce a failing `_mid` crash from the group it hit, and to see which
+//! directory path a crash interrupted.
 //!
 //! An `BULKLOAD_FAULT` value that names no point, or has an `nth` of zero or a
 //! non-number, ends the process at the first fault point it reaches with
@@ -64,13 +69,18 @@
 //! | `publish.destination.before_commit` | the group's records staged, `COMMIT` not issued |
 //! | `publish.destination.after_commit` | the group's output records and chunk hints committed |
 //!
+//! Every temporary one of these leaves carries the destination store's tag and
+//! is removed by the next invocation's sweep; see `materialize`.
+//!
 //! Directory publication, in `Destination::directory` and `finish_directories`:
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `directory.after_mkdir` | a new 0700 directory with no pending-directory record |
-//! | `directory.after_pending_record` | the 0700 directory and its pending record |
-//! | `directory.before_complete` | final modes applied and sealed; pending records still present |
+//! | `directory.after_mkdir` | an empty 0700 `.bulkload-<tag>-d-*` temporary directory, no record |
+//! | `directory.after_pending_record` | the temporary, its parent sealed, and a record bound to its inode; not renamed |
+//! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent sealed, not flushed |
+//! | `directory.after_fallback_mkdir` | with no no-replace rename (R-N119): a 0700 directory under its final name, no record |
+//! | `directory.before_complete` | one directory's final mode applied and sealed; its pending record still present |
 //!
 //! Protocol boundaries, in `transfer`:
 //!
@@ -157,6 +167,10 @@ pub enum Point {
     DirectoryAfterMkdir,
     /// `directory.after_pending_record`
     DirectoryAfterPendingRecord,
+    /// `directory.after_rename`
+    DirectoryAfterRename,
+    /// `directory.after_fallback_mkdir`
+    DirectoryAfterFallbackMkdir,
     /// `directory.before_complete`
     DirectoryBeforeComplete,
     /// `serve.after_content`
@@ -173,7 +187,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::PublishSourceAfterAppend,
         Self::PublishSourceAfterPackSync,
         Self::PublishSourceAfterLocationInsert,
@@ -188,6 +202,8 @@ impl Point {
         Self::PublishDestinationAfterCommit,
         Self::DirectoryAfterMkdir,
         Self::DirectoryAfterPendingRecord,
+        Self::DirectoryAfterRename,
+        Self::DirectoryAfterFallbackMkdir,
         Self::DirectoryBeforeComplete,
         Self::ServeAfterContent,
         Self::ServeBeforeDone,
@@ -214,6 +230,8 @@ impl Point {
             Self::PublishDestinationAfterCommit => "publish.destination.after_commit",
             Self::DirectoryAfterMkdir => "directory.after_mkdir",
             Self::DirectoryAfterPendingRecord => "directory.after_pending_record",
+            Self::DirectoryAfterRename => "directory.after_rename",
+            Self::DirectoryAfterFallbackMkdir => "directory.after_fallback_mkdir",
             Self::DirectoryBeforeComplete => "directory.before_complete",
             Self::ServeAfterContent => "serve.after_content",
             Self::ServeBeforeDone => "serve.before_done",
@@ -277,12 +295,69 @@ pub fn hit_in(point: Point, store: &Path) {
     hit_at(point, Some(store));
 }
 
+std::thread_local! {
+    static GROUP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static DIRECTORY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Clears this thread's group note when the group's publication ends.
+#[must_use = "the group note is cleared as soon as the guard is dropped"]
+pub struct GroupNote(());
+
+impl Drop for GroupNote {
+    fn drop(&mut self) {
+        GROUP.with(|group| *group.borrow_mut() = None);
+    }
+}
+
+/// Describe the publication group this thread is publishing, until the
+/// returned guard drops.
+///
+/// A crash receipt for a publication point records it. Each store's committer
+/// publishes on its own thread, so the note is thread-local; it is cleared
+/// per group, so no receipt names a finished group. A source group lists the
+/// batch indices of its captures (a group can span batches, so indices from
+/// different batches merge); a destination group lists one index per output,
+/// `0..n`.
+pub fn note_group(capture_ids: &[usize], chunks: usize) -> GroupNote {
+    let ids: Vec<String> = capture_ids.iter().map(ToString::to_string).collect();
+    let description = format!("group capture_ids={} chunks={chunks}", ids.join(","));
+    GROUP.with(|group| *group.borrow_mut() = Some(description));
+    GroupNote(())
+}
+
+/// Name the directory-creation path this thread is on (`rename` or
+/// `fallback`); a crash receipt for a directory-creation point records it.
+pub fn note_directory(path: Option<&'static str>) {
+    DIRECTORY.with(|directory| directory.set(path));
+}
+
+const fn creates_directory(point: Point) -> bool {
+    matches!(
+        point,
+        Point::DirectoryAfterMkdir
+            | Point::DirectoryAfterPendingRecord
+            | Point::DirectoryAfterRename
+            | Point::DirectoryAfterFallbackMkdir
+    )
+}
+
 fn receipt(point: Point, store: Option<&Path>) {
     if let Some(path) = std::env::var_os(FAULT_RECEIPT_ENV) {
         let mut body = format!("{}\n", point.name());
         if let Some(store) = store {
             body.push_str(&store.display().to_string());
             body.push('\n');
+            if let Some(group) = GROUP.with(|group| group.borrow().clone()) {
+                body.push_str(&group);
+                body.push('\n');
+            }
+        } else if creates_directory(point) {
+            if let Some(directory) = DIRECTORY.with(std::cell::Cell::get) {
+                body.push_str("directory_create=");
+                body.push_str(directory);
+                body.push('\n');
+            }
         }
         // Best effort: the page cache outlives `_exit`, no sync is needed.
         let _ = std::fs::write(path, body);

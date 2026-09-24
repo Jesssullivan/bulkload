@@ -1155,18 +1155,64 @@ fn drift_marked(heads: &str) -> bool {
     })
 }
 
+// A directory this process created exclusively (mode 0700, named by a
+// process-wide counter, never reused), removed when dropped. Created in the
+// first `near` directory that accepts it, else in TMPDIR.
+#[derive(Debug)]
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn create(near: Option<&Path>) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir();
+        for parent in near.into_iter().chain(std::iter::once(temp.as_path())) {
+            loop {
+                let candidate = parent.join(format!(
+                    ".bulkload-staged-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                    Ok(()) => return Ok(Self(candidate)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    // This parent refuses a private directory; try the next.
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(BulkloadRefusal::Io(None))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        // Best effort: a leftover private copy is disk, never custody.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A bundle staged for one restore or import: a private copy whose headers
 /// were checked for the drift marker, and the only path the verb reads.
 ///
 /// Checking one path and importing it again later is a window in which the
-/// file can be replaced. The copy lives in a directory this process created
-/// exclusively (mode 0700, named by a process-wide counter, never reused);
-/// the check and every later read see the same bytes. On APFS, btrfs and XFS
-/// the copy is a clone. The directory is removed when the stage is dropped.
+/// file can be replaced. The copy lives in a private directory next to the
+/// bundle (the corpus, for an estate apply), falling back to TMPDIR, and is
+/// written by this process while it hashes the bytes: it is a full copy, never
+/// a clone, and costs one sequential read and write of the bundle. The check,
+/// the digest and every later read see the same bytes. The directory is
+/// removed when the stage is dropped.
 #[derive(Debug)]
 pub struct StagedBundle {
-    directory: PathBuf,
+    // Held only so dropping the stage removes its private directory.
+    _directory: PrivateDir,
     bundle: PathBuf,
+    digest: [u8; 32],
 }
 
 impl StagedBundle {
@@ -1175,13 +1221,39 @@ impl StagedBundle {
     pub fn path(&self) -> &Path {
         &self.bundle
     }
+
+    /// blake3 of the staged bytes, computed while they were copied.
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 }
 
-impl Drop for StagedBundle {
-    fn drop(&mut self) {
-        // Best effort: a leftover private copy is disk, never custody.
-        let _ = fs::remove_dir_all(&self.directory);
+// Copy `source` to a new private file while hashing it: one read, one write.
+fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut from = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let mut to = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)?;
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let count = from.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let chunk = buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?;
+        hash.update(chunk);
+        to.write_all(chunk)?;
     }
+    Ok(*hash.finalize().as_bytes())
 }
 
 /// Stage `bundle` privately and refuse it if it carries the drift marker.
@@ -1190,38 +1262,25 @@ impl Drop for StagedBundle {
 /// Refuses [`BulkloadRefusal::CaptureDrifted`] for a marked bundle, and
 /// unreadable or malformed bundles.
 pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let source = fs::canonicalize(bundle)?;
-    let directory = loop {
-        let candidate = std::env::temp_dir().join(format!(
-            "bulkload-staged-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
-            Ok(()) => break candidate,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-    };
-    let staged = StagedBundle {
-        bundle: directory.join("capture.bundle"),
-        directory,
-    };
-    fs::copy(&source, &staged.bundle)?;
+    let directory = PrivateDir::create(source.parent())?;
+    let path = directory.path().join("capture.bundle");
+    let digest = copy_hashing(&source, &path)?;
     let heads = text(
-        git(&staged.directory)
+        git(directory.path())
             .args(["bundle", "list-heads"])
-            .arg(&staged.bundle),
+            .arg(&path),
     )?;
     if drift_marked(&heads) {
         return Err(BulkloadRefusal::CaptureDrifted);
     }
     #[cfg(test)]
     mid_pass::fire(&source, mid_pass::Stage::BundleChecked);
-    Ok(staged)
+    Ok(StagedBundle {
+        _directory: directory,
+        bundle: path,
+        digest,
+    })
 }
 
 // A private repository holding the snapshot's refs and exactly the authority
@@ -1395,6 +1454,8 @@ pub(crate) mod mid_pass {
         /// Keyed by a bundle, not a checkout: after its drift check, before a
         /// restore reads it again.
         BundleChecked,
+        /// After the index bytes are read, before they are validated.
+        IndexRead,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -2265,7 +2326,18 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>)> {
         "index",
     ]))?);
     let before_index = fs::read(&index_path)?;
-    let flags = text(git(repo).args(["ls-files", "--debug"]))?;
+    #[cfg(test)]
+    mid_pass::fire(&fs::canonicalize(repo)?, mid_pass::Stage::IndexRead);
+    // Validate exactly the bytes that are carried, never the live index a
+    // moment later (round-4 R2): every check reads a private copy of them.
+    let scratch = PrivateDir::create(None)?;
+    let carried = scratch.path().join("index");
+    fs::write(&carried, &before_index)?;
+    let checked = |args: &[&str]| -> Result<Vec<u8>> {
+        output(git(repo).env("GIT_INDEX_FILE", &carried).args(args))
+    };
+    let flags = String::from_utf8(checked(&["ls-files", "--debug"])?)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     if flags
         .lines()
         .filter_map(|line| line.split_once("\tflags: "))
@@ -2273,10 +2345,13 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>)> {
     {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    if !text(git(repo).args(["rev-parse", "--shared-index-path"]))?.is_empty() {
+    if !checked(&["rev-parse", "--shared-index-path"])?
+        .trim_ascii()
+        .is_empty()
+    {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    let entries = output(git(repo).args(["ls-files", "--stage", "-z"]))?;
+    let entries = checked(&["ls-files", "--stage", "-z"])?;
     if entries
         .split(|b| *b == 0)
         .any(|entry| entry.starts_with(b"160000 "))
@@ -5159,6 +5234,130 @@ mod tests {
             fs::read(restored.join("tracked")).unwrap(),
             b"tracked bytes at census",
             "the restored bytes are the checked bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-4 R1 (reviewer's r4_shallow_envelope_with_inner_marker_only): an
+    // envelope whose inner inventory carries capture-drift-v1 but whose
+    // headers do not (written by an older head, or re-enveloped) still
+    // refuses when it is unpacked.
+    #[test]
+    fn r4_shallow_envelope_with_inner_marker_only() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-r4-inner-only-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let full = root.join("full");
+        committed_repository(&full, b"tracked");
+        fs::write(full.join("tracked"), b"second").unwrap();
+        output(git(&full).args(["-c", "commit.gpgsign=false", "commit", "-qam", "second"]))
+            .unwrap();
+        let source = root.join("shallow");
+        output(
+            git(&root)
+                .args(["clone", "-q", "--depth=1", "--no-local"])
+                .arg(format!("file://{}", full.display()))
+                .arg(&source),
+        )
+        .unwrap();
+        output(git(&source).args(["config", "remote.origin.url", "https://example.test/s.git"]))
+            .unwrap();
+        let lane = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&lane).args(["update-ref", "refs/heads/lane", "HEAD"])).unwrap();
+        });
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        assert!(!export.drift.is_empty());
+        // Re-envelope without the header marker.
+        let scratch = root.join("scratch.git");
+        output(git(&root).args(["init", "-q", "--bare"]).arg(&scratch)).unwrap();
+        output(
+            git(&scratch)
+                .args(["fetch", "-q"])
+                .arg(&export.bundle)
+                .arg("refs/carry-export/shallow-custody-v1:refs/carry-export/shallow-custody-v1"),
+        )
+        .unwrap();
+        let forged = root.join("forged.bundle");
+        output(
+            git(&scratch)
+                .args(["bundle", "create", "-q"])
+                .arg(&forged)
+                .arg("refs/carry-export/shallow-custody-v1"),
+        )
+        .unwrap();
+        let inner = shallow::headers(&scratch, &forged).unwrap();
+        assert!(inner.contains("capture-drift-v1"), "inner marker present");
+        let result = restore_bundle(&forged, &root.join("restored"), "neo");
+        assert_eq!(
+            result.err(),
+            Some(BulkloadRefusal::CaptureDrifted),
+            "inner marker ignored"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-4 P1: a stage lives next to its bundle (the corpus), not in
+    // TMPDIR, is private, and is removed on drop.
+    #[test]
+    fn a_stage_lives_next_to_its_bundle_and_is_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, source) = drift_fixture("stage-near");
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        let staged = stage_bundle(&export.bundle).unwrap();
+        let directory = staged.path().parent().unwrap().to_path_buf();
+        assert_eq!(
+            directory.parent().unwrap(),
+            fs::canonicalize(export.bundle.parent().unwrap()).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let bytes = fs::read(&export.bundle).unwrap();
+        assert_eq!(fs::read(staged.path()).unwrap(), bytes);
+        // Hashed while it was copied: apply's digest check reads nothing twice.
+        assert_eq!(staged.digest(), *blake3::hash(&bytes).as_bytes());
+        drop(staged);
+        assert!(!directory.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-4 P1: a parent that refuses a private directory falls back to
+    // TMPDIR. Not permission-based, so it holds under root on CI.
+    #[test]
+    fn a_stage_falls_back_to_tmpdir_when_its_parent_refuses() {
+        let (root, _) = drift_fixture("stage-fallback");
+        let not_a_directory = root.join("plain-file");
+        fs::write(&not_a_directory, b"").unwrap();
+        let directory = PrivateDir::create(Some(&not_a_directory)).unwrap();
+        assert_eq!(directory.path().parent().unwrap(), std::env::temp_dir());
+        let path = directory.path().to_path_buf();
+        drop(directory);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-4 R2: the index checks validate the bytes that are carried, not
+    // whatever the live index holds a moment later.
+    #[test]
+    fn the_index_checks_validate_the_carried_bytes() {
+        let (root, source) = drift_fixture("index-carried");
+        output(git(&source).args(["update-index", "--assume-unchanged", "tracked"])).unwrap();
+        let inside = fs::canonicalize(&source).unwrap();
+        mid_pass::arm_at(&source, mid_pass::Stage::IndexRead, move || {
+            output(git(&inside).args(["update-index", "--no-assume-unchanged", "tracked"]))
+                .unwrap();
+        });
+        assert_eq!(
+            capture_key_parts(&source).err(),
+            Some(BulkloadRefusal::GitInventoryMalformed),
+            "the carried index holds an unsupported flag"
         );
         fs::remove_dir_all(root).unwrap();
     }

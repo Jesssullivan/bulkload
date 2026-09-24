@@ -16,6 +16,9 @@
 //!   so an output may be recorded before its capture);
 //! - **I2** no destination leaf under a final name holds partial content, and
 //!   `.bulkload-*` temporaries are the only extra names;
+//! - **I4** (R-N79) after the resume no `.bulkload-*` temporary remains: the
+//!   sweep removed exactly the ones the crash left and recorded none as
+//!   ambiguous;
 //! - **I3** the resume reads exactly the source bytes of files that had neither
 //!   an output record nor a committed capture before the crash, so every
 //!   committed file costs 0 source bytes;
@@ -30,20 +33,35 @@
 //! misplaced fsync**. It does detect ordering errors that show up without
 //! power loss: a record committed before its data, a final name holding
 //! partial content, or a resume that cannot adopt what a crash left.
-//! Power-loss coverage is the remaining W7 follow-up: a power-loss replay
-//! harness, either a syscall-log (ALICE-style) crash-state checker or
-//! dm-log-writes replay.
+//! Power-loss coverage is the remaining W7 follow-up (R-N88, tracked on #49):
+//! a power-loss replay harness, either a syscall-log (ALICE-style)
+//! crash-state checker or dm-log-writes replay.
 //!
 //! # Known violations
 //!
-//! Tests marked `#[ignore]` with a "known violation" reason assert invariants
-//! the v3 engine breaks today (R-N86). They are listed, not fixed, and never
-//! count as coverage:
+//! Tests marked `#[ignore = "known violation ..."]` assert invariants the
+//! engine breaks today. They are listed in `KNOWN_VIOLATIONS`, not fixed,
+//! and never count as coverage. `every_fault_point_has_a_scenario` compares
+//! the list with the tests this binary reports under `--list --ignored`, and
+//! checks each listed test's ignore reason:
 //!
-//! - `directory_after_mkdir`: a crash between `mkdirat` and the pending
-//!   directory record never converges.
-//! - `live_writer_*_leaves_no_source_pack_bytes`: a refused capture leaves the
-//!   victim's bytes, unindexed, in the source pack.
+//! - `live_writer_*_leaves_no_source_pack_bytes` (four, R-N86): a refused
+//!   capture leaves the victim's bytes, unindexed, in the source pack.
+//! - `directory_after_fallback_mkdir` (R-N119): without a no-replace rename,
+//!   a crash between the fallback `mkdirat` and its record never converges.
+//!
+//! # Hung scenarios
+//!
+//! A crash child runs a watchdog: if its fault point is not reached within
+//! `CHILD_WATCHDOG` it ends itself with `_exit(CHILD_WATCHDOG_EXIT_CODE)` and
+//! the parent fails that scenario by name. The child only ever ends itself;
+//! nothing here sends it a signal (R-N11). The parent's own deadline sits just
+//! above the watchdog, so a hung scenario fails well inside the CI job limit.
+//!
+//! Every `materialize.*` point, and `directory.after_mkdir` and
+//! `directory.after_pending_record` (an empty directory temporary not yet
+//! renamed into place), must leave at least one temporary at the crash, so I4
+//! is exercised, not vacuous, at each of them.
 //!
 //! # Live writer
 //!
@@ -73,12 +91,19 @@ use std::time::{Duration, Instant};
 use bulkload_agent::fault::{
     parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV, GROUP_FILES_ENV,
 };
+use bulkload_agent::freshness::NullCache;
+use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
 use bulkload_agent::transfer::{copy, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
+use bulkload_agent::walk::{walk, WalkOptions};
 use bulkload_proto::{BulkloadRefusal, RowSchema};
 
 /// `transfer_store::PERSIST_BATCH` (crate-private): chunks per durable batch.
 const PERSIST_BATCH: usize = 256;
+/// `transfer::BATCH_ROWS` (crate-private): rows offered per batch.
+const BATCH_ROWS: usize = 32;
+/// `io::durable::GROUP_FILES`: the most outputs one destination group holds.
+const GROUP_FILES: usize = 64;
 /// One byte past `PERSIST_BATCH × CDC_MAX`, so the file spans several batches.
 const LARGE_BYTES: usize = PERSIST_BATCH * bulkload_agent::hash::CDC_MAX_BYTES as usize + 1;
 const SMALL_FILES: usize = 48;
@@ -378,7 +403,10 @@ fn assert_i2(label: &str, scratch: &Scratch) -> usize {
     let mut temporaries = 0;
     for (path, metadata) in tree(&scratch.destination()) {
         if is_temporary(&path) {
-            assert!(metadata.is_file(), "{label} I2: temporary is not a file");
+            assert!(
+                metadata.is_file() || metadata.is_dir(),
+                "{label} I2: temporary is neither a file nor a directory"
+            );
             temporaries += 1;
             continue;
         }
@@ -418,11 +446,11 @@ fn source_files(scratch: &Scratch) -> BTreeMap<Vec<u8>, u64> {
         .collect()
 }
 
-/// Run one armed child `copy` to its fault point.
-/// A `mid` child closes every group at one file, so `nth` hits of the group
-/// points land at a reproducible place; a first-hit child keeps the default
-/// grouping.
-fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) {
+/// Run one armed child `copy` to its fault point. Returns the crashing
+/// publication group's composition for a publication point. A `mid` child
+/// closes every group at one file, so `nth` hits of the group points land at
+/// an exact place; a first-hit child keeps the default grouping.
+fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Option<String> {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -436,9 +464,13 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) {
             "--nocapture",
         ])
         .env(CHILD_ENV, &scratch.base)
+        .stdin(Stdio::null())
         .env(FAULT_ENV, label)
-        .env(GROUP_FILES_ENV, if mid { "1" } else { "" })
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
+        .env(GROUP_FILES_ENV, if mid { "1" } else { "" })
+        .envs(
+            (point == Point::DirectoryAfterFallbackMkdir).then_some((RENAME_UNSUPPORTED_ENV, "1")),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -459,6 +491,13 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) {
             )
         })
         .unwrap();
+    assert_ne!(
+        child.status.code(),
+        Some(CHILD_WATCHDOG_EXIT_CODE),
+        "{label}: hung; the crash child's watchdog ended it after {CHILD_WATCHDOG:?} \
+         (stderr {})",
+        String::from_utf8_lossy(&child.stderr)
+    );
     assert_eq!(
         child.status.code(),
         Some(FAULT_EXIT_CODE),
@@ -466,15 +505,16 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) {
         child.status,
         String::from_utf8_lossy(&child.stderr)
     );
-    assert_receipt(scratch, point);
+    assert_receipt(scratch, point)
 }
 
 /// The crash landed at `point`, and a publication point in the store it names.
-fn assert_receipt(scratch: &Scratch, point: Point) {
+fn assert_receipt(scratch: &Scratch, point: Point) -> Option<String> {
     let receipt = fs::read_to_string(scratch.base.join("receipt")).unwrap();
     let mut lines = receipt.lines();
     assert_eq!(lines.next(), Some(point.name()), "receipt point");
-    let store = if point.name().starts_with("publish.source.") {
+    let source = point.name().starts_with("publish.source.");
+    let store = if source {
         Some(scratch.source_state())
     } else if point.name().starts_with("publish.destination.") {
         Some(scratch.destination_state())
@@ -482,12 +522,89 @@ fn assert_receipt(scratch: &Scratch, point: Point) {
         None
     };
     let expected = store.map(|store| fs::canonicalize(store).unwrap().display().to_string());
-    assert_eq!(
-        lines.next().map(str::to_owned),
-        expected,
-        "{}: crash receipt names the wrong store",
-        point.name()
+    let mut group = None;
+    if let Some(expected) = expected {
+        assert_eq!(
+            lines.next(),
+            Some(expected.as_str()),
+            "{}: crash receipt names the wrong store",
+            point.name()
+        );
+        // The group it hit, so a `_mid` failure can be reproduced.
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("{}: publication receipt has no group line", point.name()));
+        assert_group(point, source, line);
+        group = Some(line.to_owned());
+    } else if let Some(path) = directory_path(point) {
+        assert_eq!(
+            lines.next(),
+            Some(format!("directory_create={path}").as_str()),
+            "{}: receipt names the wrong directory path",
+            point.name()
+        );
+    }
+    assert_eq!(lines.next(), None, "{}: extra receipt lines", point.name());
+    group
+}
+
+/// The directory-creation path a crash at `point` must report, if any.
+const fn directory_path(point: Point) -> Option<&'static str> {
+    match point {
+        Point::DirectoryAfterMkdir
+        | Point::DirectoryAfterPendingRecord
+        | Point::DirectoryAfterRename => Some("rename"),
+        Point::DirectoryAfterFallbackMkdir => Some("fallback"),
+        _ => None,
+    }
+}
+
+/// `group capture_ids=<ids> chunks=<n>` for one committer group.
+///
+/// A source pack group lists the distinct, ascending batch indices of the
+/// captures whose chunks or refusals it carries; a group can span batches, so
+/// indices from two batches merge, and a group holding only completions lists
+/// none. A destination group lists one index per output, `0..n` with
+/// `1 <= n <= GROUP_FILES`, and the distinct chunks those outputs hold.
+fn assert_group(point: Point, source: bool, line: &str) {
+    let label = point.name();
+    let rest = line
+        .strip_prefix("group capture_ids=")
+        .unwrap_or_else(|| panic!("{label}: group line {line:?}"));
+    let (ids, chunks) = rest
+        .split_once(" chunks=")
+        .unwrap_or_else(|| panic!("{label}: group line {line:?}"));
+    let ids: Vec<usize> = ids
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            id.parse()
+                .unwrap_or_else(|_| panic!("{label}: id in {line:?}"))
+        })
+        .collect();
+    let _: usize = chunks
+        .parse()
+        .unwrap_or_else(|_| panic!("{label}: chunk count in {line:?}"));
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "{label}: capture ids not distinct and ascending: {line:?}"
     );
+    if source {
+        assert!(
+            ids.iter().all(|id| *id < BATCH_ROWS),
+            "{label}: source group ids outside a batch: {line:?}"
+        );
+    } else {
+        assert!(
+            !ids.is_empty() && ids.len() <= GROUP_FILES,
+            "{label}: destination group size: {line:?}"
+        );
+        assert_eq!(
+            ids,
+            (0..ids.len()).collect::<Vec<_>>(),
+            "{label}: destination group ids: {line:?}"
+        );
+    }
 }
 
 /// After a resume: records and names cover every source file, and a
@@ -521,11 +638,23 @@ fn assert_complete(
     }
 }
 
+/// Points whose crash always leaves a tagged temporary: a staged file before
+/// its rename, a directory temporary before its rename.
+const fn leaves_temporary(point: Point) -> bool {
+    matches!(
+        point,
+        Point::MaterializeAfterTempWrite
+            | Point::MaterializeAfterTempSeal
+            | Point::DirectoryAfterMkdir
+            | Point::DirectoryAfterPendingRecord
+    )
+}
+
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    crash_child(&scratch, point, &label, nth > 1);
+    let group = crash_child(&scratch, point, &label, nth > 1);
 
     let before = crash_state(&scratch);
     assert_i1(&label, &scratch, &before);
@@ -585,21 +714,54 @@ fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     assert_i1(&format!("{label} resumed"), &scratch, &after);
     let temporaries = assert_i2(&format!("{label} resumed"), &scratch);
     assert_complete(&label, &scratch, fixture, &files, &after);
+    // I4: the sweep leaves no temporary behind and removes only the crash's.
+    if leaves_temporary(point) {
+        assert!(
+            crash_temporaries >= 1,
+            "{label}: this crash must leave a temporary for I4 to sweep"
+        );
+    }
+    assert_eq!(
+        temporaries, 0,
+        "{label} I4: a temporary survived the resume"
+    );
+    assert_eq!(
+        resumed.temporaries_removed, crash_temporaries as u64,
+        "{label} I4: the sweep must remove exactly the crash's temporaries"
+    );
+    assert!(
+        resumed.temporaries_left.is_empty(),
+        "{label} I4: nothing here is ambiguous, yet {:?} was left",
+        resumed.temporaries_left
+    );
     println!(
         "{label}: outputs_before={} captures_before={} temporaries_at_crash={crash_temporaries} \
          resume_completed={} resume_reused={} resume_source_bytes={} resume_bytes_received={} \
-         temporaries_left={temporaries}",
+         temporaries_left={temporaries}{}",
         before.outputs.len(),
         before.captures.len(),
         resumed.completed,
         resumed.reused,
         resumed.source_bytes_read,
         resumed.bytes_received,
+        group
+            .map(|group| format!(" crash_{group}"))
+            .unwrap_or_default(),
     );
 }
 
-/// How long a crash child may run before the scenario fails.
-const CHILD_DEADLINE: Duration = Duration::from_mins(5);
+/// How long a crash child runs before its watchdog ends it. The slowest
+/// child (`serve.before_done`) performs a whole copy, 64 MiB file included,
+/// before its point; in a debug build on a host at load average ~40 that took
+/// over 90 s, so the watchdog sits well above it and well inside the 15-minute
+/// CI job.
+const CHILD_WATCHDOG: Duration = Duration::from_mins(4);
+
+/// Exit status of a crash child whose watchdog fired: the scenario hung.
+const CHILD_WATCHDOG_EXIT_CODE: i32 = 88;
+
+/// How long the parent waits for a crash child: the watchdog plus a margin.
+const CHILD_DEADLINE: Duration = Duration::from_secs(270);
 
 /// Set only in a child: the scratch base whose trees it copies.
 const CHILD_ENV: &str = "BULKLOAD_W7_CHILD_BASE";
@@ -610,6 +772,15 @@ fn crash_child_entry() {
     let Some(base) = std::env::var_os(CHILD_ENV).map(PathBuf::from) else {
         return;
     };
+    // A scenario that never reaches its fault point must not hold the CI job
+    // open: past the watchdog this child ends itself, never signalled.
+    std::thread::spawn(|| {
+        std::thread::sleep(CHILD_WATCHDOG);
+        eprintln!("crash child watchdog: no fault point within {CHILD_WATCHDOG:?}");
+        // SAFETY: `_exit` takes no pointers and never returns; this process
+        // ends only itself, with a status the parent reports by scenario.
+        unsafe { libc::_exit(CHILD_WATCHDOG_EXIT_CODE) }
+    });
     // An armed fault point ends this process inside `copy`. Returning at all
     // means the point was never reached, which the parent reports.
     let outcome = copy(
@@ -658,7 +829,9 @@ scenarios! {
     publish_destination_before_commit_mid => PublishDestinationBeforeCommit: 20, WITH_REFUSAL;
     publish_destination_after_commit_first => PublishDestinationAfterCommit: 1, WITH_REFUSAL;
     publish_destination_after_commit_mid => PublishDestinationAfterCommit: 20, WITH_REFUSAL;
+    directory_after_mkdir => DirectoryAfterMkdir: 1, NO_REFUSAL;
     directory_after_pending_record => DirectoryAfterPendingRecord: 1, NO_REFUSAL;
+    directory_after_rename => DirectoryAfterRename: 1, NO_REFUSAL;
     directory_before_complete => DirectoryBeforeComplete: 1, NO_REFUSAL;
     serve_after_content_mid => ServeAfterContent: 25, WITH_REFUSAL;
     serve_before_done => ServeBeforeDone: 1, WITH_REFUSAL;
@@ -699,12 +872,69 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(parse(""), None);
 }
 
-/// Points whose only crash-resume scenario is an `#[ignore]`d known-violation
-/// test. They are listed here and never counted as coverage.
-const KNOWN_VIOLATIONS: [Point; 1] = [Point::DirectoryAfterMkdir];
+/// The `#[ignore]` reason every known-violation test carries, verbatim prefix.
+const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
+
+/// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
+/// today, with the fault point each one is the only scenario for, if any.
+/// Listed, never counted as coverage.
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 5] = [
+    // R-N86: a refused capture leaves unindexed bytes in the source pack.
+    (
+        "live_writer_in_place_overwrite_leaves_no_source_pack_bytes",
+        None,
+    ),
+    ("live_writer_truncate_leaves_no_source_pack_bytes", None),
+    (
+        "live_writer_rename_replace_leaves_no_source_pack_bytes",
+        None,
+    ),
+    (
+        "live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes",
+        None,
+    ),
+    // R-N119: the mkdirat fallback has a crash window with no record.
+    (
+        "directory_after_fallback_mkdir",
+        Some(Point::DirectoryAfterFallbackMkdir),
+    ),
+];
+
+/// The attributes directly above `fn <name>(` (or `pub fn <name>(`): the
+/// text between the preceding item's end and the function.
+fn attributes_of<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let at = [format!("\nfn {name}("), format!("\npub fn {name}(")]
+        .iter()
+        .find_map(|needle| source.find(needle.as_str()))?;
+    let before = &source[..at];
+    let start = before.rfind("\n}").map_or(0, |end| end + 2);
+    Some(&before[start..])
+}
+
+/// Names this test binary itself reports as ignored: `--list --ignored`.
+/// Whatever form an `#[ignore]` takes (indented, same-line, `cfg_attr`),
+/// libtest is the authority on what is ignored.
+fn ignored_by_libtest() -> Vec<String> {
+    let listed = Command::new(std::env::current_exe().unwrap())
+        .args(["--list", "--ignored"])
+        .env_remove(CHILD_ENV)
+        .env_remove(FAULT_ENV)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "--list --ignored failed");
+    String::from_utf8(listed.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::to_owned)
+        .collect()
+}
 
 /// Every point is exercised by a passing (non-ignored) scenario in the
-/// `scenarios!` table, or is listed in [`KNOWN_VIOLATIONS`] — never both.
+/// `scenarios!` table, or is a [`KNOWN_VIOLATIONS`] point, never both. The
+/// tests libtest reports as ignored are exactly the listed violations, and
+/// each carries the known-violation reason.
 #[test]
 fn every_fault_point_has_a_scenario() {
     let source = include_str!("fault_harness.rs");
@@ -712,7 +942,11 @@ fn every_fault_point_has_a_scenario() {
     let table = &source[start..];
     let table = &table[..table.find("\n}\n").unwrap()];
     let covered = |point: &Point| table.contains(&format!("=> {point:?}:"));
-    let known = |point: &Point| KNOWN_VIOLATIONS.contains(point);
+    let known = |point: &Point| {
+        KNOWN_VIOLATIONS
+            .iter()
+            .any(|(_, known)| known.as_ref() == Some(point))
+    };
     let missing: Vec<&str> = Point::ALL
         .into_iter()
         .filter(|point| !covered(point) && !known(point))
@@ -731,28 +965,114 @@ fn every_fault_point_has_a_scenario() {
         both.is_empty(),
         "known violations also claimed as coverage: {both:?}"
     );
-    for point in KNOWN_VIOLATIONS {
+    let mut ignored = ignored_by_libtest();
+    ignored.sort();
+    let mut listed: Vec<String> = KNOWN_VIOLATIONS
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect();
+    listed.sort();
+    assert_eq!(
+        ignored, listed,
+        "ignored tests must be exactly the listed known violations"
+    );
+    for (name, point) in KNOWN_VIOLATIONS {
+        let attributes = attributes_of(source, name)
+            .unwrap_or_else(|| panic!("{name}: listed but not defined here"));
         assert!(
-            source.contains(&format!("crash_resume(Point::{point:?}, ")),
-            "{}: known violation without its ignored test",
-            point.name()
+            attributes.contains(KNOWN_VIOLATION_REASON),
+            "{name}: ignored without the known-violation reason"
         );
+        if let Some(point) = point {
+            assert!(
+                source.contains(&format!("crash_resume(Point::{point:?}, ")),
+                "{}: known violation without its crash scenario",
+                point.name()
+            );
+        }
     }
 }
 
-/// VIOLATION in the v3 engine (TIN-4546), recorded rather than fixed.
-///
-/// `Destination::directory` creates the directory 0700 with `mkdirat`, then
-/// records ownership with `pending_directory`. A crash between the two leaves
-/// a 0700 directory with no pending record. On resume `mkdirat` meets EEXIST,
-/// finds no record, compares 0700 with the source mode and refuses the
-/// directory `GIT_DESTINATION_OCCUPIED`. The refusal also blocks
-/// `finish_directories` for the whole run, so the carry never converges and
-/// the directory keeps mode 0700. I1/I2/I3 still hold; convergence does not.
+/// Known violation (R-N119). Without a no-replace rename, a directory is
+/// created by `mkdirat` at its final name and recorded after; a crash in
+/// between leaves an unrecorded 0700 directory that the resume refuses
+/// `GIT_DESTINATION_OCCUPIED`, so the carry never converges.
 #[test]
-#[ignore = "v3 violation: crash between mkdirat and the pending-directory record never converges"]
-fn directory_after_mkdir() {
-    crash_resume(Point::DirectoryAfterMkdir, 1, NO_REFUSAL);
+#[ignore = "known violation (R-N119): the mkdirat fallback leaves an unrecorded directory on a crash before its record"]
+fn directory_after_fallback_mkdir() {
+    crash_resume(Point::DirectoryAfterFallbackMkdir, 1, NO_REFUSAL);
+}
+
+/// R-N79: after `materialize.after_temp_seal` each staged file not yet
+/// renamed is an orphan under a tagged temporary name. A walk of the crashed
+/// destination records each and never carries it, onward carry included; the
+/// resume removes exactly those names, and every published output keeps its
+/// content.
+#[test]
+fn materialize_after_temp_seal_sweeps_only_temporaries() {
+    let label = format!("{}:25", Point::MaterializeAfterTempSeal.name());
+    let scratch = Scratch::new("after-temp-seal-sweep");
+    populate(&scratch.source(), WITH_REFUSAL);
+    crash_child(&scratch, Point::MaterializeAfterTempSeal, &label, true);
+
+    let destination = scratch.destination();
+    let crashed = tree(&destination);
+    let mut orphans: Vec<Vec<u8>> = crashed
+        .iter()
+        .filter(|(path, _)| is_temporary(path))
+        .map(|(path, metadata)| {
+            assert!(metadata.is_file(), "{label}: orphan is not a file");
+            assert_eq!(metadata.nlink(), 1, "{label}: an orphan shares an inode");
+            path.clone()
+        })
+        .collect();
+    orphans.sort();
+    assert!(!orphans.is_empty(), "{label}: the crash left no temporary");
+
+    // No walk carries an orphan: the census records each instead of a row.
+    let census = walk(
+        &WalkOptions::new(fs::canonicalize(&destination).unwrap()),
+        &mut NullCache,
+    )
+    .unwrap();
+    assert!(
+        census.rows.iter().all(|row| !is_temporary(&row.rel_path)),
+        "{label}: the walk offered a temporary as a row"
+    );
+    let mut recorded = census.engine_temporaries;
+    recorded.sort();
+    assert_eq!(recorded, orphans);
+    let onward = scratch.base.join("onward");
+    fs::create_dir(&onward).unwrap();
+    let carried = copy(
+        &destination,
+        &onward,
+        &scratch.base.join("onward-source-state"),
+        &scratch.base.join("onward-destination-state"),
+    )
+    .unwrap();
+    assert!(carried.refusals.is_empty(), "{:?}", carried.refusals);
+    assert!(
+        tree(&onward).keys().all(|path| !is_temporary(path)),
+        "{label}: an onward carry planted an orphan"
+    );
+
+    let resumed = scratch.run();
+    assert_eq!(resumed.temporaries_removed, orphans.len() as u64);
+    assert!(resumed.temporaries_left.is_empty());
+    for orphan in &orphans {
+        assert!(fs::symlink_metadata(destination.join(relative(orphan))).is_err());
+    }
+    for (path, metadata) in tree(&scratch.source()) {
+        if metadata.is_file() && path != REFUSED.as_bytes() {
+            assert_eq!(
+                digest(&destination.join(relative(&path))),
+                digest(&scratch.source().join(relative(&path))),
+                "{label}: {:?}",
+                relative(&path)
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

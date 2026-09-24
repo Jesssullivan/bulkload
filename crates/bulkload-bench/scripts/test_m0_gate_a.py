@@ -247,7 +247,7 @@ class RoundThreeTest(unittest.TestCase):
         self.assertIn(" gated=0 ", shipped)
         self.assertIn("all_rows_gated=0", lines[-1])
 
-    def test_last_arm_unplug_is_detected(self) -> None:
+    def test_last_rclone_arm_unplug_is_detected(self) -> None:
         executable(
             self.rclone,
             """#!/bin/sh
@@ -257,7 +257,8 @@ cp -R "$2" "$3"
 """,
         )
         # 8 reps x 2 rclone arms = 16 measured rclone calls, plus 2 in the
-        # warm-up: the 18th call is the last rclone arm of the run.
+        # warm-up: the 18th call is the last rclone arm of the run. It is not
+        # the run's final arm (see test_unplug_during_final_arm_of_final_rep).
         lines = self.run_gate([])
         rows = self.samples(lines)
         last_rclone = [row for row in rows if "arm=rclone" in row][-1]
@@ -413,6 +414,111 @@ cp -R "$2" "$3"
             for a, b in zip(seq, seq[1:]):
                 pairs[(a, b)] = pairs.get((a, b), 0) + 1
             self.assertGreater(len(set(pairs.values())), 1, pairs)
+
+
+# --- Round-4 review tests (#57 @ 08fc8ad), ported. test_limit_* document
+# residual limits of point sampling; they pass while the limit exists.
+
+
+def gate_rows(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith("gate_a_sample")]
+
+
+class RoundFourTest(RoundThreeTest):
+    """Round-4 cases; the inherited round-3 cases are not re-run here."""
+
+    def test_unplug_during_final_arm_of_final_rep(self) -> None:
+        # williams(4) row 3 = [3,0,2,1]: the last arm of rep 7 is
+        # floor-barrier, the 16th durable-corpus call with no warm-up.
+        lines = self.run_gate(["--warmup", "0"], {"UNPLUG_AT": "16"})
+        rows = gate_rows(lines)
+        self.assertEqual(len(rows), 32)
+        self.assertTrue(rows[-1].startswith("gate_a_sample arm=floor-barrier "))
+        self.assertIn(" power_after=battery gated=0 ", rows[-1])
+        self.assertTrue(all(" gated=1 " in row for row in rows[:-1]))
+        self.assertIn("final_power=battery", lines[-1])
+        self.assertIn("all_rows_gated=0", lines[-1])
+        summary = next(
+            line
+            for line in lines
+            if line.startswith("gate_a_summary arm=floor-barrier")
+        )
+        self.assertIn("gated_reps=7 stats_over=gated", summary)
+
+    def test_unplug_mid_run_then_replug(self) -> None:
+        executable(
+            self.bench,
+            R3_BENCH_STUB.replace(
+                'if [ -n "$UNPLUG_AT" ] && [ "$c" -ge "$UNPLUG_AT" ]; then '
+                ': > "$STUB_DIR/battery"; fi',
+                'if [ "$c" -eq 3 ]; then : > "$STUB_DIR/battery"; fi\n'
+                '    if [ "$c" -eq 5 ]; then rm -f "$STUB_DIR/battery"; fi',
+            ),
+        )
+        lines = self.run_gate(["--warmup", "0"])
+        self.assertTrue(any(" gated=0 " in row for row in gate_rows(lines)))
+        self.assertIn("final_power=ac", lines[-1])
+        self.assertIn("all_rows_gated=0", lines[-1])
+
+    def test_power_unknown_after_arm_is_not_gated(self) -> None:
+        seq = {"n": 0}
+
+        def conditions() -> tuple[float, str, bool]:
+            seq["n"] += 1
+            # 1 preflight, then (before, after) per arm: call 5 is arm 2's after.
+            if seq["n"] == 5:
+                return (1.0, "unknown", False)
+            return (1.0, "ac", True)
+
+        self.conditions = conditions
+        lines = self.run_gate(["--warmup", "0"])
+        self.assertIn(" power_after=unknown gated=0 ", gate_rows(lines)[1])
+        self.assertIn("all_rows_gated=0", lines[-1])
+
+    def test_limit_transient_mid_arm_unplug_is_invisible(self) -> None:
+        # Documented limit: power is sampled just before and just after each
+        # arm, so an unplug-and-replug inside one arm is not seen.
+        executable(
+            self.bench,
+            R3_BENCH_STUB.replace(
+                'echo "micro name=durable-corpus',
+                ': > "$STUB_DIR/battery"; rm -f "$STUB_DIR/battery"\n'
+                '    echo "micro name=durable-corpus',
+            ),
+        )
+        lines = self.run_gate(["--warmup", "0"])
+        self.assertIn("all_rows_gated=1", lines[-1])
+
+    def test_limit_load_spike_during_arm_invisible(self) -> None:
+        # Documented limit: load1 is a before-arm check only.
+        seq = {"n": 0}
+
+        def conditions() -> tuple[float, str, bool]:
+            seq["n"] += 1
+            if seq["n"] > 1 and seq["n"] % 2 == 1:
+                return (9.0, "ac", False)
+            return (1.0, "ac", True)
+
+        self.conditions = conditions
+        lines = self.run_gate(["--warmup", "0"])
+        self.assertIn("all_rows_gated=1", lines[-1])
+
+    def test_reps_below_min_with_override_header(self) -> None:
+        lines = self.run_gate(["4", "--warmup", "0"], override=True)
+        self.assertIn("min_reps_met=0", lines[0])
+        self.assertIn("balanced=1 balance=within-row-only", lines[0])
+        self.assertIn("all_rows_gated=0", lines[-1])
+
+    def test_negative_warmup_and_reps_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.run_gate(["-3"])
+        with self.assertRaises(SystemExit):
+            self.run_gate(["--warmup", "-1"])
+
+
+for _name in [n for n in dir(RoundThreeTest) if n.startswith("test_")]:
+    if _name not in RoundFourTest.__dict__:
+        setattr(RoundFourTest, _name, None)
 
 
 if __name__ == "__main__":

@@ -827,8 +827,7 @@ fn import_base(
         return Ok(());
     }
     let staged = git_carry::stage_bundle(&path)?;
-    if hash_file(staged.path())? != base.digest || git_carry::shared::requires_base(staged.path())?
-    {
+    if staged.digest() != base.digest || git_carry::shared::requires_base(staged.path())? {
         return Err(BulkloadRefusal::DigestMismatch);
     }
     git_carry::import_staged(&item.repository, &staged, source)?;
@@ -853,16 +852,12 @@ fn apply_item(
     }
     // A capture that drifted under its export does not hold the drifted
     // seats' bytes. Its bundle says so in-band, and apply refuses it on that
-    // marker, fail-closed, before any base import, journal or destination is
-    // touched, whether or not the corpus sidecar survived; the next capture
+    // marker, fail-closed, before any base import, journal write or
+    // destination is touched, whether or not the corpus sidecar survived; the
+    // next capture
     // pass extends it clean. Key-only drift leaves a coherent snapshot, which
     // applies. R-N29 (apply proceeds on an occupied destination, recording
     // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
-    //
-    // One private stage is the only copy this apply reads: the marker check,
-    // the digest check and the restore all see the same bytes (round-3 N4),
-    // and the restore verbs below do not check again.
-    let staged = git_carry::stage_bundle(&corpus.join(&captured.bundle))?;
     let journal = state.join(format!(
         "{identity}-{}-{}.done",
         blake3::hash(source.as_bytes()).to_hex(),
@@ -877,7 +872,13 @@ fn apply_item(
         };
         return Ok(Completion::clean(outcome));
     }
-    if hash_file(staged.path())? != captured.digest {
+    // After the journal (round-4 P2): a re-apply of a done item stages and
+    // copies nothing. Otherwise one private stage next to the corpus is the
+    // only copy this apply reads: the marker check, the digest (computed while
+    // copying) and the restore all see the same bytes (round-3 N4), and the
+    // restore verbs below do not check again.
+    let staged = git_carry::stage_bundle(&corpus.join(&captured.bundle))?;
+    if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
     import_base(item, &captured, staged.path(), corpus, source, imported)?;
@@ -1948,6 +1949,34 @@ mod tests {
             reuse_signals(&plan, &state, &corpus),
             vec![("captured", Some("future-stamp"))]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round-4 P2: re-applying an item that is already done reads the journal
+    // first and stages nothing, so it never copies (or even needs) the bundle.
+    #[test]
+    fn a_reapply_of_a_done_item_stages_nothing() {
+        let (root, _, _, plan, corpus) = drifting_plan("reapply");
+        let state = root.join("state");
+        receipts(&plan, &state, &corpus).unwrap();
+        let applied = root.join("applied");
+        apply(&plan, &corpus, &applied, "neo", 2, &|_| Ok(())).unwrap();
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
+        let bundle = corpus.join(&record.bundle);
+        let held = root.join("held.bundle");
+        fs::rename(&bundle, &held).unwrap();
+        let outcomes = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 2, &|row| {
+            outcomes.lock().unwrap().push(row.outcome);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec!["previous-workspace-restoration-not-revalidated"]
+        );
+        fs::rename(&held, &bundle).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

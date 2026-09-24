@@ -70,7 +70,11 @@ pub fn force_rename_unsupported(on: bool) {
     RENAME_UNSUPPORTED.with(|forced| forced.set(on));
 }
 
-fn rename_exclusive(directory: &std::fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+/// An exclusive (no-replace) rename behind the test hook, with no fallback.
+///
+/// # Errors
+/// Returns the rename failure; see [`rename_unsupported`].
+pub fn rename_exclusive(directory: &std::fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
     #[cfg(any(test, feature = "fault-injection"))]
     {
         #[cfg(feature = "fault-injection")]

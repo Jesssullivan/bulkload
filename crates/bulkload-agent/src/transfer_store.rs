@@ -324,6 +324,21 @@ pub(crate) enum PublisherSide {
     Destination,
 }
 
+/// An unfinished directory this state created, keyed by its row.
+///
+/// Committed once the directory exists under a tagged temporary name and its
+/// parent is synced, before it is renamed into place (R-N102), and deleted
+/// once the final mode is durable. It names an inode, never just a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDirectory {
+    /// Device of the created directory.
+    pub dev: u64,
+    /// Inode of the created directory.
+    pub ino: u64,
+    /// The final mode `finish_directories` applies.
+    pub mode: u32,
+}
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
@@ -532,33 +547,39 @@ impl Store {
             .transpose()
     }
 
-    /// Remember an unfinished directory by inode and its intended mode.
+    /// Bind a pending directory to the inode this state created.
     ///
     /// # Errors
     /// Refuses persistence failures.
-    pub fn pending_directory(
+    pub fn record_directory_created(
         &self,
         key: &[u8],
         dev: u64,
         ino: u64,
         mode: u32,
-        record: bool,
-    ) -> Result<bool> {
-        let identity = postcard::to_stdvec(&(dev, ino, mode))?;
-        if record {
-            let started = Instant::now();
-            let recorded = self
-                .conn
-                .execute(
-                    "INSERT INTO directories VALUES (?1, ?2)
-                ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                    (key, &identity),
-                )
-                .map_err(sqlite_error);
-            counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
-            recorded?;
-            return Ok(true);
-        }
+    ) -> Result<()> {
+        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        let started = Instant::now();
+        let recorded = self
+            .conn
+            .execute(
+                "INSERT INTO directories VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                (key, identity),
+            )
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
+        recorded?;
+        Ok(())
+    }
+
+    /// The unfinished-directory record for `key`, if any.
+    ///
+    /// # Errors
+    /// Refuses database failures, and refuses a record this engine cannot
+    /// decode exactly with [`BulkloadRefusal::SchemaMismatch`], so an
+    /// unreadable record never grants ownership.
+    pub fn directory_record(&self, key: &[u8]) -> Result<Option<PendingDirectory>> {
         let found: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -568,7 +589,45 @@ impl Store {
             )
             .optional()
             .map_err(sqlite_error)?;
-        Ok(found == Some(identity))
+        found
+            .map(|bytes| match postcard::take_from_bytes(&bytes) {
+                Ok((record, [])) => Ok(record),
+                _ => Err(BulkloadRefusal::SchemaMismatch),
+            })
+            .transpose()
+    }
+
+    /// Clear every pending record bound to `(dev, ino)`, once that inode is
+    /// gone, so a recycled inode number can never inherit its ownership.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn clear_directories_bound_to(&self, dev: u64, ino: u64) -> Result<()> {
+        let bound: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT key, identity FROM directories")
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            let mut bound = Vec::new();
+            for row in rows {
+                let (key, identity) = row.map_err(sqlite_error)?;
+                if let Ok((record, [])) = postcard::take_from_bytes::<PendingDirectory>(&identity) {
+                    if record.dev == dev && record.ino == ino {
+                        bound.push(key);
+                    }
+                }
+            }
+            bound
+        };
+        for key in bound {
+            self.complete_directory(&key)?;
+        }
+        Ok(())
     }
 
     /// Retire pending ownership after directory metadata is durable.
@@ -1041,6 +1100,32 @@ impl StorePublisher {
     }
 }
 
+/// Record a source pack group's composition for a crash receipt: the batch
+/// indices of its captures, sorted and distinct, and the chunk payloads it
+/// carries. A group can span batches, so indices from two batches merge.
+#[cfg(feature = "fault-injection")]
+fn note_pack_group(items: &[PackItem]) -> crate::fault::GroupNote {
+    let mut ids: Vec<usize> = items
+        .iter()
+        .filter_map(|item| match item {
+            PackItem::Chunks { capture_id, .. } | PackItem::Refused { capture_id } => {
+                Some(*capture_id)
+            }
+            PackItem::Capture { .. } => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let chunks = items
+        .iter()
+        .map(|item| match item {
+            PackItem::Chunks { chunks, .. } => chunks.len(),
+            PackItem::Capture { .. } | PackItem::Refused { .. } => 0,
+        })
+        .sum();
+    crate::fault::note_group(&ids, chunks)
+}
+
 /// Group-commit sink for a source store: captured chunks are appended to the
 /// pack as they arrive, and each group seals the pack before committing the
 /// chunk locations and the captures that reference them.
@@ -1069,6 +1154,8 @@ impl PackSink {
     /// a refused capture stay in the pack, unindexed.
     pub(crate) fn publish(&mut self, items: Vec<PackItem>) -> Result<()> {
         PUBLISH_GROUPS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "fault-injection")]
+        let _note = note_pack_group(&items);
         let append_started = Instant::now();
         let mut locations = Vec::new();
         let mut captures = Vec::new();
