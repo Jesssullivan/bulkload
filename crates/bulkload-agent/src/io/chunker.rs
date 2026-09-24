@@ -233,16 +233,21 @@ pub fn chunk_segmented(
             out.push(chunk);
         }
     }
-    // The last segment's chain always runs to the end; this only matters if
-    // the true chain skipped past it without meeting it.
-    let before = out.len();
-    cutter.chain(data, at, data.len(), &mut out)?;
-    counters.cdc_redo_bytes += out
-        .get(before..)
-        .unwrap_or(&[])
-        .iter()
-        .map(|chunk| u64::from(chunk.len))
-        .sum::<u64>();
+    // Unreachable by construction: the last segment's `stop` is the end of
+    // the input, and its loop ends only by adopting that segment's chain
+    // (which runs to the end) or by re-chunking until `at >= stop`. Checked,
+    // not assumed: a stitcher that stopped early is an internal error, never
+    // a silently short chunk list.
+    debug_assert_eq!(
+        at,
+        data.len(),
+        "stitcher stopped before the end of the input"
+    );
+    if at != data.len() {
+        return Err(io::Error::other(
+            "stitcher stopped before the end of the input",
+        ));
+    }
     counters.chunks = to_u64(out.len());
     Ok((out, counters))
 }

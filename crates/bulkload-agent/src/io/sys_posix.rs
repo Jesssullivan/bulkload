@@ -496,3 +496,73 @@ pub fn socket_buffers(fd: impl AsFd) -> io::Result<(libc::c_int, libc::c_int)> {
     }
     Ok(values.into())
 }
+
+/// Test support: a process-wide `RLIMIT_FSIZE` soft limit with `SIGXFSZ`
+/// ignored, so a write past the limit is accepted up to it and then fails
+/// with `EFBIG` instead of ending the process. Dropping it restores the old
+/// limit and disposition. Process-wide: a test using it must run alone.
+#[cfg(all(test, feature = "io-trace"))]
+pub struct FileSizeLimit {
+    old_limit: libc::rlimit,
+    old_action: libc::sigaction,
+}
+
+#[cfg(all(test, feature = "io-trace"))]
+impl FileSizeLimit {
+    /// Set the soft file-size limit to `bytes` and ignore `SIGXFSZ`.
+    ///
+    /// # Errors
+    /// Returns the `getrlimit`, `sigaction` or `setrlimit` failure.
+    pub fn set(bytes: u64) -> io::Result<Self> {
+        let mut old_limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `old_limit` is a live, exclusively borrowed `rlimit`.
+        check(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut old_limit) })?;
+        let zeroed = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: an all-zero `sigaction` is a valid value: no handler
+        // pointer, an empty flag set and a zeroed mask.
+        let mut ignore = unsafe { zeroed.assume_init() };
+        ignore.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: `ignore.sa_mask` is a live, exclusively borrowed mask.
+        check(unsafe { libc::sigemptyset(&raw mut ignore.sa_mask) })?;
+        let mut old_action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: both pointers are live locals of type `sigaction` for the
+        // call; the kernel fills `old_action`.
+        check(unsafe {
+            libc::sigaction(libc::SIGXFSZ, &raw const ignore, old_action.as_mut_ptr())
+        })?;
+        // SAFETY: `sigaction` returned 0, so it filled `old_action`, which
+        // was zero-initialized in any case.
+        let old_action = unsafe { old_action.assume_init() };
+        let limit = libc::rlimit {
+            rlim_cur: bytes,
+            rlim_max: old_limit.rlim_max,
+        };
+        let guard = Self {
+            old_limit,
+            old_action,
+        };
+        // SAFETY: `limit` is a live `rlimit` for the call.
+        check(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit) })?;
+        Ok(guard)
+    }
+}
+
+#[cfg(all(test, feature = "io-trace"))]
+impl Drop for FileSizeLimit {
+    fn drop(&mut self) {
+        // SAFETY: `old_limit` is a live `rlimit` read by `getrlimit`.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const self.old_limit) };
+        // SAFETY: `old_action` is the disposition `sigaction` returned, and a
+        // null old-action pointer is allowed.
+        let _ = unsafe {
+            libc::sigaction(
+                libc::SIGXFSZ,
+                &raw const self.old_action,
+                std::ptr::null_mut(),
+            )
+        };
+    }
+}

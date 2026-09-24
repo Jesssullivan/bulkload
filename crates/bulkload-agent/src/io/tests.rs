@@ -494,42 +494,189 @@ mod traced {
         assert_eq!(modes, vec![file_mode, dir_mode, temp_mode]);
     }
 
-    /// Review #3: two threads race overlapping writes into one file. With
-    /// the serial lock, replaying the recorded writes in trace order must
-    /// rebuild exactly the bytes on disk; an event order that differed from
-    /// the syscall order would leave the wrong writer's bytes on top.
+    /// Review r2 finding 1 (reviewer probe P3a): two threads race
+    /// create-exclusive and unlink of one name. The kernel forces the
+    /// successful Create and Unlink of that name to alternate, so any trace
+    /// order that differs from the syscall order shows up as two Creates or
+    /// two Unlinks in a row, at any step. Without the serial lock this finds
+    /// order violations in every run (reviewer: 30/72/54 over 3 runs).
     #[test]
-    fn concurrent_traced_writes_replay_to_the_file_on_disk() {
-        const ROUNDS: usize = 400;
+    fn create_and_unlink_of_one_name_alternate_in_the_trace() {
+        const ROUNDS: usize = 20_000;
         let dir = tempfile::TempDir::new().unwrap();
         let root = sys::open_root(dir.path()).unwrap();
-        let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
         let recorder = Recorder::new();
         let start = std::sync::Barrier::new(2);
+        let wins = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
-            for (byte, offset, len) in [(b'a', 0_u64, 64_usize), (b'b', 16, 32)] {
-                let (recorder, fd, start) = (&recorder, &fd, &start);
+            for _ in 0..2 {
+                let (recorder, root, start, wins) = (&recorder, &root, &start, &wins);
                 scope.spawn(move || {
                     let _attached = recorder.attach();
-                    let payload = vec![byte; len];
                     start.wait();
                     for _ in 0..ROUNDS {
-                        sys::pwrite_all(fd, &payload, offset).unwrap();
+                        match sys::openat_beneath(root, Path::new("x"), OpenMode::CreateExcl(0o600))
+                        {
+                            Ok(fd) => {
+                                wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                drop(fd);
+                                sys::unlinkat(root, &c("x"), false).unwrap();
+                            }
+                            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                            Err(error) => panic!("{error}"),
+                        }
                     }
                 });
             }
         });
         let events = recorder.take();
-        assert_eq!(events.len(), 2 * ROUNDS, "one event per write");
-        let mut replay = vec![0_u8; 64];
-        for event in &events {
-            let Event::Write { offset, data, .. } = event else {
-                panic!("unexpected event {event:?}");
-            };
-            let start = usize::try_from(*offset).unwrap();
-            replay[start..start + data.len()].copy_from_slice(data);
+        let mut present = false;
+        let mut violations = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                Event::Create {
+                    name: Some(name), ..
+                } if name == b"x" => {
+                    if present {
+                        violations.push(index);
+                    }
+                    present = true;
+                }
+                Event::Unlink { name, .. } if name == b"x" => {
+                    if !present {
+                        violations.push(index);
+                    }
+                    present = false;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
         }
-        assert_eq!(fs::read(dir.path().join("f")).unwrap(), replay);
+        let wins = wins.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(events.len(), 2 * wins);
+        assert!(wins > 0, "no create ever succeeded");
+        assert!(
+            violations.is_empty(),
+            "trace order differs from syscall order at events {:?} of {}",
+            violations.iter().take(8).collect::<Vec<_>>(),
+            events.len()
+        );
+    }
+
+    /// Review r2 finding 1 (reviewer probe P3b): each round, thread A writes a
+    /// 1 MiB block (its event build copies and hashes it: a long window) and
+    /// thread B writes one byte at a jittered point inside that window. After
+    /// every round the file on disk is compared with the replay of the trace
+    /// so far, so each round is an independent chance to catch a misordered
+    /// pair. Without the serial lock this mismatches in most rounds
+    /// (reviewer: 195/188/157 of 400).
+    #[test]
+    fn every_round_the_trace_replays_to_the_bytes_on_disk() {
+        const ROUNDS: usize = 400;
+        const BIG: usize = 1 << 20;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = sys::open_root(dir.path()).unwrap();
+        let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
+        let recorder = Recorder::new();
+        let meet = std::sync::Barrier::new(3);
+        let mut replay = vec![0_u8; BIG];
+        let mut mismatches = Vec::new();
+        std::thread::scope(|scope| {
+            let (recorder_a, fd_a, meet_a) = (&recorder, &fd, &meet);
+            scope.spawn(move || {
+                let _attached = recorder_a.attach();
+                for round in 0..ROUNDS {
+                    let payload = vec![u8::try_from(round % 200).unwrap() + 1; BIG];
+                    meet_a.wait();
+                    sys::pwrite_all(fd_a, &payload, 0).unwrap();
+                    meet_a.wait();
+                }
+            });
+            let (recorder_b, fd_b, meet_b) = (&recorder, &fd, &meet);
+            scope.spawn(move || {
+                let _attached = recorder_b.attach();
+                for round in 0..ROUNDS {
+                    meet_b.wait();
+                    let spin = std::time::Instant::now();
+                    let delay = std::time::Duration::from_micros(
+                        u64::try_from((round * 37) % 3000).unwrap(),
+                    );
+                    while spin.elapsed() < delay {
+                        std::hint::spin_loop();
+                    }
+                    sys::pwrite_all(fd_b, &[0xEE], 0).unwrap();
+                    meet_b.wait();
+                }
+            });
+            for round in 0..ROUNDS {
+                meet.wait();
+                meet.wait();
+                for event in recorder.take() {
+                    let Event::Write { offset, data, .. } = event else {
+                        panic!("unexpected event {event:?}");
+                    };
+                    let start = usize::try_from(offset).unwrap();
+                    replay[start..start + data.len()].copy_from_slice(&data);
+                }
+                let mut disk = [0_u8; 1];
+                sys::pread_full(&fd, &mut disk, 0).unwrap();
+                if disk[0] != replay[0] {
+                    mismatches.push(round);
+                }
+            }
+        });
+        assert!(
+            mismatches.is_empty(),
+            "trace replay differs from disk after rounds {:?} ({} of {ROUNDS})",
+            mismatches.iter().take(8).collect::<Vec<_>>(),
+            mismatches.len()
+        );
+    }
+
+    /// Review r2 finding 2 (reviewer probe P5): a write the kernel accepts
+    /// only in part is traced as exactly the accepted prefix. `RLIMIT_FSIZE`
+    /// makes the kernel accept 10 000 bytes of a 20 000-byte write and then
+    /// fail with `EFBIG`. The limit is process-wide, so this test is ignored
+    /// in the normal run and `just rust-check` runs it alone
+    /// (`--exact --test-threads=1`).
+    #[test]
+    #[ignore = "sets the process-wide RLIMIT_FSIZE; just rust-check runs it alone"]
+    fn partial_write_prefix_is_traced() {
+        const LIMIT: u64 = 10_000;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = sys::open_root(dir.path()).unwrap();
+        let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
+        let payload: Vec<u8> = (0..20_000_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let recorder = Recorder::new();
+        let result = {
+            let _limit = sys::FileSizeLimit::set(LIMIT).unwrap();
+            let _attached = recorder.attach();
+            sys::pwrite_all(&fd, &payload, 0)
+        };
+        let events = recorder.take();
+        let on_disk = fs::read(dir.path().join("f")).unwrap();
+        let error = result.expect_err("a write past RLIMIT_FSIZE must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::EFBIG), "{error}");
+        assert_eq!(
+            on_disk.len(),
+            usize::try_from(LIMIT).unwrap(),
+            "the kernel accepts the prefix"
+        );
+        assert_eq!(on_disk.as_slice(), &payload[..on_disk.len()]);
+        assert_eq!(events.len(), 1, "the accepted prefix is traced: {events:?}");
+        let Event::Write {
+            offset,
+            data,
+            digest,
+            ..
+        } = &events[0]
+        else {
+            panic!("not a write: {:?}", events[0]);
+        };
+        assert_eq!(*offset, 0);
+        assert_eq!(data.as_slice(), on_disk.as_slice());
+        assert_eq!(*digest, *blake3::hash(&on_disk).as_bytes());
     }
 
     #[test]
