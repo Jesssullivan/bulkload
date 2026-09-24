@@ -16,8 +16,41 @@
 //! rather than any concrete cache, so callers choose a persistent, in-memory
 //! or null cache.
 
+// Crash-consistency fault points. With the `fault-injection` feature each
+// expands to a call into `fault`; without it each expands to an empty block,
+// so a shipped build carries no fault code at all. See `fault` for the list.
+#[cfg(feature = "fault-injection")]
+macro_rules! fault_point {
+    ($point:ident) => {{
+        $crate::fault::hit($crate::fault::Point::$point);
+    }};
+}
+
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! fault_point {
+    ($point:ident) => {{}};
+}
+
+// Live-writer hook: runs registered source mutations once per capture, after
+// the first content chunk has been read and before the rest of the file is.
+#[cfg(feature = "fault-injection")]
+macro_rules! fault_mid_read {
+    ($first:expr, $path:expr) => {{
+        if $first {
+            $crate::fault::mid_read($path);
+        }
+    }};
+}
+
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! fault_mid_read {
+    ($first:expr, $path:expr) => {{}};
+}
+
 pub mod counters;
 pub mod estate;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod freshness;
 pub mod git_carry;
 pub mod handoff;

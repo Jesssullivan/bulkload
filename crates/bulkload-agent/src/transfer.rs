@@ -35,7 +35,7 @@ use crate::counters::{self, Counter};
 use crate::freshness::{NullCache, StatIdentity};
 use crate::materialize::Destination;
 use crate::transfer_store::{
-    row_key, Manifest, PreparedEvent, Side, Store, StorePublisher, PERSIST_BATCH,
+    row_key, Manifest, PreparedEvent, PublisherSide, Store, StorePublisher, PERSIST_BATCH,
 };
 use crate::walk::{walk, WalkOptions};
 use crate::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
@@ -198,7 +198,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         return Err(BulkloadRefusal::FrameCodec);
     };
     let root = std::fs::canonicalize(path(root))?;
-    let store = Store::open(&path(state))?.with_side(Side::Source);
+    let store = Store::open(&path(state))?;
     if store.root().starts_with(&root) || root.starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
@@ -209,7 +209,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         meta.dev(),
         meta.ino(),
     ))?;
-    let mut publisher = store.publisher()?;
+    let mut publisher = store.publisher(PublisherSide::Source)?;
     write_frame(
         output,
         FrameKind::TransferStart {
@@ -273,6 +273,7 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
             },
         )?;
     }
+    fault_point!(ServeBeforeDone);
     write_frame(
         output,
         FrameKind::TransferDone {
@@ -301,7 +302,7 @@ fn send_batch<R: Read, W: Write>(
             let sender = sender.clone();
             let next = &next;
             std::thread::Builder::new().spawn_scoped(scope, move || {
-                let opened = Store::open_reader(state).map(|store| store.with_side(Side::Source));
+                let opened = Store::open_reader(state);
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(row) = batch.get(index) else {
@@ -351,7 +352,9 @@ fn send_batch<R: Read, W: Write>(
                     ) => break,
                 }
             }
-            for ack in publisher.publish_group(group)? {
+            let acknowledgements = publisher.publish_group(group)?;
+            fault_point!(ServeAfterPublishGroup);
+            for ack in acknowledgements {
                 bytes_read = bytes_read.saturating_add(ack.bytes_read);
                 completed += 1;
                 let row = batch
@@ -367,6 +370,7 @@ fn send_batch<R: Read, W: Write>(
                 match ack.captured {
                     Ok(manifest) => {
                         send_content(input, output, &manifest, store, row)?;
+                        fault_point!(ServeAfterContent);
                     }
                     Err(refusal) => write_frame(
                         output,
@@ -442,7 +446,7 @@ pub fn receive<R: Read, W: Write>(
     destination: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
-    let store = Store::open(destination_state)?.with_side(Side::Destination);
+    let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
@@ -464,7 +468,7 @@ pub fn receive<R: Read, W: Write>(
         target_meta.dev(),
         target_meta.ino(),
     ))?;
-    let mut publisher = store.publisher()?;
+    let mut publisher = store.publisher(PublisherSide::Destination)?;
     let mut stats = TransferStats::default();
     let mut rows = 0;
     loop {
@@ -486,6 +490,7 @@ pub fn receive<R: Read, W: Write>(
                         needed: needed.clone(),
                     },
                 )?;
+                fault_point!(ReceiveAfterWantFiles);
                 loop {
                     match read_frame(input)?.kind {
                         FrameKind::FileContent { index } => {
@@ -587,7 +592,12 @@ fn receive_content<R: Read, W: Write>(
     let materialize_started = Instant::now();
     let applied = received
         .and_then(|()| context.target.file(row, &manifest, context.store))
-        .and_then(|identity| context.store.record_output(&key, &identity));
+        .and_then(|identity| {
+            fault_point!(ReceiveBeforeRecordOutput);
+            context.store.record_output(&key, &identity)?;
+            fault_point!(ReceiveAfterRecordOutput);
+            Ok(())
+        });
     MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
     write_frame(
         output,
@@ -595,6 +605,7 @@ fn receive_content<R: Read, W: Write>(
             success: applied.is_ok(),
         },
     )?;
+    fault_point!(ReceiveAfterApplied);
     match applied {
         Ok(()) => stats.completed += 1,
         Err(refusal) => stats
@@ -647,6 +658,7 @@ fn receive_chunks<R: Read, W: Write>(
                         capture_id: 0,
                         chunks: std::mem::take(&mut pending),
                     }])?;
+                    fault_point!(ReceiveAfterChunkPublish);
                 }
             }
             FrameKind::Refusal { .. } => return Err(BulkloadRefusal::SealedObjectMissing),
@@ -657,6 +669,7 @@ fn receive_chunks<R: Read, W: Write>(
         capture_id: 0,
         chunks: pending,
     }])?;
+    fault_point!(ReceiveAfterChunkPublish);
     Ok(())
 }
 
@@ -746,6 +759,7 @@ fn capture_uncached(
         crate::hash::CDC_MAX_BYTES,
     ) {
         let chunk = chunk.map_err(|_| BulkloadRefusal::Io(None))?;
+        fault_mid_read!(chunks.is_empty(), &file_path);
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }

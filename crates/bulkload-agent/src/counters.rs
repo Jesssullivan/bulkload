@@ -73,7 +73,6 @@ counters! {
     // Bytes written, by stage.
     SourcePackWrite => "write_source_pack_bytes",
     DestPackWrite => "write_dest_pack_bytes",
-    OtherPackWrite => "write_other_pack_bytes",
     LegacyChunkWrite => "write_legacy_chunk_bytes",
     DestMaterializeWrite => "write_dest_materialize_bytes",
     // Framed transport, as seen by this process.
@@ -103,7 +102,6 @@ counters! {
     // SQLite commits, by kind. Autocommit statements count as one commit each.
     SqlitePublishSource => "sqlite_publish_source_commits",
     SqlitePublishDest => "sqlite_publish_dest_commits",
-    SqlitePublishOther => "sqlite_publish_other_commits",
     SqliteRecordOutput => "sqlite_record_output_commits",
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
