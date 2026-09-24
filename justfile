@@ -52,7 +52,7 @@ rust-check:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
-    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1
+    cd {{ root }} && BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture
     cd {{ root }} && cargo test --workspace --locked
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness

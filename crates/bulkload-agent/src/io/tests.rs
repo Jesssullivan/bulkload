@@ -394,6 +394,9 @@ mod traced {
     use crate::io::trace::recorder::Recorder;
     use crate::io::trace::{Event, SyncKind};
 
+    /// Set only by `just rust-check`'s isolated partial-write step.
+    const PARTIAL_WRITE_ALONE: &str = "BULKLOAD_IO_PARTIAL_WRITE_ALONE";
+
     #[test]
     fn mutating_calls_record_events_only_while_attached() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -636,12 +639,21 @@ mod traced {
     /// only in part is traced as exactly the accepted prefix. `RLIMIT_FSIZE`
     /// makes the kernel accept 10 000 bytes of a 20 000-byte write and then
     /// fail with `EFBIG`. The limit is process-wide, so this test is ignored
-    /// in the normal run and `just rust-check` runs it alone
-    /// (`--exact --test-threads=1`).
+    /// in the normal run, and it acts only when `PARTIAL_WRITE_ALONE` is
+    /// set, which only `just rust-check`'s isolated step (`--exact
+    /// --test-threads=1`) sets. A `--include-ignored` run beside the other
+    /// write tests therefore does nothing instead of failing them with
+    /// spurious `EFBIG`.
     #[test]
     #[ignore = "sets the process-wide RLIMIT_FSIZE; just rust-check runs it alone"]
     fn partial_write_prefix_is_traced() {
         const LIMIT: u64 = 10_000;
+        if std::env::var_os(PARTIAL_WRITE_ALONE).is_none() {
+            println!("SKIPPED partial_write_prefix_is_traced: {PARTIAL_WRITE_ALONE} is unset");
+            return;
+        }
+        let before = sys::FileSizeLimit::current().unwrap();
+        let ignored_before = sys::FileSizeLimit::sigxfsz_ignored().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let root = sys::open_root(dir.path()).unwrap();
         let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
@@ -651,9 +663,18 @@ mod traced {
         let recorder = Recorder::new();
         let result = {
             let _limit = sys::FileSizeLimit::set(LIMIT).unwrap();
+            assert_eq!(sys::FileSizeLimit::current().unwrap().0, LIMIT);
+            assert!(sys::FileSizeLimit::sigxfsz_ignored().unwrap());
             let _attached = recorder.attach();
             sys::pwrite_all(&fd, &payload, 0)
         };
+        // Review r3 note 2: the guard's drop restores the limit and the
+        // SIGXFSZ disposition; an empty drop fails here.
+        assert_eq!(sys::FileSizeLimit::current().unwrap(), before);
+        assert_eq!(
+            sys::FileSizeLimit::sigxfsz_ignored().unwrap(),
+            ignored_before
+        );
         let events = recorder.take();
         let on_disk = fs::read(dir.path().join("f")).unwrap();
         let error = result.expect_err("a write past RLIMIT_FSIZE must fail");
