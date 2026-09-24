@@ -118,3 +118,11 @@
   normal after the crash (about 1 s per verb run), so the full corpus goes
   through the CLI only as a sample; the in-process test covers all of it.
 - **R6-C:** one sentence in both docs.
+- **Cohort raw outputs (item 5):** all 26 repositories re-run read-only from
+  neo at 03:45:28Z–03:48:15Z with the `332c7be` release binary. The raw
+  output is committed as
+  `docs/evidence/git-carry-estimate-cohort1-raw-2026-09-24.txt`, and the
+  evidence table was regenerated from it: 5,415 objects, 9,758,779 B.
+- **Write scan:** nothing on sting. On neo, only glorious.build's files from
+  another session's commit at 03:45:30Z (reflog `commit:`), about 90 s
+  before its pair ran.

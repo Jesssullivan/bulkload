@@ -15,9 +15,9 @@ count of the thin pack that `pack-objects --stdout --thin --revs
 --delta-base-offset` builds for the missing set, counted in flight and never
 written. The negotiation model is upload-pack's: sparse edges and bitmaps
 pinned off, and, for a shallow destination, upload-pack's shallow-client
-invocation. Against sting's current refs, neo is missing **3,937 objects**, and
-their thin pack is **8.532 MB**. The informational stored size of the same
-objects (`missing_bytes_disk`) is 15.050 MB. The thin pack is smaller because it sends
+invocation. Against sting's current refs, neo is missing **5,415 objects**, and
+their thin pack is **9.759 MB** (9,758,779 B). The informational stored size of
+the same objects (`missing_bytes_disk`) is 23.675 MB. The thin pack is smaller because it sends
 deltas against objects sting already holds. crs310-8g-2s-in shows this most
 clearly: 0.449 MB thin against 3.550 MB stored.
 
@@ -57,19 +57,26 @@ clearly: 0.449 MB thin against 3.550 MB stored.
   A bitmapped sender that left bitmaps on would pack *fewer* objects than the
   walk (W6 M1 spike, bulkload#64), so the estimate stays an upper bound for it.
 
-The cohort-1 history on disk is 1,467.50 MB (informational), so the carry
-moves 0.58 % of it. No pair was refused (R-N75): blahaj is shallow on both
+The cohort-1 history on disk is 1,475.90 MB (informational), so the carry
+moves 0.66 % of it. No pair was refused (R-N75): blahaj is shallow on both
 sides at the same frontier, so it estimates, and no destination is a partial
 clone.
 
 ## Identity and command
 
-- **Revision:** bulkload `f65313b` (`feat/m2-w6-git-carry-estimate`, after the
-  PR #55 review fixes). The release binary was built from that tree.
+- **Revision:** bulkload `332c7be` (`feat/m2-w6-git-carry-estimate`, after the
+  PR #55 r6 fixes and R-N121). The release binary was built from that tree. Its
+  estimate logic is that of `89e572c` (R-N116); `332c7be` changes only how a
+  refusal reports stderr.
+- **Raw output:** every repository's full verb output, with exact byte counts,
+  is committed in
+  [`git-carry-estimate-cohort1-raw-2026-09-24.txt`](git-carry-estimate-cohort1-raw-2026-09-24.txt).
+  The MB figures on this page are those bytes / 10^6, rounded.
 - **Command:** `bulkload-agent git-carry-estimate /Users/jess/git/<repo>
   sting:/srv/fast-local/jess/git/<repo>`, run once per repository.
-- **Window:** 2026-09-23T17:56:23Z to 17:57:35Z, 72 s for all 26
-  repositories. blahaj took the longest, at 20 s.
+- **Window:** 2026-09-24T03:45:28Z to 03:48:15Z, 167 s for all 26
+  repositories, one run each. Earlier runs on this page (17:56Z, 22:03Z,
+  01:34Z) are superseded; neo moved between them.
 - **Probe:** one POSIX script, run through `bash -s -- PATH`. It runs locally
   for the source and over **one** ssh session per repository for sting
   (`ssh -T -oBatchMode=yes -oConnectTimeout=15 sting "env GIT_NO_LAZY_FETCH=1
@@ -94,15 +101,11 @@ clone.
 - **No writes on either host.** After the run, `find` of every repository's
   git dir for files newer than the start of the window found:
   - **sting:** nothing.
-  - **neo:** one file, `bulkload/.git/worktrees/review-pr53b/index`, written
-    at 17:57:07Z. That is about 12 s after bulkload's pair finished. It is
-    another lane's worktree, and the verb never writes an index.
-
-  A first run at 17:42:27Z–17:43:21Z, from `5098e3e`, also wrote nothing on
-  sting. On neo, the only new files were blahaj's
-  `worktrees/electrical-powerdown-20260923/*` and `config`. They were written
-  at 17:43:25Z, after that run ended, when another session ran
-  `worktree add -b`.
+  - **neo:** only glorious.build's `index`, `COMMIT_EDITMSG`, `logs/HEAD` and
+    new objects from 03:45:30Z–03:45:38Z. The reflog records them as
+    `commit: docs: renumber the sail width ruling W112 (W100)`, another
+    session's commit. It landed about 90 s before glorious.build's pair
+    started, and the verb never commits.
 - **Units:** MB means 10^6 bytes. `missing_thin_pack_bytes` is the whole pack
   stream: header, entries and trailer. `missing_bytes_disk` and "history on
   disk" are sums of `%(objectsize:disk)`, the size each object takes in neo's
@@ -119,13 +122,13 @@ clone.
 | DarwinNicUtil | 1.07 | 416 | 65 | 56 | 9 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | MassageIthaca | 199.37 | 21,443 | 1,793 | 1,787 | 6 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | account-controller | 1.53 | 832 | 32 | 22 | 10 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| blahaj ¹ | 34.13 | 39,798 | 2,281 | 1,784 | 497 | 4 | 31 | **0.016** | 31 | 0.051 | 6 / 17 / 8 / 0 |
-| bulkload | 7.81 | 2,723 | 78 | 68 | 10 | 2 | 672 | **0.426** | 672 | 1.909 | 115 / 335 / 221 / 1 |
+| blahaj | 34.13 | 39,798 | 2,281 | 1,784 | 497 | 4 | 31 | **0.016** | 31 | 0.051 | 6 / 17 / 8 / 0 |
+| bulkload | 13.12 | 3,565 | 78 | 68 | 10 | 2 | 1,514 | **0.932** | 1,514 | 7.217 | 223 / 797 / 493 / 1 |
 | ci-templates | 5.05 | 2,091 | 213 | 182 | 31 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | claude-kvm | 205.06 | 2,013 | 32 | 26 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| dcx2496-control | 0.47 | 901 | 47 | 41 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| glorious-build-infra | 0.39 | 358 | 59 | 21 | 38 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| glorious.build | 21.21 | 4,554 | 136 | 115 | 21 | 0 | 200 | **6.281** | 200 | 7.353 | 27 / 100 / 73 / 0 |
+| dcx2496-control | 0.51 | 920 | 47 | 41 | 6 | 0 | 19 | **0.010** | 19 | 0.040 | 1 / 9 / 9 / 0 |
+| glorious-build-infra | 0.47 | 576 | 60 | 50 | 10 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
+| glorious.build | 23.52 | 4,822 | 137 | 116 | 21 | 0 | 461 | **6.776** | 461 | 9.651 | 69 / 232 / 160 / 0 |
 | great-falls-tool-bus-infra | 1.77 | 3,250 | 245 | 227 | 18 | 0 | 41 | **0.012** | 41 | 0.084 | 4 / 22 / 15 / 0 |
 | greatfallstoolbus.org | 8.67 | 5,897 | 309 | 292 | 17 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | legalab | 3.99 | 2,592 | 154 | 148 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
@@ -136,79 +139,26 @@ clone.
 | qutebrowser | 64.50 | 182,869 | 173 | 167 | 6 | 1 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | softconnect | 0.33 | 194 | 8 | 2 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | tailnet-acl | 0.17 | 324 | 34 | 28 | 6 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| tinyland-infra | 1.94 | 2,707 | 99 | 74 | 25 | 2 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
-| tinyland.dev | 834.67 | 38,337 | 445 | 382 | 63 | 3 | 77 | **0.017** | 77 | 0.123 | 7 / 52 / 18 / 0 |
+| tinyland-infra | 1.80 | 2,884 | 99 | 84 | 15 | 2 | 32 | **0.036** | 32 | 0.231 | 5 / 16 / 11 / 0 |
+| tinyland.dev | 835.21 | 38,615 | 445 | 382 | 63 | 3 | 355 | **0.164** | 355 | 0.672 | 10 / 179 / 166 / 0 |
 | medical-massage-specialists-infra | 5.10 | 4,168 | 125 | 125 | 0 | 0 | 0 | **0.000** | 0 | 0.000 | 0 / 0 / 0 / 0 |
 | printstack | 1.75 | 2,624 | 30 | 25 | 5 | 2 | 10 | **0.025** | 10 | 0.070 | 2 / 4 / 4 / 0 |
-| asfirewire-legalab | 45.02 | 19,483 | 61 | 60 | 1 | 0 | 2,234 | **1.258** | 2,234 | 1.587 | 140 / 1098 / 996 / 0 |
+| asfirewire-legalab | 45.27 | 19,549 | 61 | 60 | 1 | 0 | 2,280 | **1.291** | 2,280 | 1.787 | 142 / 1118 / 1020 / 0 |
 | crs310-8g-2s-in | 7.51 | 6,015 | 273 | 273 | 0 | 1 | 614 | **0.449** | 614 | 3.550 | 66 / 267 / 281 / 0 |
-| **Total (26)** | **1,467.50** | **350,564** | **6,906** | **6,052** | **854** | **22** | **3,937** | **8.532** | **3,937** | **15.050** | 371 / 1916 / 1649 / 1 |
+| **Total (26)** | **1,475.90** | **352,432** | **6,908** | **6,092** | **816** | **22** | **5,415** | **9.759** | **5,415** | **23.675** | 532 / 2682 / 2200 / 1 |
 
-¹ **blahaj was re-run alone** at 2026-09-24T01:34:42Z–01:35:02Z with the
-release binary built from `bb6efa7`. That binary's estimate logic is the same
-as `89e572c`'s: every held tip is a have, ancestors first (R-N116), with
-upload-pack's shallow-client model and the flag pins. The other 25 rows are
-from the 17:56Z run.
-
-The 22:03Z run's raw output was lost when neo crashed, before it was
-persisted. This run replaces it.
-
-- **Result:** 31 objects, 15,584 B (the missing set's stored size is
-  51,001 B, informational).
-- **Shallow:** both sides are shallow at the same frontier (`bf9acf31`).
-- **Haves:** all 1,784 held tips are haves.
-- **No writes:** a scan after the run found no file under blahaj's git dir
-  newer than the start of the run, on neo or on sting.
-- **Why it moved from 22:03Z (30 / 14,644):** neo's blahaj changed in
-  between. `source_objects` went from 39,797 to 39,798, and missing commits
-  from 5 to 6. sting's side is unchanged: 2,281 tips, 1,784 of them held.
-- **Raw output:**
-
-  ```text
-  source=/Users/jess/git/blahaj
-  destination=sting:/srv/fast-local/jess/git/blahaj
-  source_objects=39798
-  source_history_bytes=34128615
-  source_commits=3752
-  source_trees=21141
-  source_blobs=14877
-  source_tags=28
-  source_unavailable_objects=0
-  source_partial_clone=0
-  source_shallow_count=1
-  stash_entries=4
-  destination_tip_count=2281
-  destination_shallow_count=1
-  haves_used=1784
-  destination_tips_unknown_to_source=497
-  missing_objects=31
-  missing_unavailable_objects=0
-  missing_thin_pack_bytes=15584
-  missing_thin_pack_objects=31
-  missing_bytes_disk=51001
-  missing_commits=6
-  missing_commit_bytes_disk=3718
-  missing_trees=17
-  missing_tree_bytes_disk=15590
-  missing_blobs=8
-  missing_blob_bytes_disk=31693
-  missing_tags=0
-  missing_tag_bytes_disk=0
-  gate_metric=missing_thin_pack_bytes
-  gate_rule=R-N97,R-N113,R-N116 sent_bytes<=1.1*missing_thin_pack_bytes sent_objects<=missing_objects oracle=upload-pack(haves=every_held_tip,order=ancestors_first; shallow: frontier=source's, shallow_lines, --shallow)
-  informational=source_history_bytes,missing_bytes_disk,missing_*_bytes_disk
-  ```
-
-- **Earlier models, on the 22:03Z neo state and sting's tips at that time:**
+- **blahaj** is 31 objects / 15,584 B in this run, the same as its 01:34Z
+  re-run. Its history across the review rounds, on earlier neo states:
 
   | Model | Objects | Thin-pack bytes |
   |---|---:|---:|
   | Old verb: plain walk, all haves | 48 | 17,686 |
   | r2 verb: parent-drop rule (upload-pack's largest pack) | 32 | 14,826 |
   | r4 verb: every held tip, ancestors first (R-N116), 22:03Z | 30 | 14,644 |
+  | r4 verb, 01:34Z and 03:45Z (one more neo change) | 31 | 15,584 |
 
-- **Earlier figure:** the r2 review's 20 objects / 10,146 B was measured on an
-  earlier source state, so it is not comparable.
+  The r2 review's 20 objects / 10,146 B was measured on an earlier source
+  state, so it is not comparable.
 
 - **Thin-pack objects equal missing objects in every repository.** In the
   first run, from `5098e3e`, bulkload packed 659 objects against 658 walked.
@@ -218,8 +168,9 @@ persisted. This run replaces it.
   deep in the haves' history, so a bitmapped source was falsely refused. The
   verb refuses (`CONTRACT_SELF_INCONSISTENT`) if the counts still differ. The M1
   sender must pin both flags.
-- **Moving repositories:** bulkload and glorious.build gained commits between
-  the two runs; the table is the second run.
+- **Moving repositories:** bulkload, glorious.build and asfirewire-legalab
+  gained commits on neo across the day. The table is the single 03:45Z run,
+  and its raw output is committed alongside this page.
 - **"Tips unknown to neo"** counts destination tips that neo does not hold as
   objects. Most are sting-side `refs/carry/*` capture commits, which exist only
   in the carried bundles. A follow-up refname read, made during the first
@@ -249,8 +200,8 @@ persisted. This run replaces it.
   refs reach: `source_unavailable_objects=0`. Its newest pack is from
   2026-09-22, so the first baseline run did not lazily fetch into it. The
   verb now runs with `GIT_NO_LAZY_FETCH=1`, so it cannot.
-- **Destination tips rose from 6,885 to 6,906** because the probe now reads
-  every worktree's `HEAD` and per-worktree refs.
+- **Destination tips rose from 6,885 to 6,908:** the probe now reads every
+  worktree's `HEAD` and per-worktree refs, and sting's own refs moved.
 - **medical-massage-specialists-infra** has no missing objects, even though
   its cohort-1 apply was refused. Sting's own refs already cover every object
   neo holds.
@@ -267,10 +218,10 @@ The design lane's figures are stored sizes, so they compare with
 | Repository | Design lane (stored) | `missing_bytes_disk` (info) | Match | `missing_thin_pack_bytes` (gate) |
 |---|---:|---:|---|---:|
 | crs310-8g-2s-in | 3.55 MB | 3.550 MB, 614 objects | **yes** (exact) | 0.449 MB |
-| asfirewire-legalab | 1.59 MB | 1.587 MB, 2,234 objects | **yes** (exact) | 1.258 MB |
-| glorious.build | 5.30 MB | 7.353 MB, 200 objects | no: neo moved | 6.281 MB |
-| Cohort history | 1,465 MB | 1,467.47 MB | **yes** (+2.3 MB of new commits) | — |
-| Cohort missing | 3,141 objects, ≈ 11 MB | 3,944 objects, 15.03 MB | no: neo moved | 8.530 MB |
+| asfirewire-legalab | 1.59 MB | 1.787 MB, 2,280 objects | no: neo moved (1.587 MB, 2,234 objects, exact at 17:56Z) | 1.291 MB |
+| glorious.build | 5.30 MB | 9.651 MB, 461 objects | no: neo moved | 6.776 MB |
+| Cohort history | 1,465 MB | 1,475.90 MB | **yes** (+10.9 MB of new commits) | — |
+| Cohort missing | 3,141 objects, ≈ 11 MB | 5,415 objects, 23.68 MB | no: neo moved | 9.759 MB |
 
 **Why the figures moved.** In the first baseline run (`8472eae`), every missing commit was attributed by its
 committer date. neo committed 91 bulkload commits (60 of them on
@@ -336,6 +287,6 @@ The verb uses every destination ref, as the v2 negotiation does.
   partial-clone destination, and a shallow destination whose frontier differs
   from the source's. Such a destination's refs do not prove it holds their
   history.
-- The bundle carry repacks the whole closure on every capture: 1,467 MB of
-  history, against an 8.5 MB thin pack actually missing today. The carry-v2
+- The bundle carry repacks the whole closure on every capture: 1,476 MB of
+  history, against a 9.8 MB thin pack actually missing today. The carry-v2
   negotiation removes that repacking.
