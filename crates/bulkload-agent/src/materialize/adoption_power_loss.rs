@@ -13,7 +13,12 @@
 //! all under one process-wide recorder. `check_view` enumerates every
 //! power-loss state of that resume.
 
-#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
 
 use super::*;
 use crate::io::crash_check::{check_view, Entry, Image, Options};
@@ -135,10 +140,8 @@ fn an_adopted_fallback_directory_is_sealed_before_its_record_binds() {
                     }
                     CommitRecord::DirectoryCreated {
                         node: Some(node), ..
-                    } => {
-                        if !matches!(view.node(*node), Some(Entry::Dir { .. })) {
-                            return Err(format!("bound directory record {node:?} is not named"));
-                        }
+                    } if !matches!(view.node(*node), Some(Entry::Dir { .. })) => {
+                        return Err(format!("bound directory record {node:?} is not named"));
                     }
                     _ => {}
                 }
