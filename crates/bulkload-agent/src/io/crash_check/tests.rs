@@ -866,6 +866,103 @@ fn a_device_barrier_orders_only_sent_mutations() {
     assert!(!z_without_x(&sent), "a sent X write is ordered before Z");
 }
 
+/// #74 review, D2 (checker mutant CM1): a full flush drains only the drive
+/// holding the file it names. A sent write on drive 1 stays optional after a
+/// full flush on drive 2; the same flush on drive 1 makes it durable.
+#[test]
+fn a_full_flush_drains_only_its_own_drive() {
+    let elsewhere = NodeId { dev: 2, ino: 77 };
+    let trace = |flushed: NodeId| {
+        vec![
+            write(KEEP_NODE, b"XXXX"),
+            Event::Sync {
+                node: KEEP_NODE,
+                kind: SyncKind::Kick,
+            },
+            Event::Sync {
+                node: flushed,
+                kind: SyncKind::FullFlush,
+            },
+        ]
+    };
+    let keeps = |events: &[Event]| -> BTreeSet<Vec<u8>> {
+        contents(events, &Options::default())
+            .0
+            .into_iter()
+            .map(|(keep, _)| keep)
+            .collect()
+    };
+    assert_eq!(
+        keeps(&trace(elsewhere)),
+        [KEEP.to_vec(), b"XXXX-bytes".to_vec()].into(),
+        "a full flush on another drive leaves this drive's write volatile"
+    );
+    assert_eq!(keeps(&trace(LEDGER)), [b"XXXX-bytes".to_vec()].into());
+}
+
+/// #74 review, D2 (checker mutant CM2): a device-wide barrier orders only
+/// I/O on its own drive, on both sides of the barrier. `far` sits on drive 2;
+/// `keep` and `other` on drive 1.
+///
+/// - X sent on drive 1, a barrier on drive 2, then Z on drive 1: Z may
+///   persist without X.
+/// - X sent on drive 1, a barrier on drive 2, then Z on drive 2: the barrier
+///   orders nothing sent on drive 1, so Z may persist without X.
+/// - Y sent on drive 2, a barrier on drive 2, then Z on drive 1: the barrier
+///   orders nothing issued on drive 1, so Z may persist without Y.
+#[test]
+fn a_device_barrier_orders_only_its_own_drive() {
+    const FAR: NodeId = NodeId { dev: 2, ino: 6 };
+    let image = with_other().with_file(b"far", FAR, b"");
+    let states = |events: &[Event]| -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let mut seen = Vec::new();
+        let report = check(&image, events, &Options::default(), |root, _| {
+            let read = |name: &str| std::fs::read(root.join(name)).map_err(|e| e.to_string());
+            seen.push((read("keep")?, read("other")?, read("far")?));
+            Ok(())
+        })
+        .unwrap();
+        assert!(report.passed(), "{}", report.summary(events));
+        seen
+    };
+    let sent_then_barrier = |sent: NodeId, data: &[u8], after: Event| {
+        vec![
+            write(sent, data),
+            Event::Sync {
+                node: sent,
+                kind: SyncKind::Kick,
+            },
+            Event::Sync {
+                node: FAR,
+                kind: SyncKind::Barrier,
+            },
+            after,
+        ]
+    };
+
+    let same_side = states(&sent_then_barrier(KEEP_NODE, b"XXXX", write(OTHER, b"Z")));
+    assert!(
+        same_side
+            .iter()
+            .any(|(keep, other, _)| keep == KEEP && other == b"Z"),
+        "a barrier on another drive does not order this drive's writes"
+    );
+    let earlier_elsewhere = states(&sent_then_barrier(KEEP_NODE, b"XXXX", write(FAR, b"Z")));
+    assert!(
+        earlier_elsewhere
+            .iter()
+            .any(|(keep, _, far)| keep == KEEP && far == b"Z"),
+        "a barrier orders only mutations sent on its own drive"
+    );
+    let later_elsewhere = states(&sent_then_barrier(FAR, b"Y", write(OTHER, b"Z")));
+    assert!(
+        later_elsewhere
+            .iter()
+            .any(|(_, other, far)| far.is_empty() && other == b"Z"),
+        "a barrier orders only mutations issued on its own drive"
+    );
+}
+
 /// Review M5 (a sync counts only once it completed): create tmp, write,
 /// rename, then fsync the file, then fsync the directory. A crash between the
 /// rename and the file fsync can publish `data` without its bytes, so this

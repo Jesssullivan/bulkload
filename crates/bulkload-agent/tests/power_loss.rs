@@ -190,8 +190,10 @@ fn traced_copy(scratch: &Scratch) -> (Image, Vec<Event>) {
 fn options() -> Options {
     Options {
         ignore_foreign: true,
-        // A real copy's trace is long; bounded crash points are listed in the
-        // report's summary, printed with every run.
+        // A real copy's trace is long, so some crash points are explored
+        // only within the bound. Each is listed in the report's summary: a
+        // failing assertion prints it in full; on a passing run libtest
+        // captures the `eprintln!`, so run with `--nocapture` to see it.
         accept_bounded: true,
         ..Options::default()
     }

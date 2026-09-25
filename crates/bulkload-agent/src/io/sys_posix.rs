@@ -360,8 +360,16 @@ pub fn fchmod(fd: impl AsFd, mode: u32) -> io::Result<()> {
     trace_serial!();
     let fd = fd.as_fd();
     let bits = super::sys::to_mode_t(mode & 0o7777)?;
-    // SAFETY: the descriptor is live for the call; `fchmod` takes no pointers.
-    check(unsafe { libc::fchmod(fd.as_raw_fd(), bits) })?;
+    // `EINTR` is retried, as `std::fs::set_permissions` does (#74 review, D7).
+    loop {
+        // SAFETY: the descriptor is live for the call; `fchmod` takes no
+        // pointers.
+        match check(unsafe { libc::fchmod(fd.as_raw_fd(), bits) }) {
+            Ok(_) => break,
+            Err(error) if is_interrupted(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
     trace_event!(
         "fchmod",
         Ok(super::trace::Event::SetMode {

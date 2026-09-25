@@ -917,6 +917,10 @@ impl StorePublisher {
     /// # Errors
     /// Refuses serialization or database failures; nothing is committed then.
     pub(crate) fn commit_outputs(&self, outputs: &[OutputRecord]) -> Result<()> {
+        // The trace's serial lock is taken before SQLite's write lock, the
+        // order every traced store write uses (#74 review, D5).
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         self.store
             .conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -962,8 +966,6 @@ impl StorePublisher {
             PublishSourceBeforeCommit,
             PublishDestinationBeforeCommit
         );
-        #[cfg(feature = "io-trace")]
-        let _serial = crate::io::trace::serialize();
         let started = Instant::now();
         let committed = self
             .store
@@ -1072,6 +1074,9 @@ impl StorePublisher {
         if locations.is_empty() && captures.is_empty() {
             return Ok(());
         }
+        // Trace lock before SQLite's write lock, as everywhere (D5).
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         self.store
             .conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -1116,8 +1121,6 @@ impl StorePublisher {
             PublishSourceBeforeCommit,
             PublishDestinationBeforeCommit
         );
-        #[cfg(feature = "io-trace")]
-        let _serial = crate::io::trace::serialize();
         let commit_started = Instant::now();
         #[cfg(test)]
         let committed = inject_fault(PublishFault::BeforeCommit).and_then(|()| {
