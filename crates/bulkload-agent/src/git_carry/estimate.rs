@@ -90,6 +90,9 @@ use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
 mod stderr_store;
+pub(in crate::git_carry) use stderr_store::{
+    create_private, cstring, open_existing, private_file, private_subdirectory, PrivateState,
+};
 pub use stderr_store::{Capture, StderrStore, CLASSIFY_LIMIT};
 
 /// Where the destination's offer is read from.
@@ -322,7 +325,7 @@ impl Refused {
         }
     }
 
-    const fn because(refusal: BulkloadRefusal, reason: &'static str) -> Self {
+    pub(super) const fn because(refusal: BulkloadRefusal, reason: &'static str) -> Self {
         Self {
             refusal,
             reason: Some(reason),
@@ -670,16 +673,17 @@ pub fn estimate_with(
     })
 }
 
-fn has_control(path: &OsStr) -> bool {
+pub(super) fn has_control(path: &OsStr) -> bool {
     path.as_bytes().iter().any(u8::is_ascii_control)
 }
 
 /// The source repository as the probe resolved it.
-struct Repository {
+#[derive(Debug)]
+pub(super) struct Repository {
     /// `rev-parse --absolute-git-dir` of the probed root.
-    git_dir: PathBuf,
+    pub(super) git_dir: PathBuf,
     /// The root's parent: discovery never climbs above the root.
-    ceiling: PathBuf,
+    pub(super) ceiling: PathBuf,
 }
 
 /// [`git`] on the probed git dir, plus the estimate's no-write, no-network
@@ -687,7 +691,7 @@ struct Repository {
 /// `core.hooksPath=/dev/null` come from [`git`]; this adds `--git-dir`,
 /// `GIT_CEILING_DIRECTORIES`, `maintenance.auto=false` and
 /// `GIT_NO_LAZY_FETCH`.
-fn hardened(repository: &Repository) -> Command {
+pub(super) fn hardened(repository: &Repository) -> Command {
     let mut command = git(&repository.git_dir);
     let mut git_dir = std::ffi::OsString::from("--git-dir=");
     git_dir.push(&repository.git_dir);
@@ -704,14 +708,14 @@ fn hardened(repository: &Repository) -> Command {
 
 /// What one repository offers, as [`PROBE_SCRIPT`] reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Probe {
-    tips: BTreeSet<String>,
-    shallow: BTreeSet<String>,
-    partial: bool,
-    git_dir: PathBuf,
-    ceiling: PathBuf,
-    root: PathBuf,
-    common: PathBuf,
+pub(super) struct Probe {
+    pub(super) tips: BTreeSet<String>,
+    pub(super) shallow: BTreeSet<String>,
+    pub(super) partial: bool,
+    pub(super) git_dir: PathBuf,
+    pub(super) ceiling: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) common: PathBuf,
 }
 
 /// Exit status of [`PROBE_SCRIPT`] when its argument is not a repository root.
@@ -831,7 +835,7 @@ done
 printf 'end\n'
 "#;
 
-fn local_probe(repository: &Path) -> Command {
+pub(super) fn local_probe(repository: &Path) -> Command {
     let mut command = Command::new("bash");
     command.args(["-s", "--"]).arg(repository);
     for key in [
@@ -889,7 +893,7 @@ fn remote_command(path: &str) -> String {
 // large-error threshold. A refusal is the cold path; boxing it would change
 // this public shape for no measured gain.
 #[allow(clippy::result_large_err)]
-fn run_probe(
+pub(super) fn run_probe(
     command: &mut Command,
     store: Option<&StderrStore>,
 ) -> std::result::Result<Probe, Refused> {
@@ -937,6 +941,24 @@ fn run_probe(
         written.map_err(|_| BulkloadRefusal::Io(None))??;
         return Ok(parse_probe(&answer?)?);
     };
+    Err(child_refusal(
+        refusal,
+        None,
+        store,
+        (head, total, capture, capture_error),
+    ))
+}
+
+/// A refusal raised by a child, with its drained stderr classified and, with
+/// a `store`, kept privately under its keyed digest (R-N121). No byte of the
+/// stderr reaches the returned value.
+pub(super) fn child_refusal(
+    refusal: BulkloadRefusal,
+    reason: Option<&'static str>,
+    store: Option<&StderrStore>,
+    drained: Drained,
+) -> Refused {
+    let (head, total, capture, capture_error) = drained;
     let mut receipt = StderrReceipt {
         class: StderrClass::of(&head),
         keyed_blake3: None,
@@ -956,19 +978,21 @@ fn run_probe(
         (Some(store), Some(capture)) => store.discard(capture),
         _ => {}
     }
-    Err(Refused {
+    Refused {
         refusal,
-        reason: None,
+        reason,
         stderr: (total > 0).then_some(receipt),
-    })
+    }
 }
 
-type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal>);
+/// A drained stderr stream: the classified head, the total byte count, the
+/// private capture (with a store) and why the capture failed, if it did.
+pub(super) type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal>);
 
 /// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
 /// them all, and stream them all into `capture`. A capture write failure is
 /// recorded, and the stream is still drained so the child never blocks.
-fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
+pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
     let mut head = Vec::new();
     let mut total = 0_u64;
     let mut failure = None;
@@ -1084,7 +1108,10 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
 /// Destination tips that exist as objects in `source`, with their types, in
 /// oid order. With `GIT_NO_LAZY_FETCH` a partial source answers `missing` for
 /// a tip only its promisor holds instead of fetching it (F1).
-fn present(source: &Repository, tips: &BTreeSet<String>) -> Result<Vec<(String, String)>> {
+pub(super) fn present(
+    source: &Repository,
+    tips: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>> {
     if tips.is_empty() {
         return Ok(Vec::new());
     }
@@ -1119,7 +1146,7 @@ fn present(source: &Repository, tips: &BTreeSet<String>) -> Result<Vec<(String, 
 }
 
 /// Every stash reflog entry, newest first; empty when there is no stash.
-fn stash_entries(source: &Repository) -> Result<Vec<String>> {
+pub(super) fn stash_entries(source: &Repository) -> Result<Vec<String>> {
     let stash =
         run(hardened(source).args(["for-each-ref", "--format=%(objectname)", "refs/stash"]))?;
     if stash.is_empty() {
@@ -1141,7 +1168,7 @@ fn stash_entries(source: &Repository) -> Result<Vec<String>> {
 
 /// `rev-list`/`pack-objects --revs` stdin: the wants, then `--not` and the
 /// haves when there are any.
-fn revisions(wants: &BTreeSet<String>, haves: &[String]) -> String {
+pub(super) fn revisions(wants: &BTreeSet<String>, haves: &[String]) -> String {
     let mut request = String::new();
     for value in wants {
         request.push_str(value);
@@ -3163,8 +3190,10 @@ mod tests {
         assert!(StderrStore::open(&state_dir(&fixture, "clean")).is_ok());
     }
 
-    /// D1: a state dir inside the source or a local destination, work tree or
-    /// git dir, refuses before anything is kept there.
+    /// D1, DF1 (#70): a state dir inside the source or a local destination,
+    /// work tree or git dir, refuses before anything is kept there. Opening
+    /// the store wrote nothing, so the state dir stays empty and neither
+    /// repository shows an untracked `stderr/key`.
     #[test]
     fn a_state_dir_inside_a_repository_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3193,9 +3222,70 @@ mod tests {
                 inside.display()
             );
             assert_eq!(refused.reason, Some("state_dir_inside_repository"));
+            assert_eq!(
+                std::fs::read_dir(&inside).unwrap().count(),
+                0,
+                "DF1: nothing was created in {}",
+                inside.display()
+            );
+            for repo in [&source, &destination] {
+                // An empty directory is invisible to git; `stderr/key` is not.
+                let status = text(git(repo).args(["status", "--porcelain", "-uall"])).unwrap();
+                assert_eq!(status, "", "DF1: {} stays clean", repo.display());
+            }
         }
         let outside = state_dir(&fixture, "outside");
         let store = StderrStore::open(&outside).unwrap();
         assert!(estimate_with(&source, &Destination::Local(destination), Some(&store)).is_ok());
+    }
+
+    /// DF2 (#70): containment is decided by directory identity, so a state
+    /// dir inside the source is refused whichever spelling names the source:
+    /// a symlink, a case alias on a case-insensitive volume, or (macOS) the
+    /// `/System/Volumes/Data` firmlink spelling. The old prefix comparison
+    /// let the last two through.
+    #[test]
+    fn a_state_dir_inside_a_repository_is_refused_under_any_spelling() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new("stderr-alias");
+        let source = fixture.repo("Source");
+        commit(&source, "a.txt", "a");
+        let destination = fixture.repo("destination");
+        let inside = source.join("state");
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = fixture.root.join("link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let resolved = std::fs::canonicalize(&source).unwrap();
+        let mut spellings = vec![link];
+        let folded = fixture.root.join("SOURCE");
+        if folded.exists() {
+            spellings.push(folded);
+        }
+        let data = Path::new("/System/Volumes/Data").join(resolved.strip_prefix("/").unwrap());
+        if data.exists() {
+            spellings.push(data);
+        }
+        let store = StderrStore::open(&inside).unwrap();
+        for spelling in &spellings {
+            assert!(store.is_inside(spelling), "{}", spelling.display());
+            let refused = estimate_with(
+                spelling,
+                &Destination::Local(destination.clone()),
+                Some(&store),
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused.refusal,
+                BulkloadRefusal::SnapshotRootsOverlap,
+                "{}",
+                spelling.display()
+            );
+            assert_eq!(std::fs::read_dir(&inside).unwrap().count(), 0);
+        }
+        // A sibling is not an ancestor, however its name compares.
+        assert!(!store.is_inside(&destination));
+        assert!(!store.is_inside(&fixture.root.join("Sourc")));
+        println!("df2 spellings={}", spellings.len());
     }
 }
