@@ -85,15 +85,17 @@ io-partial-write-alone:
     fi
 
 # W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature. CI runs it as the separate `fault-harness`
-# terminal gate, in parallel with the source gate and under its own 15-minute
-# cap (R-N122). The harness build goes to its own target dir, so
-# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
-# The feature clippy pass stays in the shared dir: it only type-checks and
-# writes no executables.
+# `fault-injection` feature, and the R-N88 power-loss harness, which runs the
+# crash-state checker on the syscall trace of a real copy and needs
+# `io-trace`. CI runs both as the separate `fault-harness` terminal gate, in
+# parallel with the source gate and under its own 15-minute cap (R-N122). The
+# harness builds go to their own target dir, so `target/debug/bulkload-agent`
+# is never replaced by a fault-enabled binary. The feature clippy pass stays in
+# the shared dir: it only type-checks and writes no executables.
 fault-harness:
-    cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings
+    cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
+    cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss
 
 # Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
 # current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
