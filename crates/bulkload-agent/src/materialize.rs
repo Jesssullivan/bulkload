@@ -414,7 +414,14 @@ impl Destination {
         let metadata = existing.metadata()?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
         let owned = match store.directory_record(key) {
-            Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => true,
+            Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => {
+                // A crash at `directory.after_rename` leaves the rename into
+                // place unsealed. Seal it before any output inside the
+                // directory can commit, or a power loss can keep the output
+                // record and lose the directory's name (#74 round 2, N1).
+                self.seal_entry(parent)?;
+                true
+            }
             // A fallback `mkdirat` whose intent committed but whose binding
             // did not (R-N119): adopt the directory only while it is still
             // exactly what `mkdirat` left, then bind the record to it.
