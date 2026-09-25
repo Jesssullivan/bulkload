@@ -1621,6 +1621,57 @@ fn unprovable_destinations_and_malformed_offers_are_refused() {
     );
 }
 
+/// R-N131: a shallow source with a full destination refuses at negotiation,
+/// before anything is listed, persisted or sent, whether or not the
+/// destination already holds the boundary's parents; the destination gains
+/// no shallow file. The estimate refuses the same pair the same way.
+#[test]
+fn r_n131_shallow_source_full_destination_refuses_before_sending() {
+    let scratch = Scratch::new("r-n131");
+    let origin = scratch.init("origin", false);
+    let commits = delta_history(&origin, 67, 2, 4);
+    let source = clone(&scratch, &origin, "source", Some(2), false);
+    write(&source, "src/file0.txt", noise(68, 30).as_bytes());
+    commit_all(&source, "shallow work");
+    let empty = scratch.init("empty.git", true);
+    let holding = destination_at(&scratch, &origin, &commits[1]);
+    let sender = Source::probe(&source, None).unwrap();
+    assert!(!sender.shallow().is_empty());
+    let wants = sender.wants().unwrap();
+    let state = scratch.state("state");
+    for destination in [&empty, &holding] {
+        let refs_before = text(args(destination, ["for-each-ref"]), "refs");
+        let offer = Offer::probe(destination, None).unwrap();
+        assert!(offer.shallow.is_empty());
+        let refused = first_round(&sender, &offer, &wants, None).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+        assert_eq!(refused.reason, Some("source_shallow_destination_full"));
+        let estimated = estimate(&source, &Destination::Local(destination.clone())).unwrap_err();
+        assert_eq!(estimated.refusal, BulkloadRefusal::GitHavesUnprovable);
+        assert_eq!(estimated.reason, Some("source_shallow_destination_full"));
+        assert!(!destination.join("shallow").exists(), "no shallow file");
+        assert_eq!(
+            text(args(destination, ["for-each-ref"]), "refs"),
+            refs_before
+        );
+    }
+    // No round, so no plan and no list: the state dir stays empty.
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    // The same source into a destination shallow at its frontier carries.
+    let matching = clone(&scratch, &origin, "matching.git", Some(2), true);
+    assert_eq!(
+        fs::read(source.join(".git/shallow")).unwrap(),
+        fs::read(matching.join("shallow")).unwrap()
+    );
+    check(
+        &scratch,
+        "r-n131-matching",
+        &source,
+        &matching,
+        DEFAULT_SEGMENT_CAP,
+    );
+}
+
 /// An object the walk needs but the source lacks refuses the plan; one that
 /// vanishes between the list and the pack refuses the segment, with its
 /// stderr classified and never echoed (R-N121).

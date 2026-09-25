@@ -38,8 +38,9 @@ impl FirstRound {
 /// that made `offer`.
 ///
 /// # Errors
-/// Refuses `GIT_HAVES_UNPROVABLE` for a partial-clone destination or a
-/// shallow one whose frontier differs from the source's (R-N75),
+/// Refuses `GIT_HAVES_UNPROVABLE` for a partial-clone destination, a
+/// shallow one whose frontier differs from the source's (R-N75), or a full
+/// one when the source is shallow (R-N131),
 /// `GIT_INVENTORY_MALFORMED` for an offer or want that is not an object name,
 /// and a child whose output is not the shape promised.
 pub fn first_round(
@@ -62,6 +63,15 @@ pub fn first_round(
         return Err(Refused::because(
             BulkloadRefusal::GitHavesUnprovable,
             "destination_shallow_frontier_differs",
+        ));
+    }
+    // R-N131: a shallow source's boundary commits name parents it does not
+    // hold, and a shallow file is never written into a full destination, so
+    // the carry refuses here, before anything is listed or sent.
+    if offer.shallow.is_empty() && !source.shallow.is_empty() {
+        return Err(Refused::because(
+            BulkloadRefusal::GitHavesUnprovable,
+            "source_shallow_destination_full",
         ));
     }
     let held = present(&source.repository, &offer.tips)?;

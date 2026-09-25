@@ -10,8 +10,10 @@
 //! it holds, ordered ancestors first: the topological order of their peeled
 //! commits, with held tips that peel to no commit (a tag of a tree, a ref to a
 //! blob) last (spike D1; they cannot make upload-pack drop a have). The first
-//! round is [`FirstRound`]. A partial-clone destination, or a shallow one whose
-//! frontier differs from the source's, is refused `GIT_HAVES_UNPROVABLE`.
+//! round is [`FirstRound`]. A partial-clone destination, a shallow one whose
+//! frontier differs from the source's (R-N75), or a full one when the source
+//! is shallow (R-N131), is refused `GIT_HAVES_UNPROVABLE` before anything is
+//! listed or sent; a shallow file is never written into a full destination.
 //!
 //! **Object list.** `rev-list --objects-edge --missing=print <wants> --not
 //! <haves>` (`--objects-edge-aggressive` for a shallow destination, as

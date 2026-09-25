@@ -76,7 +76,10 @@
 //! A destination whose refs cannot prove it holds their history is refused
 //! (R-N75): a partial clone (by any config file of any worktree, a `.promisor`
 //! pack in its object store or any alternate's), or a shallow repository whose
-//! frontier differs from the source's.
+//! frontier differs from the source's. A shallow source with a full destination
+//! is refused too (R-N131, `source_shallow_destination_full`): the carried
+//! commits would name parents behind the source's frontier, and a shallow file
+//! is never written into a full destination.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -630,6 +633,16 @@ pub fn estimate_with(
         return Err(Refused::because(
             BulkloadRefusal::GitHavesUnprovable,
             "destination_shallow_frontier_differs",
+        ));
+    }
+    // R-N131: a shallow source cannot carry into a full destination. Its
+    // boundary commits name parents it does not hold, and bulkload never
+    // writes a shallow file into a full destination, so this refuses with
+    // no size, as the M1 sender refuses before it sends anything.
+    if !shallow && !own.shallow.is_empty() {
+        return Err(Refused::because(
+            BulkloadRefusal::GitHavesUnprovable,
+            "source_shallow_destination_full",
         ));
     }
     let repo = Repository {
@@ -1663,6 +1676,12 @@ mod tests {
         commit(&source, "four.txt", "4");
         let destination = fixture.repo("destination");
         mirror(&source, &destination, &[(&third, "refs/heads/main")]);
+        // R-N131: the destination must be shallow at the source's frontier.
+        std::fs::copy(
+            source.join(".git/shallow"),
+            destination.join(".git/shallow"),
+        )
+        .unwrap();
         let result = estimate(&source, &Destination::Local(destination)).unwrap();
         assert_eq!(result.source_shallow_count, 1);
         assert_eq!(result.haves_used, 1);
@@ -1678,6 +1697,40 @@ mod tests {
 
     /// R-N75 (F2): a shallow destination whose frontier differs from the
     /// source's cannot prove it holds its tips' history, so the verb refuses.
+    /// R-N131: a shallow source with a full destination is refused, with no
+    /// size, whether or not the destination holds the boundary's parents.
+    #[test]
+    fn shallow_source_with_a_full_destination_is_refused() {
+        let fixture = Fixture::new("r-n131");
+        let origin = fixture.repo("origin");
+        commit(&origin, "one.txt", "1");
+        let second = commit(&origin, "two.txt", "2");
+        let source = fixture.shallow_clone(&origin, "source", 1);
+        commit(&source, "three.txt", "3");
+        let empty = fixture.repo("empty");
+        let holding = fixture.plain_clone(&origin, "holding");
+        for destination in [empty, holding] {
+            let before = snapshot(&destination);
+            let refused = estimate(&source, &Destination::Local(destination.clone())).unwrap_err();
+            assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+            assert_eq!(refused.reason, Some("source_shallow_destination_full"));
+            assert!(refused
+                .lines()
+                .iter()
+                .all(|line| !line.starts_with("missing_")));
+            assert_eq!(snapshot(&destination), before, "nothing written");
+            assert!(!destination.join(".git/shallow").exists());
+        }
+        // The same source against a destination shallow at its frontier
+        // still estimates.
+        let matching = fixture.shallow_clone(&origin, "matching", 1);
+        assert_eq!(
+            std::fs::read(matching.join(".git/shallow")).unwrap(),
+            format!("{second}\n").into_bytes()
+        );
+        assert!(estimate(&source, &Destination::Local(matching)).is_ok());
+    }
+
     #[test]
     fn shallow_destination_with_a_different_frontier_is_refused() {
         let fixture = Fixture::new("shallow-destination");
