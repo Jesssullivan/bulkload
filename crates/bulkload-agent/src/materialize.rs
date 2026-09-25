@@ -427,6 +427,11 @@ impl Destination {
                     })
                     && fresh_fallback(&existing, &metadata)? =>
             {
+                // The crashed run's `mkdirat` entry was never sealed: seal it
+                // (fully flushing a parent off the store's device) before the
+                // record binds its inode, so no durable record names an entry
+                // a power loss can still lose (#74 review, B1).
+                self.seal_entry(parent)?;
                 store.record_directory_created(key, dev, ino, mode)?;
                 true
             }
@@ -609,7 +614,12 @@ impl Destination {
             Err(error) => return Err(error.into()),
         }
         let mut bytes = vec![0_u8; target.len().saturating_add(1)];
-        let read = crate::io::sys::readlinkat(&parent, &leaf, &mut bytes)?;
+        // Any failure (`EINVAL`: the leaf is a file or a directory; `ENOENT`:
+        // it went away) means the leaf is not this symlink: refused as
+        // occupied, as before the move to `io::sys` (#74 review, B2).
+        let Ok(read) = crate::io::sys::readlinkat(&parent, &leaf, &mut bytes) else {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        };
         if read != target.len() || bytes.get(..target.len()) != Some(target.as_slice()) {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
@@ -1154,6 +1164,46 @@ mod tests {
         Ok(())
     }
 
+    /// #74 review, B2: a symlink whose leaf is already a regular file or a
+    /// directory is refused as occupied, never as an I/O fault (`EINVAL`
+    /// from `readlinkat`), as before the move to `io::sys`.
+    #[test]
+    fn a_symlink_onto_an_occupied_leaf_refuses_as_occupied() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-symlink-occupied-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::os::unix::fs::symlink("target", source.join("as-file"))?;
+        std::os::unix::fs::symlink("target", source.join("as-dir"))?;
+        std::fs::write(destination.join("as-file"), b"someone else's")?;
+        std::fs::create_dir(destination.join("as-dir"))?;
+        let store = Store::open(&base.join("state"))?;
+        let mut target = Destination::open(&destination, &store)?;
+        let mut codes = Vec::new();
+        for row in crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows
+        {
+            codes.push(target.symlink(&row).err().map(|refusal| refusal.code()));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            codes,
+            [
+                Some("GIT_DESTINATION_OCCUPIED"),
+                Some("GIT_DESTINATION_OCCUPIED")
+            ]
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_group_fully_flushes_each_touched_device_the_store_is_not_on() -> Result<()> {
         let directory = Arc::new(File::open(std::env::temp_dir())?);
@@ -1236,3 +1286,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "io-trace"))]
+mod adoption_power_loss;
