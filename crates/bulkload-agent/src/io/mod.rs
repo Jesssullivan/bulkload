@@ -31,13 +31,18 @@
 //! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Barrier` / `Fsync` |
 //! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `FullFlush` / `Fsync` |
 //! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Kick` |
-//! | `sys::rename_noreplace` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)` | `Rename` |
+//! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
+//! | `sys::rename_noreplace` | as `rename_exclusive` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename` / `Link` |
 //! | [`TempFile::create`] + [`TempFile::publish`] | named temp + rename | `O_TMPFILE` + `linkat` (named fallback) | `Create`, `Link`/`Rename` |
 //!
-//! The names and argument shapes of `barrier`, `barrier_dir`, `full_flush`,
-//! `rename_noreplace` and `set_socket_buffers` match the W3 lane's `sys`
-//! module, so `durable.rs` moves onto this layer without edits to its call
-//! sites.
+//! `durable.rs` seals a file with `sys::barrier` on Darwin and with
+//! `sys::full_flush` (`fsync`) on Linux, not `fdatasync`: a mode set with
+//! `fchmod` after the last write must be durable with the data. Directories
+//! and the pack use `sys::barrier_dir` and `sys::barrier`/`sys::full_flush`
+//! per the durability mode. Directory creation and file publication use
+//! `sys::rename_exclusive` (through [`rename_exclusive`] and
+//! [`publish_noreplace`]), never the Linux `linkat` fallback, which fails with
+//! `EPERM` on a directory and would hide the R-N119 path taken.
 
 // R-N54: every unsafe block names its obligations, one unsafe operation per
 // block, so each SAFETY comment covers exactly one call.
@@ -323,34 +328,23 @@ pub enum Published {
 #[cfg(feature = "fault-injection")]
 pub const RENAME_UNSUPPORTED_ENV: &str = "BULKLOAD_FAULT_RENAME_UNSUPPORTED";
 
+/// Test hook: while `on`, this thread's exclusive renames report `EINVAL` at
+/// the syscall, as on a file system without them (see `sys_posix`).
 #[cfg(any(test, feature = "fault-injection"))]
-std::thread_local! {
-    static RENAME_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+pub use sys_posix::force_rename_unsupported;
 
-/// Test hook: while `on`, this thread's exclusive renames report `EINVAL`,
-/// as on a file system without them.
-#[cfg(any(test, feature = "fault-injection"))]
-pub fn force_rename_unsupported(on: bool) {
-    RENAME_UNSUPPORTED.with(|forced| forced.set(on));
-}
-
-/// An exclusive (no-replace) rename behind the test hook, with no fallback.
+/// An exclusive (no-replace) rename with no fallback of any kind: the bare
+/// `renameatx_np(RENAME_EXCL)` / `renameat2(RENAME_NOREPLACE)`. A file system
+/// without it reports an error [`rename_unsupported`] recognizes, so a
+/// directory can take the `mkdirat` fallback and a file the link fallback
+/// (R-N119). `sys::rename_noreplace`, which falls back to `linkat` inside
+/// `sys` on Linux, is for `TempFile::publish` only: `linkat` on a directory
+/// is `EPERM`.
 ///
 /// # Errors
 /// Returns the rename failure; see [`rename_unsupported`].
 pub fn rename_exclusive(directory: &std::fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    #[cfg(any(test, feature = "fault-injection"))]
-    {
-        #[cfg(feature = "fault-injection")]
-        let from_env = std::env::var_os(RENAME_UNSUPPORTED_ENV).is_some();
-        #[cfg(not(feature = "fault-injection"))]
-        let from_env = false;
-        if from_env || RENAME_UNSUPPORTED.with(std::cell::Cell::get) {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-    }
-    sys::rename_noreplace(directory, from, to)
+    sys::rename_exclusive(directory, from, to)
 }
 
 /// Whether an exclusive rename failed because the file system or kernel does
