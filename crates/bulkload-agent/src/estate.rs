@@ -325,7 +325,7 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
         Plan::default()
     };
     let mut identities = std::collections::HashSet::new();
-    let mut targets: Vec<((PathBuf, bool), PathBuf)> = Vec::new();
+    let mut targets: Vec<(TargetKey, PathBuf)> = Vec::new();
     // Round 4 N4: targets compare in canonical, case-folded form.
     for previous in &contents.items {
         identities.insert(id(previous)?);
@@ -359,50 +359,107 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
     write(plan, &contents)
 }
 
+// Whether a volume compares names case-insensitively, as far as it could be
+// told (R6-1). `Unknown` is kept apart from `Insensitive` because the two
+// kinds of comparison below must fail in opposite directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Case {
+    Sensitive,
+    Insensitive,
+    Unknown,
+}
+
+/// A workspace target as `target_key` resolved it, unfolded, with its volume's
+/// case answer.
+type TargetKey = (PathBuf, Case);
+
+// Two target keys in the form they compare in. Targets are compared folded
+// unless both answers are positively Sensitive: an unknown answer fails
+// toward detecting an overlap (R5-7).
+fn comparable((target, case): &TargetKey, (other, other_case): &TargetKey) -> (PathBuf, PathBuf) {
+    if *case == Case::Sensitive && *other_case == Case::Sensitive {
+        (target.clone(), other.clone())
+    } else {
+        (fold(target), fold(other))
+    }
+}
+
+// Whether `inner` lies strictly inside `outer`, compared as `comparable`.
+fn nests_within(inner: &TargetKey, outer: &TargetKey) -> bool {
+    let (inner, outer) = comparable(inner, outer);
+    inner.starts_with(&outer) && inner != outer
+}
+
 // R-N114: two workspace targets collide when they are equal, or when one lies
 // inside the other anywhere but at exactly the place the inner item's source
 // lies inside the outer item's source (a nested repository planned as its own
-// item, restored where it was). Component-wise, never string prefixes. The
-// targets are `target_key` forms (round 4 N4); when those are case-folded the
-// source relation is compared case-folded too.
-fn overlapping(
-    (target, folded): &(PathBuf, bool),
-    source: &Path,
-    (other, other_folded): &(PathBuf, bool),
-    other_source: &Path,
-) -> bool {
-    if target == other {
+// item, restored where it was). Component-wise, never string prefixes.
+//
+// The two checks fail in opposite directions (R6-1, R-N83, R-N123). Target
+// overlap is compared folded unless both volumes answered Sensitive, so an
+// unanswerable probe can only add refusals. The source relation only ever
+// allows an overlap, so it is compared case-folded only when both volumes
+// answered Insensitive; otherwise exactly, taking the relative path from the
+// unfolded targets wherever they nest, so an unanswerable probe never relaxes
+// a planned-nest refusal and a same-case plan still passes.
+fn overlapping(target: &TargetKey, source: &Path, other: &TargetKey, other_source: &Path) -> bool {
+    let (folded_target, folded_other) = comparable(target, other);
+    if folded_target == folded_other {
         return true;
     }
-    // R5-3: the source relation is compared case-folded only when both
-    // target keys were folded; otherwise exactly (folding can only relax it).
-    let both_folded = *folded && *other_folded;
-    let nested = |inner: &Path, inner_source: &Path, outer: &Path, outer_source: &Path| {
-        inner
-            .strip_prefix(outer)
+    let relation_folded = target.1 == Case::Insensitive && other.1 == Case::Insensitive;
+    let nested = |inner: &TargetKey,
+                  folded_inner: &Path,
+                  inner_source: &Path,
+                  outer: &TargetKey,
+                  folded_outer: &Path,
+                  outer_source: &Path| {
+        folded_inner
+            .strip_prefix(folded_outer)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
-            .map(|relative| {
+            .map(|folded_relative| {
+                let relative = inner
+                    .0
+                    .strip_prefix(&outer.0)
+                    .map_or_else(|_| folded_relative.to_path_buf(), Path::to_path_buf);
                 let joined = outer_source.join(relative);
-                if both_folded {
+                if relation_folded {
                     fold(&joined) != fold(inner_source)
                 } else {
                     joined != inner_source
                 }
             })
     };
-    nested(target, source, other, other_source)
-        .or_else(|| nested(other, other_source, target, source))
-        .unwrap_or(false)
+    nested(
+        target,
+        &folded_target,
+        source,
+        other,
+        &folded_other,
+        other_source,
+    )
+    .or_else(|| {
+        nested(
+            other,
+            &folded_other,
+            other_source,
+            target,
+            &folded_target,
+            source,
+        )
+    })
+    .unwrap_or(false)
 }
 
 // Round 4 N4 (R-N114): a workspace target in a form two targets compare in.
 // The nearest existing ancestor is canonicalized (symlinks and `..` resolved
 // by the filesystem); the rest is appended lexically (`.` dropped, `..`
-// popped, a trailing slash ignored); and on a case-insensitive volume the
-// whole path is ASCII case-folded. A Unicode case or normalisation variant
-// that slips through meets the restore's typed GIT_DESTINATION_OCCUPIED.
-fn target_key(target: &Path) -> Result<(PathBuf, bool)> {
+// popped, a trailing slash ignored). The key is returned unfolded with its
+// volume's case answer; comparisons decide how to fold (R6-1). A Unicode case
+// or normalisation variant that slips through meets the restore's typed
+// GIT_DESTINATION_OCCUPIED.
+fn target_key(target: &Path) -> Result<TargetKey> {
     use std::path::Component;
     let components: Vec<Component<'_>> = target.components().collect();
     for existing in (1..=components.len()).rev() {
@@ -410,7 +467,7 @@ fn target_key(target: &Path) -> Result<(PathBuf, bool)> {
         let Ok(mut key) = fs::canonicalize(&prefix) else {
             continue;
         };
-        let insensitive = case_insensitive(&key);
+        let case = case_answer(&key);
         for part in components.iter().skip(existing) {
             match part {
                 Component::Normal(name) => key.push(name),
@@ -420,11 +477,7 @@ fn target_key(target: &Path) -> Result<(PathBuf, bool)> {
                 Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
             }
         }
-        return Ok(if insensitive {
-            (fold(&key), true)
-        } else {
-            (key, false)
-        });
+        return Ok((key, case));
     }
     Err(BulkloadRefusal::PathNotAbsolute)
 }
@@ -441,17 +494,17 @@ fn fold(path: &Path) -> PathBuf {
 // through pathconf(_PC_CASE_SENSITIVE); when it cannot answer, the read-only
 // probe below decides.
 #[cfg(target_os = "macos")]
-fn case_insensitive(path: &Path) -> bool {
+fn case_answer(path: &Path) -> Case {
     use std::os::unix::ffi::OsStrExt;
     let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return probe_case_insensitive(path);
+        return probe_case(path);
     };
     // SAFETY: `name` is a valid NUL-terminated C string that outlives the
     // call; pathconf only reads it and has no other preconditions.
     match unsafe { libc::pathconf(name.as_ptr(), libc::_PC_CASE_SENSITIVE) } {
-        1 => false,
-        0 => true,
-        _ => probe_case_insensitive(path),
+        1 => Case::Sensitive,
+        0 => Case::Insensitive,
+        _ => probe_case(path),
     }
 }
 
@@ -459,33 +512,45 @@ fn case_insensitive(path: &Path) -> bool {
 // vfat folds everywhere), so probe read-only: find the deepest component of
 // `path` whose name has an ASCII letter, and ask whether its case-flipped
 // spelling names the same inode. Nothing is created. A flipped name that is
-// absent means case-sensitive; anything unanswerable means insensitive.
+// absent means Sensitive; anything unanswerable is Unknown.
 #[cfg(not(target_os = "macos"))]
-fn case_insensitive(path: &Path) -> bool {
-    probe_case_insensitive(path)
+fn case_answer(path: &Path) -> Case {
+    probe_case(path)
 }
 
+// The probe's answer as the older boolean: anything but a positive Sensitive
+// counts as insensitive (the R5-7 reading, which the probe tests pin).
+#[cfg(test)]
 fn probe_case_insensitive(path: &Path) -> bool {
+    probe_case(path) != Case::Sensitive
+}
+
+#[cfg(test)]
+fn case_insensitive(path: &Path) -> bool {
+    case_answer(path) != Case::Sensitive
+}
+
+fn probe_case(path: &Path) -> Case {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
-    // R5-7: every unanswerable case answers insensitive, which can only add
-    // overlap refusals: a path that does not resolve, a walk that reaches the
-    // root without a lettered name, a lookup that fails for any reason but
-    // absence, and a walk that would cross a device boundary (the parent
-    // directory would answer for another volume).
+    // Unknown whenever the probe cannot answer (R5-7, R6-1): a path that does
+    // not resolve, a walk that reaches the root without a lettered name, a
+    // lookup that fails for any reason but absence, and a walk that would
+    // cross a device boundary (the parent directory would answer for another
+    // volume). Callers decide which way Unknown fails.
     let Ok(mut meta) = fs::symlink_metadata(path) else {
-        return true;
+        return Case::Unknown;
     };
     let mut current = path.to_path_buf();
     loop {
         let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
-            return true;
+            return Case::Unknown;
         };
         let Ok(parent_meta) = fs::symlink_metadata(parent) else {
-            return true;
+            return Case::Unknown;
         };
         if parent_meta.dev() != meta.dev() {
-            return true;
+            return Case::Unknown;
         }
         let bytes = name.as_bytes();
         if bytes.iter().any(u8::is_ascii_alphabetic) {
@@ -501,9 +566,12 @@ fn probe_case_insensitive(path: &Path) -> bool {
                 .collect();
             let variant = parent.join(std::ffi::OsString::from_vec(flipped));
             return match fs::symlink_metadata(variant) {
-                Ok(folded) => folded.dev() == meta.dev() && folded.ino() == meta.ino(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(_) => true,
+                Ok(folded) if folded.dev() == meta.dev() && folded.ino() == meta.ino() => {
+                    Case::Insensitive
+                }
+                Ok(_) => Case::Sensitive,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Case::Sensitive,
+                Err(_) => Case::Unknown,
             };
         }
         current = parent.to_path_buf();
@@ -1317,15 +1385,14 @@ pub fn apply(
         let depth = match &item.workspace {
             None => 0,
             Some(workspace) => {
-                let (key, _) = target_key(workspace)?;
+                let key = target_key(workspace)?;
                 let mut depth = 0;
                 for other in contents
                     .items
                     .iter()
                     .filter_map(|other| other.workspace.as_ref())
                 {
-                    let (other, _) = target_key(other)?;
-                    if key.starts_with(&other) && key != other {
+                    if nests_within(&key, &target_key(other)?) {
                         depth += 1;
                     }
                 }
@@ -2699,6 +2766,59 @@ mod tests {
         }
     }
 
+    // R6-1 (R-N83, R-N123): an unanswerable case probe must never relax a
+    // planned-nest refusal. The unanswerable path is forced without any
+    // host device boundary: `/` is a letterless walk to the root, so the
+    // probe cannot answer there. The R5-3 plan (nest at Vendor/inner, planned
+    // at T/vendor/inner) refuses whether the answer is Sensitive or Unknown,
+    // and is only relaxed by a positive Insensitive answer on both keys.
+    #[test]
+    fn an_unanswerable_case_probe_never_relaxes_a_planned_nest_refusal() {
+        assert_eq!(probe_case(Path::new("/")), Case::Unknown);
+        let outer_source = Path::new("/src/outer");
+        let inner_source = Path::new("/src/outer/Vendor/inner");
+        let target = PathBuf::from("/mnt/T");
+        let inner = target.join("vendor/inner");
+        let plan = |case: Case, other_case: Case| {
+            overlapping(
+                &(inner.clone(), case),
+                inner_source,
+                &(target.clone(), other_case),
+                outer_source,
+            )
+        };
+        assert!(plan(Case::Sensitive, Case::Sensitive));
+        assert!(plan(Case::Unknown, Case::Unknown));
+        assert!(plan(Case::Unknown, Case::Insensitive));
+        assert!(plan(Case::Insensitive, Case::Unknown));
+        assert!(plan(Case::Sensitive, Case::Insensitive));
+        assert!(!plan(Case::Insensitive, Case::Insensitive));
+        // A same-case plan still passes on an unanswerable volume.
+        let same = Path::new("/src/outer/vendor/inner");
+        assert!(!overlapping(
+            &(inner.clone(), Case::Unknown),
+            same,
+            &(target.clone(), Case::Unknown),
+            outer_source,
+        ));
+        // Unanswerable still fails toward detecting a case-variant overlap
+        // between unrelated items.
+        assert!(overlapping(
+            &(PathBuf::from("/mnt/t/x"), Case::Unknown),
+            Path::new("/src/other"),
+            &(target.clone(), Case::Unknown),
+            outer_source,
+        ));
+        // Only positive Sensitive answers on both sides keep case-distinct
+        // targets distinct.
+        assert!(!overlapping(
+            &(PathBuf::from("/mnt/t/x"), Case::Sensitive),
+            Path::new("/src/other"),
+            &(target, Case::Sensitive),
+            outer_source,
+        ));
+    }
+
     // Round 4 N4 on both platforms: the read-only case probe agrees with a
     // created-file ground truth on whatever volume the test runs on (case-
     // insensitive APFS on macOS, case-sensitive ext4 on Linux CI).
@@ -3067,5 +3187,55 @@ mod review_pr53e_probe {
         // which answers for the wrong volume. It stops at the device change
         // and fails toward detecting overlap instead.
         assert!(probed && at_root);
+    }
+}
+
+// The #53 round-6 reviewer demonstrator (R6-1), kept as a regression test and
+// adapted to the three-valued case answer: an unanswerable probe (here, a
+// real device boundary when the host has one) must not re-admit the R5-3
+// case-mismatched nest plan.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53f_r6 {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn r6_unanswerable_probe_refolds_the_source_relation() {
+        let boundary = ["/Users", "/nix", "/home", "/tmp", "/boot", "/mnt"]
+            .iter()
+            .map(Path::new)
+            .find(|p| {
+                let (Ok(m), Ok(pm)) = (
+                    fs::symlink_metadata(p),
+                    fs::symlink_metadata(p.parent().unwrap()),
+                ) else {
+                    return false;
+                };
+                m.dev() != pm.dev()
+            });
+        if let Some(b) = boundary {
+            assert_eq!(probe_case(b), Case::Unknown, "{b:?}");
+        }
+        let outer_src = Path::new("/src/outer");
+        let inner_src = Path::new("/src/outer/Vendor/inner");
+        let t = PathBuf::from("/mnt/T");
+        let answered = overlapping(
+            &(t.join("vendor/inner"), Case::Sensitive),
+            inner_src,
+            &(t.clone(), Case::Sensitive),
+            outer_src,
+        );
+        let unanswerable = overlapping(
+            &(t.join("vendor/inner"), Case::Unknown),
+            inner_src,
+            &(t, Case::Unknown),
+            outer_src,
+        );
+        assert!(answered);
+        assert!(
+            unanswerable,
+            "unanswerable probe re-admits the R5-3 case-mismatched nest plan"
+        );
     }
 }
