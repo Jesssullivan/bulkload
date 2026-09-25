@@ -275,13 +275,17 @@ fn no_corpus_probe_reaches_a_refusal_line() {
     let root = scratch("corpus");
     let state = state_dir(&root.0, "state");
     let store = StderrStore::open(&state).unwrap();
-    let key = key(&state);
+    // DF1 (#70): opening the store writes nothing; the first capture makes
+    // `stderr/` and the key.
+    assert!(!state.join("stderr").exists());
     let payloads = payloads();
     assert!(payloads.len() > 2000, "{}", payloads.len());
+    let mut made = None;
     for (group, input, secret) in &payloads {
         let mut capture = store.capture().unwrap();
         capture.write(input).unwrap();
         let (digest, file) = store.commit(capture).unwrap();
+        let key = *made.get_or_insert_with(|| key(&state));
         assert_eq!(digest, blake3::keyed_hash(&key, input).to_hex().to_string());
         assert_eq!(std::fs::read(&file).unwrap(), *input);
         let head = &input[..input.len().min(CLASSIFY_LIMIT)];
