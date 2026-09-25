@@ -595,3 +595,59 @@ impl Drop for FileSizeLimit {
         };
     }
 }
+
+/// `(soft, hard)` `RLIMIT_NOFILE`.
+///
+/// # Errors
+/// Returns a failed `getrlimit`.
+pub fn nofile_limit() -> io::Result<(u64, u64)> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live, writable `rlimit` for the duration of the
+    // call, and RLIMIT_NOFILE is a valid resource.
+    check(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) })?;
+    Ok((limit.rlim_cur, limit.rlim_max))
+}
+
+/// Set `RLIMIT_NOFILE` to `(soft, hard)`.
+///
+/// # Errors
+/// Returns a failed `setrlimit`, e.g. `soft` above `hard`.
+pub fn set_nofile_limit(soft: u64, hard: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: `limit` is a live, initialized `rlimit` for the duration of the
+    // call, and RLIMIT_NOFILE is a valid resource.
+    check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) })?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+std::thread_local! {
+    static RENAME_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: while `on`, this thread's exclusive renames report `EINVAL`.
+///
+/// The error replaces the syscall's result, as on a file system without the
+/// call. It sits at the syscall, below every fallback, so tests see what a
+/// real unsupported file system does to each caller (PR #59 round 4, B1).
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn force_rename_unsupported(on: bool) {
+    RENAME_UNSUPPORTED.with(|forced| forced.set(on));
+}
+
+/// Whether the test hook, or `RENAME_UNSUPPORTED_ENV` in a fault-injection
+/// build, forces exclusive renames to report `EINVAL`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub(super) fn rename_forced_unsupported() -> bool {
+    #[cfg(feature = "fault-injection")]
+    let from_env = std::env::var_os(super::RENAME_UNSUPPORTED_ENV).is_some();
+    #[cfg(not(feature = "fault-injection"))]
+    let from_env = false;
+    from_env || RENAME_UNSUPPORTED.with(std::cell::Cell::get)
+}

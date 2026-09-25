@@ -2,6 +2,12 @@
 //! Verification is outside timing and warms the OS cache. Initial means fresh
 //! private application state, not cold storage. Outputs are retained, never deleted.
 //!
+//! Host hygiene (R-N81): a gated sample (native, or rclone as shipped) is
+//! recorded only while the host is on AC power with a 1-minute load average
+//! below 2.5. Every sample row records both. When either condition fails the
+//! bench refuses, unless `--informational` is given; then each such sample is
+//! flagged `gated=false` and the verdict is informational only.
+//!
 //! `bulkload-bench micro <name>` runs the M0 micro-benchmarks instead; see
 //! [`micro`].
 
@@ -16,6 +22,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 use bulkload_agent::counters::Counters;
+use bulkload_agent::durable::Durability;
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
@@ -53,6 +60,94 @@ struct Cli {
     /// Exact source revision used to build the native binary under test.
     #[arg(long)]
     revision: String,
+    /// Native durability mode: `group` (the default) or `strict`.
+    #[arg(long, default_value = "group", value_parser = parse_durability)]
+    durability: Durability,
+    /// Record samples even when the R-N81 host preflight fails, flagged
+    /// `gated=false`; the verdict is then informational only.
+    #[arg(long)]
+    informational: bool,
+}
+
+fn parse_durability(value: &str) -> Result<Durability, String> {
+    value
+        .parse()
+        .map_err(|_| format!("expected group or strict, got {value:?}"))
+}
+
+/// Largest 1-minute load average at which a gated sample may run (R-N81).
+const MAX_GATED_LOAD1: f64 = 2.5;
+
+/// Host conditions read immediately before a sample (R-N81).
+#[derive(Clone, Debug, PartialEq)]
+struct Preflight {
+    /// `ac`, `battery` or `unknown`, from `pmset -g batt`.
+    power: &'static str,
+    /// The 1-minute load average from `getloadavg`, if available.
+    load1: Option<f64>,
+}
+
+impl Preflight {
+    fn read() -> Self {
+        let power = Command::new("pmset")
+            .args(["-g", "batt"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map_or("unknown", |output| {
+                power_source(&String::from_utf8_lossy(&output.stdout))
+            });
+        Self {
+            power,
+            load1: load_average(),
+        }
+    }
+
+    /// Why a gated sample may not run now, or `None` when it may.
+    fn blocker(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if self.power != "ac" {
+            reasons.push(format!("power={}", self.power));
+        }
+        match self.load1 {
+            Some(load) if load < MAX_GATED_LOAD1 => (),
+            Some(load) => reasons.push(format!("load1={load:.2}>={MAX_GATED_LOAD1}")),
+            None => reasons.push("load1=unknown".to_owned()),
+        }
+        (!reasons.is_empty()).then(|| reasons.join(","))
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "power={} load1={}",
+            self.power,
+            self.load1
+                .map_or_else(|| "unknown".to_owned(), |load| format!("{load:.2}"))
+        )
+    }
+}
+
+fn power_source(pmset: &str) -> &'static str {
+    let first = pmset.lines().next().unwrap_or_default();
+    if first.contains("'AC Power'") {
+        "ac"
+    } else if first.contains("'Battery Power'") {
+        "battery"
+    } else {
+        "unknown"
+    }
+}
+
+fn load_average() -> Option<f64> {
+    let mut loads = [0.0_f64; 3];
+    // SAFETY: `loads` is a writable array of three doubles, and 3 is its length.
+    let read = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+    if read < 1 {
+        return None;
+    }
+    loads.first().copied()
 }
 
 #[derive(Debug)]
@@ -77,6 +172,8 @@ struct Sample {
     chunk_timing: Option<ChunkTiming>,
     transfer_timing: Option<TransferTiming>,
     counters: Option<Counters>,
+    preflight: Preflight,
+    gated: bool,
 }
 
 struct SampleRun<'a> {
@@ -384,6 +481,8 @@ fn interrupt_after_payload(
     destination_state: &Path,
 ) -> io::Result<()> {
     let (sender, mut receiver) = std::os::unix::net::UnixStream::pair()?;
+    transfer::tune_stream(&sender);
+    transfer::tune_stream(&receiver);
     std::thread::scope(|scope| -> io::Result<()> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
             let mut input = sender.try_clone()?;
@@ -465,7 +564,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
         Arm::Rclone => "cumulative-children-peak",
     };
     println!(
-        "sample sequence={} arm={:?} phase={} elapsed_ms={:.3} throughput_bytes_s={} workload_bytes={} transferred_content_bytes={} source_bytes_read={} max_rss_kib={} rss_scope={} verification=full-blake3-outside-timing verification_rows={verification_rows}",
+        "sample sequence={} arm={:?} phase={} elapsed_ms={:.3} throughput_bytes_s={} workload_bytes={} transferred_content_bytes={} source_bytes_read={} max_rss_kib={} rss_scope={} verification=full-blake3-outside-timing verification_rows={verification_rows} {} gated={}",
         sample.sequence,
         sample.arm,
         sample.phase,
@@ -476,6 +575,8 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
         metric(sample.source_read),
         sample.rss_kib,
         rss_scope,
+        sample.preflight.render(),
+        sample.gated,
     );
     if let (Some(chunk), Some(transfer)) = (sample.chunk_timing, sample.transfer_timing) {
         println!(
@@ -518,6 +619,16 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
     }
     if rows(run.source)? != run.expected {
         return Err(io::Error::other("fixture changed before arm"));
+    }
+    let preflight = Preflight::read();
+    let blocker = preflight.blocker();
+    if let Some(reason) = &blocker {
+        if !cli.informational {
+            return Err(io::Error::other(format!(
+                "R-N81 preflight refused a gated {:?} {} sample: {reason}",
+                run.arm, run.phase
+            )));
+        }
     }
     let chunk_before = ChunkTiming::snapshot();
     let transfer_before = TransferTiming::snapshot();
@@ -582,6 +693,8 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
         chunk_timing: (run.arm == Arm::Native).then_some(chunk_timing),
         transfer_timing: (run.arm == Arm::Native).then_some(transfer_timing),
         counters: (run.arm == Arm::Native).then_some(counters),
+        preflight,
+        gated: blocker.is_none(),
     };
     print_sample(&sample, run.expected.len());
     Ok(sample)
@@ -629,8 +742,10 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
 
 fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
     println!(
-        "benchmark revision={} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={}",
+        "benchmark revision={} durability={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={}",
         cli.revision,
+        cli.durability,
+        cli.informational,
         rclone_identity,
         fixture.sealed_identity,
         fixture.private_identity,
@@ -800,6 +915,7 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
         println!("verdict status=diagnostic-only reason=single-arm-run");
         return Ok(());
     }
+    let ungated = samples.iter().filter(|sample| !sample.gated).count();
     let initial_native = median(samples, Arm::Native, "initial")?;
     let initial_rclone = median(samples, Arm::Rclone, "initial")?;
     let delta_native = median(samples, Arm::Native, "delta")?;
@@ -819,6 +935,18 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
     let initial_win = initial_native < initial_rclone;
     let delta_win = delta_native < delta_rclone;
     let passed = initial_win && delta_win && warm_zero && interrupted_zero && rss_ok;
+    if ungated > 0 {
+        println!(
+            "median phase=initial native_ms={initial_native:.3} rclone_ms={initial_rclone:.3} gated=false"
+        );
+        println!(
+            "median phase=delta native_ms={delta_native:.3} rclone_ms={delta_rclone:.3} gated=false"
+        );
+        println!(
+            "verdict status=informational reason=r-n81-preflight ungated_samples={ungated} r25_warm_zero={warm_zero} r25_interrupted_zero={interrupted_zero} native_rss_below_2gib={rss_ok}"
+        );
+        return Ok(());
+    }
     println!(
         "median phase=initial native_ms={initial_native:.3} rclone_ms={initial_rclone:.3} native_wins={initial_win}"
     );
@@ -842,6 +970,8 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
 }
 
 fn run(cli: &Cli) -> io::Result<()> {
+    bulkload_agent::durable::set_durability(cli.durability);
+    let _ = bulkload_agent::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
     let mut fixture = seed_fixture(&sealed_source, &work)?;
     let rclone_identity = cli
@@ -890,6 +1020,35 @@ mod tests {
     }
 
     #[test]
+    fn preflight_gates_on_ac_power_and_load() {
+        assert_eq!(
+            power_source("Now drawing from 'AC Power'\n -InternalBattery-0"),
+            "ac"
+        );
+        assert_eq!(power_source("Now drawing from 'Battery Power'"), "battery");
+        assert_eq!(power_source(""), "unknown");
+        let clean = Preflight {
+            power: "ac",
+            load1: Some(1.0),
+        };
+        assert_eq!(clean.blocker(), None);
+        assert_eq!(clean.render(), "power=ac load1=1.00");
+        let busy = Preflight {
+            power: "battery",
+            load1: Some(2.5),
+        };
+        assert_eq!(
+            busy.blocker().as_deref(),
+            Some("power=battery,load1=2.50>=2.5")
+        );
+        let blind = Preflight {
+            power: "unknown",
+            load1: None,
+        };
+        assert!(blind.blocker().is_some());
+    }
+
+    #[test]
     fn delta_mutates_exactly_one_percent_without_touching_sealed_input() -> io::Result<()> {
         let fixture = tempfile::tempdir()?;
         let sealed = fixture.path().join("sealed");
@@ -931,6 +1090,8 @@ mod tests {
             reps: 1,
             only: Some(Arm::Native),
             revision: "test-revision".to_owned(),
+            durability: Durability::Group,
+            informational: true,
         };
         run(&cli)?;
         // A repeated invocation cannot accidentally reuse another run's state.

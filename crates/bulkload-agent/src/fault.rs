@@ -44,29 +44,30 @@
 //!
 //! # Fault points
 //!
-//! Store publication, in `StorePublisher::publish_group`. The source capture
-//! publisher and the destination chunk publisher share this code but not these
-//! points: each stage exists once per store, `publish.source.<stage>` and
-//! `publish.destination.<stage>`, so an `nth` hit always lands in a known
-//! store. A crash receipt (below) also records that store's root.
+//! Source pack groups, in `PackSink::publish` and `StorePublisher::commit`
+//! (the source store's committer thread):
 //!
-//! | Stage | Crash leaves (in the named store) |
-//! |-------|-----------------------------------|
-//! | `after_append` | chunk bytes appended to `chunks.pack`, not synced, not indexed |
-//! | `after_pack_sync` | pack tail synced, not indexed |
-//! | `after_location_insert` | open transaction with chunk locations (hot journal) |
-//! | `after_manifest_insert` | open transaction with locations and captures (hot journal) |
-//! | `before_commit` | the whole group staged, `COMMIT` not issued (hot journal) |
-//! | `after_commit` | the group committed, no acknowledgement sent |
+//! | Name | Crash leaves (in the source store) |
+//! |------|------------------------------------|
+//! | `publish.source.after_append` | chunk bytes appended to `chunks.pack`, not sealed, not indexed |
+//! | `publish.source.after_pack_sync` | the pack tail sealed, not indexed |
+//! | `publish.source.after_location_insert` | an open transaction with chunk locations |
+//! | `publish.source.after_manifest_insert` | an open transaction with locations and captures |
+//! | `publish.source.before_commit` | the whole group staged, `COMMIT` not issued |
+//! | `publish.source.after_commit` | the group committed |
 //!
-//! Output publication, in `Destination::file`:
+//! Destination output groups, in `StagedFile::publish`, `PublishSink::commit`
+//! and `StorePublisher::commit_outputs` (the destination committer thread),
+//! plus the staging step on the receiving thread:
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `materialize.after_temp_write` | a complete, unsynced `.bulkload-*` temporary at mode 0600 |
-//! | `materialize.after_temp_sync` | the temporary at its final mode, synced, not linked |
-//! | `materialize.after_link` | the final name linked to the synced temporary; parent not synced |
-//! | `materialize.after_parent_sync` | the link durable; the temporary name still present |
+//! | `materialize.after_temp_write` | a complete `.bulkload-*` temporary at its final mode, not sealed, not queued |
+//! | `materialize.after_temp_seal` | the temporary sealed, not renamed |
+//! | `materialize.after_rename` | the final name holding the sealed file; no output record |
+//! | `publish.destination.after_dir_seal` | a group's files renamed and its directories sealed; no records |
+//! | `publish.destination.before_commit` | the group's records staged, `COMMIT` not issued |
+//! | `publish.destination.after_commit` | the group's output records and chunk hints committed |
 //!
 //! Every temporary one of these leaves carries the destination store's tag and
 //! is removed by the next invocation's sweep; see `materialize`.
@@ -76,23 +77,28 @@
 //! | Name | Crash leaves |
 //! |------|--------------|
 //! | `directory.after_mkdir` | an empty 0700 `.bulkload-<tag>-d-*` temporary directory, no record |
-//! | `directory.after_pending_record` | the temporary, its parent synced, and a record bound to its inode; not renamed |
-//! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent not synced |
+//! | `directory.after_pending_record` | the temporary, its parent sealed, and a record bound to its inode; not renamed |
+//! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent sealed, not flushed |
 //! | `directory.after_fallback_mkdir` | with no no-replace rename (R-N119): a 0700 directory under its final name, no record |
-//! | `directory.before_complete` | the final mode applied and synced; the pending record still present |
+//! | `directory.before_complete` | one directory's final mode applied and sealed; its pending record still present |
 //!
 //! Protocol boundaries, in `transfer`:
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `serve.after_publish_group` | a committed source group whose files were not yet offered |
-//! | `serve.after_content` | one file offered and acknowledged `Applied` by the receiver |
-//! | `serve.before_done` | every batch sent, `TransferDone` not sent |
+//! | `serve.after_content` | one file sent and acknowledged `Applied`; its capture may not be committed |
+//! | `serve.before_done` | every capture committed, `TransferDone` not sent |
 //! | `receive.after_want_files` | a batch census answered, no content received for it |
-//! | `receive.after_chunk_publish` | one file's received chunks committed, the file not materialized |
-//! | `receive.before_record_output` | a verified output under its final name with no output record |
-//! | `receive.after_record_output` | a verified output and its output record; `Applied` not sent |
-//! | `receive.after_applied` | the output recorded and `Applied` sent |
+//! | `receive.after_chunks` | one file's chunks verified and written to its temporary |
+//! | `receive.after_applied` | `Applied` sent; the output may still be waiting on its group |
+//!
+//! # Group size
+//!
+//! Group commit closes a group by count, size or idle time, so how many
+//! groups a run has depends on timing. With [`GROUP_FILES_ENV`] set to `N`,
+//! every committer closes a group at `N` files. Only `N = 1` makes `nth` hits
+//! of the group points exact: with a larger `N` the idle timeout can still
+//! close a group early.
 //!
 //! # Live-writer hook
 //!
@@ -117,6 +123,19 @@ pub const FAULT_SPEC_INVALID_EXIT_CODE: i32 = 87;
 /// Optional path the process writes its crash receipt to before exiting.
 pub const FAULT_RECEIPT_ENV: &str = "BULKLOAD_FAULT_RECEIPT";
 
+/// Optional group size, in files, for every committer (see "Group size").
+pub const GROUP_FILES_ENV: &str = "BULKLOAD_FAULT_GROUP_FILES";
+
+/// The group size [`GROUP_FILES_ENV`] asks for, if it names a positive count.
+#[must_use]
+pub fn group_files() -> Option<u64> {
+    std::env::var(GROUP_FILES_ENV)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|files| *files > 0)
+}
+
 /// A named crash point in the durability path. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Point {
@@ -132,26 +151,18 @@ pub enum Point {
     PublishSourceBeforeCommit,
     /// `publish.source.after_commit`
     PublishSourceAfterCommit,
-    /// `publish.destination.after_append`
-    PublishDestinationAfterAppend,
-    /// `publish.destination.after_pack_sync`
-    PublishDestinationAfterPackSync,
-    /// `publish.destination.after_location_insert`
-    PublishDestinationAfterLocationInsert,
-    /// `publish.destination.after_manifest_insert`
-    PublishDestinationAfterManifestInsert,
+    /// `materialize.after_temp_write`
+    MaterializeAfterTempWrite,
+    /// `materialize.after_temp_seal`
+    MaterializeAfterTempSeal,
+    /// `materialize.after_rename`
+    MaterializeAfterRename,
+    /// `publish.destination.after_dir_seal`
+    PublishDestinationAfterDirSeal,
     /// `publish.destination.before_commit`
     PublishDestinationBeforeCommit,
     /// `publish.destination.after_commit`
     PublishDestinationAfterCommit,
-    /// `materialize.after_temp_write`
-    MaterializeAfterTempWrite,
-    /// `materialize.after_temp_sync`
-    MaterializeAfterTempSync,
-    /// `materialize.after_link`
-    MaterializeAfterLink,
-    /// `materialize.after_parent_sync`
-    MaterializeAfterParentSync,
     /// `directory.after_mkdir`
     DirectoryAfterMkdir,
     /// `directory.after_pending_record`
@@ -162,55 +173,42 @@ pub enum Point {
     DirectoryAfterFallbackMkdir,
     /// `directory.before_complete`
     DirectoryBeforeComplete,
-    /// `serve.after_publish_group`
-    ServeAfterPublishGroup,
     /// `serve.after_content`
     ServeAfterContent,
     /// `serve.before_done`
     ServeBeforeDone,
     /// `receive.after_want_files`
     ReceiveAfterWantFiles,
-    /// `receive.after_chunk_publish`
-    ReceiveAfterChunkPublish,
-    /// `receive.before_record_output`
-    ReceiveBeforeRecordOutput,
-    /// `receive.after_record_output`
-    ReceiveAfterRecordOutput,
+    /// `receive.after_chunks`
+    ReceiveAfterChunks,
     /// `receive.after_applied`
     ReceiveAfterApplied,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 22] = [
         Self::PublishSourceAfterAppend,
         Self::PublishSourceAfterPackSync,
         Self::PublishSourceAfterLocationInsert,
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
-        Self::PublishDestinationAfterAppend,
-        Self::PublishDestinationAfterPackSync,
-        Self::PublishDestinationAfterLocationInsert,
-        Self::PublishDestinationAfterManifestInsert,
+        Self::MaterializeAfterTempWrite,
+        Self::MaterializeAfterTempSeal,
+        Self::MaterializeAfterRename,
+        Self::PublishDestinationAfterDirSeal,
         Self::PublishDestinationBeforeCommit,
         Self::PublishDestinationAfterCommit,
-        Self::MaterializeAfterTempWrite,
-        Self::MaterializeAfterTempSync,
-        Self::MaterializeAfterLink,
-        Self::MaterializeAfterParentSync,
         Self::DirectoryAfterMkdir,
         Self::DirectoryAfterPendingRecord,
         Self::DirectoryAfterRename,
         Self::DirectoryAfterFallbackMkdir,
         Self::DirectoryBeforeComplete,
-        Self::ServeAfterPublishGroup,
         Self::ServeAfterContent,
         Self::ServeBeforeDone,
         Self::ReceiveAfterWantFiles,
-        Self::ReceiveAfterChunkPublish,
-        Self::ReceiveBeforeRecordOutput,
-        Self::ReceiveAfterRecordOutput,
+        Self::ReceiveAfterChunks,
         Self::ReceiveAfterApplied,
     ];
 
@@ -224,32 +222,21 @@ impl Point {
             Self::PublishSourceAfterManifestInsert => "publish.source.after_manifest_insert",
             Self::PublishSourceBeforeCommit => "publish.source.before_commit",
             Self::PublishSourceAfterCommit => "publish.source.after_commit",
-            Self::PublishDestinationAfterAppend => "publish.destination.after_append",
-            Self::PublishDestinationAfterPackSync => "publish.destination.after_pack_sync",
-            Self::PublishDestinationAfterLocationInsert => {
-                "publish.destination.after_location_insert"
-            }
-            Self::PublishDestinationAfterManifestInsert => {
-                "publish.destination.after_manifest_insert"
-            }
+            Self::MaterializeAfterTempWrite => "materialize.after_temp_write",
+            Self::MaterializeAfterTempSeal => "materialize.after_temp_seal",
+            Self::MaterializeAfterRename => "materialize.after_rename",
+            Self::PublishDestinationAfterDirSeal => "publish.destination.after_dir_seal",
             Self::PublishDestinationBeforeCommit => "publish.destination.before_commit",
             Self::PublishDestinationAfterCommit => "publish.destination.after_commit",
-            Self::MaterializeAfterTempWrite => "materialize.after_temp_write",
-            Self::MaterializeAfterTempSync => "materialize.after_temp_sync",
-            Self::MaterializeAfterLink => "materialize.after_link",
-            Self::MaterializeAfterParentSync => "materialize.after_parent_sync",
             Self::DirectoryAfterMkdir => "directory.after_mkdir",
             Self::DirectoryAfterPendingRecord => "directory.after_pending_record",
             Self::DirectoryAfterRename => "directory.after_rename",
             Self::DirectoryAfterFallbackMkdir => "directory.after_fallback_mkdir",
             Self::DirectoryBeforeComplete => "directory.before_complete",
-            Self::ServeAfterPublishGroup => "serve.after_publish_group",
             Self::ServeAfterContent => "serve.after_content",
             Self::ServeBeforeDone => "serve.before_done",
             Self::ReceiveAfterWantFiles => "receive.after_want_files",
-            Self::ReceiveAfterChunkPublish => "receive.after_chunk_publish",
-            Self::ReceiveBeforeRecordOutput => "receive.before_record_output",
-            Self::ReceiveAfterRecordOutput => "receive.after_record_output",
+            Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterApplied => "receive.after_applied",
         }
     }
@@ -326,9 +313,12 @@ impl Drop for GroupNote {
 /// Describe the publication group this thread is publishing, until the
 /// returned guard drops.
 ///
-/// A crash receipt for a publication point records it. Thread-local, because
-/// a local `copy` publishes source and destination groups on different
-/// threads; cleared per group, so no receipt names a finished group.
+/// A crash receipt for a publication point records it. Each store's committer
+/// publishes on its own thread, so the note is thread-local; it is cleared
+/// per group, so no receipt names a finished group. A source group lists the
+/// batch indices of its captures (a group can span batches, so indices from
+/// different batches merge); a destination group lists one index per output,
+/// `0..n`.
 pub fn note_group(capture_ids: &[usize], chunks: usize) -> GroupNote {
     let ids: Vec<String> = capture_ids.iter().map(ToString::to_string).collect();
     let description = format!("group capture_ids={} chunks={chunks}", ids.join(","));

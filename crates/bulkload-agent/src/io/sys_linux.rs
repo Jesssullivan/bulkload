@@ -140,7 +140,9 @@ pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
 }
 
 /// Rename `from` to `to` inside `directory`; an existing `to` is `EEXIST` and
-/// is left untouched.
+/// is left untouched. Falls back to `linkat` then `unlinkat` where
+/// `renameat2(RENAME_NOREPLACE)` is not offered, so it suits files only; see
+/// [`rename_exclusive`] for a rename with no fallback.
 ///
 /// # Errors
 /// Returns the rename failure.
@@ -149,13 +151,43 @@ pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Res
     rename_noreplace_at(directory, from, directory, to)
 }
 
-/// `renameat2(RENAME_NOREPLACE)` between two directories. A file system
-/// without it (`EINVAL`, `ENOSYS`) gets `linkat` then `unlinkat`, which is
-/// also no-clobber but is two directory operations.
+/// [`rename_exclusive_at`], then on `EINVAL`/`ENOSYS` `linkat` and `unlinkat`
+/// (no-clobber, two directory operations). For files only: `linkat` on a
+/// directory is `EPERM`.
+///
+/// # Errors
+/// Returns the rename, link or unlink failure; an occupied `to` is `EEXIST`.
+pub fn rename_noreplace_at(
+    from_dir: impl AsFd,
+    from: &CStr,
+    to_dir: impl AsFd,
+    to: &CStr,
+) -> io::Result<()> {
+    let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
+    match rename_exclusive_at(from_dir, from, to_dir, to) {
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
+            linkat(from_dir, from, to_dir, to)?;
+            unlinkat(from_dir, from, false)
+        }
+        other => other,
+    }
+}
+
+/// [`rename_exclusive_at`] within one directory.
+///
+/// # Errors
+/// Returns the rename failure.
+pub fn rename_exclusive(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
+    let directory = directory.as_fd();
+    rename_exclusive_at(directory, from, directory, to)
+}
+
+/// The bare `renameat2(RENAME_NOREPLACE)`, with no fallback: a kernel or file
+/// system without it reports `EINVAL` or `ENOSYS`.
 ///
 /// # Errors
 /// Returns the rename failure; an occupied `to` is `EEXIST`.
-pub fn rename_noreplace_at(
+pub fn rename_exclusive_at(
     from_dir: impl AsFd,
     from: &CStr,
     to_dir: impl AsFd,
@@ -163,6 +195,10 @@ pub fn rename_noreplace_at(
 ) -> io::Result<()> {
     trace_serial!();
     let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
+    #[cfg(any(test, feature = "fault-injection"))]
+    if super::sys_posix::rename_forced_unsupported() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     // SAFETY: both descriptors are live for the call and both names are
     // NUL-terminated and outlive it.
     let renamed = unsafe {
@@ -174,25 +210,20 @@ pub fn rename_noreplace_at(
             libc::RENAME_NOREPLACE,
         )
     };
-    if renamed == 0 {
-        trace_event!(
-            "renameat2",
-            Ok(super::trace::Event::Rename {
-                node: fstatat_nofollow(to_dir, to)?.node,
-                from_dir: fstat(from_dir)?.node,
-                from: from.to_bytes().to_vec(),
-                to_dir: fstat(to_dir)?.node,
-                to: to.to_bytes().to_vec(),
-            })
-        );
-        return Ok(());
+    if renamed != 0 {
+        return Err(io::Error::last_os_error());
     }
-    let error = io::Error::last_os_error();
-    if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
-        return Err(error);
-    }
-    linkat(from_dir, from, to_dir, to)?;
-    unlinkat(from_dir, from, false)
+    trace_event!(
+        "renameat2",
+        Ok(super::trace::Event::Rename {
+            node: fstatat_nofollow(to_dir, to)?.node,
+            from_dir: fstat(from_dir)?.node,
+            from: from.to_bytes().to_vec(),
+            to_dir: fstat(to_dir)?.node,
+            to: to.to_bytes().to_vec(),
+        })
+    );
+    Ok(())
 }
 
 /// Whether `/proc/self/fd` is reachable, probed once per process. Without it
@@ -348,4 +379,21 @@ pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
 )]
 pub const fn thread_qos() -> io::Result<Option<Qos>> {
     Ok(None)
+}
+
+/// Raise a pipe's capacity with `F_SETPIPE_SZ`. Returns `false` without
+/// changing anything when `fd` is not a pipe.
+///
+/// # Errors
+/// Returns a failed `fstat` or `fcntl`.
+pub fn set_pipe_buffer(fd: BorrowedFd<'_>, bytes: libc::c_int) -> io::Result<bool> {
+    if !fstat(fd)?.is_fifo() {
+        return Ok(false);
+    }
+    // SAFETY: the descriptor is a live pipe for the call, and F_SETPIPE_SZ
+    // takes one integer argument.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, bytes) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }

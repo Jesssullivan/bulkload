@@ -132,17 +132,15 @@ pub fn kick(file: impl AsFd, _offset: u64, _len: u64) -> io::Result<()> {
 }
 
 /// Rename `from` to `to` inside `directory`; an existing `to` is `EEXIST` and
-/// is left untouched.
+/// is left untouched. Darwin has no fallback: this is [`rename_exclusive`].
 ///
 /// # Errors
 /// Returns the rename failure.
 pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
-    let directory = directory.as_fd();
-    rename_noreplace_at(directory, from, directory, to)
+    rename_exclusive(directory, from, to)
 }
 
-/// `renameatx_np(RENAME_EXCL)` between two directories: one directory
-/// operation, no-clobber.
+/// [`rename_exclusive_at`]; Darwin has no fallback.
 ///
 /// # Errors
 /// Returns the rename failure; an occupied `to` is `EEXIST`.
@@ -152,8 +150,36 @@ pub fn rename_noreplace_at(
     to_dir: impl AsFd,
     to: &CStr,
 ) -> io::Result<()> {
+    rename_exclusive_at(from_dir, from, to_dir, to)
+}
+
+/// [`rename_exclusive_at`] within one directory.
+///
+/// # Errors
+/// Returns the rename failure.
+pub fn rename_exclusive(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
+    let directory = directory.as_fd();
+    rename_exclusive_at(directory, from, directory, to)
+}
+
+/// The bare `renameatx_np(RENAME_EXCL)` between two directories: one
+/// directory operation, no-clobber, no fallback. A file system without it
+/// reports `ENOTSUP` or `EINVAL`.
+///
+/// # Errors
+/// Returns the rename failure; an occupied `to` is `EEXIST`.
+pub fn rename_exclusive_at(
+    from_dir: impl AsFd,
+    from: &CStr,
+    to_dir: impl AsFd,
+    to: &CStr,
+) -> io::Result<()> {
     trace_serial!();
     let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
+    #[cfg(any(test, feature = "fault-injection"))]
+    if super::sys_posix::rename_forced_unsupported() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     // SAFETY: both descriptors are live for the call and both names are
     // NUL-terminated and outlive it.
     let renamed = unsafe {
@@ -297,4 +323,16 @@ pub fn thread_qos() -> io::Result<Option<Qos>> {
     Ok([Qos::UserInitiated, Qos::Utility, Qos::Background]
         .into_iter()
         .find(|candidate| qos_class(*candidate) as u32 == class))
+}
+
+/// Darwin pipes size themselves; there is nothing to raise.
+///
+/// # Errors
+/// Never fails on Darwin.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches the Linux F_SETPIPE_SZ call"
+)]
+pub const fn set_pipe_buffer(_fd: BorrowedFd<'_>, _bytes: libc::c_int) -> io::Result<bool> {
+    Ok(false)
 }
