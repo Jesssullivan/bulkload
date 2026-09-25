@@ -19,7 +19,13 @@ use std::process::Command;
 /// A match is exact on the package name, or on the name plus a `-` (so
 /// `tokio-util` is caught alongside `tokio`, while `unicode-normalization`
 /// is not mistaken for `ring`).
-const FORBIDDEN: &[&str] = &["tokio", "opendal", "reqwest", "ring", "tonic"];
+///
+/// The io layer (plan D3, R-N54) is libc-only: `nix`, `rustix`, `memmap2` and
+/// `io-uring` are forbidden too. `tempfile` pulls `rustix` as a dev-dependency
+/// only, which `-e normal` excludes.
+const FORBIDDEN: &[&str] = &[
+    "tokio", "opendal", "reqwest", "ring", "tonic", "nix", "rustix", "memmap2", "io-uring",
+];
 
 fn is_forbidden(name: &str) -> Option<&'static str> {
     FORBIDDEN
@@ -107,12 +113,19 @@ fn forbidden_matcher_is_neither_too_broad_nor_too_narrow() {
     assert_eq!(is_forbidden("tokio-util"), Some("tokio"));
     assert_eq!(is_forbidden("ring"), Some("ring"));
     assert_eq!(is_forbidden("tonic-prost"), Some("tonic"));
+    assert_eq!(is_forbidden("nix"), Some("nix"));
+    assert_eq!(is_forbidden("rustix"), Some("rustix"));
+    assert_eq!(is_forbidden("rustix-linux-procfs"), Some("rustix"));
+    assert_eq!(is_forbidden("memmap2"), Some("memmap2"));
+    assert_eq!(is_forbidden("io-uring"), Some("io-uring"));
 
     assert_eq!(is_forbidden("unicode-normalization"), None);
     assert_eq!(is_forbidden("blake3"), None);
     assert_eq!(is_forbidden("ignore"), None);
     assert_eq!(is_forbidden("rusqlite"), None);
     assert_eq!(is_forbidden("stringprep"), None);
+    assert_eq!(is_forbidden("libc"), None);
+    assert_eq!(is_forbidden("unix-socket"), None);
 
     assert_eq!(package_name("├── serde v1.0.210"), Some("serde"));
     assert_eq!(package_name("│   └── tokio v1.40.0 (*)"), Some("tokio"));

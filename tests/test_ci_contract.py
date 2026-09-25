@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "2c6bc4b88c4a777c957980f26fa19efb833bb20f29ab75bba6c1d64b06d16ffe"
+WORKFLOW_SHA256 = "6b3df5845e5f33c4d6acdabcd912898846d69695930373ff14bca7f8152f61f2"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -24,8 +24,11 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "2012114906f3a1d6e05adb9c475120c51d940ef09a45ff4b5f870f6cc2ecfe5b"
-GUARD_SHA256 = "ba46969b7826d64d9493d38b865e264cb78c47d2269f0f66e08a171f8acd9535"
+ACTION_SHA256 = "2cd1796c907f46d55af04b66d0f2f1c53211c78e80a092787a23edc06aa39ee1"
+GUARD_SHA256 = "825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f"
+FAULT_HARNESS_STEP_SHA256 = (
+    "fc226b95e6553343298eb65a434df43ec6a07fdda7821b47a66e0ecff06a1bbe"
+)
 SOURCE_GATE_STEP_SHA256 = (
     "96893435532ebb5d5e4b53e813e2069a28c8c23303a70c1bb9b1a9fb4071bdf2"
 )
@@ -46,8 +49,30 @@ FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
 EXPECTED_SHA_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.sha || github.sha }}"
+    "github.event.pull_request.head.sha || "
+    "github.event_name == 'merge_group' && "
+    "github.event.merge_group.head_sha || github.sha }}"
 )
+# The audited trigger inventory (R-N124): main pushes and release tags, pull
+# requests, and the main merge queue. Nothing else may start CI.
+WORKFLOW_TRIGGERS = (
+    "on:\n"
+    "  push:\n"
+    "    branches: [main]\n"
+    '    tags: ["v*"]\n'
+    "  pull_request:\n"
+    "  merge_group:\n"
+    "    types: [checks_requested]\n"
+    "\n"
+    "permissions:\n"
+)
+# Every guard invocation runs the digest-checked bytes as a `-c` argument. A
+# stdin pipe (`printf | bash -s`) raced the guard's early `exit` and failed with
+# a broken pipe when the reader closed before the writer finished.
+GUARD_INVOCATION = (
+    '/bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard'
+)
+
 HEAD_REPOSITORY_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name || github.repository }}"
@@ -61,17 +86,19 @@ UPLOAD_EXPRESSION = (
     "&& 'true' || 'false' }}"
 )
 MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
-TERMINAL_GATES = ("source", "build", "test")
+TERMINAL_GATES = ("source", "build", "test", "fault-harness")
 TERMINAL_CONSUMERS = {
     "source": "Run repository-owned source gates",
     "build": "Build the Bulkload documentation through the public Flywheel action",
     "test": "Test the complete Bulkload Bazel graph through the public Flywheel action",
+    "fault-harness": "Run the repository-owned fault harness",
 }
 ACTION_STEP_GATES = {
     "Revalidate immutable Bazel build authority": "build",
     TERMINAL_CONSUMERS["build"]: "build",
     "Revalidate immutable Bazel test authority": "test",
     TERMINAL_CONSUMERS["test"]: "test",
+    TERMINAL_CONSUMERS["fault-harness"]: "fault-harness",
     TERMINAL_CONSUMERS["source"]: "source",
 }
 JOB_FENCED_ACTION_ENV = {
@@ -104,6 +131,181 @@ USES_PATTERN = re.compile(r"(?m)^\s+uses:\s*([^\s#]+)")
 
 class ContractError(ValueError):
     pass
+
+
+# Exact recipe headers and bodies of the repository gates CI and `just check`
+# run (R-N122). The justfile is not digest-pinned, so emptying or rewiring one
+# of these recipes must fail here instead.
+PINNED_JUST_RECIPES = {
+    "rust-check": (
+        "rust-check:",
+        (
+            "cd {{ root }} && cargo fmt --all -- --check",
+            "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
+            "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::",
+            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
+            "cd {{ root }} && cargo test --workspace --locked",
+        ),
+    ),
+    "io-partial-write-alone": (
+        "io-partial-write-alone:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "status=0",
+            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
+            "printf '%s\\n' \"$output\"",
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "io-partial-write-alone: cargo test failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "if [[ $output == *SKIPPED* ]]; then",
+            '    echo "io-partial-write-alone: the P5 proof skipped itself" >&2',
+            "    exit 1",
+            "fi",
+            "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
+            "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
+            "proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced \\.\\.\\. ok$' <<<\"$output\" || true)",
+            "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+            "    echo \"io-partial-write-alone: expected exactly one '1 passed; 0 failed' result\" >&2",
+            "    exit 1",
+            "fi",
+            "if [[ $proved -ne 1 ]]; then",
+            '    echo "io-partial-write-alone: the passing test was not the P5 proof" >&2',
+            "    exit 1",
+            "fi",
+        ),
+    ),
+    "fault-harness": (
+        "fault-harness:",
+        (
+            "cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection -- -D warnings",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness",
+        ),
+    ),
+    "check-source": (
+        "check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir rust-check",
+        (),
+    ),
+    "ci-source": (
+        "ci-source: check-source secrets-scan-history",
+        (),
+    ),
+    "ci-fault-harness": (
+        "ci-fault-harness: fault-harness",
+        (),
+    ),
+    "check": (
+        "check:",
+        (
+            "cd {{ root }} && nix develop .#default --command just check-source",
+            "cd {{ root }} && nix develop .#default --command just fault-harness",
+            "cd {{ root }} && just test",
+        ),
+    ),
+}
+
+
+def just_recipe(justfile: str, name: str) -> tuple[str, tuple[str, ...]]:
+    lines = justfile.splitlines()
+    headers = [
+        index
+        for index, line in enumerate(lines)
+        if line == name + ":" or line.startswith(name + ": ")
+    ]
+    if len(headers) != 1:
+        raise ContractError(f"just recipe {name} must be declared exactly once")
+    body = []
+    for line in lines[headers[0] + 1 :]:
+        if not line.startswith("    "):
+            break
+        body.append(line.removeprefix("    "))
+    return lines[headers[0]], tuple(body)
+
+
+P5_COMMAND = (
+    "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib "
+    "--locked --features io-trace io::tests::traced::partial_write_prefix_is_traced "
+    "-- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?"
+)
+
+
+def validate_p5_alone(justfile: str) -> None:
+    """The P5 proof (#69) must really run: it skips itself and still reports
+    `1 passed` unless BULKLOAD_IO_PARTIAL_WRITE_ALONE is set, so its recipe
+    must set the variable, select the one test exactly, and reject a skip or
+    any result other than one `1 passed; 0 failed`."""
+    _, rust_check = just_recipe(justfile, "rust-check")
+    if rust_check.count(
+        "cd {{ root }} && {{ just_executable() }} io-partial-write-alone"
+    ) != 1 or any("partial_write_prefix_is_traced" in line for line in rust_check):
+        raise ContractError(
+            "rust-check must run P5 only through io-partial-write-alone"
+        )
+    _, body = just_recipe(justfile, "io-partial-write-alone")
+    required = (
+        P5_COMMAND,
+        "if [[ $output == *SKIPPED* ]]; then",
+        "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
+        "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' <<<\"$output\" || true)",
+        "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+        "proved=$(grep -c '^test io::tests::traced::partial_write_prefix_is_traced "
+        '\\.\\.\\. ok$\' <<<"$output" || true)',
+        "if [[ $proved -ne 1 ]]; then",
+        "if [[ $status -ne 0 ]]; then",
+    )
+    for line in required:
+        if body.count(line) != 1:
+            raise ContractError(f"P5 must run alone and fail closed: {line}")
+
+
+# Top-level justfile lines that change how every recipe runs: settings,
+# exports, imports, modules, aliases and variables. A later `set
+# allow-duplicate-recipes`, a redirected `root :=` or an `export PATH := stub`
+# would rewire the pinned recipes without touching their bodies.
+JUSTFILE_TOP_LEVEL = (
+    'set shell := ["bash", "-euo", "pipefail", "-c"]',
+    'export PYTHONDONTWRITEBYTECODE := "1"',
+    "root := justfile_directory()",
+    'import? "justfile.flywheel"',
+)
+JUST_TOP_LEVEL_PATTERN = re.compile(
+    r"^(?:set|export|import|mod|alias)\b|^[A-Za-z_][A-Za-z0-9_-]*\s*:="
+)
+JUST_GLOBAL_DIRECTIVE_PATTERN = re.compile(r"^(?:set|export|import|mod|alias)\b")
+
+
+def just_top_level(justfile: str) -> tuple[str, ...]:
+    return tuple(
+        line for line in justfile.splitlines() if JUST_TOP_LEVEL_PATTERN.match(line)
+    )
+
+
+def just_header_count(justfile: str, name: str) -> int:
+    return len(re.findall(rf"(?m)^@?{re.escape(name)}(?=[\s:])", justfile))
+
+
+def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
+    for name, expected in PINNED_JUST_RECIPES.items():
+        if just_header_count(justfile, name) != 1:
+            raise ContractError(f"just recipe {name} must be declared exactly once")
+        if just_recipe(justfile, name) != expected:
+            raise ContractError(f"just recipe {name} drifted from its pinned body")
+    if just_top_level(justfile) != JUSTFILE_TOP_LEVEL:
+        raise ContractError("justfile top-level settings or variables drifted")
+    if imported is not None:
+        # The fleet-managed import may change its own recipes, but it may not
+        # set, export, import, alias or redefine anything the gates rely on.
+        if any(
+            JUST_GLOBAL_DIRECTIVE_PATTERN.match(line) for line in imported.splitlines()
+        ):
+            raise ContractError("imported justfile must not declare global directives")
+        for name in PINNED_JUST_RECIPES:
+            if just_header_count(imported, name):
+                raise ContractError(f"imported justfile must not declare {name}")
+    validate_p5_alone(justfile)
 
 
 def sha256(source: str) -> str:
@@ -183,12 +385,34 @@ def validate_job_routing(workflow: str) -> None:
         "    strategy:\n"
         "      fail-fast: false\n"
         "      matrix:\n"
-        "        gate: [source, build, test]\n"
+        "        gate: [source, build, test, fault-harness]\n"
     )
     if workflow.count(matrix) != 1:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
     if workflow.count("matrix:") != 1 or workflow.count(MATRIX_GATE_EXPRESSION) != 2:
         raise ContractError("terminal gate matrix authority escaped its audited scope")
+
+    if workflow.count(WORKFLOW_TRIGGERS) != 1 or not workflow.startswith(
+        "name: CI\n\n" + WORKFLOW_TRIGGERS
+    ):
+        raise ContractError("workflow trigger inventory drifted")
+    if re.search(
+        r"(?m)^\s*(?:pull_request_target|workflow_run|workflow_dispatch)\s*:", workflow
+    ):
+        raise ContractError("workflow must not add an unaudited trigger")
+
+    if re.search(
+        r"(?mi)^\s*(?:continue-on-error|\"continue-on-error\"|'continue-on-error')\s*:",
+        workflow,
+    ):
+        raise ContractError("CI workflow must not suppress a job or step failure")
+    # The single job-level cap applies to every matrix gate (R-N122).
+    timeouts = re.findall(
+        r"(?mi)^\s*(?:timeout-minutes|\"timeout-minutes\"|'timeout-minutes')\s*:.*$",
+        workflow,
+    )
+    if timeouts != ["    timeout-minutes: 15"]:
+        raise ContractError("every terminal gate must keep the audited 15-minute cap")
 
     declarations = [
         line
@@ -370,6 +594,7 @@ def validate_terminal_consumer_paths(action: str) -> None:
     ]
     expected_paths = {
         "source": [*common, TERMINAL_CONSUMERS["source"]],
+        "fault-harness": [*common, TERMINAL_CONSUMERS["fault-harness"]],
         "build": [
             *common,
             "Revalidate immutable Bazel build authority",
@@ -877,6 +1102,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "Build the Bulkload documentation through the public Flywheel action",
         "Revalidate immutable Bazel test authority",
         "Test the complete Bulkload Bazel graph through the public Flywheel action",
+        "Run the repository-owned fault harness",
         "Run repository-owned source gates",
     ]
     if step_names != expected_step_names:
@@ -926,6 +1152,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             "env",
             "with",
         ),
+        "Run the repository-owned fault harness": ("if", "shell", "env", "run"),
         "Run repository-owned source gates": ("if", "shell", "env", "run"),
     }
     for name in expected_step_names:
@@ -1012,6 +1239,29 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     ):
         raise ContractError("source gate must not define wrappers or detach failures")
 
+    # The fault-harness gate (R-N122) is the audited source step with exactly
+    # three substitutions: its name, its gate condition and its just recipe.
+    harness_step = extract_action_step(action, TERMINAL_CONSUMERS["fault-harness"])
+    if exact_digest and sha256(harness_step) != FAULT_HARNESS_STEP_SHA256:
+        raise ContractError("repository fault-harness step mapping drifted")
+    derived_harness_step = (
+        source_gate_step.replace(
+            f"    - name: {TERMINAL_CONSUMERS['source']}\n",
+            f"    - name: {TERMINAL_CONSUMERS['fault-harness']}\n",
+            1,
+        )
+        .replace(
+            "      if: ${{ inputs.gate == 'source' }}\n",
+            "      if: ${{ inputs.gate == 'fault-harness' }}\n",
+            1,
+        )
+        .replace(source_exec, "          .#default --command just ci-fault-harness", 1)
+    )
+    if harness_step != derived_harness_step + "\n":
+        raise ContractError(
+            "fault-harness gate must be the audited source step with its own recipe"
+        )
+
     nix_setup = (
         "tinyland-inc/ci-templates/.github/actions/nix-setup@" + CI_TEMPLATES_REV
     )
@@ -1048,14 +1298,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     required = (
         "        BULKLOAD_GATE: ${{ inputs.gate }}",
         '        case "$BULKLOAD_GATE" in',
-        "          source | build | test) ;;",
+        "          source | build | test | fault-harness) ;;",
         "        attic-cache: main",
         "      id: guard-snapshot",
         "      id: authority",
         "      id: bazel-build-authority",
         "      id: bazel-test-authority",
-        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- preflight",
-        "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- enforce",
+        f"        {GUARD_INVOCATION} preflight",
+        f"        {GUARD_INVOCATION} enforce",
         '        [[ "$(nix config show store)" == local ]]',
         '        [[ "$(nix config show allow-symlinked-store)" == false ]]',
         '        [[ "$(nix eval --raw --expr builtins.storeDir)" == /nix/store ]]',
@@ -1081,7 +1331,6 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         "        actual_public_keys=$(nix config show trusted-public-keys | tr ' ' '\\n' | sed '/^$/d' | LC_ALL=C sort)",
         '        expected_public_keys=$(printf \'%s\\n\' "$ATTIC_PUBLIC_KEY" "$nixos_public_key" | LC_ALL=C sort)',
         '        [[ "$actual_public_keys" == "$expected_public_keys" ]]',
-        "        exec nix develop --no-write-lock-file --ignore-environment \\",
         "        command: build",
         "        targets: //:bulkload",
         "        command: test",
@@ -1090,6 +1339,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     for declaration in required:
         if action.count(declaration) != 1:
             raise ContractError(f"local action contract drifted: {declaration.strip()}")
+    # Once in each repository consumer: the fault-harness and source gates.
+    if (
+        action.count(
+            "        exec nix develop --no-write-lock-file --ignore-environment \\"
+        )
+        != 2
+    ):
+        raise ContractError("repository consumer exec inventory drifted")
 
     reviewed_env_steps = expected_step_names[1:]
     environment = {
@@ -1195,6 +1452,14 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         for key, value in captured_bazel_context.items()
         if not key.startswith("BULKLOAD_CAPTURED_") and key != "ATTIC_SERVER"
     }
+    # The fault-harness and source gates are the two repository consumers; they
+    # share one exact environment.
+    repository_consumer_context = {
+        "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
+        "ATTIC_CACHE": "main",
+        "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
+        "ATTIC_PUBLIC_READ_SITE": "bulkload-ci",
+    }
     exact_extras = {
         reviewed_env_steps[0]: {},
         reviewed_env_steps[1]: guard_context,
@@ -1217,12 +1482,8 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             "BULKLOAD_BAZEL_PHASE": "test",
         },
         reviewed_env_steps[8]: bazel_consumer_context,
-        reviewed_env_steps[9]: {
-            "ATTIC_SERVER": "${{ steps.authority.outputs.attic_server }}",
-            "ATTIC_CACHE": "main",
-            "ATTIC_PUBLIC_KEY": PUBLIC_KEY,
-            "ATTIC_PUBLIC_READ_SITE": "bulkload-ci",
-        },
+        reviewed_env_steps[9]: repository_consumer_context,
+        reviewed_env_steps[10]: repository_consumer_context,
     }
     for name, env in environment.items():
         extras = exact_extras[name]
@@ -1329,6 +1590,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         reviewed_env_steps[7]: common_home,
         reviewed_env_steps[8]: "${{ steps.bazel-test-authority.outputs.bazel_home }}",
         reviewed_env_steps[9]: source_home,
+        reviewed_env_steps[10]: source_home,
     }
     for name in reviewed_env_steps:
         env = environment[name]
@@ -1363,6 +1625,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
             8
         ]: "${{ steps.bazel-test-authority.outputs.bazel_runtime_home }}",
         reviewed_env_steps[9]: source_home,
+        reviewed_env_steps[10]: source_home,
     }
     expected_test_tmpdirs = {name: '""' for name in reviewed_env_steps}
     expected_test_tmpdirs[reviewed_env_steps[6]] = (
@@ -1428,7 +1691,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         ):
             raise ContractError(f"local action {name} captured Nix config drifted")
 
-    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 8:
+    if action.count("      shell: /bin/bash --noprofile --norc -p {0}") != 9:
         raise ContractError(
             "every direct shell boundary must use absolute privileged non-profile Bash"
         )
@@ -1448,12 +1711,7 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
     )
     if action.count(digest_check) != 4:
         raise ContractError("every captured guard must have an external digest check")
-    if (
-        action.count(
-            "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel"
-        )
-        != 2
-    ):
+    if action.count(f"        {GUARD_INVOCATION} bazel") != 2:
         raise ContractError("each Bazel invocation needs an immediate authority guard")
     if (
         action.count(
@@ -1466,18 +1724,16 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("Bazel executor input must remain empty")
 
     snapshot = action.index("- name: Snapshot the exact public-read guard")
-    preflight = action.index("/bin/bash --noprofile --norc -p -s -- preflight")
+    preflight = action.index(f"{GUARD_INVOCATION} preflight")
     setup = action.index(f"uses: {nix_setup}")
-    enforce = action.index("/bin/bash --noprofile --norc -p -s -- enforce")
+    enforce = action.index(f"{GUARD_INVOCATION} enforce")
     effective_nix = action.index(
         "\n    - name: Verify effective Nix client authority\n"
     )
     source = action.index("\n    - name: Run repository-owned source gates\n")
     bazel_guards = [
         match.start()
-        for match in re.finditer(
-            re.escape("/bin/bash --noprofile --norc -p -s -- bazel"), action
-        )
+        for match in re.finditer(re.escape(f"{GUARD_INVOCATION} bazel"), action)
     ]
     bazel_actions = [
         match.start()
@@ -1538,6 +1794,11 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         'require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"',
         'require_equal "ref" "${BULKLOAD_REF:-}" "${GITHUB_REF:-}"',
         '"pull-request head repository"',
+        "  merge_group)\n",
+        '"merge-group repository"',
+        '[[ "${BULKLOAD_REF:-}" == refs/heads/gh-readonly-queue/main/* ]] ||',
+        'die "merge-group ref is outside the main merge queue"',
+        '*) die "event is outside the reviewed push/pull_request/merge_group inventory" ;;',
         '"$(git -C "${GITHUB_WORKSPACE:?}" rev-parse HEAD)"',
         'if [[ "$BULKLOAD_EVENT_NAME" == push && "$BULKLOAD_REF" == refs/heads/main ]]; then',
         'case "$mode" in',
@@ -2008,6 +2269,15 @@ class CiContractTest(unittest.TestCase):
                 "Revalidate immutable Bazel test authority",
                 TERMINAL_CONSUMERS["test"],
             ],
+            "fault-harness": [
+                "Validate the terminal gate selection",
+                "Snapshot the exact public-read guard",
+                "Preflight raw runner endpoint authority",
+                "Discover sanctioned runner endpoint authority",
+                "Enforce the discovered public-read boundary",
+                "Verify effective Nix client authority",
+                TERMINAL_CONSUMERS["fault-harness"],
+            ],
         }
         all_consumers = set(TERMINAL_CONSUMERS.values())
         for gate in TERMINAL_GATES:
@@ -2020,16 +2290,89 @@ class CiContractTest(unittest.TestCase):
                 )
                 self.assertEqual(selected[-1], TERMINAL_CONSUMERS[gate])
 
-    def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
-        workflow_variants = [
+    def test_workflow_triggers_cap_and_failure_suppression_mutations_fail_closed(
+        self,
+    ) -> None:
+        cap = "    timeout-minutes: 15\n"
+        queue = "  merge_group:\n    types: [checks_requested]\n"
+        variants = [
+            self.workflow.replace(queue, "", 1),
             self.workflow.replace(
-                "        gate: [source, build, test]",
-                "        gate: [source, build]",
+                queue, "  merge_group:\n    types: [checks_requested, destroyed]\n", 1
+            ),
+            self.workflow.replace(queue, queue + "  workflow_dispatch:\n", 1),
+            self.workflow.replace(queue, queue + "  pull_request_target:\n", 1),
+            self.workflow.replace(
+                "    branches: [main]\n", "    branches: ['**']\n", 1
+            ),
+            self.workflow.replace(
+                "github.event_name == 'merge_group' && "
+                "github.event.merge_group.head_sha || ",
+                "",
+                1,
+            ),
+            self.workflow.replace(cap, "    timeout-minutes: 30\n", 1),
+            self.workflow.replace(cap, "", 1),
+            self.workflow.replace(cap, cap + "    continue-on-error: true\n", 1),
+            self.workflow.replace(cap, cap + '    "continue-on-error": true\n', 1),
+            self.workflow.replace(
+                "      - name: Bulkload public-read cache-first validation\n",
+                "      - name: Bulkload public-read cache-first validation\n"
+                "        timeout-minutes: 60\n",
                 1,
             ),
             self.workflow.replace(
+                "      - name: Bulkload public-read cache-first validation\n",
+                "      - name: Bulkload public-read cache-first validation\n"
+                "        continue-on-error: true\n",
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, self.workflow)
+                with self.assertRaises(ContractError):
+                    validate_workflow(unsafe, exact_digest=False)
+
+    def test_fault_harness_gate_mutations_fail_closed(self) -> None:
+        harness_exec = "          .#default --command just ci-fault-harness"
+        harness_condition = "      if: ${{ inputs.gate == 'fault-harness' }}\n"
+        variants = [
+            self.action.replace(
+                harness_exec, "          .#default --command just rust-check", 1
+            ),
+            self.action.replace(harness_exec, harness_exec + "\n        /bin/true", 1),
+            self.action.replace(harness_condition, "", 1),
+            self.action.replace(
+                harness_condition, "      if: ${{ inputs.gate == 'source' }}\n", 1
+            ),
+            self.action.replace(
+                "          source | build | test | fault-harness) ;;",
+                "          source | build | test) ;;",
+                1,
+            ),
+            self.action.replace(
+                "        --keep XDG_STATE_HOME \\\n" + harness_exec,
+                harness_exec,
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, self.action)
+                with self.assertRaises(ContractError):
+                    validate_local_action(unsafe, exact_digest=False)
+
+    def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
+        workflow_variants = [
+            self.workflow.replace(
+                "        gate: [source, build, test, fault-harness]",
                 "        gate: [source, build, test]",
-                "        gate: [build, source, test]",
+                1,
+            ),
+            self.workflow.replace(
+                "        gate: [source, build, test, fault-harness]",
+                "        gate: [build, source, test, fault-harness]",
                 1,
             ),
             self.workflow.replace("      fail-fast: false", "      fail-fast: true", 1),
@@ -2540,15 +2883,16 @@ class CiContractTest(unittest.TestCase):
                 1,
             ),
             self.action.replace(
-                "/bin/bash --noprofile --norc -p -s -- preflight",
+                f"{GUARD_INVOCATION} preflight",
                 '/bin/bash --noprofile --norc -p "$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh" preflight',
                 1,
             ),
             self.action.replace(
-                "        printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- bazel\n",
-                "",
+                f"{GUARD_INVOCATION} preflight",
+                "printf '%s' \"$guard_source\" | /bin/bash --noprofile --norc -p -s -- preflight",
                 1,
             ),
+            self.action.replace(f"        {GUARD_INVOCATION} bazel\n", "", 1),
             self.action.replace(GUARD_SHA256, "0" * 64, 1),
             self.action.replace(
                 "        BAZEL_REMOTE_CACHE: ${{ steps.authority.outputs.bazel_remote_cache }}",
@@ -2650,6 +2994,16 @@ class CiContractTest(unittest.TestCase):
                 'printf "%s\\n" "${ATTIC_SERVER:-}"',
             ),
             self.guard.replace("refs/heads/main", "refs/heads/*"),
+            self.guard.replace(
+                "refs/heads/gh-readonly-queue/main/*", "refs/heads/gh-readonly-queue/*"
+            ),
+            self.guard.replace('"merge-group repository"', '"merge-group source"'),
+            self.guard.replace(
+                'die "merge-group ref is outside the main merge queue"', "true"
+            ),
+            self.guard.replace(
+                "  merge_group)\n", "  merge_group | workflow_dispatch)\n"
+            ),
             self.guard.replace('NIX_REMOTE:-}" local', 'NIX_REMOTE:-}" daemon'),
             self.guard.replace(REVIEWED_PATH, "/tmp/unaudited:/usr/bin:/bin"),
             self.guard.replace(
@@ -2835,13 +3189,16 @@ class CiContractTest(unittest.TestCase):
             def run_guard(
                 mode: str, env: dict[str, str], *, check: bool = True
             ) -> subprocess.CompletedProcess[str]:
+                # Exactly the action's invocation: the guard bytes as `-c`.
                 result = subprocess.run(
                     [
                         "/bin/bash",
                         "--noprofile",
                         "--norc",
                         "-p",
-                        str(self.root / GUARD_PATH),
+                        "-c",
+                        (self.root / GUARD_PATH).read_text(encoding="utf-8"),
+                        "bulkload-public-read-guard",
                         mode,
                     ],
                     check=False,
@@ -3004,6 +3361,33 @@ class CiContractTest(unittest.TestCase):
             )
             run_guard("preflight", main_env)
             run_guard("enforce", main_env)
+
+            queue_ref = "refs/heads/gh-readonly-queue/main/pr-67-" + "a" * 40
+            queue_env = dict(base_env)
+            queue_env.update(
+                {
+                    "BULKLOAD_EVENT_NAME": "merge_group",
+                    "BULKLOAD_REF": queue_ref,
+                    "GITHUB_EVENT_NAME": "merge_group",
+                    "GITHUB_REF": queue_ref,
+                }
+            )
+            run_guard("preflight", queue_env)
+            run_guard("enforce", queue_env)
+            for key, value in (
+                ("BULKLOAD_UPLOAD_BAZEL_RESULTS", "true"),
+                ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
+                ("BULKLOAD_REF", "refs/heads/gh-readonly-queue/other/pr-1-x"),
+                ("BULKLOAD_REF", "refs/heads/main"),
+            ):
+                unsafe_env = dict(queue_env)
+                unsafe_env[key] = value
+                if key == "BULKLOAD_REF":
+                    unsafe_env["GITHUB_REF"] = value
+                with self.subTest(merge_group=key, value=value):
+                    self.assertNotEqual(
+                        run_guard("enforce", unsafe_env, check=False).returncode, 0
+                    )
 
             for key, value in (
                 ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
@@ -3196,6 +3580,116 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("just flywheel-build //:bulkload", justfile)
         self.assertIn("just flywheel-test //:tests", justfile)
         self.assertIn("scripts/ci-public-read-guard.sh", justfile)
+        validate_just_recipes(
+            justfile, (self.root / "justfile.flywheel").read_text(encoding="utf-8")
+        )
+
+    def test_pinned_just_recipe_mutations_fail_closed(self) -> None:
+        justfile = (self.root / "justfile").read_text(encoding="utf-8")
+        harness_test = PINNED_JUST_RECIPES["fault-harness"][1][1]
+        variants = [
+            justfile.replace(
+                "    cd {{ root }} && cargo test --workspace --locked\n", "", 1
+            ),
+            justfile.replace("    " + harness_test + "\n", "", 1),
+            justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history",
+                "ci-source: secrets-scan-history",
+                1,
+            ),
+            justfile.replace(
+                "    cd {{ root }} && nix develop .#default --command just fault-harness\n",
+                "",
+                1,
+            ),
+            justfile.replace("secrets-scan-dir rust-check", "secrets-scan-dir", 1),
+            justfile.replace(harness_test, harness_test + " || true", 1),
+            justfile.replace(
+                "BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test", "cargo test", 1
+            ),
+            justfile.replace(
+                "-- --ignored --exact --test-threads=1 --nocapture",
+                "-- --ignored --test-threads=1 --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "-- --ignored --exact --test-threads=1 --nocapture",
+                "-- --ignored --exact --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $output == *SKIPPED* ]]; then\n", "    if false; then\n", 1
+            ),
+            justfile.replace(
+                "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
+                "if [[ $passed -lt 1 ]]; then",
+                1,
+            ),
+            justfile.replace(
+                "    cd {{ root }} && {{ just_executable() }} io-partial-write-alone\n",
+                "",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $proved -ne 1 ]]; then\n", "    if false; then\n", 1
+            ),
+            justfile.replace(
+                "partial_write_prefix_is_traced \\.\\.\\. ok$'",
+                "[a-z_:]* \\.\\.\\. ok$'",
+                1,
+            ),
+            # The review's seven escapes that rewire pinned recipes without
+            # touching their bodies (R-N122, #71 review A1).
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nio-partial-write-alone *args:\n    @echo 'test result: ok. 1 passed; 0 failed;'\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nrust-check *args:\n    true\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\nfault-harness *args:\n    true\n",
+            "set allow-duplicate-recipes := true\n"
+            + justfile
+            + "\n[private]\nio-partial-write-alone *args:\n    true\n",
+            justfile.replace(
+                "root := justfile_directory()\n",
+                "root := justfile_directory() / 'decoy'\n",
+                1,
+            ),
+            justfile.replace(
+                'export PYTHONDONTWRITEBYTECODE := "1"\n',
+                'export PYTHONDONTWRITEBYTECODE := "1"\n'
+                'export PATH := justfile_directory() / "stub" + ":" + env("PATH")\n',
+                1,
+            ),
+            justfile.replace(
+                'export PYTHONDONTWRITEBYTECODE := "1"\n',
+                'export PYTHONDONTWRITEBYTECODE := "1"\n'
+                'export RUSTFLAGS := "--cfg skip_p5"\n',
+                1,
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, justfile)
+                with self.assertRaises(ContractError):
+                    validate_just_recipes(unsafe)
+        imported = (self.root / "justfile.flywheel").read_text(encoding="utf-8")
+        validate_just_recipes(justfile, imported)
+        for index, unsafe_import in enumerate(
+            [
+                'export PATH := "/tmp/stub:" + env("PATH")\n' + imported,
+                "set allow-duplicate-recipes := true\n" + imported,
+                imported + "\nrust-check:\n    true\n",
+                imported + "\n@fault-harness:\n    true\n",
+                'import? "elsewhere.just"\n' + imported,
+            ]
+        ):
+            with self.subTest(imported=index):
+                with self.assertRaises(ContractError):
+                    validate_just_recipes(justfile, unsafe_import)
 
     def test_actionlint_knows_only_the_sanctioned_custom_label(self) -> None:
         config = (self.root / ".github/actionlint.yaml").read_text(encoding="utf-8")

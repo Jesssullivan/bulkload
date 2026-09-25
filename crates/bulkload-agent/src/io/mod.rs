@@ -1,23 +1,288 @@
-//! The engine's raw I/O layer (R-N54).
+//! The engine's raw I/O layer (M2 W4, plan D3; R-N54, R-N58, R-N88).
 //!
-//! All `unsafe` for durable writes and transport tuning lives in the platform
-//! modules (`sys_darwin.rs`, `sys_linux.rs`); each block carries a `SAFETY`
-//! comment. [`durable`] builds group commit on top of them.
+//! Every `unsafe` block in this module lives in one of four files, and each
+//! carries a `// SAFETY:` comment (R-N54):
+//!
+//! - `sys_posix.rs`: the calls Darwin and Linux share (`openat`, `fstat`,
+//!   `pread`/`pwrite`, `fchmod`, `unlinkat`, `mkdirat`, `linkat`,
+//!   `setsockopt`);
+//! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
+//!   `renameatx_np(RENAME_EXCL)`, `F_PREALLOCATE`, `F_RDADVISE` and thread
+//!   `QoS`;
+//! - `sys_linux.rs`: `fdatasync`, `sync_file_range`,
+//!   `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE` plus `linkat` through
+//!   `/proc/self/fd`, `fallocate(KEEP_SIZE)` and `posix_fadvise`;
+//! - `buf.rs`: the aligned slab allocation.
+//!
+//! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
+//! it, so callers name one module on both platforms. There is no `mmap`
+//! anywhere: a live writer truncating a source file would turn a mapped read
+//! into `SIGBUS`, where `pread` returns a short count.
+//!
+//! # Contract for `durable.rs`
+//!
+//! Group commit (W3, `durable.rs`) is built on these calls. Each mutating call
+//! records one trace event when the `io-trace` feature is on (see `trace`),
+//! with the sync kind the crash checker models:
+//!
+//! | call | Darwin | Linux | trace kind |
+//! |---|---|---|---|
+//! | `sys::barrier` | `F_BARRIERFSYNC` | `fdatasync` | `Barrier` / `DataSync` |
+//! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Barrier` / `Fsync` |
+//! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `FullFlush` / `Fsync` |
+//! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Kick` |
+//! | `sys::rename_noreplace` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)` | `Rename` |
+//! | [`TempFile::create`] + [`TempFile::publish`] | named temp + rename | `O_TMPFILE` + `linkat` (named fallback) | `Create`, `Link`/`Rename` |
+//!
+//! The names and argument shapes of `barrier`, `barrier_dir`, `full_flush`,
+//! `rename_noreplace` and `set_socket_buffers` match the W3 lane's `sys`
+//! module, so `durable.rs` moves onto this layer without edits to its call
+//! sites.
 
+// R-N54: every unsafe block names its obligations, one unsafe operation per
+// block, so each SAFETY comment covers exactly one call.
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block
+)]
+
+/// Hold the recorder's serial lock for the rest of the enclosing block when
+/// the `io-trace` feature is on and a recorder is attached to this thread, so
+/// traced syscalls and their events happen in one global order. Removed by
+/// `cfg` with the feature off.
+macro_rules! trace_serial {
+    () => {
+        #[cfg(feature = "io-trace")]
+        let _serial = $crate::io::trace::serialize();
+    };
+}
+
+/// Record a trace event when the `io-trace` feature is on.
+///
+/// `$call` names the syscall; `$make` is an expression of type
+/// `std::io::Result<trace::Event>`. It is evaluated only while a recorder is
+/// attached to the current thread, after the syscall succeeded. A failure to
+/// build the event (an `fstat` for the node identity) is itself recorded as
+/// `Event::Untraced`, which the crash checker refuses: nothing is dropped
+/// silently. With the feature off the whole statement is removed by `cfg`, so
+/// the tracing sites compile to nothing.
+macro_rules! trace_event {
+    ($call:literal, $make:expr) => {{
+        #[cfg(feature = "io-trace")]
+        $crate::io::trace::record($call, || $make);
+    }};
+}
+
+pub mod buf;
+pub mod chunker;
+#[cfg(test)]
+pub mod crash_check;
 pub mod durable;
 pub mod limits;
+#[cfg(any(test, feature = "io-trace"))]
+pub mod trace;
+
+mod sys_posix;
 
 #[cfg(target_vendor = "apple")]
 #[path = "sys_darwin.rs"]
 pub mod sys;
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "linux")]
 #[path = "sys_linux.rs"]
 pub mod sys;
 
-use std::ffi::CStr;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::FileTypeExt as _;
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+compile_error!("bulkload's io layer supports Darwin and Linux only");
+
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsFd, OwnedFd};
+
+/// Identity of an inode as the kernel reports it (`st_dev`, `st_ino`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// The `fstat` fields the engine reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub node: NodeId,
+    /// Full `st_mode`, file type bits included.
+    pub mode: u32,
+    pub nlink: u64,
+    pub size: u64,
+    pub mtime_ns: i128,
+    pub ctime_ns: i128,
+}
+
+// File type bits of `st_mode`. The values are the traditional Unix ones and
+// are identical on Darwin and Linux; `mode_t` itself is `u16` on Darwin and
+// `u32` on Linux, so the layer carries modes as `u32`.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFSOCK: u32 = 0o140_000;
+#[cfg_attr(
+    target_vendor = "apple",
+    allow(dead_code, reason = "only Linux sizes pipes")
+)]
+const S_IFIFO: u32 = 0o010_000;
+
+impl Stat {
+    pub const fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+
+    pub const fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+
+    pub const fn is_socket(&self) -> bool {
+        self.mode & S_IFMT == S_IFSOCK
+    }
+
+    #[cfg_attr(
+        target_vendor = "apple",
+        allow(dead_code, reason = "only Linux sizes pipes")
+    )]
+    pub const fn is_fifo(&self) -> bool {
+        self.mode & S_IFMT == S_IFIFO
+    }
+
+    /// Permission bits only.
+    pub const fn permissions(&self) -> u32 {
+        self.mode & 0o7777
+    }
+}
+
+/// How the last component of a confined path is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Read only, `O_NONBLOCK` so a FIFO swapped in cannot block the reader.
+    Read,
+    /// A directory, for use as the base of further `*at` calls.
+    Directory,
+    /// Create a new regular file, `O_RDWR | O_CREAT | O_EXCL`, with these
+    /// permission bits. An existing name is `EEXIST`, never reused.
+    CreateExcl(u32),
+}
+
+/// A thread quality-of-service class (Darwin `QoS`; a no-op on Linux).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qos {
+    /// `QOS_CLASS_USER_INITIATED`: the plan's class for the largest file, so
+    /// it lands on a P-core.
+    UserInitiated,
+    /// `QOS_CLASS_UTILITY`.
+    Utility,
+    /// `QOS_CLASS_BACKGROUND`: E-cores only.
+    Background,
+}
+
+/// Hex digits in a destination store's temporary tag.
+pub const TEMP_TAG_HEX: usize = 16;
+
+/// A destination store's temporary tag: 16 lowercase hex digits, as
+/// `materialize::temporary_tag` derives it from the store's authority. Named
+/// temporaries carry it so the store's sweep (R-N79) covers them.
+pub type TempTag = [u8; TEMP_TAG_HEX];
+
+/// A staged file that is not yet visible under its final name.
+///
+/// On Linux it is an `O_TMPFILE` inode with no name at all, so a crash leaves
+/// no orphan; a file system without `O_TMPFILE`, or a process without
+/// `/proc/self/fd`, gets a named temporary instead. On Darwin it is always a
+/// named temporary (`O_EXCL`, private mode) named `.bulkload-<tag>-<pid>-<n>`
+/// in the materializer's grammar, so a crash leaves nothing the store's
+/// sweep does not recognize. The staged file remembers the
+/// directory it was created in, and [`TempFile::publish`] consumes it and
+/// never replaces an existing name.
+#[derive(Debug)]
+pub struct TempFile {
+    fd: OwnedFd,
+    dir: OwnedFd,
+    kind: Staged,
+}
+
+#[derive(Debug)]
+enum Staged {
+    /// Linux `O_TMPFILE`: published with `linkat` through `/proc/self/fd`.
+    Anonymous,
+    /// A named temporary in the staging directory: published with
+    /// rename-no-replace.
+    Named(CString),
+}
+
+/// A failed [`TempFile::publish`]: the staged file comes back to the caller,
+/// who can retry under another name or discard it.
+#[derive(Debug)]
+pub struct PublishError {
+    pub temp: TempFile,
+    pub error: std::io::Error,
+}
+
+impl TempFile {
+    /// Stage a new file in `dir` with permission bits `mode`; a named
+    /// temporary carries the destination store's `tag`. The directory
+    /// descriptor is duplicated and kept for [`TempFile::publish`].
+    ///
+    /// # Errors
+    /// `InvalidInput` for a malformed tag; otherwise the `openat` or
+    /// descriptor-duplication failure.
+    pub fn create(dir: impl AsFd, mode: u32, tag: &TempTag) -> std::io::Result<Self> {
+        let dir = dir.as_fd();
+        let (fd, kind) = if let Some(fd) = sys::open_tmpfile(dir, mode)? {
+            (fd, Staged::Anonymous)
+        } else {
+            let (fd, name) = sys::create_temp_named(dir, mode, tag)?;
+            (fd, Staged::Named(name))
+        };
+        Ok(Self {
+            fd,
+            dir: dir.try_clone_to_owned()?,
+            kind,
+        })
+    }
+
+    /// The staged file's descriptor, for `pwrite`, sync and `fchmod`.
+    pub const fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    /// Whether this is an unnamed `O_TMPFILE` inode.
+    pub const fn is_anonymous(&self) -> bool {
+        matches!(self.kind, Staged::Anonymous)
+    }
+
+    /// Give the staged file the name `name` in the directory it was staged in,
+    /// and return its descriptor. An existing `name` is `EEXIST` and is left
+    /// untouched. The caller seals the directory afterwards: the new name is
+    /// durable only after a directory sync.
+    ///
+    /// # Errors
+    /// Returns the staged file with the link or rename failure; an occupied
+    /// name is `EEXIST`.
+    pub fn publish(self, name: &std::ffi::CStr) -> Result<OwnedFd, Box<PublishError>> {
+        let result = match &self.kind {
+            Staged::Anonymous => sys::link_tmpfile(&self.fd, &self.dir, name),
+            Staged::Named(temp) => sys::rename_noreplace(&self.dir, temp, name),
+        };
+        match result {
+            Ok(()) => Ok(self.fd),
+            Err(error) => Err(Box::new(PublishError { temp: self, error })),
+        }
+    }
+}
+
+/// Convert a Rust path component to a C string for an `*at` call.
+///
+/// # Errors
+/// `InvalidInput` when the bytes contain a NUL.
+pub fn c_name(bytes: &[u8]) -> std::io::Result<CString> {
+    CString::new(bytes).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
 
 /// Socket buffer size for transfer streams. With Darwin's 8 KiB `AF_UNIX`
 /// default a socketpair moves 0.26–0.71 GB/s; at 4 MiB it moves
@@ -85,7 +350,7 @@ pub fn rename_exclusive(directory: &std::fs::File, from: &CStr, to: &CStr) -> st
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
     }
-    sys::rename_exclusive(directory, from, to)
+    sys::rename_noreplace(directory, from, to)
 }
 
 /// Whether an exclusive rename failed because the file system or kernel does
@@ -114,7 +379,8 @@ pub fn publish_noreplace(
     match rename_exclusive(directory, from, to) {
         Ok(()) => Ok(Published::Renamed),
         Err(error) if rename_unsupported(&error) => {
-            sys::link_then_unlink(directory, from, to)?;
+            sys::linkat(directory, from, directory, to)?;
+            sys::unlinkat(directory, from, false)?;
             crate::counters::bump(crate::counters::Counter::PublishLinkFallback);
             Ok(Published::Linked)
         }
@@ -122,29 +388,11 @@ pub fn publish_noreplace(
     }
 }
 
-fn file_type(fd: BorrowedFd<'_>) -> std::io::Result<std::fs::FileType> {
-    Ok(std::fs::File::from(fd.try_clone_to_owned()?)
-        .metadata()?
-        .file_type())
-}
-
-fn is_socket(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    Ok(file_type(fd)?.is_socket())
-}
-
-#[cfg_attr(target_vendor = "apple", allow(dead_code))]
-fn is_fifo(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
-    Ok(file_type(fd)?.is_fifo())
-}
-
-#[allow(clippy::cast_possible_truncation)]
-const fn c_int_len() -> libc::socklen_t {
-    // A `c_int` is 4 bytes on every supported target.
-    std::mem::size_of::<libc::c_int>() as libc::socklen_t
-}
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
-mod tests {
+mod transport_tests {
     use super::*;
 
     #[test]

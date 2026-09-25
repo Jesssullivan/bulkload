@@ -96,13 +96,26 @@ pub fn seal_file(file: &File) -> std::io::Result<()> {
     match durability() {
         Durability::Group => {
             counters::timed(Counter::FlushBarrier, Counter::FlushBarrierNs, || {
-                super::sys::barrier(file)
+                file_seal(file)
             })
         }
         Durability::Strict => counters::timed(Counter::FlushFull, Counter::FlushFullNs, || {
             super::sys::full_flush(file)
         }),
     }
+}
+
+/// The group-mode seal for one file: `F_BARRIERFSYNC` on Darwin. Elsewhere
+/// `fsync`, not the io layer's `fdatasync` barrier: a mode set with `fchmod`
+/// after the last write must be durable with the data (PR #59 review, F4).
+#[cfg(target_vendor = "apple")]
+fn file_seal(file: &File) -> std::io::Result<()> {
+    super::sys::barrier(file)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn file_seal(file: &File) -> std::io::Result<()> {
+    super::sys::full_flush(file)
 }
 
 /// Seal one directory's entries ahead of any record that depends on them.

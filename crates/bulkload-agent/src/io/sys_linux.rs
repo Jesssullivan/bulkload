@@ -1,147 +1,368 @@
-//! Linux (and other non-Darwin Unix) system calls for the durable-write and
-//! transport paths.
+//! Linux system calls for the durable-write, read and transport paths.
 //!
-//! Every `unsafe` block states why its preconditions hold (R-N54). Callers
-//! see only safe functions over owned descriptors and C strings.
+//! The calls Linux shares with Darwin come from `sys_posix` and are
+//! re-exported here. Every `unsafe` block states why its preconditions hold
+//! (R-N54). Each mutating call records one trace event under `io-trace`.
+//!
+//! Linux's durability ladder: `sync_file_range(WRITE)` starts write-back and
+//! is neither durable nor ordered (it is never used alone; plan D3 "Linux");
+//! `fdatasync` makes a file's data durable, cache flush included;
+//! `fsync` also makes its metadata durable, and on a directory makes its
+//! entries durable.
 
 use std::ffi::CStr;
-use std::fs::File;
-use std::os::fd::{AsRawFd as _, BorrowedFd};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 
-/// `fsync`: the file's data and all of its metadata are durable on return.
-///
-/// That includes a mode set with `fchmod` after the last write, which
-/// `fdatasync` would not carry, so `fdatasync` is not used as a seal.
+pub use super::sys_posix::*;
+use super::sys_posix::{fsync_raw, to_off_t};
+use super::{NodeId, Qos, Stat};
+
+/// Translate a Linux `struct stat`.
+#[allow(
+    clippy::useless_conversion,
+    reason = "st_nlink is u64 on x86_64 but u32 on aarch64 Linux"
+)]
+pub(super) fn stat_from_raw(raw: &libc::stat) -> Stat {
+    Stat {
+        node: NodeId {
+            dev: raw.st_dev,
+            ino: raw.st_ino,
+        },
+        mode: raw.st_mode,
+        nlink: u64::from(raw.st_nlink),
+        size: u64::try_from(raw.st_size).unwrap_or(0),
+        mtime_ns: i128::from(raw.st_mtime) * 1_000_000_000 + i128::from(raw.st_mtime_nsec),
+        ctime_ns: i128::from(raw.st_ctime) * 1_000_000_000 + i128::from(raw.st_ctime_nsec),
+    }
+}
+
+/// Permission bits as Linux's 32-bit `mode_t`.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches Darwin's 16-bit mode_t conversion"
+)]
+pub(super) const fn to_mode_t(mode: u32) -> io::Result<libc::mode_t> {
+    Ok(mode)
+}
+
+fn retry_eintr(mut call: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    loop {
+        if call() != -1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// `fdatasync`: the file's data, and the metadata needed to read it back, are
+/// durable when this returns.
 ///
 /// # Errors
 /// Returns the flush failure.
-pub fn barrier(file: &File) -> std::io::Result<()> {
-    file.sync_all()
+pub fn data_sync(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `fdatasync` takes no pointers.
+    retry_eintr(|| unsafe { libc::fdatasync(fd.as_raw_fd()) })?;
+    trace_event!(
+        "fdatasync",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::DataSync,
+        })
+    );
+    Ok(())
+}
+
+/// The per-file seal of the group protocol. On Linux there is no barrier
+/// without a flush, so this is [`data_sync`] (the W3 `sys::barrier` shape).
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn barrier(file: impl AsFd) -> io::Result<()> {
+    data_sync(file)
+}
+
+/// `fsync`: data and metadata durable; on a directory, its entries.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn full_flush(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    fsync_raw(fd)?;
+    trace_event!(
+        "fsync",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Fsync,
+        })
+    );
+    Ok(())
 }
 
 /// `fsync` on a directory descriptor, making its entries durable.
 ///
 /// # Errors
 /// Returns the flush failure.
-pub fn barrier_dir(directory: &File) -> std::io::Result<()> {
-    directory.sync_all()
+pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
+    full_flush(directory)
 }
 
-/// `fsync`: data and metadata durable, device cache flushed.
+/// Start write-back of `[offset, offset + len)` with
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)`. Not durable and not ordered; a
+/// later [`data_sync`] is what makes the range durable.
 ///
 /// # Errors
-/// Returns the flush failure.
-pub fn full_flush(file: &File) -> std::io::Result<()> {
-    file.sync_all()
+/// Returns the `sync_file_range` failure.
+pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    let (offset, len) = (to_off_t(offset)?, to_off_t(len)?);
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `sync_file_range` takes no pointers.
+    retry_eintr(|| unsafe {
+        libc::sync_file_range(fd.as_raw_fd(), offset, len, libc::SYNC_FILE_RANGE_WRITE)
+    })?;
+    trace_event!(
+        "sync_file_range",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Kick,
+        })
+    );
+    Ok(())
 }
 
-/// Rename `from` to `to` inside `directory` atomically, failing with `EEXIST`
-/// rather than replacing an existing `to` (`renameat2(RENAME_NOREPLACE)`).
+/// Rename `from` to `to` inside `directory`; an existing `to` is `EEXIST` and
+/// is left untouched.
 ///
 /// # Errors
-/// Returns the rename failure; an occupied target is `EEXIST`, and a kernel
-/// or file system without it reports `EINVAL` or `ENOSYS`.
-pub fn rename_exclusive(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let fd = libc::c_long::from(directory.as_raw_fd());
-        // SAFETY: renameat2 reads two NUL-terminated names relative to a
-        // descriptor owned by `directory` for the duration of the call; the
-        // raw syscall avoids depending on a libc wrapper.
-        let renamed = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                fd,
-                from.as_ptr(),
-                fd,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if renamed == 0 {
-            return Ok(());
+/// Returns the rename failure.
+pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
+    let directory = directory.as_fd();
+    rename_noreplace_at(directory, from, directory, to)
+}
+
+/// `renameat2(RENAME_NOREPLACE)` between two directories. A file system
+/// without it (`EINVAL`, `ENOSYS`) gets `linkat` then `unlinkat`, which is
+/// also no-clobber but is two directory operations.
+///
+/// # Errors
+/// Returns the rename failure; an occupied `to` is `EEXIST`.
+pub fn rename_noreplace_at(
+    from_dir: impl AsFd,
+    from: &CStr,
+    to_dir: impl AsFd,
+    to: &CStr,
+) -> io::Result<()> {
+    trace_serial!();
+    let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
+    // SAFETY: both descriptors are live for the call and both names are
+    // NUL-terminated and outlive it.
+    let renamed = unsafe {
+        libc::renameat2(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed == 0 {
+        trace_event!(
+            "renameat2",
+            Ok(super::trace::Event::Rename {
+                node: fstatat_nofollow(to_dir, to)?.node,
+                from_dir: fstat(from_dir)?.node,
+                from: from.to_bytes().to_vec(),
+                to_dir: fstat(to_dir)?.node,
+                to: to.to_bytes().to_vec(),
+            })
+        );
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+        return Err(error);
+    }
+    linkat(from_dir, from, to_dir, to)?;
+    unlinkat(from_dir, from, false)
+}
+
+/// Whether `/proc/self/fd` is reachable, probed once per process. Without it
+/// an `O_TMPFILE` inode could not be given a name, so staging uses a named
+/// temporary instead.
+fn proc_fd_reachable() -> bool {
+    static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REACHABLE.get_or_init(|| std::fs::metadata("/proc/self/fd").is_ok_and(|meta| meta.is_dir()))
+}
+
+/// Stage an unnamed file in `dir` with `O_TMPFILE`. Returns `None` when
+/// `/proc/self/fd` is unreachable, or when the kernel or file system does not
+/// support `O_TMPFILE` (`EOPNOTSUPP`, `EISDIR`, `EINVAL`); the caller then
+/// falls back to a named temporary.
+///
+/// # Errors
+/// Returns any other `openat` failure.
+pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd>> {
+    if !proc_fd_reachable() {
+        return Ok(None);
+    }
+    trace_serial!();
+    let here = c".";
+    match openat_raw(
+        dir,
+        here,
+        libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+        mode,
+    ) {
+        Ok(fd) => {
+            trace_event!(
+                "openat(O_TMPFILE)",
+                Ok(super::trace::Event::Create {
+                    dir: Some(fstat(dir)?.node),
+                    name: None,
+                    node: fstat(&fd)?.node,
+                    // The effective mode, after the umask.
+                    mode: fstat(&fd)?.permissions(),
+                })
+            );
+            Ok(Some(fd))
         }
-        Err(std::io::Error::last_os_error())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (directory, from, to);
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
-/// Link `from` to `to` inside `directory`, then remove `from`.
-///
-/// No-clobber (`linkat` fails with `EEXIST`), but two directory operations
-/// rather than one: the fallback where no exclusive rename is offered.
+/// Give an `O_TMPFILE` inode the name `name` in `dir`:
+/// `linkat(AT_FDCWD, "/proc/self/fd/N", dir, name, AT_SYMLINK_FOLLOW)`, which
+/// needs no capability. [`open_tmpfile`] only stages anonymously when
+/// `/proc/self/fd` is reachable. An occupied `name` is `EEXIST`.
 ///
 /// # Errors
-/// Returns the failed link or unlink.
-pub fn link_then_unlink(directory: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    let fd = directory.as_raw_fd();
-    // SAFETY: `fd` is owned by `directory` for the duration of the call, both
-    // names are NUL-terminated and outlive it, and flag 0 never follows links.
-    if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// Returns the `linkat` failure.
+pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<()> {
+    trace_serial!();
+    let (fd, dir) = (file.as_fd(), dir.as_fd());
+    let proc_path = super::c_name(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+    // SAFETY: `dir` is live for the call, both paths are NUL-terminated and
+    // outlive it, and AT_FDCWD with an absolute path reads no descriptor.
+    let linked = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            proc_path.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if linked != 0 {
+        return Err(io::Error::last_os_error());
     }
-    // SAFETY: as above; `from` is the private temporary name just linked.
-    if unsafe { libc::unlinkat(fd, from.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    trace_event!(
+        "linkat(/proc/self/fd)",
+        Ok(super::trace::Event::Link {
+            node: fstat(fd)?.node,
+            dir: fstat(dir)?.node,
+            name: name.to_bytes().to_vec(),
+        })
+    );
+    Ok(())
+}
+
+/// Reserve `[0, len)` without changing the file size
+/// (`fallocate(FALLOC_FL_KEEP_SIZE)`). Returns `false` when the file system
+/// declines (`EOPNOTSUPP`).
+///
+/// # Errors
+/// Returns any other `fallocate` failure.
+pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
+    let fd = file.as_fd();
+    let len = to_off_t(len)?;
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `fallocate` takes no pointers.
+    match retry_eintr(|| unsafe {
+        libc::fallocate(fd.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len)
+    }) {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Read-ahead advice for `[offset, offset + len)`
+/// (`posix_fadvise(POSIX_FADV_WILLNEED)`).
+///
+/// # Errors
+/// Returns the error number `posix_fadvise` reports.
+pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for the call; `posix_fadvise` takes no
+    // pointers and returns an error number instead of setting errno.
+    let ret = unsafe {
+        libc::posix_fadvise(
+            fd.as_raw_fd(),
+            to_off_t(offset)?,
+            to_off_t(len)?,
+            libc::POSIX_FADV_WILLNEED,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(ret));
     }
     Ok(())
 }
 
-/// Raise `SO_SNDBUF` and `SO_RCVBUF` on a socket descriptor. Returns `false`
-/// without changing anything when `fd` is not a socket.
+/// Linux has no `QoS` classes; nothing is applied.
 ///
 /// # Errors
-/// Returns a failed `fstat` or `setsockopt`.
-pub fn set_socket_buffers(fd: BorrowedFd<'_>, bytes: libc::c_int) -> std::io::Result<bool> {
-    if !super::is_socket(fd)? {
-        return Ok(false);
-    }
-    let fd = fd.as_raw_fd();
-    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // SAFETY: `fd` is an open socket the caller owns for the duration of
-        // the call; the option value is a live `c_int` and its exact size is
-        // passed as the option length.
-        let set = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                std::ptr::from_ref(&bytes).cast(),
-                super::c_int_len(),
-            )
-        };
-        if set != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(true)
+/// Never fails on Linux.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches Darwin's pthread_set_qos_class_self_np"
+)]
+pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
+    Ok(false)
 }
 
-/// Raise a pipe's capacity with `F_SETPIPE_SZ`. Returns `false` when `fd` is
-/// not a pipe or the platform has no such control.
+/// Linux has no `QoS` classes.
+///
+/// # Errors
+/// Never fails on Linux.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches Darwin's pthread_get_qos_class_np"
+)]
+pub const fn thread_qos() -> io::Result<Option<Qos>> {
+    Ok(None)
+}
+
+/// Raise a pipe's capacity with `F_SETPIPE_SZ`. Returns `false` without
+/// changing anything when `fd` is not a pipe.
 ///
 /// # Errors
 /// Returns a failed `fstat` or `fcntl`.
-pub fn set_pipe_buffer(fd: BorrowedFd<'_>, bytes: libc::c_int) -> std::io::Result<bool> {
-    if !super::is_fifo(fd)? {
+pub fn set_pipe_buffer(fd: BorrowedFd<'_>, bytes: libc::c_int) -> io::Result<bool> {
+    if !fstat(fd)?.is_fifo() {
         return Ok(false);
     }
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `fd` is an open pipe the caller owns for the duration of the
-        // call, and F_SETPIPE_SZ takes one integer argument.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, bytes) } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(true)
+    // SAFETY: the descriptor is a live pipe for the call, and F_SETPIPE_SZ
+    // takes one integer argument.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, bytes) } == -1 {
+        return Err(io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = bytes;
-        Ok(false)
-    }
+    Ok(true)
 }

@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -22,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gate: [source, build, test]
+        gate: [source, build, test, fault-harness]
     env:
       BASH_ENV: /dev/null
       ENV: /dev/null
@@ -67,7 +69,7 @@ jobs:
           SSL_CERT_DIR: ""
           SSLKEYLOGFILE: ""
           BULKLOAD_CHECKOUT_TOKEN: ${{ github.token }}
-          BULKLOAD_EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BULKLOAD_EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
           BULKLOAD_REPOSITORY: ${{ github.repository }}
           BULKLOAD_SERVER_URL: ${{ github.server_url }}
         run: |
@@ -232,7 +234,7 @@ jobs:
         with:
           gate: ${{ matrix.gate }}
           event-name: ${{ github.event_name }}
-          expected-sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          expected-sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
           ref: ${{ github.ref }}
           repository: ${{ github.repository }}
           head-repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}

@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use bulkload_agent::io::limits::{descriptor_limit, set_soft_descriptor_limit};
+use bulkload_agent::limits::{descriptor_limit, set_soft_descriptor_limit};
 use bulkload_agent::transfer::copy;
 
 #[test]

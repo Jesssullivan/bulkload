@@ -68,7 +68,29 @@ pub mod freshness;
 pub mod git_carry;
 pub mod handoff;
 pub mod hash;
-pub mod io;
+// The engine's io layer (R-N90, R-N54, R-N88). W3's group commit
+// (`io::durable`), descriptor limits and transport tuning run on its `sys`
+// calls; the W4 pieces (`buf`, `chunker`, `TempFile`) stay unwired until W4
+// integration, so a non-test build still sees those items as dead.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the W4 parts of the io layer are unwired until W4 integration (R-N90)"
+    )
+)]
+pub(crate) mod io;
+
+/// Group-commit durability controls (M2 W3): the `--durability` mode and the
+/// per-file and per-directory seals. See `io::durable`.
+pub mod durable {
+    pub use crate::io::durable::*;
+}
+
+/// Open-file limits and the destination's descriptor budget (M2 W3).
+pub mod limits {
+    pub use crate::io::limits::*;
+}
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod transfer;

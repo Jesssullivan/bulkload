@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use bulkload_agent::counters::{Counter, Counters};
-use bulkload_agent::io::durable::{set_durability, Durability};
+use bulkload_agent::durable::{set_durability, Durability};
 use bulkload_agent::transfer::{copy, TransferStats};
 
 struct Scratch(PathBuf);

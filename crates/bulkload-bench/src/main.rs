@@ -22,8 +22,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 use bulkload_agent::counters::Counters;
+use bulkload_agent::durable::Durability;
 use bulkload_agent::freshness::NullCache;
-use bulkload_agent::io::durable::Durability;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
 use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
@@ -970,8 +970,8 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
 }
 
 fn run(cli: &Cli) -> io::Result<()> {
-    bulkload_agent::io::durable::set_durability(cli.durability);
-    let _ = bulkload_agent::io::limits::raise_descriptor_limit();
+    bulkload_agent::durable::set_durability(cli.durability);
+    let _ = bulkload_agent::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
     let mut fixture = seed_fixture(&sealed_source, &work)?;
     let rclone_identity = cli

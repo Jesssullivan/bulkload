@@ -19,16 +19,7 @@ const DARWIN_OPEN_MAX: u64 = 10_240;
 /// # Errors
 /// Returns a failed `getrlimit`.
 pub fn descriptor_limit() -> std::io::Result<(u64, u64)> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live, writable `rlimit` for the duration of the
-    // call, and RLIMIT_NOFILE is a valid resource.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((limit.rlim_cur, limit.rlim_max))
+    super::sys::nofile_limit()
 }
 
 /// Set the soft `RLIMIT_NOFILE` to `soft`, keeping the hard limit.
@@ -38,16 +29,7 @@ pub fn descriptor_limit() -> std::io::Result<(u64, u64)> {
 /// limit.
 pub fn set_soft_descriptor_limit(soft: u64) -> std::io::Result<()> {
     let (_, hard) = descriptor_limit()?;
-    let limit = libc::rlimit {
-        rlim_cur: soft,
-        rlim_max: hard,
-    };
-    // SAFETY: `limit` is a live, initialized `rlimit` for the duration of the
-    // call, and RLIMIT_NOFILE is a valid resource.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    super::sys::set_nofile_limit(soft, hard)
 }
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit; return the new soft limit.
