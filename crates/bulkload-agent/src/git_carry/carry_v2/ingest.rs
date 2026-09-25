@@ -159,9 +159,15 @@ impl Target {
     }
 
     /// The destination command: the estimate's hardened invocation (no
-    /// hooks, no auto-gc or maintenance, `GIT_NO_LAZY_FETCH`, `LC_ALL=C`),
-    /// with pack and ref writes fsynced by Git as well, and
-    /// `GIT_QUARANTINE_PATH` stripped.
+    /// hooks, no auto-gc or maintenance, `GIT_NO_LAZY_FETCH`,
+    /// `GIT_NO_REPLACE_OBJECTS`, `LC_ALL=C`), with pack and ref writes fsynced
+    /// by Git as well, and `GIT_QUARANTINE_PATH` stripped.
+    ///
+    /// #75 r1 B3: grafts are off (`GIT_GRAFT_FILE=/dev/null`), and neither
+    /// `GIT_SHALLOW_FILE` nor `GIT_REPLACE_REF_BASE` is inherited. A graft
+    /// that made a held tip parentless hid a deleted parent from both the
+    /// preflight and the connectivity check; the history they walk is now
+    /// the one the objects record (and the repository's real shallow file).
     fn git(&self) -> Command {
         let mut command = hardened(&self.repository);
         command
@@ -171,7 +177,10 @@ impl Target {
                 "-c",
                 "core.fsyncMethod=fsync",
             ])
-            .env_remove("GIT_QUARANTINE_PATH");
+            .env_remove("GIT_QUARANTINE_PATH")
+            .env_remove("GIT_SHALLOW_FILE")
+            .env_remove("GIT_REPLACE_REF_BASE")
+            .env("GIT_GRAFT_FILE", "/dev/null");
         command
     }
 
@@ -225,9 +234,10 @@ impl IngestPlan {
     /// # Errors
     /// `FIELD_DOMAIN_VIOLATION` for a `pack_id` that is not 64 lowercase hex
     /// digits, a have or oid that is not an object name, a ref name outside
-    /// the conservative set (`refs/`, then `[A-Za-z0-9._/+@-]` components, no
-    /// empty, dot-leading or `.lock` component, no `..`), or a name given
-    /// twice.
+    /// the conservative set (`refs/carry/`, then `[A-Za-z0-9._/+@-]`
+    /// components, no empty, dot-leading or `.lock` component, no `..`; #75
+    /// r1 D7), or two names that clash: equal once ASCII case is folded, or
+    /// one a directory of the other (#75 r1 B4, D3).
     pub fn new(
         pack_id: &str,
         segments: usize,
@@ -235,22 +245,21 @@ impl IngestPlan {
         mut updates: Vec<RefUpdate>,
     ) -> crate::Result<Self> {
         let bad = || BulkloadRefusal::FieldDomainViolation;
-        if pack_id.len() != 64
-            || !pack_id
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
+        if !pack_id_ok(pack_id) {
             return Err(bad());
         }
         if !haves.iter().all(|value| is_oid(value.as_bytes())) {
             return Err(bad());
         }
         updates.sort();
-        let mut names = BTreeSet::new();
-        for update in &updates {
-            if !ref_name(&update.name)
-                || !is_oid(update.oid.as_bytes())
-                || !names.insert(&update.name)
+        for (index, update) in updates.iter().enumerate() {
+            if !ref_name(&update.name) || !is_oid(update.oid.as_bytes()) {
+                return Err(bad());
+            }
+            if updates
+                .iter()
+                .skip(index + 1)
+                .any(|other| clashes(&update.name, &other.name))
             {
                 return Err(bad());
             }
@@ -334,11 +343,38 @@ impl IngestPlan {
     }
 }
 
-/// Git's ref-name rules, narrowed to a conservative byte set.
+/// Whether `pack_id` is a plan id: exactly 64 lowercase hex digits (#75 r1
+/// B2: it names a journal file, so nothing else may reach a path).
+pub(super) fn pack_id_ok(pack_id: &str) -> bool {
+    pack_id.len() == 64
+        && pack_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether two ref names cannot both exist, or would alias, on some
+/// destination: equal once ASCII case is folded (a case-insensitive file
+/// system maps both to one loose file, #75 r1 B4), or one is a directory of
+/// the other (a directory/file conflict, #75 r1 D3). Equal names clash too.
+fn clashes(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    a == b
+        || b.strip_prefix(a.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+        || a.strip_prefix(b.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Git's ref-name rules, narrowed to a conservative byte set and, for M1, to
+/// `refs/carry/` (#75 r1 D7: no `refs/replace/`, `refs/heads/` or other
+/// namespace an ordinary git command reads).
 fn ref_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("refs/") else {
         return false;
     };
+    if !name.starts_with("refs/carry/") {
+        return false;
+    }
     name.len() <= 1024
         && !name.contains("..")
         && !name.contains("@{")
@@ -490,6 +526,11 @@ impl<'a> Ingest<'a> {
             .or(pack_id)
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?
             .to_owned();
+        // #75 r1 B2: a resume's pack_id names a file; nothing but a plan id
+        // may reach the journal store.
+        if !pack_id_ok(&pack_id) {
+            return Err(BulkloadRefusal::FieldDomainViolation.into());
+        }
         let git_dir = target.repository.git_dir.as_path();
         match Journal::open(journals, &pack_id)? {
             Found::Fresh(journal) => {
@@ -509,13 +550,26 @@ impl<'a> Ingest<'a> {
                 };
                 // A refusal here leaves nothing: no plan, no quarantine, no
                 // journal.
-                if let Err(refused) = session.occupied().and_then(|()| session.preflight()) {
+                // #75 r1 B1: a fresh session never adopts a quarantine it did
+                // not make (a lost state dir's, or another state dir's).
+                let fresh = session
+                    .occupied()
+                    .and_then(|()| session.preflight())
+                    .and_then(|()| match open_dir(&session.quarantine_path()) {
+                        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(()),
+                        Ok(_) => Err(Refused::because(
+                            BulkloadRefusal::GitDestinationOccupied,
+                            "quarantine_exists",
+                        )),
+                        Err(error) => Err(error.into()),
+                    });
+                if let Err(refused) = fresh {
                     session.journal.remove()?;
                     return Err(refused);
                 }
                 let block = session.plan.block(git_dir);
                 session.journal.append(&block)?;
-                session.quarantine(true)?;
+                session.make_quarantine()?;
                 Ok(session)
             }
             Found::Existing(journal, records) => {
@@ -605,6 +659,26 @@ impl<'a> Ingest<'a> {
             .join(format!("incoming-bulkload-{}", self.plan.pack_id))
     }
 
+    /// Create the quarantine and its `pack/` for a new session, refusing
+    /// `GIT_DESTINATION_OCCUPIED` if the name already exists (#75 r1 B1).
+    fn make_quarantine(&self) -> Outcome<()> {
+        let objects = open_dir(&self.target.objects)?;
+        let name = cstring(format!("incoming-bulkload-{}", self.plan.pack_id).as_bytes())?;
+        // SAFETY: `objects` is an open directory and `name` NUL-terminated.
+        if unsafe { libc::mkdirat(objects.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                return Err(Refused::because(
+                    BulkloadRefusal::GitDestinationOccupied,
+                    "quarantine_exists",
+                ));
+            }
+            return Err(BulkloadRefusal::from(error).into());
+        }
+        self.quarantine(true)?;
+        Ok(())
+    }
+
     /// Open the quarantine directory and its `pack/`, creating and sealing
     /// them when `create` is set.
     fn quarantine(&self, create: bool) -> crate::Result<Option<(File, File)>> {
@@ -672,58 +746,89 @@ impl<'a> Ingest<'a> {
         Ok(())
     }
 
-    /// Current values of the plan's refs, by name.
+    /// Current values of the plan's refs, by name, resolved byte-exactly.
     fn current(&self) -> Outcome<BTreeMap<String, String>> {
-        let mut command = self.target.git();
-        command.args(["for-each-ref", "--format=%(objectname) %(refname)"]);
-        for update in &self.plan.updates {
-            command.arg(&update.name);
-        }
-        let wanted: BTreeSet<&str> = self.plan.updates.iter().map(|u| u.name.as_str()).collect();
-        let mut current = BTreeMap::new();
-        if wanted.is_empty() {
-            return Ok(current);
-        }
-        run_child(&mut command, &[], self.store, "ref_read_failed", |stdout| {
-            lines(stdout, |line| {
-                let text = std::str::from_utf8(line)
-                    .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-                let (oid, name) = text
-                    .split_once(' ')
-                    .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-                // A pattern also matches refs below it; keep exact names.
-                if wanted.contains(name) {
-                    current.insert(name.to_owned(), oid.to_owned());
-                }
-                Ok(())
-            })
-        })?;
-        Ok(current)
+        let names: Vec<&str> = self.plan.updates.iter().map(|u| u.name.as_str()).collect();
+        let values = self.resolve(&names)?;
+        Ok(names
+            .into_iter()
+            .zip(values)
+            .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value)))
+            .collect())
     }
 
-    /// Refuse a plan ref that already names another object.
+    /// Refuse `GIT_DESTINATION_OCCUPIED` / `carry_ref_occupied` when a plan
+    /// ref already names another object, is a symbolic ref (#75 r1 D2), or
+    /// clashes with an existing ref of another spelling: equal once ASCII
+    /// case is folded (#75 r1 B4) or a directory of it, either way (#75 r1
+    /// D3). Runs at open and again just before migration.
     fn occupied(&self) -> Outcome<()> {
+        let occupied = || {
+            Refused::because(
+                BulkloadRefusal::GitDestinationOccupied,
+                "carry_ref_occupied",
+            )
+        };
         let current = self.current()?;
         for update in &self.plan.updates {
             if current
                 .get(&update.name)
                 .is_some_and(|oid| oid != &update.oid)
             {
-                return Err(Refused::because(
-                    BulkloadRefusal::GitDestinationOccupied,
-                    "carry_ref_occupied",
-                ));
+                return Err(occupied());
+            }
+        }
+        for name in self.all_refs(None)? {
+            if self
+                .plan
+                .updates
+                .iter()
+                .any(|update| update.name != name && clashes(&update.name, &name))
+            {
+                return Err(occupied());
+            }
+        }
+        for update in &self.plan.updates {
+            // `symbolic-ref -q` exits 0 for a symref (dangling or not) and 1
+            // for anything else; a dangling one is invisible to for-each-ref.
+            let status = self
+                .target
+                .git()
+                .args(["symbolic-ref", "-q", &update.name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            match status.code() {
+                Some(1) => {}
+                Some(0) => {
+                    return Err(Refused::because(
+                        BulkloadRefusal::GitDestinationOccupied,
+                        "carry_ref_symbolic",
+                    ))
+                }
+                _ => return Err(BulkloadRefusal::GitInventoryMalformed.into()),
             }
         }
         Ok(())
     }
 
-    /// Remove `tmp_*` leftovers and packs no journal record names from the
-    /// quarantine's `pack/`. Anything else there refuses.
+    /// Bring the quarantine to exactly this session's journaled packs:
+    /// remove `tmp_*` leftovers and packs no journal record names from its
+    /// `pack/`, refuse anything else in it or beside `pack/`
+    /// (`GIT_DESTINATION_OCCUPIED`), and refuse `SEALED_OBJECT_MISSING` when a
+    /// journaled pack's `.pack` or `.idx` is gone (#75 r1 B1).
     fn sweep(&self) -> crate::Result<()> {
-        let Some((_, pack)) = self.quarantine(false)? else {
-            return Ok(());
+        let Some((quarantine, pack)) = self.quarantine(false)? else {
+            return if self.acks.is_empty() {
+                Ok(())
+            } else {
+                Err(BulkloadRefusal::SealedObjectMissing)
+            };
         };
+        if entries(&quarantine)? != [b"pack".to_vec()] {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
         let kept: BTreeSet<&str> = self.acks.iter().map(|ack| ack.pack.as_str()).collect();
         for name in entries(&pack)? {
             let Ok(text) = std::str::from_utf8(&name) else {
@@ -751,6 +856,14 @@ impl<'a> Ingest<'a> {
             }
         }
         seal_dir(&pack)?;
+        for ack in &self.acks {
+            for extension in ["pack", "idx"] {
+                let name = cstring(format!("pack-{}.{extension}", ack.pack).as_bytes())?;
+                if open_file_at(&pack, &name).is_err() {
+                    return Err(BulkloadRefusal::SealedObjectMissing);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -793,6 +906,10 @@ impl<'a> Ingest<'a> {
             }
         }
         seal_dir(&pack_dir)?;
+        // #75 r1 D1(a): the ack is a record on the state dir's device; the
+        // pack's device is fully flushed first, so the ack never outlives the
+        // pack on power loss (device-wide on Darwin, R-N103).
+        flush_device(&pack_dir)?;
         let ack = SegmentAck {
             index,
             pack: hash,
@@ -861,6 +978,9 @@ impl<'a> Ingest<'a> {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
         if self.stage == Stage::Receiving {
+            // #75 r1 B1: the check sees exactly the journaled packs, and
+            // every one of them is there.
+            self.sweep()?;
             if let Err(refused) = self.connected() {
                 self.discard_quarantine()?;
                 self.journal
@@ -872,6 +992,10 @@ impl<'a> Ingest<'a> {
             self.stage = Stage::Connected;
         }
         if self.stage == Stage::Connected {
+            // #75 r1 D3: refs can move between open and now. Refuse before
+            // any pack migrates, while the caller can still abandon the
+            // session (or finish it once the ref is cleared).
+            self.occupied()?;
             self.migrate()?;
             fault_point!(GitIngestAfterMigrate);
             self.journal.append(&[Record::Migrated])?;
@@ -884,6 +1008,11 @@ impl<'a> Ingest<'a> {
                 .append(&[Record::Published(before.clone(), after.clone())])?;
             self.carry = Some((before, after));
             self.stage = Stage::Published;
+        }
+        if self.stage >= Stage::Published {
+            // #75 r1 D1(b): a journaled publication is re-checked; a ref lost
+            // to power loss is published again (its objects checked first).
+            self.ensure_published()?;
         }
         if self.stage == Stage::Published {
             self.drop_keeps()?;
@@ -972,6 +1101,7 @@ impl<'a> Ingest<'a> {
         drop(from);
         self.discard_quarantine()?;
         seal_dir(&objects)?;
+        flush_device(&objects)?;
         Ok(())
     }
 
@@ -1001,8 +1131,12 @@ impl<'a> Ingest<'a> {
         }
         let before = self.carry_digest()?;
         if !transaction.is_empty() {
+            // #75 r1 D2: `--no-deref`, so a symref at a plan name is never
+            // followed (and `occupied` refuses one before this).
             run_child(
-                self.target.git().args(["update-ref", "--stdin", "-z"]),
+                self.target
+                    .git()
+                    .args(["update-ref", "--no-deref", "--stdin", "-z"]),
                 &transaction,
                 self.store,
                 "ref_transaction_refused",
@@ -1016,45 +1150,204 @@ impl<'a> Ingest<'a> {
                 refused
             })?;
         }
+        self.seal_refs()?;
         let after = self.carry_digest()?;
+        if !self.all_published()? {
+            return Err(Refused::because(
+                BulkloadRefusal::GitDestinationOccupied,
+                "published_ref_missing",
+            ));
+        }
         Ok((before, after))
     }
 
-    /// BLAKE3 over `<oid> <refname>` lines of every `refs/carry/*` ref whose
-    /// name the plan does not publish, in ref-name order.
-    fn carry_digest(&self) -> Outcome<String> {
-        let ours: BTreeSet<&[u8]> = self
+    /// Seal what the ref transaction wrote: every directory from `refs/` to
+    /// each plan ref's parent, `packed-refs`, a `reftable/` directory and its
+    /// files, and the common dir; then fully flush the device (#75 r1 D1(b):
+    /// Git fsyncs ref contents, not the directories naming them).
+    fn seal_refs(&self) -> crate::Result<()> {
+        let common = open_dir(&self.target.common)?;
+        for update in &self.plan.updates {
+            let mut directory = open_dir_at(&common, &cstring(b"refs")?)?;
+            let parts: Vec<&str> = update.name.split('/').collect();
+            let parents = parts
+                .get(1..parts.len().saturating_sub(1))
+                .unwrap_or_default();
+            seal_dir(&directory)?;
+            for part in parents {
+                directory = match open_dir_at(&directory, &cstring(part.as_bytes())?) {
+                    Ok(next) => next,
+                    // Packed or reftable storage has no loose directory.
+                    Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => break,
+                    Err(error) => return Err(error),
+                };
+                seal_dir(&directory)?;
+            }
+        }
+        match open_file_at(&common, &cstring(b"packed-refs")?) {
+            Ok(file) => seal_file(&file)?,
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
+            Err(error) => return Err(error),
+        }
+        match open_dir_at(&common, &cstring(b"reftable")?) {
+            Ok(tables) => {
+                for name in entries(&tables)? {
+                    seal_file(&open_file_at(&tables, &cstring(&name)?)?)?;
+                }
+                seal_dir(&tables)?;
+            }
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
+            Err(error) => return Err(error),
+        }
+        seal_dir(&common)?;
+        flush_device(&common)?;
+        Ok(())
+    }
+
+    /// Whether every plan ref resolves, byte-exactly, to its oid.
+    fn all_published(&self) -> Outcome<bool> {
+        let names: Vec<&str> = self.plan.updates.iter().map(|u| u.name.as_str()).collect();
+        let values = self.resolve(&names)?;
+        Ok(self
             .plan
             .updates
             .iter()
-            .map(|update| update.name.as_bytes())
-            .collect();
-        let mut hasher = blake3::Hasher::new();
+            .zip(values)
+            .all(|(update, value)| value.as_deref() == Some(update.oid.as_str())))
+    }
+
+    /// A journaled publication whose refs no longer resolve (lost to power
+    /// loss after the journal record) is published again, once the objects
+    /// are shown complete without the quarantine (#75 r1 D1(b)).
+    fn ensure_published(&self) -> Outcome<()> {
+        if self.all_published()? {
+            return Ok(());
+        }
+        self.occupied()?;
+        self.connected_in_store()?;
+        self.publish()?;
+        Ok(())
+    }
+
+    /// The refs-only connectivity check against the main store.
+    fn connected_in_store(&self) -> Outcome<()> {
+        let mut input = Vec::new();
+        for update in &self.plan.updates {
+            input.extend_from_slice(update.oid.as_bytes());
+            input.push(b'\n');
+        }
         run_child(
             self.target.git().args([
-                "for-each-ref",
-                "--format=%(objectname) %(refname)",
-                "refs/carry/",
+                "rev-list",
+                "--objects",
+                "--stdin",
+                "--not",
+                "--all",
+                "--quiet",
             ]),
-            &[],
+            &input,
+            self.store,
+            "connectivity_missing",
+            |stdout| {
+                std::io::copy(stdout, &mut std::io::sink())?;
+                Ok(())
+            },
+        )
+        .map_err(|mut refused| {
+            refused.refusal = BulkloadRefusal::GitHavesUnprovable;
+            refused
+        })
+    }
+
+    /// Resolve full ref names byte-exactly, as `cat-file --batch-check`
+    /// does (loose file first, then packed): `None` for a name that names
+    /// nothing. This sees a loose file a case-insensitive file system maps
+    /// to a packed ref's name, which `for-each-ref` does not (#75 r1 B4).
+    fn resolve(&self, names: &[&str]) -> Outcome<Vec<Option<String>>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for name in names {
+            input.extend_from_slice(name.as_bytes());
+            input.push(b'\n');
+        }
+        let mut values = Vec::with_capacity(names.len());
+        run_child(
+            self.target
+                .git()
+                .args(["cat-file", "--batch-check=%(objectname)"]),
+            &input,
             self.store,
             "ref_read_failed",
             |stdout| {
                 lines(stdout, |line| {
-                    let name = line
-                        .iter()
-                        .position(|b| *b == b' ')
-                        .and_then(|at| line.get(at + 1..))
-                        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-                    if !ours.contains(name) {
-                        hasher.update(line);
-                        hasher.update(b"\n");
-                    }
+                    values.push(if is_oid(line) {
+                        Some(
+                            String::from_utf8(line.to_vec())
+                                .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?,
+                        )
+                    } else if line.ends_with(b" missing") {
+                        None
+                    } else {
+                        return Err(BulkloadRefusal::GitInventoryMalformed);
+                    });
                     Ok(())
                 })
             },
         )?;
+        if values.len() != names.len() {
+            return Err(BulkloadRefusal::GitInventoryMalformed.into());
+        }
+        Ok(values)
+    }
+
+    /// BLAKE3 over `<oid> <refname>` lines of every `refs/carry/*` ref whose
+    /// name the plan does not publish, in ref-name order, each oid resolved
+    /// byte-exactly by name ([`Ingest::resolve`]), so a ref that a
+    /// case-folded loose file now shadows changes the digest (#75 r1 B4).
+    fn carry_digest(&self) -> Outcome<String> {
+        let ours: BTreeSet<&str> = self
+            .plan
+            .updates
+            .iter()
+            .map(|update| update.name.as_str())
+            .collect();
+        let names: Vec<String> = self
+            .all_refs(Some("refs/carry/"))?
+            .into_iter()
+            .filter(|name| !ours.contains(name.as_str()))
+            .collect();
+        let values = self.resolve(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let mut hasher = blake3::Hasher::new();
+        for (name, value) in names.iter().zip(values) {
+            hasher.update(value.as_deref().unwrap_or("missing").as_bytes());
+            hasher.update(b" ");
+            hasher.update(name.as_bytes());
+            hasher.update(b"\n");
+        }
         Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    /// Every ref name (under `prefix`, when given), as `for-each-ref` lists
+    /// them, in name order.
+    fn all_refs(&self, prefix: Option<&str>) -> Outcome<Vec<String>> {
+        let mut command = self.target.git();
+        command.args(["for-each-ref", "--format=%(refname)"]);
+        if let Some(prefix) = prefix {
+            command.arg(prefix);
+        }
+        let mut names = Vec::new();
+        run_child(&mut command, &[], self.store, "ref_read_failed", |stdout| {
+            lines(stdout, |line| {
+                names.push(
+                    String::from_utf8(line.to_vec())
+                        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?,
+                );
+                Ok(())
+            })
+        })?;
+        Ok(names)
     }
 
     /// Drop each migrated pack's `.keep` if it still holds this session's
@@ -1129,7 +1422,7 @@ fn index_pack(
                 hasher.update(chunk);
                 bytes += u64::try_from(read).unwrap_or(u64::MAX);
                 // A child that stopped reading refused the pack; its status
-                // says so. Keep draining the reader for the digest.
+                // says so, and nothing more is read.
                 if stdin.write_all(chunk).is_err() {
                     return Ok((bytes, hasher.finalize().to_hex().to_string(), false));
                 }
@@ -1168,6 +1461,16 @@ fn index_pack(
     let hash =
         String::from_utf8(hash.to_vec()).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     Ok((hash, bytes, blake3))
+}
+
+/// A full flush of `file`'s device, counted as one (`F_FULLFSYNC` on Darwin,
+/// which drains the whole drive cache; `fsync` elsewhere).
+fn flush_device(file: &File) -> crate::Result<()> {
+    Ok(crate::counters::timed(
+        crate::counters::Counter::FlushFull,
+        crate::counters::Counter::FlushFullNs,
+        || crate::io::sys::full_flush(file),
+    )?)
 }
 
 fn open_dir(path: &Path) -> crate::Result<File> {

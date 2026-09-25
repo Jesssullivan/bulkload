@@ -222,6 +222,19 @@ pub(super) fn plan_digest(block: &[Record]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Whether `line` is a well-formed record that only follows a sealed plan.
+fn after_plan(line: &[u8]) -> bool {
+    std::str::from_utf8(line)
+        .ok()
+        .and_then(|line| Record::parse(line).ok())
+        .is_some_and(|record| {
+            !matches!(
+                record,
+                Record::Begin { .. } | Record::Have(_) | Record::Ref(..) | Record::Planned(_)
+            )
+        })
+}
+
 /// An open, locked journal.
 #[derive(Debug)]
 pub(super) struct Journal {
@@ -248,6 +261,11 @@ impl Journal {
     /// `SCHEMA_MISMATCH` for a complete line that does not parse or check,
     /// the private-file checks, and any I/O failure.
     pub(super) fn open(store: &JournalStore, pack_id: &str) -> crate::Result<Found> {
+        // #75 r1 B2: the name is built from `pack_id`, so only a plan id
+        // (64 lowercase hex digits) may name a journal.
+        if !super::ingest::pack_id_ok(pack_id) {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
         let directory = store.directory(true)?.ok_or(BulkloadRefusal::Io(None))?;
         let name = cstring(format!("{pack_id}.journal").as_bytes())?;
         let file = match open_rw(&directory, &name) {
@@ -295,34 +313,80 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Take the exclusive lock, retrying briefly: a child that another
+    /// thread of this process spawns shares every open file description
+    /// until its `exec` closes the close-on-exec ones, so a lock just
+    /// released by a closed session can look held for that instant. A
+    /// session that really holds it for the whole window refuses
+    /// `JOURNAL_OWNERSHIP_CONFLICT`.
     fn lock(&self) -> crate::Result<()> {
-        // SAFETY: the descriptor is open for the life of `self.file`.
-        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Err(BulkloadRefusal::JournalOwnershipConflict);
+        const ATTEMPTS: u32 = 100;
+        for attempt in 1..=ATTEMPTS {
+            // SAFETY: the descriptor is open for the life of `self.file`.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(());
             }
-            return Err(error.into());
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error.into());
+            }
+            if attempt < ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
-        Ok(())
+        Err(BulkloadRefusal::JournalOwnershipConflict)
     }
 
-    /// Every complete record; a torn final line is cut off and sealed.
+    /// Every complete record. A torn final line is cut off and sealed: one
+    /// without its newline (a prefix tear), or, #75 r1 D1(c), a complete
+    /// final line that fails its check (power loss can keep a record's last
+    /// page and lose its first); the step it would have recorded is redone.
+    /// A bad line before a sealed plan means no plan was ever sealed, so it
+    /// reads as no records. Any other bad line refuses `SCHEMA_MISMATCH`.
     fn read(&self) -> crate::Result<Vec<Record>> {
         let mut bytes = Vec::new();
         (&self.file).read_to_end(&mut bytes)?;
-        let complete = bytes
+        let mut complete = bytes
             .iter()
             .rposition(|b| *b == b'\n')
             .map_or(0, |at| at + 1);
+        let mut records = Vec::new();
+        let mut start = 0;
+        let body = bytes.get(..complete).unwrap_or_default();
+        // `body` ends at a newline (or is empty): split off that last one.
+        let lines: Vec<&[u8]> = body
+            .strip_suffix(b"\n")
+            .map(|body| body.split(|b| *b == b'\n').collect())
+            .unwrap_or_default();
+        for (index, line) in lines.iter().enumerate() {
+            let parsed = std::str::from_utf8(line)
+                .map_err(|_| BulkloadRefusal::SchemaMismatch)
+                .and_then(Record::parse);
+            match parsed {
+                Ok(record) => records.push(record),
+                Err(_) if index + 1 == lines.len() => {
+                    complete = start;
+                    break;
+                }
+                // A hole in a plan block that never sealed: nothing after it
+                // was ever written (a block is sealed before anything else is
+                // appended), so no plan exists.
+                Err(_)
+                    if !records.iter().any(|r| matches!(r, Record::Planned(_)))
+                        && !lines.iter().skip(index + 1).any(|later| after_plan(later)) =>
+                {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            }
+            start += line.len() + 1;
+        }
         if complete < bytes.len() {
             self.file
                 .set_len(u64::try_from(complete).map_err(|_| BulkloadRefusal::BudgetExceeded)?)?;
             seal_file(&self.file)?;
         }
-        let text = std::str::from_utf8(bytes.get(..complete).unwrap_or_default())
-            .map_err(|_| BulkloadRefusal::SchemaMismatch)?;
-        text.lines().map(Record::parse).collect()
+        Ok(records)
     }
 
     /// Append `records` in one write and seal it.
