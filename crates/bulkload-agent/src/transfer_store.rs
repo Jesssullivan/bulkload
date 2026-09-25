@@ -3,8 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
-use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -299,8 +298,9 @@ struct Exclusive(fs::File);
 
 impl Drop for Exclusive {
     fn drop(&mut self) {
-        // SAFETY: this guard owns a live descriptor for the acquired flock.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        // Best effort: the descriptor closes right after, which also drops
+        // the lock.
+        let _ = crate::io::sys::flock_unlock(&self.0);
     }
 }
 
@@ -484,12 +484,31 @@ impl Store {
             .transpose()
     }
 
+    /// Record one `Event::Commit` for this store (R-N88): a commit returned
+    /// and made `records` durable. Called only after success.
+    #[cfg(feature = "io-trace")]
+    fn trace_commit(&self, records: impl FnOnce() -> Vec<crate::io::trace::CommitRecord>) {
+        crate::io::trace::record("sqlite commit", || {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = fs::metadata(&self.root)?;
+            Ok(crate::io::trace::Event::Commit {
+                store: crate::io::NodeId {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
+                records: records(),
+            })
+        });
+    }
+
     /// Commit only a completed identity-checked capture.
     ///
     /// # Errors
     /// Refuses serialization or database failures.
     pub fn record_capture(&self, key: &[u8], value: &Manifest) -> Result<()> {
         let encoded = postcard::to_stdvec(value)?;
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         let started = Instant::now();
         let recorded = self
             .conn
@@ -501,6 +520,8 @@ impl Store {
             .map_err(sqlite_error);
         counters::sqlite_commit(Counter::SqliteRecordCapture, started, &recorded);
         recorded?;
+        #[cfg(feature = "io-trace")]
+        self.trace_commit(|| vec![crate::io::trace::CommitRecord::Capture { key: key.to_vec() }]);
         Ok(())
     }
 
@@ -559,6 +580,8 @@ impl Store {
         mode: u32,
     ) -> Result<()> {
         let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         let started = Instant::now();
         let recorded = self
             .conn
@@ -570,6 +593,16 @@ impl Store {
             .map_err(sqlite_error);
         counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
         recorded?;
+        #[cfg(feature = "io-trace")]
+        self.trace_commit(|| {
+            vec![crate::io::trace::CommitRecord::DirectoryCreated {
+                key: key.to_vec(),
+                node: (dev, ino)
+                    .ne(&(0, 0))
+                    .then_some(crate::io::NodeId { dev, ino }),
+                mode,
+            }]
+        });
         Ok(())
     }
 
@@ -635,6 +668,8 @@ impl Store {
     /// # Errors
     /// Refuses persistence failures.
     pub fn complete_directory(&self, key: &[u8]) -> Result<()> {
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         let started = Instant::now();
         let completed = self
             .conn
@@ -642,6 +677,10 @@ impl Store {
             .map_err(sqlite_error);
         counters::sqlite_commit(Counter::SqliteDirectoryComplete, started, &completed);
         completed?;
+        #[cfg(feature = "io-trace")]
+        self.trace_commit(|| {
+            vec![crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }]
+        });
         Ok(())
     }
 
@@ -812,10 +851,7 @@ impl StorePublisher {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(store.root.join("writer.lock"))?;
-        // SAFETY: the owned descriptor remains open for the guard lifetime.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        crate::io::sys::flock_exclusive(&lock)?;
         let exclusive = Exclusive(lock);
         let pack = OpenOptions::new()
             .read(true)
@@ -881,6 +917,10 @@ impl StorePublisher {
     /// # Errors
     /// Refuses serialization or database failures; nothing is committed then.
     pub(crate) fn commit_outputs(&self, outputs: &[OutputRecord]) -> Result<()> {
+        // The trace's serial lock is taken before SQLite's write lock, the
+        // order every traced store write uses (#74 review, D5).
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         self.store
             .conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -933,6 +973,17 @@ impl StorePublisher {
             .execute_batch("COMMIT")
             .map_err(sqlite_error);
         counters::sqlite_commit(self.group_counter(), started, &committed);
+        #[cfg(feature = "io-trace")]
+        if committed.is_ok() {
+            self.store.trace_commit(|| {
+                outputs
+                    .iter()
+                    .map(|output| crate::io::trace::CommitRecord::Output {
+                        rel_path: output.rel_path.clone(),
+                    })
+                    .collect()
+            });
+        }
         if committed.is_ok() {
             publication_crash!(
                 self,
@@ -990,7 +1041,7 @@ impl StorePublisher {
             return Ok(None);
         }
         let offset = self.pack_end;
-        self.pack.write_all_at(data, offset)?;
+        crate::io::sys::pwrite_all(&self.pack, data, offset)?;
         self.pack_end = offset
             .checked_add(data.len() as u64)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -1023,6 +1074,9 @@ impl StorePublisher {
         if locations.is_empty() && captures.is_empty() {
             return Ok(());
         }
+        // Trace lock before SQLite's write lock, as everywhere (D5).
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
         self.store
             .conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -1087,6 +1141,15 @@ impl StorePublisher {
             SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
         }
         counters::sqlite_commit(self.group_counter(), commit_started, &committed);
+        #[cfg(feature = "io-trace")]
+        if committed.is_ok() {
+            self.store.trace_commit(|| {
+                captures
+                    .iter()
+                    .map(|(key, _)| crate::io::trace::CommitRecord::Capture { key: key.clone() })
+                    .collect()
+            });
+        }
         if let Err(error) = committed {
             let _ = self.store.conn.execute_batch("ROLLBACK");
             return Err(error);
@@ -1216,6 +1279,7 @@ impl PackSink {
 }
 
 impl crate::io::durable::GroupSink for PackSink {
+    const SIDE: crate::io::durable::GroupSide = crate::io::durable::GroupSide::Source;
     type Item = PackItem;
     type Report = Result<()>;
 

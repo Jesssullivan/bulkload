@@ -47,11 +47,10 @@
 //! drains only the store's device.
 
 use std::ffi::{CStr, CString};
-use std::fs::{File, Permissions};
+use std::fs::File;
 use std::io::{Read as _, Seek as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::fd::AsFd as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -216,7 +215,7 @@ impl Destination {
     /// # Errors
     /// Refuses a missing root or symlink root, or a store without authority.
     pub fn open(path: &Path, store: &Store) -> Result<Self> {
-        let root = open_dir(libc::AT_FDCWD, &cstring(path.as_os_str().as_bytes())?)?;
+        let root = File::from(crate::io::sys::open_dir_path_nofollow(path)?);
         Ok(Self {
             root,
             path: std::fs::canonicalize(path)?,
@@ -294,19 +293,16 @@ impl Destination {
     pub fn directory(&mut self, row: &RowSchema, store: &Store, authority: &[u8]) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         let key = postcard::to_stdvec(&(authority, &row.rel_path))?;
-        if stat_at(parent.as_raw_fd(), &leaf)?.is_some() {
+        if stat_at(&parent, &leaf)?.is_some() {
             return self.existing_directory(row, &parent, &leaf, &key, store);
         }
         let mode = row.mode & 0o7777;
         #[cfg(feature = "fault-injection")]
         crate::fault::note_directory(Some("rename"));
         let temporary = self.temporary(Some(DIRECTORY_MARK))?;
-        // SAFETY: the descriptor and NUL-terminated name remain valid.
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), temporary.as_ptr(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        crate::io::sys::mkdirat(&parent, &temporary, 0o700)?;
         fault_point!(DirectoryAfterMkdir);
-        let bound = open_dir(parent.as_raw_fd(), &temporary)
+        let bound = open_dir(&parent, &temporary)
             .and_then(|created| Ok(created.metadata()?))
             .and_then(|metadata| {
                 self.seal_entry(&parent)?;
@@ -360,10 +356,15 @@ impl Destination {
     /// filesystem with no atomic no-replace rename (R-N119).
     ///
     /// `mkdirat` itself never replaces, so a taken leaf is still refused as
-    /// foreign. The cost is one crash window: a crash between `mkdirat` and
-    /// the record leaves an unrecorded 0700 directory that a resume refuses
-    /// (`directory.after_fallback_mkdir`, a listed known violation). Every
-    /// directory created this way is reported in [`Destination::created`].
+    /// foreign. The record comes first: an *intent* (a directory record bound
+    /// to no inode, see [`INTENT`]) is committed before the `mkdirat`, then
+    /// bound to the new inode once its entry is sealed. A crash between the
+    /// two leaves a directory the intent owns, which a resume adopts when it
+    /// is still what `mkdirat` made: an empty 0700 directory owned by this
+    /// user (`directory.after_fallback_mkdir`). A `mkdirat` that fails clears
+    /// the intent at once, so it never claims a directory someone else made.
+    /// Every directory created this way is reported in
+    /// [`Destination::created`].
     fn fallback_directory(
         &mut self,
         row: &RowSchema,
@@ -375,9 +376,9 @@ impl Destination {
         let mode = row.mode & 0o7777;
         #[cfg(feature = "fault-injection")]
         crate::fault::note_directory(Some("fallback"));
-        // SAFETY: the descriptor and NUL-terminated leaf remain valid.
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
-            let error = std::io::Error::last_os_error();
+        store.record_directory_created(&key, INTENT.0, INTENT.1, mode)?;
+        if let Err(error) = crate::io::sys::mkdirat(parent, leaf, 0o700) {
+            let _ = store.complete_directory(&key);
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
                 BulkloadRefusal::GitDestinationOccupied
             } else {
@@ -385,7 +386,7 @@ impl Destination {
             });
         }
         fault_point!(DirectoryAfterFallbackMkdir);
-        let metadata = open_dir(parent.as_raw_fd(), leaf)?.metadata()?;
+        let metadata = open_dir(parent, leaf)?.metadata()?;
         self.seal_entry(parent)?;
         store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
         self.created.fallback.push(row.rel_path.clone());
@@ -408,12 +409,32 @@ impl Destination {
         store: &Store,
     ) -> Result<()> {
         let mode = row.mode & 0o7777;
-        let existing = open_dir(parent.as_raw_fd(), leaf)?;
+        let existing = open_dir(parent, leaf)?;
         self.sweep(&existing, &row.rel_path, store)?;
         let metadata = existing.metadata()?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
         let owned = match store.directory_record(key) {
             Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => true,
+            // A fallback `mkdirat` whose intent committed but whose binding
+            // did not (R-N119): adopt the directory only while it is still
+            // exactly what `mkdirat` left, then bind the record to it.
+            Ok(Some(record))
+                if record
+                    == (PendingDirectory {
+                        dev: INTENT.0,
+                        ino: INTENT.1,
+                        mode,
+                    })
+                    && fresh_fallback(&existing, &metadata)? =>
+            {
+                // The crashed run's `mkdirat` entry was never sealed: seal it
+                // (fully flushing a parent off the store's device) before the
+                // record binds its inode, so no durable record names an entry
+                // a power loss can still lose (#74 review, B1).
+                self.seal_entry(parent)?;
+                store.record_directory_created(key, dev, ino, mode)?;
+                true
+            }
             // A record that does not own this directory is stale; clear it
             // so it can never adopt one later (R-N102, F3).
             Ok(Some(_)) | Err(BulkloadRefusal::SchemaMismatch) => {
@@ -460,7 +481,7 @@ impl Destination {
     /// by name and relative to its descriptor; record every other grammar
     /// match and leave it alone. See the module docs.
     fn sweep(&mut self, directory: &File, rel_dir: &[u8], store: &Store) -> Result<()> {
-        let euid = effective_uid();
+        let euid = crate::io::sys::effective_uid();
         let mut removed = false;
         for (name, kind) in temporary_candidates(directory)? {
             let mut rel_path = rel_dir.to_vec();
@@ -468,38 +489,42 @@ impl Destination {
                 rel_path.push(b'/');
             }
             rel_path.extend_from_slice(name.as_bytes());
-            let (expected, flags) = match kind {
-                TemporaryName::File(tag) if tag == self.tag => (libc::S_IFREG, 0),
-                TemporaryName::Directory(tag) if tag == self.tag => {
-                    (libc::S_IFDIR, libc::AT_REMOVEDIR)
-                }
+            let want_directory = match kind {
+                TemporaryName::File(tag) if tag == self.tag => false,
+                TemporaryName::Directory(tag) if tag == self.tag => true,
                 _ => {
                     self.swept.left.push(rel_path);
                     continue;
                 }
             };
-            let Some(stat) = stat_at(directory.as_raw_fd(), &name)? else {
+            let Some(stat) = stat_at(directory, &name)? else {
                 continue;
             };
-            if stat.st_mode & libc::S_IFMT != expected || stat.st_uid != euid {
+            let kind_matches = if want_directory {
+                stat.is_dir()
+            } else {
+                stat.is_file()
+            };
+            if !kind_matches || stat.uid != euid {
                 self.swept.left.push(rel_path);
                 continue;
             }
             // A directory temporary was never renamed into place, so no record
             // bound to it owns a final directory. Clear such records first:
             // once the inode is gone its number may be reused (N3).
-            if expected == libc::S_IFDIR {
-                store.clear_directories_bound_to(stat_dev(&stat), stat_ino(&stat))?;
+            if want_directory {
+                store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
             }
-            // SAFETY: descriptor and NUL-terminated name are valid. `unlinkat`
-            // removes this one name: with flags 0 never a directory (the inode
-            // survives under any other link), with AT_REMOVEDIR only an empty
-            // directory.
-            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
-                self.swept.removed += 1;
-                removed = true;
-            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
-                self.swept.left.push(rel_path);
+            // `unlinkat` removes this one name: without AT_REMOVEDIR never a
+            // directory (the inode survives under any other link), with it
+            // only an empty directory.
+            match crate::io::sys::unlinkat(directory, &name, want_directory) {
+                Ok(()) => {
+                    self.swept.removed += 1;
+                    removed = true;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(_) => self.swept.left.push(rel_path),
             }
         }
         if removed {
@@ -529,13 +554,13 @@ impl Destination {
             let (path, dev, ino, mode) =
                 (pending.path.clone(), pending.dev, pending.ino, pending.mode);
             let (parent, leaf) = self.parent(&path)?;
-            let directory = open_dir(parent.as_raw_fd(), &leaf)?;
+            let directory = open_dir(&parent, &leaf)?;
             drop(parent);
             let metadata = directory.metadata()?;
             if metadata.dev() != dev || metadata.ino() != ino {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
-            directory.set_permissions(Permissions::from_mode(mode))?;
+            crate::io::sys::fchmod(&directory, mode)?;
             self.seal_entry(&directory)?;
             fault_point!(DirectoryBeforeComplete);
             if let Some(pending) = self.directories.get(index) {
@@ -579,31 +604,23 @@ impl Destination {
             .as_ref()
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         let target_c = cstring(target)?;
-        // SAFETY: descriptor and both NUL-terminated strings remain valid.
-        let result =
-            unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
-        if result == 0 {
-            crate::io::durable::seal_dir(&parent)?;
-            self.note_unflushed(parent);
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
+        match crate::io::sys::symlinkat(&target_c, &parent, &leaf) {
+            Ok(()) => {
+                crate::io::durable::seal_dir(&parent)?;
+                self.note_unflushed(parent);
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
         }
         let mut bytes = vec![0_u8; target.len().saturating_add(1)];
-        // SAFETY: bytes is writable for its full length; strings/descriptors valid.
-        let read = unsafe {
-            libc::readlinkat(
-                parent.as_raw_fd(),
-                leaf.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
+        // Any failure (`EINVAL`: the leaf is a file or a directory; `ENOENT`:
+        // it went away) means the leaf is not this symlink: refused as
+        // occupied, as before the move to `io::sys` (#74 review, B2).
+        let Ok(read) = crate::io::sys::readlinkat(&parent, &leaf, &mut bytes) else {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
         };
-        if usize::try_from(read).ok() != Some(target.len())
-            || bytes.get(..target.len()) != Some(target.as_slice())
-        {
+        if read != target.len() || bytes.get(..target.len()) != Some(target.as_slice()) {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
         Ok(())
@@ -631,20 +648,11 @@ impl Destination {
     pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
         let (parent, leaf) = self.shared_parent(&row.rel_path)?;
         let temporary = self.temporary(None)?;
-        // SAFETY: parent descriptor and path are valid; mode accompanies O_CREAT.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                temporary.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: fd is a newly-created uniquely owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = File::from(crate::io::sys::create_excl_at(
+            parent.as_fd(),
+            &temporary,
+            0o600,
+        )?);
         Ok(StagedFile {
             parent,
             temporary,
@@ -699,7 +707,7 @@ impl Destination {
             if parts.peek().is_none() {
                 return Ok((directory, component));
             }
-            directory = open_dir(directory.as_raw_fd(), &component)?;
+            directory = open_dir(&directory, &component)?;
         }
         Err(BulkloadRefusal::PathEscapesRoot)
     }
@@ -763,12 +771,8 @@ fn full_flush_counted(handle: &File) -> Result<()> {
 }
 
 fn unlink(parent: &File, name: &CString) -> Result<()> {
-    // SAFETY: parent descriptor and NUL-terminated name remain valid; flag 0
-    // removes only a non-directory entry.
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    // Without AT_REMOVEDIR this removes only a non-directory entry.
+    Ok(crate::io::sys::unlinkat(parent, name, false)?)
 }
 
 /// One destination output for a group commit.
@@ -871,6 +875,7 @@ impl TouchedDevices {
 }
 
 impl crate::io::durable::GroupSink for PublishSink {
+    const SIDE: crate::io::durable::GroupSide = crate::io::durable::GroupSide::Destination;
     type Item = Publication;
     /// `(relative path, outcome)` for every submitted output, in commit order.
     type Report = Vec<(Vec<u8>, Result<()>)>;
@@ -986,6 +991,19 @@ pub(crate) fn verify_existing(
     Ok(identity)
 }
 
+/// The `(dev, ino)` of a directory record committed before its `mkdirat`
+/// (R-N119). No inode on Darwin or Linux has number 0.
+const INTENT: (u64, u64) = (0, 0);
+
+/// Whether `directory` is still exactly what the fallback `mkdirat` made: an
+/// empty directory with mode 0700, owned by this user.
+fn fresh_fallback(directory: &File, metadata: &std::fs::Metadata) -> Result<bool> {
+    Ok(metadata.is_dir()
+        && metadata.mode() & 0o7777 == 0o700
+        && metadata.uid() == crate::io::sys::effective_uid()
+        && crate::io::sys::list_dir(directory)?.is_empty())
+}
+
 /// Best-effort undo of a directory creation that did not publish: clear its
 /// record and remove the still-empty temporary. Anything left is swept later.
 fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store) {
@@ -993,176 +1011,34 @@ fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store)
     // names an inode that no final directory holds, and a surviving empty
     // temporary is removed by the next sweep.
     let _ = store.complete_directory(key);
-    // SAFETY: descriptor and NUL-terminated name are valid; AT_REMOVEDIR
-    // removes only an empty directory.
-    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR) };
-}
-
-// `dev_t` is signed on some targets; this is the same cast
-// `MetadataExt::dev` makes, so the value matches what records hold.
-#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
-const fn stat_dev(stat: &libc::stat) -> u64 {
-    stat.st_dev as u64
-}
-
-#[allow(clippy::useless_conversion)]
-fn stat_ino(stat: &libc::stat) -> u64 {
-    u64::from(stat.st_ino)
+    // AT_REMOVEDIR removes only an empty directory.
+    let _ = crate::io::sys::unlinkat(parent, temporary, true);
 }
 
 /// `fstatat` without following a final symlink; `None` when the name is absent.
-fn stat_at(parent: i32, name: &CStr) -> Result<Option<libc::stat>> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: name is NUL-terminated and `stat` is writable for one struct.
-    let result = unsafe {
-        libc::fstatat(
-            parent,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        // SAFETY: a successful fstatat initialized the whole struct.
-        return Ok(Some(unsafe { stat.assume_init() }));
+fn stat_at(parent: &File, name: &CStr) -> Result<Option<crate::io::Stat>> {
+    match crate::io::sys::fstatat_nofollow(parent, name) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENOENT) {
-        Ok(None)
-    } else {
-        Err(error.into())
-    }
-}
-
-fn effective_uid() -> libc::uid_t {
-    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
-    unsafe { libc::geteuid() }
 }
 
 /// Every entry directly inside `directory` whose name is in the temporary
-/// grammar. Reads through a fresh descriptor for `.`, so the caller's
-/// descriptor keeps its own offset and nothing is resolved through a path.
+/// grammar, read through a fresh descriptor for `.` (see `sys::list_dir`).
 fn temporary_candidates(directory: &File) -> Result<Vec<(CString, TemporaryName)>> {
-    // SAFETY: "." is NUL-terminated; a successful descriptor is owned here.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: fd is an open directory descriptor; fdopendir takes it over.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: fdopendir failed, so fd is still owned here and closed once.
-        unsafe { libc::close(fd) };
-        return Err(error.into());
-    }
-    let mut found = Vec::new();
-    let listed = loop {
-        let checked = clear_errno();
-        // SAFETY: stream is a live directory stream owned by this function.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            break match error.raw_os_error() {
-                Some(code) if checked && code != 0 => Err(error),
-                _ => Ok(()),
-            };
-        }
-        // SAFETY: readdir returned a live entry whose NUL-terminated d_name
-        // stays valid until the next readdir on this stream; it is copied first.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if let Some(kind) = temporary_name(name.to_bytes()) {
-            found.push((name.to_owned(), kind));
-        }
-    };
-    // SAFETY: closes the stream, and the descriptor it owns, exactly once.
-    unsafe { libc::closedir(stream) };
-    listed?;
-    Ok(found)
+    Ok(crate::io::sys::list_dir(directory)?
+        .into_iter()
+        .filter_map(|name| temporary_name(name.to_bytes()).map(|kind| (name, kind)))
+        .collect())
 }
 
-/// Zero this thread's `errno`, so a NULL from `readdir` separates the end of
-/// the stream from an error. Returns `false` on a target with no known errno
-/// accessor; there a NULL is read as the end of the stream, which can only
-/// shorten a sweep (leave temporaries), never widen what it removes.
-fn clear_errno() -> bool {
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "emscripten",
-        target_os = "hurd",
-        target_os = "redox",
-        target_os = "dragonfly",
-        target_os = "l4re",
-    ))]
-    // SAFETY: __errno_location returns this thread's errno slot, valid for writes.
-    unsafe {
-        *libc::__errno_location() = 0;
-        return true;
-    }
-    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
-    // SAFETY: __error returns this thread's errno slot, valid for writes.
-    unsafe {
-        *libc::__error() = 0;
-        return true;
-    }
-    #[cfg(any(
-        target_os = "android",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "nuttx",
-    ))]
-    // SAFETY: __errno returns this thread's errno slot, valid for writes.
-    unsafe {
-        *libc::__errno() = 0;
-        return true;
-    }
-    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
-    // SAFETY: ___errno returns this thread's errno slot, valid for writes.
-    unsafe {
-        *libc::___errno() = 0;
-        return true;
-    }
-    #[allow(unreachable_code)]
-    false
+fn open_dir(parent: &File, name: &CStr) -> Result<File> {
+    Ok(File::from(crate::io::sys::open_dir_at(parent, name)?))
 }
 
-fn open_dir(parent: i32, name: &CString) -> Result<File> {
-    // SAFETY: name is NUL-terminated; successful descriptor is uniquely owned.
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: fd is a newly opened descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn open_regular(parent: &File, name: &CString) -> Result<File> {
-    // SAFETY: parent and name are valid; no create flag needs a mode argument.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: fd is uniquely owned.
-    let file = unsafe { File::from_raw_fd(fd) };
+fn open_regular(parent: &File, name: &CStr) -> Result<File> {
+    let file = File::from(crate::io::sys::open_read_at(parent, name)?);
     if !file.metadata()?.is_file() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
@@ -1230,6 +1106,101 @@ mod tests {
         );
         assert_eq!(kept, b"theirs");
         assert_eq!(listed, 1, "the temporary name is removed");
+        Ok(())
+    }
+
+    /// PR #59 review (5), mutant M10: a group whose directory seal fails
+    /// must commit no record, so no output is ever recorded ahead of the
+    /// entry that names it.
+    #[test]
+    fn a_failed_directory_seal_commits_no_record() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-seal-failure-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(source.join("file"), b"ours")?;
+        let row = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
+        let staged = target.stage(&row)?;
+        (&**staged.file()).write_all(b"ours")?;
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        crate::io::durable::fail_dir_seals(true);
+        sink.commit(vec![Publication::Staged {
+            staged,
+            record: PendingOutput {
+                key: b"key".to_vec(),
+                rel_path: b"file".to_vec(),
+                size: 4,
+                hints: Vec::new(),
+            },
+        }]);
+        crate::io::durable::fail_dir_seals(false);
+        let report = sink.finish();
+        let identity = StatIdentity::from_metadata(&std::fs::metadata(destination.join("file"))?);
+        let recorded = Store::open(&base.join("state"))?.output_matches(b"key", &identity)?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [(b"file".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO))))]
+        );
+        assert!(
+            !recorded,
+            "no record may commit after a failed directory seal"
+        );
+        Ok(())
+    }
+
+    /// #74 review, B2: a symlink whose leaf is already a regular file or a
+    /// directory is refused as occupied, never as an I/O fault (`EINVAL`
+    /// from `readlinkat`), as before the move to `io::sys`.
+    #[test]
+    fn a_symlink_onto_an_occupied_leaf_refuses_as_occupied() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-symlink-occupied-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::os::unix::fs::symlink("target", source.join("as-file"))?;
+        std::os::unix::fs::symlink("target", source.join("as-dir"))?;
+        std::fs::write(destination.join("as-file"), b"someone else's")?;
+        std::fs::create_dir(destination.join("as-dir"))?;
+        let store = Store::open(&base.join("state"))?;
+        let mut target = Destination::open(&destination, &store)?;
+        let mut codes = Vec::new();
+        for row in crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows
+        {
+            codes.push(target.symlink(&row).err().map(|refusal| refusal.code()));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            codes,
+            [
+                Some("GIT_DESTINATION_OCCUPIED"),
+                Some("GIT_DESTINATION_OCCUPIED")
+            ]
+        );
         Ok(())
     }
 
@@ -1315,3 +1286,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "io-trace"))]
+mod adoption_power_loss;

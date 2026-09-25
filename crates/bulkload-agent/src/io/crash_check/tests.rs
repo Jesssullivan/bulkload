@@ -19,7 +19,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::{check, BarrierScope, Image, Options, Report, StateInfo, MAX_EXHAUSTIVE};
+use super::{
+    check, check_view, BarrierScope, Entry, Image, Options, Report, StateInfo, View, MAX_EXHAUSTIVE,
+};
 use crate::io::trace::{Event, SyncKind};
 use crate::io::NodeId;
 
@@ -183,6 +185,8 @@ const fn strict() -> Options {
         exhaustive_limit: 12,
         sector: None,
         accept_bounded: false,
+        commit_drains: cfg!(target_vendor = "apple"),
+        ignore_foreign: false,
     }
 }
 
@@ -470,10 +474,244 @@ fn a_scanned_tree_materializes_unchanged() {
     assert!(report.passed());
     assert_eq!((report.crash_points, report.states), (1, 1));
 
+    // Symlinks are modelled: scanned, materialized and read back literally.
     std::os::unix::fs::symlink("top", dir.path().join("link")).unwrap();
+    let image = Image::scan(dir.path()).unwrap();
+    let report = check(
+        &image,
+        &[],
+        &Options::default(),
+        |root, _| match std::fs::read_link(root.join("link")) {
+            Ok(target) if target == Path::new("top") => Ok(()),
+            other => Err(format!("link read back as {other:?}")),
+        },
+    )
+    .unwrap();
+    assert!(report.passed());
+    let fifo = dir.path().join("fifo");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
     assert!(
         Image::scan(dir.path()).is_err(),
-        "symlinks are not modelled"
+        "special files are not modelled"
+    );
+}
+
+/// Barrier-seal a file, rename it into place and barrier the directory, then
+/// let a store commit on the same drive return (the W3 group protocol).
+fn group_commit_trace(store: NodeId) -> Vec<Event> {
+    use crate::io::trace::CommitRecord;
+    let mut events = publish_trace(Some(SyncKind::Barrier), Some(SyncKind::Barrier), false);
+    // Every record kind rides along; the checker reads none of them itself.
+    events.push(Event::Commit {
+        store,
+        records: vec![
+            CommitRecord::Output {
+                rel_path: b"data".to_vec(),
+            },
+            CommitRecord::Capture { key: b"k".to_vec() },
+            CommitRecord::DirectoryCreated {
+                key: b"d".to_vec(),
+                node: None,
+                mode: 0o755,
+            },
+            CommitRecord::DirectoryComplete { key: b"d".to_vec() },
+        ],
+    });
+    events
+}
+
+/// A committed output record must name a durable file with the new bytes.
+fn committed_invariant(view: View<'_>, info: &StateInfo) -> Result<(), String> {
+    if info.commits.is_empty() {
+        return Ok(());
+    }
+    match view.get(b"data") {
+        Some(Entry::File { data, .. }) if data == NEW => Ok(()),
+        other => Err(format!("committed record names {other:?}")),
+    }
+}
+
+/// Model rule 5: with `commit_drains` (Darwin, `fullfsync=ON`) a store
+/// commit drains its drive, so barrier-sealed entries on that drive are
+/// durable once it returns; without the drain, or on another drive, they are
+/// not.
+#[test]
+fn a_store_commit_drains_only_its_own_drive() {
+    let draining = Options {
+        commit_drains: true,
+        ..Options::default()
+    };
+    let report = check_view(
+        &initial(),
+        &group_commit_trace(LEDGER),
+        &draining,
+        committed_invariant,
+    )
+    .unwrap();
+    assert!(
+        report.passed(),
+        "{}",
+        report.summary(&group_commit_trace(LEDGER))
+    );
+
+    let plain = Options {
+        commit_drains: false,
+        ..Options::default()
+    };
+    let report = check_view(
+        &initial(),
+        &group_commit_trace(LEDGER),
+        &plain,
+        committed_invariant,
+    )
+    .unwrap();
+    assert!(
+        !report.passed(),
+        "a commit that does not drain leaves the barriers volatile"
+    );
+
+    let elsewhere = NodeId { dev: 2, ino: 99 };
+    let report = check_view(
+        &initial(),
+        &group_commit_trace(elsewhere),
+        &draining,
+        committed_invariant,
+    )
+    .unwrap();
+    assert!(
+        !report.passed(),
+        "a drain of another drive does not make this one durable"
+    );
+}
+
+/// `StateInfo::commits` lists exactly the commits completed before the crash.
+#[test]
+fn commits_are_reported_once_they_return() {
+    let events = group_commit_trace(LEDGER);
+    let commit_event = events.len() - 1;
+    let mut seen = BTreeSet::new();
+    check_view(&initial(), &events, &Options::default(), |_, info| {
+        assert_eq!(!info.commits.is_empty(), info.complete);
+        if info.complete {
+            assert_eq!(info.commits, vec![commit_event]);
+        }
+        seen.insert(info.commits.len());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, [0, 1].into());
+}
+
+/// `check_view` and `check` agree on every toy protocol.
+#[test]
+fn the_in_memory_view_agrees_with_materialized_states() {
+    let traces = [
+        publish_trace(Some(SyncKind::Fsync), Some(SyncKind::Fsync), false),
+        publish_trace(None, Some(SyncKind::Fsync), false),
+        publish_trace(Some(SyncKind::Fsync), None, false),
+        publish_trace(Some(SyncKind::Barrier), Some(SyncKind::Barrier), true),
+    ];
+    for events in traces {
+        for options in [Options::default(), strict()] {
+            let on_disk = check(&initial(), &events, &options, publish_invariant).unwrap();
+            let in_memory = check_view(&initial(), &events, &options, |view, info| {
+                let keep = match view.get(b"keep") {
+                    Some(Entry::File { data, .. }) => data,
+                    other => return Err(format!("keep: {other:?}")),
+                };
+                if keep != KEEP {
+                    return Err("keep changed".to_owned());
+                }
+                match view.get(b"data") {
+                    Some(Entry::File { data, .. }) if data == NEW => Ok(()),
+                    Some(Entry::File { .. }) => Err("wrong bytes".to_owned()),
+                    None if info.complete => Err("not durable".to_owned()),
+                    None => Ok(()),
+                    Some(other) => Err(format!("data is {other:?}")),
+                }
+            })
+            .unwrap();
+            assert_eq!(on_disk.states, in_memory.states);
+            assert_eq!(on_disk.violations.len(), in_memory.violations.len());
+        }
+    }
+}
+
+/// A mutation of a node outside the image is refused by default, and with
+/// `ignore_foreign` dropped and counted; a foreign full flush still drains.
+#[test]
+fn foreign_nodes_are_refused_or_counted_never_silent() {
+    let foreign = NodeId { dev: 1, ino: 500 };
+    let mut events = vec![write(foreign, b"store bytes")];
+    events.extend(publish_trace(
+        Some(SyncKind::Barrier),
+        Some(SyncKind::Barrier),
+        false,
+    ));
+    events.push(Event::Sync {
+        node: foreign,
+        kind: SyncKind::FullFlush,
+    });
+    let error = check_view(&initial(), &events, &Options::default(), |_, _| Ok(())).unwrap_err();
+    assert!(error.to_string().contains("outside the image"), "{error}");
+
+    let options = Options {
+        ignore_foreign: true,
+        ..Options::default()
+    };
+    let report = check_view(&initial(), &events, &options, |view, info| {
+        if info.complete
+            && view.get(b"data")
+                != Some(Entry::File {
+                    data: NEW,
+                    mode: 0o600,
+                })
+        {
+            return Err("the foreign full flush did not drain the drive".to_owned());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(report.foreign, 1);
+    assert!(report.summary(&events).contains("foreign=1"));
+    assert!(report.passed(), "{}", report.summary(&events));
+}
+
+/// A traced symlink is an entry like any other: it persists only with its
+/// directory, and reads back literally.
+#[test]
+fn symlinks_are_namespace_entries() {
+    let events = vec![
+        Event::Symlink {
+            dir: ROOT,
+            name: b"link".to_vec(),
+            node: n(40),
+            target: b"keep".to_vec(),
+        },
+        Event::Sync {
+            node: ROOT,
+            kind: SyncKind::Fsync,
+        },
+    ];
+    let mut outcomes = BTreeSet::new();
+    let report = check_view(&initial(), &events, &Options::default(), |view, info| {
+        let link = view.get(b"link");
+        if info.complete && link != Some(Entry::Symlink { target: b"keep" }) {
+            return Err(format!("synced symlink lost: {link:?}"));
+        }
+        outcomes.insert(link.is_some());
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed());
+    assert_eq!(
+        outcomes,
+        [false, true].into(),
+        "an unsynced symlink may be lost"
     );
 }
 
@@ -628,6 +866,103 @@ fn a_device_barrier_orders_only_sent_mutations() {
     assert!(!z_without_x(&sent), "a sent X write is ordered before Z");
 }
 
+/// #74 review, D2 (checker mutant CM1): a full flush drains only the drive
+/// holding the file it names. A sent write on drive 1 stays optional after a
+/// full flush on drive 2; the same flush on drive 1 makes it durable.
+#[test]
+fn a_full_flush_drains_only_its_own_drive() {
+    let elsewhere = NodeId { dev: 2, ino: 77 };
+    let trace = |flushed: NodeId| {
+        vec![
+            write(KEEP_NODE, b"XXXX"),
+            Event::Sync {
+                node: KEEP_NODE,
+                kind: SyncKind::Kick,
+            },
+            Event::Sync {
+                node: flushed,
+                kind: SyncKind::FullFlush,
+            },
+        ]
+    };
+    let keeps = |events: &[Event]| -> BTreeSet<Vec<u8>> {
+        contents(events, &Options::default())
+            .0
+            .into_iter()
+            .map(|(keep, _)| keep)
+            .collect()
+    };
+    assert_eq!(
+        keeps(&trace(elsewhere)),
+        [KEEP.to_vec(), b"XXXX-bytes".to_vec()].into(),
+        "a full flush on another drive leaves this drive's write volatile"
+    );
+    assert_eq!(keeps(&trace(LEDGER)), [b"XXXX-bytes".to_vec()].into());
+}
+
+/// #74 review, D2 (checker mutant CM2): a device-wide barrier orders only
+/// I/O on its own drive, on both sides of the barrier. `far` sits on drive 2;
+/// `keep` and `other` on drive 1.
+///
+/// - X sent on drive 1, a barrier on drive 2, then Z on drive 1: Z may
+///   persist without X.
+/// - X sent on drive 1, a barrier on drive 2, then Z on drive 2: the barrier
+///   orders nothing sent on drive 1, so Z may persist without X.
+/// - Y sent on drive 2, a barrier on drive 2, then Z on drive 1: the barrier
+///   orders nothing issued on drive 1, so Z may persist without Y.
+#[test]
+fn a_device_barrier_orders_only_its_own_drive() {
+    const FAR: NodeId = NodeId { dev: 2, ino: 6 };
+    let image = with_other().with_file(b"far", FAR, b"");
+    let states = |events: &[Event]| -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let mut seen = Vec::new();
+        let report = check(&image, events, &Options::default(), |root, _| {
+            let read = |name: &str| std::fs::read(root.join(name)).map_err(|e| e.to_string());
+            seen.push((read("keep")?, read("other")?, read("far")?));
+            Ok(())
+        })
+        .unwrap();
+        assert!(report.passed(), "{}", report.summary(events));
+        seen
+    };
+    let sent_then_barrier = |sent: NodeId, data: &[u8], after: Event| {
+        vec![
+            write(sent, data),
+            Event::Sync {
+                node: sent,
+                kind: SyncKind::Kick,
+            },
+            Event::Sync {
+                node: FAR,
+                kind: SyncKind::Barrier,
+            },
+            after,
+        ]
+    };
+
+    let same_side = states(&sent_then_barrier(KEEP_NODE, b"XXXX", write(OTHER, b"Z")));
+    assert!(
+        same_side
+            .iter()
+            .any(|(keep, other, _)| keep == KEEP && other == b"Z"),
+        "a barrier on another drive does not order this drive's writes"
+    );
+    let earlier_elsewhere = states(&sent_then_barrier(KEEP_NODE, b"XXXX", write(FAR, b"Z")));
+    assert!(
+        earlier_elsewhere
+            .iter()
+            .any(|(keep, _, far)| keep == KEEP && far == b"Z"),
+        "a barrier orders only mutations sent on its own drive"
+    );
+    let later_elsewhere = states(&sent_then_barrier(FAR, b"Y", write(OTHER, b"Z")));
+    assert!(
+        later_elsewhere
+            .iter()
+            .any(|(_, other, far)| far.is_empty() && other == b"Z"),
+        "a barrier orders only mutations issued on its own drive"
+    );
+}
+
 /// Review M5 (a sync counts only once it completed): create tmp, write,
 /// rename, then fsync the file, then fsync the directory. A crash between the
 /// rename and the file fsync can publish `data` without its bytes, so this
@@ -679,6 +1014,67 @@ fn partial_traces_and_bad_options_are_refused() {
         ..Options::default()
     };
     assert!(check(&initial(), &[], &options, |_, _| Ok(())).is_err());
+}
+
+/// `View::walk` lists every reachable entry, parents first, and
+/// `View::node` finds an inode only while some directory names it.
+#[test]
+fn the_view_walks_the_tree_and_finds_named_inodes() {
+    let dir = n(50);
+    let events = vec![
+        Event::Mkdir {
+            dir: ROOT,
+            name: b"d".to_vec(),
+            node: dir,
+            mode: 0o755,
+        },
+        Event::Create {
+            dir: Some(dir),
+            name: Some(b"f".to_vec()),
+            node: n(51),
+            mode: 0o644,
+        },
+        write(n(51), b"inner"),
+        Event::Sync {
+            node: n(51),
+            kind: SyncKind::Fsync,
+        },
+        Event::Sync {
+            node: dir,
+            kind: SyncKind::Fsync,
+        },
+        Event::Sync {
+            node: ROOT,
+            kind: SyncKind::Fsync,
+        },
+    ];
+    let mut complete_walks = Vec::new();
+    check_view(&initial(), &events, &Options::default(), |view, info| {
+        if info.complete {
+            complete_walks.push(
+                view.walk()
+                    .into_iter()
+                    .map(|(path, _)| String::from_utf8(path).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                view.node(n(51)),
+                Some(Entry::File {
+                    data: b"inner",
+                    mode: 0o644
+                })
+            );
+        }
+        if view.get(b"d").is_none() {
+            assert!(
+                !view.names(n(51)),
+                "an unnamed directory hides its children"
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(complete_walks, vec![vec!["d", "d/f", "keep", "ledger"]]);
 }
 
 /// The same protocols through the real syscall wrappers, checked from the

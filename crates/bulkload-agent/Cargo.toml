@@ -26,6 +26,13 @@ name = "fault_harness"
 path = "tests/fault_harness.rs"
 required-features = ["fault-injection"]
 
+# Power-loss harness (R-N88): the crash-state checker on the syscall trace of
+# a real copy; needs the trace compiled in.
+[[test]]
+name = "power_loss"
+path = "tests/power_loss.rs"
+required-features = ["io-trace"]
+
 # R34 dependency wall. This list is closed: the `dep_graph` integration test
 # asserts that tokio, opendal, reqwest, ring and tonic are absent from
 # `cargo tree -p bulkload-agent -e normal`. Adding an async runtime, an

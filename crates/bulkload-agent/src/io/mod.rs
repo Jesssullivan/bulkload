@@ -5,11 +5,12 @@
 //!
 //! - `sys_posix.rs`: the calls Darwin and Linux share (`openat`, `fstat`,
 //!   `pread`/`pwrite`, `fchmod`, `unlinkat`, `mkdirat`, `linkat`,
-//!   `setsockopt`);
+//!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
+//!   `readdir`, `geteuid`, `flock`, `setsockopt`/`getsockopt`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
 //!   `renameatx_np(RENAME_EXCL)`, `F_PREALLOCATE`, `F_RDADVISE` and thread
 //!   `QoS`;
-//! - `sys_linux.rs`: `fdatasync`, `sync_file_range`,
+//! - `sys_linux.rs`: `fdatasync`, `fsync`, `sync_file_range`,
 //!   `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE` plus `linkat` through
 //!   `/proc/self/fd`, `fallocate(KEEP_SIZE)` and `posix_fadvise`;
 //! - `buf.rs`: the aligned slab allocation.
@@ -19,30 +20,47 @@
 //! anywhere: a live writer truncating a source file would turn a mapped read
 //! into `SIGBUS`, where `pread` returns a short count.
 //!
+//! The destination's materializer (`materialize.rs`), the source pack writes
+//! and the counted syncs (`counters.rs`) all go through `sys`, so the R-N88
+//! trace sees every destination syscall; none of them holds raw `libc`.
+//!
 //! # Contract for `durable.rs`
 //!
-//! Group commit (W3, `durable.rs`) is built on these calls. Each mutating call
-//! records one trace event when the `io-trace` feature is on (see `trace`),
-//! with the sync kind the crash checker models:
+//! Group commit (W3, `durable.rs`) is built on these calls. With the
+//! `io-trace` feature each mutating call records its trace events (see
+//! `trace`), with the sync kind the crash checker models. That is one event
+//! per call, except the Linux `rename_noreplace` fallback, which records its
+//! `linkat` and its `unlinkat`:
 //!
-//! | call | Darwin | Linux | trace kind |
+//! | call | Darwin | Linux | trace |
 //! |---|---|---|---|
-//! | `sys::barrier` | `F_BARRIERFSYNC` | `fdatasync` | `Barrier` / `DataSync` |
-//! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Barrier` / `Fsync` |
-//! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `FullFlush` / `Fsync` |
-//! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Kick` |
+//! | `sys::barrier` | `F_BARRIERFSYNC` | `fdatasync` | `Sync(Barrier)` / `Sync(DataSync)` |
+//! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Sync(Barrier)` / `Sync(Fsync)` |
+//! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `Sync(FullFlush)` / `Sync(Fsync)` |
+//! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Sync(Kick)` |
 //! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
-//! | `sys::rename_noreplace` | as `rename_exclusive` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename` / `Link` |
+//! | `sys::rename_noreplace` | as `rename_exclusive` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
+//! | `sys::create_excl_at`, `sys::mkdirat`, `sys::symlinkat` | | | `Create`, `Mkdir`, `Symlink` |
+//! | `sys::pwrite_all`, `sys::fchmod`, `sys::unlinkat`, `sys::linkat` | | | `Write`, `SetMode`, `Unlink`, `Link` |
 //! | [`TempFile::create`] + [`TempFile::publish`] | named temp + rename | `O_TMPFILE` + `linkat` (named fallback) | `Create`, `Link`/`Rename` |
+//!
+//! The stores add an `Event::Commit` when a `SQLite` commit returns, naming
+//! the records it made durable.
 //!
 //! `durable.rs` seals a file with `sys::barrier` on Darwin and with
 //! `sys::full_flush` (`fsync`) on Linux, not `fdatasync`: a mode set with
 //! `fchmod` after the last write must be durable with the data. Directories
-//! and the pack use `sys::barrier_dir` and `sys::barrier`/`sys::full_flush`
-//! per the durability mode. Directory creation and file publication use
-//! `sys::rename_exclusive` (through [`rename_exclusive`] and
-//! [`publish_noreplace`]), never the Linux `linkat` fallback, which fails with
-//! `EPERM` on a directory and would hide the R-N119 path taken.
+//! are sealed with `sys::barrier_dir` in group mode and `sys::full_flush` in
+//! strict mode. The source pack is sealed as a file. On Linux, `durable.rs`
+//! never calls `sys::barrier`.
+//!
+//! Directory creation and file publication use `sys::rename_exclusive`
+//! (through [`rename_exclusive`] and [`publish_noreplace`]), never the
+//! sys-internal Linux `linkat` fallback of `sys::rename_noreplace`: `linkat`
+//! on a directory fails with `EPERM` and would hide the R-N119 path taken.
+//! [`publish_noreplace`] has its own io-level `linkat` + `unlinkat` fallback,
+//! for files only, and counts it; a directory takes the `mkdirat` fallback
+//! with an intent record first (R-N119).
 
 // R-N54: every unsafe block names its obligations, one unsafe operation per
 // block, so each SAFETY comment covers exactly one call.
@@ -78,9 +96,17 @@ macro_rules! trace_event {
     }};
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub mod buf;
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub mod chunker;
-#[cfg(test)]
+#[cfg(any(test, feature = "io-trace"))]
 pub mod crash_check;
 pub mod durable;
 pub mod limits;
@@ -117,6 +143,8 @@ pub struct Stat {
     /// Full `st_mode`, file type bits included.
     pub mode: u32,
     pub nlink: u64,
+    /// Owner (`st_uid`).
+    pub uid: u32,
     pub size: u64,
     pub mtime_ns: i128,
     pub ctime_ns: i128,
@@ -157,6 +185,10 @@ impl Stat {
     }
 
     /// Permission bits only.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+    )]
     pub const fn permissions(&self) -> u32 {
         self.mode & 0o7777
     }
@@ -164,6 +196,10 @@ impl Stat {
 
 /// How the last component of a confined path is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub enum OpenMode {
     /// Read only, `O_NONBLOCK` so a FIFO swapped in cannot block the reader.
     Read,
@@ -176,6 +212,10 @@ pub enum OpenMode {
 
 /// A thread quality-of-service class (Darwin `QoS`; a no-op on Linux).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub enum Qos {
     /// `QOS_CLASS_USER_INITIATED`: the plan's class for the largest file, so
     /// it lands on a P-core.
@@ -187,11 +227,19 @@ pub enum Qos {
 }
 
 /// Hex digits in a destination store's temporary tag.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub const TEMP_TAG_HEX: usize = 16;
 
 /// A destination store's temporary tag: 16 lowercase hex digits, as
 /// `materialize::temporary_tag` derives it from the store's authority. Named
 /// temporaries carry it so the store's sweep (R-N79) covers them.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub type TempTag = [u8; TEMP_TAG_HEX];
 
 /// A staged file that is not yet visible under its final name.
@@ -205,6 +253,10 @@ pub type TempTag = [u8; TEMP_TAG_HEX];
 /// directory it was created in, and [`TempFile::publish`] consumes it and
 /// never replaces an existing name.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub struct TempFile {
     fd: OwnedFd,
     dir: OwnedFd,
@@ -212,6 +264,10 @@ pub struct TempFile {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 enum Staged {
     /// Linux `O_TMPFILE`: published with `linkat` through `/proc/self/fd`.
     Anonymous,
@@ -223,11 +279,19 @@ enum Staged {
 /// A failed [`TempFile::publish`]: the staged file comes back to the caller,
 /// who can retry under another name or discard it.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub struct PublishError {
     pub temp: TempFile,
     pub error: std::io::Error,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 impl TempFile {
     /// Stage a new file in `dir` with permission bits `mode`; a named
     /// temporary carries the destination store's `tag`. The directory
@@ -285,6 +349,10 @@ impl TempFile {
 ///
 /// # Errors
 /// `InvalidInput` when the bytes contain a NUL.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn c_name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
 }

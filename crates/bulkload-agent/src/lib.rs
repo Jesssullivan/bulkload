@@ -69,16 +69,9 @@ pub mod git_carry;
 pub mod handoff;
 pub mod hash;
 // The engine's io layer (R-N90, R-N54, R-N88). W3's group commit
-// (`io::durable`), descriptor limits and transport tuning run on its `sys`
-// calls; the W4 pieces (`buf`, `chunker`, `TempFile`) stay unwired until W4
-// integration, so a non-test build still sees those items as dead.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the W4 parts of the io layer are unwired until W4 integration (R-N90)"
-    )
-)]
+// (`io::durable`), the destination's materializer and the counted syncs run on
+// its `sys` calls. The pieces W4's later PRs wire in carry their own narrowly
+// scoped `dead_code` allowances.
 pub(crate) mod io;
 
 /// Group-commit durability controls (M2 W3): the `--durability` mode and the
@@ -90,6 +83,22 @@ pub mod durable {
 /// Open-file limits and the destination's descriptor budget (M2 W3).
 pub mod limits {
     pub use crate::io::limits::*;
+}
+
+/// The R-N88 syscall trace (`io::trace`). Public only with the `io-trace`
+/// feature, so the fault harness can record a real `copy`; a default build
+/// exports nothing here.
+#[cfg(feature = "io-trace")]
+pub mod trace {
+    pub use crate::io::trace::*;
+    pub use crate::io::NodeId;
+}
+
+/// The R-N88 crash-state checker (`io::crash_check`), public only with the
+/// `io-trace` feature.
+#[cfg(feature = "io-trace")]
+pub mod crash_check {
+    pub use crate::io::crash_check::*;
 }
 pub mod materialize;
 pub mod provider_sqlite;

@@ -197,6 +197,48 @@ fn namespace_calls_create_link_rename_and_remove() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+/// PR #59 round 5, D2: under the rename-unsupported hook the bare
+/// exclusive rename reports `EINVAL`, which `rename_unsupported` recognizes,
+/// and makes no link: both names stay as they were.
+#[test]
+fn an_unsupported_exclusive_rename_reports_einval_and_links_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("a"), b"x").unwrap();
+    let root = sys::open_root(dir.path()).unwrap();
+    crate::io::force_rename_unsupported(true);
+    let result = sys::rename_exclusive(&root, &c("a"), &c("b"));
+    crate::io::force_rename_unsupported(false);
+    let error = result.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    assert!(crate::io::rename_unsupported(&error));
+    assert!(dir.path().join("a").exists());
+    assert!(!dir.path().join("b").exists(), "no link was made");
+    sys::rename_exclusive(&root, &c("a"), &c("b")).unwrap();
+    assert!(dir.path().join("b").exists(), "without the hook it renames");
+}
+
+/// PR #59 round 5, D2: `sys::rename_noreplace` is for files only. Under the
+/// hook, on a directory, its Linux `linkat` fallback fails with `EPERM`
+/// (which is why directories never take it); on Darwin it is the bare
+/// exclusive rename and reports `EINVAL`. The directory stays in place.
+#[test]
+fn rename_noreplace_on_a_directory_never_moves_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("d")).unwrap();
+    let root = sys::open_root(dir.path()).unwrap();
+    crate::io::force_rename_unsupported(true);
+    let result = sys::rename_noreplace(&root, &c("d"), &c("e"));
+    crate::io::force_rename_unsupported(false);
+    let expected = if cfg!(target_os = "linux") {
+        libc::EPERM
+    } else {
+        libc::EINVAL
+    };
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(expected));
+    assert!(dir.path().join("d").is_dir());
+    assert!(!dir.path().join("e").exists());
+}
+
 #[test]
 fn every_sync_kind_succeeds_on_files_and_directories() {
     let dir = tempfile::TempDir::new().unwrap();
