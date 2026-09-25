@@ -95,6 +95,16 @@ BOUNDARIES:
     any depth when Git tracks nothing beneath it, records each omitted root and
     its size as custody, and carries every other untracked and ignored file.
     --include-rebuildable carries the rebuildable set too, at full fidelity.
+    A foreign repository nested in a checkout, or a gitlink, is custody named
+    per nest (path, admin, HEAD, unpushed commits, carried-ignored count) on
+    git-export stderr and in every estate receipt; its tracked content and
+    history are its own item and are not carried, its ignored files are
+    (R-N89) unless the nest is planned as its own estate item, which then
+    owns them and is named as carried-by=<item> (R-N114). A nest with any
+    staged, unstaged or untracked change, hidden index flags, a conversion
+    attribute, a stash, a detached-only commit, an operation in progress,
+    filter commands, a populated submodule, or outer-tracked paths under it
+    refuses (R-N73, R-N83, R-N115).
     estate-capture tolerates refs and worktree seats moving under a pass (R25):
     the item reports outcome=captured-with-drift with reason=drift=N, the N
     rows ride in the CORPUS {bundle}.drift sidecar (the bundle's
@@ -108,8 +118,9 @@ BOUNDARIES:
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
     with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
-    config, shallow or
-    nested-worktree changes under a pass still refuse GIT_AUTHORITY_CHANGED;
+    config, shallow,
+    nested-worktree or nested-repository changes under a pass still refuse
+    GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
     handoff-verify probes; it never signals a child process (R-N11).
     Receipt evidence is exit statuses, counts and operator-known identifiers only.
@@ -249,6 +260,10 @@ fn export_command(
             omission.entries
         );
     }
+    // Escaped and quoted: a newline in a nest path cannot forge a line (F8).
+    for nested in &export.nested_repositories {
+        eprintln!("{}", nested.receipt_line());
+    }
     println!("{}", export.bundle.display());
     Ok(())
 }
@@ -357,6 +372,10 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 // its raw bytes go to a private 0600 file whose path is printed as
 // `stderr_file=`, with a digest keyed by the state dir's key; without it,
 // nothing is written and no digest is printed.
+// The estimate verb's `Refused` carries a `BulkloadRefusal`, whose
+// path-carrying variants (#53) put it just over clippy's 128-byte
+// large-error threshold; see git_carry::estimate.
+#[allow(clippy::result_large_err)]
 fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::git_carry::estimate::{estimate_with, Destination, Refused, StderrStore};
     let (state_dir, args) = match args {
@@ -526,6 +545,11 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         // item stays one line.
         for line in &row.drift {
             writeln!(output, "item={} drift={line}", row.item)?;
+        }
+        // One line per nest after the item line, so a nest-free item stays
+        // one line (R-N73). Paths inside are byte-escaped.
+        for line in &row.nested {
+            writeln!(output, "item={} {line}", row.item)?;
         }
         output.flush()?;
         Ok(())

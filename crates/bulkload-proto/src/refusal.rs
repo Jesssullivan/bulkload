@@ -76,6 +76,36 @@ pub enum BulkloadRefusal {
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
     GitIgnorePolicyConflict,
+    /// A restore destination's parent directory does not exist (R-N114):
+    /// typically an enclosing item that should have created it did not.
+    GitDestinationParentMissing,
+    /// A nested repository holds a stash (`refs/stash` or a non-empty stash
+    /// reflog): work its enclosing capture would not carry (R-N83).
+    GitNestStashed,
+    /// A nested repository's detached HEAD holds commits no local branch,
+    /// tag or remote-tracking ref reaches (R-N83).
+    GitNestDetachedUnreachable,
+    /// A nested repository holds an ignored repository of its own, outside
+    /// any rebuildable root, which no capture carries (R-N111). Carries the
+    /// inner repository's path relative to the captured checkout, raw bytes;
+    /// [`fmt::Display`] prints it escaped.
+    GitNestInnerRepository(Vec<u8>),
+    /// A tracked path in a nested repository has a built-in conversion
+    /// attribute (`ident`, `working-tree-encoding`, `text`, `eol`, `crlf`)
+    /// that can hide an edit from its status (R-N73). Carries the path
+    /// relative to the captured checkout; [`fmt::Display`] prints it escaped.
+    GitNestConversionAttribute(Vec<u8>),
+    /// A nested repository holds a populated submodule of its own, or anything
+    /// but an empty directory at one of its gitlink paths (R-N115). Carries
+    /// the gitlink's path relative to the captured checkout; [`fmt::Display`]
+    /// prints it escaped.
+    GitNestPopulatedSubmodule(Vec<u8>),
+    /// A nested repository planned as its own estate item refused its own
+    /// capture in the same pass, so it carries none of its seats: the
+    /// enclosing capture refuses rather than name it as the carrier (R-N114).
+    /// Carries the nest's path relative to the enclosing checkout;
+    /// [`fmt::Display`] prints it escaped.
+    GitNestCarrierRefused(Vec<u8>),
     /// A path given as a repository is not that repository's root: Git would
     /// resolve it to an enclosing repository, or to none at all.
     GitRepositoryNotAtPath,
@@ -153,6 +183,13 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
+            Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
+            Self::GitNestStashed => "GIT_NEST_STASHED",
+            Self::GitNestDetachedUnreachable => "GIT_NEST_DETACHED_UNREACHABLE",
+            Self::GitNestInnerRepository(_) => "GIT_NEST_INNER_REPOSITORY",
+            Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
+            Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
+            Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
@@ -175,6 +212,13 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
+            // Escaped inside quotes: a path cannot forge a second line.
+            Self::GitNestInnerRepository(ref path)
+            | Self::GitNestConversionAttribute(ref path)
+            | Self::GitNestPopulatedSubmodule(ref path)
+            | Self::GitNestCarrierRefused(ref path) => {
+                write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
+            }
             _ => f.write_str(self.code()),
         }
     }
@@ -229,6 +273,13 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
+            BulkloadRefusal::GitDestinationParentMissing,
+            BulkloadRefusal::GitNestStashed,
+            BulkloadRefusal::GitNestDetachedUnreachable,
+            BulkloadRefusal::GitNestInnerRepository(Vec::new()),
+            BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
+            BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
+            BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::SqliteIntegrityCheckFailed,

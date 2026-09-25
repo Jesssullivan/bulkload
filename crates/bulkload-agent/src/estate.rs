@@ -62,6 +62,12 @@ pub struct Receipt {
     /// Why a pass that had a retained capture reused none of its blobs, as in
     /// `reuse_unavailable=shallow`. `None` when reuse ran or was not offered.
     pub reuse_unavailable: Option<&'static str>,
+    /// One line per foreign nested repository or gitlink the capture names
+    /// as custody (R-N73), from [`git_carry::NestedRepository::receipt_line`],
+    /// naming the carrying item for a nest planned as its own (R-N114).
+    /// Empty for a repository without nests. The durable statement is the
+    /// `{bundle}.nested` sidecar.
+    pub nested: Vec<String>,
 }
 
 /// One item's completed operation and what it carried.
@@ -70,6 +76,8 @@ struct Completion {
     drift: Vec<String>,
     bytes_read: u64,
     reuse_unavailable: Option<&'static str>,
+    /// Receipt lines, one per nest, already naming any carrying item.
+    nested: Vec<String>,
 }
 
 impl Completion {
@@ -79,7 +87,12 @@ impl Completion {
             drift: Vec::new(),
             bytes_read: 0,
             reuse_unavailable: None,
+            nested: Vec::new(),
         }
+    }
+
+    fn naming(self, nested: Vec<String>) -> Self {
+        Self { nested, ..self }
     }
 }
 
@@ -118,6 +131,89 @@ fn retained_parts(corpus: &Path, bundle: &str) -> Result<Option<Parts>> {
     } else {
         Ok(None)
     }
+}
+
+// The nests a retained capture recorded. Absent means it recorded none: the
+// sidecar is written whenever the capture's custody is non-empty.
+fn retained_nested(corpus: &Path, bundle: &str) -> Result<Vec<git_carry::NestedRepository>> {
+    let path = corpus.join(format!("{bundle}.nested"));
+    if path.try_exists()? {
+        read(&path)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Plan items by canonical source: which item carries a checkout (R-N114).
+type Owners = std::collections::BTreeMap<PathBuf, String>;
+
+fn owners(plan: &Plan) -> Result<Owners> {
+    let mut owners = Owners::new();
+    for item in &plan.items {
+        owners.entry(item.source.clone()).or_insert(id(item)?);
+    }
+    Ok(owners)
+}
+
+// R-N114: the sources of other plan items nested strictly inside this one.
+// Those nests carry their own seats; this item's capture carries none of them.
+fn planned_nests(item: &Item, owners: &Owners) -> Vec<PathBuf> {
+    owners
+        .keys()
+        .filter(|source| source.starts_with(&item.source) && **source != item.source)
+        .cloned()
+        .collect()
+}
+
+// R-N114, round 4 N5: a planned carrier whose own capture refused in this
+// pass carries none of its seats. Refuse by name rather than record the nest
+// as carried by it, reuse hit or not (nested items capture first).
+fn carriers_captured(
+    item: &Item,
+    planned: &[PathBuf],
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let refused = refused
+        .lock()
+        .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+    match planned.iter().find(|source| refused.contains(*source)) {
+        Some(carrier) => Err(BulkloadRefusal::GitNestCarrierRefused(
+            carrier
+                .strip_prefix(&item.source)
+                .map_err(|_| BulkloadRefusal::PathEscapesRoot)?
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+        )),
+        None => Ok(()),
+    }
+}
+
+// One receipt line per nest; a nest planned as its own item is named with the
+// item that carries it (R-N114).
+fn nest_lines(item: &Item, owners: &Owners, nested: &[git_carry::NestedRepository]) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    nested
+        .iter()
+        .map(|nest| {
+            let line = nest.receipt_line();
+            let carrier = nest
+                .own_item
+                .then(|| {
+                    owners.get(
+                        &item
+                            .source
+                            .join(std::ffi::OsStr::from_bytes(&nest.rel_path)),
+                    )
+                })
+                .flatten();
+            match carrier {
+                Some(carrier) => format!("{line} carried-by={carrier}"),
+                None => line,
+            }
+        })
+        .collect()
 }
 
 /// Read the exact reviewed items without performing capture or apply.
@@ -229,11 +325,14 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
         Plan::default()
     };
     let mut identities = std::collections::HashSet::new();
-    let mut targets = std::collections::HashSet::new();
+    let mut targets: Vec<(TargetKey, PathBuf)> = Vec::new();
+    // Round 4 N4, R6-1: targets are held as target_key forms (canonical,
+    // unfolded, with their volume's case answer); `overlapping` decides how
+    // each comparison folds.
     for previous in &contents.items {
         identities.insert(id(previous)?);
         if let Some(target) = &previous.workspace {
-            targets.insert(target.clone());
+            targets.push((target_key(target)?, previous.source.clone()));
         }
     }
     for incoming in items {
@@ -248,13 +347,245 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
             continue;
         }
         if let Some(target) = &item.workspace {
-            if !targets.insert(target.clone()) {
+            let key = target_key(target)?;
+            if targets
+                .iter()
+                .any(|(other, source)| overlapping(&key, &item.source, other, source))
+            {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
+            targets.push((key, item.source.clone()));
         }
         contents.items.push(item);
     }
     write(plan, &contents)
+}
+
+// Whether a volume compares names case-insensitively, as far as it could be
+// told (R6-1). `Unknown` is kept apart from `Insensitive` because the two
+// kinds of comparison below must fail in opposite directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Case {
+    Sensitive,
+    Insensitive,
+    Unknown,
+}
+
+/// A workspace target as `target_key` resolved it, unfolded, with its volume's
+/// case answer.
+type TargetKey = (PathBuf, Case);
+
+// Two target keys in the form they compare in. Targets are compared folded
+// unless both answers are positively Sensitive: an unknown answer fails
+// toward detecting an overlap (R5-7).
+fn comparable((target, case): &TargetKey, (other, other_case): &TargetKey) -> (PathBuf, PathBuf) {
+    if *case == Case::Sensitive && *other_case == Case::Sensitive {
+        (target.clone(), other.clone())
+    } else {
+        (fold(target), fold(other))
+    }
+}
+
+// Whether `inner` lies strictly inside `outer`, compared as `comparable`.
+fn nests_within(inner: &TargetKey, outer: &TargetKey) -> bool {
+    let (inner, outer) = comparable(inner, outer);
+    inner.starts_with(&outer) && inner != outer
+}
+
+// R-N114: two workspace targets collide when they are equal, or when one lies
+// inside the other anywhere but at exactly the place the inner item's source
+// lies inside the outer item's source (a nested repository planned as its own
+// item, restored where it was). Component-wise, never string prefixes.
+//
+// The two checks fail in opposite directions (R6-1, R-N83, R-N123). Target
+// overlap is compared folded unless both volumes answered Sensitive, so an
+// unanswerable probe can only add refusals. The source relation only ever
+// allows an overlap, so it is compared case-folded only when both volumes
+// answered Insensitive; otherwise exactly, taking the relative path from the
+// unfolded targets wherever they nest, so an unanswerable probe never relaxes
+// a planned-nest refusal and a same-case plan still passes.
+fn overlapping(target: &TargetKey, source: &Path, other: &TargetKey, other_source: &Path) -> bool {
+    let (folded_target, folded_other) = comparable(target, other);
+    if folded_target == folded_other {
+        return true;
+    }
+    let relation_folded = target.1 == Case::Insensitive && other.1 == Case::Insensitive;
+    let nested = |inner: &TargetKey,
+                  folded_inner: &Path,
+                  inner_source: &Path,
+                  outer: &TargetKey,
+                  folded_outer: &Path,
+                  outer_source: &Path| {
+        folded_inner
+            .strip_prefix(folded_outer)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|_| {
+                // R7-1: the relative path is always the inner key's own
+                // unfolded components past the outer's depth (folding changes
+                // only ASCII letters, never the component count), so the
+                // relation is compared exactly even when the targets nest only
+                // case-folded; it is folded solely under (Insensitive,
+                // Insensitive) below.
+                let relative: PathBuf = inner
+                    .0
+                    .components()
+                    .skip(outer.0.components().count())
+                    .collect();
+                let joined = outer_source.join(relative);
+                if relation_folded {
+                    fold(&joined) != fold(inner_source)
+                } else {
+                    joined != inner_source
+                }
+            })
+    };
+    nested(
+        target,
+        &folded_target,
+        source,
+        other,
+        &folded_other,
+        other_source,
+    )
+    .or_else(|| {
+        nested(
+            other,
+            &folded_other,
+            other_source,
+            target,
+            &folded_target,
+            source,
+        )
+    })
+    .unwrap_or(false)
+}
+
+// Round 4 N4 (R-N114): a workspace target in a form two targets compare in.
+// The nearest existing ancestor is canonicalized (symlinks and `..` resolved
+// by the filesystem); the rest is appended lexically (`.` dropped, `..`
+// popped, a trailing slash ignored). The key is returned unfolded with its
+// volume's case answer; comparisons decide how to fold (R6-1). A Unicode case
+// or normalisation variant that slips through meets the restore's typed
+// GIT_DESTINATION_OCCUPIED.
+fn target_key(target: &Path) -> Result<TargetKey> {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = target.components().collect();
+    for existing in (1..=components.len()).rev() {
+        let prefix: PathBuf = components.iter().take(existing).collect();
+        let Ok(mut key) = fs::canonicalize(&prefix) else {
+            continue;
+        };
+        let case = case_answer(&key);
+        for part in components.iter().skip(existing) {
+            match part {
+                Component::Normal(name) => key.push(name),
+                Component::ParentDir => {
+                    key.pop();
+                }
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+        return Ok((key, case));
+    }
+    Err(BulkloadRefusal::PathNotAbsolute)
+}
+
+fn fold(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    PathBuf::from(std::ffi::OsString::from_vec(
+        path.as_os_str().as_bytes().to_ascii_lowercase(),
+    ))
+}
+
+// Whether names on the volume holding `path` compare case-insensitively,
+// decided at run time per volume, never assumed per platform. macOS answers
+// through pathconf(_PC_CASE_SENSITIVE); when it cannot answer, the read-only
+// probe below decides.
+#[cfg(target_os = "macos")]
+fn case_answer(path: &Path) -> Case {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return probe_case(path);
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call; pathconf only reads it and has no other preconditions.
+    match unsafe { libc::pathconf(name.as_ptr(), libc::_PC_CASE_SENSITIVE) } {
+        1 => Case::Sensitive,
+        0 => Case::Insensitive,
+        _ => probe_case(path),
+    }
+}
+
+// Elsewhere there is no volume-wide query (ext4 casefold is per directory,
+// vfat folds everywhere), so probe read-only: find the deepest component of
+// `path` whose name has an ASCII letter, and ask whether its case-flipped
+// spelling names the same inode. Nothing is created. A flipped name that is
+// absent means Sensitive; anything unanswerable is Unknown.
+#[cfg(not(target_os = "macos"))]
+fn case_answer(path: &Path) -> Case {
+    probe_case(path)
+}
+
+// The probe's answer as the older boolean: anything but a positive Sensitive
+// counts as insensitive (the R5-7 reading, which the probe tests pin).
+#[cfg(test)]
+fn probe_case_insensitive(path: &Path) -> bool {
+    probe_case(path) != Case::Sensitive
+}
+
+#[cfg(test)]
+fn case_insensitive(path: &Path) -> bool {
+    case_answer(path) != Case::Sensitive
+}
+
+fn probe_case(path: &Path) -> Case {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::MetadataExt;
+    // Unknown whenever the probe cannot answer (R5-7, R6-1): a path that does
+    // not resolve, a walk that reaches the root without a lettered name, a
+    // lookup that fails for any reason but absence, and a walk that would
+    // cross a device boundary (the parent directory would answer for another
+    // volume). Callers decide which way Unknown fails.
+    let Ok(mut meta) = fs::symlink_metadata(path) else {
+        return Case::Unknown;
+    };
+    let mut current = path.to_path_buf();
+    loop {
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            return Case::Unknown;
+        };
+        let Ok(parent_meta) = fs::symlink_metadata(parent) else {
+            return Case::Unknown;
+        };
+        if parent_meta.dev() != meta.dev() {
+            return Case::Unknown;
+        }
+        let bytes = name.as_bytes();
+        if bytes.iter().any(u8::is_ascii_alphabetic) {
+            let flipped: Vec<u8> = bytes
+                .iter()
+                .map(|b| {
+                    if b.is_ascii_lowercase() {
+                        b.to_ascii_uppercase()
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            let variant = parent.join(std::ffi::OsString::from_vec(flipped));
+            return match fs::symlink_metadata(variant) {
+                Ok(folded) if folded.dev() == meta.dev() && folded.ino() == meta.ino() => {
+                    Case::Insensitive
+                }
+                Ok(_) => Case::Sensitive,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Case::Sensitive,
+                Err(_) => Case::Unknown,
+            };
+        }
+        current = parent.to_path_buf();
+        meta = parent_meta;
+    }
 }
 
 struct Exclusive(fs::File);
@@ -490,17 +821,26 @@ fn capture_item(
     corpus: &Path,
     base: Option<&Base>,
     policy: git_carry::CapturePolicy,
+    owners: &Owners,
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
+    let planned = planned_nests(item, owners);
+    carriers_captured(item, &planned, refused)?;
     // The opaque key cannot say what moved. Keep its typed parts so the
     // post-capture re-read can separate tolerable drift from Git authority.
-    let parts = git_carry::capture_key_parts_with_policy(&item.source, policy)?;
+    // The parts carry the nested custody, so a reuse hit names exactly the
+    // nests the retained capture recorded (R-N73, B4).
+    let parts = git_carry::capture_key_parts_with_planned(&item.source, policy, &planned)?;
+    let nested = nest_lines(item, owners, parts.nested_repositories());
     let key = parts.digest()?;
     let authority = parts.authority()?;
     let (retained, started_ns, extends) =
         match retained_capture(&record, corpus, &parts, key, authority)? {
-            Retained::Hit => return Ok(Completion::clean("capture-reused-after-census")),
+            Retained::Hit => {
+                return Ok(Completion::clean("capture-reused-after-census").naming(nested));
+            }
             Retained::Extend {
                 bundle,
                 started_ns,
@@ -522,8 +862,14 @@ fn capture_item(
             prerequisite: prerequisite.as_deref(),
             policy,
             reuse,
+            planned: &planned,
         },
     )?;
+    // The export's own census must name the nests the key did: a nest that
+    // moved between the key and the export's snapshot is authority (B4).
+    if export.nested_repositories != parts.nested_repositories() {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
     // Not an opaque key comparison. Anything outside the ref inventory and the
     // worktree census moving is Git authority changing under the capture and
     // still refuses (R-N30). Within them, the export's own window is not the
@@ -539,28 +885,12 @@ fn capture_item(
     // interleaved sidecar can never make a drifted capture a reuse hit.
     let key_drift = parts.drift_across(
         &export,
-        &git_carry::capture_key_parts_with_policy(&item.source, policy)?,
+        &git_carry::capture_key_parts_with_planned(&item.source, policy, &planned)?,
     )?;
     let mut drift = export.drift;
     drift.merge(key_drift)?;
     let recorded_key = if drift.is_empty() { key } else { poisoned(key) };
-    let bundle = export.bundle;
-    let digest = hash_file(&bundle)?;
-    let name = format!(
-        "{identity}-{}.bundle",
-        blake3::Hash::from_bytes(digest).to_hex()
-    );
-    let published = corpus.join(&name);
-    if published.try_exists()? {
-        if hash_file(&published)? != digest {
-            return Err(BulkloadRefusal::DigestMismatch);
-        }
-    } else {
-        fs::hard_link(&bundle, &published)?;
-    }
-    // Completion may survive a crash only after its bundle bytes are durable.
-    fs::File::open(&published)?.sync_file_counted()?;
-    let metadata = fs::symlink_metadata(&published)?;
+    let (name, digest, metadata) = publish_bundle(corpus, &identity, &export.bundle)?;
     if let Some(base) = base {
         // Publish dependency custody before the unchanged completion codec.
         write(&corpus.join(format!("{name}.base")), base)?;
@@ -570,12 +900,11 @@ fn capture_item(
     // every live restore journal still decodes. This sidecar can be a superset
     // of the bundle's own capture-drift-v1 ref: it also names what moved
     // between the pre-pass key and the export's snapshot.
-    let drift_sidecar = corpus.join(format!("{name}.drift"));
-    if !drift.is_empty() {
-        write(&drift_sidecar, &drift)?;
-    }
-    write(
-        &corpus.join(format!("{name}.parts")),
+    let drift_sidecar = publish_sidecars(
+        corpus,
+        &name,
+        &drift,
+        &export.nested_repositories,
         &Parts {
             authority,
             started_ns: export.started_ns,
@@ -623,7 +952,56 @@ fn capture_item(
             .or(future)
             .or(export.reuse_unavailable)
             .map(git_carry::ReuseUnavailable::code),
+        nested,
     })
+}
+
+// Publish an exported bundle into the corpus under its content name, durable
+// before any record names it. Returns the name, its digest and its metadata.
+fn publish_bundle(
+    corpus: &Path,
+    identity: &str,
+    bundle: &Path,
+) -> Result<(String, [u8; 32], fs::Metadata)> {
+    let digest = hash_file(bundle)?;
+    let name = format!(
+        "{identity}-{}.bundle",
+        blake3::Hash::from_bytes(digest).to_hex()
+    );
+    let published = corpus.join(&name);
+    if published.try_exists()? {
+        if hash_file(&published)? != digest {
+            return Err(BulkloadRefusal::DigestMismatch);
+        }
+    } else {
+        fs::hard_link(bundle, &published)?;
+    }
+    // Completion may survive a crash only after its bundle bytes are durable.
+    // Counted, as main counts every sync (#57).
+    fs::File::open(&published)?.sync_file_counted()?;
+    let metadata = fs::symlink_metadata(&published)?;
+    Ok((name, digest, metadata))
+}
+
+// The capture's sidecars beside its bundle, before its record: the drift rows
+// (only when it drifted), the nest custody (only when there is any, R-N73)
+// and the key parts. Returns the drift sidecar's path, present or not.
+fn publish_sidecars(
+    corpus: &Path,
+    name: &str,
+    drift: &git_carry::CaptureDrift,
+    nested: &[git_carry::NestedRepository],
+    parts: &Parts,
+) -> Result<PathBuf> {
+    let drift_sidecar = corpus.join(format!("{name}.drift"));
+    if !drift.is_empty() {
+        write(&drift_sidecar, drift)?;
+    }
+    if !nested.is_empty() {
+        write(&corpus.join(format!("{name}.nested")), &nested)?;
+    }
+    write(&corpus.join(format!("{name}.parts")), parts)?;
+    Ok(drift_sidecar)
 }
 
 fn execute(
@@ -646,8 +1024,15 @@ fn execute(
                 Ok(done) => {
                     // The count rides in the layout-safe reason; the rows ride
                     // in the sidecar and the in-process receipt.
-                    let reason =
-                        (!done.drift.is_empty()).then(|| format!("drift={}", done.drift.len()));
+                    // Nest custody is counted the same way (R-N73).
+                    let counts: Vec<String> = [
+                        (!done.drift.is_empty()).then(|| format!("drift={}", done.drift.len())),
+                        (!done.nested.is_empty()).then(|| format!("nested={}", done.nested.len())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let reason = (!counts.is_empty()).then(|| counts.join(" "));
                     (done, reason)
                 }
                 Err(error) => {
@@ -663,6 +1048,7 @@ fn execute(
                 drift: done.drift,
                 bytes_read: done.bytes_read,
                 reuse_unavailable: done.reuse_unavailable,
+                nested: done.nested,
             })
         })
     })?;
@@ -781,15 +1167,47 @@ pub fn capture_with_policy(
     let contents: Plan = read(plan)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let groups = capture_groups(&contents)?;
-    execute(
-        &contents,
-        jobs,
-        &|item| {
-            let base = group_base(item, &groups, state, corpus)?;
-            capture_item(item, state, corpus, base.as_ref(), policy)
-        },
-        &|row| emit(state, row, receipt),
-    )
+    let owners = owners(&contents)?;
+    // R-N114, round 4 N5: an item whose source lies inside another item's
+    // source captures first, level by level from the deepest, so the outer
+    // knows whether each planned carrier's own capture refused in this pass.
+    let refused = Mutex::new(std::collections::BTreeSet::new());
+    let operation = |item: &Item| {
+        let result = group_base(item, &groups, state, corpus).and_then(|base| {
+            capture_item(
+                item,
+                state,
+                corpus,
+                base.as_ref(),
+                policy,
+                &owners,
+                &refused,
+            )
+        });
+        if result.is_err() {
+            refused
+                .lock()
+                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
+                .insert(item.source.clone());
+        }
+        result
+    };
+    let mut levels = std::collections::BTreeMap::<usize, Plan>::new();
+    for item in &contents.items {
+        let depth = contents
+            .items
+            .iter()
+            .filter(|other| item.source.starts_with(&other.source) && item.source != other.source)
+            .count();
+        levels.entry(depth).or_default().items.push(item.clone());
+    }
+    let mut outcome = Ok(());
+    for level in levels.values().rev() {
+        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+            outcome = Err(error);
+        }
+    }
+    outcome
 }
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
@@ -844,12 +1262,22 @@ fn apply_item(
     state: &Path,
     source: &str,
     imported: &ImportedBases,
+    owners: &Owners,
 ) -> Result<Completion> {
     let identity = id(item)?;
-    let captured: Capture = read(&corpus.join(format!("{identity}.capture")))?;
+    let record = corpus.join(format!("{identity}.capture"));
+    // Round 4 N5: an item whose capture refused has no record. That is a
+    // typed refusal, never a bare IO errno.
+    if !record.try_exists()? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    let captured: Capture = read(&record)?;
     if !filename(&captured.bundle) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
+    // The nests a capture did not carry ride into every receipt that names
+    // its bundle, so an apply never presents them as restored.
+    let nested = nest_lines(item, owners, &retained_nested(corpus, &captured.bundle)?);
     // A capture that drifted under its export does not hold the drifted
     // seats' bytes. Its bundle says so in-band, and apply refuses it on that
     // marker, fail-closed, before any base import, journal write or
@@ -870,14 +1298,26 @@ fn apply_item(
             "refs-imported" => "previous-ref-custody-not-workspace-parity",
             _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
         };
-        return Ok(Completion::clean(outcome));
+        return Ok(Completion::clean(outcome).naming(nested));
     }
     // After the journal (round-4 P2): a re-apply of a done item stages and
     // copies nothing. Otherwise one private stage next to the corpus is the
     // only copy this apply reads: the marker check, the digest (computed while
     // copying) and the restore all see the same bytes (round-3 N4), and the
     // restore verbs below do not check again.
-    let staged = git_carry::stage_bundle(&corpus.join(&captured.bundle))?;
+    // R5-4: a carrier bundle the record names but the corpus no longer holds
+    // is a typed refusal, never a bare IO errno.
+    let published = corpus.join(&captured.bundle);
+    if !published.try_exists()? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    let staged = git_carry::stage_bundle(&published).map_err(|error| {
+        if error == BulkloadRefusal::Io(Some(libc::ENOENT)) {
+            BulkloadRefusal::SealedObjectMissing
+        } else {
+            error
+        }
+    })?;
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
@@ -894,7 +1334,7 @@ fn apply_item(
         "refs-imported"
     };
     write(&journal, &outcome.to_owned())?;
-    Ok(Completion::clean(outcome))
+    Ok(Completion::clean(outcome).naming(nested))
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -917,7 +1357,11 @@ pub fn apply(
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
     for item in &contents.items {
-        let common = if item.repository.try_exists()? {
+        // A standalone restore's repository is its own workspace: if it is
+        // already there, that is a collision the restore refuses by type
+        // (R-N114), not Git administration to serialise on.
+        let standalone = item.workspace.as_ref() == Some(&item.repository);
+        let common = if !standalone && item.repository.try_exists()? {
             git_carry::common_repository(&item.repository)?
         } else {
             item.repository.clone()
@@ -925,23 +1369,54 @@ pub fn apply(
         groups.insert(id(item)?, common.clone());
         locks.entry(common).or_insert_with(|| Mutex::new(()));
     }
-    execute(
-        &contents,
-        jobs,
-        &|item| {
-            let common = groups
-                .get(&id(item)?)
-                .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
-            let lock = locks
-                .get(common)
-                .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
-            let _guard = lock
-                .lock()
-                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-            apply_item(item, corpus, state, source, &imported)
-        },
-        &|row| emit(state, row, receipt),
-    )
+    let owners = owners(&contents)?;
+    let operation = |item: &Item| {
+        let common = groups
+            .get(&id(item)?)
+            .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
+        let lock = locks
+            .get(common)
+            .ok_or(BulkloadRefusal::GitAuthorityChanged)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+        apply_item(item, corpus, state, source, &imported, &owners)
+    };
+    // R-N114: an item whose workspace lies inside another item's workspace
+    // restores after it, level by level, so the outer checkout lays down the
+    // parent directories and the nested item creates its own directory. Items
+    // within a level still run in parallel. Every level runs; any refusal is
+    // reported at the end, exactly as within one level.
+    let mut levels = std::collections::BTreeMap::<usize, Plan>::new();
+    for item in &contents.items {
+        // Compared in target_key form (round 4 N4), so a case or `..`
+        // variant of an enclosing target still orders after it.
+        let depth = match &item.workspace {
+            None => 0,
+            Some(workspace) => {
+                let key = target_key(workspace)?;
+                let mut depth = 0;
+                for other in contents
+                    .items
+                    .iter()
+                    .filter_map(|other| other.workspace.as_ref())
+                {
+                    if nests_within(&key, &target_key(other)?) {
+                        depth += 1;
+                    }
+                }
+                depth
+            }
+        };
+        levels.entry(depth).or_default().items.push(item.clone());
+    }
+    let mut outcome = Ok(());
+    for level in levels.values() {
+        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+            outcome = Err(error);
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -2148,5 +2623,784 @@ mod tests {
         assert_eq!(fs::read(target.join("big")).unwrap(), vec![b'b'; 65_536]);
         assert_eq!(fs::read(target.join("small")).unwrap(), b"small untracked");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N73 B3: every estate receipt names every nest. A clean nest two
+    // commits ahead of its remote-tracking ref is custody; the capture, the
+    // reuse hit and the apply each name it with unpushed=2, the count rides
+    // in the layout-safe reason, and the rows ride in `{bundle}.nested`.
+    #[test]
+    fn every_estate_receipt_names_every_nest_with_its_unpushed_count() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-nested-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let nest = source.join("vendor/inner");
+        fs::create_dir_all(&nest).unwrap();
+        git(&nest, &["init", "--template="]);
+        fs::write(nest.join("lib.c"), b"v1").unwrap();
+        git(&nest, &["add", "lib.c"]);
+        git(&nest, &["commit", "-m", "v1"]);
+        git(
+            &nest,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/inner.git",
+            ],
+        );
+        git(&nest, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        for step in ["v2", "v3"] {
+            fs::write(nest.join("lib.c"), step).unwrap();
+            git(&nest, &["commit", "-am", step]);
+        }
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        let rows = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.nested.clone()));
+            Ok(())
+        };
+        // Wait out the racy window before the reuse pass (R-N76), as #52's
+        // own reuse tests do: seats stamped within 2 s of a pass never make a
+        // whole-capture hit.
+        settle();
+        capture(&plan, &state, &corpus, 1, &record).unwrap();
+        settle();
+        capture(&plan, &state, &corpus, 1, &record).unwrap();
+        apply(&plan, &corpus, &root.join("applied"), "neo", 1, &record).unwrap();
+        let rows = rows.into_inner().unwrap();
+        let outcomes: Vec<_> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                "captured",
+                "capture-reused-after-census",
+                "workspace-restored"
+            ]
+        );
+        for (_, reason, nested) in &rows {
+            assert_eq!(reason.as_deref(), Some("nested=1"));
+            assert_eq!(nested.len(), 1);
+            let line = nested.first().unwrap();
+            assert!(line.starts_with("nested-repository path=\"vendor/inner\" "));
+            assert!(line.contains(" unpushed=2 remotes=yes"));
+        }
+        // The durable sidecar beside the bundle; the Capture codec is unchanged.
+        let items = inspect(&plan).unwrap();
+        let item = items.first().unwrap();
+        let captured: Capture =
+            read(&corpus.join(format!("{}.capture", id(item).unwrap()))).unwrap();
+        let sidecar: Vec<git_carry::NestedRepository> =
+            read(&corpus.join(format!("{}.nested", captured.bundle))).unwrap();
+        assert_eq!(
+            sidecar.iter().map(|nest| nest.unpushed).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(!target.join("vendor/inner").exists());
+        assert_eq!(fs::read(target.join("file")).unwrap(), b"base");
+
+        // A dirty nest is refused by name of refusal, never silently dropped.
+        fs::write(nest.join("lib.c"), b"unsaved edit").unwrap();
+        let refused = Mutex::new(Vec::new());
+        assert!(capture(&plan, &state, &corpus, 1, &|row| {
+            refused
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(
+            refused.into_inner().unwrap(),
+            vec![(
+                "refused",
+                Some(BulkloadRefusal::GitInventoryMalformed.to_string())
+            )]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Round 4 N4 (R-N114), R6-1: targets are compared as target_key forms.
+    // A `..` target that physically lands inside another item's target, and
+    // a case variant of one on a case-insensitive volume, refuse at add; the
+    // nest at its own place in another case is accepted.
+    #[test]
+    fn overlapping_targets_compare_canonical_and_case_folded() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-fold-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template="]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        git(&other, &["init", "--template="]);
+        fs::write(other.join("file"), b"other").unwrap();
+        git(&other, &["add", "file"]);
+        git(&other, &["commit", "-m", "other"]);
+        fs::create_dir(root.join("elsewhere")).unwrap();
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        let sneaky = root.join("elsewhere/../target/file");
+        let dotdot = add(&plan, &other, &sneaky, Some(&sneaky));
+        let insensitive = {
+            fs::write(root.join("probe"), b"").unwrap();
+            let folded = root.join("PROBE").exists();
+            fs::remove_file(root.join("probe")).unwrap();
+            folded
+        };
+        let variant = root.join("TARGET/x");
+        let cased = add(&plan, &other, &variant, Some(&variant));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(dotdot, Err(BulkloadRefusal::GitDestinationOccupied));
+        if insensitive {
+            assert_eq!(cased, Err(BulkloadRefusal::GitDestinationOccupied));
+        } else {
+            assert_eq!(cased, Ok(()));
+        }
+    }
+
+    // R6-1 (R-N83, R-N123): an unanswerable case probe must never relax a
+    // planned-nest refusal. The unanswerable path is forced without any
+    // host device boundary: `/` is a letterless walk to the root, so the
+    // probe cannot answer there. The R5-3 plan (nest at Vendor/inner, planned
+    // at T/vendor/inner) refuses whether the answer is Sensitive or Unknown,
+    // and is only relaxed by a positive Insensitive answer on both keys.
+    #[test]
+    fn an_unanswerable_case_probe_never_relaxes_a_planned_nest_refusal() {
+        assert_eq!(probe_case(Path::new("/")), Case::Unknown);
+        let outer_source = Path::new("/src/outer");
+        let inner_source = Path::new("/src/outer/Vendor/inner");
+        let target = PathBuf::from("/mnt/T");
+        let inner = target.join("vendor/inner");
+        let plan = |case: Case, other_case: Case| {
+            overlapping(
+                &(inner.clone(), case),
+                inner_source,
+                &(target.clone(), other_case),
+                outer_source,
+            )
+        };
+        assert!(plan(Case::Sensitive, Case::Sensitive));
+        assert!(plan(Case::Unknown, Case::Unknown));
+        assert!(plan(Case::Unknown, Case::Insensitive));
+        assert!(plan(Case::Insensitive, Case::Unknown));
+        assert!(plan(Case::Sensitive, Case::Insensitive));
+        assert!(!plan(Case::Insensitive, Case::Insensitive));
+        // A same-case plan still passes on an unanswerable volume.
+        let same = Path::new("/src/outer/vendor/inner");
+        assert!(!overlapping(
+            &(inner.clone(), Case::Unknown),
+            same,
+            &(target.clone(), Case::Unknown),
+            outer_source,
+        ));
+        // Unanswerable still fails toward detecting a case-variant overlap
+        // between unrelated items.
+        assert!(overlapping(
+            &(PathBuf::from("/mnt/t/x"), Case::Unknown),
+            Path::new("/src/other"),
+            &(target.clone(), Case::Unknown),
+            outer_source,
+        ));
+        // Only positive Sensitive answers on both sides keep case-distinct
+        // targets distinct.
+        assert!(!overlapping(
+            &(PathBuf::from("/mnt/t/x"), Case::Sensitive),
+            Path::new("/src/other"),
+            &(target, Case::Sensitive),
+            outer_source,
+        ));
+    }
+
+    // Round 4 N4 on both platforms: the read-only case probe agrees with a
+    // created-file ground truth on whatever volume the test runs on (case-
+    // insensitive APFS on macOS, case-sensitive ext4 on Linux CI).
+    #[test]
+    fn the_read_only_case_probe_matches_the_volume() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-case-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let named = root.join("CaseProbe");
+        fs::create_dir(&named).unwrap();
+        fs::write(root.join("probe"), b"").unwrap();
+        let folds = root.join("PROBE").exists();
+        let probed = probe_case_insensitive(&named);
+        let digits = root.join("1234");
+        fs::create_dir(&digits).unwrap();
+        // A name with no letter is decided by its nearest lettered ancestor.
+        let through_parent = probe_case_insensitive(&digits);
+        let at_root = probe_case_insensitive(&root);
+        let platform = case_insensitive(&named);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(probed, folds);
+        assert_eq!(through_parent, at_root);
+        assert_eq!(platform, folds);
+    }
+
+    // B4: a nest's HEAD moving between the capture's pre-pass key and the
+    // export, or after the export's last read, refuses the item with
+    // GIT_AUTHORITY_CHANGED; it is never recorded as drift.
+    #[test]
+    fn a_nest_head_moving_around_the_export_refuses_the_capture() {
+        for stage in [
+            git_carry::mid_pass::Stage::Snapshot,
+            git_carry::mid_pass::Stage::AfterPass,
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "tcfs-estate-nest-moves-{stage:?}-{}",
+                std::process::id()
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+            let source = root.join("source");
+            fs::create_dir(&source).unwrap();
+            git(&source, &["init", "--template="]);
+            fs::write(source.join("file"), b"base").unwrap();
+            git(&source, &["add", "file"]);
+            git(&source, &["commit", "-m", "base"]);
+            let nest = source.join("vendor/inner");
+            fs::create_dir_all(&nest).unwrap();
+            git(&nest, &["init", "--template="]);
+            fs::write(nest.join("lib.c"), b"v1").unwrap();
+            git(&nest, &["add", "lib.c"]);
+            git(&nest, &["commit", "-m", "v1"]);
+            let plan = root.join("plan");
+            add(&plan, &source, &root.join("destination"), None).unwrap();
+            let inner = fs::canonicalize(&nest).unwrap();
+            git_carry::mid_pass::arm_at(&source, stage, move || {
+                fs::write(inner.join("lib.c"), b"v2").unwrap();
+                git(&inner, &["commit", "-am", "v2"]);
+            });
+            let rows = Mutex::new(Vec::new());
+            let result = capture(
+                &plan,
+                &root.join("state"),
+                &root.join("corpus"),
+                1,
+                &|row| {
+                    rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                    Ok(())
+                },
+            );
+            fs::remove_dir_all(&root).unwrap();
+            assert!(result.is_err(), "{stage:?}");
+            assert_eq!(
+                rows.into_inner().unwrap(),
+                vec![(
+                    "refused",
+                    Some(BulkloadRefusal::GitAuthorityChanged.to_string())
+                )],
+                "{stage:?}"
+            );
+        }
+    }
+
+    // A capture of a repository with no nest writes no `.nested` sidecar and
+    // its receipt reason stays None, exactly as before.
+    #[test]
+    fn a_nest_free_capture_has_no_nested_sidecar_or_reason() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-no-nest-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let plan = root.join("plan");
+        add(&plan, &source, &root.join("destination"), None).unwrap();
+        let corpus = root.join("corpus");
+        let rows = Mutex::new(Vec::new());
+        capture(&plan, &root.join("state"), &corpus, 1, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.reason.clone(), row.nested.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.into_inner().unwrap(), vec![(None, Vec::new())]);
+        assert!(!fs::read_dir(&corpus)
+            .unwrap()
+            .any(|entry| entry.unwrap().path().extension() == Some("nested".as_ref())));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N114: a populated submodule planned as its own item. The outer names
+    // it as carried by that item and creates no directory for it; the item
+    // restores it exactly once; the restored outer is clean.
+    #[test]
+    fn a_populated_submodule_planned_as_its_own_item_restores_once() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-own-sub-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let upstream = root.join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "--template=", "-b", "main"]);
+        fs::write(upstream.join("lib.c"), b"v1").unwrap();
+        git(&upstream, &["add", "lib.c"]);
+        git(&upstream, &["commit", "-m", "v1"]);
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template=", "-b", "main"]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        git(
+            &outer,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        git(&outer, &["commit", "-m", "sub"]);
+        let sub = outer.join("sub");
+        git(
+            &sub,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/sub.git",
+            ],
+        );
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        add(&plan, &sub, &target.join("sub"), Some(&target.join("sub"))).unwrap();
+        let items = inspect(&plan).unwrap();
+        let sub_id = id(items
+            .iter()
+            .find(|item| item.source.ends_with("sub"))
+            .unwrap())
+        .unwrap();
+        let rows = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.nested.clone()));
+            Ok(())
+        };
+        capture(&plan, &root.join("state"), &root.join("corpus"), 1, &record).unwrap();
+        apply(
+            &plan,
+            &root.join("corpus"),
+            &root.join("applied"),
+            "neo",
+            1,
+            &record,
+        )
+        .unwrap();
+        let rows = rows.into_inner().unwrap();
+        assert!(rows.iter().all(|row| row.0 != "refused"), "{rows:?}");
+        assert!(rows.iter().any(|row| row
+            .2
+            .iter()
+            .any(|line| line.ends_with(&format!(" seats=own-item carried-by={sub_id}")))));
+        assert!(target.join("sub/.git").exists());
+        assert_eq!(fs::read(target.join("sub/lib.c")).unwrap(), b"v1");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // R-N114: overlapping workspace targets are refused unless the inner item
+    // is the outer item's nested source restored at the same relative place;
+    // a restore onto an existing destination is a typed collision, never an
+    // errno.
+    #[test]
+    fn overlapping_targets_and_occupied_destinations_refuse_by_type() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-overlap-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let outer = root.join("outer");
+        fs::create_dir(&outer).unwrap();
+        git(&outer, &["init", "--template="]);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        git(&outer, &["add", "file"]);
+        git(&outer, &["commit", "-m", "outer"]);
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        git(&other, &["init", "--template="]);
+        fs::write(other.join("file"), b"other").unwrap();
+        git(&other, &["add", "file"]);
+        git(&other, &["commit", "-m", "other"]);
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &outer, &target, Some(&target)).unwrap();
+        // Another repository restored inside the outer's target: a collision.
+        let inside = target.join("vendor/other");
+        assert_eq!(
+            add(&plan, &other, &inside, Some(&inside)),
+            Err(BulkloadRefusal::GitDestinationOccupied)
+        );
+        // The outer restored inside another item's target: a collision too.
+        let around = root.join("around");
+        let plan2 = root.join("plan2");
+        add(&plan2, &other, &around.join("x"), Some(&around.join("x"))).unwrap();
+        assert_eq!(
+            add(&plan2, &outer, &around, Some(&around)),
+            Err(BulkloadRefusal::GitDestinationOccupied)
+        );
+        // A restore onto an existing directory is typed.
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        fs::create_dir(&target).unwrap();
+        let refused = Mutex::new(Vec::new());
+        assert!(
+            apply(&plan, &corpus, &root.join("applied"), "neo", 1, &|row| {
+                refused.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            refused.into_inner().unwrap(),
+            vec![Some(BulkloadRefusal::GitDestinationOccupied.to_string())]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// #53 round-5 reviewer probes of 895cd8a's read-only case probe (R-N114),
+// kept as regression tests. The case-sensitive directory comes from RV5_CS
+// (an hdiutil case-sensitive APFS image), its mount root from RV5_CS_ROOT;
+// those probes skip when unset. Under R5-7 an unanswerable probe (a missing
+// path, or a walk that would cross a device boundary) answers insensitive,
+// which can only add overlap refusals; the two probes that asserted the
+// opposite now assert that.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53e_probe {
+    use super::*;
+
+    fn cs() -> Option<(PathBuf, PathBuf)> {
+        Some((
+            fs::canonicalize(std::env::var_os("RV5_CS")?).ok()?,
+            fs::canonicalize(std::env::var_os("RV5_CS_ROOT")?).ok()?,
+        ))
+    }
+
+    fn scratch(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(format!("rv5p-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    // A symlinked nearest existing ancestor: target_key resolves it, so the
+    // probe sees the real directory on the real volume.
+    #[test]
+    fn rv5_probe_symlinked_ancestor_is_resolved_before_probing() {
+        let Some((cs, _)) = cs() else { return };
+        let root = scratch(&cs, "symlink");
+        let real = root.join("Real");
+        fs::create_dir(&real).unwrap();
+        let tmp = scratch(&std::env::temp_dir(), "symlink-ci");
+        std::os::unix::fs::symlink(&real, tmp.join("Link")).unwrap();
+        let (key, _) = target_key(&tmp.join("Link/Sub/Leaf")).unwrap();
+        let (probe_real, probe_link) = (
+            probe_case_insensitive(&real),
+            probe_case_insensitive(&tmp.join("Link")),
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&tmp).unwrap();
+        eprintln!("key={key:?} probe(real on cs)={probe_real} probe(link on ci)={probe_link}");
+        assert_eq!(
+            key,
+            real.join("Sub/Leaf"),
+            "not folded: the real volume is case-sensitive"
+        );
+        assert!(!probe_real);
+    }
+
+    // A case-flipped name that exists as a different entry on a case-sensitive
+    // volume is a different inode: still case-sensitive.
+    #[test]
+    fn rv5_probe_flipped_name_existing_as_another_entry() {
+        let Some((cs, _)) = cs() else { return };
+        let root = scratch(&cs, "flipped");
+        fs::create_dir(root.join("Tgt")).unwrap();
+        fs::create_dir(root.join("tGT")).unwrap();
+        fs::write(root.join("File"), b"a").unwrap();
+        fs::write(root.join("fILE"), b"b").unwrap();
+        let dirs = probe_case_insensitive(&root.join("Tgt"));
+        let files = probe_case_insensitive(&root.join("File"));
+        // A hard link under the flipped name (files only) is the same inode.
+        fs::remove_file(root.join("fILE")).unwrap();
+        fs::hard_link(root.join("File"), root.join("fILE")).unwrap();
+        let hardlinked = probe_case_insensitive(&root.join("File"));
+        fs::remove_dir_all(&root).unwrap();
+        eprintln!("dirs={dirs} files={files} hardlinked={hardlinked}");
+        assert!(!dirs && !files);
+    }
+
+    // A component that does not exist yet: nothing resolves, no fold, and
+    // target_key probes only its existing ancestor.
+    #[test]
+    fn rv5_probe_missing_component() {
+        let tmp = scratch(&std::env::temp_dir(), "missing");
+        let missing = probe_case_insensitive(&tmp.join("NotThere"));
+        let (key, _) = target_key(&tmp.join("NotThere/Deeper")).unwrap();
+        let ci = probe_case_insensitive(&tmp);
+        fs::remove_dir_all(&tmp).unwrap();
+        eprintln!("missing={missing} tmp-probe={ci} key={key:?}");
+        // R5-7: nothing resolves, so the probe cannot answer: insensitive.
+        assert!(missing);
+    }
+
+    // A letterless directory directly under a case-sensitive volume's mount
+    // root, whose mount point sits on a case-insensitive parent: the nearest
+    // lettered component is the mount point, looked up in the parent volume.
+    #[test]
+    fn rv5_probe_across_a_mount_boundary() {
+        let Some((_, cs_root)) = cs() else { return };
+        let letterless = cs_root.join("1234");
+        fs::create_dir_all(&letterless).unwrap();
+        let probed = probe_case_insensitive(&letterless);
+        let at_root = probe_case_insensitive(&cs_root);
+        eprintln!(
+            "probe(cs_root/1234)={probed} probe(cs_root)={at_root} (volume is case-sensitive)"
+        );
+        // R5-7: the walk would look the mount point up in the parent volume,
+        // which answers for the wrong volume. It stops at the device change
+        // and fails toward detecting overlap instead.
+        assert!(probed && at_root);
+    }
+}
+
+// The #53 round-6 reviewer demonstrator (R6-1), kept as a regression test and
+// adapted to the three-valued case answer: an unanswerable probe (here, a
+// real device boundary when the host has one) must not re-admit the R5-3
+// case-mismatched nest plan.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_pr53f_r6 {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn r6_unanswerable_probe_refolds_the_source_relation() {
+        let boundary = ["/Users", "/nix", "/home", "/tmp", "/boot", "/mnt"]
+            .iter()
+            .map(Path::new)
+            .find(|p| {
+                let (Ok(m), Ok(pm)) = (
+                    fs::symlink_metadata(p),
+                    fs::symlink_metadata(p.parent().unwrap()),
+                ) else {
+                    return false;
+                };
+                m.dev() != pm.dev()
+            });
+        if let Some(b) = boundary {
+            assert_eq!(probe_case(b), Case::Unknown, "{b:?}");
+        }
+        let outer_src = Path::new("/src/outer");
+        let inner_src = Path::new("/src/outer/Vendor/inner");
+        let t = PathBuf::from("/mnt/T");
+        let answered = overlapping(
+            &(t.join("vendor/inner"), Case::Sensitive),
+            inner_src,
+            &(t.clone(), Case::Sensitive),
+            outer_src,
+        );
+        let unanswerable = overlapping(
+            &(t.join("vendor/inner"), Case::Unknown),
+            inner_src,
+            &(t, Case::Unknown),
+            outer_src,
+        );
+        assert!(answered);
+        assert!(
+            unanswerable,
+            "unanswerable probe re-admits the R5-3 case-mismatched nest plan"
+        );
+    }
+}
+
+// The #53 round-7 reviewer demonstrator (R7-1; R-N71, R-N83, R-N123),
+// kept as regression tests.
+#[cfg(test)]
+mod review_pr53g_r7 {
+    use super::*;
+
+    const ALL: [Case; 3] = [Case::Sensitive, Case::Insensitive, Case::Unknown];
+
+    fn ov(t: &str, ts: &str, ca: Case, o: &str, os: &str, cb: Case) -> bool {
+        overlapping(
+            &(PathBuf::from(t), ca),
+            Path::new(ts),
+            &(PathBuf::from(o), cb),
+            Path::new(os),
+        )
+    }
+
+    // Every answer pairing, both argument orders: the R5-3 plan refuses
+    // unless both answers are positively Insensitive; the same-case plan
+    // always passes.
+    #[test]
+    fn r7_pairing_table_both_directions() {
+        for a in ALL {
+            for b in ALL {
+                let both_i = a == Case::Insensitive && b == Case::Insensitive;
+                let fwd = ov(
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/Vendor/inner",
+                    a,
+                    "/mnt/T",
+                    "/src/outer",
+                    b,
+                );
+                let rev = ov(
+                    "/mnt/T",
+                    "/src/outer",
+                    a,
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/Vendor/inner",
+                    b,
+                );
+                eprintln!("R5-3 plan ({a:?},{b:?}) fwd_refused={fwd} rev_refused={rev}");
+                assert_eq!(fwd, !both_i, "fwd {a:?} {b:?}");
+                assert_eq!(rev, !both_i, "rev {a:?} {b:?}");
+                let same_f = ov(
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/vendor/inner",
+                    a,
+                    "/mnt/T",
+                    "/src/outer",
+                    b,
+                );
+                let same_r = ov(
+                    "/mnt/T",
+                    "/src/outer",
+                    a,
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/vendor/inner",
+                    b,
+                );
+                assert!(!same_f && !same_r, "same-case plan refused at {a:?} {b:?}");
+            }
+        }
+    }
+
+    // Exhaustive monotonicity over a small universe: substituting a definite
+    // answer for any Unknown never yields a refusal the Unknown result lacks.
+    #[test]
+    fn r7_unknown_is_never_less_refusing_than_a_definite_answer() {
+        let targets = [
+            "/m/T", "/m/t", "/m/T/v/i", "/m/t/v/i", "/m/T/V/i", "/m/t/V/i", "/m/T/x", "/m/t/X",
+        ];
+        let sources = ["/s/o", "/s/o/v/i", "/s/o/V/i", "/s/p"];
+        let subst = |c: Case| -> Vec<Case> {
+            if c == Case::Unknown {
+                vec![Case::Sensitive, Case::Insensitive]
+            } else {
+                vec![c]
+            }
+        };
+        let mut checked = 0usize;
+        for t in targets {
+            for ts in sources {
+                for o in targets {
+                    for os in sources {
+                        for a in ALL {
+                            for b in ALL {
+                                let got = ov(t, ts, a, o, os, b);
+                                for a2 in subst(a) {
+                                    for b2 in subst(b) {
+                                        let definite = ov(t, ts, a2, o, os, b2);
+                                        assert!(got || !definite, "{t} {ts} {a:?} / {o} {os} {b:?}: definite ({a2:?},{b2:?}) refuses, unknown admits");
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("monotonicity pairs checked: {checked}");
+    }
+
+    // R7-1: when the targets nest only case-folded (the outer prefix differs
+    // in case), the relative path falls back to the FOLDED relative, so the
+    // source relation is compared folded under (Unknown, Unknown) -- the
+    // exact-comparison contract is not kept. Control: the same relative case
+    // mismatch with a same-case prefix is refused.
+    #[test]
+    fn r7_fallback_folds_the_relation_when_the_prefix_differs_in_case() {
+        let u = Case::Unknown;
+        let control = ov(
+            "/data/T/VENDOR/inner",
+            "/src/outer/vendor/inner",
+            u,
+            "/data/T",
+            "/src/outer",
+            u,
+        );
+        assert!(control);
+        // The seven pairs that are neither (Sensitive, Sensitive) nor
+        // (Insensitive, Insensitive) nest the targets case-folded and compare
+        // the relation exactly, so the relative VENDOR/inner never matches
+        // vendor/inner however the outer prefix is spelled: refused, both
+        // argument orders. Under (Sensitive, Sensitive) /data/t and /data/T
+        // are different places, so there is nothing to refuse; under
+        // (Insensitive, Insensitive) the relation matches case-folded.
+        for a in ALL {
+            for b in ALL {
+                let both_s = a == Case::Sensitive && b == Case::Sensitive;
+                let both_i = a == Case::Insensitive && b == Case::Insensitive;
+                let expected = !both_s && !both_i;
+                let fwd = ov(
+                    "/data/t/VENDOR/inner",
+                    "/src/outer/vendor/inner",
+                    a,
+                    "/data/T",
+                    "/src/outer",
+                    b,
+                );
+                let rev = ov(
+                    "/data/T",
+                    "/src/outer",
+                    a,
+                    "/data/t/VENDOR/inner",
+                    "/src/outer/vendor/inner",
+                    b,
+                );
+                assert_eq!(fwd, expected, "R7-1 fwd ({a:?},{b:?})");
+                assert_eq!(rev, expected, "R7-1 rev ({a:?},{b:?})");
+            }
+        }
     }
 }

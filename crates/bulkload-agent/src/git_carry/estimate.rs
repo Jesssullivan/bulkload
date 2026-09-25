@@ -542,6 +542,11 @@ impl CarryEstimate {
 /// unreachable remote, or Git output that is not the shape these commands
 /// promise. A refusal raised by a child process carries only the class of
 /// its stderr (R-N121); see [`estimate_with`] to keep the raw bytes.
+// `Refused` carries a `BulkloadRefusal`, whose path-carrying variants
+// (nested-repository custody, #53) put it just over clippy's 128-byte
+// large-error threshold. A refusal is the cold path; boxing it would change
+// this public shape for no measured gain.
+#[allow(clippy::result_large_err)]
 pub fn estimate(
     source: &Path,
     destination: &Destination,
@@ -558,6 +563,11 @@ pub fn estimate(
 /// # Errors
 /// As [`estimate`], and `SNAPSHOT_ROOTS_OVERLAP` for a state dir inside
 /// either repository.
+// `Refused` carries a `BulkloadRefusal`, whose path-carrying variants
+// (nested-repository custody, #53) put it just over clippy's 128-byte
+// large-error threshold. A refusal is the cold path; boxing it would change
+// this public shape for no measured gain.
+#[allow(clippy::result_large_err)]
 pub fn estimate_with(
     source: &Path,
     destination: &Destination,
@@ -874,6 +884,11 @@ fn remote_command(path: &str) -> String {
 /// to a private capture and the keyed digest (D3: nothing is buffered
 /// without bound). A refused probe keeps the capture; a successful one
 /// discards it.
+// `Refused` carries a `BulkloadRefusal`, whose path-carrying variants
+// (nested-repository custody, #53) put it just over clippy's 128-byte
+// large-error threshold. A refusal is the cold path; boxing it would change
+// this public shape for no measured gain.
+#[allow(clippy::result_large_err)]
 fn run_probe(
     command: &mut Command,
     store: Option<&StderrStore>,
