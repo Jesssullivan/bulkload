@@ -4,7 +4,7 @@
 //! (`bulkload-agent` running as source and as destination). It holds three
 //! things and deliberately nothing else:
 //!
-//! * [`frame`] -- the postcard frame codec skeleton.
+//! * [`frame`] -- the wire v5 frame codec (R-N118).
 //! * [`row`] -- the scanned-row schema the agent emits.
 //! * [`refusal`] -- the [`BulkloadRefusal`] taxonomy.
 //!
@@ -16,7 +16,7 @@ pub mod frame;
 pub mod refusal;
 pub mod row;
 
-pub use frame::{Frame, FrameKind, PROTO_VERSION};
+pub use frame::{Control, Decision, Frame, PROTO_VERSION};
 pub use refusal::BulkloadRefusal;
 pub use row::{FileKind, RowSchema};
 
