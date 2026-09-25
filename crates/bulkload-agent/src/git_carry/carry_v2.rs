@@ -344,3 +344,77 @@ fn lines(
         line(body)?;
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn git_at(repo: &Path) -> Command {
+        let mut command = super::super::git(repo);
+        command
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@invalid");
+        command
+    }
+
+    /// #73 round-2 D1, the reviewer's case 6 (`r2_probe.rs`): a round built
+    /// by hand inside the crate, claiming a full destination (or another
+    /// frontier) for a shallow source, is refused by `PackPlan::build`
+    /// before anything is listed. Outside the crate such a round cannot be
+    /// built at all: the fields are private.
+    #[test]
+    fn a_hand_built_round_cannot_skip_the_shallow_rules() {
+        let root = std::env::temp_dir().join(format!(
+            "bulkload-carry-v2-d1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let origin = root.join("origin");
+        super::super::output(
+            git_at(&root)
+                .args(["init", "-q", "-b", "main"])
+                .arg(&origin),
+        )
+        .unwrap();
+        for index in 0..3 {
+            std::fs::write(origin.join("f.txt"), format!("{index}\n")).unwrap();
+            super::super::output(git_at(&origin).args(["add", "f.txt"])).unwrap();
+            super::super::output(git_at(&origin).args(["commit", "-q", "-m", "c"])).unwrap();
+        }
+        let url = format!("file://{}", origin.display());
+        let shallow = root.join("shallow");
+        super::super::output(
+            git_at(&root)
+                .args(["clone", "-q", "--depth", "1", url.as_str()])
+                .arg(&shallow),
+        )
+        .unwrap();
+        let source = Source::probe(&shallow, None).unwrap();
+        assert!(!source.shallow().is_empty());
+        let wants: Vec<String> = source.wants().unwrap().into_iter().collect();
+        let other = "1".repeat(40);
+        for (frontier, reason) in [
+            (Vec::new(), "source_shallow_destination_full"),
+            (vec![other], "destination_shallow_frontier_differs"),
+        ] {
+            let round = FirstRound {
+                wants: wants.clone(),
+                haves: Vec::new(),
+                shallow: frontier,
+                destination_tips: 0,
+                non_commit_haves: 0,
+            };
+            let refused = PackPlan::build(&source, &round, DEFAULT_SEGMENT_CAP, None).unwrap_err();
+            assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+            assert_eq!(refused.reason, Some(reason));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bulkload_agent::git_carry::carry_v2::{
     first_round, FirstRound, ListStore, Offer, PackPlan, Source, DEFAULT_SEGMENT_CAP,
 };
-use bulkload_agent::git_carry::estimate::{estimate, Destination};
+use bulkload_agent::git_carry::estimate::{estimate, Destination, StderrStore};
 use bulkload_agent::BulkloadRefusal;
 
 // ---------------------------------------------------------------------------
@@ -509,15 +509,15 @@ fn assert_haves(name: &str, source: &Path, destination: &Path, round: &FirstRoun
         .into_iter()
         .filter(|tip| has_object(source, tip))
         .collect();
-    let offered: BTreeSet<String> = round.haves.iter().cloned().collect();
+    let offered: BTreeSet<String> = round.haves().iter().cloned().collect();
     assert_eq!(offered, held, "{name}: haves are exactly the held tips");
     assert_eq!(
         offered.len(),
-        round.haves.len(),
+        round.haves().len(),
         "{name}: no duplicate have"
     );
     let peeled: Vec<Option<String>> = round
-        .haves
+        .haves()
         .iter()
         .map(|have| peeled_commit(source, have))
         .collect();
@@ -599,7 +599,7 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path, cap: 
         segments.push(pack);
     }
 
-    let oracle = upload_pack(source, &round.wants, &round.haves, &round.shallow);
+    let oracle = upload_pack(source, round.wants(), round.haves(), round.shallow());
     let oracle_set = carried(scratch, destination, &oracle);
     assert_eq!(set, oracle_set, "{name}: R-N113 sent set == upload-pack");
 
@@ -641,10 +641,10 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path, cap: 
          segments={} sent_objects={objects} sent_bytes={bytes} oracle_objects={} \
          oracle_bytes={} estimate_objects={} estimate_bytes={} sent_set_eq_oracle=true \
          byte_ratio={:.4}",
-        measured.round.haves.len(),
-        measured.round.non_commit_haves,
-        measured.round.wants.len(),
-        measured.round.shallow.len(),
+        measured.round.haves().len(),
+        measured.round.non_commit_haves(),
+        measured.round.wants().len(),
+        measured.round.shallow().len(),
         measured.plan.edges(),
         measured.segments.len(),
         measured.oracle_set.len(),
@@ -654,7 +654,12 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path, cap: 
         ratio(bytes, estimate.thin_pack.bytes),
     );
 
-    ingest(destination, &measured.segments, &measured.round.wants, name);
+    ingest(
+        destination,
+        &measured.segments,
+        measured.round.wants(),
+        name,
+    );
     measured
 }
 
@@ -848,7 +853,7 @@ fn matching_shallow_frontier() {
         &destination,
         DEFAULT_SEGMENT_CAP,
     );
-    assert!(!sent.round.shallow.is_empty());
+    assert!(!sent.round.shallow().is_empty());
     assert_eq!(frontier, fs::read(destination.join("shallow")).unwrap());
 }
 
@@ -899,11 +904,11 @@ fn fork_below_have_shallow_destination() {
         DEFAULT_SEGMENT_CAP,
     );
     let mut request = String::new();
-    for want in &sent.round.wants {
+    for want in sent.round.wants() {
         let _ = writeln!(request, "{want}");
     }
     request.push_str("--not\n");
-    for have in &sent.round.haves {
+    for have in sent.round.haves() {
         let _ = writeln!(request, "{have}");
     }
     let plain = String::from_utf8(ok(
@@ -977,9 +982,9 @@ fn fixture_b_two_held_tips() {
         &destination,
         DEFAULT_SEGMENT_CAP,
     );
-    assert!(sent.round.haves.len() >= 2, "multi-held-tip");
+    assert!(sent.round.haves().len() >= 2, "multi-held-tip");
     assert!(
-        sent.round.destination_tips > sent.round.haves.len(),
+        sent.round.destination_tips() > sent.round.haves().len(),
         "a destination tip unknown to the source is not a have"
     );
 }
@@ -1010,12 +1015,12 @@ fn fixture_p1_have_order_matters() {
         dated(&source, "g.txt", &noise(82, 400), 6);
         let name = format!("fixture-p1-seed{seed}");
         let sent = check(&scratch, &name, &source, &destination, DEFAULT_SEGMENT_CAP);
-        assert_eq!(sent.round.haves, vec![parent.clone(), child.clone()]);
+        assert_eq!(sent.round.haves(), [parent.clone(), child.clone()]);
         let child_first = upload_pack(
             &source,
-            &sent.round.wants,
+            sent.round.wants(),
             &[child, parent],
-            &sent.round.shallow,
+            sent.round.shallow(),
         );
         assert!(
             header_count(&child_first) > sent.objects(),
@@ -1122,7 +1127,7 @@ fn fixture_f_two_frontiers() {
         &destination,
         DEFAULT_SEGMENT_CAP,
     );
-    assert_eq!(sent.round.shallow.len(), 2);
+    assert_eq!(sent.round.shallow().len(), 2);
 }
 
 /// Reviewer fixture A3 (#55 R3): a shallow destination holding a commit and
@@ -1161,7 +1166,7 @@ fn fixture_a3_grandparent_have() {
         &destination,
         DEFAULT_SEGMENT_CAP,
     );
-    assert_eq!(sent.round.haves.len(), 2);
+    assert_eq!(sent.round.haves().len(), 2);
     assert_eq!(sent.set.len(), 2, "the re-added commit and its tree");
 }
 
@@ -1287,8 +1292,8 @@ fn d1_non_commit_held_tips_go_last() {
     let tree_tag = rev(&source, "refs/mirror/tags/tree-tag");
     let blob_tag = rev(&source, "refs/mirror/tags/blob-tag");
     let commit_tag = rev(&source, "refs/mirror/tags/commit-tag");
-    let haves = &sent.round.haves;
-    assert_eq!(sent.round.non_commit_haves, 3);
+    let haves = sent.round.haves();
+    assert_eq!(sent.round.non_commit_haves(), 3);
     let mut tail: Vec<String> = haves[haves.len() - 3..].to_vec();
     tail.sort();
     let mut expected = vec![tree_tag, blob_tag, blob];
@@ -1318,7 +1323,7 @@ fn destination_holding_everything_gets_no_pack() {
     );
     assert_eq!(sent.plan.segments(), 0);
     assert!(sent.oracle.is_empty() || header_count(&sent.oracle) == 0);
-    assert!(sent.round.wants.is_empty());
+    assert!(sent.round.wants().is_empty());
 }
 
 /// The delta fixture of spike Q2 with a 64 KiB cap: several segments, each
@@ -1635,15 +1640,20 @@ fn r_n131_shallow_source_full_destination_refuses_before_sending() {
     commit_all(&source, "shallow work");
     let empty = scratch.init("empty.git", true);
     let holding = destination_at(&scratch, &origin, &commits[1]);
-    let sender = Source::probe(&source, None).unwrap();
+    // #73 round-2 D2: the state dir is really in use. A list store and a
+    // stderr store are opened on it (opening creates nothing), and the
+    // store goes to every probe and to negotiation.
+    let state = scratch.state("state");
+    let lists = ListStore::open(&state).unwrap();
+    let store = StderrStore::open(&state).unwrap();
+    let sender = Source::probe(&source, Some(&store)).unwrap();
     assert!(!sender.shallow().is_empty());
     let wants = sender.wants().unwrap();
-    let state = scratch.state("state");
     for destination in [&empty, &holding] {
         let refs_before = text(args(destination, ["for-each-ref"]), "refs");
-        let offer = Offer::probe(destination, None).unwrap();
+        let offer = Offer::probe(destination, Some(&store)).unwrap();
         assert!(offer.shallow.is_empty());
-        let refused = first_round(&sender, &offer, &wants, None).unwrap_err();
+        let refused = first_round(&sender, &offer, &wants, Some(&store)).unwrap_err();
         assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
         assert_eq!(refused.reason, Some("source_shallow_destination_full"));
         let estimated = estimate(&source, &Destination::Local(destination.clone())).unwrap_err();
@@ -1655,8 +1665,22 @@ fn r_n131_shallow_source_full_destination_refuses_before_sending() {
             refs_before
         );
     }
-    // No round, so no plan and no list: the state dir stays empty.
-    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    // No round, so no plan and no list: `git-carry-v2/` was never created.
+    // The refusals are the verb's own, so no child failed and the stderr
+    // store holds its key and nothing else (each child opened a capture,
+    // which made `stderr/` and the key, and discarded it on success).
+    let mut names: Vec<_> = fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["stderr"]);
+    let kept: Vec<_> = fs::read_dir(state.join("stderr"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(kept, ["key"]);
+    drop(lists);
     // The same source into a destination shallow at its frontier carries.
     let matching = clone(&scratch, &origin, "matching.git", Some(2), true);
     assert_eq!(
@@ -1670,6 +1694,77 @@ fn r_n131_shallow_source_full_destination_refuses_before_sending() {
         &matching,
         DEFAULT_SEGMENT_CAP,
     );
+}
+
+/// #73 round-2 D1: a round only `first_round` can build still meets a source
+/// that moved. Negotiated against a full source and a full destination, the
+/// build refuses once the source has become shallow (R-N131); a plan built
+/// and persisted while both were shallow at one frontier refuses every
+/// resumed segment once the source's frontier moves (R-N75), and once the
+/// source is unshallowed.
+#[test]
+fn a_source_whose_frontier_moved_is_refused_at_build_and_at_resume() {
+    let scratch = Scratch::new("d1-moved");
+    let origin = scratch.init("origin", false);
+    let commits = delta_history(&origin, 71, 2, 6);
+    // Full source, full destination; then the source takes a frontier.
+    let source = clone(&scratch, &origin, "source", None, false);
+    let destination = destination_at(&scratch, &origin, &commits[2]);
+    let full = Source::probe(&source, None).unwrap();
+    let offer = Offer::probe(&destination, None).unwrap();
+    let round = first_round(&full, &offer, &full.wants().unwrap(), None).unwrap();
+    fs::write(source.join(".git/shallow"), format!("{}\n", commits[4])).unwrap();
+    let moved = Source::probe(&source, None).unwrap();
+    let refused = PackPlan::build(&moved, &round, DEFAULT_SEGMENT_CAP, None).unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+    assert_eq!(refused.reason, Some("source_shallow_destination_full"));
+
+    // Both shallow at one frontier: plan, persist, send segment 0.
+    let shallow_source = clone(&scratch, &origin, "shallow-source", Some(2), false);
+    write(&shallow_source, "src/file0.txt", noise(72, 40).as_bytes());
+    commit_all(&shallow_source, "work");
+    let shallow_destination = clone(&scratch, &origin, "shallow-destination.git", Some(2), true);
+    let lists = ListStore::open(&scratch.state("state")).unwrap();
+    let sender = Source::probe(&shallow_source, None).unwrap();
+    let offer = Offer::probe(&shallow_destination, None).unwrap();
+    let round = first_round(&sender, &offer, &sender.wants().unwrap(), None).unwrap();
+    let plan = PackPlan::build(&sender, &round, DEFAULT_SEGMENT_CAP, None).unwrap();
+    assert_eq!(plan.shallow(), round.shallow());
+    lists.persist(&plan, &sender).unwrap();
+    assert!(plan.send_segment(&sender, 0, &mut Vec::new(), None).is_ok());
+    let frontier = fs::read(shallow_source.join(".git/shallow")).unwrap();
+    // The frontier moves (deepened by one commit's worth), then goes away.
+    for (contents, reason) in [
+        (
+            format!("{}\n", commits[3]).into_bytes(),
+            "destination_shallow_frontier_differs",
+        ),
+        (Vec::new(), "destination_shallow_frontier_differs"),
+    ] {
+        if contents.is_empty() {
+            fs::remove_file(shallow_source.join(".git/shallow")).unwrap();
+        } else {
+            fs::write(shallow_source.join(".git/shallow"), &contents).unwrap();
+        }
+        let resumed = Source::probe(&shallow_source, None).unwrap();
+        let loaded = lists.load(plan.pack_id()).unwrap();
+        let refused = loaded
+            .send_segment(&resumed, 0, &mut Vec::new(), None)
+            .unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+        assert_eq!(refused.reason, Some(reason));
+        assert_eq!(
+            loaded.check_source(&resumed).unwrap_err().reason,
+            Some(reason)
+        );
+    }
+    fs::write(shallow_source.join(".git/shallow"), &frontier).unwrap();
+    let restored = Source::probe(&shallow_source, None).unwrap();
+    assert!(lists
+        .load(plan.pack_id())
+        .unwrap()
+        .send_segment(&restored, 0, &mut Vec::new(), None)
+        .is_ok());
 }
 
 /// An object the walk needs but the source lacks refuses the plan; one that
@@ -1843,7 +1938,6 @@ fn a_failing_sink_refuses_and_the_child_ends_on_its_own() {
 /// digest and the file's path.
 #[test]
 fn a_refused_segment_keeps_its_stderr_privately() {
-    use bulkload_agent::git_carry::estimate::StderrStore;
     use std::os::unix::fs::PermissionsExt as _;
     let scratch = Scratch::new("stderr");
     let source = scratch.init("source", false);

@@ -46,7 +46,8 @@ impl PackPlan {
     /// being left out.
     ///
     /// # Errors
-    /// Refuses an index past the last segment (`FIELD_DOMAIN_VIOLATION`), a
+    /// Refuses a source whose frontier no longer fits the plan
+    /// ([`PackPlan::check_source`]), an index past the last segment (`FIELD_DOMAIN_VIOLATION`), a
     /// pack whose header does not count exactly the segment's objects
     /// (`CONTRACT_SELF_INCONSISTENT`), a failing child (classified stderr),
     /// and any sink failure.
@@ -57,6 +58,7 @@ impl PackPlan {
         sink: &mut dyn Write,
         store: Option<&super::StderrStore>,
     ) -> Outcome<SegmentReceipt> {
+        self.check_source(source)?;
         let (Some(input), Some(expected)) =
             (self.segment_input(index), self.segment_objects(index))
         else {
