@@ -18,6 +18,14 @@
 //! - The digest is BLAKE3 in keyed mode, with a random 32-byte key created
 //!   once as `DIR/stderr/key` under the same checks, so a receipt's digest
 //!   cannot confirm a guessed secret without the key.
+//! - Opening a store writes nothing: `stderr/` and the key are created by the
+//!   first capture (DF1), after the caller has refused a state dir inside a
+//!   repository. That containment check compares directory identities
+//!   (device and inode) along the state dir's ancestors, never path prefixes
+//!   (DF2).
+//!
+//! [`PrivateState`] and the private-file helpers are shared with git carry
+//! v2's list store (`git_carry::carry_v2`).
 
 use std::ffi::CString;
 use std::fs::File;
@@ -27,36 +35,34 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::{BulkloadRefusal, Result};
 
 /// Bytes of a child's stderr kept in memory, for classification only.
 pub const CLASSIFY_LIMIT: usize = 1 << 20;
 
-/// The opened, checked `DIR/stderr` directory and its digest key.
+/// A private state directory, opened by descriptor and checked: owned by the
+/// effective uid, no group or other bits, no extended ACL. It also remembers
+/// the device and inode of every directory from `/` down to itself, so
+/// containment is decided by identity, never by comparing path spellings
+/// (DF2: a case alias, a firmlink or a bind mount names the same directory
+/// under another prefix). Opening it creates nothing (DF1).
 #[derive(Debug)]
-pub struct StderrStore {
-    root: PathBuf,
+pub struct PrivateState {
     directory: File,
-    shown: PathBuf,
-    key: [u8; 32],
+    root: PathBuf,
+    chain: Vec<(u64, u64)>,
 }
 
-/// One child's stderr being streamed into a private temporary.
-pub struct Capture {
-    file: File,
-    temporary: CString,
-    hasher: blake3::Hasher,
-}
-
-impl StderrStore {
-    /// Open `state_dir` and its `stderr/` directory, creating `stderr/` and
-    /// the digest key when absent.
+impl PrivateState {
+    /// Open `state_dir`: its parent is canonicalized once, then walked from
+    /// `/` one component at a time with `O_DIRECTORY|O_NOFOLLOW`.
     ///
     /// # Errors
-    /// Refuses a state dir or `stderr/` that is a symlink, is not owned by
-    /// the effective uid, has group or other permission bits, or carries an
-    /// extended ACL; a key file that fails the same checks; any I/O failure.
+    /// Refuses a state dir that is a symlink, is not owned by the effective
+    /// uid, has group or other permission bits or carries an extended ACL,
+    /// and any I/O failure.
     pub fn open(state_dir: &Path) -> Result<Self> {
         let absolute = if state_dir.is_absolute() {
             state_dir.to_path_buf()
@@ -68,45 +74,158 @@ impl StderrStore {
         };
         let parent = std::fs::canonicalize(parent)?;
         let mut directory = open_dir(None, Path::new("/"))?;
+        let mut chain = vec![identity(&directory)?];
         for component in parent.components() {
             match component {
                 Component::RootDir => {}
-                Component::Normal(part) => directory = open_dir(Some(&directory), Path::new(part))?,
+                Component::Normal(part) => {
+                    directory = open_dir(Some(&directory), Path::new(part))?;
+                    chain.push(identity(&directory)?);
+                }
                 _ => return Err(BulkloadRefusal::PathEscapesRoot),
             }
         }
         let state = open_dir(Some(&directory), Path::new(name))?;
         private_directory(&state)?;
-        let leaf = cstring(b"stderr")?;
-        // SAFETY: `state` is an open directory and `leaf` is NUL-terminated.
-        if unsafe { libc::mkdirat(state.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
+        chain.push(identity(&state)?);
+        Ok(Self {
+            directory: state,
+            root: parent.join(name),
+            chain,
+        })
+    }
+
+    /// Whether the state dir is `path`'s directory or lies under it: `path`
+    /// (followed) has the device and inode of the state dir or of one of its
+    /// ancestors (DF2).
+    #[must_use]
+    pub fn is_inside(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| self.chain.contains(&(metadata.dev(), metadata.ino())))
+    }
+
+    /// The state dir as its canonical parent and name spell it.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The open state dir.
+    #[must_use]
+    pub const fn directory(&self) -> &File {
+        &self.directory
+    }
+}
+
+/// Open `name` under `parent` as a private directory, creating it at 0700
+/// first when `create` is set. Without `create`, an absent directory is
+/// `None`; anything else at the name must pass the private checks.
+///
+/// # Errors
+/// Refuses a symlink, a non-directory, a directory that is not private, and
+/// any I/O failure.
+pub fn private_subdirectory(parent: &File, name: &str, create: bool) -> Result<Option<File>> {
+    if create {
+        let leaf = cstring(name.as_bytes())?;
+        // SAFETY: `parent` is an open directory and `leaf` is NUL-terminated.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {
                 return Err(error.into());
             }
         }
-        let stderr = open_dir(Some(&state), Path::new("stderr"))?;
-        private_directory(&stderr)?;
-        let key = key(&stderr)?;
-        let root = parent.join(name);
+    }
+    match open_dir(Some(parent), Path::new(name)) {
+        Ok(directory) => {
+            private_directory(&directory)?;
+            Ok(Some(directory))
+        }
+        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) if !create => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn identity(directory: &File) -> Result<(u64, u64)> {
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// The opened, checked `DIR/stderr` directory and its digest key.
+///
+/// Both are created on the first capture (DF1): opening a store writes nothing, so a state dir
+/// that a later check refuses (inside a repository) is left untouched.
+pub struct StderrStore {
+    state: PrivateState,
+    shown: PathBuf,
+    opened: Mutex<Option<Opened>>,
+}
+
+/// `DIR/stderr` and the key, once a capture needed them.
+struct Opened {
+    directory: File,
+    key: [u8; 32],
+}
+
+impl std::fmt::Debug for StderrStore {
+    // The key never reaches a `Debug` rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StderrStore")
+            .field("shown", &self.shown)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One child's stderr being streamed into a private temporary.
+pub struct Capture {
+    file: File,
+    temporary: CString,
+    hasher: blake3::Hasher,
+}
+
+impl StderrStore {
+    /// Open `state_dir`, checking an existing `stderr/` directory. Nothing is
+    /// created: `stderr/` and the digest key are made by the first
+    /// [`StderrStore::capture`] (DF1).
+    ///
+    /// # Errors
+    /// Refuses a state dir or an existing `stderr/` that is a symlink, is not
+    /// owned by the effective uid, has group or other permission bits, or
+    /// carries an extended ACL; any I/O failure.
+    pub fn open(state_dir: &Path) -> Result<Self> {
+        let state = PrivateState::open(state_dir)?;
+        private_subdirectory(state.directory(), "stderr", false)?;
         Ok(Self {
-            shown: root.join("stderr"),
-            root,
-            directory: stderr,
-            key,
+            shown: state.root().join("stderr"),
+            state,
+            opened: Mutex::new(None),
         })
     }
 
-    /// Whether the state dir lies at or under `path` (resolved).
+    /// Whether the state dir lies at or under `path`, by directory identity
+    /// (DF2).
     #[must_use]
     pub fn is_inside(&self, path: &Path) -> bool {
-        std::fs::canonicalize(path).is_ok_and(|resolved| self.root.starts_with(resolved))
+        self.state.is_inside(path)
     }
 
-    /// Start a capture: a new private temporary in `stderr/`.
+    /// Run `step` with `stderr/` and the key, creating them on first use.
+    fn with_opened<T>(&self, step: impl FnOnce(&Opened) -> Result<T>) -> Result<T> {
+        let mut guard = self.opened.lock().map_err(|_| BulkloadRefusal::Io(None))?;
+        if guard.is_none() {
+            let directory = private_subdirectory(self.state.directory(), "stderr", true)?
+                .ok_or(BulkloadRefusal::Io(None))?;
+            let key = key(&directory)?;
+            *guard = Some(Opened { directory, key });
+        }
+        step(guard.as_ref().ok_or(BulkloadRefusal::Io(None))?)
+    }
+
+    /// Start a capture: a new private temporary in `stderr/`, which (with
+    /// the key) is created here on first use.
     ///
     /// # Errors
-    /// Refuses when the temporary cannot be created privately.
+    /// Refuses when `stderr/` or the key fail the private checks, or the
+    /// temporary cannot be created privately.
     pub fn capture(&self) -> Result<Capture> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
@@ -120,11 +239,13 @@ impl StderrStore {
             )
             .as_bytes(),
         )?;
-        let file = create_private(&self.directory, &temporary)?;
-        Ok(Capture {
-            file,
-            temporary,
-            hasher: blake3::Hasher::new_keyed(&self.key),
+        self.with_opened(|opened| {
+            let file = create_private(&opened.directory, &temporary)?;
+            Ok(Capture {
+                file,
+                temporary,
+                hasher: blake3::Hasher::new_keyed(&opened.key),
+            })
         })
     }
 
@@ -136,12 +257,12 @@ impl StderrStore {
     /// Refuses an existing file that fails those checks, or an I/O failure.
     /// The temporary is removed either way.
     pub fn commit(&self, capture: Capture) -> Result<(String, PathBuf)> {
-        let outcome = self.link(&capture);
+        let outcome = self.with_opened(|opened| self.link(opened, &capture));
         self.discard(capture);
         outcome
     }
 
-    fn link(&self, capture: &Capture) -> Result<(String, PathBuf)> {
+    fn link(&self, opened: &Opened, capture: &Capture) -> Result<(String, PathBuf)> {
         capture.file.sync_all()?;
         let digest = capture.hasher.finalize().to_hex().to_string();
         let leaf = format!("{digest}.log");
@@ -150,9 +271,9 @@ impl StderrStore {
         // `stderr` directory; `linkat` never replaces an existing name.
         let linked = unsafe {
             libc::linkat(
-                self.directory.as_raw_fd(),
+                opened.directory.as_raw_fd(),
                 capture.temporary.as_ptr(),
-                self.directory.as_raw_fd(),
+                opened.directory.as_raw_fd(),
                 name.as_ptr(),
                 0,
             )
@@ -162,15 +283,15 @@ impl StderrStore {
             if error.raw_os_error() != Some(libc::EEXIST) {
                 return Err(error.into());
             }
-            let existing = open_existing(&self.directory, &name)?;
+            let existing = open_existing(&opened.directory, &name)?;
             private_file(&existing)?;
-            let mut hasher = blake3::Hasher::new_keyed(&self.key);
+            let mut hasher = blake3::Hasher::new_keyed(&opened.key);
             hasher.update_reader(&existing)?;
             if hasher.finalize().to_hex().as_str() != digest {
                 return Err(BulkloadRefusal::PathEscapesRoot);
             }
         }
-        self.directory.sync_all()?;
+        opened.directory.sync_all()?;
         Ok((digest, self.shown.join(leaf)))
     }
 
@@ -181,8 +302,13 @@ impl StderrStore {
             file, temporary, ..
         } = capture;
         drop(file);
-        // SAFETY: the name is NUL-terminated and relative to `stderr`.
-        unsafe { libc::unlinkat(self.directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        // A capture exists only once `stderr/` was opened, so this never
+        // creates it.
+        let _ = self.with_opened(|opened| {
+            // SAFETY: the name is NUL-terminated and relative to `stderr`.
+            unsafe { libc::unlinkat(opened.directory.as_raw_fd(), temporary.as_ptr(), 0) };
+            Ok(())
+        });
     }
 }
 
@@ -198,7 +324,7 @@ impl Capture {
     }
 }
 
-fn cstring(bytes: &[u8]) -> Result<CString> {
+pub fn cstring(bytes: &[u8]) -> Result<CString> {
     CString::new(bytes).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
@@ -221,7 +347,7 @@ fn open_dir(parent: Option<&File>, name: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn create_private(directory: &File, name: &CString) -> Result<File> {
+pub fn create_private(directory: &File, name: &CString) -> Result<File> {
     // SAFETY: `directory` is open, `name` is NUL-terminated, and the mode
     // accompanies O_CREAT.
     let fd = unsafe {
@@ -252,7 +378,7 @@ fn create_private(directory: &File, name: &CString) -> Result<File> {
     Ok(file)
 }
 
-fn open_existing(directory: &File, name: &CString) -> Result<File> {
+pub fn open_existing(directory: &File, name: &CString) -> Result<File> {
     // SAFETY: `directory` is open and `name` NUL-terminated; O_NONBLOCK keeps
     // a FIFO planted at the name from blocking the open.
     let fd = unsafe {
@@ -308,7 +434,7 @@ fn private_directory(directory: &File) -> Result<()> {
     Ok(())
 }
 
-fn private_file(file: &File) -> Result<()> {
+pub fn private_file(file: &File) -> Result<()> {
     let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
