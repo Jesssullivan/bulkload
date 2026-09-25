@@ -11,7 +11,9 @@
 //! crash state and runs `copy` again, clean and in process, and asserts:
 //!
 //! - **I1** every recorded output's file has its recorded stat identity and
-//!   hashes to the committed source manifest for that path;
+//!   the source's content, and hashes to the committed source manifest for
+//!   that path when one exists (the source sends before its capture commits,
+//!   so an output may be recorded before its capture);
 //! - **I2** no destination leaf under a final name holds partial content, and
 //!   `.bulkload-*` temporaries are the only extra names;
 //! - **I4** (R-N79) after the resume no `.bulkload-*` temporary remains: the
@@ -37,15 +39,14 @@
 //!
 //! # Known violations
 //!
-//! Tests marked `#[ignore = "known violation ..."]` assert invariants the v3
+//! Tests marked `#[ignore = "known violation ..."]` assert invariants the
 //! engine breaks today. They are listed in `KNOWN_VIOLATIONS`, not fixed,
 //! and never count as coverage. `every_fault_point_has_a_scenario` compares
 //! the list with the tests this binary reports under `--list --ignored`, and
 //! checks each listed test's ignore reason:
 //!
-//! - `live_writer_*_leaves_no_source_index` (four, R-N86): a refused capture
-//!   leaves the victim's chunks and committed `chunk_locations` rows in the
-//!   source store.
+//! - `live_writer_*_leaves_no_source_pack_bytes` (four, R-N86): a refused
+//!   capture leaves the victim's bytes, unindexed, in the source pack.
 //! - `directory_after_fallback_mkdir` (R-N119): without a no-replace rename,
 //!   a crash between the fallback `mkdirat` and its record never converges.
 //!
@@ -88,7 +89,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bulkload_agent::fault::{
-    parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV,
+    parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV, GROUP_FILES_ENV,
 };
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
@@ -101,8 +102,8 @@ use bulkload_proto::{BulkloadRefusal, RowSchema};
 const PERSIST_BATCH: usize = 256;
 /// `transfer::BATCH_ROWS` (crate-private): rows offered per batch.
 const BATCH_ROWS: usize = 32;
-/// `transfer::PUBLISH_GROUP_EVENTS` (crate-private): events per source group.
-const PUBLISH_GROUP_EVENTS: usize = 9;
+/// `io::durable::GROUP_FILES`: the most outputs one destination group holds.
+const GROUP_FILES: usize = 64;
 /// One byte past `PERSIST_BATCH × CDC_MAX`, so the file spans several batches.
 const LARGE_BYTES: usize = PERSIST_BATCH * bulkload_agent::hash::CDC_MAX_BYTES as usize + 1;
 const SMALL_FILES: usize = 48;
@@ -239,8 +240,8 @@ fn is_temporary(path: &[u8]) -> bool {
         .is_some_and(|leaf| leaf.starts_with(TEMP_PREFIX))
 }
 
-/// Committed rows of one store table, read from a copy of the database (and
-/// any hot journal) so the crash state the resume sees is left untouched.
+/// Committed rows of one store table, read from a copy of the database and
+/// its WAL, so the crash state the resume sees is left untouched.
 fn committed(state: &Path, scratch: &Path, table: &str) -> Vec<(RowSchema, Vec<u8>)> {
     let database = state.join("transfer.sqlite");
     if !database.exists() {
@@ -251,10 +252,10 @@ fn committed(state: &Path, scratch: &Path, table: &str) -> Vec<(RowSchema, Vec<u
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::copy(&database, &copy).unwrap();
-    let journal = state.join("transfer.sqlite-journal");
-    let copied_journal = PathBuf::from(format!("{}-journal", copy.display()));
-    if journal.exists() {
-        fs::copy(&journal, &copied_journal).unwrap();
+    let wal = state.join("transfer.sqlite-wal");
+    let copied_wal = PathBuf::from(format!("{}-wal", copy.display()));
+    if wal.exists() {
+        fs::copy(&wal, &copied_wal).unwrap();
     }
     let rows = {
         let connection = rusqlite::Connection::open(&copy).unwrap();
@@ -286,8 +287,13 @@ fn committed(state: &Path, scratch: &Path, table: &str) -> Vec<(RowSchema, Vec<u
             Vec::new()
         }
     };
-    let _ = fs::remove_file(&copy);
-    let _ = fs::remove_file(&copied_journal);
+    for leftover in [
+        copy.clone(),
+        copied_wal,
+        PathBuf::from(format!("{}-shm", copy.display())),
+    ] {
+        let _ = fs::remove_file(leftover);
+    }
     rows
 }
 
@@ -300,10 +306,10 @@ fn chunk_index(state: &Path, scratch: &Path) -> BTreeMap<[u8; 32], u64> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::copy(&database, &copy).unwrap();
-    let journal = state.join("transfer.sqlite-journal");
-    let copied_journal = PathBuf::from(format!("{}-journal", copy.display()));
-    if journal.exists() {
-        fs::copy(&journal, &copied_journal).unwrap();
+    let wal = state.join("transfer.sqlite-wal");
+    let copied_wal = PathBuf::from(format!("{}-wal", copy.display()));
+    if wal.exists() {
+        fs::copy(&wal, &copied_wal).unwrap();
     }
     let index = {
         let connection = rusqlite::Connection::open(&copy).unwrap();
@@ -325,8 +331,13 @@ fn chunk_index(state: &Path, scratch: &Path) -> BTreeMap<[u8; 32], u64> {
             .collect();
         index
     };
-    let _ = fs::remove_file(&copy);
-    let _ = fs::remove_file(&copied_journal);
+    for leftover in [
+        copy.clone(),
+        copied_wal,
+        PathBuf::from(format!("{}-shm", copy.display())),
+    ] {
+        let _ = fs::remove_file(leftover);
+    }
     index
 }
 
@@ -348,8 +359,11 @@ fn crash_state(scratch: &Scratch) -> CrashState {
     CrashState { outputs, captures }
 }
 
-/// I1: each output record names a file with that identity and the committed
-/// source content.
+/// I1: each output record names a file with that identity and the source's
+/// content, and matches the committed capture where one exists. The source
+/// sends a file before its capture commits (M2 W3), so a crash can leave an
+/// output record whose capture never committed; the resume then reuses the
+/// output without reading the source.
 fn assert_i1(label: &str, scratch: &Scratch, state: &CrashState) {
     for (path, identity) in &state.outputs {
         let target = scratch.destination().join(relative(path));
@@ -367,15 +381,13 @@ fn assert_i1(label: &str, scratch: &Scratch, state: &CrashState) {
             observed, *identity,
             "{label} I1: identity of {target:?} drifted from its record"
         );
-        let manifest = state
-            .captures
-            .get(path)
-            .unwrap_or_else(|| panic!("{label} I1: output {target:?} has no committed capture"));
         let content = digest(&target);
-        assert_eq!(
-            content, manifest.digest,
-            "{label} I1: {target:?} does not hash to its manifest"
-        );
+        if let Some(manifest) = state.captures.get(path) {
+            assert_eq!(
+                content, manifest.digest,
+                "{label} I1: {target:?} does not hash to its manifest"
+            );
+        }
         assert_eq!(
             content,
             digest(&scratch.source().join(relative(path))),
@@ -435,8 +447,10 @@ fn source_files(scratch: &Scratch) -> BTreeMap<Vec<u8>, u64> {
 }
 
 /// Run one armed child `copy` to its fault point. Returns the crashing
-/// publication group's composition for a publication point.
-fn crash_child(scratch: &Scratch, point: Point, label: &str) -> Option<String> {
+/// publication group's composition for a publication point. A `mid` child
+/// closes every group at one file, so `nth` hits of the group points land at
+/// an exact place; a first-hit child keeps the default grouping.
+fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Option<String> {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -453,6 +467,7 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str) -> Option<String> {
         .stdin(Stdio::null())
         .env(FAULT_ENV, label)
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
+        .env(GROUP_FILES_ENV, if mid { "1" } else { "" })
         .envs(
             (point == Point::DirectoryAfterFallbackMkdir).then_some((RENAME_UNSUPPORTED_ENV, "1")),
         )
@@ -544,9 +559,13 @@ const fn directory_path(point: Point) -> Option<&'static str> {
     }
 }
 
-/// `group capture_ids=<ids> chunks=<n>`: distinct ascending batch indices
-/// and the payload count of one publication group. A destination group is
-/// one chunk batch under capture id 0.
+/// `group capture_ids=<ids> chunks=<n>` for one committer group.
+///
+/// A source pack group lists the distinct, ascending batch indices of the
+/// captures whose chunks or refusals it carries; a group can span batches, so
+/// indices from two batches merge, and a group holding only completions lists
+/// none. A destination group lists one index per output, `0..n` with
+/// `1 <= n <= GROUP_FILES`, and the distinct chunks those outputs hold.
 fn assert_group(point: Point, source: bool, line: &str) {
     let label = point.name();
     let rest = line
@@ -557,12 +576,13 @@ fn assert_group(point: Point, source: bool, line: &str) {
         .unwrap_or_else(|| panic!("{label}: group line {line:?}"));
     let ids: Vec<usize> = ids
         .split(',')
+        .filter(|id| !id.is_empty())
         .map(|id| {
             id.parse()
                 .unwrap_or_else(|_| panic!("{label}: id in {line:?}"))
         })
         .collect();
-    let chunks: usize = chunks
+    let _: usize = chunks
         .parse()
         .unwrap_or_else(|_| panic!("{label}: chunk count in {line:?}"));
     assert!(
@@ -571,18 +591,18 @@ fn assert_group(point: Point, source: bool, line: &str) {
     );
     if source {
         assert!(
-            !ids.is_empty() && ids.iter().all(|id| *id < BATCH_ROWS),
-            "{label}: source group ids outside one batch: {line:?}"
-        );
-        assert!(
-            chunks <= PUBLISH_GROUP_EVENTS * PERSIST_BATCH,
-            "{label}: source group larger than a group can be: {line:?}"
+            ids.iter().all(|id| *id < BATCH_ROWS),
+            "{label}: source group ids outside a batch: {line:?}"
         );
     } else {
-        assert_eq!(ids, vec![0], "{label}: destination group ids: {line:?}");
         assert!(
-            chunks <= PERSIST_BATCH,
-            "{label}: destination group larger than a batch: {line:?}"
+            !ids.is_empty() && ids.len() <= GROUP_FILES,
+            "{label}: destination group size: {line:?}"
+        );
+        assert_eq!(
+            ids,
+            (0..ids.len()).collect::<Vec<_>>(),
+            "{label}: destination group ids: {line:?}"
         );
     }
 }
@@ -618,21 +638,23 @@ fn assert_complete(
     }
 }
 
-/// Points whose crash always leaves a tagged temporary: a file temporary in
-/// output publication, a directory temporary before the rename.
-fn leaves_temporary(point: Point) -> bool {
-    point.name().starts_with("materialize.")
-        || matches!(
-            point,
-            Point::DirectoryAfterMkdir | Point::DirectoryAfterPendingRecord
-        )
+/// Points whose crash always leaves a tagged temporary: a staged file before
+/// its rename, a directory temporary before its rename.
+const fn leaves_temporary(point: Point) -> bool {
+    matches!(
+        point,
+        Point::MaterializeAfterTempWrite
+            | Point::MaterializeAfterTempSeal
+            | Point::DirectoryAfterMkdir
+            | Point::DirectoryAfterPendingRecord
+    )
 }
 
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    let group = crash_child(&scratch, point, &label);
+    let group = crash_child(&scratch, point, &label, nth > 1);
 
     let before = crash_state(&scratch);
     assert_i1(&label, &scratch, &before);
@@ -795,36 +817,27 @@ scenarios! {
     publish_source_before_commit_mid => PublishSourceBeforeCommit: 8, WITH_REFUSAL;
     publish_source_after_commit_first => PublishSourceAfterCommit: 1, WITH_REFUSAL;
     publish_source_after_commit_mid => PublishSourceAfterCommit: 8, WITH_REFUSAL;
-    publish_destination_after_append_first => PublishDestinationAfterAppend: 1, WITH_REFUSAL;
-    publish_destination_after_append_mid => PublishDestinationAfterAppend: 30, WITH_REFUSAL;
-    publish_destination_after_pack_sync_first => PublishDestinationAfterPackSync: 1, WITH_REFUSAL;
-    publish_destination_after_pack_sync_mid => PublishDestinationAfterPackSync: 30, WITH_REFUSAL;
-    publish_destination_after_location_insert_first => PublishDestinationAfterLocationInsert: 1, WITH_REFUSAL;
-    publish_destination_after_location_insert_mid => PublishDestinationAfterLocationInsert: 20, WITH_REFUSAL;
-    publish_destination_after_manifest_insert_first => PublishDestinationAfterManifestInsert: 1, WITH_REFUSAL;
-    publish_destination_after_manifest_insert_mid => PublishDestinationAfterManifestInsert: 20, WITH_REFUSAL;
+    materialize_after_temp_write_first => MaterializeAfterTempWrite: 1, WITH_REFUSAL;
+    materialize_after_temp_write_mid => MaterializeAfterTempWrite: 25, WITH_REFUSAL;
+    materialize_after_temp_seal_first => MaterializeAfterTempSeal: 1, WITH_REFUSAL;
+    materialize_after_temp_seal_mid => MaterializeAfterTempSeal: 25, WITH_REFUSAL;
+    materialize_after_rename_first => MaterializeAfterRename: 1, WITH_REFUSAL;
+    materialize_after_rename_mid => MaterializeAfterRename: 25, WITH_REFUSAL;
+    publish_destination_after_dir_seal_first => PublishDestinationAfterDirSeal: 1, WITH_REFUSAL;
+    publish_destination_after_dir_seal_mid => PublishDestinationAfterDirSeal: 20, WITH_REFUSAL;
     publish_destination_before_commit_first => PublishDestinationBeforeCommit: 1, WITH_REFUSAL;
     publish_destination_before_commit_mid => PublishDestinationBeforeCommit: 20, WITH_REFUSAL;
     publish_destination_after_commit_first => PublishDestinationAfterCommit: 1, WITH_REFUSAL;
     publish_destination_after_commit_mid => PublishDestinationAfterCommit: 20, WITH_REFUSAL;
-    materialize_after_temp_write_first => MaterializeAfterTempWrite: 1, WITH_REFUSAL;
-    materialize_after_temp_write_mid => MaterializeAfterTempWrite: 25, WITH_REFUSAL;
-    materialize_after_temp_sync_mid => MaterializeAfterTempSync: 25, WITH_REFUSAL;
-    materialize_after_link_mid => MaterializeAfterLink: 25, WITH_REFUSAL;
-    materialize_after_parent_sync_mid => MaterializeAfterParentSync: 25, WITH_REFUSAL;
     directory_after_mkdir => DirectoryAfterMkdir: 1, NO_REFUSAL;
     directory_after_pending_record => DirectoryAfterPendingRecord: 1, NO_REFUSAL;
     directory_after_rename => DirectoryAfterRename: 1, NO_REFUSAL;
     directory_before_complete => DirectoryBeforeComplete: 1, NO_REFUSAL;
-    serve_after_publish_group_first => ServeAfterPublishGroup: 1, WITH_REFUSAL;
-    serve_after_publish_group_mid => ServeAfterPublishGroup: 4, WITH_REFUSAL;
     serve_after_content_mid => ServeAfterContent: 25, WITH_REFUSAL;
     serve_before_done => ServeBeforeDone: 1, WITH_REFUSAL;
     receive_after_want_files_first => ReceiveAfterWantFiles: 1, WITH_REFUSAL;
     receive_after_want_files_second => ReceiveAfterWantFiles: 2, WITH_REFUSAL;
-    receive_after_chunk_publish_mid => ReceiveAfterChunkPublish: 25, WITH_REFUSAL;
-    receive_before_record_output_mid => ReceiveBeforeRecordOutput: 25, WITH_REFUSAL;
-    receive_after_record_output_mid => ReceiveAfterRecordOutput: 25, WITH_REFUSAL;
+    receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
     receive_after_applied_mid => ReceiveAfterApplied: 25, WITH_REFUSAL;
 }
 
@@ -866,15 +879,18 @@ const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 /// today, with the fault point each one is the only scenario for, if any.
 /// Listed, never counted as coverage.
 const KNOWN_VIOLATIONS: [(&str, Option<Point>); 5] = [
-    // R-N86: a refused capture leaves source index residue.
+    // R-N86: a refused capture leaves unindexed bytes in the source pack.
     (
-        "live_writer_in_place_overwrite_leaves_no_source_index",
+        "live_writer_in_place_overwrite_leaves_no_source_pack_bytes",
         None,
     ),
-    ("live_writer_truncate_leaves_no_source_index", None),
-    ("live_writer_rename_replace_leaves_no_source_index", None),
+    ("live_writer_truncate_leaves_no_source_pack_bytes", None),
     (
-        "live_writer_same_size_mtime_restored_leaves_no_source_index",
+        "live_writer_rename_replace_leaves_no_source_pack_bytes",
+        None,
+    ),
+    (
+        "live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes",
         None,
     ),
     // R-N119: the mkdirat fallback has a crash window with no record.
@@ -987,41 +1003,33 @@ fn directory_after_fallback_mkdir() {
     crash_resume(Point::DirectoryAfterFallbackMkdir, 1, NO_REFUSAL);
 }
 
-/// R-N79: after `materialize.after_link` the orphan is a second hard link to a
-/// published output. A walk of the crashed destination records it and never
-/// carries it, onward carry included; the resume unlinks the temporary name
-/// alone, and the published name keeps its inode and content.
+/// R-N79: after `materialize.after_temp_seal` each staged file not yet
+/// renamed is an orphan under a tagged temporary name. A walk of the crashed
+/// destination records each and never carries it, onward carry included; the
+/// resume removes exactly those names, and every published output keeps its
+/// content.
 #[test]
-fn materialize_after_link_sweeps_only_the_temporary_name() {
-    let label = format!("{}:25", Point::MaterializeAfterLink.name());
-    let scratch = Scratch::new("after-link-sweep");
+fn materialize_after_temp_seal_sweeps_only_temporaries() {
+    let label = format!("{}:25", Point::MaterializeAfterTempSeal.name());
+    let scratch = Scratch::new("after-temp-seal-sweep");
     populate(&scratch.source(), WITH_REFUSAL);
-    crash_child(&scratch, Point::MaterializeAfterLink, &label);
+    crash_child(&scratch, Point::MaterializeAfterTempSeal, &label, true);
 
     let destination = scratch.destination();
     let crashed = tree(&destination);
-    let orphans: Vec<(&Vec<u8>, &fs::Metadata)> = crashed
+    let mut orphans: Vec<Vec<u8>> = crashed
         .iter()
         .filter(|(path, _)| is_temporary(path))
-        .collect();
-    assert_eq!(orphans.len(), 1, "{label}: exactly one orphan");
-    let (orphan, orphan_meta) = orphans[0];
-    assert_eq!(
-        orphan_meta.nlink(),
-        2,
-        "{label}: the orphan is a second link"
-    );
-    let published: Vec<&Vec<u8>> = crashed
-        .iter()
-        .filter(|(path, metadata)| {
-            !is_temporary(path) && metadata.is_file() && metadata.ino() == orphan_meta.ino()
+        .map(|(path, metadata)| {
+            assert!(metadata.is_file(), "{label}: orphan is not a file");
+            assert_eq!(metadata.nlink(), 1, "{label}: an orphan shares an inode");
+            path.clone()
         })
-        .map(|(path, _)| path)
         .collect();
-    assert_eq!(published.len(), 1, "{label}: one published name shares it");
-    let published = published[0].clone();
+    orphans.sort();
+    assert!(!orphans.is_empty(), "{label}: the crash left no temporary");
 
-    // No walk carries the orphan: the census records it instead of a row.
+    // No walk carries an orphan: the census records each instead of a row.
     let census = walk(
         &WalkOptions::new(fs::canonicalize(&destination).unwrap()),
         &mut NullCache,
@@ -1031,7 +1039,9 @@ fn materialize_after_link_sweeps_only_the_temporary_name() {
         census.rows.iter().all(|row| !is_temporary(&row.rel_path)),
         "{label}: the walk offered a temporary as a row"
     );
-    assert_eq!(census.engine_temporaries, vec![orphan.clone()]);
+    let mut recorded = census.engine_temporaries;
+    recorded.sort();
+    assert_eq!(recorded, orphans);
     let onward = scratch.base.join("onward");
     fs::create_dir(&onward).unwrap();
     let carried = copy(
@@ -1044,24 +1054,25 @@ fn materialize_after_link_sweeps_only_the_temporary_name() {
     assert!(carried.refusals.is_empty(), "{:?}", carried.refusals);
     assert!(
         tree(&onward).keys().all(|path| !is_temporary(path)),
-        "{label}: an onward carry planted the orphan"
+        "{label}: an onward carry planted an orphan"
     );
 
     let resumed = scratch.run();
-    assert_eq!(resumed.temporaries_removed, 1);
+    assert_eq!(resumed.temporaries_removed, orphans.len() as u64);
     assert!(resumed.temporaries_left.is_empty());
-    assert!(fs::symlink_metadata(destination.join(relative(orphan))).is_err());
-    let kept = fs::symlink_metadata(destination.join(relative(&published))).unwrap();
-    assert_eq!(
-        kept.ino(),
-        orphan_meta.ino(),
-        "{label}: published inode replaced"
-    );
-    assert_eq!(kept.nlink(), 1, "{label}: the orphan link was not removed");
-    assert_eq!(
-        digest(&destination.join(relative(&published))),
-        digest(&scratch.source().join(relative(&published))),
-    );
+    for orphan in &orphans {
+        assert!(fs::symlink_metadata(destination.join(relative(orphan))).is_err());
+    }
+    for (path, metadata) in tree(&scratch.source()) {
+        if metadata.is_file() && path != REFUSED.as_bytes() {
+            assert_eq!(
+                digest(&destination.join(relative(&path))),
+                digest(&scratch.source().join(relative(&path))),
+                "{label}: {:?}",
+                relative(&path)
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1201,12 +1212,17 @@ fn live_writer(mutation: Mutation) -> Scratch {
         "{label}: capture committed"
     );
     assert_eq!(assert_i2(&label, &scratch), 0);
-    let bystanders = bystander_chunks(&label, &recorded);
+    // The destination keeps no byte pack (M2 W3): no chunk rows, no pack bytes.
     assert_index_is(
         &format!("{label} destination"),
         &scratch,
         &scratch.destination_state(),
-        &bystanders,
+        &BTreeMap::new(),
+    );
+    assert_pack_is(
+        &format!("{label} destination"),
+        &scratch.destination_state(),
+        0,
     );
     scratch
 }
@@ -1223,7 +1239,7 @@ fn bystander_chunks(label: &str, recorded: &CrashState) -> BTreeMap<[u8; 32], u6
     chunks
 }
 
-/// A store's committed chunk rows and its pack cover exactly `expected`.
+/// A store's committed chunk rows are exactly `expected`.
 fn assert_index_is(
     label: &str,
     scratch: &Scratch,
@@ -1231,23 +1247,25 @@ fn assert_index_is(
     expected: &BTreeMap<[u8; 32], u64>,
 ) {
     let index = chunk_index(state, &scratch.base.join("inspect"));
-    let pack = fs::metadata(state.join("chunks.pack")).unwrap().len();
     assert!(
         index == *expected,
-        "{label}: chunk_locations hold {} rows ({} bytes); the bystanders need {} rows",
+        "{label}: chunk_locations hold {} rows ({} bytes); expected {} rows",
         index.len(),
         index.values().sum::<u64>(),
         expected.len()
     );
+}
+
+/// A store's `chunks.pack` holds exactly `bytes`.
+fn assert_pack_is(label: &str, state: &Path, bytes: u64) {
+    let pack = fs::metadata(state.join("chunks.pack")).unwrap().len();
     assert_eq!(
-        pack,
-        expected.values().sum::<u64>(),
-        "{label}: chunks.pack holds {pack} bytes; the bystanders need {}",
-        expected.values().sum::<u64>()
+        pack, bytes,
+        "{label}: chunks.pack holds {pack} bytes; expected {bytes}"
     );
 }
 
-/// The source store keeps no index row or pack byte for a refused capture.
+/// The source store indexes no chunk of a refused capture (R-N86).
 fn assert_source_index_only_bystanders(mutation: Mutation) {
     let label = format!("{mutation:?}");
     let scratch = live_writer(mutation);
@@ -1258,6 +1276,19 @@ fn assert_source_index_only_bystanders(mutation: Mutation) {
         &scratch,
         &scratch.source_state(),
         &bystanders,
+    );
+}
+
+/// The source pack holds no byte of a refused capture.
+fn assert_source_pack_only_bystanders(mutation: Mutation) {
+    let label = format!("{mutation:?}");
+    let scratch = live_writer(mutation);
+    let recorded = crash_state(&scratch);
+    let bystanders = bystander_chunks(&label, &recorded);
+    assert_pack_is(
+        &format!("{label} source"),
+        &scratch.source_state(),
+        bystanders.values().sum(),
     );
 }
 
@@ -1281,33 +1312,51 @@ fn live_writer_same_size_mtime_restored_refuses() {
     live_writer(Mutation::SameSizeMtimeRestored);
 }
 
-// KNOWN VIOLATION (R-N86), recorded rather than fixed. `capture_uncached`
-// sends each batch of chunks to the publisher as it reads them and only
-// compares the stat identity after the last batch. By the time the refusal
-// is known, the victim's chunks are appended to the source `chunks.pack` and
-// their `chunk_locations` rows are committed. No capture or output record
-// points at them, so I1 holds, but the source store keeps index rows and pack
-// bytes for content that was never a consistent snapshot.
 #[test]
-#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
 fn live_writer_in_place_overwrite_leaves_no_source_index() {
     assert_source_index_only_bystanders(Mutation::InPlaceOverwrite);
 }
 
 #[test]
-#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
 fn live_writer_truncate_leaves_no_source_index() {
     assert_source_index_only_bystanders(Mutation::Truncate);
 }
 
 #[test]
-#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
 fn live_writer_rename_replace_leaves_no_source_index() {
     assert_source_index_only_bystanders(Mutation::RenameReplace);
 }
 
 #[test]
-#[ignore = "known violation (R-N86): refused capture leaves victim chunks indexed in the source pack; W4 removes the source pack (R-N58)"]
 fn live_writer_same_size_mtime_restored_leaves_no_source_index() {
     assert_source_index_only_bystanders(Mutation::SameSizeMtimeRestored);
+}
+
+// KNOWN VIOLATION (R-N86), recorded rather than fixed. The source committer
+// appends each captured chunk to `chunks.pack` as it arrives and indexes it
+// only with a capture that passed its final stat check, so a refused capture
+// leaves no `chunk_locations` row (tested above) but its bytes stay in the
+// pack, unindexed. W4 removes the source pack (R-N58).
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_in_place_overwrite_leaves_no_source_pack_bytes() {
+    assert_source_pack_only_bystanders(Mutation::InPlaceOverwrite);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_truncate_leaves_no_source_pack_bytes() {
+    assert_source_pack_only_bystanders(Mutation::Truncate);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_rename_replace_leaves_no_source_pack_bytes() {
+    assert_source_pack_only_bystanders(Mutation::RenameReplace);
+}
+
+#[test]
+#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
+fn live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes() {
+    assert_source_pack_only_bystanders(Mutation::SameSizeMtimeRestored);
 }

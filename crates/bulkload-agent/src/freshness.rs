@@ -226,6 +226,7 @@ impl SqliteCache {
     /// Refuses if `SQLite` declines to open the file or to create the schema.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = rusqlite::Connection::open(path).map_err(|_| BulkloadRefusal::Io(None))?;
+        crate::io::durable::configure_sqlite(&conn)?;
         Self::from_connection(conn)
     }
 
@@ -428,7 +429,16 @@ mod tests {
         {
             let cache = SqliteCache::open(&path).unwrap();
             assert_eq!(cache.digest(&id).unwrap(), Some([9; 32]));
+            let mode: String = cache
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
         }
-        std::fs::remove_file(path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.clone().into_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
     }
 }

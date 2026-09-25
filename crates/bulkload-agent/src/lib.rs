@@ -31,6 +31,19 @@ macro_rules! fault_point {
     ($point:ident) => {{}};
 }
 
+// A fault point whose crash receipt also names the store root being written.
+#[cfg(feature = "fault-injection")]
+macro_rules! fault_point_in {
+    ($point:ident, $root:expr) => {{
+        $crate::fault::hit_in($crate::fault::Point::$point, $root);
+    }};
+}
+
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! fault_point_in {
+    ($point:ident, $root:expr) => {{}};
+}
+
 // Live-writer hook: runs registered source mutations once per capture, after
 // the first content chunk has been read and before the rest of the file is.
 #[cfg(feature = "fault-injection")]
@@ -55,17 +68,29 @@ pub mod freshness;
 pub mod git_carry;
 pub mod handoff;
 pub mod hash;
-// M2 W4 io layer (R-N90, R-N54, R-N88). Unwired until W4 integration: its
-// callers today are its own tests and the chunker micro-bench, so a non-test
-// build sees every item as dead.
+// The engine's io layer (R-N90, R-N54, R-N88). W3's group commit
+// (`io::durable`), descriptor limits and transport tuning run on its `sys`
+// calls; the W4 pieces (`buf`, `chunker`, `TempFile`) stay unwired until W4
+// integration, so a non-test build still sees those items as dead.
 #[cfg_attr(
     not(test),
     allow(
         dead_code,
-        reason = "M2 W4 io layer is unwired until W4 integration (R-N90); tests are its callers"
+        reason = "the W4 parts of the io layer are unwired until W4 integration (R-N90)"
     )
 )]
 pub(crate) mod io;
+
+/// Group-commit durability controls (M2 W3): the `--durability` mode and the
+/// per-file and per-directory seals. See `io::durable`.
+pub mod durable {
+    pub use crate::io::durable::*;
+}
+
+/// Open-file limits and the destination's descriptor budget (M2 W3).
+pub mod limits {
+    pub use crate::io::limits::*;
+}
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod transfer;

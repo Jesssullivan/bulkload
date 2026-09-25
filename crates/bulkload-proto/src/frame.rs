@@ -117,6 +117,32 @@ impl Frame {
         Ok(out)
     }
 
+    /// Encode a [`FrameKind::Chunk`] frame from borrowed bytes.
+    ///
+    /// The result is byte-identical to [`Frame::encode`] on the owned frame,
+    /// without first copying `data` into a `Vec`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Frame::encode`].
+    pub fn encode_chunk(digest: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+        let mut out = vec![0_u8; LENGTH_PREFIX_BYTES];
+        let frame = ChunkFrameRef {
+            version: PROTO_VERSION,
+            kind: ChunkKindRef { digest, data },
+        };
+        out = postcard::to_extend(&frame, out)?;
+        let body_len = out.len() - LENGTH_PREFIX_BYTES;
+        if body_len > MAX_FRAME_BYTES {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let len = u32::try_from(body_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        out.get_mut(..LENGTH_PREFIX_BYTES)
+            .ok_or(BulkloadRefusal::FrameCodec)?
+            .copy_from_slice(&len.to_be_bytes());
+        Ok(out)
+    }
+
     /// Decode one frame from the front of `buf`.
     ///
     /// Returns the frame and the number of bytes consumed, so a caller can
@@ -150,6 +176,34 @@ impl Frame {
             return Err(BulkloadRefusal::FrameCodec);
         }
         Ok((frame, end))
+    }
+}
+
+/// Declaration index of [`FrameKind::Chunk`]; serde encodes variants by it.
+const CHUNK_VARIANT: u32 = 8;
+
+#[derive(Serialize)]
+struct ChunkFrameRef<'a> {
+    version: u16,
+    kind: ChunkKindRef<'a>,
+}
+
+struct ChunkKindRef<'a> {
+    digest: &'a [u8; 32],
+    data: &'a [u8],
+}
+
+impl Serialize for ChunkKindRef<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStructVariant as _;
+        let mut variant =
+            serializer.serialize_struct_variant("FrameKind", CHUNK_VARIANT, "Chunk", 2)?;
+        variant.serialize_field("digest", self.digest)?;
+        variant.serialize_field("data", self.data)?;
+        variant.end()
     }
 }
 
@@ -209,6 +263,19 @@ mod tests {
             Frame::decode(&bytes).unwrap_err(),
             BulkloadRefusal::BudgetExceeded
         );
+    }
+
+    #[test]
+    fn borrowed_chunk_encoding_matches_the_owned_frame() {
+        for data in [Vec::new(), vec![0, 255, 3], vec![9_u8; 300_000]] {
+            let owned = Frame::new(FrameKind::Chunk {
+                digest: [7; 32],
+                data: data.clone(),
+            });
+            let borrowed = Frame::encode_chunk(&[7; 32], &data).unwrap();
+            assert_eq!(borrowed, owned.encode().unwrap());
+            assert_eq!(Frame::decode(&borrowed).unwrap().0, owned);
+        }
     }
 
     #[test]

@@ -31,13 +31,18 @@
 //! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Barrier` / `Fsync` |
 //! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `FullFlush` / `Fsync` |
 //! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Kick` |
-//! | `sys::rename_noreplace` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)` | `Rename` |
+//! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
+//! | `sys::rename_noreplace` | as `rename_exclusive` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename` / `Link` |
 //! | [`TempFile::create`] + [`TempFile::publish`] | named temp + rename | `O_TMPFILE` + `linkat` (named fallback) | `Create`, `Link`/`Rename` |
 //!
-//! The names and argument shapes of `barrier`, `barrier_dir`, `full_flush`,
-//! `rename_noreplace` and `set_socket_buffers` match the W3 lane's `sys`
-//! module, so `durable.rs` moves onto this layer without edits to its call
-//! sites.
+//! `durable.rs` seals a file with `sys::barrier` on Darwin and with
+//! `sys::full_flush` (`fsync`) on Linux, not `fdatasync`: a mode set with
+//! `fchmod` after the last write must be durable with the data. Directories
+//! and the pack use `sys::barrier_dir` and `sys::barrier`/`sys::full_flush`
+//! per the durability mode. Directory creation and file publication use
+//! `sys::rename_exclusive` (through [`rename_exclusive`] and
+//! [`publish_noreplace`]), never the Linux `linkat` fallback, which fails with
+//! `EPERM` on a directory and would hide the R-N119 path taken.
 
 // R-N54: every unsafe block names its obligations, one unsafe operation per
 // block, so each SAFETY comment covers exactly one call.
@@ -77,6 +82,8 @@ pub mod buf;
 pub mod chunker;
 #[cfg(test)]
 pub mod crash_check;
+pub mod durable;
+pub mod limits;
 #[cfg(any(test, feature = "io-trace"))]
 pub mod trace;
 
@@ -93,7 +100,7 @@ pub mod sys;
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 compile_error!("bulkload's io layer supports Darwin and Linux only");
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, OwnedFd};
 
 /// Identity of an inode as the kernel reports it (`st_dev`, `st_ino`).
@@ -122,6 +129,11 @@ const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFSOCK: u32 = 0o140_000;
+#[cfg_attr(
+    target_vendor = "apple",
+    allow(dead_code, reason = "only Linux sizes pipes")
+)]
+const S_IFIFO: u32 = 0o010_000;
 
 impl Stat {
     pub const fn is_file(&self) -> bool {
@@ -134,6 +146,14 @@ impl Stat {
 
     pub const fn is_socket(&self) -> bool {
         self.mode & S_IFMT == S_IFSOCK
+    }
+
+    #[cfg_attr(
+        target_vendor = "apple",
+        allow(dead_code, reason = "only Linux sizes pipes")
+    )]
+    pub const fn is_fifo(&self) -> bool {
+        self.mode & S_IFMT == S_IFIFO
     }
 
     /// Permission bits only.
@@ -269,5 +289,113 @@ pub fn c_name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
 }
 
+/// Socket buffer size for transfer streams. With Darwin's 8 KiB `AF_UNIX`
+/// default a socketpair moves 0.26–0.71 GB/s; at 4 MiB it moves
+/// 8.6–13.3 GB/s (`docs/evidence/m0-2026-09-23.md`).
+pub const SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
+
+/// Pipe capacity requested where the platform allows it (the Linux default
+/// `fs.pipe-max-size` for an unprivileged process).
+pub const PIPE_BUFFER_BYTES: libc::c_int = 1024 * 1024;
+
+/// Raise the kernel buffers of one transfer stream; return whether any changed.
+///
+/// A socket gets [`SOCKET_BUFFER_BYTES`], a Linux pipe [`PIPE_BUFFER_BYTES`],
+/// anything else nothing.
+///
+/// # Errors
+/// Returns a failed `fstat`, `setsockopt` or `fcntl`.
+pub fn tune_transport(stream: &impl AsFd) -> std::io::Result<bool> {
+    let fd = stream.as_fd();
+    if sys::set_socket_buffers(fd, SOCKET_BUFFER_BYTES)? {
+        return Ok(true);
+    }
+    sys::set_pipe_buffer(fd, PIPE_BUFFER_BYTES)
+}
+
+/// How a no-replace publish was carried out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Published {
+    /// One atomic exclusive rename.
+    Renamed,
+    /// `linkat` then `unlinkat`, because this file system offers no
+    /// exclusive rename (R-N119).
+    Linked,
+}
+
+/// Environment variable that makes a fault-harness child's exclusive renames
+/// report `EINVAL`, forcing the no-replace fallback (R-N119).
+#[cfg(feature = "fault-injection")]
+pub const RENAME_UNSUPPORTED_ENV: &str = "BULKLOAD_FAULT_RENAME_UNSUPPORTED";
+
+/// Test hook: while `on`, this thread's exclusive renames report `EINVAL` at
+/// the syscall, as on a file system without them (see `sys_posix`).
+#[cfg(any(test, feature = "fault-injection"))]
+pub use sys_posix::force_rename_unsupported;
+
+/// An exclusive (no-replace) rename with no fallback of any kind: the bare
+/// `renameatx_np(RENAME_EXCL)` / `renameat2(RENAME_NOREPLACE)`. A file system
+/// without it reports an error [`rename_unsupported`] recognizes, so a
+/// directory can take the `mkdirat` fallback and a file the link fallback
+/// (R-N119). `sys::rename_noreplace`, which falls back to `linkat` inside
+/// `sys` on Linux, is for `TempFile::publish` only: `linkat` on a directory
+/// is `EPERM`.
+///
+/// # Errors
+/// Returns the rename failure; see [`rename_unsupported`].
+pub fn rename_exclusive(directory: &std::fs::File, from: &CStr, to: &CStr) -> std::io::Result<()> {
+    sys::rename_exclusive(directory, from, to)
+}
+
+/// Whether an exclusive rename failed because the file system or kernel does
+/// not offer it, rather than because of the names involved.
+#[must_use]
+pub fn rename_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
+        })
+}
+
+/// Publish `from` as `to` inside `directory` without replacing an existing `to`.
+///
+/// An exclusive rename, or where the file system offers none, `linkat` then
+/// `unlinkat` (R-N119). The path taken is returned and counted
+/// (`publish_link_fallback`).
+///
+/// # Errors
+/// Returns the failure; an occupied target is `EEXIST` either way.
+pub fn publish_noreplace(
+    directory: &std::fs::File,
+    from: &CStr,
+    to: &CStr,
+) -> std::io::Result<Published> {
+    match rename_exclusive(directory, from, to) {
+        Ok(()) => Ok(Published::Renamed),
+        Err(error) if rename_unsupported(&error) => {
+            sys::linkat(directory, from, directory, to)?;
+            sys::unlinkat(directory, from, false)?;
+            crate::counters::bump(crate::counters::Counter::PublishLinkFallback);
+            Ok(Published::Linked)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn socketpair_buffers_are_raised_and_files_are_left_alone() -> std::io::Result<()> {
+        let (left, right) = std::os::unix::net::UnixStream::pair()?;
+        assert!(tune_transport(&left)?);
+        assert!(tune_transport(&right)?);
+        let file = std::fs::File::open(std::env::temp_dir())?;
+        assert!(!tune_transport(&file)?);
+        Ok(())
+    }
+}

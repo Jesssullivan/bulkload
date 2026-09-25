@@ -5,8 +5,10 @@
 //! Every name this module creates first appears under a tagged temporary name
 //! in its own parent directory:
 //!
-//! - [`Destination::file`] writes an output as `.bulkload-<tag>-<pid>-<n>`,
-//!   links the final name to it and unlinks it;
+//! - [`Destination::stage`] writes an output as `.bulkload-<tag>-<pid>-<n>`;
+//!   its group commit seals it and publishes it under the final name without
+//!   replacement: an exclusive rename, or `linkat` then `unlinkat` where the
+//!   filesystem has none (R-N119);
 //! - [`Destination::directory`] creates a directory as
 //!   `.bulkload-<tag>-d-<pid>-<n>`, binds its record to that inode and renames
 //!   it into place without replacement (R-N102).
@@ -14,9 +16,7 @@
 //! `<tag>` is 16 lowercase hex digits derived from the destination store's
 //! random authority, so only a process holding that store can produce it.
 //! `<pid>` and `<n>` are canonical decimals (no leading zeros). A crash inside
-//! either publication leaves the temporary behind; after
-//! `materialize.after_link` a file temporary is a second hard link to the
-//! published output.
+//! either publication leaves the temporary behind.
 //!
 //! A later invocation removes such a name only when every check holds (R-N79):
 //!
@@ -35,20 +35,38 @@
 //! form earlier engines generated, the wrong kind, another owner, a non-empty
 //! directory) is left in place and reported by [`Destination::swept`]. A name
 //! outside the grammar is not a temporary at all and is never considered.
+//! Untagged `.bulkload-<pid>-<n>` names left by engines before the tagged
+//! grammar are therefore reported, never removed; the operator removes them.
+//!
+//! # Durability
+//!
+//! Directory entries are sealed (`io::durable::seal_dir`) rather than fully
+//! flushed one by one. A record naming a directory is committed only after
+//! the entry it depends on is sealed and, when that entry lives on a device
+//! other than the store's, fully flushed: the store commit's own full flush
+//! drains only the store's device.
 
 use std::ffi::{CStr, CString};
 use std::fs::{File, Permissions};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::counters::{self, CountedSync as _, Counter};
 use crate::freshness::StatIdentity;
-use crate::transfer_store::{Manifest, PendingDirectory, Store};
+use crate::transfer_store::{
+    ChunkHint, Manifest, OutputRecord, PendingDirectory, Store, StorePublisher,
+};
 use crate::{BulkloadRefusal, Result, RowSchema};
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub use crate::io::force_rename_unsupported;
+#[cfg(feature = "fault-injection")]
+pub use crate::io::RENAME_UNSUPPORTED_ENV;
 
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -160,7 +178,15 @@ pub struct Destination {
     root: File,
     path: PathBuf,
     tag: [u8; TAG_HEX],
+    /// Device of the destination store, whose commits drain only it.
+    store_device: u64,
+    /// The most recent staged file's parent, shared by its siblings so each
+    /// directory costs one descriptor rather than one per file.
+    last_parent: std::cell::RefCell<Option<(Vec<u8>, Arc<File>)>>,
     directories: Vec<OwnedDirectory>,
+    /// Devices holding a directory entry sealed by barrier only, awaiting a
+    /// full flush, each with one descriptor on it.
+    unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
 }
@@ -195,7 +221,10 @@ impl Destination {
             root,
             path: std::fs::canonicalize(path)?,
             tag: temporary_tag(&store.authority()?),
+            store_device: std::fs::metadata(store.root())?.dev(),
+            last_parent: std::cell::RefCell::new(None),
             directories: Vec::new(),
+            unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
             created: Creation::default(),
         })
@@ -246,12 +275,13 @@ impl Destination {
     ///
     /// Creation is create-then-rename (R-N102): `mkdirat` under a tagged
     /// temporary name, `fstat` through an `O_NOFOLLOW | O_DIRECTORY`
-    /// descriptor, sync the parent, commit the record bound to that
-    /// `(dev, ino)`, then rename into place without replacement. A crash
-    /// therefore leaves either an empty tagged temporary (removed by a later
-    /// sweep) or a final directory whose record names its inode; no state ever
-    /// names only a path. A rename that finds the leaf taken refuses it as
-    /// foreign and removes this invocation's temporary.
+    /// descriptor, seal the parent (and fully flush it when it is not on the
+    /// store's device), commit the record bound to that `(dev, ino)`, then
+    /// rename into place without replacement and seal the parent again. A
+    /// crash therefore leaves either an empty tagged temporary (removed by a
+    /// later sweep) or a final directory whose record names its inode; no
+    /// state ever names only a path. A rename that finds the leaf taken
+    /// refuses it as foreign and removes this invocation's temporary.
     ///
     /// An existing directory is adopted only when its record names its inode
     /// and mode. Any other record is cleared, so it can never adopt later. A
@@ -279,7 +309,7 @@ impl Destination {
         let bound = open_dir(parent.as_raw_fd(), &temporary)
             .and_then(|created| Ok(created.metadata()?))
             .and_then(|metadata| {
-                parent.sync_dir_counted()?;
+                self.seal_entry(&parent)?;
                 store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
                 Ok(metadata)
             });
@@ -291,9 +321,9 @@ impl Destination {
             }
         };
         fault_point!(DirectoryAfterPendingRecord);
-        if let Err(error) = rename_publish(&parent, &temporary, &leaf) {
+        if let Err(error) = crate::io::rename_exclusive(&parent, &temporary, &leaf) {
             discard_directory(&parent, &temporary, &key, store);
-            if rename_unsupported(&error) {
+            if crate::io::rename_unsupported(&error) {
                 return self.fallback_directory(row, &parent, &leaf, key, store);
             }
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
@@ -303,7 +333,8 @@ impl Destination {
             });
         }
         fault_point!(DirectoryAfterRename);
-        parent.sync_dir_counted()?;
+        crate::io::durable::seal_dir(&parent)?;
+        self.note_unflushed(parent);
         self.created.renamed += 1;
         self.directories.push(OwnedDirectory {
             path: row.rel_path.clone(),
@@ -312,6 +343,16 @@ impl Destination {
             ino: metadata.ino(),
             key,
         });
+        Ok(())
+    }
+
+    /// Seal `parent`'s entries ahead of a record that depends on them, with a
+    /// full flush when `parent` is not on the store's device.
+    fn seal_entry(&self, parent: &File) -> Result<()> {
+        crate::io::durable::seal_dir(parent)?;
+        if parent.metadata()?.dev() != self.store_device {
+            full_flush_counted(parent)?;
+        }
         Ok(())
     }
 
@@ -345,7 +386,7 @@ impl Destination {
         }
         fault_point!(DirectoryAfterFallbackMkdir);
         let metadata = open_dir(parent.as_raw_fd(), leaf)?.metadata()?;
-        parent.sync_dir_counted()?;
+        self.seal_entry(parent)?;
         store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
         self.created.fallback.push(row.rel_path.clone());
         self.directories.push(OwnedDirectory {
@@ -467,23 +508,62 @@ impl Destination {
         Ok(())
     }
 
-    /// Apply final modes to directories this invocation created, deepest first.
+    /// Apply final modes to directories this invocation created, deepest
+    /// first, one directory at a time: set the mode, seal it (fully flushing a
+    /// directory off the store's device), then commit its completion. Each
+    /// completion commit drains the store's device.
+    ///
+    /// One descriptor is open at a time, so any number of new directories
+    /// finish within the descriptor limit.
     ///
     /// # Errors
     /// Refuses changed/removed directories and failed durable metadata writes.
-    pub fn finish_directories(&self, store: &Store) -> Result<()> {
-        for pending in self.directories.iter().rev() {
-            let (parent, leaf) = self.parent(&pending.path)?;
+    pub fn finish_directories(&mut self, store: &Store) -> Result<()> {
+        if self.directories.is_empty() {
+            return Ok(());
+        }
+        for index in (0..self.directories.len()).rev() {
+            let Some(pending) = self.directories.get(index) else {
+                continue;
+            };
+            let (path, dev, ino, mode) =
+                (pending.path.clone(), pending.dev, pending.ino, pending.mode);
+            let (parent, leaf) = self.parent(&path)?;
             let directory = open_dir(parent.as_raw_fd(), &leaf)?;
+            drop(parent);
             let metadata = directory.metadata()?;
-            if metadata.dev() != pending.dev || metadata.ino() != pending.ino {
+            if metadata.dev() != dev || metadata.ino() != ino {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
-            directory.set_permissions(Permissions::from_mode(pending.mode))?;
-            directory.sync_dir_counted()?;
+            directory.set_permissions(Permissions::from_mode(mode))?;
+            self.seal_entry(&directory)?;
             fault_point!(DirectoryBeforeComplete);
-            store.complete_directory(&pending.key)?;
+            if let Some(pending) = self.directories.get(index) {
+                store.complete_directory(&pending.key)?;
+            }
             counters::bump(Counter::DirectoriesFinished);
+        }
+        // The completion commits drained the store's device; entries sealed
+        // on other devices still wait for `flush_session`.
+        self.unflushed.remove(&self.store_device);
+        Ok(())
+    }
+
+    fn note_unflushed(&mut self, directory: File) {
+        if let Ok(metadata) = directory.metadata() {
+            self.unflushed.entry(metadata.dev()).or_insert(directory);
+        }
+    }
+
+    /// End a session: fully flush each device that still holds a directory
+    /// or symlink entry sealed only by a barrier, so those entries reach
+    /// stable media.
+    ///
+    /// # Errors
+    /// Returns the flush failure.
+    pub fn flush_session(&mut self) -> Result<()> {
+        for (_, handle) in self.unflushed.drain() {
+            full_flush_counted(&handle)?;
         }
         Ok(())
     }
@@ -492,7 +572,7 @@ impl Destination {
     ///
     /// # Errors
     /// Refuses a different existing target or any unsafe ancestor.
-    pub fn symlink(&self, row: &RowSchema) -> Result<()> {
+    pub fn symlink(&mut self, row: &RowSchema) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         let target = row
             .link_target
@@ -503,7 +583,8 @@ impl Destination {
         let result =
             unsafe { libc::symlinkat(target_c.as_ptr(), parent.as_raw_fd(), leaf.as_ptr()) };
         if result == 0 {
-            parent.sync_dir_counted()?;
+            crate::io::durable::seal_dir(&parent)?;
+            self.note_unflushed(parent);
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -528,22 +609,27 @@ impl Destination {
         Ok(())
     }
 
-    /// Verify chunks and publish a complete file with link-at no-replace semantics.
+    /// An existing regular output at `row`'s path with its parent directory,
+    /// opened without following any link, or `None` when the path is free.
     ///
     /// # Errors
-    /// Refuses corrupt/missing chunks, size/digest mismatches or destination divergence.
-    pub fn file(
-        &self,
-        row: &RowSchema,
-        manifest: &Manifest,
-        store: &Store,
-    ) -> Result<StatIdentity> {
-        let (parent, leaf) = self.parent(&row.rel_path)?;
+    /// Refuses a conflicting node or unsafe ancestor.
+    pub(crate) fn existing(&self, row: &RowSchema) -> Result<Option<(File, Arc<File>)>> {
+        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
         match open_regular(&parent, &leaf) {
-            Ok(file) => return verify_existing(file, row, manifest),
-            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => (),
-            Err(error) => return Err(error),
+            Ok(file) => Ok(Some((file, parent))),
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
+            Err(error) => Err(error),
         }
+    }
+
+    /// Create a private temporary file (`O_EXCL`, mode 0600) beside `row`'s
+    /// leaf. The caller writes it and hands it to a [`PublishSink`].
+    ///
+    /// # Errors
+    /// Refuses an unsafe ancestor or a failed create.
+    pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
+        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
         let temporary = self.temporary(None)?;
         // SAFETY: parent descriptor and path are valid; mode accompanies O_CREAT.
         let fd = unsafe {
@@ -558,34 +644,48 @@ impl Destination {
             return Err(std::io::Error::last_os_error().into());
         }
         // SAFETY: fd is a newly-created uniquely owned descriptor.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let result = write_chunks(&mut file, row, manifest, store).and_then(|()| {
-            // SAFETY: all descriptors/paths valid; linkat never replaces an existing leaf.
-            let linked = unsafe {
-                libc::linkat(
-                    parent.as_raw_fd(),
-                    temporary.as_ptr(),
-                    parent.as_raw_fd(),
-                    leaf.as_ptr(),
-                    0,
-                )
-            };
-            if linked != 0 {
-                return Err(std::io::Error::last_os_error().into());
+        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(StagedFile {
+            parent,
+            temporary,
+            leaf,
+            file: Arc::new(file),
+        })
+    }
+
+    /// Open a published output read-only by relative path, component by
+    /// component, following no link.
+    ///
+    /// # Errors
+    /// Refuses a missing output, a non-regular node or an unsafe ancestor.
+    pub(crate) fn open_output(&self, rel_path: &[u8]) -> Result<File> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        open_regular(&parent, &leaf)
+    }
+
+    fn shared_parent(&self, path: &[u8]) -> Result<(Arc<File>, CString)> {
+        let directory = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .and_then(|end| path.get(..end))
+            .unwrap_or_default();
+        if let Some((cached, parent)) = self.last_parent.borrow().as_ref() {
+            if cached.as_slice() == directory {
+                let leaf = path
+                    .get(directory.len()..)
+                    .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest))
+                    .ok_or(BulkloadRefusal::PathEscapesRoot)?;
+                if leaf.is_empty() || leaf == b"." || leaf == b".." {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
+                }
+                return Ok((Arc::clone(parent), cstring(leaf)?));
             }
-            fault_point!(MaterializeAfterLink);
-            parent.sync_dir_counted()?;
-            fault_point!(MaterializeAfterParentSync);
-            Ok(())
-        });
-        // SAFETY: remove only the unique temporary name created above.
-        let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
-        if removed != 0 {
-            return Err(std::io::Error::last_os_error().into());
         }
-        result?;
-        counters::bump(Counter::FilesMaterialized);
-        verify_existing(file, row, manifest)
+        let (parent, leaf) = self.parent(path)?;
+        let parent = Arc::new(parent);
+        self.last_parent
+            .replace(Some((directory.to_vec(), Arc::clone(&parent))));
+        Ok((parent, leaf))
     }
 
     fn parent(&self, path: &[u8]) -> Result<(File, CString)> {
@@ -605,42 +705,259 @@ impl Destination {
     }
 }
 
-fn write_chunks(
-    file: &mut File,
-    row: &RowSchema,
-    manifest: &Manifest,
-    store: &Store,
-) -> Result<()> {
-    let mut hasher = blake3::Hasher::new();
-    let mut size = 0_u64;
-    for chunk in &manifest.chunks {
-        let data = store
-            .chunk_for(&chunk.digest, Counter::DestMaterializePackRead)?
-            .ok_or(BulkloadRefusal::SealedObjectMissing)?;
-        if data.len() as u64 != chunk.size {
-            return Err(BulkloadRefusal::DigestMismatch);
-        }
-        size = size
-            .checked_add(chunk.size)
-            .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        if size > row.size {
-            return Err(BulkloadRefusal::DigestMismatch);
-        }
-        counters::update(&mut hasher, Counter::HashMaterializeFile, &data);
-        file.write_all(&data)?;
-        counters::add_len(Counter::DestMaterializeWrite, data.len());
+/// A destination file written under a private temporary name, published
+/// by a [`PublishSink`] once its data is sealed.
+pub(crate) struct StagedFile {
+    parent: Arc<File>,
+    temporary: CString,
+    leaf: CString,
+    file: Arc<File>,
+}
+
+impl StagedFile {
+    /// The open temporary file. It stays readable after publication.
+    pub(crate) const fn file(&self) -> &Arc<File> {
+        &self.file
     }
-    if size != row.size || *hasher.finalize().as_bytes() != manifest.digest {
-        return Err(BulkloadRefusal::DigestMismatch);
+
+    /// Remove the temporary name, abandoning the file.
+    ///
+    /// # Errors
+    /// Returns a failed unlink.
+    pub(crate) fn discard(self) -> Result<()> {
+        unlink(&self.parent, &self.temporary)
     }
-    fault_point!(MaterializeAfterTempWrite);
-    file.set_permissions(Permissions::from_mode(row.mode & 0o7777))?;
-    file.sync_file_counted()?;
-    fault_point!(MaterializeAfterTempSync);
+
+    /// Seal the data, then rename into place without replacing anything.
+    /// The identity is taken from the open file after the rename.
+    fn publish(self) -> Result<(StatIdentity, Arc<File>)> {
+        if let Err(error) = crate::io::durable::seal_file(&self.file) {
+            let _ = unlink(&self.parent, &self.temporary);
+            return Err(error.into());
+        }
+        fault_point!(MaterializeAfterTempSeal);
+        if let Err(error) = crate::io::publish_noreplace(&self.parent, &self.temporary, &self.leaf)
+        {
+            let _ = unlink(&self.parent, &self.temporary);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                BulkloadRefusal::GitDestinationOccupied
+            } else {
+                error.into()
+            });
+        }
+        fault_point!(MaterializeAfterRename);
+        counters::bump(Counter::FilesMaterialized);
+        Ok((
+            StatIdentity::from_metadata(&self.file.metadata()?),
+            self.parent,
+        ))
+    }
+}
+
+fn full_flush_counted(handle: &File) -> Result<()> {
+    Ok(counters::timed(
+        Counter::FlushFull,
+        Counter::FlushFullNs,
+        || crate::io::sys::full_flush(handle),
+    )?)
+}
+
+fn unlink(parent: &File, name: &CString) -> Result<()> {
+    // SAFETY: parent descriptor and NUL-terminated name remain valid; flag 0
+    // removes only a non-directory entry.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
-fn verify_existing(mut file: File, row: &RowSchema, manifest: &Manifest) -> Result<StatIdentity> {
+/// One destination output for a group commit.
+pub(crate) enum Publication {
+    /// A fully written staged file to seal, rename into place and record.
+    Staged {
+        staged: StagedFile,
+        record: PendingOutput,
+    },
+    /// An existing output already verified against its manifest, with the
+    /// descriptor it was verified through and its parent directory. Its data
+    /// and entry are sealed like a written file's before the record commits.
+    Adopted {
+        record: OutputRecord,
+        file: File,
+        parent: Arc<File>,
+    },
+}
+
+/// The record for a staged file, completed with its identity once published.
+pub(crate) struct PendingOutput {
+    pub key: Vec<u8>,
+    pub rel_path: Vec<u8>,
+    pub size: u64,
+    pub hints: Vec<ChunkHint>,
+}
+
+/// Group-commit sink for a destination: seal each file, rename it into
+/// place, seal each touched directory once, then commit every record of the
+/// group in one transaction.
+pub(crate) struct PublishSink {
+    publisher: StorePublisher,
+    /// Device of the store. Its commit's full flush drains only this device.
+    store_device: u64,
+    outcomes: Vec<(Vec<u8>, Result<()>)>,
+}
+
+impl PublishSink {
+    /// `publisher` holds the destination store's single-writer guard.
+    ///
+    /// # Errors
+    /// Refuses if the store root cannot be stat'ed.
+    pub(crate) fn new(publisher: StorePublisher) -> Result<Self> {
+        let store_device = std::fs::metadata(publisher.store().root())?.dev();
+        Ok(Self {
+            publisher,
+            store_device,
+            outcomes: Vec::new(),
+        })
+    }
+
+    /// Treat the store as if it lived on `device` (tests of the
+    /// cross-device flush without a second volume).
+    #[cfg(test)]
+    const fn assume_store_device(mut self, device: u64) -> Self {
+        self.store_device = device;
+        self
+    }
+}
+
+/// One descriptor per device a group touched, for its full flush.
+#[derive(Default)]
+struct TouchedDevices {
+    directories: Vec<Arc<File>>,
+    seen: std::collections::HashSet<(u64, u64)>,
+    devices: std::collections::HashMap<u64, Arc<File>>,
+}
+
+impl TouchedDevices {
+    fn directory(&mut self, directory: Arc<File>) {
+        if let Ok(metadata) = directory.metadata() {
+            self.devices
+                .entry(metadata.dev())
+                .or_insert_with(|| Arc::clone(&directory));
+            if !self.seen.insert((metadata.dev(), metadata.ino())) {
+                return;
+            }
+        }
+        self.directories.push(directory);
+    }
+
+    /// Seal every touched directory once, then, in group mode, fully flush
+    /// each touched device other than `store_device`: the store commit that
+    /// follows drains only its own device. Returns the devices flushed.
+    fn seal(&self, store_device: u64) -> Result<usize> {
+        for directory in &self.directories {
+            crate::io::durable::seal_dir(directory)?;
+        }
+        let mut flushed = 0;
+        if crate::io::durable::durability() == crate::io::durable::Durability::Group {
+            for (device, handle) in &self.devices {
+                if *device != store_device {
+                    full_flush_counted(handle)?;
+                    flushed += 1;
+                }
+            }
+        }
+        Ok(flushed)
+    }
+}
+
+impl crate::io::durable::GroupSink for PublishSink {
+    type Item = Publication;
+    /// `(relative path, outcome)` for every submitted output, in commit order.
+    type Report = Vec<(Vec<u8>, Result<()>)>;
+
+    fn weight(item: &Publication) -> (u64, u64) {
+        match item {
+            Publication::Staged { record, .. } => (1, record.size),
+            Publication::Adopted { .. } => (1, 0),
+        }
+    }
+
+    fn commit(&mut self, items: Vec<Publication>) {
+        #[cfg(feature = "fault-injection")]
+        let _note = {
+            let ids: Vec<usize> = (0..items.len()).collect();
+            let chunks = items
+                .iter()
+                .map(|item| match item {
+                    Publication::Staged { record, .. } => record.hints.len(),
+                    Publication::Adopted { .. } => 0,
+                })
+                .sum();
+            crate::fault::note_group(&ids, chunks)
+        };
+        let mut records = Vec::with_capacity(items.len());
+        let mut touched = TouchedDevices::default();
+        for item in items {
+            match item {
+                Publication::Staged { staged, record } => match staged.publish() {
+                    Ok((identity, parent)) => {
+                        touched.directory(parent);
+                        records.push(OutputRecord {
+                            key: record.key,
+                            rel_path: record.rel_path,
+                            identity,
+                            hints: record.hints,
+                        });
+                    }
+                    Err(refusal) => self.outcomes.push((record.rel_path, Err(refusal))),
+                },
+                Publication::Adopted {
+                    record,
+                    file,
+                    parent,
+                } => match crate::io::durable::seal_file(&file) {
+                    Ok(()) => {
+                        touched.directory(parent);
+                        records.push(record);
+                    }
+                    Err(error) => self.outcomes.push((record.rel_path, Err(error.into()))),
+                },
+            }
+        }
+        let committed = touched.seal(self.store_device).and_then(|_| {
+            fault_point_in!(
+                PublishDestinationAfterDirSeal,
+                self.publisher.store().root()
+            );
+            self.publisher.commit_outputs(&records)
+        });
+        for record in records {
+            self.outcomes.push((record.rel_path, committed.clone()));
+        }
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        None
+    }
+
+    fn finish(self) -> Self::Report {
+        self.outcomes
+    }
+}
+
+/// Verify an existing output byte-for-byte against `manifest` before adopting it.
+///
+/// Only the adopt path uses this; freshly written outputs are built from
+/// verified chunks and are not read back.
+///
+/// # Errors
+/// Refuses a size, mode or digest difference, or a change while reading.
+pub(crate) fn verify_existing(
+    file: &File,
+    row: &RowSchema,
+    manifest: &Manifest,
+) -> Result<StatIdentity> {
+    let mut file = file;
     file.rewind()?;
     let before = file.metadata()?;
     if before.len() != row.size || before.mode() & 0o7777 != row.mode & 0o7777 {
@@ -679,120 +996,6 @@ fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store)
     // SAFETY: descriptor and NUL-terminated name are valid; AT_REMOVEDIR
     // removes only an empty directory.
     let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR) };
-}
-
-/// Environment variable that makes a fault-harness child's no-replace renames
-/// report EINVAL, forcing the `mkdirat` fallback (R-N119).
-#[cfg(feature = "fault-injection")]
-pub const RENAME_UNSUPPORTED_ENV: &str = "BULKLOAD_FAULT_RENAME_UNSUPPORTED";
-
-#[cfg(any(test, feature = "fault-injection"))]
-std::thread_local! {
-    static RENAME_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Test hook: while `on`, this thread's no-replace renames report EINVAL, as
-/// on a filesystem without them, so directory creation takes the fallback.
-#[cfg(any(test, feature = "fault-injection"))]
-pub fn force_rename_unsupported(on: bool) {
-    RENAME_UNSUPPORTED.with(|forced| forced.set(on));
-}
-
-/// The no-replace rename, behind the test hook.
-fn rename_publish(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    #[cfg(any(test, feature = "fault-injection"))]
-    {
-        #[cfg(feature = "fault-injection")]
-        let from_env = std::env::var_os(RENAME_UNSUPPORTED_ENV).is_some();
-        #[cfg(not(feature = "fault-injection"))]
-        let from_env = false;
-        if from_env || RENAME_UNSUPPORTED.with(std::cell::Cell::get) {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-    }
-    rename_no_replace(parent, from, to)
-}
-
-/// Whether a no-replace rename failed because this filesystem or kernel does
-/// not offer it, rather than because of the names involved.
-fn rename_unsupported(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::Unsupported
-        || error.raw_os_error().is_some_and(|code| {
-            [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
-        })
-}
-
-/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
-/// replacing an existing `to`.
-#[cfg(target_os = "linux")]
-fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    let fd = libc::c_long::from(parent.as_raw_fd());
-    // SAFETY: renameat2 reads two NUL-terminated names relative to a valid
-    // descriptor; the raw syscall avoids depending on a libc wrapper.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            fd,
-            from.as_ptr(),
-            fd,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
-/// replacing an existing `to`.
-#[cfg(target_os = "android")]
-fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    // SAFETY: both names are NUL-terminated and the descriptor is valid.
-    let result = unsafe {
-        libc::renameat2(
-            parent.as_raw_fd(),
-            from.as_ptr(),
-            parent.as_raw_fd(),
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// Rename `from` to `to` inside `parent`, failing with EEXIST instead of
-/// replacing an existing `to`.
-#[cfg(target_vendor = "apple")]
-fn rename_no_replace(parent: &File, from: &CStr, to: &CStr) -> std::io::Result<()> {
-    // SAFETY: both names are NUL-terminated and the descriptor is valid.
-    let result = unsafe {
-        libc::renameatx_np(
-            parent.as_raw_fd(),
-            from.as_ptr(),
-            parent.as_raw_fd(),
-            to.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// No atomic no-replace rename is known here; directory creation takes the
-/// plain `mkdirat` fallback.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_no_replace(_: &File, _: &CStr, _: &CStr) -> std::io::Result<()> {
-    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 // `dev_t` is signed on some targets; this is the same cast
@@ -968,4 +1171,147 @@ fn open_regular(parent: &File, name: &CString) -> Result<File> {
 
 fn cstring(bytes: &[u8]) -> Result<CString> {
     CString::new(bytes).map_err(|_| BulkloadRefusal::PathNotPortable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::durable::GroupSink as _;
+    use crate::transfer_store::PublisherSide;
+    use std::io::Write as _;
+
+    #[test]
+    fn publish_never_replaces_an_output_that_appeared_meanwhile() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-materialize-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(source.join("file"), b"ours")?;
+        let row = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
+        let staged = target.stage(&row)?;
+        (&**staged.file()).write_all(b"ours")?;
+        std::fs::write(destination.join("file"), b"theirs")?;
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?
+        .assume_store_device(u64::MAX);
+        sink.commit(vec![Publication::Staged {
+            staged,
+            record: PendingOutput {
+                key: b"key".to_vec(),
+                rel_path: b"file".to_vec(),
+                size: 4,
+                hints: Vec::new(),
+            },
+        }]);
+        let report = sink.finish();
+        let listed = std::fs::read_dir(&destination)?.count();
+        let kept = std::fs::read(destination.join("file"))?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [(
+                b"file".to_vec(),
+                Err(BulkloadRefusal::GitDestinationOccupied)
+            )]
+        );
+        assert_eq!(kept, b"theirs");
+        assert_eq!(listed, 1, "the temporary name is removed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_fully_flushes_each_touched_device_the_store_is_not_on() -> Result<()> {
+        let directory = Arc::new(File::open(std::env::temp_dir())?);
+        let device = directory.metadata()?.dev();
+        let mut touched = TouchedDevices::default();
+        touched.directory(Arc::clone(&directory));
+        touched.directory(directory);
+        assert_eq!(touched.directories.len(), 1, "one seal per directory");
+        // Same device as the store: its commit drains the device.
+        assert_eq!(touched.seal(device)?, 0);
+        // Store elsewhere (PR #59 review): one full flush on this device.
+        assert_eq!(touched.seal(device.wrapping_add(1))?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_falls_back_to_link_where_exclusive_rename_is_unsupported() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-rename-fallback-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(source.join("free"), b"ours")?;
+        std::fs::write(source.join("taken"), b"ours")?;
+        let rows = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows;
+        std::fs::write(destination.join("taken"), b"theirs")?;
+        let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
+        let mut publications = Vec::new();
+        for row in &rows {
+            let staged = target.stage(row)?;
+            (&**staged.file()).write_all(b"ours")?;
+            publications.push(Publication::Staged {
+                staged,
+                record: PendingOutput {
+                    key: row.rel_path.clone(),
+                    rel_path: row.rel_path.clone(),
+                    size: 4,
+                    hints: Vec::new(),
+                },
+            });
+        }
+        let before = counters::Counters::snapshot();
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        crate::io::force_rename_unsupported(true);
+        sink.commit(publications);
+        crate::io::force_rename_unsupported(false);
+        let mut report = sink.finish();
+        report.sort_by(|left, right| left.0.cmp(&right.0));
+        let fallbacks = counters::Counters::snapshot()
+            .since(before)
+            .get(Counter::PublishLinkFallback);
+        let free = std::fs::read(destination.join("free"))?;
+        let taken = std::fs::read(destination.join("taken"))?;
+        let listed = std::fs::read_dir(&destination)?.count();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [
+                (b"free".to_vec(), Ok(())),
+                (
+                    b"taken".to_vec(),
+                    Err(BulkloadRefusal::GitDestinationOccupied)
+                ),
+            ]
+        );
+        assert!(fallbacks >= 1, "the fallback path is recorded");
+        assert_eq!(free, b"ours");
+        assert_eq!(taken, b"theirs", "the fallback never replaces");
+        assert_eq!(listed, 2, "no temporary is left behind");
+        Ok(())
+    }
 }

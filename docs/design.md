@@ -150,6 +150,15 @@ name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
 (R-N78, R-N102).
 
+Records commit in groups. Each file is sealed (`F_BARRIERFSYNC` on Darwin,
+`fsync` elsewhere, so its mode is durable too) and renamed into place without
+replacement. Each touched directory is sealed once. Each touched device other
+than the state store's is fully flushed. Then one `SQLite` WAL commit
+(`synchronous=FULL`, `fullfsync=ON`) makes the whole group durable; its full
+flush drains the store's own device. A group whose files share the store's
+device therefore needs no other device-cache flush. `--durability=strict`
+fully flushes every file instead, for comparison.
+
 ## Reclaim
 
 Unique content is preserved before redundant containers are deleted. Content
