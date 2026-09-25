@@ -6,8 +6,8 @@ Operator interview 2026-09-20, Linear TIN-3692; placement per R-N14
 (2026-09-21). These three rulings outrank everything else in this file. The
 fuller text with enforcement paths, tests, and history lives in lab
 `AGENTS.md` "Hard Rules" (carrier PR xoxd-ai/lab#1850) — this block is the
-summary; it applies in this repo unchanged and sharpens the existing "never
-signal a process" line below.
+summary; it applies in this repo unchanged, and the session line in "Estate
+rules" below defers to its R-N11 bullet.
 
 - **R-N11 — Agents never kill agents, tmux or live sessions** (amended
   2026-09-24, TIN-3692). Operator-only on any host: signalling another
@@ -78,7 +78,11 @@ historical rulings ledger (evidence, not current instructions).
 
 ## Estate rules
 
-- Keep all operator and agent sessions running. Never signal a process.
+- Keep all operator and agent sessions running. Never signal another agent's
+  processes, and never kill a tmux server, session, pane or window or any
+  live session. Other process control follows the R-N11 bullet above: named
+  service lifecycle, reboots, power-off and halt are permitted when ruled
+  work needs it, after a live-session check; D-Bus power calls stay refused.
 - Include Git, agents, credentials, dots, SQLite and worktrees. Preserve both
   hosts' unique state; an unresolved state class is not an implicit exclusion.
 - Git-aware union preserves refs, objects, real stashes, indexes, working bytes
