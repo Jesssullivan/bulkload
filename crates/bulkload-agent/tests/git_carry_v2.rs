@@ -36,7 +36,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bulkload_agent::git_carry::carry_v2::{
-    first_round, FirstRound, ListStore, Offer, PackPlan, Source, DEFAULT_SEGMENT_CAP,
+    first_round, FirstRound, Ingest, IngestPlan, IngestReceipt, JournalStore, ListStore, Offer,
+    PackPlan, RefUpdate, Source, Target, DEFAULT_SEGMENT_CAP,
 };
 use bulkload_agent::git_carry::estimate::{estimate, Destination, StderrStore};
 use bulkload_agent::BulkloadRefusal;
@@ -655,9 +656,10 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path, cap: 
     );
 
     ingest(
+        scratch,
         destination,
+        &measured.plan,
         &measured.segments,
-        measured.round.wants(),
         name,
     );
     measured
@@ -672,33 +674,125 @@ fn ratio(value: u64, base: u64) -> f64 {
     value / base
 }
 
-/// Index every segment into `destination`, point a test ref at each want,
-/// and require `fsck --strict` to pass (the destination-side quarantine and
-/// ref transaction are M1 PR 2).
-fn ingest(destination: &Path, segments: &[Vec<u8>], wants: &[String], name: &str) {
-    for segment in segments {
-        ok(
-            feed(
-                args(destination, ["index-pack", "--stdin", "--fix-thin"]),
-                segment,
-            ),
-            "index-pack",
-        );
-    }
-    let mut transaction = Vec::new();
-    for (index, want) in wants.iter().enumerate() {
-        let _ = write!(
-            transaction,
-            "create refs/carry-test/{name}/{index}\0{want}\0"
-        );
-    }
-    ok(
-        feed(
-            args(destination, ["update-ref", "--stdin", "-z"]),
-            &transaction,
+/// `refs/carry/*` refs of `repo`, as `<oid> <name>` lines.
+fn carry_refs(repo: &Path) -> String {
+    text(
+        args(
+            repo,
+            [
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/carry/",
+            ],
         ),
-        "update-ref",
-    );
+        "carry refs",
+    )
+}
+
+/// The product ingest (W6 M1 PR 2): every segment through the quarantine,
+/// the refs-only connectivity check, migration and one ref transaction
+/// publishing `refs/carry/v1/test/<name>/<i>` at each want. A pre-existing
+/// `refs/carry/v1/existing/<name>` ref is planted first, and every
+/// `refs/carry/*` ref that existed before must be byte-identical after (the
+/// M1 digest gate), as the receipt's own digests must agree. Then no
+/// quarantine and none of this session's `.keep`s remain, and `fsck --strict`
+/// passes.
+fn ingest(
+    scratch: &Scratch,
+    destination: &Path,
+    plan: &PackPlan,
+    segments: &[Vec<u8>],
+    name: &str,
+) -> IngestReceipt {
+    if let Some(tip) = tips_of(destination).into_iter().next() {
+        run(
+            args(
+                destination,
+                [
+                    "update-ref",
+                    &format!("refs/carry/v1/existing/{name}"),
+                    &tip,
+                ],
+            ),
+            "plant carry ref",
+        );
+    }
+    let before = carry_refs(destination);
+    let updates: Vec<RefUpdate> = plan
+        .wants()
+        .iter()
+        .enumerate()
+        .map(|(index, want)| RefUpdate {
+            name: format!("refs/carry/v1/test/{name}/{index}"),
+            oid: want.clone(),
+        })
+        .collect();
+    let target = Target::probe(destination, None).unwrap();
+    let journals = JournalStore::open(&scratch.state(&format!(
+        "destination-state-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )))
+    .unwrap();
+    let mut session = Ingest::open(
+        &target,
+        &journals,
+        IngestPlan::of(plan, updates.clone()).unwrap(),
+        None,
+    )
+    .unwrap_or_else(|refused| panic!("{name}: open refused: {refused}"));
+    for (index, segment) in segments.iter().enumerate() {
+        assert_eq!(session.next_segment(), index);
+        let ack = session.receive(index, &mut &segment[..]).unwrap();
+        assert_eq!(ack.bytes, u64::try_from(segment.len()).unwrap());
+        assert_eq!(ack.blake3, blake3::hash(segment).to_hex().to_string());
+    }
+    let receipt = session
+        .finish()
+        .unwrap_or_else(|refused| panic!("{name}: finish refused: {refused}"));
+    assert_eq!(receipt.segments.len(), segments.len());
+    assert_eq!(receipt.carry_refs_before, receipt.carry_refs_after);
+    let after = carry_refs(destination);
+    for line in before.lines() {
+        assert!(
+            after.lines().any(|kept| kept == line),
+            "{name}: existing carry ref moved: {line}"
+        );
+    }
+    for update in &updates {
+        assert_eq!(
+            rev(destination, &update.name),
+            update.oid,
+            "{name}: published"
+        );
+    }
+    assert_clean(destination, name);
+    receipt
+}
+
+/// No quarantine, no bulkload `.keep`, no `tmp_*`, and `fsck --strict` passes.
+fn assert_clean(destination: &Path, name: &str) {
+    let objects = objects_dir(destination);
+    for entry in fs::read_dir(&objects).unwrap() {
+        let entry = entry.unwrap().file_name();
+        assert!(
+            !entry.to_string_lossy().starts_with("incoming-"),
+            "{name}: quarantine left: {}",
+            entry.to_string_lossy()
+        );
+    }
+    for entry in fs::read_dir(objects.join("pack")).unwrap() {
+        let path = entry.unwrap().path();
+        let leaf = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!leaf.starts_with("tmp_"), "{name}: {leaf}");
+        if Path::new(&leaf).extension().is_some_and(|x| x == "keep") {
+            assert!(
+                !fs::read_to_string(&path)
+                    .unwrap()
+                    .starts_with("bulkload git-carry-v2"),
+                "{name}: our keep left: {leaf}"
+            );
+        }
+    }
     let fsck = args(
         destination,
         ["fsck", "--strict", "--no-progress", "--no-dangling"],
@@ -1363,91 +1457,84 @@ fn segments_are_self_contained_and_together_equal_upload_pack() {
     );
 }
 
-/// "A crash in segment k re-sends only segments >= k", sender side: the plan
-/// is persisted, segments 0..k are sent and indexed, segment k is cut off
-/// mid-stream (index-pack refuses it), and after a restart the plan is read
-/// back by `pack_id` and only segments k.. are packed again. The union
-/// ingests, is exactly upload-pack's set, and passes fsck. Regenerated bytes
-/// need not match the first attempt's digests (spike D6).
+/// "A crash in segment k re-sends only segments >= k", both sides, in
+/// process: the sender persists its plan; the destination journals segments
+/// 0..k, and segment k is cut off mid-stream (index-pack refuses it,
+/// `segment_invalid`, and the quarantine is swept). Both sides then restart:
+/// the destination resumes from its journal alone and asks for segment k
+/// (`GitResume{pack_id, next_segment}`); the sender reads its plan back by
+/// `pack_id` and packs only segments k.. . The ingest finishes, publishes
+/// exactly upload-pack's objects, and passes fsck. Regenerated bytes need not
+/// match the first attempt's digests (spike D6).
 #[test]
 fn resume_from_segment_k_packs_only_later_segments() {
     let scratch = Scratch::new("resume");
     let (source, destination) = segmented_fixture(&scratch);
     let lists = ListStore::open(&scratch.state("state")).unwrap();
+    let journals = JournalStore::open(&scratch.state("destination-state")).unwrap();
     let sender = Source::probe(&source, None).unwrap();
-    let offer = Offer::probe(&destination, None).unwrap();
-    let round = first_round(&sender, &offer, &sender.wants().unwrap(), None).unwrap();
+    let target = Target::probe(&destination, None).unwrap();
+    let round = first_round(&sender, target.offer(), &sender.wants().unwrap(), None).unwrap();
     let plan = PackPlan::build(&sender, &round, SMALL_CAP, None).unwrap();
     let path = lists.persist(&plan, &sender).unwrap();
     assert!(path.ends_with(format!("git-carry-v2/lists/{}.list", plan.pack_id())));
     let n = plan.segments();
     let k = n / 2;
     assert!(k >= 1 && k < n, "a middle segment fails ({n} segments)");
+    let updates = vec![RefUpdate {
+        name: "refs/carry/v1/test/resume/state".to_owned(),
+        oid: plan.wants()[0].clone(),
+    }];
 
     // First attempt: 0..k land, k is cut off.
+    let mut session = Ingest::open(
+        &target,
+        &journals,
+        IngestPlan::of(&plan, updates.clone()).unwrap(),
+        None,
+    )
+    .unwrap();
     let mut first = Vec::new();
     for index in 0..=k {
         let mut pack = Vec::new();
         first.push(plan.send_segment(&sender, index, &mut pack, None).unwrap());
-        let body = if index == k {
-            pack[..pack.len() / 2].to_vec()
+        if index < k {
+            session.receive(index, &mut &pack[..]).unwrap();
         } else {
-            pack
-        };
-        let indexed = feed(
-            args(&destination, ["index-pack", "--stdin", "--fix-thin"]),
-            &body,
-        );
-        assert_eq!(indexed.status.success(), index < k, "segment {index}");
+            let refused = session
+                .receive(index, &mut &pack[..pack.len() / 2])
+                .unwrap_err();
+            assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+            assert_eq!(refused.reason, Some("segment_invalid"));
+        }
     }
+    assert_eq!(session.next_segment(), k);
+    drop(session);
     drop(plan);
     drop(sender);
 
-    // Restart: read the plan back by name and send only k..n.
+    // Restart both sides.
+    let target = Target::probe(&destination, None).unwrap();
+    let mut session = Ingest::resume(&target, &journals, first_pack_id(&path), None).unwrap();
+    assert_eq!(session.next_segment(), k, "GitResume asks for segment k");
     let sender = Source::probe(&source, None).unwrap();
     let plan = lists.load(first_pack_id(&path)).unwrap();
     assert_eq!(plan.segments(), n);
     let mut resumed = Vec::new();
     let mut regenerated = 0_u64;
-    for index in k..plan.segments() {
+    for index in session.next_segment()..plan.segments() {
         let mut pack = Vec::new();
         let receipt = plan.send_segment(&sender, index, &mut pack, None).unwrap();
         regenerated += receipt.bytes;
-        ok(
-            feed(
-                args(&destination, ["index-pack", "--stdin", "--fix-thin"]),
-                &pack,
-            ),
-            "resumed index-pack",
-        );
+        session.receive(index, &mut &pack[..]).unwrap();
         resumed.push(receipt);
     }
     assert_eq!(resumed.len(), n - k, "only segments >= k were packed again");
+    let receipt = session.finish().unwrap();
+    assert_eq!(receipt.segments.len(), n);
+    assert_eq!(rev(&destination, &updates[0].name), updates[0].oid);
+    assert_clean(&destination, "resume");
     let total: u64 = first[..k].iter().map(|r| r.bytes).sum::<u64>() + regenerated;
-    // The destination now holds everything: the refs-only connectivity check
-    // passes for the wants, and fsck is clean after the refs are published.
-    let mut wants = String::new();
-    for want in plan.wants() {
-        let _ = writeln!(wants, "{want}");
-    }
-    ok(
-        feed(
-            args(
-                &destination,
-                [
-                    "rev-list",
-                    "--objects",
-                    "--stdin",
-                    "--not",
-                    "--all",
-                    "--quiet",
-                ],
-            ),
-            wants.as_bytes(),
-        ),
-        "connectivity",
-    );
-    ingest(&destination, &[], plan.wants(), "resume");
     let oracle = upload_pack(&source, plan.wants(), plan.haves(), &[]);
     let sent_objects: u32 = first[..k].iter().map(|r| r.objects).sum::<u32>()
         + resumed.iter().map(|r| r.objects).sum::<u32>();
@@ -2004,6 +2091,374 @@ fn a_refused_segment_keeps_its_stderr_privately() {
         BulkloadRefusal::SnapshotRootsOverlap
     );
     assert_eq!(fs::read_dir(&inside).unwrap().count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Destination ingest: refusals and recovery (W6 M1 PR 2)
+// ---------------------------------------------------------------------------
+
+/// A bare destination holding `commits[at]` loose (a push this small unpacks),
+/// a source ahead of it, and the sender's plan with one update.
+struct Pair {
+    scratch: Scratch,
+    destination: PathBuf,
+    held: String,
+    plan: PackPlan,
+    sender: Source,
+    updates: Vec<RefUpdate>,
+}
+
+fn pair(name: &str, cap: u64) -> Pair {
+    let scratch = Scratch::new(name);
+    let source = scratch.init("source", false);
+    let commits = delta_history(&source, 83, 3, 8);
+    let held = commits[3].clone();
+    let destination = destination_at(&scratch, &source, &held);
+    let sender = Source::probe(&source, None).unwrap();
+    let offer = Offer::probe(&destination, None).unwrap();
+    let round = first_round(&sender, &offer, &sender.wants().unwrap(), None).unwrap();
+    let plan = PackPlan::build(&sender, &round, cap, None).unwrap();
+    let updates = vec![RefUpdate {
+        name: format!("refs/carry/v1/test/{name}/state"),
+        oid: plan.wants()[0].clone(),
+    }];
+    Pair {
+        scratch,
+        destination,
+        held,
+        plan,
+        sender,
+        updates,
+    }
+}
+
+impl Pair {
+    fn segment(&self, index: usize) -> Vec<u8> {
+        let mut pack = Vec::new();
+        self.plan
+            .send_segment(&self.sender, index, &mut pack, None)
+            .unwrap();
+        pack
+    }
+
+    fn ingest_plan(&self) -> IngestPlan {
+        IngestPlan::of(&self.plan, self.updates.clone()).unwrap()
+    }
+
+    fn loose(&self, oid: &str) -> PathBuf {
+        objects_dir(&self.destination)
+            .join(&oid[..2])
+            .join(&oid[2..])
+    }
+}
+
+/// Nothing of a refused open remains: no journal, no quarantine, refs as
+/// they were.
+fn assert_untouched(pair: &Pair, state: &Path, refs_before: &str) {
+    let journals = state.join("git-carry-v2/ingest");
+    if journals.exists() {
+        assert_eq!(fs::read_dir(&journals).unwrap().count(), 0, "no journal");
+    }
+    for entry in fs::read_dir(objects_dir(&pair.destination)).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(!name.to_string_lossy().starts_with("incoming-"));
+    }
+    assert_eq!(
+        text(args(&pair.destination, ["for-each-ref"]), "refs"),
+        refs_before
+    );
+}
+
+/// Spike Q3 / B3: a held tip whose closure is damaged (a blob under it
+/// deleted), or whose parent commit is deleted, is refused by the R-N75
+/// preflight before any journal, quarantine or ref exists. Without the
+/// preflight the refs-only connectivity check would trust the held ref.
+#[test]
+fn a_damaged_held_tip_closure_is_refused_before_anything_is_written() {
+    for damage in ["blob", "parent"] {
+        let pair = pair(&format!("preflight-{damage}"), DEFAULT_SEGMENT_CAP);
+        let victim = match damage {
+            "blob" => rev(&pair.destination, &format!("{}:src/file0.txt", pair.held)),
+            _ => rev(&pair.destination, &format!("{}~1", pair.held)),
+        };
+        fs::remove_file(pair.loose(&victim)).unwrap();
+        let refs_before = text(args(&pair.destination, ["for-each-ref"]), "refs");
+        let state = pair.scratch.state("destination-state");
+        let journals = JournalStore::open(&state).unwrap();
+        let target = Target::probe(&pair.destination, None).unwrap();
+        let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+        assert_eq!(
+            refused.refusal,
+            BulkloadRefusal::GitHavesUnprovable,
+            "{damage}"
+        );
+        assert_eq!(
+            refused.reason,
+            Some("held_tip_closure_incomplete"),
+            "{damage}"
+        );
+        assert_untouched(&pair, &state, &refs_before);
+    }
+}
+
+/// Spike Q3: the have is pruned after the preflight passed (its ref deleted,
+/// `prune --expire=now`). A thin segment whose deltas need it then fails at
+/// `index-pack` (`segment_invalid`) or, failing that, connectivity
+/// (`connectivity_missing`); both are `GIT_HAVES_UNPROVABLE` (re-negotiate).
+/// Nothing is published, the abandoned session leaves no quarantine, and
+/// opening the same plan again starts fresh and is refused by the preflight.
+#[test]
+fn a_have_pruned_after_the_preflight_never_publishes() {
+    let pair = pair("pruned-have", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    run(
+        args(&pair.destination, ["update-ref", "-d", "refs/heads/main"]),
+        "delete have ref",
+    );
+    run(args(&pair.destination, ["prune", "--expire=now"]), "prune");
+    assert!(!has_object(&pair.destination, &pair.held));
+    let segment = pair.segment(0);
+    let refused_at = if let Err(refused) = session.receive(0, &mut &segment[..]) {
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+        assert_eq!(refused.reason, Some("segment_invalid"));
+        session.abandon("segment_invalid").unwrap();
+        "index-pack"
+    } else {
+        let refused = session.finish().unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+        assert_eq!(refused.reason, Some("connectivity_missing"));
+        "connectivity"
+    };
+    println!("m1 case=pruned-have refused_at={refused_at}");
+    for update in &pair.updates {
+        assert!(
+            args(
+                &pair.destination,
+                ["rev-parse", "--verify", "-q", &update.name]
+            )
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty(),
+            "nothing published"
+        );
+    }
+    for entry in fs::read_dir(objects_dir(&pair.destination)).unwrap() {
+        assert!(!entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("incoming-"));
+    }
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+    assert_eq!(refused.reason, Some("held_tip_closure_incomplete"));
+}
+
+/// A plan ref that already names another object refuses at open, before
+/// anything is written; one that already names its oid is verified, not
+/// moved.
+#[test]
+fn an_occupied_ref_refuses_and_a_matching_one_is_verified() {
+    let pair = pair("occupied", DEFAULT_SEGMENT_CAP);
+    let name = &pair.updates[0].name;
+    run(
+        args(&pair.destination, ["update-ref", name, &pair.held]),
+        "occupy",
+    );
+    let refs_before = text(args(&pair.destination, ["for-each-ref"]), "refs");
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::GitDestinationOccupied);
+    assert_eq!(refused.reason, Some("carry_ref_occupied"));
+    assert_untouched(&pair, &state, &refs_before);
+    // Already at its oid (a re-run): the objects are sent again, the ref is
+    // only verified, and its reflog-free value is unchanged.
+    let segments: Vec<Vec<u8>> = (0..pair.plan.segments()).map(|k| pair.segment(k)).collect();
+    ingest(
+        &pair.scratch,
+        &pair.destination,
+        &pair.plan,
+        &segments,
+        "first",
+    );
+    run(
+        args(
+            &pair.destination,
+            ["update-ref", name, &pair.updates[0].oid],
+        ),
+        "set to the want",
+    );
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let journals = JournalStore::open(&pair.scratch.state("again")).unwrap();
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    for (index, segment) in segments.iter().enumerate() {
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    session.finish().unwrap();
+    assert_eq!(rev(&pair.destination, name), pair.updates[0].oid);
+}
+
+/// The journal: one session per `pack_id` at a time, the same plan on
+/// reopen, segments in order, a torn final line cut off, an altered line
+/// refused; a finished session reopens as finished.
+#[test]
+fn the_journal_is_exclusive_ordered_and_recovers_a_torn_tail() {
+    let pair = pair("journal", 64 * 1024);
+    assert!(pair.plan.segments() >= 2, "{}", pair.plan.segments());
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    assert_eq!(
+        Ingest::open(&target, &journals, pair.ingest_plan(), None)
+            .unwrap_err()
+            .refusal,
+        BulkloadRefusal::JournalOwnershipConflict,
+        "a second session is locked out"
+    );
+    let segment = pair.segment(1);
+    assert_eq!(
+        session.receive(1, &mut &segment[..]).unwrap_err().refusal,
+        BulkloadRefusal::FieldDomainViolation,
+        "segments arrive in order"
+    );
+    let first = pair.segment(0);
+    session.receive(0, &mut &first[..]).unwrap();
+    drop(session);
+    // Another plan under the same pack_id is not this session.
+    let mut other = pair.updates.clone();
+    other[0].name.push_str("-other");
+    let refused = Ingest::open(
+        &target,
+        &journals,
+        IngestPlan::of(&pair.plan, other).unwrap(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+    // A torn append is cut off; resume carries on from segment 1.
+    let journal = state
+        .join("git-carry-v2/ingest")
+        .join(format!("{}.journal", pair.plan.pack_id()));
+    let intact = fs::read(&journal).unwrap();
+    let mut torn = intact.clone();
+    torn.extend_from_slice(b"segment 1 deadbeef");
+    fs::write(&journal, &torn).unwrap();
+    let mut session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+    assert_eq!(session.next_segment(), 1);
+    assert_eq!(fs::read(&journal).unwrap(), intact, "torn tail cut off");
+    for index in 1..pair.plan.segments() {
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    let receipt = session.finish().unwrap();
+    // Finished: reopening (with the plan or from the journal) does nothing
+    // and returns the same receipt.
+    let again = Ingest::open(&target, &journals, pair.ingest_plan(), None)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(again, receipt);
+    assert_clean(&pair.destination, "journal");
+    // An altered complete line is refused, never guessed at.
+    let mut altered = fs::read(&journal).unwrap();
+    let at = altered.iter().position(|b| *b == b'\n').unwrap() + 3;
+    altered[at] ^= 1;
+    fs::write(&journal, &altered).unwrap();
+    assert_eq!(
+        Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
+            .unwrap_err()
+            .refusal,
+        BulkloadRefusal::SchemaMismatch
+    );
+    // Resuming a pack_id with no journal leaves none behind.
+    assert_eq!(
+        Ingest::resume(&target, &journals, &"0".repeat(64), None)
+            .unwrap_err()
+            .refusal,
+        BulkloadRefusal::SealedObjectMissing
+    );
+    assert!(!state
+        .join("git-carry-v2/ingest")
+        .join(format!("{}.journal", "0".repeat(64)))
+        .exists());
+}
+
+/// A journal store inside the destination (work tree, git dir or objects
+/// dir, under any spelling) is refused before anything is written.
+#[test]
+fn a_journal_store_inside_the_destination_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pair = pair("inside", DEFAULT_SEGMENT_CAP);
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let link = pair.scratch.path("destination-link");
+    std::os::unix::fs::symlink(&pair.destination, &link).unwrap();
+    for inside in [
+        pair.destination.join("state"),
+        objects_dir(&pair.destination).join("state"),
+    ] {
+        fs::create_dir(&inside).unwrap();
+        fs::set_permissions(&inside, fs::Permissions::from_mode(0o700)).unwrap();
+        let journals = JournalStore::open(&inside).unwrap();
+        let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::SnapshotRootsOverlap);
+        assert_eq!(fs::read_dir(&inside).unwrap().count(), 0);
+    }
+    let journals = JournalStore::open(&link.join("state")).unwrap();
+    assert_eq!(
+        Ingest::open(&target, &journals, pair.ingest_plan(), None)
+            .unwrap_err()
+            .refusal,
+        BulkloadRefusal::SnapshotRootsOverlap
+    );
+}
+
+/// Plans are validated as the wire will carry them.
+#[test]
+fn malformed_ingest_plans_are_refused() {
+    let id = "a".repeat(64);
+    let oid = "b".repeat(40);
+    let update = |name: &str| RefUpdate {
+        name: name.to_owned(),
+        oid: oid.clone(),
+    };
+    assert!(IngestPlan::new(
+        &id,
+        1,
+        vec![oid.clone()],
+        vec![update("refs/carry/v1/x/state")]
+    )
+    .is_ok());
+    for name in [
+        "HEAD",
+        "refs/",
+        "refs/carry//x",
+        "refs/carry/../x",
+        "refs/carry/.x",
+        "refs/carry/x.lock",
+        "refs/carry/x.LOCK",
+        "refs/carry/x.",
+        "refs/carry/x y",
+        "refs/carry/x@{1}",
+        "refs/carry/x\n",
+        "refs/heads/-",
+    ] {
+        let bad = name != "refs/heads/-";
+        assert_eq!(
+            IngestPlan::new(&id, 1, vec![], vec![update(name)]).is_err(),
+            bad,
+            "{name:?}"
+        );
+    }
+    assert!(IngestPlan::new(&id, 1, vec![], vec![update("refs/a"), update("refs/a")]).is_err());
+    assert!(IngestPlan::new("ABC", 1, vec![], vec![]).is_err());
+    assert!(IngestPlan::new(&id, 1, vec!["HEAD".to_owned()], vec![]).is_err());
 }
 
 // ---------------------------------------------------------------------------

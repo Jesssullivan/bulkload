@@ -92,6 +92,19 @@
 //! | `receive.after_chunks` | one file's chunks verified and written to its temporary |
 //! | `receive.after_applied` | `Applied` sent; the output may still be waiting on its group |
 //!
+//! Git carry v2 ingest (W6 M1), in `git_carry::carry_v2::ingest`, on the
+//! destination:
+//!
+//! | Name | Crash leaves |
+//! |------|--------------|
+//! | `git_ingest.after_index_pack` | a complete pack in the quarantine, not sealed, not journaled |
+//! | `git_ingest.after_segment` | a segment sealed and journaled (the ack point) |
+//! | `git_ingest.after_connected` | every segment in, connectivity checked and journaled |
+//! | `git_ingest.mid_migrate` | some of the quarantine's files moved into `objects/pack`, some not |
+//! | `git_ingest.after_migrate` | every pack moved, `objects/pack` sealed, quarantine gone; not journaled |
+//! | `git_ingest.after_publish` | the ref transaction committed; not journaled |
+//! | `git_ingest.before_done` | the `.keep`s dropped and sealed; not journaled |
+//!
 //! # Group size
 //!
 //! Group commit closes a group by count, size or idle time, so how many
@@ -183,11 +196,25 @@ pub enum Point {
     ReceiveAfterChunks,
     /// `receive.after_applied`
     ReceiveAfterApplied,
+    /// `git_ingest.after_index_pack`
+    GitIngestAfterIndexPack,
+    /// `git_ingest.after_segment`
+    GitIngestAfterSegment,
+    /// `git_ingest.after_connected`
+    GitIngestAfterConnected,
+    /// `git_ingest.mid_migrate`
+    GitIngestMidMigrate,
+    /// `git_ingest.after_migrate`
+    GitIngestAfterMigrate,
+    /// `git_ingest.after_publish`
+    GitIngestAfterPublish,
+    /// `git_ingest.before_done`
+    GitIngestBeforeDone,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 29] = [
         Self::PublishSourceAfterAppend,
         Self::PublishSourceAfterPackSync,
         Self::PublishSourceAfterLocationInsert,
@@ -210,6 +237,13 @@ impl Point {
         Self::ReceiveAfterWantFiles,
         Self::ReceiveAfterChunks,
         Self::ReceiveAfterApplied,
+        Self::GitIngestAfterIndexPack,
+        Self::GitIngestAfterSegment,
+        Self::GitIngestAfterConnected,
+        Self::GitIngestMidMigrate,
+        Self::GitIngestAfterMigrate,
+        Self::GitIngestAfterPublish,
+        Self::GitIngestBeforeDone,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -238,6 +272,13 @@ impl Point {
             Self::ReceiveAfterWantFiles => "receive.after_want_files",
             Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterApplied => "receive.after_applied",
+            Self::GitIngestAfterIndexPack => "git_ingest.after_index_pack",
+            Self::GitIngestAfterSegment => "git_ingest.after_segment",
+            Self::GitIngestAfterConnected => "git_ingest.after_connected",
+            Self::GitIngestMidMigrate => "git_ingest.mid_migrate",
+            Self::GitIngestAfterMigrate => "git_ingest.after_migrate",
+            Self::GitIngestAfterPublish => "git_ingest.after_publish",
+            Self::GitIngestBeforeDone => "git_ingest.before_done",
         }
     }
 
