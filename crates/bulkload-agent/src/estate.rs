@@ -326,7 +326,9 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
     };
     let mut identities = std::collections::HashSet::new();
     let mut targets: Vec<(TargetKey, PathBuf)> = Vec::new();
-    // Round 4 N4: targets compare in canonical, case-folded form.
+    // Round 4 N4, R6-1: targets are held as target_key forms (canonical,
+    // unfolded, with their volume's case answer); `overlapping` decides how
+    // each comparison folds.
     for previous in &contents.items {
         identities.insert(id(previous)?);
         if let Some(target) = &previous.workspace {
@@ -418,11 +420,18 @@ fn overlapping(target: &TargetKey, source: &Path, other: &TargetKey, other_sourc
             .strip_prefix(folded_outer)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
-            .map(|folded_relative| {
-                let relative = inner
+            .map(|_| {
+                // R7-1: the relative path is always the inner key's own
+                // unfolded components past the outer's depth (folding changes
+                // only ASCII letters, never the component count), so the
+                // relation is compared exactly even when the targets nest only
+                // case-folded; it is folded solely under (Insensitive,
+                // Insensitive) below.
+                let relative: PathBuf = inner
                     .0
-                    .strip_prefix(&outer.0)
-                    .map_or_else(|_| folded_relative.to_path_buf(), Path::to_path_buf);
+                    .components()
+                    .skip(outer.0.components().count())
+                    .collect();
                 let joined = outer_source.join(relative);
                 if relation_folded {
                     fold(&joined) != fold(inner_source)
@@ -2722,7 +2731,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Round 4 N4 (R-N114): targets compare in canonical, case-folded form.
+    // Round 4 N4 (R-N114), R6-1: targets are compared as target_key forms.
     // A `..` target that physically lands inside another item's target, and
     // a case variant of one on a case-insensitive volume, refuse at add; the
     // nest at its own place in another case is accepted.
@@ -3237,5 +3246,161 @@ mod review_pr53f_r6 {
             unanswerable,
             "unanswerable probe re-admits the R5-3 case-mismatched nest plan"
         );
+    }
+}
+
+// The #53 round-7 reviewer demonstrator (R7-1; R-N71, R-N83, R-N123),
+// kept as regression tests.
+#[cfg(test)]
+mod review_pr53g_r7 {
+    use super::*;
+
+    const ALL: [Case; 3] = [Case::Sensitive, Case::Insensitive, Case::Unknown];
+
+    fn ov(t: &str, ts: &str, ca: Case, o: &str, os: &str, cb: Case) -> bool {
+        overlapping(
+            &(PathBuf::from(t), ca),
+            Path::new(ts),
+            &(PathBuf::from(o), cb),
+            Path::new(os),
+        )
+    }
+
+    // Every answer pairing, both argument orders: the R5-3 plan refuses
+    // unless both answers are positively Insensitive; the same-case plan
+    // always passes.
+    #[test]
+    fn r7_pairing_table_both_directions() {
+        for a in ALL {
+            for b in ALL {
+                let both_i = a == Case::Insensitive && b == Case::Insensitive;
+                let fwd = ov(
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/Vendor/inner",
+                    a,
+                    "/mnt/T",
+                    "/src/outer",
+                    b,
+                );
+                let rev = ov(
+                    "/mnt/T",
+                    "/src/outer",
+                    a,
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/Vendor/inner",
+                    b,
+                );
+                eprintln!("R5-3 plan ({a:?},{b:?}) fwd_refused={fwd} rev_refused={rev}");
+                assert_eq!(fwd, !both_i, "fwd {a:?} {b:?}");
+                assert_eq!(rev, !both_i, "rev {a:?} {b:?}");
+                let same_f = ov(
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/vendor/inner",
+                    a,
+                    "/mnt/T",
+                    "/src/outer",
+                    b,
+                );
+                let same_r = ov(
+                    "/mnt/T",
+                    "/src/outer",
+                    a,
+                    "/mnt/T/vendor/inner",
+                    "/src/outer/vendor/inner",
+                    b,
+                );
+                assert!(!same_f && !same_r, "same-case plan refused at {a:?} {b:?}");
+            }
+        }
+    }
+
+    // Exhaustive monotonicity over a small universe: substituting a definite
+    // answer for any Unknown never yields a refusal the Unknown result lacks.
+    #[test]
+    fn r7_unknown_is_never_less_refusing_than_a_definite_answer() {
+        let targets = [
+            "/m/T", "/m/t", "/m/T/v/i", "/m/t/v/i", "/m/T/V/i", "/m/t/V/i", "/m/T/x", "/m/t/X",
+        ];
+        let sources = ["/s/o", "/s/o/v/i", "/s/o/V/i", "/s/p"];
+        let subst = |c: Case| -> Vec<Case> {
+            if c == Case::Unknown {
+                vec![Case::Sensitive, Case::Insensitive]
+            } else {
+                vec![c]
+            }
+        };
+        let mut checked = 0usize;
+        for t in targets {
+            for ts in sources {
+                for o in targets {
+                    for os in sources {
+                        for a in ALL {
+                            for b in ALL {
+                                let got = ov(t, ts, a, o, os, b);
+                                for a2 in subst(a) {
+                                    for b2 in subst(b) {
+                                        let definite = ov(t, ts, a2, o, os, b2);
+                                        assert!(got || !definite, "{t} {ts} {a:?} / {o} {os} {b:?}: definite ({a2:?},{b2:?}) refuses, unknown admits");
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("monotonicity pairs checked: {checked}");
+    }
+
+    // R7-1: when the targets nest only case-folded (the outer prefix differs
+    // in case), the relative path falls back to the FOLDED relative, so the
+    // source relation is compared folded under (Unknown, Unknown) -- the
+    // exact-comparison contract is not kept. Control: the same relative case
+    // mismatch with a same-case prefix is refused.
+    #[test]
+    fn r7_fallback_folds_the_relation_when_the_prefix_differs_in_case() {
+        let u = Case::Unknown;
+        let control = ov(
+            "/data/T/VENDOR/inner",
+            "/src/outer/vendor/inner",
+            u,
+            "/data/T",
+            "/src/outer",
+            u,
+        );
+        assert!(control);
+        // The seven pairs that are neither (Sensitive, Sensitive) nor
+        // (Insensitive, Insensitive) nest the targets case-folded and compare
+        // the relation exactly, so the relative VENDOR/inner never matches
+        // vendor/inner however the outer prefix is spelled: refused, both
+        // argument orders. Under (Sensitive, Sensitive) /data/t and /data/T
+        // are different places, so there is nothing to refuse; under
+        // (Insensitive, Insensitive) the relation matches case-folded.
+        for a in ALL {
+            for b in ALL {
+                let both_s = a == Case::Sensitive && b == Case::Sensitive;
+                let both_i = a == Case::Insensitive && b == Case::Insensitive;
+                let expected = !both_s && !both_i;
+                let fwd = ov(
+                    "/data/t/VENDOR/inner",
+                    "/src/outer/vendor/inner",
+                    a,
+                    "/data/T",
+                    "/src/outer",
+                    b,
+                );
+                let rev = ov(
+                    "/data/T",
+                    "/src/outer",
+                    a,
+                    "/data/t/VENDOR/inner",
+                    "/src/outer/vendor/inner",
+                    b,
+                );
+                assert_eq!(fwd, expected, "R7-1 fwd ({a:?},{b:?})");
+                assert_eq!(rev, expected, "R7-1 rev ({a:?},{b:?})");
+            }
+        }
     }
 }
