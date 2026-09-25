@@ -29,10 +29,22 @@ pub(super) fn stat_from_raw(raw: &libc::stat) -> Stat {
         },
         mode: u32::from(raw.st_mode),
         nlink: u64::from(raw.st_nlink),
+        uid: raw.st_uid,
         size: u64::try_from(raw.st_size).unwrap_or(0),
         mtime_ns: i128::from(raw.st_mtime) * 1_000_000_000 + i128::from(raw.st_mtime_nsec),
         ctime_ns: i128::from(raw.st_ctime) * 1_000_000_000 + i128::from(raw.st_ctime_nsec),
     }
+}
+
+/// Zero this thread's `errno`, so a NULL from `readdir` tells the end of the
+/// stream apart from an error.
+pub(super) fn clear_errno() {
+    // SAFETY: `__error` takes no arguments and returns this thread's errno
+    // slot.
+    let slot = unsafe { libc::__error() };
+    // SAFETY: `slot` is this thread's errno, a valid, aligned `c_int` that
+    // lives as long as the thread.
+    unsafe { *slot = 0 };
 }
 
 /// Permission bits as Darwin's 16-bit `mode_t`.
@@ -117,6 +129,10 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns the `fsync` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn kick(file: impl AsFd, _offset: u64, _len: u64) -> io::Result<()> {
     trace_serial!();
     let fd = file.as_fd();
@@ -136,6 +152,10 @@ pub fn kick(file: impl AsFd, _offset: u64, _len: u64) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns the rename failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
     rename_exclusive(directory, from, to)
 }
@@ -144,6 +164,10 @@ pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Res
 ///
 /// # Errors
 /// Returns the rename failure; an occupied `to` is `EEXIST`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn rename_noreplace_at(
     from_dir: impl AsFd,
     from: &CStr,
@@ -215,6 +239,10 @@ pub fn rename_exclusive_at(
     clippy::unnecessary_wraps,
     reason = "the signature matches the Linux O_TMPFILE call"
 )]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub const fn open_tmpfile(_dir: BorrowedFd<'_>, _mode: u32) -> io::Result<Option<OwnedFd>> {
     Ok(None)
 }
@@ -223,6 +251,10 @@ pub const fn open_tmpfile(_dir: BorrowedFd<'_>, _mode: u32) -> io::Result<Option
 ///
 /// # Errors
 /// Always `Unsupported`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn link_tmpfile(_file: impl AsFd, _dir: impl AsFd, _name: &CStr) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
@@ -233,6 +265,10 @@ pub fn link_tmpfile(_file: impl AsFd, _dir: impl AsFd, _name: &CStr) -> io::Resu
 ///
 /// # Errors
 /// Returns an unexpected `fcntl` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
     let fd = file.as_fd();
     let length = to_off_t(len)?;
@@ -267,6 +303,10 @@ pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
 ///
 /// # Errors
 /// Returns the `fcntl` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     let fd = file.as_fd();
     let mut advice = libc::radvisory {
@@ -282,6 +322,10 @@ pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 const fn qos_class(class: Qos) -> libc::qos_class_t {
     match class {
         Qos::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
@@ -294,6 +338,10 @@ const fn qos_class(class: Qos) -> libc::qos_class_t {
 ///
 /// # Errors
 /// Returns the error number `pthread_set_qos_class_self_np` reports.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn set_thread_qos(class: Qos) -> io::Result<bool> {
     // SAFETY: the call acts on the calling thread only and takes no pointers.
     let ret = unsafe { libc::pthread_set_qos_class_self_np(qos_class(class), 0) };
@@ -307,6 +355,10 @@ pub fn set_thread_qos(class: Qos) -> io::Result<bool> {
 ///
 /// # Errors
 /// Returns the error number `pthread_get_qos_class_np` reports.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn thread_qos() -> io::Result<Option<Qos>> {
     let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
     let mut priority: libc::c_int = 0;

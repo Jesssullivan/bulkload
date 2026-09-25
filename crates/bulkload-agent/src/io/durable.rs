@@ -118,11 +118,27 @@ fn file_seal(file: &File) -> std::io::Result<()> {
     super::sys::full_flush(file)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIR_SEALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: while `on`, this thread's [`seal_dir`] calls fail with `EIO`
+/// before any syscall, as a device error would.
+#[cfg(test)]
+pub fn fail_dir_seals(on: bool) {
+    FAIL_DIR_SEALS.with(|flag| flag.set(on));
+}
+
 /// Seal one directory's entries ahead of any record that depends on them.
 ///
 /// # Errors
 /// Returns the flush failure.
 pub fn seal_dir(directory: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SEALS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
     match durability() {
         Durability::Group => {
             counters::timed(Counter::FlushDirBarrier, Counter::FlushDirBarrierNs, || {
@@ -174,8 +190,22 @@ pub fn configure_sqlite(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Which store a sink commits to, for per-side test limits (F3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSide {
+    /// The source store (captures and the source pack).
+    Source,
+    /// The destination store (outputs).
+    Destination,
+    /// Neither (tests of the committer itself).
+    Other,
+}
+
 /// The work a [`Committer`] makes durable.
 pub trait GroupSink: Send + 'static {
+    /// The store this sink commits to.
+    const SIDE: GroupSide = GroupSide::Other;
+
     /// One unit of work.
     type Item: Send + 'static;
     /// What [`Committer::finish`] hands back.
@@ -201,6 +231,8 @@ pub struct Limits {
     pub group_files: u64,
     /// Close a group once it holds this many payload bytes.
     pub group_bytes: u64,
+    /// Close a group after this long without a new item.
+    pub group_idle: Duration,
     /// Queued items before [`Committer::submit`] blocks the producer.
     pub queue_depth: usize,
 }
@@ -210,6 +242,7 @@ impl Default for Limits {
         Self {
             group_files: GROUP_FILES,
             group_bytes: GROUP_BYTES,
+            group_idle: GROUP_IDLE,
             queue_depth: QUEUE_DEPTH,
         }
     }
@@ -244,10 +277,17 @@ impl<S: GroupSink> Committer<S> {
     /// Refuses if the thread cannot be spawned.
     pub fn spawn_with(sink: S, limits: Limits) -> Result<Self> {
         #[cfg(feature = "fault-injection")]
-        let limits = crate::fault::group_files().map_or(limits, |group_files| Limits {
-            group_files,
-            ..limits
-        });
+        let limits = {
+            let mut limits = crate::fault::group_files().map_or(limits, |group_files| Limits {
+                group_files,
+                ..limits
+            });
+            if let Some((files, idle)) = crate::fault::side_group(S::SIDE) {
+                limits.group_files = files;
+                limits.group_idle = idle.unwrap_or(limits.group_idle);
+            }
+            limits
+        };
         let (sender, receiver) = std::sync::mpsc::sync_channel(limits.queue_depth.max(1));
         let failure = Failure::default();
         let shared = Failure::clone(&failure);
@@ -368,7 +408,7 @@ fn run<S: GroupSink>(
                 Err(_) => break,
             }
         } else {
-            match receiver.recv_timeout(GROUP_IDLE) {
+            match receiver.recv_timeout(limits.group_idle) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     group.close(&mut sink, failure);

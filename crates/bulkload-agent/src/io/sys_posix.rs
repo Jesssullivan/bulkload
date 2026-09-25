@@ -68,6 +68,10 @@ pub(super) fn openat_raw(
 ///
 /// # Errors
 /// `InvalidInput` for a path with a NUL, otherwise the `open` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid_input())?;
     loop {
@@ -97,6 +101,10 @@ pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
 /// # Errors
 /// `InvalidInput` for an empty path, an absolute path, a `..` component or a
 /// NUL byte; otherwise the failing `openat`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn openat_beneath(root: impl AsFd, rel: &Path, mode: OpenMode) -> io::Result<OwnedFd> {
     let mut names: Vec<&OsStr> = Vec::new();
     for component in rel.components() {
@@ -144,7 +152,7 @@ pub fn openat_beneath(root: impl AsFd, rel: &Path, mode: OpenMode) -> io::Result
 }
 
 /// Create `name` in `dir` as a new regular file (`O_EXCL`, never follows).
-pub(super) fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<OwnedFd> {
+pub fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<OwnedFd> {
     trace_serial!();
     let fd = openat_raw(
         dir,
@@ -165,6 +173,10 @@ pub(super) fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io:
     Ok(fd)
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Create a private named temporary in `dir` (`O_EXCL`), retrying on a name
@@ -178,6 +190,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// # Errors
 /// `InvalidInput` for a tag that is not 16 lowercase hex digits; otherwise
 /// the `openat` failure, or `AlreadyExists` after 64 collisions.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn create_temp_named(
     dir: impl AsFd,
     mode: u32,
@@ -248,6 +264,10 @@ pub fn fstatat_nofollow(dir: impl AsFd, name: &CStr) -> io::Result<Stat> {
 /// # Errors
 /// Returns the `pread` failure, or `InvalidInput` for an offset past
 /// `i64::MAX`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn pread_full(fd: impl AsFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let raw = fd.as_fd().as_raw_fd();
     let mut done = 0_usize;
@@ -427,8 +447,187 @@ pub fn linkat(from_dir: impl AsFd, from: &CStr, to_dir: impl AsFd, to: &CStr) ->
     Ok(())
 }
 
+/// Open the directory `name` inside `dir` for further `*at` calls, following
+/// no link (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`).
+///
+/// # Errors
+/// Returns the `openat` failure; a symlink is `ELOOP` or `ENOTDIR`.
+pub fn open_dir_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat_raw(
+        dir.as_fd(),
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+/// Open the directory at `path` without following its final component.
+/// Earlier components may be symlinks: the path is the operator's.
+///
+/// # Errors
+/// `InvalidInput` for a path with a NUL, otherwise the `open` failure.
+pub fn open_dir_path_nofollow(path: &Path) -> io::Result<OwnedFd> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid_input())?;
+    loop {
+        // SAFETY: `path` is NUL-terminated and outlives the call; the flags
+        // carry no O_CREAT, so the two-argument form is correct.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        match check(fd) {
+            // SAFETY: `fd` was just returned by `open` and nothing else owns it.
+            Ok(fd) => return Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Err(error) if is_interrupted(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Open `name` inside `dir` read-only without following a link or blocking on
+/// a FIFO (`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`). The caller checks the kind.
+///
+/// # Errors
+/// Returns the `openat` failure.
+pub fn open_read_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat_raw(
+        dir.as_fd(),
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+/// `symlinkat(target, dir, name)`: a new symbolic link holding `target`
+/// literally. An existing `name` is `EEXIST`.
+///
+/// # Errors
+/// Returns the `symlinkat` failure.
+pub fn symlinkat(target: &CStr, dir: impl AsFd, name: &CStr) -> io::Result<()> {
+    trace_serial!();
+    let dir = dir.as_fd();
+    // SAFETY: both strings are NUL-terminated and outlive the call; the
+    // descriptor is live for it.
+    check(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) })?;
+    trace_event!(
+        "symlinkat",
+        Ok(super::trace::Event::Symlink {
+            dir: fstat(dir)?.node,
+            name: name.to_bytes().to_vec(),
+            node: fstatat_nofollow(dir, name)?.node,
+            target: target.to_bytes().to_vec(),
+        })
+    );
+    Ok(())
+}
+
+/// The target of the symlink `name` inside `dir`, read into `buf`; returns
+/// the byte count. A count equal to `buf.len()` may be truncated.
+///
+/// # Errors
+/// Returns the `readlinkat` failure.
+pub fn readlinkat(dir: impl AsFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is a live, exclusively borrowed slice, valid for writes of
+    // `buf.len()` bytes; the name is NUL-terminated and the descriptor live.
+    let read = unsafe {
+        libc::readlinkat(
+            dir.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(read).map_err(|_| invalid_input())
+}
+
+/// The names directly inside `dir`, `.` and `..` excluded, read through a
+/// fresh descriptor for `.` so `dir`'s own offset is untouched and nothing is
+/// resolved through a path.
+///
+/// # Errors
+/// Returns the `openat`, `fdopendir` or `readdir` failure.
+pub fn list_dir(dir: impl AsFd) -> io::Result<Vec<CString>> {
+    let fd = openat_raw(
+        dir.as_fd(),
+        c".",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
+    // SAFETY: `raw` is an open directory descriptor this function owns;
+    // `fdopendir` takes it over on success.
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `raw` is still owned here; adopting
+        // it into an `OwnedFd` closes it exactly once.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    let listed = loop {
+        super::sys::clear_errno();
+        // SAFETY: `stream` is a live directory stream owned by this function.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            break match error.raw_os_error() {
+                Some(code) if code != 0 => Err(error),
+                _ => Ok(()),
+            };
+        }
+        // SAFETY: `readdir` returned a live, aligned entry that stays valid
+        // until the next `readdir` on this stream.
+        let d_name = unsafe { &(*entry).d_name };
+        // SAFETY: `d_name` is NUL-terminated and lives until the next
+        // `readdir`; the name is copied before then.
+        let name = unsafe { CStr::from_ptr(d_name.as_ptr()) };
+        if name != c"." && name != c".." {
+            names.push(name.to_owned());
+        }
+    };
+    // SAFETY: closes the stream, and the descriptor it owns, exactly once.
+    unsafe { libc::closedir(stream) };
+    listed.map(|()| names)
+}
+
+/// The effective user id.
+#[must_use]
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
+    unsafe { libc::geteuid() }
+}
+
+/// Take an exclusive `flock` on `file` without blocking.
+///
+/// # Errors
+/// Returns the `flock` failure; another holder is `EWOULDBLOCK`.
+pub fn flock_exclusive(file: impl AsFd) -> io::Result<()> {
+    // SAFETY: the descriptor is live for the call; `flock` takes no pointers.
+    check(unsafe { libc::flock(file.as_fd().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })
+        .map(|_| ())
+}
+
+/// Release an `flock` held on `file`.
+///
+/// # Errors
+/// Returns the `flock` failure.
+pub fn flock_unlock(file: impl AsFd) -> io::Result<()> {
+    // SAFETY: the descriptor is live for the call; `flock` takes no pointers.
+    check(unsafe { libc::flock(file.as_fd().as_raw_fd(), libc::LOCK_UN) }).map(|_| ())
+}
+
 /// Plain `fsync` with `EINTR` retried. Not traced here: the platform module
 /// records it with the sync kind it has on that platform.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub(super) fn fsync_raw(fd: BorrowedFd<'_>) -> io::Result<()> {
     loop {
         // SAFETY: the descriptor is live for the call; `fsync` takes no
@@ -476,6 +675,10 @@ pub fn set_socket_buffers(fd: impl AsFd, bytes: libc::c_int) -> io::Result<bool>
 ///
 /// # Errors
 /// Returns the `getsockopt` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn socket_buffers(fd: impl AsFd) -> io::Result<(libc::c_int, libc::c_int)> {
     let fd = fd.as_fd();
     let mut values = [0 as libc::c_int; 2];

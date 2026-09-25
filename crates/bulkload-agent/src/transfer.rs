@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -983,9 +983,7 @@ fn write_staged<R: Read, W: Write>(
     fault_point!(ReceiveAfterChunks);
     Ok(
         match received.and_then(|()| {
-            staged
-                .file()
-                .set_permissions(std::fs::Permissions::from_mode(row.mode & 0o7777))
+            crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
                 .map_err(BulkloadRefusal::from)
         }) {
             Ok(()) => {
@@ -1141,7 +1139,7 @@ fn read_verified(
 
 fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
     for offset in offsets {
-        file.write_all_at(data, *offset)?;
+        crate::io::sys::pwrite_all(file, data, *offset)?;
         counters::add_len(Counter::DestMaterializeWrite, data.len());
     }
     Ok(())
@@ -1391,6 +1389,7 @@ fn path(bytes: Vec<u8>) -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 

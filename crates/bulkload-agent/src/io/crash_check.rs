@@ -4,9 +4,10 @@
 //! Equal: On the Complexity of Crafting Crash-Consistent Applications",
 //! OSDI '14 (the ALICE tool). A protocol runs once with the `io-trace`
 //! recorder attached. The checker then builds every file-system state a power
-//! loss could leave under the persistence model below, materializes each one
-//! into a fresh temporary directory, and runs a caller-supplied invariant on
-//! it. It runs in CI with no host changes: no loop device, no block tracing,
+//! loss could leave under the persistence model below and runs a
+//! caller-supplied invariant on it: [`check`] materializes each state into a
+//! fresh temporary directory, and [`check_view`] reads it in memory, which is
+//! what the fault harness uses on the trace of a real `copy`. It runs in CI with no host changes: no loop device, no block tracing,
 //! just the logical trace.
 //!
 //! # Persistence model
@@ -38,6 +39,17 @@
 //!    every earlier mutation of `X`.
 //! 4. **Parents.** A mutation inside a directory created by a traced mkdir, or
 //!    a rename or link of such a directory, requires that mkdir.
+//! 5. **Commits.** An `Event::Commit` is a store's `SQLite` commit returning.
+//!    Its records are durable from then on, which the invariant reads from
+//!    [`StateInfo::commits`]; the database itself is not modelled. With
+//!    [`Options::commit_drains`] (Darwin, `fullfsync=ON`) the commit also
+//!    drains the drive holding the store, like a full flush there.
+//!
+//! Drains and device-wide barriers act on one drive: the `dev` of the node
+//! they name. Mutations of nodes the image does not hold (a store's own
+//! files) are refused, or dropped and counted with
+//! [`Options::ignore_foreign`]; their syncs are kept, since a full flush of
+//! any file on a drive drains that drive.
 //!
 //! The Darwin rules follow Apple's documentation. `fcntl(2)`: `F_FULLFSYNC`
 //! "does the same thing as fsync(2) then asks the drive to flush all buffered
@@ -116,6 +128,17 @@ pub struct Options {
     /// explored within the bound. Off by default: a bounded run is not a
     /// pass unless the caller says so.
     pub accept_bounded: bool,
+    /// Whether a completed [`Event::Commit`] drains the drive holding its
+    /// store (model rule 2). True on Darwin, where the store's `SQLite`
+    /// commit issues `F_FULLFSYNC` (`fullfsync=ON`); false elsewhere, where
+    /// it only syncs its own files.
+    pub commit_drains: bool,
+    /// Drop mutations of nodes the image does not hold and the trace never
+    /// creates (a store's own files, written outside the image), counting
+    /// them in [`Report::foreign`]. Syncs are always kept: a full flush of a
+    /// foreign file still drains its drive. Off by default: an unknown node
+    /// is then an error.
+    pub ignore_foreign: bool,
 }
 
 /// Largest accepted [`Options::exhaustive_limit`] (2^20 subsets per point).
@@ -128,6 +151,8 @@ impl Default for Options {
             exhaustive_limit: 12,
             sector: None,
             accept_bounded: false,
+            commit_drains: cfg!(target_vendor = "apple"),
+            ignore_foreign: false,
         }
     }
 }
@@ -141,6 +166,9 @@ enum Node {
     Dir {
         entries: BTreeMap<Vec<u8>, NodeId>,
         mode: u32,
+    },
+    Symlink {
+        target: Vec<u8>,
     },
 }
 
@@ -165,6 +193,7 @@ fn node_id(meta: &std::fs::Metadata) -> NodeId {
 
 impl Image {
     /// An image holding only an empty root directory.
+    #[must_use]
     pub fn empty(root: NodeId) -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(
@@ -178,6 +207,7 @@ impl Image {
     }
 
     /// Add a durable regular file `name` in the root (hand-written traces).
+    #[must_use]
     pub fn with_file(mut self, name: &[u8], node: NodeId, data: &[u8]) -> Self {
         self.nodes.insert(
             node,
@@ -192,11 +222,11 @@ impl Image {
         self
     }
 
-    /// Read the tree under `root` as the durable pre-trace image. Only
-    /// regular files and directories are supported.
+    /// Read the tree under `root` as the durable pre-trace image: regular
+    /// files, directories and symlinks.
     ///
     /// # Errors
-    /// Returns an I/O failure, or `Other` for a symlink or special file.
+    /// Returns an I/O failure, or `Other` for a special file.
     pub fn scan(root: &Path) -> io::Result<Self> {
         let meta = std::fs::metadata(root)?;
         let mut image = Self {
@@ -223,9 +253,19 @@ impl Image {
                         mode: meta.mode() & 0o7777,
                     },
                 );
+            } else if meta.file_type().is_symlink() {
+                self.nodes.insert(
+                    child,
+                    Node::Symlink {
+                        target: std::fs::read_link(entry.path())?
+                            .as_os_str()
+                            .as_bytes()
+                            .to_vec(),
+                    },
+                );
             } else {
                 return Err(other(format!(
-                    "{}: only regular files and directories are modelled",
+                    "{}: only regular files, directories and symlinks are modelled",
                     entry.path().display()
                 )));
             }
@@ -264,6 +304,9 @@ impl Image {
                 Some(Node::Dir { .. }) => {
                     std::fs::create_dir(&child_path)?;
                     self.write_dir(*child, &child_path, depth + 1)?;
+                }
+                Some(Node::Symlink { target }) => {
+                    std::os::unix::fs::symlink(OsStr::from_bytes(target), &child_path)?;
                 }
                 None => {
                     return Err(other(format!(
@@ -307,7 +350,9 @@ impl Image {
             }
             Change::Mode { node, mode: bits } => match self.nodes.get_mut(node) {
                 Some(Node::File { mode, .. } | Node::Dir { mode, .. }) => *mode = *bits,
-                None => return Err(other(format!("fchmod of unknown node {node:?}"))),
+                Some(Node::Symlink { .. }) | None => {
+                    return Err(other(format!("fchmod of unknown node {node:?}")))
+                }
             },
             Change::Rename {
                 node,
@@ -377,6 +422,12 @@ enum Action {
         node: NodeId,
         kind: SyncKind,
     },
+    /// A store's `SQLite` commit returned; with `drain`, the drive holding
+    /// `store` was drained.
+    Commit {
+        store: NodeId,
+        drain: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -390,7 +441,7 @@ impl Op {
     fn mutation(&self) -> Option<(Class, &[NodeId])> {
         match &self.action {
             Action::Mutate { class, objects, .. } => Some((*class, objects)),
-            Action::Sync { .. } => None,
+            Action::Sync { .. } | Action::Commit { .. } => None,
         }
     }
 }
@@ -418,6 +469,9 @@ pub struct StateInfo {
     pub complete: bool,
     /// Trace event indices whose effect persisted.
     pub persisted: Vec<usize>,
+    /// Trace event indices of the [`Event::Commit`]s that completed before
+    /// the crash: their records are durable in this state.
+    pub commits: Vec<usize>,
 }
 
 /// A crash point where not every subset was tried.
@@ -448,6 +502,8 @@ pub struct Report {
     pub ops: usize,
     pub crash_points: usize,
     pub states: usize,
+    /// Mutations dropped under [`Options::ignore_foreign`].
+    pub foreign: usize,
     pub bounded: Vec<BoundNote>,
     pub violations: Vec<Violation>,
 }
@@ -455,24 +511,28 @@ pub struct Report {
 impl Report {
     /// No violation, and either every crash point was explored exhaustively
     /// or the caller set [`Options::accept_bounded`].
-    pub fn passed(&self) -> bool {
+    #[must_use]
+    pub const fn passed(&self) -> bool {
         self.violations.is_empty() && (self.exhaustive() || self.accept_bounded)
     }
 
     /// Every crash point had every legal subset of its optional mutations
     /// tried.
-    pub fn exhaustive(&self) -> bool {
+    #[must_use]
+    pub const fn exhaustive(&self) -> bool {
         self.bounded.is_empty()
     }
 
     /// A human-readable account, bound notes and every violation included.
+    #[must_use]
     pub fn summary(&self, events: &[Event]) -> String {
         let mut out = format!(
-            "crash_check events={} ops={} crash_points={} states={} exhaustive={} bounded_points={} violations={}\n",
+            "crash_check events={} ops={} crash_points={} states={} foreign={} exhaustive={} bounded_points={} violations={}\n",
             self.events,
             self.ops,
             self.crash_points,
             self.states,
+            self.foreign,
             self.exhaustive(),
             self.bounded.len(),
             self.violations.len()
@@ -527,6 +587,8 @@ fn describe(event: &Event) -> String {
         Event::Link { name: n, .. } => format!("link {}", name(n)),
         Event::Rename { from, to, .. } => format!("rename {} -> {}", name(from), name(to)),
         Event::Unlink { name: n, .. } => format!("unlink {}", name(n)),
+        Event::Symlink { name: n, .. } => format!("symlink {}", name(n)),
+        Event::Commit { records, .. } => format!("commit {} records", records.len()),
         Event::Untraced { call, .. } => format!("untraced {call}"),
     }
 }
@@ -535,26 +597,78 @@ fn describe(event: &Event) -> String {
 struct Plan {
     ops: Vec<Op>,
     fresh: Fresh,
+    foreign: usize,
     /// `requires[a]`: mutations that must persist if mutation `a` does.
     requires: Vec<BTreeSet<usize>>,
+    /// For each mutation, the op index by which it has been sent to its
+    /// device (rule 2), if ever.
+    sent_at: Vec<Option<usize>>,
+    /// For each mutation, the op index after whose completion it is durable
+    /// (rules 1 and 2), if ever.
+    durable_at: Vec<Option<usize>>,
+}
+
+/// The device a mutation lives on: that of its first object.
+fn device(objects: &[NodeId]) -> Option<u64> {
+    objects.first().map(|node| node.dev)
 }
 
 /// Inodes a trace creates, with their initial state.
 type Fresh = Vec<(NodeId, Node)>;
 
+/// The ops of a trace, the inodes it creates, and how many foreign
+/// mutations [`Options::ignore_foreign`] dropped.
+struct Lowered {
+    ops: Vec<Op>,
+    fresh: Fresh,
+    foreign: usize,
+}
+
+/// Whether every node an event mutates is known: in the image or created
+/// earlier in the trace. Syncs and commits touch nothing.
+fn touches_only(event: &Event, known: &HashSet<NodeId>) -> bool {
+    let known = |node: &NodeId| known.contains(node);
+    match event {
+        Event::Create { dir, .. } => dir.as_ref().is_none_or(known),
+        Event::Mkdir { dir, .. }
+        | Event::Link { dir, .. }
+        | Event::Unlink { dir, .. }
+        | Event::Symlink { dir, .. } => known(dir),
+        Event::Write { node, .. } | Event::SetMode { node, .. } => known(node),
+        Event::Rename {
+            from_dir, to_dir, ..
+        } => known(from_dir) && known(to_dir),
+        Event::Sync { .. } | Event::Commit { .. } | Event::Untraced { .. } => true,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one match arm per trace event kind; splitting it hides the lowering"
 )]
-fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result<(Vec<Op>, Fresh)> {
+fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result<Lowered> {
     let mut ops: Vec<Op> = Vec::new();
     let mut fresh = Vec::new();
+    let mut foreign = 0_usize;
     // A node identity names one inode for the whole trace. A file system may
     // reuse an inode number after an unlink; the model cannot tell the two
     // apart, so such a trace is refused rather than conflated.
     let mut known: HashSet<NodeId> = initial.nodes.keys().copied().collect();
     for (index, event) in events.iter().enumerate() {
-        if let Event::Create { node, .. } | Event::Mkdir { node, .. } = event {
+        if !touches_only(event, &known) {
+            if options.ignore_foreign {
+                foreign += 1;
+                continue;
+            }
+            return Err(other(format!(
+                "trace event {index} ({}) touches a node outside the image",
+                describe(event)
+            )));
+        }
+        if let Event::Create { node, .. }
+        | Event::Mkdir { node, .. }
+        | Event::Symlink { node, .. } = event
+        {
             if !known.insert(*node) {
                 return Err(other(format!(
                     "trace event {index} creates node {node:?}, which the image or an \
@@ -623,6 +737,28 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
                     },
                 );
             }
+            Event::Symlink {
+                dir,
+                name,
+                node,
+                target,
+            } => {
+                fresh.push((
+                    *node,
+                    Node::Symlink {
+                        target: target.clone(),
+                    },
+                ));
+                push(
+                    Class::Namespace,
+                    vec![*dir],
+                    Change::Entry {
+                        dir: *dir,
+                        name: name.clone(),
+                        node: *node,
+                    },
+                );
+            }
             Event::Write {
                 node, offset, data, ..
             } => {
@@ -654,6 +790,13 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
                 action: Action::Sync {
                     node: *node,
                     kind: *kind,
+                },
+            }),
+            Event::Commit { store, .. } => ops.push(Op {
+                event: index,
+                action: Action::Commit {
+                    store: *store,
+                    drain: options.commit_drains,
                 },
             }),
             Event::Link { node, dir, name } => push(
@@ -703,58 +846,113 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
             }
         }
     }
-    Ok((ops, fresh))
+    Ok(Lowered {
+        ops,
+        fresh,
+        foreign,
+    })
 }
 
 impl Plan {
     fn new(initial: &Image, events: &[Event], options: &Options) -> io::Result<Self> {
-        let (ops, fresh) = build_ops(initial, events, options)?;
-        let mut plan = Self {
-            requires: vec![BTreeSet::new(); ops.len()],
+        let Lowered {
             ops,
             fresh,
+            foreign,
+        } = build_ops(initial, events, options)?;
+        let mut plan = Self {
+            requires: vec![BTreeSet::new(); ops.len()],
+            sent_at: vec![None; ops.len()],
+            durable_at: vec![None; ops.len()],
+            ops,
+            fresh,
+            foreign,
         };
+        plan.compute_persistence();
         plan.add_barrier_edges(options.barrier_scope);
         plan.add_parent_edges();
         Ok(plan)
     }
 
-    /// Every object of mutation `m` has a sync after `m` and before `until`
-    /// satisfying `accept`.
-    fn covered(&self, m: usize, until: usize, accept: fn(SyncKind, Class) -> bool) -> bool {
-        let Some((class, objects)) = self.ops.get(m).and_then(Op::mutation) else {
-            return false;
-        };
-        objects.iter().all(|object| {
-            self.ops
+    /// The first op after mutation `m` by which every object of `m` had a
+    /// sync satisfying `accept`, if there is one.
+    fn covered_at(&self, m: usize, accept: fn(SyncKind, Class) -> bool) -> Option<usize> {
+        let (class, objects) = self.ops.get(m).and_then(Op::mutation)?;
+        let mut latest = None;
+        for object in objects {
+            let first = self
+                .ops
                 .iter()
                 .enumerate()
-                .take(until)
                 .skip(m + 1)
-                .any(|(_, op)| {
+                .find(|(_, op)| {
                     matches!(op.action, Action::Sync { node, kind } if node == *object && accept(kind, class))
                 })
-        })
+                .map(|(index, _)| index)?;
+            latest = Some(latest.map_or(first, |at: usize| at.max(first)));
+        }
+        latest
+    }
+
+    /// The device an op drains, if it is a drain: a full flush drains the
+    /// drive holding its file, and a store commit with `drain` the drive
+    /// holding its store.
+    const fn drains(op: &Op) -> Option<u64> {
+        match op.action {
+            Action::Sync {
+                node,
+                kind: SyncKind::FullFlush,
+            } => Some(node.dev),
+            Action::Commit { store, drain: true } => Some(store.dev),
+            Action::Sync { .. } | Action::Commit { .. } | Action::Mutate { .. } => None,
+        }
+    }
+
+    fn compute_persistence(&mut self) {
+        for m in 0..self.ops.len() {
+            let Some((_, objects)) = self.ops.get(m).and_then(Op::mutation) else {
+                continue;
+            };
+            let dev = device(objects);
+            let sent = self.covered_at(m, sends);
+            let direct = self.covered_at(m, durable_on_object);
+            let drained = sent.and_then(|sent| {
+                self.ops
+                    .iter()
+                    .enumerate()
+                    .skip(sent + 1)
+                    .find(|(_, op)| Self::drains(op).is_some() && Self::drains(op) == dev)
+                    .map(|(index, _)| index)
+            });
+            let durable = match (direct, drained) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(slot) = self.sent_at.get_mut(m) {
+                *slot = sent;
+            }
+            if let Some(slot) = self.durable_at.get_mut(m) {
+                *slot = durable;
+            }
+        }
     }
 
     fn durable(&self, m: usize, crash_point: usize) -> bool {
-        if self.covered(m, crash_point, durable_on_object) {
-            return true;
-        }
+        self.durable_at
+            .get(m)
+            .copied()
+            .flatten()
+            .is_some_and(|at| at < crash_point)
+    }
+
+    /// Trace event indices of the commits completed before `crash_point`.
+    fn commits_before(&self, crash_point: usize) -> Vec<usize> {
         self.ops
             .iter()
-            .enumerate()
             .take(crash_point)
-            .skip(m + 1)
-            .any(|(flush, op)| {
-                matches!(
-                    op.action,
-                    Action::Sync {
-                        kind: SyncKind::FullFlush,
-                        ..
-                    }
-                ) && self.covered(m, flush + 1, sends)
-            })
+            .filter(|op| matches!(op.action, Action::Commit { .. }))
+            .map(|op| op.event)
+            .collect()
     }
 
     fn mutations(&self) -> impl Iterator<Item = (usize, Class, &[NodeId])> + '_ {
@@ -774,11 +972,12 @@ impl Plan {
                     node,
                     kind: SyncKind::Barrier,
                 } => Some((index, node)),
-                Action::Sync { .. } | Action::Mutate { .. } => None,
+                Action::Sync { .. } | Action::Commit { .. } | Action::Mutate { .. } => None,
             })
             .collect();
         let mut edges = Vec::new();
         for (barrier, object) in barriers {
+            // A drive barrier orders only I/O on its own drive.
             let before: Vec<usize> = self
                 .mutations()
                 .filter(|(index, class, objects)| {
@@ -787,14 +986,25 @@ impl Plan {
                             BarrierScope::Object => {
                                 objects.contains(&object) && sends(SyncKind::Barrier, *class)
                             }
-                            BarrierScope::Device => self.covered(*index, barrier + 1, sends),
+                            BarrierScope::Device => {
+                                device(objects) == Some(object.dev)
+                                    && self
+                                        .sent_at
+                                        .get(*index)
+                                        .copied()
+                                        .flatten()
+                                        .is_some_and(|sent| sent <= barrier)
+                            }
                         }
                 })
                 .map(|(index, _, _)| index)
                 .collect();
             for (after, _, objects) in self.mutations() {
-                let ordered =
-                    after > barrier && (scope == BarrierScope::Device || objects.contains(&object));
+                let ordered = after > barrier
+                    && match scope {
+                        BarrierScope::Device => device(objects) == Some(object.dev),
+                        BarrierScope::Object => objects.contains(&object),
+                    };
                 if ordered {
                     edges.extend(before.iter().map(|earlier| (after, *earlier)));
                 }
@@ -919,17 +1129,101 @@ impl Plan {
     }
 }
 
-/// Enumerate the crash states of `events` from the durable image `initial`
-/// and run `invariant` on each, materialized in a fresh directory.
-///
-/// # Errors
-/// Refuses a trace holding an [`Event::Untraced`], an invalid
-/// [`Options::exhaustive_limit`], or a state that cannot be materialized.
-pub fn check(
+/// One entry of a crash state, as [`View`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry<'a> {
+    File { data: &'a [u8], mode: u32 },
+    Dir { mode: u32 },
+    Symlink { target: &'a [u8] },
+}
+
+/// Read-only access to one crash state's tree, by path relative to the root
+/// the image was built from.
+#[derive(Clone, Copy, Debug)]
+pub struct View<'a> {
+    image: &'a Image,
+}
+
+impl<'a> View<'a> {
+    fn entry(self, node: NodeId) -> Option<Entry<'a>> {
+        match self.image.nodes.get(&node)? {
+            Node::File { data, mode } => Some(Entry::File { data, mode: *mode }),
+            Node::Dir { mode, .. } => Some(Entry::Dir { mode: *mode }),
+            Node::Symlink { target } => Some(Entry::Symlink { target }),
+        }
+    }
+
+    /// The entry at `rel` (`/`-separated, no leading `/`); the empty path is
+    /// the root.
+    #[must_use]
+    pub fn get(self, rel: &[u8]) -> Option<Entry<'a>> {
+        let mut node = self.image.root;
+        for part in rel
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+        {
+            let Node::Dir { entries, .. } = self.image.nodes.get(&node)? else {
+                return None;
+            };
+            node = *entries.get(part)?;
+        }
+        self.entry(node)
+    }
+
+    /// Every entry beneath the root, by relative path, parents first.
+    #[must_use]
+    pub fn walk(self) -> Vec<(Vec<u8>, Entry<'a>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![(Vec::new(), self.image.root, 0_usize)];
+        while let Some((path, node, depth)) = stack.pop() {
+            let Some(Node::Dir { entries, .. }) = self.image.nodes.get(&node) else {
+                continue;
+            };
+            if depth > 64 {
+                continue;
+            }
+            for (name, child) in entries.iter().rev() {
+                let mut rel = path.clone();
+                if !rel.is_empty() {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(name);
+                if let Some(entry) = self.entry(*child) {
+                    if matches!(entry, Entry::Dir { .. }) {
+                        stack.push((rel.clone(), *child, depth + 1));
+                    }
+                    out.push((rel, entry));
+                }
+            }
+        }
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    /// Whether inode `node` is reachable in this state: named by some entry.
+    #[must_use]
+    pub fn names(self, node: NodeId) -> bool {
+        self.image.nodes.values().any(|entry| {
+            matches!(entry, Node::Dir { entries, .. } if entries.values().any(|child| *child == node))
+        })
+    }
+
+    /// The entry of inode `node` if any directory names it.
+    #[must_use]
+    pub fn node(self, node: NodeId) -> Option<Entry<'a>> {
+        if self.names(node) {
+            self.entry(node)
+        } else {
+            None
+        }
+    }
+}
+
+fn enumerate(
     initial: &Image,
     events: &[Event],
     options: &Options,
-    mut invariant: impl FnMut(&Path, &StateInfo) -> Result<(), String>,
+    mut visit: impl FnMut(&Image, &StateInfo) -> io::Result<Result<(), String>>,
 ) -> io::Result<Report> {
     if options.exhaustive_limit > MAX_EXHAUSTIVE {
         return Err(other(format!(
@@ -938,14 +1232,13 @@ pub fn check(
         )));
     }
     let plan = Plan::new(initial, events, options)?;
-    let scratch = tempfile::TempDir::new()?;
     let mut report = Report {
         accept_bounded: options.accept_bounded,
         events: events.len(),
         ops: plan.ops.len(),
+        foreign: plan.foreign,
         ..Report::default()
     };
-    let mut serial = 0_usize;
     for crash_point in 0..=plan.ops.len() {
         report.crash_points += 1;
         let issued: BTreeSet<usize> = plan
@@ -996,21 +1289,19 @@ pub fn check(
                 skipped: total.saturating_sub(u128::try_from(states.len()).unwrap_or(u128::MAX)),
             });
         }
+        let commits = plan.commits_before(crash_point);
         for state in states {
             report.states += 1;
             let set: BTreeSet<usize> = state.iter().copied().collect();
             let image = plan.image(initial, &set)?;
-            serial += 1;
-            let dir = scratch.path().join(format!("state-{serial}"));
-            std::fs::create_dir(&dir)?;
-            image.materialize(&dir)?;
             let info = StateInfo {
                 crash_point,
                 ops: plan.ops.len(),
                 complete: crash_point == plan.ops.len(),
                 persisted: plan.events_of(state.iter().copied()),
+                commits: commits.clone(),
             };
-            if let Err(message) = invariant(&dir, &info) {
+            if let Err(message) = visit(&image, &info)? {
                 report.violations.push(Violation {
                     crash_point,
                     persisted: info.persisted.clone(),
@@ -1018,10 +1309,74 @@ pub fn check(
                     message,
                 });
             }
-            std::fs::remove_dir_all(&dir)?;
         }
     }
     Ok(report)
+}
+
+/// Enumerate the crash states of `events` from the durable image `initial`
+/// and run `invariant` on each, read in memory through a [`View`].
+///
+/// # Errors
+/// Refuses a trace holding an [`Event::Untraced`], a foreign node (unless
+/// [`Options::ignore_foreign`]), an invalid [`Options::exhaustive_limit`], or
+/// a state that cannot be built.
+pub fn check_view(
+    initial: &Image,
+    events: &[Event],
+    options: &Options,
+    mut invariant: impl FnMut(View<'_>, &StateInfo) -> Result<(), String>,
+) -> io::Result<Report> {
+    enumerate(initial, events, options, |image, info| {
+        Ok(invariant(View { image }, info))
+    })
+}
+
+static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A private scratch directory, removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "bulkload-crash-check-{}-{}",
+            std::process::id(),
+            SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Enumerate the crash states of `events` from the durable image `initial`
+/// and run `invariant` on each, materialized in a fresh directory.
+///
+/// # Errors
+/// As [`check_view`], or a state that cannot be materialized.
+pub fn check(
+    initial: &Image,
+    events: &[Event],
+    options: &Options,
+    mut invariant: impl FnMut(&Path, &StateInfo) -> Result<(), String>,
+) -> io::Result<Report> {
+    let scratch = Scratch::new()?;
+    let mut serial = 0_usize;
+    enumerate(initial, events, options, |image, info| {
+        serial += 1;
+        let dir = scratch.0.join(format!("state-{serial}"));
+        std::fs::create_dir(&dir)?;
+        image.materialize(&dir)?;
+        let verdict = invariant(&dir, info);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(verdict)
+    })
 }
 
 #[cfg(test)]
