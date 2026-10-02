@@ -134,6 +134,15 @@ resume-power-loss:
 bench-io-chunker:
     cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
+# bulkload-bench built at --rev-a (7c3ecc7) and --rev-b (origin/main), each
+# rep the full R23 bench with the rclone baseline, plus one v4 (41bf9a4)
+# native rep for dedup loss. Gated runs only on neo, AC power, load1 < 2.5,
+# lanes quiet (R-N81, R-N91); --dry-run makes a synthetic corpus and is NOT a
+# gate sample.
+# #88 gate (a) / R23 A/B/A/B/A harness (OI-1002-Q27)
+bench-r23-ab *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_ab.py {{ args }}
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
@@ -166,6 +175,7 @@ check-optional:
     cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features m1-spike -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
     cd {{ root }} && {{ just_executable() }} test-local
