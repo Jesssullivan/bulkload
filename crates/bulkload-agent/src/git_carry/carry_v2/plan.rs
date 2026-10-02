@@ -1,6 +1,7 @@
 //! The object list, its segments, and `<pack_id>.list`.
 
 use super::super::estimate::Refused;
+use super::negotiate::shallow_shape;
 use super::{is_oid, lines, pinned, run_child, FirstRound, Outcome, Source};
 use crate::BulkloadRefusal;
 
@@ -46,13 +47,17 @@ impl PackPlan {
         if cap == 0 {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #73 round-2 D1: the round's destination frontier must still fit
+        // this source (R-N75, R-N131), whoever built the round and however
+        // the source moved since.
+        shallow_shape(&source.shallow, &round.shallow().iter().cloned().collect())?;
         let (edges, objects) = object_list(source, round, store)?;
         let sized = sizes(source, &objects, store)?;
         let segments = cut(objects, &sized, cap);
         Ok(Self::sealed(
-            round.wants.clone(),
-            round.haves.clone(),
-            round.shallow.clone(),
+            round.wants().to_vec(),
+            round.haves().to_vec(),
+            round.shallow().to_vec(),
             cap,
             edges,
             segments,
@@ -121,6 +126,24 @@ impl PackPlan {
     #[must_use]
     pub fn wants(&self) -> &[String] {
         &self.wants
+    }
+
+    /// The destination frontier this plan was built for (empty for a full
+    /// destination).
+    #[must_use]
+    pub fn shallow(&self) -> &[String] {
+        &self.shallow
+    }
+
+    /// Refuse unless `source`'s frontier fits this plan's destination
+    /// frontier (R-N75, R-N131). [`PackPlan::send_segment`] runs it on
+    /// every send, so a plan loaded for resume is checked against the
+    /// source as it is now (#73 round-2 D1).
+    ///
+    /// # Errors
+    /// `GIT_HAVES_UNPROVABLE` with the rule's reason.
+    pub fn check_source(&self, source: &Source) -> Outcome<()> {
+        shallow_shape(&source.shallow, &self.shallow.iter().cloned().collect())
     }
 
     /// The segment cap, in stored bytes.
@@ -306,16 +329,16 @@ fn object_list(
     store: Option<&super::StderrStore>,
 ) -> Outcome<Listed> {
     let mut input = Vec::new();
-    for value in &round.wants {
+    for value in round.wants() {
         input.extend_from_slice(value.as_bytes());
         input.push(b'\n');
     }
-    if round.wants.is_empty() {
+    if round.wants().is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    if !round.haves.is_empty() {
+    if !round.haves().is_empty() {
         input.extend_from_slice(b"--not\n");
-        for value in &round.haves {
+        for value in round.haves() {
             input.extend_from_slice(value.as_bytes());
             input.push(b'\n');
         }
