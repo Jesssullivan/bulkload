@@ -15,7 +15,7 @@
 //!    ref updates, the destination's git dir) is sealed into the journal,
 //!    then the quarantine `objects/incoming-bulkload-<pack_id>-<state key>/`
 //!    is made (receive-pack's tmp-objdir pattern; the key names the state dir,
-//!    #75 r2 N4) and sealed.
+//!    #75 r2 N4, by its identity token rather than its path, #82) and sealed.
 //! 3. **Segments**, in order: `index-pack --stdin --fix-thin --keep` into the
 //!    quarantine (`GIT_OBJECT_DIRECTORY` the quarantine, the main store its
 //!    alternate, `GIT_QUARANTINE_PATH` set, so Git refuses any ref update).
@@ -643,7 +643,8 @@ impl<'a> Ingest<'a> {
         if !pack_id_ok(&pack_id) {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
-        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key());
+        // #82: keyed by the state dir's identity token, not its path.
+        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key()?);
         let git_dir = target.repository.git_dir.as_path();
         let journal = match Journal::open(journals, &pack_id)? {
             Found::Existing(journal, records) => {
@@ -664,14 +665,16 @@ impl<'a> Ingest<'a> {
         // was replaced under it keeps its packs and this open refuses.
         if let Err(refused) = discard_quarantine(&target.objects, &quarantine, None) {
             // #75 r5: the journal is this open's own and empty (created, or
-            // emptied in place, under its lock); leave none behind.
-            journal.remove()?;
-            return Err(refused);
+            // emptied in place, under its lock); leave none behind. #94: the
+            // refusal stays the one returned; a failed removal rides along.
+            return Err(cleaned(refused, journal.remove()));
         }
         let Some(plan) = plan else {
             // A resume found nothing sealed; leave no empty journal.
-            journal.remove()?;
-            return Err(BulkloadRefusal::SealedObjectMissing.into());
+            return Err(cleaned(
+                BulkloadRefusal::SealedObjectMissing.into(),
+                journal.remove(),
+            ));
         };
         let mut session = Self {
             target,
@@ -690,8 +693,7 @@ impl<'a> Ingest<'a> {
         // dir's has another name).
         let fresh = session.occupied().and_then(|()| session.preflight());
         if let Err(refused) = fresh {
-            session.journal.remove()?;
-            return Err(refused);
+            return Err(cleaned(refused, session.journal.remove()));
         }
         let block = session.plan.block(git_dir);
         session.journal.append(&block)?;
@@ -1194,6 +1196,9 @@ impl<'a> Ingest<'a> {
         if self.stage == Stage::Done {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #92: an `abandoned` record a resume would never read leaves the
+        // name's journal (another copy's) to replay packs this discards.
+        self.still_owned()?;
         let _fence = self.target.fence()?;
         self.abandon_journaled(reason)?;
         if self.stage >= Stage::Migrated {
@@ -1207,9 +1212,14 @@ impl<'a> Ingest<'a> {
     /// the next open discards what is left; a torn
     /// `abandoned` line leaves a session whose quarantine is whole or
     /// partly gone, which resume abandons again.
+    ///
+    /// #92: the quarantine is discarded only while the journal holding the
+    /// `abandoned` record is the one at the name, so a resume reads it.
     fn abandon_journaled(&self, reason: &'static str) -> Outcome<()> {
+        self.still_owned()?;
         self.journal
             .append(&[Record::Abandoned(reason.to_owned())])?;
+        self.still_owned()?;
         self.discard_quarantine()
     }
 
@@ -1231,6 +1241,11 @@ impl<'a> Ingest<'a> {
         if self.acks.len() != self.plan.segments {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #92: every record below is one a resume replays from; a journal
+        // whose name now holds another file would lose them, and a resume
+        // would replay from the wrong stage. Checked first, and again after
+        // each append before the step that depends on it.
+        self.still_owned()?;
         // #75 r3 M1: one finish at a time per repository, so another
         // session's publication never lands between this one's digests.
         let _fence = self.target.fence()?;
@@ -1248,6 +1263,8 @@ impl<'a> Ingest<'a> {
             self.stage = Stage::Connected;
         }
         if self.stage == Stage::Connected {
+            // #92: migration only once `connected` is where a resume reads.
+            self.still_owned()?;
             // #75 r1 D3: refs can move between open and now. Refuse before
             // any pack migrates, while the caller can still abandon the
             // session (or finish it once the ref is cleared).
@@ -1258,6 +1275,8 @@ impl<'a> Ingest<'a> {
             self.stage = Stage::Migrated;
         }
         if self.stage == Stage::Migrated {
+            // #92: publication only once `migrated` is where a resume reads.
+            self.still_owned()?;
             let (before, after) = self.publish()?;
             fault_point!(GitIngestAfterPublish);
             self.journal
@@ -1266,6 +1285,9 @@ impl<'a> Ingest<'a> {
             self.stage = Stage::Published;
         }
         if self.stage == Stage::Published {
+            // #92: the keeps drop only once `published` is where a resume
+            // reads.
+            self.still_owned()?;
             // #75 r1 D1(b): a journaled publication is re-checked; a ref lost
             // to power loss is published again (its objects checked first).
             // #75 r2 N5: a Done session is not: its refs were sealed and the
@@ -1739,6 +1761,17 @@ fn index_pack(
     let hash =
         String::from_utf8(hash.to_vec()).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     Ok((hash, bytes, blake3))
+}
+
+/// #94: `refused` after a cleanup that followed it. The refusal is what the
+/// caller acts on (`quarantine_held` means another live session, not an I/O
+/// fault), so it is always the one returned; a cleanup that failed is
+/// attached as [`Refused::cleanup`] and printed as `cleanup_refused=`.
+fn cleaned(mut refused: Refused, cleanup: crate::Result<()>) -> Refused {
+    if let Err(error) = cleanup {
+        refused.cleanup = Some(error);
+    }
+    refused
 }
 
 /// Open the quarantine `name` under `objects` and take its exclusive

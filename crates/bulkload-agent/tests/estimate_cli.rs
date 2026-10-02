@@ -298,6 +298,7 @@ fn no_corpus_probe_reaches_a_refusal_line() {
                 file: Some(file),
                 file_refused: None,
             }),
+            cleanup: None,
         };
         let lines = refused.lines();
         for line in &lines {
