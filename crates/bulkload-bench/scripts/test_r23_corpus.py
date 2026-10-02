@@ -77,7 +77,21 @@ class RoundTripTests(unittest.TestCase):
             out = Path(raw) / "copy"
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(corpus.main(["generate", str(out)]), 0)
+                extra = out / "corpus" / "small" / "extra-dir"
+                extra.mkdir(mode=0o755)
+                self.assertEqual(corpus.main(["verify", str(out / "corpus")]), 1)
+                extra.rmdir()
+                self.assertEqual(corpus.main(["seal", str(out)]), 0)
+                blob = out / "corpus" / "big" / "blob-b.bin"
+                self.assertEqual(blob.stat().st_mode & 0o777, 0o444)
+                self.assertEqual(out.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(corpus.main(["verify", str(out / "corpus")]), 0)
+                for dirpath, dirs, _names in os.walk(out):
+                    for name in dirs:
+                        (Path(dirpath) / name).chmod(0o755)
+                out.chmod(0o755)
                 victim = out / "corpus" / "small" / "s01.bin"
+                victim.chmod(0o644)
                 victim.write_bytes(b"\x00")
                 self.assertEqual(corpus.main(["verify", str(out / "corpus")]), 1)
 

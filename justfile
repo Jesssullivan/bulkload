@@ -134,18 +134,20 @@ resume-power-loss:
 bench-io-chunker:
     cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
-# bulkload-bench built at --rev-a (7c3ecc7) and --rev-b (origin/main), each
-# rep the full R23 bench with the rclone baseline, plus one v4 (41bf9a4)
-# native rep for dedup loss. Gated runs only on neo, AC power, load1 < 2.5,
+# bulkload-bench built at --rev-b (origin/main, the candidate) and --rev-a
+# (7c3ecc7, informational), each rep the full R23 bench with the rclone
+# baseline, plus one v4 (41bf9a4) native rep for dedup loss. B passes R23
+# iff every B rep's verdict passes. Gated runs only on neo, AC power, load1 < 2.5,
 # lanes quiet (R-N81, R-N91); --dry-run makes a synthetic corpus and is NOT a
 # gate sample.
-# #88 gate (a) / R23 A/B/A/B/A harness (OI-1002-Q27)
+# #88 gate (a) / R23 B/A/B/A/B harness (OI-1002-Q30, OI-1002-Q27)
 bench-r23-ab *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_ab.py {{ args }}
 
 # `generate OUT` writes OUT/corpus plus a protected README; `verify CORPUS`
-# checks the committed manifest and content identity f4a7619f... Byte-identical
-# on every host: SHAKE-256 counter mode from a fixed seed, no live files.
+# checks the committed manifest and content identity f4a7619f...; `seal OUT`
+# makes a generated copy read-only (0444/0555). Byte-identical on every host:
+# SHAKE-256 counter mode from a fixed seed, no live files.
 # R23 corpus v1 generator / verifier (OI-1002-Q28)
 bench-r23-corpus *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_corpus.py {{ args }}

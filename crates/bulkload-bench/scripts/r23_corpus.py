@@ -30,13 +30,15 @@ committed. The committed identity covers content and paths only. It is the
 BLAKE3 of the manifest, one line per regular file sorted by path bytes:
 `<path>\\t<size>\\t<blake3>\\n`. The manifest is committed beside this script
 as r23_corpus.manifest.tsv. `verify` also checks that the tree has no
-other entries, that files are 0644 and that directories are 0755. Those are
+other files or directories, that files are 0644 (or 0444 when sealed) and
+that directories are 0755 (or 0555). Those are
 the remaining fields the bench's `same_payload` compares.
 
 Usage:
   r23_corpus.py generate OUT   # OUT new; writes OUT/corpus, OUT/README.md, OUT/MANIFEST.tsv
   r23_corpus.py verify CORPUS  # exit 0 only if CORPUS matches the committed manifest
   r23_corpus.py manifest CORPUS
+  r23_corpus.py seal OUT       # verify, then make OUT read-only (0444/0555)
 BLAKE3 comes from `b3sum`: $R23_B3SUM, then PATH, then nixpkgs#b3sum
 resolved through the repo flake's inputs.
 """
@@ -60,6 +62,9 @@ HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "r23_corpus.manifest.tsv"
 REPO = HERE.parents[2]
 MIB = 1 << 20
+# Generated modes, and the read-only modes `seal` applies to an archive copy.
+FILE_MODES = (0o644, 0o444)
+DIR_MODES = (0o755, 0o555)
 
 # (path, kind, size, source). Order is irrelevant; the manifest is sorted.
 FILES: list[tuple[str, str, int, str | None]] = [
@@ -165,18 +170,27 @@ def manifest_text(corpus: Path) -> tuple[str, list[str]]:
     """Return the manifest of `corpus` and any problems with its tree."""
     problems: list[str] = []
     files: list[str] = []
+    expected_dirs = {
+        parent.as_posix()
+        for path, _k, _s, _src in FILES
+        for parent in Path(path).parents
+        if parent != Path(".")
+    }
     for dirpath, dirs, names in os.walk(corpus):
         for name in dirs:
             path = Path(dirpath) / name
-            if path.is_symlink() or (path.lstat().st_mode & 0o777) != 0o755:
-                problems.append(f"directory not 0755: {path.relative_to(corpus)}")
+            rel = path.relative_to(corpus).as_posix()
+            if path.is_symlink() or (path.lstat().st_mode & 0o777) not in DIR_MODES:
+                problems.append(f"directory not 0755/0555: {rel}")
+            elif rel not in expected_dirs:
+                problems.append(f"extra directory: {rel}")
         for name in names:
             path = Path(dirpath) / name
             rel = path.relative_to(corpus).as_posix()
             if path.is_symlink() or not path.is_file():
                 problems.append(f"not a regular file: {rel}")
-            elif (path.lstat().st_mode & 0o777) != 0o644:
-                problems.append(f"file not 0644: {rel}")
+            elif (path.lstat().st_mode & 0o777) not in FILE_MODES:
+                problems.append(f"file not 0644/0444: {rel}")
             else:
                 files.append(rel)
     files.sort(key=lambda rel: rel.encode())
@@ -254,6 +268,25 @@ def readme(identity: str, text: str) -> str:
     )
 
 
+def seal(out: Path) -> int:
+    """Make a generated copy (OUT from `generate`) read-only, after verifying it.
+
+    Files become 0444 and directories 0555, including OUT itself, so the
+    copy cannot be changed without an explicit chmod. Run only on copies this
+    script generated.
+    """
+    if verify(out / "corpus") != 0:
+        return 1
+    for dirpath, dirs, names in os.walk(out, topdown=False):
+        for name in names:
+            (Path(dirpath) / name).chmod(0o444)
+        for name in dirs:
+            (Path(dirpath) / name).chmod(0o555)
+    out.chmod(0o555)
+    print(f"r23-corpus sealed={out} files=0444 dirs=0555")
+    return verify(out / "corpus")
+
+
 def verify(corpus: Path) -> int:
     text, problems = manifest_text(corpus)
     identity = identity_of(text)
@@ -269,7 +302,7 @@ def verify(corpus: Path) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] not in ("generate", "verify", "manifest"):
+    if len(argv) != 2 or argv[0] not in ("generate", "verify", "manifest", "seal"):
         print(__doc__)
         return 2
     target = Path(argv[1]).resolve()
@@ -277,6 +310,8 @@ def main(argv: list[str]) -> int:
         return generate(target)
     if argv[0] == "verify":
         return verify(target)
+    if argv[0] == "seal":
+        return seal(target)
     text, problems = manifest_text(target)
     sys.stdout.write(text)
     print(f"identity={identity_of(text)} problems={problems}", file=sys.stderr)

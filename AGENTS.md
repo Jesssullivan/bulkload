@@ -65,6 +65,10 @@ historical rulings ledger (evidence, not current instructions).
 
 - Performance is the bar (R23, R-N57): the engine must beat rclone on the
   R23 gates, measured by `bulkload-bench` with 3-rep A/B medians.
+- R23 amendment (2026-10-02, OI-1002-Q30): the #88 gate (a) sample runs
+  the outer order B/A/B/A/B (`r23_ab.py`); B passes the R23 gate if and
+  only if every B rep's bench verdict passes. A is the informational
+  baseline and never decides the gate.
 - Unsafe-first (R-N54): raw syscalls, zero-copy and reused buffers are the
   default design choice. Every `unsafe` block carries a `// SAFETY:` comment.
 - R25 (R-N58): never re-read a byte the destination already holds durably,

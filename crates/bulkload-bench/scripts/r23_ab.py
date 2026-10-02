@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Gate (a) / R23 A/B harness for #88 (OI-1002-Q27, R23, R-N57, R-N81, R-N91).
+"""Gate (a) / R23 B/A harness for #88 (OI-1002-Q30, OI-1002-Q28, OI-1002-Q27).
 
-Runs `bulkload-bench` built at two revisions in the order A/B/A/B/A, one
-bench invocation per repetition. Each invocation is the full R23 bench as in
+Runs `bulkload-bench` built at two revisions in the order B/A/B/A/B
+(OI-1002-Q30), one bench invocation per repetition. B (--rev-b, default
+origin/main) is the candidate; A (--rev-a, default 7c3ecc7) is the
+informational baseline. Each invocation is the full R23 bench as in
 docs/evidence/r23-2026-09-18.md: native and rclone alternate N/R/N/R/N
 (`--reps 3`), then warm resume, interrupted resume and the 1 % delta, so the
 rclone baseline runs the same way, with the same flags, inside every
 repetition. One extra native-only repetition of the v4 engine (41bf9a4 by
 default) is run last, as the reference for the dedup-loss measurement.
+
+Gate rollup (OI-1002-Q30, AGENTS.md R23 amendment): B passes the R23 gate if
+and only if every B rep's bench verdict is `pass`. A never decides the gate.
+An aborted or refused sample has no gate verdict.
 
 What it reports, per repetition and as medians per revision (#88):
   - flush_barrier_ns and flush_full_ns totals over the native initial copies;
@@ -27,30 +33,53 @@ Preconditions (gated mode, the default):
     (R-N91). It is recorded, not checked.
   - The corpus is R23 corpus v1 (r23_corpus.py, OI-1002-Q28): 23 regular
     files, 239,819,837 bytes, and `r23_corpus.py verify` matches the
-    committed manifest (content identity f4a7619f...). With other
-    --expect-files/--expect-bytes only the shape is checked.
+    committed manifest (content identity f4a7619f...). Gated mode refuses
+    non-default --expect-files/--expect-bytes.
   - The work root does not exist yet. Its parent should be on the volume
     under test (TinylandState for gate a).
-  - After the builds, the harness waits up to --settle-seconds for load1 to
-    fall below 2.5 on AC power. It checks again before every repetition and
-    after every repetition (power, and every bench row gated=true). The
-    bench itself checks before every arm. A failed check ends the sample:
-    the evidence draft is written with status=aborted and the exit is 3.
+
+Corpus integrity: the sealed corpus is read-only (0444/0555). The harness
+copies it once into <work>/corpus with 0644/0755 modes, because the bench
+mutates its private fixture for the 1 % delta and so cannot read a
+read-only tree. That working copy is content-verified before the builds.
+Every rep must report the same bench `sealed_corpus_blake3` (a stat identity
+of the working copy). After the last rep, both the working copy and the
+sealed corpus are verified again. Any failure aborts the sample (exit 3).
+
+Host checks: after the builds, the harness waits up to --settle-seconds for
+AC power and load1 < 2.5, and checks again before every repetition. After
+every repetition, power must still be AC, every bench row must say
+gated=true, and load1 must fall below 2.5 within --post-settle-seconds (the
+bench's own work raises it during the rep). The bench itself checks before
+every arm. A failed check ends the sample: status=aborted, exit 3.
 
 Page cache: the cache is never dropped, on either host. The bench verifies
 the source with a full BLAKE3 walk before every arm, so every timed arm,
 native and rclone alike, starts with the source hot. That is the one
 consistent state reachable without root (`purge` needs root on Darwin, and
-a drop would be undone by that verification read). Source residency is
-recorded before every repetition (`bulkload-bench micro residency`).
+a drop would be undone by that verification read). The harness records
+residency of the working copy before each rep, and residency of the rep's
+private fixture, which the timed arms actually read, right after the rep.
+The bench is a single process, so the harness cannot measure in between.
 Destinations are always fresh: every repetition gets a new work root, and
 the bench makes a new destination per arm.
 
---dry-run makes a tiny synthetic corpus, passes --informational and skips
-the platform, shape, quiet and load checks. Its output says
-NOT A GATE SAMPLE everywhere and goes to the work root, never docs/evidence.
+Builds: each revision is exported with `git archive` into
+<work>/build-src/src-<sha12> and built in `nix develop path:<tree>#default`.
+The per-revision CARGO_TARGET_DIR and the copied binaries stay under
+--build-root (default <repo>/target/r23-ab) as a cache across sessions.
+The harness never deletes anything outside the work root.
 
-Exit: 0 complete (the R23 verdict is in the evidence, pass or fail),
+Evidence: <work>/r23-ab.json holds everything, and the Markdown draft goes
+to docs/evidence/r23-<date>-<HHMM>Z.md. An aborted sample is titled ABORTED
+and has no medians table.
+
+--dry-run makes a tiny synthetic corpus, passes --informational and skips
+the platform, corpus-verify, quiet and load checks. Its output says
+NOT A GATE SAMPLE everywhere and goes to the work root. It refuses to
+write under docs/evidence.
+
+Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
 
@@ -72,6 +101,10 @@ import tarfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import r23_corpus  # noqa: E402
+
+CONTENT_IDENTITY = r23_corpus.EXPECTED_IDENTITY
 LOAD_LIMIT = 2.5
 # Corpus v1 from r23_corpus.py (OI-1002-Q28); the 09-18 corpus is gone.
 RECORD_FILES = 23
@@ -82,7 +115,10 @@ DEFAULT_CORPUS = (
 DEFAULT_A = "7c3ecc7"
 DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
-RULINGS = "OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+RULINGS = (
+    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+)
+DEFAULT_PATTERN = "BABAB"
 SEAL_KEYS = (
     "flush_barrier_ns",
     "flush_full_ns",
@@ -220,17 +256,22 @@ def git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def build(repo: Path, rev: str, build_root: Path, jobs: int) -> dict[str, str]:
-    """Build bulkload-bench at `rev` in its own tree and target dir."""
+def build(
+    repo: Path, rev: str, build_root: Path, scratch: Path, jobs: int
+) -> dict[str, str]:
+    """Build bulkload-bench at `rev` in its own tree and target dir.
+
+    The exported source tree goes under `scratch` (inside the new work root).
+    `build_root` keeps only the per-revision CARGO_TARGET_DIR and the copied
+    binaries, as a cache across sessions; nothing there is ever deleted.
+    """
     sha = git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
     short = sha[:12]
     binary = build_root / "bin" / f"bulkload-bench-{short}"
     if not binary.is_file():
-        source = build_root / f"src-{short}"
-        if source.exists():
-            shutil.rmtree(source)
+        source = scratch / f"src-{short}"
         source.mkdir(parents=True)
-        archive = build_root / f"src-{short}.tar"
+        archive = scratch / f"src-{short}.tar"
         git(repo, "archive", "--format=tar", "-o", str(archive), sha)
         with tarfile.open(archive) as tree:
             tree.extractall(source, filter="data")
@@ -437,6 +478,27 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
     }
 
 
+def post_settle(
+    args: argparse.Namespace,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Conditions right after a rep, and after waiting for load1 to settle.
+
+    Power must be AC at once. Load1 may wait up to --post-settle-seconds to fall
+    below the limit, because the bench's own work raises it during the rep.
+    """
+    first = conditions()
+    now = first
+    deadline = time.monotonic() + args.post_settle_seconds
+    while (
+        not args.dry_run
+        and float(now["load1"]) >= LOAD_LIMIT
+        and time.monotonic() < deadline
+    ):
+        time.sleep(10)
+        now = conditions()
+    return first, now
+
+
 def run_rep(
     label: str,
     info: dict[str, str],
@@ -446,13 +508,14 @@ def run_rep(
     rclone: Path,
     index: int,
     native_only: bool,
+    state: dict[str, object],
 ) -> dict[str, object]:
     root = work / "reps" / f"rep{index}-{label}-{info['sha'][:12]}"
     logs = work / "logs"
     before = conditions()
     if not args.dry_run and not before["ok"]:
         raise Abort(f"rep{index} {label} precondition failed: {before}")
-    cache = residency(Path(info["binary"]), corpus)
+    source_cache = residency(Path(info["binary"]), corpus)
     command = [
         info["binary"],
         "--corpus-root",
@@ -468,21 +531,29 @@ def run_rep(
     if args.dry_run:
         command.append("--informational")
     say(
-        f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} power={before['power']} residency={cache}"
+        f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} "
+        f"power={before['power']} source_residency={source_cache}"
     )
     started = time.monotonic()
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     wall_s = time.monotonic() - started
     (logs / f"rep{index}-{label}.stdout").write_text(result.stdout)
     (logs / f"rep{index}-{label}.stderr").write_text(result.stderr)
-    after = conditions()
+    after, settled = post_settle(args)
     parsed = parse_bench(result.stdout)
     if "verdict" not in parsed:
         raise Abort(
             f"rep{index} {label} bench refused (exit {result.returncode}): "
             f"{result.stderr.strip().splitlines()[-1:]}"
         )
+    # The timed arms read the bench's private per-rep fixture, not the sealed
+    # source; its residency is measured after the rep (the bench is one process).
+    fixture = root / "native-sealed-fixture"
+    fixture_cache = (
+        residency(Path(info["binary"]), fixture) if fixture.is_dir() else None
+    )
     summary = summarize(parsed)
+    sealed = parsed["header"].get("sealed_corpus_blake3")
     rep = {
         "index": index,
         "label": label,
@@ -493,18 +564,53 @@ def run_rep(
         "wall_s": round(wall_s, 3),
         "conditions_before": before,
         "conditions_after": after,
-        "source_resident_fraction": cache,
+        "conditions_after_settled": settled,
+        "source_resident_fraction": source_cache,
+        "fixture_resident_fraction_after": fixture_cache,
+        "sealed_corpus_blake3": sealed,
         "summary": summary,
         "parsed": parsed,
     }
-    if not args.dry_run and (after["power"] != "ac" or not summary["all_gated"]):
+    problems = []
+    expected = state.setdefault("sealed_corpus_blake3", sealed)
+    if sealed is None or sealed != expected:
+        problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
+    if not args.dry_run:
+        if after["power"] != "ac" or settled["power"] != "ac":
+            problems.append(f"power={after['power']}/{settled['power']}")
+        if float(settled["load1"]) >= LOAD_LIMIT:
+            problems.append(
+                f"load1={settled['load1']} still >= {LOAD_LIMIT} after "
+                f"{args.post_settle_seconds}s (right after rep: {after['load1']})"
+            )
+        if not summary["all_gated"]:
+            problems.append("a bench row was gated=false")
+    if problems:
         rep["aborted"] = True
-        raise Abort(
-            f"rep{index} {label} post-check failed: power={after['power']} "
-            f"all_gated={summary['all_gated']}",
-            rep,
-        )
+        raise Abort(f"rep{index} {label} post-check failed: {'; '.join(problems)}", rep)
     return rep
+
+
+def gate_rollup(report: dict[str, object]) -> dict[str, object]:
+    """OI-1002-Q30: B passes R23 iff every B rep's bench verdict is pass."""
+    b_reps = [r for r in report["reps"] if r["label"] == "B"]
+    statuses = [r["summary"]["verdict"].get("status") for r in b_reps]
+    passed = sum(1 for status in statuses if status == "pass")
+    if report["mode"] == "dry-run":
+        verdict = "NOT A GATE SAMPLE"
+    elif report["status"] != "complete-draft":
+        verdict = "NONE (sample aborted or refused)"
+    elif b_reps and passed == len(b_reps):
+        verdict = "PASS"
+    else:
+        verdict = "FAIL"
+    return {
+        "rule": "B passes R23 iff every B rep's bench verdict passes; A is informational (OI-1002-Q30)",
+        "b_reps": len(b_reps),
+        "b_reps_pass": passed,
+        "b_statuses": statuses,
+        "verdict": verdict,
+    }
 
 
 def per_revision(reps: list[dict[str, object]], label: str) -> dict[str, object]:
@@ -549,10 +655,17 @@ def fmt(value: object, digits: int = 3) -> str:
 
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
+    aborted = report["status"] in ("aborted", "refused")
+    gate = report["gate"]
     lines = []
-    title = f"# R23 gate (a) A/B sample for #88 - {report['date']}"
-    lines.append(title + (f" ({NOT_GATE})" if dry else " (DRAFT)"))
-    lines.append("")
+    title = f"# R23 gate (a) B/A sample for #88 - {report['stamp']}"
+    if aborted:
+        title += " (ABORTED)"
+    elif dry:
+        title += f" ({NOT_GATE})"
+    else:
+        title += " (DRAFT)"
+    lines += [title, ""]
     if dry:
         lines += [
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
@@ -562,19 +675,30 @@ def evidence(report: dict[str, object]) -> str:
         f"Status: **{report['status']}**"
         + (f" - {report['reason']}" if report.get("reason") else ""),
         "",
+        f"**R23 gate verdict for B: {gate['verdict']}** ({gate['b_reps_pass']}/"
+        f"{gate['b_reps']} B reps pass). Rule: {gate['rule']}.",
+        "",
         f"Rulings: {RULINGS}. Harness: `crates/bulkload-bench/scripts/r23_ab.py`.",
         "",
         "## Identity",
         "",
         f"- Host: `{report['host']}` ({report['platform']}); mode `{report['mode']}`;"
-        f" coordinator-quiet acknowledged: `{report['coordinator_quiet']}` (R-N91).",
-        f"- Corpus: `{report['corpus']}`, {fmt(report['corpus_files'])} regular files,"
-        f" {fmt(report['corpus_bytes'])} bytes; sealed identity"
+        f" order `{report['pattern']}`; coordinator-quiet acknowledged:"
+        f" `{report['coordinator_quiet']}` (R-N91).",
+        f"- Sealed corpus: `{report['sealed_corpus']}`. Working copy read by the bench:"
+        f" `{report['corpus']}`, {fmt(report['corpus_files'])} regular files,"
+        f" {fmt(report['corpus_bytes'])} bytes.",
+        f"- Content identity `{report['content_identity']}`; content_verified before:"
+        f" `{report['content_verified_before']}`, after the last rep:"
+        f" `{report.get('content_verified_after', 'n/a')}`.",
+        f"- Bench stat identity (`sealed_corpus_blake3`, must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
         f"- Work root: `{report['work_root']}`.",
         f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
         "- Page cache: never dropped. The bench reads the whole source (BLAKE3) before"
-        " every arm, so every timed arm starts source-hot; residency is logged per rep.",
+        " every arm, so every timed arm starts source-hot. Residency is logged for the"
+        " working copy before each rep and for the rep's private fixture (what the timed"
+        " arms read) right after it.",
         "- Destinations: a new work root per repetition and a new destination per arm.",
         "",
         "| label | rev | sha | binary sha256 |",
@@ -586,49 +710,69 @@ def evidence(report: dict[str, object]) -> str:
         )
     lines += [
         "",
+        "## Per-rep bench verdicts",
+        "",
+        "| # | label | verdict | r23 initial win | r23 delta win | r25 warm zero |"
+        " r25 interrupted zero | rss < 2 GiB |",
+        "|---:|---|---|---|---|---|---|---|",
+    ]
+    for rep in report["reps"]:
+        v = rep["summary"]["verdict"]
+        lines.append(
+            f"| {rep['index']} | {rep['label']} | {v.get('status', 'n/a')} |"
+            f" {v.get('r23_initial_win', 'n/a')} | {v.get('r23_delta_win', 'n/a')} |"
+            f" {v.get('r25_warm_zero', 'n/a')} | {v.get('r25_interrupted_zero', 'n/a')} |"
+            f" {v.get('native_rss_below_2gib', 'n/a')} |"
+        )
+    lines += [
+        "",
         "## Repetitions",
         "",
-        "| # | label | load1 before/after | power | residency | native initial median ms |"
-        " rclone initial median ms | flush_barrier_ns | flush_full_ns | stall share | files/s |"
-        " bytes received | gated |",
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| # | label | load1 before/after/settled | power | residency source/fixture |"
+        " native initial median ms | rclone initial median ms | flush_barrier_ns |"
+        " flush_full_ns | stall share | files/s | bytes received | gated |",
+        "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for rep in report["reps"]:
         s = rep["summary"]
         lines.append(
             f"| {rep['index']} | {rep['label']} | {rep['conditions_before']['load1']}/"
-            f"{rep['conditions_after']['load1']} | {rep['conditions_before']['power']} |"
-            f" {fmt(rep['source_resident_fraction'])} | {fmt(s['native_initial_median_ms'])} |"
+            f"{rep['conditions_after']['load1']}/{rep['conditions_after_settled']['load1']} |"
+            f" {rep['conditions_before']['power']} | {fmt(rep['source_resident_fraction'])}/"
+            f"{fmt(rep['fixture_resident_fraction_after'])} | {fmt(s['native_initial_median_ms'])} |"
             f" {fmt(s['rclone_initial_median_ms'])} | {fmt(s['flush_barrier_ns_total'])} |"
             f" {fmt(s['flush_full_ns_total'])} | {fmt(s['receive_stall_share_of_wall'], 4)} |"
             f" {fmt(s['files_per_s_median'], 1)} | {fmt(s['bytes_received_median'], 0)} |"
             f" {s['all_gated']} |"
         )
+    if not aborted:
+        lines += [
+            "",
+            "## Medians per revision",
+            "",
+            "| metric | B | A (informational) |",
+            "|---|---:|---:|",
+        ]
+        medians = report["per_revision"]
+        for key in medians.get("B", {}):
+            lines.append(
+                f"| {key} | {fmt(medians['B'][key])} | {fmt(medians.get('A', {}).get(key))} |"
+            )
+        dedup = report.get("dedup", {})
+        lines += [
+            "",
+            "## Dedup loss (#88)",
+            "",
+            f"- Payload P: {fmt(dedup.get('payload_bytes'))} bytes.",
+            f"- v4 reference ({report['builds'].get('V4', {}).get('rev', 'skipped')}) bytes received"
+            f" (unique chunk bytes U): {fmt(dedup.get('v4_bytes_received'), 0)}.",
+            f"- B bytes received: {fmt(dedup.get('b_bytes_received'), 0)}; duplicate share"
+            f" (B - U) / P: {fmt(dedup.get('b_dup_share'), 4)}.",
+            f"- A bytes received: {fmt(dedup.get('a_bytes_received'), 0)}; duplicate share"
+            f" (A - U) / P: {fmt(dedup.get('a_dup_share'), 4)}.",
+            f"- v4 native initial ms (one rep): {fmt(dedup.get('v4_native_initial_ms'))}.",
+        ]
     lines += [
-        "",
-        "## Medians per revision",
-        "",
-        "| metric | A | B |",
-        "|---|---:|---:|",
-    ]
-    medians = report["per_revision"]
-    for key in medians.get("A", {}):
-        lines.append(
-            f"| {key} | {fmt(medians['A'][key])} | {fmt(medians.get('B', {}).get(key))} |"
-        )
-    dedup = report.get("dedup", {})
-    lines += [
-        "",
-        "## Dedup loss (#88)",
-        "",
-        f"- Payload P: {fmt(dedup.get('payload_bytes'))} bytes.",
-        f"- v4 reference ({report['builds'].get('V4', {}).get('rev', 'skipped')}) bytes received"
-        f" (unique chunk bytes U): {fmt(dedup.get('v4_bytes_received'), 0)}.",
-        f"- B bytes received: {fmt(dedup.get('b_bytes_received'), 0)}; duplicate share"
-        f" (B - U) / P: {fmt(dedup.get('b_dup_share'), 4)}.",
-        f"- A bytes received: {fmt(dedup.get('a_bytes_received'), 0)}; duplicate share"
-        f" (A - U) / P: {fmt(dedup.get('a_dup_share'), 4)}.",
-        f"- v4 native initial ms (one rep): {fmt(dedup.get('v4_native_initial_ms'))}.",
         "",
         "## Notes",
         "",
@@ -648,7 +792,7 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
     builds = report["builds"]
     reps = report["reps"]
     report["per_revision"] = {
-        label: per_revision(reps, label) for label in ("A", "B") if label in builds
+        label: per_revision(reps, label) for label in ("B", "A") if label in builds
     }
     v4 = next((r for r in reps if r["label"] == "V4"), None)
     payload = next(
@@ -671,12 +815,32 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
         header = first["parsed"]["header"]
         report["sealed_identity"] = header.get("sealed_corpus_blake3")
         report["rclone_version"] = header.get("rclone_version")
+    report["gate"] = gate_rollup(report)
     (work / "r23-ab.json").write_text(json.dumps(report, indent=2, default=str))
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(evidence(report))
     say(
-        f"status={report['status']} json={work / 'r23-ab.json'} evidence={evidence_path}"
+        f"status={report['status']} gate={report['gate']['verdict']} "
+        f"json={work / 'r23-ab.json'} evidence={evidence_path}"
     )
+
+
+def working_copy(sealed: Path, work: Path) -> Path:
+    """Copy the (read-only) sealed corpus into the work root, writable.
+
+    The bench copies its source into a private fixture with modes preserved
+    and then mutates that fixture for the 1 % delta, so it cannot read a
+    0444/0555 sealed tree directly. The copy keeps mtimes and gets 0644/0755.
+    """
+    corpus = work / "corpus"
+    shutil.copytree(sealed, corpus, symlinks=True)
+    for dirpath, dirs, names in os.walk(corpus):
+        for name in dirs:
+            (Path(dirpath) / name).chmod(0o755)
+        for name in names:
+            (Path(dirpath) / name).chmod(0o644)
+    corpus.chmod(0o755)
+    return corpus
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -696,14 +860,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--rev-v4", default=DEFAULT_V4, help="'' skips the dedup reference"
     )
-    parser.add_argument("--pattern", default="ABABA")
+    parser.add_argument("--pattern", default=DEFAULT_PATTERN)
     parser.add_argument("--build-root", help="default: <repo>/target/r23-ab")
     parser.add_argument("--build-jobs", type=int, default=4)
     parser.add_argument("--settle-seconds", type=int, default=900)
+    parser.add_argument("--post-settle-seconds", type=int, default=180)
     parser.add_argument("--expect-files", type=int, default=RECORD_FILES)
     parser.add_argument("--expect-bytes", type=int, default=RECORD_BYTES)
     parser.add_argument(
-        "--evidence", help="default: docs/evidence/r23-<date>.md (dry run: work root)"
+        "--evidence",
+        help="default: docs/evidence/r23-<date>-<HHMM>Z.md (dry run: work root)",
     )
     parser.add_argument(
         "--coordinator-quiet",
@@ -715,13 +881,16 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = Path(args.repo).resolve()
     work = Path(args.work_root).resolve()
-    date = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+    now_utc = dt.datetime.now(dt.UTC)
+    date = now_utc.strftime("%Y-%m-%d")
+    stamp = now_utc.strftime("%Y-%m-%d-%H%MZ")
     if work.exists() or not work.parent.is_dir():
         say(f"refused: work root must be new under an existing parent: {work}")
         return 2
-    if not set(args.pattern) <= {"A", "B"} or not args.pattern:
-        say("refused: --pattern uses only A and B")
+    if not set(args.pattern) <= {"A", "B"} or "B" not in args.pattern:
+        say("refused: --pattern uses only A and B and needs at least one B")
         return 2
+    sealed = Path(args.corpus).resolve()
     if not args.dry_run:
         if platform.system() != "Darwin":
             say(
@@ -731,29 +900,32 @@ def main(argv: list[str] | None = None) -> int:
         if not args.coordinator_quiet:
             say("refused: --coordinator-quiet is required (R-N91)")
             return 2
-        if not args.corpus:
-            say("refused: --corpus is required")
+        if (args.expect_files, args.expect_bytes) != (RECORD_FILES, RECORD_BYTES):
+            say("refused: gated mode only runs R23 corpus v1 (default --expect-*)")
             return 2
-        files, size = corpus_shape(Path(args.corpus))
-        if (files, size) != (args.expect_files, args.expect_bytes):
+        files, size = corpus_shape(sealed)
+        if (files, size) != (RECORD_FILES, RECORD_BYTES):
             say(
                 f"refused: corpus shape {files} files/{size} bytes, expected "
-                f"{args.expect_files}/{args.expect_bytes}"
+                f"{RECORD_FILES}/{RECORD_BYTES}"
             )
             return 2
-        if (args.expect_files, args.expect_bytes) == (RECORD_FILES, RECORD_BYTES):
-            if corpus_verify(Path(args.corpus)) != 0:
-                say("refused: corpus does not match r23_corpus.manifest.tsv")
-                return 2
+        if corpus_verify(sealed) != 0:
+            say(f"refused: sealed corpus does not verify to {CONTENT_IDENTITY}")
+            return 2
+    evidence_dir = (repo / "docs" / "evidence").resolve()
     evidence_path = (
-        Path(args.evidence)
+        Path(args.evidence).resolve()
         if args.evidence
         else (
-            work / f"r23-dryrun-{date}.md"
+            work / f"r23-dryrun-{stamp}.md"
             if args.dry_run
-            else repo / "docs" / "evidence" / f"r23-{date}.md"
+            else evidence_dir / f"r23-{stamp}.md"
         )
     )
+    if args.dry_run and evidence_path.is_relative_to(evidence_dir):
+        say("refused: dry-run evidence never goes under docs/evidence")
+        return 2
     if evidence_path.exists():
         say(f"refused: evidence file exists: {evidence_path}")
         return 2
@@ -761,32 +933,43 @@ def main(argv: list[str] | None = None) -> int:
     work.mkdir(mode=0o700)
     (work / "logs").mkdir()
     (work / "reps").mkdir()
+    (work / "build-src").mkdir()
     if args.dry_run:
         corpus = work / "corpus"
         synthetic_corpus(corpus)
+        verified_before: object = "n/a (synthetic dry-run corpus)"
     else:
-        corpus = Path(args.corpus).resolve()
+        corpus = working_copy(sealed, work)
+        if corpus_verify(corpus) != 0:
+            say("refused: the working copy does not verify")
+            return 2
+        verified_before = True
     files, size = corpus_shape(corpus)
     build_root = (
         Path(args.build_root) if args.build_root else repo / "target" / "r23-ab"
     )
     build_root.mkdir(parents=True, exist_ok=True)
+    scratch = work / "build-src"
     builds = {
-        "A": build(repo, args.rev_a, build_root, args.build_jobs),
-        "B": build(repo, args.rev_b, build_root, args.build_jobs),
+        "B": build(repo, args.rev_b, build_root, scratch, args.build_jobs),
+        "A": build(repo, args.rev_a, build_root, scratch, args.build_jobs),
     }
     if args.rev_v4:
-        builds["V4"] = build(repo, args.rev_v4, build_root, args.build_jobs)
+        builds["V4"] = build(repo, args.rev_v4, build_root, scratch, args.build_jobs)
     rclone = resolve_rclone(repo, args.rclone)
     report: dict[str, object] = {
         "date": date,
+        "stamp": stamp,
         "mode": "dry-run" if args.dry_run else "gated",
         "host": platform.node(),
         "platform": platform.platform(),
         "coordinator_quiet": args.coordinator_quiet,
+        "sealed_corpus": str(sealed) if not args.dry_run else "n/a (synthetic)",
         "corpus": str(corpus),
         "corpus_files": files,
         "corpus_bytes": size,
+        "content_identity": CONTENT_IDENTITY if not args.dry_run else "n/a (synthetic)",
+        "content_verified_before": verified_before,
         "work_root": str(work),
         "rclone": str(rclone),
         "builds": builds,
@@ -810,13 +993,27 @@ def main(argv: list[str] | None = None) -> int:
     order = [(label, False) for label in args.pattern]
     if args.rev_v4:
         order.append(("V4", True))
+    state: dict[str, object] = {}
     try:
         for index, (label, native_only) in enumerate(order):
             report["reps"].append(
                 run_rep(
-                    label, builds[label], args, work, corpus, rclone, index, native_only
+                    label,
+                    builds[label],
+                    args,
+                    work,
+                    corpus,
+                    rclone,
+                    index,
+                    native_only,
+                    state,
                 )
             )
+        if not args.dry_run:
+            after = corpus_verify(corpus) == 0 and corpus_verify(sealed) == 0
+            report["content_verified_after"] = after
+            if not after:
+                raise Abort("corpus no longer verifies after the last rep")
     except Abort as reason:
         if reason.rep is not None:
             report["reps"].append(reason.rep)
