@@ -94,6 +94,32 @@ pub(crate) fn hash_file_observed(path: &Path, expected: &StatIdentity) -> HashRe
     }
 }
 
+/// As [`hash_file_observed`], for `rel` opened component by component beneath
+/// the `root` descriptor (W4 PR 3): no symlink anywhere in `rel` is followed.
+pub(crate) fn hash_beneath_observed(
+    root: std::os::fd::BorrowedFd<'_>,
+    rel: &Path,
+    expected: &StatIdentity,
+) -> HashRead {
+    let mut bytes_read = 0;
+    let mut metadata_checks = 0;
+    let digest = crate::io::sys::openat_beneath(root, rel, crate::io::OpenMode::Read)
+        .map_err(BulkloadRefusal::from)
+        .and_then(|fd| {
+            hash_open_file(
+                File::from(fd),
+                expected,
+                &mut bytes_read,
+                &mut metadata_checks,
+            )
+        });
+    HashRead {
+        digest,
+        bytes_read,
+        metadata_checks,
+    }
+}
+
 fn hash_open_file(
     mut file: File,
     expected: &StatIdentity,

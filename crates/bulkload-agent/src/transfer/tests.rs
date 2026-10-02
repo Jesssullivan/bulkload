@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::freshness::NullCache;
+use crate::walk::{walk, WalkOptions};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -985,5 +987,78 @@ fn interrupted_directory_mode_finalization_resumes_only_its_owned_inode() {
             .mode()
             & 0o777,
         0o555
+    );
+}
+
+/// W4 PR 3: every source read resolves component by component beneath the
+/// root descriptor. An intermediate directory replaced by a symlink to a
+/// hard link of the same inode outside the root would pass the stat-identity
+/// check through a path open; the source refuses it before reading a byte.
+#[test]
+fn a_source_read_never_follows_a_swapped_directory() {
+    let corpus = Corpus::new();
+    let source = std::fs::canonicalize(corpus.base.join("source")).unwrap();
+    let outside = corpus.base.join("outside");
+    std::fs::create_dir(source.join("dir")).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(source.join("dir/file"), noise(7, 4096)).unwrap();
+    std::fs::hard_link(source.join("dir/file"), outside.join("file")).unwrap();
+    let row = walk(&WalkOptions::new(source.clone()), &mut NullCache)
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|row| row.rel_path == b"dir/file")
+        .unwrap();
+    std::fs::rename(source.join("dir"), source.join("moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("dir")).unwrap();
+    let root_fd = crate::io::sys::open_root(&source).unwrap();
+    let credit = Credit::new();
+    let work = SourceWork {
+        root: &source,
+        root_fd: root_fd.as_fd(),
+        authority: b"authority",
+        state: &corpus.base,
+        credit: &credit,
+        retain: Arc::new(AtomicU64::new(0)),
+    };
+    let mut bytes_read = 0;
+    let refused = capture_file(&work, &row, &mut bytes_read, |_, _, _, _| {
+        panic!("no chunk may be read through the symlink")
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            BulkloadRefusal::Io(Some(libc::ENOTDIR | libc::ELOOP))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(bytes_read, 0);
+    assert!(open_source(&work, &row).is_err());
+}
+
+/// W4 PR 3: the walk runs at most `WALK_AHEAD` items ahead of the wire and
+/// waits for slots; a source with more items than that still completes.
+#[test]
+fn a_walk_longer_than_the_walk_ahead_bound_completes() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    let temporaries = WALK_AHEAD + 64;
+    for serial in 0..temporaries {
+        std::fs::write(
+            source.join(format!(".bulkload-0123456789abcdef-1-{serial}")),
+            b"",
+        )
+        .unwrap();
+    }
+    std::fs::create_dir(source.join("tail")).unwrap();
+    std::fs::write(source.join("tail/file"), b"carried").unwrap();
+    let stats = corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(stats.source_engine_temporaries.len(), temporaries);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/tail/file")).unwrap(),
+        b"carried"
     );
 }

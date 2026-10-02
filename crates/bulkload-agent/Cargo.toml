@@ -58,7 +58,6 @@ serde = { workspace = true }
 postcard = { workspace = true }
 libc = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
-ignore = { workspace = true }
 crc32c = { workspace = true }
 
 [dev-dependencies]

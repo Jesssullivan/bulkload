@@ -68,10 +68,6 @@ pub(super) fn openat_raw(
 ///
 /// # Errors
 /// `InvalidInput` for a path with a NUL, otherwise the `open` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid_input())?;
     loop {
@@ -101,10 +97,6 @@ pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
 /// # Errors
 /// `InvalidInput` for an empty path, an absolute path, a `..` component or a
 /// NUL byte; otherwise the failing `openat`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn openat_beneath(root: impl AsFd, rel: &Path, mode: OpenMode) -> io::Result<OwnedFd> {
     let mut names: Vec<&OsStr> = Vec::new();
     for component in rel.components() {
@@ -264,10 +256,6 @@ pub fn fstatat_nofollow(dir: impl AsFd, name: &CStr) -> io::Result<Stat> {
 /// # Errors
 /// Returns the `pread` failure, or `InvalidInput` for an offset past
 /// `i64::MAX`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn pread_full(fd: impl AsFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let raw = fd.as_fd().as_raw_fd();
     let mut done = 0_usize;

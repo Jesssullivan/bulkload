@@ -24,7 +24,6 @@ blake3 = { version = "1" }
 fastcdc = { version = "3" }
 libc = { version = "0.2" }
 rusqlite = { version = "0.32", features = ["bundled"] }
-ignore = { version = "0.4" }
 crc32c = { version = "0.6" }
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = { version = "3" }

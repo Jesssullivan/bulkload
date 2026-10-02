@@ -198,7 +198,10 @@ impl Stat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+    allow(
+        dead_code,
+        reason = "the source reads with `Read` (W4 PR 3); tests use the others"
+    )
 )]
 pub enum OpenMode {
     /// Read only, `O_NONBLOCK` so a FIFO swapped in cannot block the reader.
