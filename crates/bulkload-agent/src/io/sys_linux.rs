@@ -31,10 +31,22 @@ pub(super) fn stat_from_raw(raw: &libc::stat) -> Stat {
         },
         mode: raw.st_mode,
         nlink: u64::from(raw.st_nlink),
+        uid: raw.st_uid,
         size: u64::try_from(raw.st_size).unwrap_or(0),
         mtime_ns: i128::from(raw.st_mtime) * 1_000_000_000 + i128::from(raw.st_mtime_nsec),
         ctime_ns: i128::from(raw.st_ctime) * 1_000_000_000 + i128::from(raw.st_ctime_nsec),
     }
+}
+
+/// Zero this thread's `errno`, so a NULL from `readdir` tells the end of the
+/// stream apart from an error.
+pub(super) fn clear_errno() {
+    // SAFETY: `__errno_location` takes no arguments and returns this thread's
+    // errno slot.
+    let slot = unsafe { libc::__errno_location() };
+    // SAFETY: `slot` is this thread's errno, a valid, aligned `c_int` that
+    // lives as long as the thread.
+    unsafe { *slot = 0 };
 }
 
 /// Permission bits as Linux's 32-bit `mode_t`.
@@ -120,6 +132,10 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns the `sync_file_range` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     trace_serial!();
     let fd = file.as_fd();
@@ -146,6 +162,10 @@ pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
 ///
 /// # Errors
 /// Returns the rename failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
     let directory = directory.as_fd();
     rename_noreplace_at(directory, from, directory, to)
@@ -157,6 +177,10 @@ pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Res
 ///
 /// # Errors
 /// Returns the rename, link or unlink failure; an occupied `to` is `EEXIST`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn rename_noreplace_at(
     from_dir: impl AsFd,
     from: &CStr,
@@ -229,6 +253,10 @@ pub fn rename_exclusive_at(
 /// Whether `/proc/self/fd` is reachable, probed once per process. Without it
 /// an `O_TMPFILE` inode could not be given a name, so staging uses a named
 /// temporary instead.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 fn proc_fd_reachable() -> bool {
     static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REACHABLE.get_or_init(|| std::fs::metadata("/proc/self/fd").is_ok_and(|meta| meta.is_dir()))
@@ -241,6 +269,10 @@ fn proc_fd_reachable() -> bool {
 ///
 /// # Errors
 /// Returns any other `openat` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd>> {
     if !proc_fd_reachable() {
         return Ok(None);
@@ -285,6 +317,10 @@ pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd
 ///
 /// # Errors
 /// Returns the `linkat` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<()> {
     trace_serial!();
     let (fd, dir) = (file.as_fd(), dir.as_fd());
@@ -320,6 +356,10 @@ pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<
 ///
 /// # Errors
 /// Returns any other `fallocate` failure.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
     let fd = file.as_fd();
     let len = to_off_t(len)?;
@@ -339,6 +379,10 @@ pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
 ///
 /// # Errors
 /// Returns the error number `posix_fadvise` reports.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     let fd = file.as_fd();
     // SAFETY: the descriptor is live for the call; `posix_fadvise` takes no
@@ -365,6 +409,10 @@ pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     clippy::unnecessary_wraps,
     reason = "the signature matches Darwin's pthread_set_qos_class_self_np"
 )]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+)]
 pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
     Ok(false)
 }
@@ -376,6 +424,10 @@ pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
 #[allow(
     clippy::unnecessary_wraps,
     reason = "the signature matches Darwin's pthread_get_qos_class_np"
+)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
 )]
 pub const fn thread_qos() -> io::Result<Option<Qos>> {
     Ok(None)

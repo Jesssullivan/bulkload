@@ -46,9 +46,8 @@
 //! checks each listed test's ignore reason:
 //!
 //! - `live_writer_*_leaves_no_source_pack_bytes` (four, R-N86): a refused
-//!   capture leaves the victim's bytes, unindexed, in the source pack.
-//! - `directory_after_fallback_mkdir` (R-N119): without a no-replace rename,
-//!   a crash between the fallback `mkdirat` and its record never converges.
+//!   capture leaves the victim's bytes, unindexed, in the source pack. W4
+//!   PR 2 removes the source pack (R-N58).
 //!
 //! # Hung scenarios
 //!
@@ -89,7 +88,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bulkload_agent::fault::{
-    parse, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE, FAULT_RECEIPT_ENV, GROUP_FILES_ENV,
+    parse, parse_group_limits, set_mid_read_hook, Point, FAULT_ENV, FAULT_EXIT_CODE,
+    FAULT_RECEIPT_ENV, GROUP_DESTINATION_ENV, GROUP_FILES_ENV, GROUP_SOURCE_ENV,
 };
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
@@ -455,7 +455,13 @@ fn source_files(scratch: &Scratch) -> BTreeMap<Vec<u8>, u64> {
 /// publication group's composition for a publication point. A `mid` child
 /// closes every group at one file, so `nth` hits of the group points land at
 /// an exact place; a first-hit child keeps the default grouping.
-fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Option<String> {
+fn crash_child(
+    scratch: &Scratch,
+    point: Point,
+    label: &str,
+    mid: bool,
+    envs: &[(&str, &str)],
+) -> Option<String> {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -473,6 +479,7 @@ fn crash_child(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Optio
         .env(FAULT_ENV, label)
         .env(FAULT_RECEIPT_ENV, scratch.base.join("receipt"))
         .env(GROUP_FILES_ENV, if mid { "1" } else { "" })
+        .envs(envs.iter().copied())
         .envs(
             (point == Point::DirectoryAfterFallbackMkdir).then_some((RENAME_UNSUPPORTED_ENV, "1")),
         )
@@ -656,12 +663,25 @@ const fn leaves_temporary(point: Point) -> bool {
 }
 
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
+    crash_resume_with(point, nth, fixture, &[], |_| {});
+}
+
+/// [`crash_resume`] with extra environment for the crash child, and a check
+/// of the crash state before the resume.
+fn crash_resume_with(
+    point: Point,
+    nth: u64,
+    fixture: Fixture,
+    envs: &[(&str, &str)],
+    check_before: impl FnOnce(&CrashState),
+) {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    let group = crash_child(&scratch, point, &label, nth > 1);
+    let group = crash_child(&scratch, point, &label, nth > 1, envs);
 
     let before = crash_state(&scratch);
+    check_before(&before);
     assert_i1(&label, &scratch, &before);
     let crash_temporaries = assert_i2(&label, &scratch);
 
@@ -838,6 +858,10 @@ scenarios! {
     directory_after_pending_record => DirectoryAfterPendingRecord: 1, NO_REFUSAL;
     directory_after_rename => DirectoryAfterRename: 1, NO_REFUSAL;
     directory_before_complete => DirectoryBeforeComplete: 1, NO_REFUSAL;
+    // R-N119: the child's exclusive renames report EINVAL, so directories
+    // take the mkdirat fallback; its intent record, committed first, lets the
+    // resume adopt the directory the crash left.
+    directory_after_fallback_mkdir => DirectoryAfterFallbackMkdir: 1, NO_REFUSAL;
     serve_after_content_mid => ServeAfterContent: 25, WITH_REFUSAL;
     serve_before_done => ServeBeforeDone: 1, WITH_REFUSAL;
     receive_after_want_files_first => ReceiveAfterWantFiles: 1, WITH_REFUSAL;
@@ -877,13 +901,59 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
     assert_eq!(parse(""), None);
 }
 
+#[test]
+fn per_side_group_limits_parse_files_and_idle() {
+    assert_eq!(parse_group_limits("1"), Some((1, None)));
+    assert_eq!(
+        parse_group_limits("64:600000"),
+        Some((64, Some(Duration::from_mins(10))))
+    );
+    assert_eq!(parse_group_limits("0"), None);
+    assert_eq!(parse_group_limits("x"), None);
+    assert_eq!(parse_group_limits("4:"), None);
+    assert_eq!(parse_group_limits(""), None);
+}
+
+/// PR #59 review, F3: the relaxed I1 branch, deterministically. The source
+/// holds every capture in one group that no idle timer closes, while the
+/// destination commits each output as its own group. At the third output
+/// commit, outputs are recorded whose captures never committed; I1 accepts
+/// them against the source's bytes, and the resume must reuse them without
+/// reading the source.
+#[test]
+fn outputs_recorded_before_their_captures_resume() {
+    crash_resume_with(
+        Point::PublishDestinationAfterCommit,
+        3,
+        NO_REFUSAL,
+        &[
+            (GROUP_SOURCE_ENV, "100000:600000"),
+            (GROUP_DESTINATION_ENV, "1"),
+        ],
+        |before| {
+            let early = before
+                .outputs
+                .keys()
+                .filter(|path| !before.captures.contains_key(*path))
+                .count();
+            assert!(
+                early >= 3,
+                "the relaxed I1 branch must be hit: {early} outputs recorded before their \
+                 captures ({} outputs, {} captures)",
+                before.outputs.len(),
+                before.captures.len()
+            );
+        },
+    );
+}
+
 /// The `#[ignore]` reason every known-violation test carries, verbatim prefix.
 const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 
 /// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
 /// today, with the fault point each one is the only scenario for, if any.
 /// Listed, never counted as coverage.
-const KNOWN_VIOLATIONS: [(&str, Option<Point>); 5] = [
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 4] = [
     // R-N86: a refused capture leaves unindexed bytes in the source pack.
     (
         "live_writer_in_place_overwrite_leaves_no_source_pack_bytes",
@@ -897,11 +967,6 @@ const KNOWN_VIOLATIONS: [(&str, Option<Point>); 5] = [
     (
         "live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes",
         None,
-    ),
-    // R-N119: the mkdirat fallback has a crash window with no record.
-    (
-        "directory_after_fallback_mkdir",
-        Some(Point::DirectoryAfterFallbackMkdir),
     ),
 ];
 
@@ -1003,16 +1068,6 @@ fn every_fault_point_has_a_scenario() {
     }
 }
 
-/// Known violation (R-N119). Without a no-replace rename, a directory is
-/// created by `mkdirat` at its final name and recorded after; a crash in
-/// between leaves an unrecorded 0700 directory that the resume refuses
-/// `GIT_DESTINATION_OCCUPIED`, so the carry never converges.
-#[test]
-#[ignore = "known violation (R-N119): the mkdirat fallback leaves an unrecorded directory on a crash before its record"]
-fn directory_after_fallback_mkdir() {
-    crash_resume(Point::DirectoryAfterFallbackMkdir, 1, NO_REFUSAL);
-}
-
 /// R-N79: after `materialize.after_temp_seal` each staged file not yet
 /// renamed is an orphan under a tagged temporary name. A walk of the crashed
 /// destination records each and never carries it, onward carry included; the
@@ -1023,7 +1078,7 @@ fn materialize_after_temp_seal_sweeps_only_temporaries() {
     let label = format!("{}:25", Point::MaterializeAfterTempSeal.name());
     let scratch = Scratch::new("after-temp-seal-sweep");
     populate(&scratch.source(), WITH_REFUSAL);
-    crash_child(&scratch, Point::MaterializeAfterTempSeal, &label, true);
+    crash_child(&scratch, Point::MaterializeAfterTempSeal, &label, true, &[]);
 
     let destination = scratch.destination();
     let crashed = tree(&destination);

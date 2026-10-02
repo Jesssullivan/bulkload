@@ -197,51 +197,49 @@ pub fn timed(
     result
 }
 
-/// `sync_all` a regular file (`F_FULLFSYNC` on Darwin), counted as `flush_full`.
+/// `sync_all` a regular file (`F_FULLFSYNC` on Darwin, `fsync` elsewhere),
+/// counted as `flush_full`. Goes through `io::sys`, so the R-N88 trace sees it.
 ///
 /// # Errors
 /// Returns the flush failure.
 pub fn sync_full(file: &File) -> std::io::Result<()> {
-    timed(Counter::FlushFull, Counter::FlushFullNs, || file.sync_all())
+    timed(Counter::FlushFull, Counter::FlushFullNs, || {
+        crate::io::sys::full_flush(file)
+    })
 }
 
-/// `sync_data` a regular file, counted as `flush_fdatasync`.
+/// `sync_data` a regular file, counted as `flush_fdatasync`: `fdatasync` on
+/// Linux; on Darwin, as the standard library does, `F_FULLFSYNC`.
 ///
 /// # Errors
 /// Returns the flush failure.
 pub fn sync_data(file: &File) -> std::io::Result<()> {
     timed(Counter::FlushFdatasync, Counter::FlushFdatasyncNs, || {
-        file.sync_data()
+        data_sync(file)
     })
+}
+
+#[cfg(target_os = "linux")]
+fn data_sync(file: &File) -> std::io::Result<()> {
+    crate::io::sys::data_sync(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn data_sync(file: &File) -> std::io::Result<()> {
+    crate::io::sys::full_flush(file)
 }
 
 /// `fcntl(F_BARRIERFSYNC)` a regular file, counted as `flush_barrier`.
 ///
 /// Orders the file's writes before later writes without draining the device
-/// cache. Other platforms fall back to `sync_data`, still counted here.
+/// cache. On Linux `sys::barrier` is `fdatasync`, still counted here.
 ///
 /// # Errors
 /// Returns the flush failure.
 pub fn sync_barrier(file: &File) -> std::io::Result<()> {
     timed(Counter::FlushBarrier, Counter::FlushBarrierNs, || {
-        barrier(file)
+        crate::io::sys::barrier(file)
     })
-}
-
-#[cfg(target_vendor = "apple")]
-fn barrier(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: the descriptor is owned by `file`, which outlives the call, and
-    // F_BARRIERFSYNC takes no argument beyond the command.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn barrier(file: &File) -> std::io::Result<()> {
-    file.sync_data()
 }
 
 /// `sync_all` a directory descriptor, counted as `flush_dir`.
@@ -250,7 +248,7 @@ fn barrier(file: &File) -> std::io::Result<()> {
 /// Returns the flush failure.
 pub fn sync_dir(directory: &File) -> std::io::Result<()> {
     timed(Counter::FlushDir, Counter::FlushDirNs, || {
-        directory.sync_all()
+        crate::io::sys::full_flush(directory)
     })
 }
 

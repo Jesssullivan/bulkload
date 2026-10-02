@@ -139,6 +139,45 @@ pub const FAULT_RECEIPT_ENV: &str = "BULKLOAD_FAULT_RECEIPT";
 /// Optional group size, in files, for every committer (see "Group size").
 pub const GROUP_FILES_ENV: &str = "BULKLOAD_FAULT_GROUP_FILES";
 
+/// Optional group limits for the source store's committer (F3).
+///
+/// The value is `<files>[:<idle_ms>]`. It overrides [`GROUP_FILES_ENV`] on
+/// that side, so a scenario can, for example, hold every capture until the
+/// end while outputs commit one at a time (PR #59 review).
+pub const GROUP_SOURCE_ENV: &str = "BULKLOAD_FAULT_GROUP_SOURCE";
+
+/// As [`GROUP_SOURCE_ENV`], for the destination store's committer.
+pub const GROUP_DESTINATION_ENV: &str = "BULKLOAD_FAULT_GROUP_DESTINATION";
+
+/// The per-side group limits asked for: `(files, idle)`. `None` when unset or
+/// malformed (zero files, or a non-numeric part).
+#[must_use]
+pub fn side_group(
+    side: crate::io::durable::GroupSide,
+) -> Option<(u64, Option<std::time::Duration>)> {
+    let name = match side {
+        crate::io::durable::GroupSide::Source => GROUP_SOURCE_ENV,
+        crate::io::durable::GroupSide::Destination => GROUP_DESTINATION_ENV,
+        crate::io::durable::GroupSide::Other => return None,
+    };
+    parse_group_limits(&std::env::var(name).ok()?)
+}
+
+/// Parse a per-side group value, `<files>[:<idle_ms>]`.
+#[must_use]
+pub fn parse_group_limits(value: &str) -> Option<(u64, Option<std::time::Duration>)> {
+    let (files, idle) = match value.split_once(':') {
+        Some((files, idle)) => (files, Some(idle)),
+        None => (value, None),
+    };
+    let files = files.parse().ok().filter(|files| *files > 0)?;
+    let idle = match idle {
+        Some(idle) => Some(std::time::Duration::from_millis(idle.parse().ok()?)),
+        None => None,
+    };
+    Some((files, idle))
+}
+
 /// The group size [`GROUP_FILES_ENV`] asks for, if it names a positive count.
 #[must_use]
 pub fn group_files() -> Option<u64> {

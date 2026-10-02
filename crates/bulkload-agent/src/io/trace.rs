@@ -1,11 +1,15 @@
 //! Syscall trace for the crash-state checker (R-N88).
 //!
 //! With the `io-trace` feature on, every mutating call in `io::sys` (write,
-//! sync, rename, link, unlink, mkdir, fchmod, create) appends one [`Event`]
-//! to the [`Recorder`] attached to the calling thread. The checker
-//! (`io::crash_check`, test-only) replays a trace into every crash state its
-//! persistence model allows. The event types also compile under `cfg(test)`
-//! without the feature, so the checker can be proven on hand-written traces.
+//! sync, rename, link, unlink, mkdir, symlink, fchmod, create) appends one
+//! [`Event`] to the recorder attached to the calling thread, or to the
+//! process-wide recorder when none is. The stores add one [`Event::Commit`]
+//! per `SQLite` commit, naming what the commit made durable. The checker
+//! (`io::crash_check`) replays a trace into every crash state its persistence
+//! model allows. With `io-trace` both modules are public, so the fault
+//! harness can check a real `copy`; a default build exports neither. The
+//! event types also compile under `cfg(test)` without the feature, so the
+//! checker can be proven on hand-written traces.
 //!
 //! An event names files and directories by inode identity ([`NodeId`], from
 //! `fstat` after the call) and entries by `(directory node, name bytes)`, so a
@@ -64,6 +68,20 @@ pub enum Event {
     SetMode { node: NodeId, mode: u32 },
     /// A sync call on `node`.
     Sync { node: NodeId, kind: SyncKind },
+    /// A new symbolic link `name` in `dir` holding `target` literally.
+    Symlink {
+        dir: NodeId,
+        name: Vec<u8>,
+        node: NodeId,
+        target: Vec<u8>,
+    },
+    /// A `SQLite` commit of the store rooted at `store` returned: every record
+    /// in `records` is durable from here on (`synchronous=FULL`). On Darwin
+    /// the commit's `F_FULLFSYNC` also drains the drive holding the store.
+    Commit {
+        store: NodeId,
+        records: Vec<CommitRecord>,
+    },
     /// A new name for an existing inode.
     Link {
         node: NodeId,
@@ -85,6 +103,24 @@ pub enum Event {
     Untraced { call: &'static str, error: String },
 }
 
+/// What one store commit recorded, as the checker's invariants read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitRecord {
+    /// A destination output: `rel_path` holds the source's bytes.
+    Output { rel_path: Vec<u8> },
+    /// A source capture (manifest) under the store's row key.
+    Capture { key: Vec<u8> },
+    /// A directory record bound to inode `node` with final `mode`, or, with
+    /// `node` `None`, an intent recorded before a fallback `mkdirat`.
+    DirectoryCreated {
+        key: Vec<u8>,
+        node: Option<NodeId>,
+        mode: u32,
+    },
+    /// A directory's final mode is durable and its record retired.
+    DirectoryComplete { key: Vec<u8> },
+}
+
 #[cfg(feature = "io-trace")]
 pub use recorder::{record, serialize};
 
@@ -103,6 +139,21 @@ pub mod recorder {
         idle: Condvar,
     }
 
+    /// The process-wide recorder, used by threads with none attached.
+    static PROCESS: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
+
+    /// The recorder for this thread: its own, else the process-wide one.
+    fn current() -> Option<Arc<Shared>> {
+        CURRENT
+            .with(|current| current.borrow().clone())
+            .or_else(|| {
+                PROCESS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })
+    }
+
     thread_local! {
         static CURRENT: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
         /// Nesting depth of traced calls on this thread (`barrier_dir` calls
@@ -110,11 +161,13 @@ pub mod recorder {
         static DEPTH: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// A shared, ordered event log. Attach it to every thread whose calls
-    /// belong to the trace (a committer thread included). While attached,
-    /// each traced call holds the recorder's serial lock from before its
-    /// syscall until its event is appended, so the trace order is the order
-    /// in which the syscalls took effect, across threads.
+    /// A shared, ordered event log.
+    ///
+    /// Attach it to every thread whose calls belong to the trace (a
+    /// committer thread included), or process-wide. While attached, each
+    /// traced call holds the recorder's serial lock from before its syscall
+    /// until its event is appended, so the trace order is the order in which
+    /// the syscalls took effect, across threads.
     #[derive(Clone, Debug, Default)]
     pub struct Recorder {
         shared: Arc<Shared>,
@@ -135,6 +188,7 @@ pub mod recorder {
     }
 
     impl Recorder {
+        #[must_use]
         pub fn new() -> Self {
             Self::default()
         }
@@ -144,6 +198,16 @@ pub mod recorder {
             let previous =
                 CURRENT.with(|current| current.borrow_mut().replace(Arc::clone(&self.shared)));
             Attached { previous }
+        }
+
+        /// Record every thread's calls that has no recorder of its own,
+        /// including threads the engine spawns, until the guard drops.
+        pub fn attach_process(&self) -> ProcessAttached {
+            let previous = PROCESS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .replace(Arc::clone(&self.shared));
+            ProcessAttached { previous }
         }
 
         /// Remove and return every event recorded so far.
@@ -158,18 +222,33 @@ pub mod recorder {
         }
     }
 
+    /// Detaches the process-wide recorder on drop, restoring the previous one.
+    #[must_use = "the process-wide recorder detaches when this guard drops"]
+    pub struct ProcessAttached {
+        previous: Option<Arc<Shared>>,
+    }
+
+    impl Drop for ProcessAttached {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            *PROCESS.lock().unwrap_or_else(PoisonError::into_inner) = previous;
+        }
+    }
+
     /// Holds the serial lock of the attached recorder; see [`serialize`].
     #[must_use = "the serial lock is released when this guard drops"]
     pub struct Serial {
         held: Option<Arc<Shared>>,
     }
 
-    /// Enter a traced call. With a recorder attached, the outermost call on a
-    /// thread waits for the recorder's serial lock and holds it until the
-    /// guard drops; nested calls on the same thread pass through. With no
-    /// recorder attached this is one thread-local read.
+    /// Enter a traced call.
+    ///
+    /// With a recorder attached, the outermost call on a thread waits for the
+    /// recorder's serial lock and holds it until the guard drops; nested
+    /// calls on the same thread pass through. With no recorder attached this
+    /// is one thread-local read and one lock of the process-wide slot.
     pub fn serialize() -> Serial {
-        let Some(shared) = CURRENT.with(|current| current.borrow().clone()) else {
+        let Some(shared) = current() else {
             return Serial { held: None };
         };
         let depth = DEPTH.with(Cell::get);
@@ -205,7 +284,7 @@ pub mod recorder {
     /// thread. `make` runs only then, so an unattached thread pays one
     /// thread-local read per call.
     pub fn record(call: &'static str, make: impl FnOnce() -> std::io::Result<Event>) {
-        let Some(shared) = CURRENT.with(|current| current.borrow().clone()) else {
+        let Some(shared) = current() else {
             return;
         };
         let event = make().unwrap_or_else(|error| Event::Untraced {
