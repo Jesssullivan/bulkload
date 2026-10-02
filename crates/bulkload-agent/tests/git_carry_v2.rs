@@ -3460,10 +3460,12 @@ fn pr75_r3_m1_concurrent_finishes_into_one_repository_both_publish() {
     assert_clean(&first.destination, "r3-m1-concurrent");
 }
 
-/// r3 M2: a stale journal is removed before its replacement is created; a
-/// crash (or ENOSPC) in that gap leaves a quarantine under this state dir's
-/// name and no journal. The next open discards it and starts afresh
-/// instead of refusing `quarantine_exists` on every open.
+/// r3 M2: a quarantine under this state dir's name with no journal at all
+/// (the round-3 journal code removed a stale journal before creating its
+/// replacement, so a crash or ENOSPC in that gap left exactly this; since
+/// r4 N1 a stale journal is emptied in place, and the state is still
+/// reachable by losing the journal file). The next open discards it and
+/// starts afresh instead of refusing `quarantine_exists` on every open.
 #[test]
 fn pr75_r3_m2_a_quarantine_without_a_journal_is_discarded_not_wedged() {
     let pair = pair("pr75-r3-m2", 64 * 1024);
@@ -3689,7 +3691,11 @@ fn pr75_r4_n1_contending_opens_yield_exactly_one_live_session() {
 /// second open from the same state dir locks the new file, but A holds its
 /// quarantine's lock, so the open refuses `JOURNAL_OWNERSHIP_CONFLICT`
 /// before discarding or sweeping anything; A's acked pack, idx, keep and
-/// rev files survive, and A finishes.
+/// rev files survive. #75 r5: the losing fresh open removes its own empty
+/// journal, and A, whose journal is no longer at the name, refuses its next
+/// segment (`journal_replaced`) instead of acking one a resume could not
+/// read. A resume then continues from what the name holds: A's acks (the
+/// copy), or a fresh start (the empty file, removed), and finishes.
 #[test]
 fn pr75_r4_n1_a_replaced_journal_name_never_wipes_a_live_sessions_packs() {
     for copy in [false, true] {
@@ -3727,12 +3733,33 @@ fn pr75_r4_n1_a_replaced_journal_name_never_wipes_a_live_sessions_packs() {
         );
         assert_eq!(refused.reason, Some("quarantine_held"), "copy={copy}");
         assert_eq!(quarantine_entries(&pair), acked, "copy={copy}: A's packs");
-        for index in 1..pair.plan.segments() {
+        assert_eq!(
+            journal.exists(),
+            copy,
+            "copy={copy}: the loser's empty journal"
+        );
+        let second = pair.segment(1);
+        let refused = a.receive(1, &mut &second[..]).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+        assert_eq!(refused.reason, Some("journal_replaced"));
+        assert_eq!(a.next_segment(), 1, "copy={copy}: nothing acked");
+        drop(a);
+        assert_eq!(quarantine_entries(&pair), acked, "copy={copy}: A's packs");
+
+        let mut session = if copy {
+            Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap()
+        } else {
+            Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap()
+        };
+        let next = usize::from(copy);
+        assert_eq!(session.next_segment(), next, "copy={copy}");
+        for index in next..pair.plan.segments() {
             let segment = pair.segment(index);
-            a.receive(index, &mut &segment[..]).unwrap();
+            session.receive(index, &mut &segment[..]).unwrap();
         }
-        a.finish().unwrap();
+        session.finish().unwrap();
         assert!(published(&pair));
+        assert_clean(&pair.destination, "r4-n1-replaced");
     }
 }
 

@@ -133,6 +133,18 @@ impl Target {
             .filter(|path| path.starts_with(b"/") && !path.iter().any(u8::is_ascii_control))
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
         let objects = std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(objects)))?;
+        // OI-1001-Q17, #75 r5: the quarantine and the fence are `flock`
+        // locks, which a network filesystem cannot be trusted to honour (and
+        // NFS refuses on a read-only descriptor). Ingest destinations must be
+        // local; anything else refuses before a byte is written.
+        for at in [&objects, &probe.common] {
+            if let Some(kind) = remote_filesystem(&open_dir(at)?)? {
+                return Err(Refused::because(
+                    BulkloadRefusal::GitDestinationFilesystemUnsupported,
+                    kind,
+                ));
+            }
+        }
         Ok(Self {
             repository,
             root: probe.root,
@@ -650,7 +662,12 @@ impl<'a> Ingest<'a> {
         // is discarded, never adopted. #75 r4 N1: only once its own `flock`
         // is taken: a live session holds it, so a session whose journal name
         // was replaced under it keeps its packs and this open refuses.
-        discard_quarantine(&target.objects, &quarantine, None)?;
+        if let Err(refused) = discard_quarantine(&target.objects, &quarantine, None) {
+            // #75 r5: the journal is this open's own and empty (created, or
+            // emptied in place, under its lock); leave none behind.
+            journal.remove()?;
+            return Err(refused);
+        }
         let Some(plan) = plan else {
             // A resume found nothing sealed; leave no empty journal.
             journal.remove()?;
@@ -1097,6 +1114,9 @@ impl<'a> Ingest<'a> {
         {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #75 r5: a journal whose name now holds another file can no longer
+        // record an ack that a resume would read; nothing more is received.
+        self.still_owned()?;
         let (quarantine, pack_dir) = self.quarantine(false)?.ok_or(BulkloadRefusal::Io(None))?;
         drop(quarantine);
         let keep = format!("--keep=bulkload git-carry-v2 {}", self.plan.pack_id);
@@ -1138,9 +1158,23 @@ impl<'a> Ingest<'a> {
             bytes,
             blake3: ack.blake3.clone(),
         }])?;
+        // The ack is only given while a resume would read it.
+        self.still_owned()?;
         fault_point!(GitIngestAfterSegment);
         self.acks.push(ack.clone());
         Ok(ack)
+    }
+
+    /// Refuse `JOURNAL_OWNERSHIP_CONFLICT` / `journal_replaced` when the
+    /// journal's name no longer holds this session's file (#75 r5).
+    fn still_owned(&self) -> Outcome<()> {
+        if self.journal.owned()? {
+            return Ok(());
+        }
+        Err(Refused::because(
+            BulkloadRefusal::JournalOwnershipConflict,
+            "journal_replaced",
+        ))
     }
 
     /// Give up a session that is not done: journal it abandoned with
@@ -1766,6 +1800,80 @@ fn discard_quarantine(objects: &Path, name: &str, held: Option<&File>) -> Outcom
     Ok(())
 }
 
+/// The kind of network filesystem `directory` is on, or `None` for a local
+/// one (OI-1001-Q17). Linux reads `statfs.f_type`, Darwin
+/// `statfs.f_fstypename`; any other platform is taken as local.
+fn remote_filesystem(directory: &File) -> crate::Result<Option<&'static str>> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `directory` is open and `stat` is valid writable storage for
+    // one `statfs`.
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fstatfs` succeeded, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(classify_statfs(&stat))
+}
+
+#[cfg(target_os = "linux")]
+const fn classify_statfs(stat: &libc::statfs) -> Option<&'static str> {
+    // `f_type` is a signed or unsigned word by target; the magic numbers are
+    // 32-bit values.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::unnecessary_cast
+    )]
+    let magic = stat.f_type as u64 as u32;
+    linux_remote_kind(magic)
+}
+
+#[cfg(target_vendor = "apple")]
+fn classify_statfs(stat: &libc::statfs) -> Option<&'static str> {
+    #[allow(clippy::cast_sign_loss)]
+    let name: Vec<u8> = stat
+        .f_fstypename
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    darwin_remote_kind(&name)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+const fn classify_statfs(_: &libc::statfs) -> Option<&'static str> {
+    None
+}
+
+/// A Linux `statfs.f_type` magic that names a network filesystem.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const fn linux_remote_kind(magic: u32) -> Option<&'static str> {
+    match magic {
+        0x6969 => Some("nfs"),
+        0x517B => Some("smb"),
+        0xFF53_4D42 => Some("cifs"),
+        0xFE53_4D42 => Some("smb2"),
+        0x5346_414F => Some("afs"),
+        0x0102_1997 => Some("9p"),
+        0x00C3_6400 => Some("ceph"),
+        0x7375_7245 => Some("coda"),
+        _ => None,
+    }
+}
+
+/// A Darwin `statfs.f_fstypename` that names a network filesystem.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+fn darwin_remote_kind(name: &[u8]) -> Option<&'static str> {
+    match name {
+        b"nfs" => Some("nfs"),
+        b"smbfs" => Some("smbfs"),
+        b"webdav" => Some("webdav"),
+        b"afpfs" => Some("afpfs"),
+        b"ftp" => Some("ftp"),
+        _ => None,
+    }
+}
+
 /// A full flush of `file`'s device, counted as one (`F_FULLFSYNC` on Darwin,
 /// which drains the whole drive cache; `fsync` elsewhere).
 fn flush_device(file: &File) -> crate::Result<()> {
@@ -1914,4 +2022,60 @@ fn errno() -> *mut libc::c_int {
 fn errno() -> *mut libc::c_int {
     // SAFETY: returns this thread's errno location; no preconditions.
     unsafe { libc::__errno_location() }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// OI-1001-Q17: network filesystems are recognised by their Linux magic
+    /// and their Darwin type name; local ones are not.
+    #[test]
+    fn network_filesystems_are_classified_remote() {
+        for (magic, kind) in [
+            (0x6969, "nfs"),
+            (0x517B, "smb"),
+            (0xFF53_4D42, "cifs"),
+            (0xFE53_4D42, "smb2"),
+            (0x5346_414F, "afs"),
+            (0x0102_1997, "9p"),
+            (0x00C3_6400, "ceph"),
+            (0x7375_7245, "coda"),
+        ] {
+            assert_eq!(linux_remote_kind(magic), Some(kind), "{magic:#x}");
+        }
+        // ext4, xfs, btrfs, tmpfs, zfs, overlayfs.
+        for magic in [
+            0xEF53,
+            0x5846_5342,
+            0x9123_683E,
+            0x0102_1994,
+            0x2FC1_2FC1,
+            0x794C_7630,
+        ] {
+            assert_eq!(linux_remote_kind(magic), None, "{magic:#x}");
+        }
+        for (name, kind) in [
+            (&b"nfs"[..], "nfs"),
+            (b"smbfs", "smbfs"),
+            (b"webdav", "webdav"),
+            (b"afpfs", "afpfs"),
+            (b"ftp", "ftp"),
+        ] {
+            assert_eq!(darwin_remote_kind(name), Some(kind));
+        }
+        for name in [&b"apfs"[..], b"hfs", b"msdos", b"exfat", b"nfsx", b""] {
+            assert_eq!(darwin_remote_kind(name), None);
+        }
+    }
+
+    /// The scratch directory this test runs in is local, as every fixture
+    /// destination is.
+    #[test]
+    fn a_local_directory_is_not_remote() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = File::open(directory.path()).unwrap();
+        assert_eq!(remote_filesystem(&file).unwrap(), None);
+    }
 }
