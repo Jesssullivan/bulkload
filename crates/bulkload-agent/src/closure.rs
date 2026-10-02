@@ -5,25 +5,29 @@
 //! from the run's durable ledger (outcome records and apply journals, see
 //! [`crate::estate::ledger`]):
 //!
-//! - `applied`: the workspace was restored (`workspace-restored`, or a
-//!   re-apply's `previous-workspace-restoration-not-revalidated`) and a
-//!   `workspace-restored` journal proves it.
+//! - `applied`: the item plans a workspace, its outcome is
+//!   `workspace-restored` (or a re-apply's
+//!   `previous-workspace-restoration-not-revalidated`), and the exact
+//!   journal for its current capture and SOURCE says `workspace-restored`.
 //! - `refused`: the outcome is `refused` and its reason begins with a typed
-//!   refusal code from the taxonomy.
-//! - `referenced-only`: only ref custody was imported (`refs-imported`, or a
-//!   re-apply's `previous-ref-custody-not-workspace-parity`) and a
-//!   `refs-imported` journal proves it. The refs are held; no working bytes
-//!   were laid down.
+//!   refusal code. A bare `IO` or `FRAME_CODEC` names no cause, so it is
+//!   not typed enough to close an item.
+//! - `referenced-only`: the item plans no workspace, its outcome is
+//!   `refs-imported` (or `previous-ref-custody-not-workspace-parity`), and
+//!   the exact current-capture journal says `refs-imported`. The refs are
+//!   held; no working bytes were laid down, and none were planned.
 //!
-//! Anything else is `unaccounted`: no outcome record, an unreadable record, a
-//! refusal without a typed code, an applied outcome with no matching journal,
-//! or an outcome that is not an apply outcome at all (a capture-stage record,
-//! say). The report passes only when `unaccounted` is 0.
+//! Anything else is `unaccounted`: no outcome record, an unreadable record,
+//! a record naming another source, an untyped refusal, an outcome that does
+//! not match whether the item plans a workspace, a missing or mismatched
+//! current-capture journal (a stale journal from an earlier capture proves
+//! nothing), or an outcome that is not an apply outcome at all. The report
+//! passes only when `unaccounted` is 0.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use crate::estate::{Ledger, LedgerEntry};
+use crate::estate::{JournalState, Ledger, LedgerEntry};
 use crate::{BulkloadRefusal, Result};
 
 /// One planned item's closure disposition.
@@ -58,34 +62,48 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     if entry.record_unreadable {
         return Disposition::Unaccounted("outcome-record-unreadable");
     }
-    let Some((outcome, reason)) = &entry.record else {
+    let Some((source, outcome, reason)) = &entry.record else {
         return Disposition::Unaccounted("no-outcome-record");
     };
-    let journaled = |body: &str| entry.journals.iter().any(|journal| journal == body);
+    if *source != entry.source {
+        return Disposition::Unaccounted("record-source-mismatch");
+    }
+    // The exact current-capture journal must carry this body.
+    let journal = |body: &str, closed: Disposition| match &entry.journal {
+        JournalState::Present(found) if found == body => closed,
+        JournalState::Present(_) => Disposition::Unaccounted("journal-outcome-mismatch"),
+        JournalState::Absent => Disposition::Unaccounted("journal-missing"),
+        JournalState::NoCapture => Disposition::Unaccounted("capture-record-missing"),
+        JournalState::CaptureUnreadable => Disposition::Unaccounted("capture-record-unreadable"),
+    };
     match outcome.as_str() {
         "refused" => {
             // A receipt reason is the refusal's Display: its code, then any
             // escaped detail (`GIT_NEST_... path="..."`, `IO (errno 2)`).
-            let code = reason
+            match reason
                 .as_deref()
                 .and_then(|reason| reason.split_whitespace().next())
-                .filter(|code| BulkloadRefusal::is_code(code));
-            code.map_or(Disposition::Unaccounted("refusal-untyped"), |code| {
-                Disposition::Refused(code.to_owned())
-            })
+                .filter(|code| BulkloadRefusal::is_code(code))
+            {
+                None => Disposition::Unaccounted("refusal-untyped"),
+                Some("IO") => Disposition::Unaccounted("refusal-untyped-io"),
+                Some("FRAME_CODEC") => Disposition::Unaccounted("refusal-untyped-frame-codec"),
+                Some(code) => Disposition::Refused(code.to_owned()),
+            }
         }
         "workspace-restored" | "previous-workspace-restoration-not-revalidated" => {
-            if journaled("workspace-restored") {
-                Disposition::Applied
+            if entry.has_workspace {
+                journal("workspace-restored", Disposition::Applied)
             } else {
-                Disposition::Unaccounted("journal-missing")
+                Disposition::Unaccounted("outcome-workspace-mismatch")
             }
         }
         "refs-imported" | "previous-ref-custody-not-workspace-parity" => {
-            if journaled("refs-imported") {
-                Disposition::ReferencedOnly
+            if entry.has_workspace {
+                // A planned workspace that only got refs is not closed.
+                Disposition::Unaccounted("refs-only-for-workspace-item")
             } else {
-                Disposition::Unaccounted("journal-missing")
+                journal("refs-imported", Disposition::ReferencedOnly)
             }
         }
         _ => Disposition::Unaccounted("not-an-apply-outcome"),
@@ -114,6 +132,9 @@ pub struct Report {
     /// Outcome records for items the plan does not hold. Reported, not
     /// counted: they are not planned items.
     pub foreign: Vec<String>,
+    /// Journals that are no planned item's current-capture journal (foreign
+    /// or stale). Reported, not counted.
+    pub unmatched_journals: Vec<String>,
 }
 
 impl Report {
@@ -121,7 +142,8 @@ impl Report {
     #[must_use]
     pub fn from_ledger(ledger: &Ledger) -> Self {
         let mut report = Self {
-            foreign: ledger.foreign.clone(),
+            foreign: ledger.foreign_records.clone(),
+            unmatched_journals: ledger.unmatched_journals.clone(),
             ..Self::default()
         };
         for entry in &ledger.entries {
@@ -138,7 +160,7 @@ impl Report {
             report.rows.push(Row {
                 item: entry.item.clone(),
                 source: entry.source.clone(),
-                outcome: entry.record.as_ref().map(|(outcome, _)| outcome.clone()),
+                outcome: entry.record.as_ref().map(|(_, outcome, _)| outcome.clone()),
                 disposition,
             });
         }
@@ -224,6 +246,13 @@ impl Report {
             }
             out.push_str(&json_string(item));
         }
+        out.push_str("],\"unmatched_journals\":[");
+        for (index, name) in self.unmatched_journals.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(name));
+        }
         out.push_str("]}");
         out
     }
@@ -256,35 +285,59 @@ pub fn json_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn entry(item: char, record: Option<(&str, Option<&str>)>, journals: &[&str]) -> LedgerEntry {
+    fn present(body: &str) -> JournalState {
+        JournalState::Present(body.to_owned())
+    }
+
+    fn entry(
+        item: char,
+        has_workspace: bool,
+        record: Option<(&str, Option<&str>)>,
+        journal: JournalState,
+    ) -> LedgerEntry {
+        let source = PathBuf::from(format!("/src/{item}"));
         LedgerEntry {
             item: item.to_string().repeat(64),
-            source: PathBuf::from(format!("/src/{item}")),
-            record: record.map(|(outcome, reason)| (outcome.to_owned(), reason.map(str::to_owned))),
+            source: source.clone(),
+            has_workspace,
+            record: record
+                .map(|(outcome, reason)| (source, outcome.to_owned(), reason.map(str::to_owned))),
             record_unreadable: false,
-            journals: journals.iter().map(|body| (*body).to_owned()).collect(),
+            journal,
         }
     }
 
     #[test]
-    fn every_disposition_is_classified() {
+    fn every_closed_disposition_is_classified() {
         let restored = entry(
             'a',
+            true,
             Some(("workspace-restored", None)),
-            &["workspace-restored"],
+            present("workspace-restored"),
         );
         let previous = entry(
             'b',
+            true,
             Some(("previous-workspace-restoration-not-revalidated", None)),
-            &["workspace-restored"],
+            present("workspace-restored"),
         );
-        let refs = entry('c', Some(("refs-imported", None)), &["refs-imported"]);
-        let refused = entry('d', Some(("refused", Some("GIT_INVENTORY_MALFORMED"))), &[]);
-        let errno = entry('e', Some(("refused", Some("IO (errno 2)"))), &[]);
+        let refs = entry(
+            'c',
+            false,
+            Some(("refs-imported", None)),
+            present("refs-imported"),
+        );
+        let refused = entry(
+            'd',
+            true,
+            Some(("refused", Some("GIT_INVENTORY_MALFORMED"))),
+            JournalState::NoCapture,
+        );
         let nest = entry(
             'f',
+            true,
             Some(("refused", Some("GIT_NEST_STASHED path=\"x\""))),
-            &[],
+            JournalState::Absent,
         );
         assert_eq!(classify(&restored), Disposition::Applied);
         assert_eq!(classify(&previous), Disposition::Applied);
@@ -293,43 +346,135 @@ mod tests {
             classify(&refused),
             Disposition::Refused("GIT_INVENTORY_MALFORMED".into())
         );
-        assert_eq!(classify(&errno), Disposition::Refused("IO".into()));
         assert_eq!(
             classify(&nest),
             Disposition::Refused("GIT_NEST_STASHED".into())
         );
     }
 
+    // #80 review H2: a bare IO or FRAME_CODEC names no cause and does not
+    // close an item.
     #[test]
+    fn untyped_io_and_frame_codec_refusals_are_unaccounted() {
+        for (reason, why) in [
+            ("IO (errno 2)", "refusal-untyped-io"),
+            ("IO", "refusal-untyped-io"),
+            ("FRAME_CODEC", "refusal-untyped-frame-codec"),
+        ] {
+            let refused = entry(
+                'e',
+                true,
+                Some(("refused", Some(reason))),
+                JournalState::NoCapture,
+            );
+            assert_eq!(
+                classify(&refused),
+                Disposition::Unaccounted(why),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn unprovable_items_are_unaccounted() {
+        let mut other_source = entry(
+            'i',
+            true,
+            Some(("workspace-restored", None)),
+            present("workspace-restored"),
+        );
+        if let Some(record) = other_source.record.as_mut() {
+            record.0 = PathBuf::from("/src/elsewhere");
+        }
         let cases = [
-            (entry('a', None, &[]), "no-outcome-record"),
             (
-                entry('b', Some(("workspace-restored", None)), &[]),
+                entry('a', true, None, JournalState::Absent),
+                "no-outcome-record",
+            ),
+            (
+                entry(
+                    'b',
+                    true,
+                    Some(("workspace-restored", None)),
+                    JournalState::Absent,
+                ),
                 "journal-missing",
             ),
             // A refs journal does not prove a workspace restore.
             (
-                entry('c', Some(("workspace-restored", None)), &["refs-imported"]),
-                "journal-missing",
+                entry(
+                    'c',
+                    true,
+                    Some(("workspace-restored", None)),
+                    present("refs-imported"),
+                ),
+                "journal-outcome-mismatch",
             ),
             (
-                entry('d', Some(("refs-imported", None)), &[]),
-                "journal-missing",
+                entry(
+                    'd',
+                    true,
+                    Some(("workspace-restored", None)),
+                    JournalState::NoCapture,
+                ),
+                "capture-record-missing",
             ),
-            (entry('e', Some(("refused", None)), &[]), "refusal-untyped"),
             (
-                entry('f', Some(("refused", Some("disk went away"))), &[]),
+                entry(
+                    'e',
+                    false,
+                    Some(("refs-imported", None)),
+                    JournalState::CaptureUnreadable,
+                ),
+                "capture-record-unreadable",
+            ),
+            // A planned workspace that only got refs is not closed.
+            (
+                entry(
+                    'f',
+                    true,
+                    Some(("refs-imported", None)),
+                    present("refs-imported"),
+                ),
+                "refs-only-for-workspace-item",
+            ),
+            (
+                entry(
+                    'g',
+                    false,
+                    Some(("workspace-restored", None)),
+                    present("workspace-restored"),
+                ),
+                "outcome-workspace-mismatch",
+            ),
+            (
+                entry('h', true, Some(("refused", None)), JournalState::Absent),
                 "refusal-untyped",
             ),
             (
-                entry('g', Some(("capture-reused-after-census", None)), &[]),
+                entry(
+                    'j',
+                    true,
+                    Some(("refused", Some("disk went away"))),
+                    JournalState::Absent,
+                ),
+                "refusal-untyped",
+            ),
+            (
+                entry(
+                    'k',
+                    true,
+                    Some(("capture-reused-after-census", None)),
+                    JournalState::Absent,
+                ),
                 "not-an-apply-outcome",
             ),
+            (other_source, "record-source-mismatch"),
             (
                 LedgerEntry {
                     record_unreadable: true,
-                    ..entry('h', None, &[])
+                    ..entry('l', true, None, JournalState::Absent)
                 },
                 "outcome-record-unreadable",
             ),
@@ -345,14 +490,26 @@ mod tests {
             entries: vec![
                 entry(
                     'a',
+                    true,
                     Some(("workspace-restored", None)),
-                    &["workspace-restored"],
+                    present("workspace-restored"),
                 ),
-                entry('b', Some(("refused", Some("CAPTURE_DRIFTED"))), &[]),
-                entry('c', Some(("refs-imported", None)), &["refs-imported"]),
-                entry('d', None, &[]),
+                entry(
+                    'b',
+                    true,
+                    Some(("refused", Some("CAPTURE_DRIFTED"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'c',
+                    false,
+                    Some(("refs-imported", None)),
+                    present("refs-imported"),
+                ),
+                entry('d', true, None, JournalState::Absent),
             ],
-            foreign: vec!["f".repeat(64)],
+            foreign_records: vec!["f".repeat(64)],
+            unmatched_journals: vec!["stale.done".to_owned()],
         };
         let report = Report::from_ledger(&ledger);
         assert_eq!(
@@ -376,7 +533,7 @@ mod tests {
         ));
         assert!(json.contains("\"outcome\":null"));
         assert!(json.ends_with(&format!(
-            "\"foreign_outcome_records\":[\"{}\"]}}",
+            "\"foreign_outcome_records\":[\"{}\"],\"unmatched_journals\":[\"stale.done\"]}}",
             "f".repeat(64)
         )));
     }
@@ -387,12 +544,18 @@ mod tests {
             entries: vec![
                 entry(
                     'a',
+                    true,
                     Some(("workspace-restored", None)),
-                    &["workspace-restored"],
+                    present("workspace-restored"),
                 ),
-                entry('b', Some(("refused", Some("GIT_INVENTORY_MALFORMED"))), &[]),
+                entry(
+                    'b',
+                    true,
+                    Some(("refused", Some("GIT_INVENTORY_MALFORMED"))),
+                    JournalState::NoCapture,
+                ),
             ],
-            foreign: Vec::new(),
+            ..Ledger::default()
         };
         let report = Report::from_ledger(&ledger);
         assert!(report.passes());

@@ -32,17 +32,19 @@ fn copy_refuses_before_writing_when_the_floor_cannot_hold() {
     std::fs::create_dir(root.path().join("destination")).unwrap();
     std::fs::write(root.path().join("source").join("payload"), vec![7u8; 4096]).unwrap();
 
-    // 100% free afterwards is impossible: refused, typed, nothing written.
+    // 100% free afterwards is impossible: the entry is refused as a value
+    // (wire v5 Decide), typed, and nothing is written.
     let refused = copy_with_floor(root.path(), "100");
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("refused: DESTINATION_SPACE_INSUFFICIENT"),
+        stderr.contains("refused payload: DESTINATION_SPACE_INSUFFICIENT"),
         "{stderr}"
     );
     assert!(!root.path().join("destination").join("payload").exists());
 
-    // With no floor the same copy completes, so the refusal was the floor.
+    // With no floor the same session resumes and completes, so the refusal
+    // was the floor and left the cohort resumable.
     let copied = copy_with_floor(root.path(), "0");
     assert!(
         copied.status.success(),
@@ -86,6 +88,8 @@ fn closure_report_fails_when_a_planned_item_is_unaccounted() {
     let report = agent(&[
         "closure-report".as_ref(),
         plan.as_os_str(),
+        root.path().join("corpus").as_os_str(),
+        "neo".as_ref(),
         state.as_os_str(),
     ]);
     assert!(!report.status.success());
@@ -99,8 +103,13 @@ fn closure_report_fails_when_a_planned_item_is_unaccounted() {
     );
     assert!(String::from_utf8_lossy(&report.stderr).contains("refused: CLOSURE_UNACCOUNTED"));
 
-    // A plan and no state directory is a usage refusal, not a pass.
-    let missing = agent(&["closure-report".as_ref(), plan.as_os_str()]);
+    // No state directory is a usage refusal, not a pass.
+    let missing = agent(&[
+        "closure-report".as_ref(),
+        plan.as_os_str(),
+        root.path().join("corpus").as_os_str(),
+        "neo".as_ref(),
+    ]);
     assert!(!missing.status.success());
     assert!(missing.stdout.is_empty());
 }

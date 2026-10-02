@@ -55,12 +55,16 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
-    closure-report PLAN PRIVATE_STATE [PRIVATE_STATE ...]
-                Read-only: join PLAN with the apply outcome records and journals
-                in each PRIVATE_STATE (later directories override earlier
-                outcome records) and print a bulkload.closure.v1 JSON ledger:
-                every planned item is applied, refused (typed code) or
-                referenced-only, else unaccounted. Exits nonzero with
+    closure-report PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                Read-only: join PLAN with CORPUS's capture records and each
+                PRIVATE_STATE's apply outcome records and journals (later
+                directories override earlier outcome records), with SOURCE
+                the label estate-apply was given. Prints a bulkload.closure.v1
+                JSON ledger: every planned item is applied (workspace, exact
+                current-capture journal), refused (typed code; a bare IO or
+                FRAME_CODEC is not typed), or referenced-only (no workspace
+                planned, exact refs journal), else unaccounted. Stale and
+                foreign journals are listed. Exits nonzero with
                 CLOSURE_UNACCOUNTED when unaccounted > 0
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
@@ -92,10 +96,13 @@ BOUNDARIES:
     --durability=group (the default) seals each file with a barrier and makes
     each group of files durable with one SQLite commit; --durability=strict
     fully flushes every file (A/B comparison). pull passes strict to serve.
-    --min-free-percent=N (0-100, default 25): copy/pull refuse a batch, and
-    estate-apply refuses before any item, with DESTINATION_SPACE_INSUFFICIENT
-    when the planned bytes would leave the destination filesystem (statvfs)
-    with less than N% free. estate-apply plans bundle sizes, a lower bound.
+    --min-free-percent=N (0-100, default 25): DESTINATION_SPACE_INSUFFICIENT
+    when planned bytes would leave the destination filesystem (statvfs) with
+    less than N% free. copy/pull refuse each entry that does not fit, as a
+    value, before requesting its content: the bytes of every entry decided
+    and not yet Held count against a probe refreshed on each group commit,
+    so the session continues and stays resumable. estate-apply refuses before
+    any item, planning bundle sizes (a lower bound).
     copy/pull require an existing destination directory.
     copy/pull preserve divergent destinations and refuse live SQLite files.
     They enumerate the source each run; completed content is resumable.
@@ -257,12 +264,16 @@ fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
 // whether or not it passes; the verdict is the exit status.
 fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
-    let (plan, states) = args
-        .split_first()
-        .filter(|(_, states)| !states.is_empty())
-        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let [plan, corpus, source, states @ ..] = args else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    if states.is_empty() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let source = source.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
     let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
-    let ledger = bulkload_agent::estate::ledger(Path::new(plan), &states)?;
+    let ledger =
+        bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
     let report = bulkload_agent::closure::Report::from_ledger(&ledger);
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", report.to_json())?;

@@ -91,14 +91,9 @@ pub fn existing_ancestor(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// `statvfs` the filesystem holding `path`, which must exist.
-///
-/// # Errors
-/// Refuses a path with an interior NUL, and the OS error of a failed call.
-pub fn probe(path: &Path) -> Result<Space> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+/// `(blocks, available blocks, block size)` from `statvfs`.
+#[cfg(not(target_os = "macos"))]
+fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `name` is a valid NUL-terminated string that outlives the call,
     // and `stats` points to writable storage of the right size and alignment.
@@ -107,14 +102,45 @@ pub fn probe(path: &Path) -> Result<Space> {
     }
     // SAFETY: a successful statvfs initialized the whole structure.
     let stats = unsafe { stats.assume_init() };
-    // The field widths differ by platform (u64 on Linux, u32 blocks on
-    // Darwin); widen everything before multiplying.
+    // Widths vary across platforms; widen before multiplying.
     #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
-    let (blocks, available, fragment) = (
+    Ok((
         u128::from(stats.f_blocks as u64),
         u128::from(stats.f_bavail as u64),
         u128::from(stats.f_frsize as u64),
-    );
+    ))
+}
+
+/// `(blocks, available blocks, block size)` from `statfs`: Darwin's
+/// `statvfs` carries 32-bit block counts (`fsblkcnt_t`), which wrap on a
+/// large volume; its `statfs` counts are 64-bit.
+#[cfg(target_os = "macos")]
+fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `name` is a valid NUL-terminated string that outlives the call,
+    // and `stats` points to writable storage of the right size and alignment.
+    if unsafe { libc::statfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: a successful statfs initialized the whole structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok((
+        u128::from(stats.f_blocks),
+        u128::from(stats.f_bavail),
+        u128::from(stats.f_bsize),
+    ))
+}
+
+/// Probe the filesystem holding `path`, which must exist (`statvfs`;
+/// `statfs` on Darwin).
+///
+/// # Errors
+/// Refuses a path with an interior NUL, and the OS error of a failed call.
+pub fn probe(path: &Path) -> Result<Space> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+    let (blocks, available, fragment) = counts(&name)?;
     Ok(Space {
         total: u64::try_from(blocks * fragment).unwrap_or(u64::MAX),
         available: u64::try_from(available * fragment).unwrap_or(u64::MAX),
