@@ -8,30 +8,83 @@ use super::{is_oid, lines, pinned, run_child, Offer, Outcome, Source};
 use crate::BulkloadRefusal;
 
 /// The request M1's first round packs.
+///
+/// Only [`first_round`] builds one, so every round has passed the R-N75 and
+/// R-N131 checks (#73 round-2 D1); its fields are read through accessors.
+/// [`super::PackPlan`] still re-checks the shallow shape against the source it
+/// is given, at build and at every send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirstRound {
-    /// What the source sends: the wants given, minus every held tip (a fetch
-    /// never wants what the destination holds). Sorted.
-    pub wants: Vec<String>,
-    /// Exactly the held tips: every offered tip the source holds as an
-    /// object, ancestors first; tips that peel to no commit last, by oid.
-    pub haves: Vec<String>,
-    /// The destination's shallow frontier, sorted; non-empty only when it
-    /// equals the source's (R-N75).
-    pub shallow: Vec<String>,
-    /// Offered tips.
-    pub destination_tips: usize,
-    /// Held tips that peel to no commit (placed last).
-    pub non_commit_haves: usize,
+    pub(super) wants: Vec<String>,
+    pub(super) haves: Vec<String>,
+    pub(super) shallow: Vec<String>,
+    pub(super) destination_tips: usize,
+    pub(super) non_commit_haves: usize,
 }
 
 impl FirstRound {
+    /// What the source sends: the wants given, minus every held tip (a fetch
+    /// never wants what the destination holds). Sorted.
+    #[must_use]
+    pub fn wants(&self) -> &[String] {
+        &self.wants
+    }
+
+    /// Exactly the held tips: every offered tip the source holds as an
+    /// object, ancestors first; tips that peel to no commit last, by oid.
+    #[must_use]
+    pub fn haves(&self) -> &[String] {
+        &self.haves
+    }
+
+    /// The destination's shallow frontier, sorted; non-empty only when it
+    /// equals the source's (R-N75).
+    #[must_use]
+    pub fn shallow(&self) -> &[String] {
+        &self.shallow
+    }
+
+    /// Offered tips.
+    #[must_use]
+    pub const fn destination_tips(&self) -> usize {
+        self.destination_tips
+    }
+
+    /// Held tips that peel to no commit (placed last).
+    #[must_use]
+    pub const fn non_commit_haves(&self) -> usize {
+        self.non_commit_haves
+    }
+
     /// Whether the destination is shallow, which selects
     /// `--objects-edge-aggressive` as upload-pack's `--shallow` does.
     #[must_use]
     pub const fn shallow_destination(&self) -> bool {
         !self.shallow.is_empty()
     }
+}
+
+/// The R-N75 and R-N131 shallow-shape rule between a source frontier and a
+/// destination frontier: equal sets, or a refusal naming which side broke it.
+pub(super) fn shallow_shape(
+    source: &BTreeSet<String>,
+    destination: &BTreeSet<String>,
+) -> Result<(), Refused> {
+    if !destination.is_empty() && destination != source {
+        return Err(Refused::because(
+            BulkloadRefusal::GitHavesUnprovable,
+            "destination_shallow_frontier_differs",
+        ));
+    }
+    // R-N131: a shallow source's boundary commits name parents it does not
+    // hold, and a shallow file is never written into a full destination.
+    if destination.is_empty() && !source.is_empty() {
+        return Err(Refused::because(
+            BulkloadRefusal::GitHavesUnprovable,
+            "source_shallow_destination_full",
+        ));
+    }
+    Ok(())
 }
 
 /// Build the first round of carrying `wants` from `source` to the destination
@@ -59,21 +112,8 @@ pub fn first_round(
             "destination_partial_clone",
         ));
     }
-    if !offer.shallow.is_empty() && offer.shallow != source.shallow {
-        return Err(Refused::because(
-            BulkloadRefusal::GitHavesUnprovable,
-            "destination_shallow_frontier_differs",
-        ));
-    }
-    // R-N131: a shallow source's boundary commits name parents it does not
-    // hold, and a shallow file is never written into a full destination, so
-    // the carry refuses here, before anything is listed or sent.
-    if offer.shallow.is_empty() && !source.shallow.is_empty() {
-        return Err(Refused::because(
-            BulkloadRefusal::GitHavesUnprovable,
-            "source_shallow_destination_full",
-        ));
-    }
+    // R-N75 and R-N131, before anything is listed or sent.
+    shallow_shape(&source.shallow, &offer.shallow)?;
     let held = present(&source.repository, &offer.tips)?;
     let haves = ancestors_first(source, &held, store)?;
     let non_commit_haves = haves.1;
