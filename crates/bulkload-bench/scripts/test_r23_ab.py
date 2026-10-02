@@ -14,6 +14,7 @@ import io
 import json
 import os
 import stat
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +159,55 @@ class HarnessTests(unittest.TestCase):
         bad = mock.patch.object(ab, "corpus_verify", return_value=1)
         self.assertEqual(self.main(self.gated(), corpus_verify=bad), 2)
         self.assertFalse((self.tmp / "work").exists())
+
+    def test_gated_refuses_any_pattern_but_babab(self) -> None:
+        for pattern in ("B", "BA", "BBBBB", "ABABA", "BABABA"):
+            self.assertEqual(self.main([*self.gated(), "--pattern", pattern]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_rollup_needs_exactly_three_b_reps(self) -> None:
+        def report(b_reps: int) -> dict[str, object]:
+            rep = {"label": "B", "summary": {"verdict": {"status": "pass"}}}
+            return {"mode": "gated", "status": "complete-draft", "reps": [rep] * b_reps}
+
+        self.assertTrue(ab.gate_rollup(report(1))["verdict"].startswith("NONE"))
+        self.assertTrue(ab.gate_rollup(report(5))["verdict"].startswith("NONE"))
+        self.assertEqual(ab.gate_rollup(report(3))["verdict"], "PASS")
+
+    def test_cached_binary_is_reused_only_with_matching_sha256(self) -> None:
+        build_root = self.tmp / "build"
+        scratch = self.tmp / "scratch"
+        scratch.mkdir()
+        sha = "a" * 40
+        binary = build_root / "bin" / f"bulkload-bench-{sha[:12]}"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"old")
+        record = binary.with_name(binary.name + ".sha256")
+        record.write_text("0" * 64 + "\n")
+        built = build_root / f"target-{sha[:12]}" / "release" / "bulkload-bench"
+
+        def fake_git(_repo: Path, *args: str) -> str:
+            if args[0] == "archive":
+                with tarfile.open(args[args.index("-o") + 1], "w"):
+                    pass
+            return sha
+
+        def fake_cargo(*_a: object, **_k: object) -> mock.Mock:
+            built.parent.mkdir(parents=True, exist_ok=True)
+            built.write_bytes(b"new")
+            return mock.Mock(returncode=0)
+
+        with (
+            mock.patch.object(ab, "git", side_effect=fake_git),
+            mock.patch.object(ab.subprocess, "run", side_effect=fake_cargo) as cargo,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            info = ab.build(self.tmp, "rev", build_root, scratch, 1)
+            self.assertEqual(cargo.call_count, 1)
+            self.assertEqual(binary.read_bytes(), b"new")
+            self.assertEqual(record.read_text().strip(), info["sha256"])
+            ab.build(self.tmp, "rev", build_root, scratch / "again", 1)
+            self.assertEqual(cargo.call_count, 1)
 
     def test_gated_rollup_needs_every_b_rep_to_pass(self) -> None:
         with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):

@@ -24,9 +24,9 @@ Files are mode 0644, directories 0755, and every mtime is fixed at
 2026-10-02T00:00:00Z.
 
 Identity: the bench's `corpus_identity` hashes postcard-encoded RowSchema
-rows, which carry dev, ino, mtime_ns, ctime_ns and nlink. That makes it a
-stat identity: it differs on every copy and every host, and it cannot be
-committed. The committed identity covers content and paths only. It is the
+rows, which carry dev, ino, mtime_ns, ctime_ns and nlink next to the path,
+kind, size, mode and content hash. It is a content-and-metadata hash: it
+differs on every copy and every host, so it cannot be committed. The committed identity covers content and paths only. It is the
 BLAKE3 of the manifest, one line per regular file sorted by path bytes:
 `<path>\\t<size>\\t<blake3>\\n`. The manifest is committed beside this script
 as r23_corpus.manifest.tsv. `verify` also checks that the tree has no
@@ -262,8 +262,9 @@ def readme(identity: str, text: str) -> str:
         "- Generator: bulkload `crates/bulkload-bench/scripts/r23_corpus.py`\n"
         f"  (seed `{SEED}`). Regenerate anywhere with `r23_corpus.py generate`.\n"
         "- Check before use: `r23_corpus.py verify <this dir>/corpus`.\n"
-        "- The bench's own `sealed_corpus_blake3` is a stat identity (dev, ino,\n"
-        "  mtime, ctime). It differs per copy, so it is recorded, never compared.\n\n"
+        "- The bench's own `sealed_corpus_blake3` hashes content and stat metadata\n"
+        "  (dev, ino, mtime, ctime), so it differs per copy. It is compared only\n"
+        "  between reps of one session on one copy, never across copies.\n\n"
         "Manifest (path, size, blake3):\n\n```text\n" + text + "```\n"
     )
 
@@ -288,6 +289,9 @@ def seal(out: Path) -> int:
 
 
 def verify(corpus: Path) -> int:
+    if not corpus.is_dir():
+        print(f"r23-corpus verify corpus={corpus} missing=1 ok=False")
+        return 1
     text, problems = manifest_text(corpus)
     identity = identity_of(text)
     committed = MANIFEST.read_text() if MANIFEST.is_file() else None

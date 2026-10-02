@@ -42,8 +42,10 @@ Corpus integrity: the sealed corpus is read-only (0444/0555). The harness
 copies it once into <work>/corpus with 0644/0755 modes, because the bench
 mutates its private fixture for the 1 % delta and so cannot read a
 read-only tree. That working copy is content-verified before the builds.
-Every rep must report the same bench `sealed_corpus_blake3` (a stat identity
-of the working copy). After the last rep, both the working copy and the
+Every rep must report the same bench `sealed_corpus_blake3` for the working
+copy. That value is a content-and-metadata hash: BLAKE3 over every row's path, kind, size,
+mode, content hash and stat fields (dev, ino, mtime, ctime, nlink), so it
+is stable for one untouched copy and differs between copies. After the last rep, both the working copy and the
 sealed corpus are verified again. Any failure aborts the sample (exit 3).
 
 Host checks: after the builds, the harness waits up to --settle-seconds for
@@ -119,6 +121,7 @@ RULINGS = (
     "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
 )
 DEFAULT_PATTERN = "BABAB"
+GATE_B_REPS = DEFAULT_PATTERN.count("B")
 SEAL_KEYS = (
     "flush_barrier_ns",
     "flush_full_ns",
@@ -268,7 +271,15 @@ def build(
     sha = git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
     short = sha[:12]
     binary = build_root / "bin" / f"bulkload-bench-{short}"
-    if not binary.is_file():
+    recorded = binary.with_name(binary.name + ".sha256")
+    cached = (
+        binary.is_file()
+        and recorded.is_file()
+        and recorded.read_text().strip() == sha256(binary)
+    )
+    if not cached:
+        if binary.is_file():
+            say(f"cached binary {binary} has no matching sha256 record; rebuilding")
         source = scratch / f"src-{short}"
         source.mkdir(parents=True)
         archive = scratch / f"src-{short}.tar"
@@ -303,7 +314,12 @@ def build(
         shutil.copy2(
             build_root / f"target-{short}" / "release" / "bulkload-bench", binary
         )
-    return {"rev": rev, "sha": sha, "binary": str(binary), "sha256": sha256(binary)}
+        recorded.write_text(sha256(binary) + "\n")
+    digest = sha256(binary)
+    if recorded.read_text().strip() != digest:
+        say(f"build refused: {binary} does not match its sha256 record")
+        raise SystemExit(4)
+    return {"rev": rev, "sha": sha, "binary": str(binary), "sha256": digest}
 
 
 def resolve_rclone(repo: Path, given: str | None) -> Path:
@@ -600,7 +616,9 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
         verdict = "NOT A GATE SAMPLE"
     elif report["status"] != "complete-draft":
         verdict = "NONE (sample aborted or refused)"
-    elif b_reps and passed == len(b_reps):
+    elif len(b_reps) != GATE_B_REPS:
+        verdict = f"NONE ({len(b_reps)} B reps; the gate needs {GATE_B_REPS})"
+    elif passed == len(b_reps):
         verdict = "PASS"
     else:
         verdict = "FAIL"
@@ -691,7 +709,8 @@ def evidence(report: dict[str, object]) -> str:
         f"- Content identity `{report['content_identity']}`; content_verified before:"
         f" `{report['content_verified_before']}`, after the last rep:"
         f" `{report.get('content_verified_after', 'n/a')}`.",
-        f"- Bench stat identity (`sealed_corpus_blake3`, must match in every rep):"
+        f"- Bench `sealed_corpus_blake3` (content-and-metadata hash of the working"
+        f" copy, stat fields included; must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
         f"- Work root: `{report['work_root']}`.",
         f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
@@ -899,6 +918,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.coordinator_quiet:
             say("refused: --coordinator-quiet is required (R-N91)")
+            return 2
+        if args.pattern != DEFAULT_PATTERN:
+            say(
+                f"refused: gated mode runs only --pattern {DEFAULT_PATTERN}"
+                " (OI-1002-Q30)"
+            )
             return 2
         if (args.expect_files, args.expect_bytes) != (RECORD_FILES, RECORD_BYTES):
             say("refused: gated mode only runs R23 corpus v1 (default --expect-*)")

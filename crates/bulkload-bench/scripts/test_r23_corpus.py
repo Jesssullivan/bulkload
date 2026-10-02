@@ -60,6 +60,12 @@ class StructureTests(unittest.TestCase):
         source = next(corpus.content("big/blob-b.bin"))
         self.assertEqual(prefix, source)
 
+    def test_verify_reports_a_missing_path(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(corpus.main(["verify", "/nonexistent/r23-corpus"]), 1)
+        self.assertIn("missing=1", out.getvalue())
+
     def test_mixed_compressibility(self) -> None:
         text = next(corpus.content("medium/m02.txt"))
         sparse = next(corpus.content("medium/m03.img"))
