@@ -9,6 +9,7 @@ description = "Bulkload wire protocol: postcard frame codec, row schema, refusal
 [dependencies]
 serde = { workspace = true }
 postcard = { workspace = true }
+blake3 = { workspace = true }
 
 [lints.clippy]
 # R33 deny-panics wall. Refusals are Results, never panics.

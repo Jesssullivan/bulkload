@@ -1,29 +1,74 @@
-//! Native resumable transfer over framed bidirectional stdio.
+//! Native resumable transfer over one full-duplex framed stream (wire v5).
 //!
-//! Only missing chunks cross the wire. The source sends each captured chunk
-//! from memory while a committer thread appends it to the private source pack,
-//! so a resumed transfer need not re-read the source. The destination writes
-//! each output directly from the received chunks, each verified against its
-//! digest, and publishes it through group commit ([`crate::io::durable`]).
-//! Destination completion binds both source and output identity. Enumeration
-//! still walks the tree. This is not a no-rewalk performance claim.
+//! The source walks its root and offers every seat as a numbered
+//! [`Control::Entry`], up to [`ENTRY_WINDOW`] undecided at once. The
+//! destination answers each with a [`Control::Decide`]:
+//!
+//! - `Skip`/`Refuse`: nothing to send (a directory or symlink the destination
+//!   made itself, or a row it refused);
+//! - `Reuse`: the destination holds this exact source identity durably, so
+//!   the source reads nothing (R25, R-N58);
+//! - `Send`: the source reads the file once, chunks and hashes it, and streams
+//!   every chunk as a binary `Data` frame (header and payload with `writev`),
+//!   then [`Control::End`] with the `manifest_root`;
+//! - `WantManifest`: the destination may fill chunks locally (an existing
+//!   output to adopt, or chunks held by published outputs). The source sends
+//!   [`Control::Manifest`] (from its digest-only ledger without reading, when
+//!   the stat identity is recorded), the destination answers
+//!   [`Control::NeedChunks`] by index, and the source sends only those.
+//!
+//! Data frames are paced by [`Control::Credit`]: the source never has more
+//! than the granted payload bytes in flight. The source keeps no byte pack;
+//! its ledger records digests and sizes only, so a refused capture leaves
+//! nothing behind (R-N86). The destination writes each output from
+//! digest-verified chunks and publishes it through group commit
+//! ([`crate::io::durable`]). Enumeration still walks the whole tree first;
+//! the streaming walk is W4 PR 3.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-const BATCH_ROWS: usize = 32;
+use bulkload_proto::frame::{
+    data_prefix, manifest_root, wire_id, ChunkSpec, Control, DataHeader, Decision, Frame,
+    DATA_HEADER_BYTES, FRAME_HEADER_BYTES, MAX_DATA_PAYLOAD, MAX_FRAME_BYTES, TAG_DATA,
+};
+use bulkload_proto::{FileKind, PROTO_VERSION};
+
+use crate::counters::{self, Counter};
+use crate::freshness::{NullCache, StatIdentity};
+use crate::io::durable::Committer;
+use crate::materialize::{
+    verify_existing, Destination, PendingOutput, Publication, PublishSink, StagedFile,
+};
+use crate::transfer_store::{
+    row_key, ChunkHint, LedgerItem, LedgerSink, Manifest, OutputRecord, PublisherSide, Store,
+};
+use crate::walk::{walk, WalkOptions};
+use crate::{BulkloadRefusal, Result, RowSchema};
+
+/// Capture threads on the source.
 const CAPTURE_WORKERS: usize = 4;
-// Each event carries at most PERSIST_BATCH payloads (64 MiB). Eight queued
-// events plus four producer batches stay below 1 GiB.
-const CAPTURE_QUEUE: usize = CAPTURE_WORKERS * 2;
-// Captured chunks held in memory for sending; beyond this a capture's chunks
-// are read back from the sealed pack instead.
+/// Entries offered but not yet decided, at most.
+const ENTRY_WINDOW: usize = 1024;
+/// Entries whose content is in flight on the source, at most. Each may hold
+/// one staged file open on the destination.
+const ACTIVE_ENTRIES: usize = CAPTURE_WORKERS * 4;
+/// Staged files the destination accepts open at once; a source that opens
+/// more is refused.
+const MAX_OPEN_ENTRIES: usize = 64;
+/// Data payload bytes the destination grants up front.
+const CREDIT_WINDOW: u64 = 16 * 1024 * 1024;
+/// The destination returns credit once this much payload has been written.
+const CREDIT_RETURN: u64 = 1024 * 1024;
+/// Chunk bytes the source may hold in memory between a fresh manifest and
+/// the chunk requests that follow it; past this it reads them again.
 const RETAIN_BYTES: u64 = 512 * 1024 * 1024;
 // At most this many files keep an open descriptor for chunk reuse before
 // their group commits; fewer when the descriptor budget is smaller.
@@ -39,22 +84,6 @@ static CDC_HASH_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static TRANSFER_NS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
-
-use bulkload_proto::frame::{ChunkSpec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
-use bulkload_proto::FileKind;
-
-use crate::counters::{self, Counter};
-use crate::freshness::{NullCache, StatIdentity};
-use crate::io::durable::Committer;
-use crate::materialize::{
-    verify_existing, Destination, PendingOutput, Publication, PublishSink, StagedFile,
-};
-use crate::transfer_store::{
-    row_key, ChunkData, ChunkHint, Manifest, OutputRecord, PackItem, PackSink, PreparedEvent,
-    PublisherSide, Store, PERSIST_BATCH,
-};
-use crate::walk::{walk, WalkOptions};
-use crate::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -147,33 +176,6 @@ fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn send_prepared(
-    sender: &std::sync::mpsc::SyncSender<PreparedEvent>,
-    event: PreparedEvent,
-) -> Result<()> {
-    let started = Instant::now();
-    let sent = sender.send(event).map_err(|_| BulkloadRefusal::Io(None));
-    QUEUE_WAIT_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
-    sent
-}
-
-struct SendBatchContext<'a> {
-    root: &'a Path,
-    authority: &'a [u8],
-    store: &'a Store,
-    committer: &'a Committer<PackSink>,
-    batch: &'a [RowSchema],
-    needed: &'a [bool],
-}
-
-struct ReceiveContext<'a> {
-    target: &'a Destination,
-    store: &'a Store,
-    authority: &'a [u8],
-    committer: &'a Committer<PublishSink>,
-    session: &'a mut SessionChunks,
-}
-
 /// Run the same framed protocol locally over a bounded Unix stream pair.
 ///
 /// # Errors
@@ -202,8 +204,13 @@ pub fn copy(
     }
     std::thread::scope(|scope| -> Result<TransferStats> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let mut input = sender.try_clone()?;
-            serve(&mut input, &mut sender)
+            let input = sender.try_clone()?;
+            let served = serve(input, &mut sender);
+            // The source's reader thread holds a clone of this end; shutting
+            // it down ends that thread and tells the destination the source
+            // is gone, whatever `serve` returned.
+            let _ = sender.shutdown(std::net::Shutdown::Both);
+            served
         })?;
         let result = {
             let mut output = receiver.try_clone()?;
@@ -216,14 +223,9 @@ pub fn copy(
                 destination_state,
             )
         };
+        let _ = receiver.shutdown(std::net::Shutdown::Both);
         drop(receiver);
-        let served = producer.join().map_err(|_| BulkloadRefusal::Io(None))?;
-        // The space preflight refuses on the receiving side, and the source
-        // then sees only a closed stream: the receiver's refusal is the cause.
-        if matches!(result, Err(BulkloadRefusal::DestinationSpaceInsufficient)) {
-            return result;
-        }
-        served?;
+        producer.join().map_err(|_| BulkloadRefusal::Io(None))??;
         result
     })
 }
@@ -236,14 +238,229 @@ pub fn tune_stream(stream: &impl std::os::fd::AsFd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Source
+// ---------------------------------------------------------------------------
+
+/// Data payload bytes the destination has granted and the source has not yet
+/// spent. Capture threads take credit before they hand a chunk to the
+/// sending thread, so chunk memory in flight is bounded by the window.
+struct Credit {
+    state: Mutex<(u64, bool)>,
+    ready: Condvar,
+}
+
+impl Credit {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Add credit the destination returned. Available credit never exceeds
+    /// [`CREDIT_WINDOW`]: an honest destination only returns what the source
+    /// spent, so a grant past the window is refused.
+    fn grant(&self, bytes: u64) -> Result<()> {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let granted = state
+                .0
+                .checked_add(bytes)
+                .filter(|granted| *granted <= CREDIT_WINDOW)
+                .ok_or(BulkloadRefusal::BudgetExceeded)?;
+            state.0 = granted;
+        }
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    /// Stop every waiter: the session is over.
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.ready.notify_all();
+    }
+
+    fn acquire(&self, bytes: u64) -> Result<()> {
+        let started = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.1 {
+                return Err(BulkloadRefusal::Io(None));
+            }
+            if state.0 >= bytes {
+                state.0 -= bytes;
+                QUEUE_WAIT_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                return Ok(());
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Chunk bytes held between a fresh manifest and its chunk requests, with
+/// their reservation against [`RETAIN_BYTES`], released on drop.
+struct Retained {
+    chunks: Vec<Arc<Vec<u8>>>,
+    reserved: u64,
+    budget: Arc<AtomicU64>,
+}
+
+impl Retained {
+    /// Reserve `bytes` from `budget`, or `None` when it would overrun.
+    fn reserve(budget: &Arc<AtomicU64>, bytes: u64) -> Option<Self> {
+        budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .ok()?;
+        Some(Self {
+            chunks: Vec::new(),
+            reserved: bytes,
+            budget: Arc::clone(budget),
+        })
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        self.budget.fetch_add(self.reserved, Ordering::AcqRel);
+    }
+}
+
+/// Work for a capture thread.
+enum Job {
+    /// Read, chunk and stream entry `entry`.
+    Send { entry: u64 },
+    /// Produce entry `entry`'s manifest, from the ledger when it can.
+    Manifest { entry: u64 },
+    /// Send the requested chunks of an offered manifest, then `End`.
+    Serve {
+        entry: u64,
+        manifest: Manifest,
+        indices: Vec<u32>,
+        retained: Option<Retained>,
+        /// The row key to record once the destination holds the bytes.
+        record: Option<Vec<u8>>,
+    },
+}
+
+/// What the sending thread hears: destination frames from the reader
+/// thread, and capture output from the capture threads.
+enum Event {
+    Decide {
+        entry: u64,
+        decision: Decision,
+    },
+    NeedChunks {
+        entry: u64,
+        indices: Vec<u32>,
+    },
+    Held {
+        entry: u64,
+        held: bool,
+    },
+    PeerFailed(BulkloadRefusal),
+    /// One chunk, its credit already taken.
+    Chunk {
+        header: DataHeader,
+        data: Arc<Vec<u8>>,
+    },
+    Manifest {
+        entry: u64,
+        /// The row key to record, for a manifest that is not yet in the ledger.
+        record: Option<Vec<u8>>,
+        manifest: Manifest,
+        retained: Option<Retained>,
+        bytes_read: u64,
+    },
+    End {
+        entry: u64,
+        /// The capture to record once the destination holds the bytes, for
+        /// a capture not yet in the ledger.
+        record: Option<(Vec<u8>, Manifest)>,
+        root: [u8; 32],
+        chunks: u32,
+        size: u64,
+        bytes_read: u64,
+    },
+    Refused {
+        entry: u64,
+        refusal: BulkloadRefusal,
+        bytes_read: u64,
+    },
+}
+
+/// Where one entry stands on the source.
+enum SourceEntry {
+    Unoffered,
+    Undecided,
+    Queued,
+    Working,
+    Offered {
+        manifest: Manifest,
+        retained: Option<Retained>,
+        record: Option<Vec<u8>>,
+    },
+    Done,
+}
+
+/// The source's retention budget.
+#[cfg(not(test))]
+const fn retain_budget(_root: &Path) -> u64 {
+    RETAIN_BYTES
+}
+
+/// The source's retention budget; tests set a smaller one per source root.
+#[cfg(test)]
+fn retain_budget(root: &Path) -> u64 {
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(override_root, _)| override_root == root)
+        .map_or(RETAIN_BYTES, |(_, bytes)| *bytes)
+}
+
+/// Test-only retention budgets by canonical source root.
+#[cfg(test)]
+static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+/// What every capture thread shares.
+struct SourceWork<'a> {
+    root: &'a Path,
+    authority: &'a [u8],
+    state: &'a Path,
+    rows: &'a [RowSchema],
+    credit: &'a Credit,
+    retain: Arc<AtomicU64>,
+}
+
 /// Serve one transfer request from a caller-authenticated stdio transport.
 ///
+/// A reader thread owns `input` for the whole session and may outlive this
+/// call; the caller closes the transport after `serve` returns (a process
+/// exit does).
+///
 /// # Errors
-/// Refuses malformed frames, unsafe state roots, source failures and broken I/O.
-pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
-    let FrameKind::TransferOpen { root, state } = read_frame(input)?.kind else {
+/// Refuses malformed frames, a peer on another wire, unsafe state roots,
+/// source failures and broken I/O.
+pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -> Result<()> {
+    let Frame::Control(Control::Open {
+        proto,
+        wire_id: id,
+        root,
+        state,
+    }) = read_frame(&mut input)?
+    else {
         return Err(BulkloadRefusal::FrameCodec);
     };
+    if proto != PROTO_VERSION || id != wire_id() {
+        return Err(BulkloadRefusal::FrameCodec);
+    }
     let root = std::fs::canonicalize(path(root))?;
     let state = path(state);
     let store = Store::open(&state)?;
@@ -257,12 +474,12 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         meta.dev(),
         meta.ino(),
     ))?;
-    let committer = Committer::spawn(PackSink::new(
+    let committer = Committer::spawn(LedgerSink::new(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
     ))?;
-    write_frame(
+    write_control(
         output,
-        FrameKind::TransferStart {
+        &Control::Start {
             authority: authority.clone(),
         },
     )?;
@@ -279,359 +496,763 @@ pub fn serve<R: Read, W: Write>(input: &mut R, output: &mut W) -> Result<()> {
         .rows
         .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     for refused in census.refusals {
-        write_frame(
+        write_control(
             output,
-            FrameKind::Refusal {
-                code: refused.refusal.code().to_owned(),
+            &Control::Refused {
+                entry: None,
                 rel_path: refused.rel_path,
+                code: refused.refusal.code().to_owned(),
             },
         )?;
     }
     // Recorded, never carried: the receiver reports each one (R-N79).
     for rel_path in census.engine_temporaries {
-        write_frame(output, FrameKind::EngineTemporary { rel_path })?;
+        write_control(output, &Control::EngineTemporary { rel_path })?;
     }
-    let mut source_bytes_read = 0;
-    let mut rows = 0;
-    for batch in census.rows.chunks(BATCH_ROWS) {
-        rows += batch.len() as u64;
-        write_frame(
-            output,
-            FrameKind::TransferBatch {
-                rows: batch.to_vec(),
-            },
-        )?;
-        let FrameKind::WantFiles { needed } = read_frame(input)?.kind else {
-            return Err(BulkloadRefusal::FrameCodec);
-        };
-        if needed.len() != batch.len() {
-            return Err(BulkloadRefusal::FrameCodec);
+    let credit = Arc::new(Credit::new());
+    let (events_sender, events) = std::sync::mpsc::channel();
+    spawn_reader(input, events_sender.clone(), Arc::clone(&credit))?;
+    let work = SourceWork {
+        root: &root,
+        authority: &authority,
+        state: store.root(),
+        rows: &census.rows,
+        credit: &credit,
+        retain: Arc::new(AtomicU64::new(retain_budget(&root))),
+    };
+    let (jobs, job_queue) = std::sync::mpsc::channel();
+    let job_queue = Mutex::new(job_queue);
+    let served = std::thread::scope(|scope| -> Result<u64> {
+        for _ in 0..CAPTURE_WORKERS {
+            let events = events_sender.clone();
+            let (work, job_queue) = (&work, &job_queue);
+            std::thread::Builder::new()
+                .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))?;
         }
-        if batch
-            .iter()
-            .zip(&needed)
-            .any(|(row, needed)| *needed && row.kind != FileKind::Regular)
-        {
-            return Err(BulkloadRefusal::FrameCodec);
-        }
-        source_bytes_read += send_batch(
-            input,
-            output,
-            &SendBatchContext {
-                root: &root,
-                authority: &authority,
-                store: &store,
-                committer: &committer,
-                batch,
-                needed: &needed,
-            },
-        )?;
-    }
+        let sent = send_entries(output, &work, &committer, &events, jobs);
+        // Wake any capture thread waiting on credit; its job is moot now.
+        credit.close();
+        sent
+    });
+    drop(events_sender);
+    let source_bytes_read = served?;
     // Every capture of this transfer is committed, or the transfer fails,
     // before the receiver is told the source is done.
     committer.sync()?;
     fault_point!(ServeBeforeDone);
-    write_frame(
+    write_control(
         output,
-        FrameKind::TransferDone {
-            rows,
+        &Control::SourceDone {
+            entries: census.rows.len() as u64,
             source_bytes_read,
         },
     )?;
     committer.finish()?
 }
 
-/// Chunks of one capture held in memory until its file has been sent.
-#[derive(Default)]
-struct Retained {
-    chunks: HashMap<[u8; 32], ChunkData>,
-    bytes: u64,
-    /// Over budget: this capture's chunks are read back from the pack instead.
-    spilled: bool,
-}
-
-/// Every capture's retained chunks, bounded by [`RETAIN_BYTES`] in total.
-#[derive(Default)]
-struct RetainedSet {
-    captures: HashMap<usize, Retained>,
-    bytes: u64,
-}
-
-impl RetainedSet {
-    fn hold(&mut self, capture_id: usize, chunks: Vec<([u8; 32], ChunkData)>) {
-        let bytes = chunks.iter().fold(0_u64, |total, (_, data)| {
-            total.saturating_add(data.len() as u64)
-        });
-        let held = self.captures.entry(capture_id).or_default();
-        if held.spilled {
-            return;
-        }
-        if self.bytes.saturating_add(bytes) > RETAIN_BYTES {
-            self.bytes = self.bytes.saturating_sub(held.bytes);
-            *held = Retained {
-                spilled: true,
-                ..Retained::default()
-            };
-            return;
-        }
-        self.bytes = self.bytes.saturating_add(bytes);
-        held.bytes = held.bytes.saturating_add(bytes);
-        held.chunks.extend(chunks);
-    }
-
-    fn take(&mut self, capture_id: usize) -> Retained {
-        let held = self.captures.remove(&capture_id).unwrap_or_default();
-        self.bytes = self.bytes.saturating_sub(held.bytes);
-        held
-    }
-}
-
-/// What the capture workers of one batch share.
-#[derive(Clone, Copy)]
-struct CaptureWork<'a> {
-    root: &'a Path,
-    authority: &'a [u8],
-    state: &'a Path,
-    batch: &'a [RowSchema],
-    order: &'a [usize],
-}
-
-/// Start the capture workers for one batch. They take needed rows largest
-/// first, so the longest capture starts before the short ones.
-fn spawn_captures<'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
-    work: CaptureWork<'scope>,
-    next: &'scope AtomicUsize,
-    sender: &std::sync::mpsc::SyncSender<PreparedEvent>,
+/// Read the destination's frames for the whole session: credit is granted
+/// at once, decisions and chunk requests go to the sending thread.
+fn spawn_reader<R: Read + Send + 'static>(
+    mut input: R,
+    events: Sender<Event>,
+    credit: Arc<Credit>,
 ) -> Result<()> {
-    let CaptureWork {
-        root,
-        authority,
-        state,
-        batch,
-        order,
-    } = work;
-    for _ in 0..CAPTURE_WORKERS.min(order.len()) {
-        let sender = sender.clone();
-        std::thread::Builder::new().spawn_scoped(scope, move || {
-            let opened = Store::open_reader(state);
-            while let Some(index) = order.get(next.fetch_add(1, Ordering::Relaxed)).copied() {
-                let Some(row) = batch.get(index) else {
-                    break;
-                };
-                let mut bytes = 0;
-                let prepared = opened
-                    .as_ref()
-                    .map_or(Err(BulkloadRefusal::Io(None)), |store| {
-                        capture(root, authority, row, store, index, &sender, &mut bytes)
-                    });
-                if let Err(refusal) = prepared {
-                    if send_prepared(
-                        &sender,
-                        PreparedEvent::Refused {
-                            capture_id: index,
-                            bytes_read: bytes,
-                            refusal,
-                        },
-                    )
-                    .is_err()
-                    {
-                        break;
+    std::thread::Builder::new()
+        .name("bulkload-serve-reader".to_owned())
+        .spawn(move || {
+            let failure = loop {
+                let event = match read_frame(&mut input) {
+                    Ok(Frame::Control(Control::Credit { bytes })) => {
+                        if let Err(refusal) = credit.grant(bytes) {
+                            break refusal;
+                        }
+                        continue;
                     }
+                    Ok(Frame::Control(Control::Decide { entry, decision })) => {
+                        Event::Decide { entry, decision }
+                    }
+                    Ok(Frame::Control(Control::Held { entry, held })) => {
+                        Event::Held { entry, held }
+                    }
+                    Ok(Frame::Control(Control::NeedChunks { entry, indices })) => {
+                        Event::NeedChunks { entry, indices }
+                    }
+                    Ok(_) => break BulkloadRefusal::FrameCodec,
+                    Err(refusal) => break refusal,
+                };
+                if events.send(event).is_err() {
+                    break BulkloadRefusal::Io(None);
                 }
-                if opened.is_err() {
-                    break;
-                }
-            }
+            };
+            credit.close();
+            let _ = events.send(Event::PeerFailed(failure));
         })?;
-    }
     Ok(())
 }
 
-fn send_batch<R: Read, W: Write>(
-    input: &mut R,
+/// The sending thread's view of the session.
+struct Outbound<'a, W> {
+    output: &'a mut W,
+    rows: &'a [RowSchema],
+    committer: &'a Committer<LedgerSink>,
+    jobs: Sender<Job>,
+    entries: Vec<SourceEntry>,
+    offered: usize,
+    undecided: usize,
+    walk_done: bool,
+    queue: VecDeque<Job>,
+    active: usize,
+    bytes_read: u64,
+    /// Entries whose `End` is sent and whose `Held` is awaited, with the
+    /// capture to record once the destination holds the bytes.
+    awaiting: HashMap<u64, Option<(Vec<u8>, Manifest)>>,
+}
+
+/// The sending thread: offer entries, act on decisions and chunk requests,
+/// and write capture output as it arrives. Returns the source bytes read.
+fn send_entries<W: Write>(
     output: &mut W,
-    context: &SendBatchContext<'_>,
+    work: &SourceWork<'_>,
+    committer: &Committer<LedgerSink>,
+    events: &Receiver<Event>,
+    jobs: Sender<Job>,
 ) -> Result<u64> {
-    let batch = context.batch;
-    let mut order: Vec<usize> = context
-        .needed
-        .iter()
-        .enumerate()
-        .filter_map(|(index, needed)| needed.then_some(index))
-        .collect();
-    order.sort_by_key(|index| std::cmp::Reverse(batch.get(*index).map_or(0, |row| row.size)));
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| -> Result<u64> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(CAPTURE_QUEUE);
-        spawn_captures(
-            scope,
-            CaptureWork {
-                root: context.root,
-                authority: context.authority,
-                state: context.store.root(),
-                batch,
-                order: &order,
-            },
-            &next,
-            &sender,
-        )?;
-        drop(sender);
-        let mut retained = RetainedSet::default();
-        let mut bytes_read = 0_u64;
-        let mut completed = 0;
-        // After a send failure no new row is started, but captures already in
-        // flight are still recorded, so a resumed transfer need not re-read them.
-        let mut failure = None;
-        while let Ok(event) = receiver.recv() {
-            let (capture_id, read, captured) = match event {
-                PreparedEvent::Chunks { capture_id, chunks } => {
-                    context.committer.submit(PackItem::Chunks {
-                        capture_id,
-                        chunks: chunks.clone(),
-                    })?;
-                    retained.hold(capture_id, chunks);
-                    continue;
-                }
-                PreparedEvent::Complete {
-                    capture_id,
-                    bytes_read,
-                    key,
-                    manifest,
-                    reused,
-                } => {
-                    if !reused {
-                        context.committer.submit(PackItem::Capture {
-                            key,
-                            manifest: manifest.clone(),
-                        })?;
-                    }
-                    (capture_id, bytes_read, Ok(manifest))
-                }
-                PreparedEvent::Refused {
-                    capture_id,
-                    bytes_read,
-                    refusal,
-                } => {
-                    context.committer.submit(PackItem::Refused { capture_id })?;
-                    (capture_id, bytes_read, Err(refusal))
-                }
+    let mut outbound = Outbound {
+        output,
+        rows: work.rows,
+        committer,
+        jobs,
+        entries: work.rows.iter().map(|_| SourceEntry::Unoffered).collect(),
+        offered: 0,
+        undecided: 0,
+        walk_done: false,
+        queue: VecDeque::new(),
+        active: 0,
+        bytes_read: 0,
+        awaiting: HashMap::new(),
+    };
+    loop {
+        outbound.offer()?;
+        if outbound.finished() {
+            return Ok(outbound.bytes_read);
+        }
+        let event = events.recv().map_err(|_| BulkloadRefusal::Io(None))?;
+        outbound.handle(event)?;
+    }
+}
+
+impl<W: Write> Outbound<'_, W> {
+    /// Offer entries up to the window, close the walk once all are offered,
+    /// and start queued jobs up to the active bound.
+    fn offer(&mut self) -> Result<()> {
+        while self.offered < self.rows.len() && self.undecided < ENTRY_WINDOW {
+            let row = self
+                .rows
+                .get(self.offered)
+                .ok_or(BulkloadRefusal::FrameCodec)?;
+            write_control(
+                self.output,
+                &Control::Entry {
+                    entry: self.offered as u64,
+                    row: row.clone(),
+                },
+            )?;
+            if let Some(slot) = self.entries.get_mut(self.offered) {
+                *slot = SourceEntry::Undecided;
+            }
+            self.offered += 1;
+            self.undecided += 1;
+        }
+        if self.offered == self.rows.len() && !self.walk_done {
+            write_control(
+                self.output,
+                &Control::WalkDone {
+                    entries: self.rows.len() as u64,
+                },
+            )?;
+            self.walk_done = true;
+        }
+        while self.active < ACTIVE_ENTRIES {
+            let Some(job) = self.queue.pop_front() else {
+                break;
             };
-            let held = retained.take(capture_id);
-            bytes_read = bytes_read.saturating_add(read);
-            completed += 1;
-            if failure.is_some() {
-                continue;
-            }
-            match send_file(input, output, context, capture_id, captured, &held) {
-                Ok(()) => fault_point!(ServeAfterContent),
-                Err(error) => {
-                    next.store(order.len(), Ordering::Relaxed);
-                    failure = Some(error);
-                }
-            }
+            self.jobs.send(job).map_err(|_| BulkloadRefusal::Io(None))?;
+            self.active += 1;
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        if completed != order.len() {
+        Ok(())
+    }
+
+    fn finished(&self) -> bool {
+        self.walk_done
+            && self.undecided == 0
+            && self.queue.is_empty()
+            && self.active == 0
+            && self.awaiting.is_empty()
+    }
+
+    fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &RowSchema)> {
+        let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        Ok((
+            self.entries
+                .get_mut(index)
+                .ok_or(BulkloadRefusal::FrameCodec)?,
+            self.rows.get(index).ok_or(BulkloadRefusal::FrameCodec)?,
+        ))
+    }
+
+    /// Retire an entry whose job a capture thread held.
+    fn finish_entry(&mut self, entry: u64) -> Result<RowSchema> {
+        let (slot, row) = self.slot(entry)?;
+        if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
             return Err(BulkloadRefusal::Io(None));
         }
-        write_frame(output, FrameKind::BatchDone)?;
-        Ok(bytes_read)
+        *slot = SourceEntry::Done;
+        let row = row.clone();
+        self.active -= 1;
+        Ok(row)
+    }
+
+    fn handle(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::PeerFailed(refusal) => return Err(refusal),
+            Event::Decide { entry, decision } => self.decide(entry, &decision)?,
+            Event::NeedChunks { entry, indices } => self.need_chunks(entry, indices)?,
+            Event::Chunk { header, data } => write_data(self.output, &header, &data)?,
+            Event::Manifest {
+                entry,
+                record,
+                manifest,
+                retained,
+                bytes_read,
+            } => {
+                self.bytes_read = self.bytes_read.saturating_add(bytes_read);
+                write_control(
+                    self.output,
+                    &Control::Manifest {
+                        entry,
+                        root: manifest.root,
+                        chunks: manifest.chunks.clone(),
+                    },
+                )?;
+                let (slot, _) = self.slot(entry)?;
+                if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
+                    return Err(BulkloadRefusal::Io(None));
+                }
+                *slot = SourceEntry::Offered {
+                    manifest,
+                    retained,
+                    record,
+                };
+            }
+            Event::Held { entry, held } => {
+                let record = self
+                    .awaiting
+                    .remove(&entry)
+                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                // A capture is recorded only once the destination holds its
+                // bytes durably, so a committed capture never costs a source
+                // read again (R25, OI-1001-Q15).
+                if let (true, Some((key, manifest))) = (held, record) {
+                    self.committer.submit(LedgerItem {
+                        entry,
+                        key,
+                        manifest,
+                    })?;
+                }
+            }
+            Event::End {
+                entry,
+                record,
+                root,
+                chunks,
+                size,
+                bytes_read,
+            } => {
+                self.bytes_read = self.bytes_read.saturating_add(bytes_read);
+                self.finish_entry(entry)?;
+                self.awaiting.insert(entry, record);
+                write_control(
+                    self.output,
+                    &Control::End {
+                        entry,
+                        root,
+                        chunks,
+                        size,
+                    },
+                )?;
+                fault_point!(ServeAfterContent);
+            }
+            Event::Refused {
+                entry,
+                refusal,
+                bytes_read,
+            } => {
+                self.bytes_read = self.bytes_read.saturating_add(bytes_read);
+                let row = self.finish_entry(entry)?;
+                write_control(
+                    self.output,
+                    &Control::Refused {
+                        entry: Some(entry),
+                        rel_path: row.rel_path,
+                        code: refusal.code().to_owned(),
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decide(&mut self, entry: u64, decision: &Decision) -> Result<()> {
+        let (slot, row) = self.slot(entry)?;
+        if !matches!(slot, SourceEntry::Undecided) {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        let regular = row.kind == FileKind::Regular;
+        let (next, job) = match decision {
+            Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => (SourceEntry::Done, None),
+            Decision::Send | Decision::WantManifest if !regular => {
+                return Err(BulkloadRefusal::FrameCodec);
+            }
+            Decision::Send => (SourceEntry::Queued, Some(Job::Send { entry })),
+            Decision::WantManifest => (SourceEntry::Queued, Some(Job::Manifest { entry })),
+        };
+        *slot = next;
+        self.undecided -= 1;
+        self.queue.extend(job);
+        Ok(())
+    }
+
+    fn need_chunks(&mut self, entry: u64, indices: Vec<u32>) -> Result<()> {
+        let (slot, _) = self.slot(entry)?;
+        let SourceEntry::Offered {
+            manifest,
+            retained,
+            record,
+        } = std::mem::replace(slot, SourceEntry::Working)
+        else {
+            return Err(BulkloadRefusal::FrameCodec);
+        };
+        let count = manifest.chunks.len();
+        if indices.windows(2).any(|pair| pair.first() >= pair.get(1))
+            || indices.iter().any(|index| *index as usize >= count)
+        {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        self.jobs
+            .send(Job::Serve {
+                entry,
+                manifest,
+                indices,
+                retained,
+                record,
+            })
+            .map_err(|_| BulkloadRefusal::Io(None))
+    }
+}
+
+/// One capture thread: take jobs until the queue closes.
+fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
+    let store = Store::open_reader(work.state);
+    loop {
+        let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok(job) = job else {
+            break;
+        };
+        let event = match &store {
+            Ok(store) => run_job(work, store, job, events),
+            Err(refusal) => Event::Refused {
+                entry: match job {
+                    Job::Send { entry } | Job::Manifest { entry } | Job::Serve { entry, .. } => {
+                        entry
+                    }
+                },
+                refusal: refusal.clone(),
+                bytes_read: 0,
+            },
+        };
+        if events.send(event).is_err() {
+            break;
+        }
+    }
+}
+
+fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event>) -> Event {
+    let mut bytes_read = 0;
+    let (entry, outcome) = match job {
+        Job::Send { entry } => (entry, send_capture(work, entry, events, &mut bytes_read)),
+        Job::Manifest { entry } => (
+            entry,
+            match manifest_capture(work, store, entry, &mut bytes_read) {
+                Ok(Some((record, manifest, retained))) => Ok(Event::Manifest {
+                    entry,
+                    record,
+                    manifest,
+                    retained,
+                    bytes_read,
+                }),
+                // No ledger row and no room to keep the chunks: building a
+                // manifest first would read the seat twice (R25). Stream it
+                // instead; the destination takes data in place of a manifest.
+                Ok(None) => send_capture(work, entry, events, &mut bytes_read),
+                Err(refusal) => Err(refusal),
+            },
+        ),
+        Job::Serve {
+            entry,
+            manifest,
+            indices,
+            retained,
+            record,
+        } => (
+            entry,
+            serve_chunks(
+                work,
+                entry,
+                &manifest,
+                &indices,
+                retained.as_ref(),
+                events,
+                &mut bytes_read,
+            )
+            .map(|event| match event {
+                Event::End {
+                    entry,
+                    root,
+                    chunks,
+                    size,
+                    bytes_read,
+                    ..
+                } => Event::End {
+                    entry,
+                    record: record.map(|key| (key, manifest)),
+                    root,
+                    chunks,
+                    size,
+                    bytes_read,
+                },
+                other => other,
+            }),
+        ),
+    };
+    outcome.unwrap_or_else(|refusal| Event::Refused {
+        entry,
+        refusal,
+        bytes_read,
     })
 }
 
-/// Announce one requested row, then send its content or its refusal.
-fn send_file<R: Read, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    context: &SendBatchContext<'_>,
-    capture_id: usize,
-    captured: Result<Manifest>,
-    held: &Retained,
-) -> Result<()> {
-    let row = context
-        .batch
-        .get(capture_id)
-        .ok_or(BulkloadRefusal::FrameCodec)?;
-    write_frame(
-        output,
-        FrameKind::FileContent {
-            index: u32::try_from(capture_id).map_err(|_| BulkloadRefusal::FrameCodec)?,
-        },
-    )?;
-    match captured {
-        Ok(manifest) => send_content(input, output, &manifest, context, row, held),
-        Err(refusal) => write_frame(
-            output,
-            FrameKind::Refusal {
-                code: refusal.code().to_owned(),
-                rel_path: row.rel_path.clone(),
-            },
-        ),
+fn job_row<'a>(work: &SourceWork<'a>, entry: u64) -> Result<&'a RowSchema> {
+    work.rows
+        .get(usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?)
+        .ok_or(BulkloadRefusal::FrameCodec)
+}
+
+/// Read, chunk and stream one file; its `End` carries the capture to record.
+fn send_capture(
+    work: &SourceWork<'_>,
+    entry: u64,
+    events: &Sender<Event>,
+    bytes_read: &mut u64,
+) -> Result<Event> {
+    let row = job_row(work, entry)?;
+    let key = row_key(work.authority, row)?;
+    let chunks = capture_file(work.root, row, bytes_read, |index, offset, digest, data| {
+        let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        work.credit.acquire(u64::from(size))?;
+        events
+            .send(Event::Chunk {
+                header: DataHeader {
+                    entry,
+                    index,
+                    size,
+                    offset,
+                    digest,
+                },
+                data: Arc::new(data),
+            })
+            .map_err(|_| BulkloadRefusal::Io(None))
+    })?;
+    let manifest = Manifest::new(chunks);
+    Ok(Event::End {
+        entry,
+        root: manifest.root,
+        chunks: u32::try_from(manifest.chunks.len())
+            .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+        size: row.size,
+        record: Some((key, manifest)),
+        bytes_read: *bytes_read,
+    })
+}
+
+/// A manifest to offer: the row key to record (none when it came from the
+/// ledger), the manifest, and its retained chunks.
+type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>);
+
+/// One entry's manifest: from the ledger when this exact stat identity is
+/// recorded (no source read), otherwise from one read of the file, whose
+/// chunks are all kept in memory for the requests that follow. `None` when
+/// the retention budget cannot hold the file: the caller streams it instead
+/// of reading it twice (#77 review F1).
+fn manifest_capture(
+    work: &SourceWork<'_>,
+    store: &Store,
+    entry: u64,
+    bytes_read: &mut u64,
+) -> Result<Option<Offer>> {
+    let row = job_row(work, entry)?;
+    let key = row_key(work.authority, row)?;
+    if let Some(manifest) = store.capture(&key)? {
+        if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
+            return Ok(Some((None, manifest, None)));
+        }
+    }
+    // Every chunk a fresh manifest names must be kept, so the requests that
+    // follow are served from memory: a seat is read at most once a session.
+    let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
+        return Ok(None);
+    };
+    let chunks = capture_file(work.root, row, bytes_read, |_, _, _, data| {
+        retained.chunks.push(Arc::new(data));
+        Ok(())
+    })?;
+    Ok(Some((Some(key), Manifest::new(chunks), Some(retained))))
+}
+
+/// Send the requested chunks of an offered manifest, from memory when they
+/// were retained, otherwise read again at their offsets and re-verified
+/// against the manifest under an unchanged stat identity.
+fn serve_chunks(
+    work: &SourceWork<'_>,
+    entry: u64,
+    manifest: &Manifest,
+    indices: &[u32],
+    retained: Option<&Retained>,
+    events: &Sender<Event>,
+    bytes_read: &mut u64,
+) -> Result<Event> {
+    let row = job_row(work, entry)?;
+    let mut offsets = Vec::with_capacity(manifest.chunks.len());
+    let mut offset = 0_u64;
+    for chunk in &manifest.chunks {
+        offsets.push(offset);
+        offset = offset
+            .checked_add(chunk.size)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    }
+    let held = retained.filter(|held| held.chunks.len() == manifest.chunks.len());
+    let opened = if held.is_none() && !indices.is_empty() {
+        let file = crate::hash::open_nofollow(&work.root.join(path(row.rel_path.clone())))?;
+        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+            return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+        }
+        Some(file)
+    } else {
+        None
+    };
+    for index in indices {
+        let at = *index as usize;
+        let spec = manifest.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
+        let offset = *offsets.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
+        let data = if let Some(held) = held {
+            Arc::clone(held.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?)
+        } else {
+            let file = opened.as_ref().ok_or(BulkloadRefusal::Io(None))?;
+            let mut data = vec![
+                0_u8;
+                usize::try_from(spec.size)
+                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+            ];
+            file.read_exact_at(&mut data, offset)
+                .map_err(|_| BulkloadRefusal::SourceChangedAfterSnapshot)?;
+            *bytes_read = bytes_read.saturating_add(spec.size);
+            counters::add_len(Counter::SourceFileRead, data.len());
+            if counters::hash(Counter::HashCaptureChunk, &data) != spec.digest {
+                return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+            }
+            Arc::new(data)
+        };
+        let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        work.credit.acquire(u64::from(size))?;
+        events
+            .send(Event::Chunk {
+                header: DataHeader {
+                    entry,
+                    index: *index,
+                    size,
+                    offset,
+                    digest: spec.digest,
+                },
+                data,
+            })
+            .map_err(|_| BulkloadRefusal::Io(None))?;
+    }
+    if let Some(file) = &opened {
+        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+            return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+        }
+    }
+    Ok(Event::End {
+        entry,
+        record: None,
+        root: manifest.root,
+        chunks: u32::try_from(manifest.chunks.len())
+            .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+        size: row.size,
+        bytes_read: *bytes_read,
+    })
+}
+
+/// Read one source file once, chunk it and hash each chunk, handing every
+/// chunk to `sink` as `(index, offset, digest, bytes)`. The file's stat
+/// identity must match its row before and after the read; a capture that
+/// fails either check is refused, and only its caller decides what any
+/// already-handed chunk means.
+fn capture_file(
+    root: &Path,
+    row: &RowSchema,
+    bytes_read: &mut u64,
+    mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
+) -> Result<Vec<ChunkSpec>> {
+    if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
+        return Err(BulkloadRefusal::BudgetExceeded);
+    }
+    if row.rel_path.ends_with(b"-wal")
+        || row.rel_path.ends_with(b"-shm")
+        || row.rel_path.ends_with(b"-journal")
+    {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    let file_path = root.join(path(row.rel_path.clone()));
+    let mut file = crate::hash::open_nofollow(&file_path)?;
+    let expected = StatIdentity::from_row(row);
+    if StatIdentity::from_metadata(&file.metadata()?) != expected {
+        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+    }
+    let mut prefix = Vec::new();
+    let mut reader = CountReader {
+        input: &mut file,
+        count: bytes_read,
+    };
+    (&mut reader).take(16).read_to_end(&mut prefix)?;
+    if prefix.starts_with(b"SQLite format 3\0")
+        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
+        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
+    {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0_u64;
+    let _cdc_timer = PhaseTimer(&CDC_HASH_NS, Instant::now());
+    for chunk in fastcdc::v2020::StreamCDC::new(
+        prefix.as_slice().chain(reader),
+        crate::hash::CDC_MIN_BYTES,
+        crate::hash::CDC_AVG_BYTES,
+        crate::hash::CDC_MAX_BYTES,
+    ) {
+        let chunk = chunk.map_err(|_| BulkloadRefusal::Io(None))?;
+        fault_mid_read!(chunks.is_empty(), &file_path);
+        if chunks.len() >= MAX_MANIFEST_CHUNKS {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
+        let size = chunk.data.len() as u64;
+        let index = u32::try_from(chunks.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        chunks.push(ChunkSpec { digest, size });
+        sink(index, offset, digest, chunk.data)?;
+        offset = offset
+            .checked_add(size)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    }
+    if offset != row.size || StatIdentity::from_metadata(&file.metadata()?) != expected {
+        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+    }
+    Ok(chunks)
+}
+
+struct CountReader<'a, R> {
+    input: R,
+    count: &'a mut u64,
+}
+impl<R: Read> Read for CountReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.input.read(buffer)?;
+        *self.count = self.count.saturating_add(count as u64);
+        counters::add_len(Counter::SourceFileRead, count);
+        Ok(count)
     }
 }
 
-/// Send one captured file: its manifest, then each chunk the receiver asks
-/// for, from memory when retained and otherwise from the sealed pack.
-fn send_content<R: Read, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    manifest: &Manifest,
-    context: &SendBatchContext<'_>,
-    row: &RowSchema,
-    held: &Retained,
-) -> Result<()> {
-    write_frame(
-        output,
-        FrameKind::Manifest {
-            digest: manifest.digest,
-            chunks: manifest.chunks.clone(),
-        },
-    )?;
-    let FrameKind::WantChunks { digests } = read_frame(input)?.kind else {
-        return Err(BulkloadRefusal::FrameCodec);
-    };
-    let permitted: HashSet<_> = manifest.chunks.iter().map(|chunk| chunk.digest).collect();
-    let mut requested = HashSet::new();
-    let mut synced = false;
-    for digest in digests {
-        if !permitted.contains(&digest) || !requested.insert(digest) {
-            return Err(BulkloadRefusal::FrameCodec);
-        }
-        if let Some(data) = held.chunks.get(&digest) {
-            write_chunk(output, &digest, data)?;
-            continue;
-        }
-        if !synced {
-            // The chunk was not retained: wait for the pack to seal and commit
-            // what has been appended, then read it back.
-            context.committer.sync()?;
-            synced = true;
-        }
-        match context
-            .store
-            .chunk_for(&digest, Counter::SourcePackReadback)
-        {
-            Ok(Some(data)) => write_chunk(output, &digest, &data)?,
-            result => {
-                let refusal = result.err().unwrap_or(BulkloadRefusal::SealedObjectMissing);
-                write_frame(
-                    output,
-                    FrameKind::Refusal {
-                        code: refusal.code().to_owned(),
-                        rel_path: row.rel_path.clone(),
-                    },
-                )?;
-                break;
+// ---------------------------------------------------------------------------
+// Destination
+// ---------------------------------------------------------------------------
+
+/// What planning one manifest reads on the destination.
+struct ReceiveContext<'a> {
+    target: &'a Destination,
+    store: &'a Store,
+    session: &'a SessionChunks,
+    salvage: &'a Salvage,
+}
+
+/// Chunks of this store's orphaned temporaries (see
+/// [`Destination::salvaged`]): what a crashed session staged and sealed but
+/// never published. A resume fills from them instead of asking the source,
+/// so a capture the source recorded as held is never read again (R25).
+#[derive(Default)]
+struct Salvage {
+    /// Digest to (salvaged file, offset, size). Hints only: re-verified on use.
+    index: HashMap<[u8; 32], (usize, u64, u64)>,
+    /// Salvaged files indexed so far.
+    indexed: usize,
+}
+
+impl Salvage {
+    /// Index any temporaries the sweep has salvaged since the last call, by
+    /// chunking them as the source does. Unreadable bytes only cost reuse.
+    fn refresh(&mut self, target: &Destination) {
+        let salvaged = target.salvaged();
+        for at in self.indexed..salvaged {
+            let Some(file) = target.salvaged_file(at) else {
+                continue;
+            };
+            let mut offset = 0_u64;
+            let reader = SalvageReader {
+                file: &file,
+                offset: 0,
+            };
+            for chunk in fastcdc::v2020::StreamCDC::new(
+                reader,
+                crate::hash::CDC_MIN_BYTES,
+                crate::hash::CDC_AVG_BYTES,
+                crate::hash::CDC_MAX_BYTES,
+            ) {
+                let Ok(chunk) = chunk else {
+                    break;
+                };
+                counters::add_len(Counter::DestLocalReuseRead, chunk.data.len());
+                let digest = counters::hash(Counter::HashDestReuse, &chunk.data);
+                let size = chunk.data.len() as u64;
+                self.index.entry(digest).or_insert((at, offset, size));
+                offset = offset.saturating_add(size);
             }
         }
+        self.indexed = salvaged;
     }
-    if !matches!(read_frame(input)?.kind, FrameKind::Applied { .. }) {
-        return Err(BulkloadRefusal::FrameCodec);
+}
+
+/// Sequential reads of a salvaged temporary through `pread`, leaving the
+/// shared descriptor's offset alone.
+struct SalvageReader<'a> {
+    file: &'a std::fs::File,
+    offset: u64,
+}
+
+impl Read for SalvageReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(buffer, self.offset)?;
+        self.offset = self.offset.saturating_add(read as u64);
+        Ok(read)
     }
-    Ok(())
 }
 
 /// End a receive: record the sweep and directory-creation outcomes, commit
@@ -641,19 +1262,32 @@ fn finish_receive(
     store: &Store,
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
+    mut destination_refused: bool,
 ) -> Result<()> {
+    for (rel_path, outcome) in committer.finish()? {
+        match outcome {
+            Ok(()) => stats.completed += 1,
+            Err(refusal) => {
+                destination_refused = true;
+                stats.refusals.push((rel_path, refusal.code().to_owned()));
+            }
+        }
+    }
+    // With every output committed, no output needs a salvaged temporary:
+    // remove them as the sweep would have. After a destination-side refusal
+    // keep them: the refused entry's only durable copy may be one of them
+    // (#77 round 2, N4). Source-side refusals never held bytes here.
+    if destination_refused {
+        target.keep_salvaged();
+    } else {
+        target.remove_salvaged()?;
+    }
     stats.temporaries_removed = target.swept().removed;
     stats.temporaries_left.clone_from(&target.swept().left);
     stats.directories_renamed = target.created().renamed;
     stats
         .directories_fallback
         .clone_from(&target.created().fallback);
-    for (rel_path, outcome) in committer.finish()? {
-        match outcome {
-            Ok(()) => stats.completed += 1,
-            Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
-        }
-    }
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
     }
@@ -663,16 +1297,157 @@ fn finish_receive(
 /// The destination's committer, sized to the descriptor budget: a quarter
 /// for session reuse, a quarter for staged files queued or grouped for
 /// commit, which hold one descriptor each.
-fn publication_committer(state: &Path, budget: u64) -> Result<Committer<PublishSink>> {
+fn publication_committer(
+    state: &Path,
+    budget: u64,
+    notify: Sender<crate::materialize::GroupOutcomes>,
+) -> Result<Committer<PublishSink>> {
     let staged = (budget / 8).clamp(2, crate::io::durable::GROUP_FILES);
     Committer::spawn_with(
-        PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?,
+        PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?
+            .with_notify(notify),
         crate::io::durable::Limits {
             group_files: staged,
             queue_depth: usize::try_from(staged).unwrap_or(1),
             ..crate::io::durable::Limits::default()
         },
     )
+}
+
+/// A streamed entry: chunks arrive in order and are written at once.
+struct Streaming {
+    row: RowSchema,
+    key: Vec<u8>,
+    staged: Option<StagedFile>,
+    specs: Vec<ChunkSpec>,
+    offset: u64,
+    hints: Vec<ChunkHint>,
+    seen: HashSet<[u8; 32]>,
+    failure: Option<BulkloadRefusal>,
+    /// Streamed in answer to `WantManifest` (the source could not keep the
+    /// chunks for a manifest): an existing output at the path is adopted
+    /// against the streamed chunks instead of refused.
+    adopt: bool,
+}
+
+impl Streaming {
+    /// One streamed chunk: it must be the next index at the next offset.
+    /// It is written once verified; a content fault becomes the entry's
+    /// refusal and the stream stays in step.
+    fn accept(
+        &mut self,
+        target: &Destination,
+        open: &mut usize,
+        header: &DataHeader,
+        payload: &[u8],
+        verified: bool,
+    ) -> Result<()> {
+        if header.index as usize != self.specs.len() || header.offset != self.offset {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        // More chunks than any manifest may hold ends the session: nothing
+        // grows past the bound (#77 review F4).
+        if self.specs.len() >= MAX_MANIFEST_CHUNKS {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let size = payload.len() as u64;
+        let end = self.offset.saturating_add(size);
+        if self.failure.is_none() && (!verified || end > self.row.size) {
+            self.failure = Some(BulkloadRefusal::DigestMismatch);
+        }
+        if self.failure.is_none() && self.staged.is_none() {
+            if *open >= MAX_OPEN_ENTRIES {
+                return Err(BulkloadRefusal::FrameCodec);
+            }
+            match target.stage(&self.row) {
+                Ok(staged) => {
+                    *open += 1;
+                    self.staged = Some(staged);
+                }
+                Err(refusal) => self.failure = Some(refusal),
+            }
+        }
+        if self.failure.is_none() {
+            if let Some(staged) = &self.staged {
+                if let Err(refusal) = place(staged.file(), payload, &[self.offset]) {
+                    self.failure = Some(refusal);
+                }
+            }
+        }
+        self.specs.push(ChunkSpec {
+            digest: header.digest,
+            size,
+        });
+        if self.seen.insert(header.digest) {
+            self.hints.push(ChunkHint {
+                digest: header.digest,
+                offset: self.offset,
+                size,
+            });
+        }
+        self.offset = end;
+        Ok(())
+    }
+
+    fn new(row: RowSchema, key: Vec<u8>, adopt: bool) -> Self {
+        Self {
+            row,
+            key,
+            staged: None,
+            specs: Vec::new(),
+            offset: 0,
+            hints: Vec::new(),
+            seen: HashSet::new(),
+            failure: None,
+            adopt,
+        }
+    }
+}
+
+/// An entry filled from its manifest: local chunks first, then the
+/// requested ones.
+struct Filling {
+    row: RowSchema,
+    key: Vec<u8>,
+    manifest: Manifest,
+    offsets: Vec<u64>,
+    plan: Plan,
+    expected: VecDeque<u32>,
+    failure: Option<BulkloadRefusal>,
+}
+
+/// An entry the destination expects content for.
+enum Incoming {
+    Streaming(Streaming),
+    AwaitManifest { row: RowSchema, key: Vec<u8> },
+    Filling(Filling),
+}
+
+/// The destination's side of one session.
+struct Inbound<'a, W> {
+    output: &'a mut W,
+    target: &'a mut Destination,
+    store: &'a Store,
+    authority: Vec<u8>,
+    committer: &'a Committer<PublishSink>,
+    session: SessionChunks,
+    stats: TransferStats,
+    incoming: HashMap<u64, Incoming>,
+    open: usize,
+    fill_locally: bool,
+    salvage: Salvage,
+    /// The destination refused an entry itself (not the source).
+    destination_refused: bool,
+    /// Entries queued for their group commit, by relative path, awaiting
+    /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
+    pending_held: HashMap<Vec<u8>, u64>,
+    committed: Receiver<crate::materialize::GroupOutcomes>,
+    /// The source has offered every entry.
+    walk_done: bool,
+    /// Granted payload bytes not yet received.
+    granted: u64,
+    /// Received payload bytes not yet returned as credit.
+    consumed: u64,
 }
 
 /// Receive an ordinary-file carry without replacing divergent outputs.
@@ -693,18 +1468,22 @@ pub fn receive<R: Read, W: Write>(
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
     let budget = crate::io::limits::descriptor_budget();
-    let committer = publication_committer(destination_state, budget)?;
+    let (notify, group_outcomes) = std::sync::mpsc::channel();
+    let committer = publication_committer(destination_state, budget, notify)?;
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
-    write_frame(
+    let fill_locally = store.has_output_hints()?;
+    write_control(
         output,
-        FrameKind::TransferOpen {
+        &Control::Open {
+            proto: PROTO_VERSION,
+            wire_id: wire_id(),
             root: source.as_os_str().as_bytes().to_vec(),
             state: source_state.as_os_str().as_bytes().to_vec(),
         },
     )?;
-    let FrameKind::TransferStart { authority } = read_frame(input)?.kind else {
+    let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
         return Err(BulkloadRefusal::FrameCodec);
     };
     let target_meta = std::fs::metadata(target.path())?;
@@ -714,120 +1493,563 @@ pub fn receive<R: Read, W: Write>(
         target_meta.dev(),
         target_meta.ino(),
     ))?;
-    let mut session = SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES));
-    let mut stats = TransferStats::default();
-    let mut rows = 0;
-    loop {
-        match read_frame(input)?.kind {
-            FrameKind::TransferBatch { rows: batch } => {
-                if batch.is_empty() || batch.len() > BATCH_ROWS {
-                    return Err(BulkloadRefusal::BudgetExceeded);
-                }
-                rows += batch.len() as u64;
-                let census_started = Instant::now();
-                let mut needed = batch
-                    .iter()
-                    .map(|row| prepare_row(&mut target, &store, &output_authority, row, &mut stats))
-                    .collect::<Result<Vec<_>>>()?;
-                REUSE_CENSUS_NS.fetch_add(elapsed_ns(census_started), Ordering::Relaxed);
-                // OI-1001-Q2: before asking for any content, the bytes this
-                // batch would write must leave the destination above its
-                // free-space floor. Wire v4 does not tell the receiver the
-                // cohort total up front, so the plan is checked batch by
-                // batch, against a fresh statvfs that already counts every
-                // earlier batch's writes. A refusal leaves a resumable cohort.
-                let planned = batch
-                    .iter()
-                    .zip(&needed)
-                    .filter(|(_, needed)| **needed)
-                    .fold(0u64, |total, (row, _)| total.saturating_add(row.size));
-                crate::space::preflight(target.path(), planned)?;
-                write_frame(
-                    output,
-                    FrameKind::WantFiles {
-                        needed: needed.clone(),
-                    },
-                )?;
-                fault_point!(ReceiveAfterWantFiles);
-                loop {
-                    match read_frame(input)?.kind {
-                        FrameKind::FileContent { index } => {
-                            let index = index as usize;
-                            let requested =
-                                needed.get_mut(index).ok_or(BulkloadRefusal::FrameCodec)?;
-                            if !*requested {
-                                return Err(BulkloadRefusal::FrameCodec);
-                            }
-                            *requested = false;
-                            receive_content(
-                                input,
-                                output,
-                                &mut ReceiveContext {
-                                    target: &target,
-                                    store: &store,
-                                    authority: &output_authority,
-                                    committer: &committer,
-                                    session: &mut session,
-                                },
-                                batch.get(index).ok_or(BulkloadRefusal::FrameCodec)?,
-                                &mut stats,
-                            )?;
-                        }
-                        FrameKind::BatchDone if needed.iter().all(|value| !*value) => break,
-                        _ => return Err(BulkloadRefusal::FrameCodec),
+    write_control(
+        output,
+        &Control::Credit {
+            bytes: CREDIT_WINDOW,
+        },
+    )?;
+    let mut receiver = Inbound {
+        output,
+        target: &mut target,
+        store: &store,
+        authority: output_authority,
+        committer: &committer,
+        session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
+        stats: TransferStats::default(),
+        incoming: HashMap::new(),
+        open: 0,
+        fill_locally,
+        salvage: Salvage::default(),
+        destination_refused: false,
+        pending_held: HashMap::new(),
+        committed: group_outcomes,
+        walk_done: false,
+        granted: CREDIT_WINDOW,
+        consumed: 0,
+    };
+    let source_bytes_read = receiver.run(input)?;
+    let Inbound {
+        mut stats,
+        session,
+        destination_refused,
+        ..
+    } = receiver;
+    stats.source_bytes_read = source_bytes_read;
+    drop(session);
+    finish_receive(
+        &mut target,
+        &store,
+        committer,
+        &mut stats,
+        destination_refused,
+    )?;
+    Ok(stats)
+}
+
+impl<W: Write> Inbound<'_, W> {
+    /// Handle the source's frames until `SourceDone`; returns the source
+    /// bytes it reports. Entries are numbered in stream order, and the
+    /// session ends only once every entry the destination expected content
+    /// for has ended or been refused.
+    fn run<R: Read>(&mut self, input: &mut R) -> Result<u64> {
+        let mut offered = 0_u64;
+        let mut walk_done = None;
+        loop {
+            // Before blocking on the next frame: answer what has committed,
+            // and once the stream is drained, commit and answer the rest
+            // (the source waits for every `Held` before it finishes).
+            self.settle_held()?;
+            match read_frame(input)? {
+                Frame::Control(Control::Entry { entry, row }) => {
+                    if entry != offered || walk_done.is_some() {
+                        return Err(BulkloadRefusal::FrameCodec);
                     }
+                    offered += 1;
+                    self.entry(entry, row)?;
                 }
+                Frame::Control(Control::Refused {
+                    entry: None,
+                    rel_path,
+                    code,
+                }) => self.stats.refusals.push((rel_path, code)),
+                Frame::Control(Control::Refused {
+                    entry: Some(entry),
+                    rel_path,
+                    code,
+                }) => self.refused(entry, &rel_path, code)?,
+                Frame::Control(Control::EngineTemporary { rel_path }) => {
+                    self.stats.source_engine_temporaries.push(rel_path);
+                }
+                Frame::Control(Control::WalkDone { entries }) => {
+                    if entries != offered || walk_done.is_some() {
+                        return Err(BulkloadRefusal::FrameCodec);
+                    }
+                    walk_done = Some(entries);
+                    self.walk_done = true;
+                    self.settle_held()?;
+                }
+                Frame::Control(Control::Manifest {
+                    entry,
+                    root,
+                    chunks,
+                }) => self.manifest(entry, root, chunks)?,
+                Frame::Control(Control::End {
+                    entry,
+                    root,
+                    chunks,
+                    size,
+                }) => self.end(entry, root, chunks, size)?,
+                Frame::Data { header, payload } => self.data(&header, &payload)?,
+                Frame::Control(Control::SourceDone {
+                    entries,
+                    source_bytes_read,
+                }) if walk_done == Some(entries) && self.incoming.is_empty() => {
+                    return Ok(source_bytes_read);
+                }
+                _ => return Err(BulkloadRefusal::FrameCodec),
             }
-            FrameKind::Refusal { code, rel_path } => stats.refusals.push((rel_path, code)),
-            FrameKind::EngineTemporary { rel_path } => {
-                stats.source_engine_temporaries.push(rel_path);
-            }
-            FrameKind::TransferDone {
-                rows: sent,
-                source_bytes_read,
-            } if sent == rows => {
-                stats.source_bytes_read = source_bytes_read;
-                drop(session);
-                finish_receive(&mut target, &store, committer, &mut stats)?;
-                return Ok(stats);
-            }
-            _ => return Err(BulkloadRefusal::FrameCodec),
         }
     }
 }
 
-fn prepare_row(
-    target: &mut Destination,
-    store: &Store,
-    authority: &[u8],
-    row: &RowSchema,
-    stats: &mut TransferStats,
-) -> Result<bool> {
-    let key = row_key(authority, row)?;
-    let preparation = match row.kind {
-        FileKind::Directory => target.directory(row, store, authority).map(|()| false),
-        FileKind::Symlink => target.symlink(row).map(|()| false),
-        FileKind::Regular => target.identity(row).and_then(|identity| {
-            if let Some(identity) = identity {
-                if store.output_matches(&key, &identity)? {
-                    stats.reused += 1;
-                    return Ok(false);
+impl<W: Write> Inbound<'_, W> {
+    fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
+        self.destination_refused = true;
+        self.stats
+            .refusals
+            .push((rel_path, refusal.code().to_owned()));
+    }
+
+    /// Decide one offered entry.
+    fn entry(&mut self, entry: u64, row: RowSchema) -> Result<()> {
+        let census_started = Instant::now();
+        let key = row_key(&self.authority, &row)?;
+        let decided = match row.kind {
+            FileKind::Directory => self
+                .target
+                .directory(&row, self.store, &self.authority)
+                .map(|()| Decision::Skip),
+            FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
+            FileKind::Regular => self.target.identity(&row).and_then(|identity| {
+                if let Some(identity) = &identity {
+                    if self.store.output_matches(&key, identity)? {
+                        self.stats.reused += 1;
+                        return Ok(Decision::Reuse);
+                    }
+                }
+                // A manifest first only when something here could fill it:
+                // an existing output to adopt, or chunks held by published
+                // outputs. Otherwise the source reads the file exactly once.
+                Ok(
+                    if identity.is_some() || self.fill_locally || self.target.salvaged() > 0 {
+                        Decision::WantManifest
+                    } else {
+                        Decision::Send
+                    },
+                )
+            }),
+            _ => Err(BulkloadRefusal::FieldDomainViolation),
+        };
+        REUSE_CENSUS_NS.fetch_add(elapsed_ns(census_started), Ordering::Relaxed);
+        let decision = match decided {
+            Ok(decision) => decision,
+            Err(refusal) => {
+                self.refuse(row.rel_path.clone(), &refusal);
+                Decision::Refuse {
+                    code: refusal.code().to_owned(),
                 }
             }
-            Ok(true)
-        }),
-        _ => Err(BulkloadRefusal::FieldDomainViolation),
-    };
-    let needed = match preparation {
-        Ok(needed) => needed,
-        Err(refusal) => {
-            stats
-                .refusals
-                .push((row.rel_path.clone(), refusal.code().to_owned()));
-            false
+        };
+        match decision {
+            Decision::Send => {
+                self.incoming
+                    .insert(entry, Incoming::Streaming(Streaming::new(row, key, false)));
+            }
+            Decision::WantManifest => {
+                self.incoming
+                    .insert(entry, Incoming::AwaitManifest { row, key });
+            }
+            Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => (),
         }
-    };
-    Ok(needed)
+        write_control(self.output, &Control::Decide { entry, decision })?;
+        fault_point!(ReceiveAfterDecide);
+        Ok(())
+    }
+
+    /// The source refused an entry's capture after any of its data.
+    fn refused(&mut self, entry: u64, rel_path: &[u8], code: String) -> Result<()> {
+        let incoming = self
+            .incoming
+            .remove(&entry)
+            .ok_or(BulkloadRefusal::FrameCodec)?;
+        let row = match incoming {
+            Incoming::Streaming(Streaming { row, staged, .. }) => {
+                if let Some(staged) = staged {
+                    self.open -= 1;
+                    let _ = staged.discard();
+                }
+                row
+            }
+            Incoming::AwaitManifest { row, .. } => row,
+            Incoming::Filling(Filling { row, plan, .. }) => {
+                if let Plan::Write(staging) = plan {
+                    self.open -= 1;
+                    let _ = staging.staged.discard();
+                }
+                row
+            }
+        };
+        if row.rel_path != rel_path {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        self.stats.refusals.push((row.rel_path, code));
+        Ok(())
+    }
+
+    /// Plan a manifest's entry and request only what cannot be filled here.
+    fn manifest(&mut self, entry: u64, root: [u8; 32], chunks: Vec<ChunkSpec>) -> Result<()> {
+        if chunks.len() > MAX_MANIFEST_CHUNKS {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&entry) else {
+            return Err(BulkloadRefusal::FrameCodec);
+        };
+        let manifest = Manifest { root, chunks };
+        let mut offsets = Vec::with_capacity(manifest.chunks.len());
+        let mut offset = 0_u64;
+        for chunk in &manifest.chunks {
+            offsets.push(offset);
+            offset = offset.saturating_add(chunk.size);
+        }
+        let materialize_started = Instant::now();
+        self.salvage.refresh(self.target);
+        let plan = if manifest.is_consistent() {
+            if self.open >= MAX_OPEN_ENTRIES {
+                return Err(BulkloadRefusal::FrameCodec);
+            }
+            plan_file(
+                &ReceiveContext {
+                    target: self.target,
+                    store: self.store,
+                    session: &self.session,
+                    salvage: &self.salvage,
+                },
+                &row,
+                &manifest,
+            )
+        } else {
+            Plan::Refuse(BulkloadRefusal::DigestMismatch)
+        };
+        MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
+        let indices = match &plan {
+            Plan::Write(staging) => {
+                self.open += 1;
+                staging.missing.clone()
+            }
+            Plan::Refuse(_) | Plan::Adopt(..) => Vec::new(),
+        };
+        write_control(
+            self.output,
+            &Control::NeedChunks {
+                entry,
+                indices: indices.clone(),
+            },
+        )?;
+        self.incoming.insert(
+            entry,
+            Incoming::Filling(Filling {
+                row,
+                key,
+                manifest,
+                offsets,
+                plan,
+                expected: indices.into(),
+                failure: None,
+            }),
+        );
+        Ok(())
+    }
+
+    /// One data frame: account its credit, verify it against its digest (the
+    /// one integrity check on received bytes) and write it where it belongs.
+    /// Content faults become the entry's refusal and the stream stays in
+    /// step; protocol faults end the session.
+    fn data(&mut self, header: &DataHeader, payload: &[u8]) -> Result<()> {
+        let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
+        let size = payload.len() as u64;
+        self.granted = self
+            .granted
+            .checked_sub(size)
+            .ok_or(BulkloadRefusal::FrameCodec)?;
+        self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
+        let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+            && counters::hash(Counter::HashWireVerify, payload) == header.digest;
+        // A source that could not keep a manifest's chunks streams the entry
+        // in place of the manifest (#77 review F1).
+        if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {
+            if let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&header.entry)
+            {
+                self.incoming.insert(
+                    header.entry,
+                    Incoming::Streaming(Streaming::new(row, key, true)),
+                );
+            }
+        }
+        match self.incoming.get_mut(&header.entry) {
+            Some(Incoming::Streaming(streaming)) => {
+                streaming.accept(self.target, &mut self.open, header, payload, verified)?;
+            }
+            Some(Incoming::Filling(filling)) => {
+                if filling.expected.pop_front() != Some(header.index) {
+                    return Err(BulkloadRefusal::FrameCodec);
+                }
+                let at = header.index as usize;
+                let spec = filling
+                    .manifest
+                    .chunks
+                    .get(at)
+                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                if spec.digest != header.digest
+                    || spec.size != size
+                    || filling.offsets.get(at) != Some(&header.offset)
+                {
+                    return Err(BulkloadRefusal::FrameCodec);
+                }
+                if filling.failure.is_none() {
+                    if verified {
+                        if let Plan::Write(staging) = &filling.plan {
+                            if let Some((_, offsets)) = staging.placements.get(&header.digest) {
+                                if let Err(refusal) = place(staging.staged.file(), payload, offsets)
+                                {
+                                    filling.failure = Some(refusal);
+                                }
+                            }
+                        }
+                    } else {
+                        filling.failure = Some(BulkloadRefusal::DigestMismatch);
+                    }
+                }
+            }
+            _ => return Err(BulkloadRefusal::FrameCodec),
+        }
+        self.consumed = self.consumed.saturating_add(size);
+        if self.consumed >= CREDIT_RETURN {
+            let bytes = std::mem::take(&mut self.consumed);
+            self.granted = self.granted.saturating_add(bytes);
+            write_control(self.output, &Control::Credit { bytes })?;
+        }
+        Ok(())
+    }
+
+    /// An entry's data is complete: check coverage and the manifest root,
+    /// then queue the output for its group commit, or record its refusal.
+    fn end(&mut self, entry: u64, root: [u8; 32], chunks: u32, size: u64) -> Result<()> {
+        let incoming = self
+            .incoming
+            .remove(&entry)
+            .ok_or(BulkloadRefusal::FrameCodec)?;
+        let (rel_path, outcome) = match incoming {
+            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::FrameCodec),
+            Incoming::Streaming(streaming) => {
+                if chunks as usize != streaming.specs.len() || size != streaming.offset {
+                    return Err(BulkloadRefusal::FrameCodec);
+                }
+                let rel_path = streaming.row.rel_path.clone();
+                (rel_path, self.end_streaming(streaming, root))
+            }
+            Incoming::Filling(filling) => {
+                if !filling.expected.is_empty()
+                    || chunks as usize != filling.manifest.chunks.len()
+                    || root != filling.manifest.root
+                    || filling.manifest.size() != Some(size)
+                {
+                    return Err(BulkloadRefusal::FrameCodec);
+                }
+                let rel_path = filling.row.rel_path.clone();
+                (rel_path, self.end_filling(filling))
+            }
+        };
+        // Every End is answered. `held` is sent once the output's group
+        // has committed: its file and directory are sealed and the store
+        // commit has drained them, so the bytes are durable here under the
+        // final name (#77 round 2, N1). Only then may the source record the
+        // capture, which therefore never costs a source read again.
+        match outcome {
+            Ok(()) => {
+                self.pending_held.insert(rel_path, entry);
+            }
+            Err(refusal) => {
+                self.refuse(rel_path, &refusal);
+                write_control(self.output, &Control::Held { entry, held: false })?;
+            }
+        }
+        self.settle_held()?;
+        fault_point!(ReceiveAfterEnd);
+        Ok(())
+    }
+
+    /// Send `Held` for every entry whose group commit has returned.
+    fn answer_held(&mut self) -> Result<()> {
+        while let Ok(group) = self.committed.try_recv() {
+            for (rel_path, held) in group {
+                let Some(entry) = self.pending_held.remove(&rel_path) else {
+                    continue;
+                };
+                if !held {
+                    self.destination_refused = true;
+                }
+                write_control(self.output, &Control::Held { entry, held })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Once nothing more can arrive before the source waits for its `Held`
+    /// answers (every entry offered, none with content outstanding), commit
+    /// the open group now and answer every entry.
+    fn settle_held(&mut self) -> Result<()> {
+        if self.pending_held.is_empty() || !self.walk_done || !self.incoming.is_empty() {
+            return self.answer_held();
+        }
+        self.committer.sync()?;
+        self.answer_held()?;
+        if self.pending_held.is_empty() {
+            Ok(())
+        } else {
+            Err(BulkloadRefusal::Io(None))
+        }
+    }
+
+    fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32]) -> Result<()> {
+        let Streaming {
+            row,
+            key,
+            staged,
+            specs,
+            offset,
+            hints,
+            failure,
+            adopt,
+            ..
+        } = streaming;
+        if staged.is_some() {
+            self.open -= 1;
+        }
+        let checked = failure.map_or(Ok(()), Err).and_then(|()| {
+            if offset != row.size || manifest_root(&specs) != root {
+                Err(BulkloadRefusal::DigestMismatch)
+            } else {
+                Ok(())
+            }
+        });
+        if checked.is_ok() && adopt {
+            // Streamed in place of a manifest: an existing output at the
+            // path is adopted against the streamed chunks, as a manifest
+            // would have been checked, and the staged copy is dropped.
+            match self.target.existing(&row) {
+                Ok(Some((file, parent))) => {
+                    if let Some(staged) = staged {
+                        let _ = staged.discard();
+                    }
+                    let manifest = Manifest {
+                        root,
+                        chunks: specs,
+                    };
+                    let identity = verify_existing(&file, &row, &manifest)?;
+                    return self.adopt(file, parent, &row, key, identity);
+                }
+                Ok(None) => (),
+                Err(refusal) => {
+                    if let Some(staged) = staged {
+                        let _ = staged.discard();
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
+        let staged = match (checked, staged) {
+            (Ok(()), Some(staged)) => staged,
+            // An empty file has no data frame; it is staged here.
+            (Ok(()), None) => self.target.stage(&row)?,
+            (Err(refusal), staged) => {
+                if let Some(staged) = staged {
+                    let _ = staged.discard();
+                }
+                return Err(refusal);
+            }
+        };
+        fault_point!(ReceiveAfterChunks);
+        self.publish(staged, &row, key, hints)
+    }
+
+    fn end_filling(&mut self, filling: Filling) -> Result<()> {
+        let Filling {
+            row,
+            key,
+            manifest,
+            plan,
+            failure,
+            ..
+        } = filling;
+        match plan {
+            Plan::Refuse(refusal) => Err(refusal),
+            Plan::Adopt(file, parent) => {
+                let identity = verify_existing(&file, &row, &manifest)?;
+                self.adopt(file, parent, &row, key, identity)
+            }
+            Plan::Write(staging) => {
+                self.open -= 1;
+                if let Some(refusal) = failure {
+                    let _ = staging.staged.discard();
+                    return Err(refusal);
+                }
+                fault_point!(ReceiveAfterChunks);
+                self.publish(staging.staged, &row, key, staging.hints)
+            }
+        }
+    }
+
+    /// Queue a verified existing output for its group commit, which seals
+    /// it and its directory before the commit (#77 round 2, N4: an adopted
+    /// output is reported held only after that commit).
+    fn adopt(
+        &self,
+        file: std::fs::File,
+        parent: Arc<std::fs::File>,
+        row: &RowSchema,
+        key: Vec<u8>,
+        identity: StatIdentity,
+    ) -> Result<()> {
+        self.committer.submit(Publication::Adopted {
+            record: OutputRecord {
+                key,
+                rel_path: row.rel_path.clone(),
+                identity,
+                hints: Vec::new(),
+            },
+            file,
+            parent,
+        })
+    }
+
+    /// Apply the final mode and queue a fully written staged file for its
+    /// group commit, which seals it, renames it and seals its directory.
+    fn publish(
+        &mut self,
+        staged: StagedFile,
+        row: &RowSchema,
+        key: Vec<u8>,
+        hints: Vec<ChunkHint>,
+    ) -> Result<()> {
+        if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
+            .map_err(BulkloadRefusal::from)
+        {
+            let _ = staged.discard();
+            return Err(refusal);
+        }
+        fault_point!(MaterializeAfterTempWrite);
+        self.session.insert(Arc::clone(staged.file()), &hints);
+        self.committer.submit(Publication::Staged {
+            staged,
+            record: PendingOutput {
+                key,
+                rel_path: row.rel_path.clone(),
+                size: row.size,
+                hints,
+            },
+        })
+    }
 }
 
 /// Chunks this session wrote into outputs that may not have committed yet,
@@ -893,136 +2115,12 @@ enum Plan {
 
 struct Staging {
     staged: StagedFile,
-    /// Chunks to request, in first-occurrence order.
-    missing: Vec<[u8; 32]>,
+    /// Chunk indices to request: the first occurrence of each distinct chunk
+    /// this destination could not fill, ascending.
+    missing: Vec<u32>,
     /// Every offset each distinct chunk occupies, with its size.
     placements: HashMap<[u8; 32], (u64, Vec<u64>)>,
     hints: Vec<ChunkHint>,
-}
-
-fn receive_content<R: Read, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    context: &mut ReceiveContext<'_>,
-    row: &RowSchema,
-    stats: &mut TransferStats,
-) -> Result<()> {
-    let key = row_key(context.authority, row)?;
-    let manifest = match read_frame(input)?.kind {
-        FrameKind::Manifest { digest, chunks } if chunks.len() <= MAX_MANIFEST_CHUNKS => {
-            Manifest { digest, chunks }
-        }
-        FrameKind::Refusal { code, rel_path } => {
-            stats.refusals.push((rel_path, code));
-            return Ok(());
-        }
-        _ => return Err(BulkloadRefusal::FrameCodec),
-    };
-    let materialize_started = Instant::now();
-    let plan = plan_file(context, row, &manifest);
-    MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
-    let applied = match plan {
-        Plan::Refuse(refusal) => {
-            write_frame(
-                output,
-                FrameKind::WantChunks {
-                    digests: Vec::new(),
-                },
-            )?;
-            Err(refusal)
-        }
-        Plan::Adopt(file, parent) => {
-            write_frame(
-                output,
-                FrameKind::WantChunks {
-                    digests: Vec::new(),
-                },
-            )?;
-            verify_existing(&file, row, &manifest).and_then(|identity| {
-                context.committer.submit(Publication::Adopted {
-                    record: OutputRecord {
-                        key,
-                        rel_path: row.rel_path.clone(),
-                        identity,
-                        hints: Vec::new(),
-                    },
-                    file,
-                    parent,
-                })
-            })
-        }
-        Plan::Write(staging) => write_staged(input, output, context, row, key, staging, stats)?,
-    };
-    write_frame(
-        output,
-        FrameKind::Applied {
-            success: applied.is_ok(),
-        },
-    )?;
-    fault_point!(ReceiveAfterApplied);
-    if let Err(refusal) = applied {
-        stats
-            .refusals
-            .push((row.rel_path.clone(), refusal.code().to_owned()));
-    }
-    Ok(())
-}
-
-/// Request a staged file's missing chunks, write them, and queue the file
-/// for its group commit. The outer error is a transport fault; the inner
-/// result is this file's outcome.
-fn write_staged<R: Read, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    context: &mut ReceiveContext<'_>,
-    row: &RowSchema,
-    key: Vec<u8>,
-    staging: Staging,
-    stats: &mut TransferStats,
-) -> Result<Result<()>> {
-    write_frame(
-        output,
-        FrameKind::WantChunks {
-            digests: staging.missing.clone(),
-        },
-    )?;
-    let received = {
-        let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
-        receive_chunks(input, &staging, stats)
-    };
-    let Staging { staged, hints, .. } = staging;
-    let received = match received {
-        Ok(received) => received,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
-    fault_point!(ReceiveAfterChunks);
-    Ok(
-        match received.and_then(|()| {
-            crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
-                .map_err(BulkloadRefusal::from)
-        }) {
-            Ok(()) => {
-                fault_point!(MaterializeAfterTempWrite);
-                context.session.insert(Arc::clone(staged.file()), &hints);
-                context.committer.submit(Publication::Staged {
-                    staged,
-                    record: PendingOutput {
-                        key,
-                        rel_path: row.rel_path.clone(),
-                        size: row.size,
-                        hints,
-                    },
-                })
-            }
-            Err(refusal) => {
-                let _ = staged.discard();
-                Err(refusal)
-            }
-        },
-    )
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
@@ -1031,13 +2129,16 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
     let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
     let mut order = Vec::new();
     let mut offset = 0_u64;
-    for chunk in &manifest.chunks {
-        if chunk.size > u64::from(crate::hash::CDC_MAX_BYTES) {
+    for (index, chunk) in manifest.chunks.iter().enumerate() {
+        if chunk.size > u64::from(crate::hash::CDC_MAX_BYTES) || chunk.size == 0 {
             return Plan::Refuse(BulkloadRefusal::BudgetExceeded);
         }
         match placements.entry(chunk.digest) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                order.push(chunk.digest);
+                let Ok(index) = u32::try_from(index) else {
+                    return Plan::Refuse(BulkloadRefusal::BudgetExceeded);
+                };
+                order.push((chunk.digest, index));
                 entry.insert((chunk.size, vec![offset]));
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1067,7 +2168,7 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
     let mut missing = Vec::new();
     let mut hints = Vec::with_capacity(order.len());
     let mut outputs = HashMap::new();
-    for digest in order {
+    for (digest, index) in order {
         let Some((size, offsets)) = placements.get(&digest) else {
             continue;
         };
@@ -1084,7 +2185,7 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
         });
         match filled {
             Ok(Some(())) => (),
-            Ok(None) => missing.push(digest),
+            Ok(None) => missing.push(index),
             Err(refusal) => {
                 let _ = staged.discard();
                 return Plan::Refuse(refusal);
@@ -1100,8 +2201,9 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
 }
 
 /// A chunk this destination already holds, re-read and re-verified: from a
-/// file written earlier in this session, from a committed output hint, or
-/// from the store's pack. Any mismatch is a miss, never an error.
+/// file written earlier in this session, or from a published output through
+/// a committed hint, newest first. Any mismatch is a miss, never an error,
+/// and a miss on one hint falls through to the next.
 fn local_chunk(
     context: &ReceiveContext<'_>,
     outputs: &mut HashMap<Vec<u8>, Option<std::fs::File>>,
@@ -1115,32 +2217,39 @@ fn local_chunk(
             }
         }
     }
-    if let Some(hint) = context.store.output_chunk(digest)? {
-        if hint.size == size {
-            let found = if let Some(file) = outputs.get(&hint.path) {
-                file.as_ref()
-                    .and_then(|file| read_verified(file, hint.offset, size, digest))
-            } else {
-                let file = context.target.open_output(&hint.path).ok();
-                let found = file
-                    .as_ref()
-                    .and_then(|file| read_verified(file, hint.offset, size, digest));
-                if outputs.len() < HINT_FILES {
-                    outputs.insert(hint.path.clone(), file);
-                }
-                found
-            };
-            if let Some(data) = found {
+    if let Some((at, offset, held)) = context.salvage.index.get(digest) {
+        if *held == size {
+            if let Some(data) = context
+                .target
+                .salvaged_file(*at)
+                .and_then(|file| read_verified(&file, *offset, size, digest))
+            {
                 return Ok(Some(data));
             }
         }
     }
-    Ok(context
-        .store
-        .chunk_for(digest, Counter::DestLocalReuseRead)
-        .ok()
-        .flatten()
-        .filter(|data| data.len() as u64 == size))
+    for hint in context.store.output_chunks(digest)? {
+        if hint.size != size {
+            continue;
+        }
+        let found = if let Some(file) = outputs.get(&hint.path) {
+            file.as_ref()
+                .and_then(|file| read_verified(file, hint.offset, size, digest))
+        } else {
+            let file = context.target.open_output(&hint.path).ok();
+            let found = file
+                .as_ref()
+                .and_then(|file| read_verified(file, hint.offset, size, digest));
+            if outputs.len() < HINT_FILES {
+                outputs.insert(hint.path.clone(), file);
+            }
+            found
+        };
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
 }
 
 fn read_verified(
@@ -1163,235 +2272,81 @@ fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
     Ok(())
 }
 
-/// Read exactly the requested chunks, verify each against its digest (the
-/// one integrity check on received bytes) and write it at every offset it
-/// occupies. Transport faults are errors; content faults are refusals, and
-/// the remaining frames are still read so the stream stays in step.
-fn receive_chunks<R: Read>(
-    input: &mut R,
-    staging: &Staging,
-    stats: &mut TransferStats,
-) -> Result<Result<()>> {
-    let mut failure = None;
-    for expected in &staging.missing {
-        match read_frame(input)?.kind {
-            FrameKind::Chunk { digest, data } if digest == *expected => {
-                stats.bytes_received = stats.bytes_received.saturating_add(data.len() as u64);
-                if failure.is_some() {
-                    continue;
-                }
-                let Some((size, offsets)) = staging.placements.get(&digest) else {
-                    failure = Some(BulkloadRefusal::FrameCodec);
-                    continue;
-                };
-                if data.len() as u64 != *size
-                    || data.len() > crate::hash::CDC_MAX_BYTES as usize
-                    || counters::hash(Counter::HashWireVerify, &data) != digest
-                {
-                    failure = Some(BulkloadRefusal::DigestMismatch);
-                    continue;
-                }
-                if let Err(refusal) = place(staging.staged.file(), &data, offsets) {
-                    failure = Some(refusal);
-                }
-            }
-            FrameKind::Refusal { .. } => return Ok(Err(BulkloadRefusal::SealedObjectMissing)),
-            _ => return Err(BulkloadRefusal::FrameCodec),
-        }
-    }
-    Ok(failure.map_or(Ok(()), Err))
-}
+// ---------------------------------------------------------------------------
+// Framing
+// ---------------------------------------------------------------------------
 
-fn capture(
-    root: &Path,
-    authority: &[u8],
-    row: &RowSchema,
-    store: &Store,
-    capture_id: usize,
-    sender: &std::sync::mpsc::SyncSender<PreparedEvent>,
-    bytes_read: &mut u64,
-) -> Result<()> {
-    if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
-        return Err(BulkloadRefusal::BudgetExceeded);
-    }
-    let key = row_key(authority, row)?;
-    if let Some(manifest) = store.capture(&key)? {
-        if manifest.chunks.len() > MAX_MANIFEST_CHUNKS {
-            return Err(BulkloadRefusal::BudgetExceeded);
-        }
-        let available =
-            manifest
-                .chunks
-                .iter()
-                .try_fold(true, |available, chunk| -> Result<bool> {
-                    Ok(available
-                        && store
-                            .chunk_for(&chunk.digest, Counter::SourceCaptureReuseRead)?
-                            .is_some())
-                })?;
-        if available {
-            send_prepared(
-                sender,
-                PreparedEvent::Complete {
-                    capture_id,
-                    bytes_read: *bytes_read,
-                    key,
-                    manifest,
-                    reused: true,
-                },
-            )?;
-            return Ok(());
-        }
-    }
-    capture_uncached(root, row, key, capture_id, sender, bytes_read)
-}
-
-fn capture_uncached(
-    root: &Path,
-    row: &RowSchema,
-    key: Vec<u8>,
-    capture_id: usize,
-    sender: &std::sync::mpsc::SyncSender<PreparedEvent>,
-    bytes_read: &mut u64,
-) -> Result<()> {
-    if row.rel_path.ends_with(b"-wal")
-        || row.rel_path.ends_with(b"-shm")
-        || row.rel_path.ends_with(b"-journal")
-    {
-        return Err(BulkloadRefusal::SqliteStateChanged);
-    }
-    let file_path = root.join(path(row.rel_path.clone()));
-    let mut file = crate::hash::open_nofollow(&file_path)?;
-    let expected = StatIdentity::from_row(row);
-    if StatIdentity::from_metadata(&file.metadata()?) != expected {
-        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
-    }
-    let mut prefix = Vec::new();
-    let mut reader = CountReader {
-        input: &mut file,
-        count: bytes_read,
-    };
-    (&mut reader).take(16).read_to_end(&mut prefix)?;
-    if prefix.starts_with(b"SQLite format 3\0")
-        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
-        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
-    {
-        return Err(BulkloadRefusal::SqliteStateChanged);
-    }
-    let mut hasher = blake3::Hasher::new();
-    let mut chunks = Vec::new();
-    let mut pending = Vec::with_capacity(PERSIST_BATCH);
-    let _cdc_timer = PhaseTimer(&CDC_HASH_NS, Instant::now());
-    for chunk in fastcdc::v2020::StreamCDC::new(
-        prefix.as_slice().chain(reader),
-        crate::hash::CDC_MIN_BYTES,
-        crate::hash::CDC_AVG_BYTES,
-        crate::hash::CDC_MAX_BYTES,
-    ) {
-        let chunk = chunk.map_err(|_| BulkloadRefusal::Io(None))?;
-        fault_mid_read!(chunks.is_empty(), &file_path);
-        if chunks.len() >= MAX_MANIFEST_CHUNKS {
-            return Err(BulkloadRefusal::BudgetExceeded);
-        }
-        counters::update(&mut hasher, Counter::HashCaptureFile, &chunk.data);
-        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
-        chunks.push(ChunkSpec {
-            digest,
-            size: chunk.data.len() as u64,
-        });
-        pending.push((digest, Arc::new(chunk.data)));
-        if pending.len() == PERSIST_BATCH {
-            send_prepared(
-                sender,
-                PreparedEvent::Chunks {
-                    capture_id,
-                    chunks: std::mem::take(&mut pending),
-                },
-            )?;
-        }
-    }
-    if !pending.is_empty() {
-        send_prepared(
-            sender,
-            PreparedEvent::Chunks {
-                capture_id,
-                chunks: pending,
-            },
-        )?;
-    }
-    if StatIdentity::from_metadata(&file.metadata()?) != expected {
-        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
-    }
-    let manifest = Manifest {
-        digest: *hasher.finalize().as_bytes(),
-        chunks,
-    };
-    send_prepared(
-        sender,
-        PreparedEvent::Complete {
-            capture_id,
-            bytes_read: *bytes_read,
-            key,
-            manifest,
-            reused: false,
-        },
-    )?;
-    Ok(())
-}
-
-struct CountReader<'a, R> {
-    input: R,
-    count: &'a mut u64,
-}
-impl<R: Read> Read for CountReader<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.input.read(buffer)?;
-        *self.count = self.count.saturating_add(count as u64);
-        counters::add_len(Counter::SourceFileRead, count);
-        Ok(count)
-    }
-}
-
-/// Read one bounded frame without searching for delimiters.
+/// Read one bounded frame without searching for delimiters. A data frame's
+/// payload is read straight into its own buffer.
 ///
 /// # Errors
-/// Refuses truncated/oversized/invalid frames and incompatible protocol versions.
+/// Refuses truncated, oversized or invalid frames.
 pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
-    let mut header = [0_u8; LENGTH_PREFIX_BYTES];
-    input.read_exact(&mut header)?;
-    let length = u32::from_be_bytes(header) as usize;
+    let mut prefix = [0_u8; FRAME_HEADER_BYTES];
+    input.read_exact(&mut prefix)?;
+    let [a, b, c, d, tag] = prefix;
+    let length = u32::from_be_bytes([a, b, c, d]) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
-    let mut bytes = header.to_vec();
-    bytes.resize(LENGTH_PREFIX_BYTES + length, 0);
-    input.read_exact(
-        bytes
-            .get_mut(LENGTH_PREFIX_BYTES..)
-            .ok_or(BulkloadRefusal::FrameCodec)?,
-    )?;
+    let body = length.checked_sub(1).ok_or(BulkloadRefusal::FrameCodec)?;
+    let frame = if tag == TAG_DATA {
+        // Bound the frame before reading any of it, so a short frame can
+        // never pull the next frame's bytes in as its header.
+        let size = body
+            .checked_sub(DATA_HEADER_BYTES)
+            .ok_or(BulkloadRefusal::FrameCodec)?;
+        if size > MAX_DATA_PAYLOAD {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let mut header = [0_u8; DATA_HEADER_BYTES];
+        input.read_exact(&mut header)?;
+        let header = DataHeader::from_bytes(&header)?;
+        if header.size as usize != size {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        let mut payload = vec![0_u8; size];
+        input.read_exact(&mut payload)?;
+        Frame::Data { header, payload }
+    } else {
+        let mut bytes = vec![0_u8; body];
+        input.read_exact(&mut bytes)?;
+        Frame::decode_body(tag, &bytes)?
+    };
     counters::bump(Counter::WireFramesReceived);
-    counters::add_len(Counter::WireBytesReceived, bytes.len());
-    Ok(Frame::decode(&bytes)?.0)
+    counters::add_len(Counter::WireBytesReceived, FRAME_HEADER_BYTES + body);
+    Ok(frame)
 }
 
-/// Write one `Chunk` frame straight from borrowed bytes, byte-identical to
-/// [`write_frame`] with an owned [`FrameKind::Chunk`].
-fn write_chunk<W: Write>(output: &mut W, digest: &[u8; 32], data: &[u8]) -> Result<()> {
-    let encoded = Frame::encode_chunk(digest, data)?;
-    output.write_all(&encoded)?;
+/// Write one data frame: its fixed header and the payload with one gathered
+/// write, never copying the payload into a frame buffer.
+fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> Result<()> {
+    if header.size as usize != payload.len() {
+        return Err(BulkloadRefusal::FrameCodec);
+    }
+    let prefix = data_prefix(header)?;
+    let mut slices = [IoSlice::new(&prefix), IoSlice::new(payload)];
+    let mut remaining: &mut [IoSlice<'_>] = &mut slices;
+    while !remaining.is_empty() {
+        match output.write_vectored(remaining) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
     output.flush()?;
     counters::bump(Counter::WireFramesSent);
-    counters::add_len(Counter::WireBytesSent, encoded.len());
+    counters::add_len(Counter::WireBytesSent, prefix.len() + payload.len());
     Ok(())
 }
 
-/// Write one bounded frame and flush the request/reply boundary.
+/// Write one control frame and flush it.
 ///
 /// # Errors
 /// Refuses oversized messages and broken transports.
-pub fn write_frame<W: Write>(output: &mut W, kind: FrameKind) -> Result<()> {
-    let encoded = Frame::new(kind).encode()?;
+pub fn write_control<W: Write>(output: &mut W, control: &Control) -> Result<()> {
+    let encoded = control.encode()?;
     output.write_all(&encoded)?;
     output.flush()?;
     counters::bump(Counter::WireFramesSent);
@@ -1404,551 +2359,4 @@ fn path(bytes: Vec<u8>) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic)]
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    struct Corpus {
-        base: PathBuf,
-    }
-    impl Corpus {
-        fn new() -> Self {
-            let base = std::env::temp_dir().join(format!(
-                "tcfs-native-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&base).unwrap();
-            for path in ["source", "destination"] {
-                std::fs::create_dir(base.join(path)).unwrap();
-            }
-            Self { base }
-        }
-        fn run(&self) -> Result<TransferStats> {
-            copy(
-                &self.base.join("source"),
-                &self.base.join("destination"),
-                &self.base.join("source-state"),
-                &self.base.join("destination-state"),
-            )
-        }
-    }
-    impl Drop for Corpus {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.base);
-        }
-    }
-
-    /// Breaks the serve side's transport at a protocol event, not a byte
-    /// count. `write_frame` hands each frame to `write` and then calls
-    /// `flush`, so every flush closes one whole frame. Once the serve side
-    /// has offered the last requested file and sent its manifest, the next
-    /// frame (that file's first chunk) is cut in half and the transport
-    /// fails. A capture commits before its file is offered, so at that
-    /// event every capture is durable and every earlier file was
-    /// `Applied`, whatever order the capture workers finished in.
-    struct Interrupted<W> {
-        output: W,
-        frame: Vec<u8>,
-        offered: usize,
-        last: usize,
-        state: Cut,
-    }
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Cut {
-        Passing,
-        Truncate,
-        Broken,
-    }
-    impl<W: Write> Write for Interrupted<W> {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            let allowed = match self.state {
-                Cut::Broken => return Err(std::io::ErrorKind::BrokenPipe.into()),
-                Cut::Truncate => {
-                    self.state = Cut::Broken;
-                    data.len().div_ceil(2)
-                }
-                Cut::Passing => data.len(),
-            };
-            let count = self.output.write(data.get(..allowed).unwrap())?;
-            self.frame.extend_from_slice(data.get(..count).unwrap());
-            Ok(count)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            if self.state == Cut::Passing {
-                let (frame, _) = Frame::decode(&self.frame).unwrap();
-                match frame.kind {
-                    FrameKind::FileContent { .. } => self.offered += 1,
-                    FrameKind::Manifest { .. } if self.offered == self.last => {
-                        self.state = Cut::Truncate;
-                    }
-                    _ => (),
-                }
-            }
-            self.frame.clear();
-            self.output.flush()
-        }
-    }
-
-    #[test]
-    fn interrupted_transport_resumes_completed_captures_without_source_reads() {
-        const FILES: usize = 3;
-        let corpus = Corpus::new();
-        for index in 0..FILES {
-            let mut state = index as u64 + 1;
-            let bytes: Vec<u8> = (0..524_288)
-                .map(|_| {
-                    state = state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1);
-                    u8::try_from(state >> 56).unwrap()
-                })
-                .collect();
-            std::fs::write(
-                corpus.base.join("source").join(format!("file-{index}")),
-                bytes,
-            )
-            .unwrap();
-        }
-        let (sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
-        for stream in [&sender, &receiver] {
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(std::time::Duration::from_secs(20)))
-                .unwrap();
-        }
-        std::thread::scope(|scope| {
-            let producer = scope.spawn(move || {
-                let mut input = sender.try_clone().unwrap();
-                serve(
-                    &mut input,
-                    &mut Interrupted {
-                        output: sender,
-                        frame: Vec::new(),
-                        offered: 0,
-                        last: FILES,
-                        state: Cut::Passing,
-                    },
-                )
-            });
-            let mut output = receiver.try_clone().unwrap();
-            let outcome = receive(
-                &mut receiver,
-                &mut output,
-                &corpus.base.join("source"),
-                &corpus.base.join("source-state"),
-                &corpus.base.join("destination"),
-                &corpus.base.join("destination-state"),
-            );
-            drop(output);
-            drop(receiver);
-            assert!(producer.join().unwrap().is_err());
-            assert!(outcome.is_err());
-        });
-        // Every file but the last was applied; the last never reached a name.
-        assert_eq!(
-            std::fs::read_dir(corpus.base.join("destination"))
-                .unwrap()
-                .count(),
-            FILES - 1
-        );
-        let resumed = corpus.run().unwrap();
-        assert!(resumed.refusals.is_empty());
-        assert_eq!(resumed.reused, FILES as u64 - 1);
-        assert_eq!(resumed.completed, 1);
-        assert_eq!(resumed.source_bytes_read, 0);
-        for index in 0..FILES {
-            let relative = format!("file-{index}");
-            assert_eq!(
-                std::fs::read(corpus.base.join("source").join(&relative)).unwrap(),
-                std::fs::read(corpus.base.join("destination").join(relative)).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn chunk_batches_round_trip_and_resume_large_file() {
-        let corpus = Corpus::new();
-        let mut seed = 1_u32;
-        let bytes: Vec<u8> = (0..=(PERSIST_BATCH * crate::hash::CDC_MAX_BYTES as usize))
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                seed.to_le_bytes().first().copied().unwrap()
-            })
-            .collect();
-        std::fs::write(corpus.base.join("source/large"), &bytes).unwrap();
-        let first = corpus.run().unwrap();
-        assert!(first.refusals.is_empty());
-        assert_eq!(first.source_bytes_read, bytes.len() as u64);
-        assert_eq!(
-            std::fs::read(corpus.base.join("destination/large")).unwrap(),
-            bytes
-        );
-        let resumed = corpus.run().unwrap();
-        assert!(resumed.refusals.is_empty());
-        assert_eq!(resumed.source_bytes_read, 0);
-        assert_eq!(resumed.bytes_received, 0);
-    }
-
-    #[test]
-    fn parallel_batches_resume_and_continue_after_a_refused_file() {
-        let corpus = Corpus::new();
-        let bytes = vec![71_u8; 65_536];
-        for index in 0..70 {
-            std::fs::write(
-                corpus.base.join("source").join(format!("file-{index:03}")),
-                &bytes,
-            )
-            .unwrap();
-        }
-        std::fs::write(
-            corpus.base.join("source/file-035.db"),
-            b"SQLite format 3\0refused",
-        )
-        .unwrap();
-        let first = corpus.run().unwrap();
-        assert_eq!(first.completed, 70);
-        assert_eq!(first.refusals.len(), 1);
-        assert_eq!(first.source_bytes_read, 70 * 65_536 + 16);
-        assert_eq!(first.bytes_received, 65_536);
-        for index in 0..70 {
-            assert_eq!(
-                std::fs::read(
-                    corpus
-                        .base
-                        .join("destination")
-                        .join(format!("file-{index:03}"))
-                )
-                .unwrap(),
-                bytes
-            );
-        }
-        let second = corpus.run().unwrap();
-        assert_eq!(second.reused, 70);
-        assert_eq!(second.refusals.len(), 1);
-        assert_eq!(second.source_bytes_read, 16);
-        assert_eq!(second.bytes_received, 0);
-    }
-
-    #[test]
-    fn round_trip_resumes_without_source_reads_and_preserves_divergence() {
-        let corpus = Corpus::new();
-        let source = corpus.base.join("source");
-        let destination = corpus.base.join("destination");
-        std::fs::create_dir(source.join("nested")).unwrap();
-        let bytes: Vec<u8> = (0..800_000)
-            .map(|value| u8::try_from(value % 251).unwrap())
-            .collect();
-        std::fs::write(source.join("nested/data"), &bytes).unwrap();
-        std::fs::write(source.join(".credential"), b"account-file").unwrap();
-        std::fs::set_permissions(
-            source.join(".credential"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("../elsewhere", source.join("link")).unwrap();
-        let first = corpus.run().unwrap();
-        assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-        assert_eq!(
-            std::fs::read(destination.join("nested/data")).unwrap(),
-            bytes
-        );
-        assert_eq!(
-            std::fs::read_link(destination.join("link")).unwrap(),
-            Path::new("../elsewhere")
-        );
-        assert_eq!(
-            std::fs::metadata(destination.join(".credential"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let second = corpus.run().unwrap();
-        assert_eq!(second.reused, 2);
-        assert_eq!(second.source_bytes_read, 0);
-        assert_eq!(second.bytes_received, 0);
-        std::fs::set_permissions(
-            destination.join("nested"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        let metadata_conflict = corpus.run().unwrap();
-        assert_eq!(metadata_conflict.refusals.len(), 1);
-        assert_eq!(
-            std::fs::metadata(destination.join("nested"))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        std::fs::set_permissions(
-            destination.join("nested"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        std::fs::write(destination.join(".credential"), b"sting-unique").unwrap();
-        let third = corpus.run().unwrap();
-        assert_eq!(third.refusals.len(), 1);
-        assert_eq!(
-            std::fs::read(destination.join(".credential")).unwrap(),
-            b"sting-unique"
-        );
-        assert_eq!(
-            std::fs::read(source.join(".credential")).unwrap(),
-            b"account-file"
-        );
-    }
-
-    #[test]
-    fn sqlite_headers_and_destination_symlinks_are_not_raw_copied() {
-        let corpus = Corpus::new();
-        let source = corpus.base.join("source");
-        let destination = corpus.base.join("destination");
-        std::fs::write(source.join("credentials.db"), b"SQLite format 3\0opaque").unwrap();
-        std::fs::create_dir(source.join("nested")).unwrap();
-        std::fs::write(source.join("nested/secret"), b"secret").unwrap();
-        let outside = corpus.base.join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, destination.join("nested")).unwrap();
-        let result = corpus.run().unwrap();
-        assert_eq!(result.refusals.len(), 3);
-        assert!(!destination.join("credentials.db").exists());
-        assert!(!outside.join("secret").exists());
-    }
-
-    #[test]
-    fn sweep_removes_only_this_stores_temporaries_and_records_the_rest() {
-        let corpus = Corpus::new();
-        let source = corpus.base.join("source");
-        let destination = corpus.base.join("destination");
-        std::fs::create_dir(source.join("nested")).unwrap();
-        std::fs::write(source.join("nested/data"), vec![3_u8; 70_000]).unwrap();
-        // Payload that merely shares the prefix, or matches only the untagged
-        // form, is carried; a tagged temporary in the source is recorded by
-        // the walk, forwarded, and never carried.
-        std::fs::write(source.join(".bulkload-notes"), b"operator notes").unwrap();
-        std::fs::write(source.join(".bulkload-2026-09"), b"september").unwrap();
-        std::fs::write(source.join(".bulkload-fedcba9876543210-9-9"), b"orphan").unwrap();
-        let first = corpus.run().unwrap();
-        assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-        assert_eq!(
-            first.source_engine_temporaries,
-            vec![b".bulkload-fedcba9876543210-9-9".to_vec()]
-        );
-        assert!(destination.join(".bulkload-notes").exists());
-        assert_eq!(
-            std::fs::read(destination.join(".bulkload-2026-09")).unwrap(),
-            b"september"
-        );
-        assert!(!destination.join(".bulkload-fedcba9876543210-9-9").exists());
-
-        let tag = {
-            let store = Store::open(&corpus.base.join("destination-state")).unwrap();
-            crate::materialize::temporary_tag(&store.authority().unwrap())
-        };
-        let own = |mark: &str, serial: u32| {
-            let mut name = b".bulkload-".to_vec();
-            name.extend_from_slice(&tag);
-            name.extend_from_slice(format!("{mark}-1-{serial}").as_bytes());
-            PathBuf::from(std::ffi::OsString::from_vec(name))
-        };
-        let foreign = if tag.as_slice() == b"0123456789abcdef" {
-            ".bulkload-abcdef0123456789-1-5"
-        } else {
-            ".bulkload-0123456789abcdef-1-5"
-        };
-        let outside = corpus.base.join("outside");
-        std::fs::write(&outside, b"not ours").unwrap();
-        // Removed: an orphan copy, a second link to a published output, and
-        // an empty directory temporary.
-        std::fs::write(destination.join(own("", 1)), b"partial").unwrap();
-        std::fs::hard_link(
-            destination.join("nested/data"),
-            destination.join("nested").join(own("", 2)),
-        )
-        .unwrap();
-        std::fs::create_dir(destination.join(own("-d", 7))).unwrap();
-        // Left and recorded: this store's file tag on a symlink and on a
-        // directory, a non-empty directory temporary, another store's tag,
-        // and the untagged form. `.bulkload-2026-09` is outside the grammar
-        // (a leading zero), so it is not even considered.
-        std::os::unix::fs::symlink(&outside, destination.join(own("", 3))).unwrap();
-        std::fs::create_dir(destination.join(own("", 4))).unwrap();
-        std::fs::create_dir(destination.join(own("-d", 8))).unwrap();
-        std::fs::write(destination.join(own("-d", 8)).join("held"), b"kept").unwrap();
-        std::fs::write(destination.join(foreign), b"another store").unwrap();
-        std::fs::write(destination.join(".bulkload-77-6"), b"untagged").unwrap();
-
-        let second = corpus.run().unwrap();
-        assert!(second.refusals.is_empty(), "{:?}", second.refusals);
-        assert_eq!(second.temporaries_removed, 3);
-        let mut left = second.temporaries_left;
-        left.sort();
-        let mut expected = vec![
-            own("", 3).as_os_str().as_bytes().to_vec(),
-            own("", 4).as_os_str().as_bytes().to_vec(),
-            own("-d", 8).as_os_str().as_bytes().to_vec(),
-            foreign.as_bytes().to_vec(),
-            b".bulkload-77-6".to_vec(),
-        ];
-        expected.sort();
-        assert_eq!(left, expected);
-        assert!(!destination.join(own("", 1)).exists());
-        assert!(std::fs::symlink_metadata(destination.join("nested").join(own("", 2))).is_err());
-        assert!(std::fs::symlink_metadata(destination.join(own("-d", 7))).is_err());
-        let data = std::fs::metadata(destination.join("nested/data")).unwrap();
-        assert_eq!(data.nlink(), 1);
-        assert_eq!(
-            std::fs::read(destination.join("nested/data")).unwrap(),
-            vec![3_u8; 70_000]
-        );
-        assert!(std::fs::symlink_metadata(destination.join(own("", 3)))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::read(&outside).unwrap(), b"not ours");
-        assert!(destination.join(own("", 4)).is_dir());
-        assert_eq!(
-            std::fs::read(destination.join(own("-d", 8)).join("held")).unwrap(),
-            b"kept"
-        );
-        assert!(destination.join(foreign).is_file());
-        assert!(destination.join(".bulkload-77-6").is_file());
-        assert_eq!(
-            std::fs::read(destination.join(".bulkload-notes")).unwrap(),
-            b"operator notes"
-        );
-    }
-
-    #[test]
-    fn temporary_grammar_is_exact() {
-        use crate::materialize::{temporary_name, TemporaryName};
-        assert_eq!(
-            temporary_name(b".bulkload-0123456789abcdef-12-0"),
-            Some(TemporaryName::File(*b"0123456789abcdef"))
-        );
-        assert_eq!(
-            temporary_name(b".bulkload-0123456789abcdef-d-12-0"),
-            Some(TemporaryName::Directory(*b"0123456789abcdef"))
-        );
-        assert_eq!(
-            temporary_name(b".bulkload-4242-7"),
-            Some(TemporaryName::Untagged)
-        );
-        for name in [
-            b".bulkload-".as_slice(),
-            b".bulkload-notes",
-            b".bulkload-0123456789ABCDEF-1-2",
-            b".bulkload-0123456789abcde-1-2",
-            b".bulkload-0123456789abcdef-1-2-3",
-            b".bulkload-0123456789abcdef-x-1-2",
-            b".bulkload-0123456789abcdef-1-",
-            b".bulkload-0123456789abcdef-01-2",
-            b".bulkload-0123456789abcdef-d-1-00",
-            b".bulkload-0123456789abcdef-1-99999999999999999999",
-            b".bulkload-0123456789abcdef-+1-2",
-            b".bulkload-012-7",
-            b".bulkload-1-2.tmp",
-            b".bulkload--1",
-            b"x.bulkload-1-2",
-        ] {
-            assert_eq!(temporary_name(name), None, "{}", name.escape_ascii());
-        }
-    }
-
-    #[test]
-    fn directories_fall_back_to_mkdir_without_a_no_replace_rename() {
-        // R-N119: the hook makes this thread's no-replace renames report
-        // EINVAL, as on a filesystem that lacks them.
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::materialize::force_rename_unsupported(false);
-            }
-        }
-        let corpus = Corpus::new();
-        let source = corpus.base.join("source");
-        let destination = corpus.base.join("destination");
-        std::fs::create_dir_all(source.join("outer/inner")).unwrap();
-        std::fs::write(source.join("outer/inner/data"), b"payload").unwrap();
-        std::fs::set_permissions(source.join("outer"), std::fs::Permissions::from_mode(0o750))
-            .unwrap();
-        let first = {
-            let _restore = Restore;
-            crate::materialize::force_rename_unsupported(true);
-            corpus.run().unwrap()
-        };
-        assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-        assert_eq!(first.directories_renamed, 0);
-        assert_eq!(
-            first.directories_fallback,
-            vec![b"outer".to_vec(), b"outer/inner".to_vec()]
-        );
-        assert_eq!(
-            std::fs::metadata(destination.join("outer")).unwrap().mode() & 0o7777,
-            0o750
-        );
-        assert_eq!(
-            std::fs::read(destination.join("outer/inner/data")).unwrap(),
-            b"payload"
-        );
-        // No directory temporary survives the fallback.
-        let leftovers: Vec<_> = std::fs::read_dir(&destination)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.as_bytes().starts_with(b".bulkload-"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-
-        // Without the hook the same shape takes the rename path.
-        let renamed = Corpus::new();
-        std::fs::create_dir(renamed.base.join("source/outer")).unwrap();
-        let stats = renamed.run().unwrap();
-        assert_eq!(stats.directories_renamed, 1);
-        assert!(stats.directories_fallback.is_empty());
-    }
-
-    #[test]
-    fn interrupted_directory_mode_finalization_resumes_only_its_owned_inode() {
-        let corpus = Corpus::new();
-        let source = corpus.base.join("source");
-        let destination = corpus.base.join("destination");
-        std::fs::create_dir(source.join("nested")).unwrap();
-        let mut row = walk(&WalkOptions::new(source), &mut NullCache)
-            .unwrap()
-            .rows
-            .remove(0);
-        row.mode = 0o40_555;
-        let store = Store::open(&corpus.base.join("destination-state")).unwrap();
-        {
-            let mut first = Destination::open(&destination, &store).unwrap();
-            first.directory(&row, &store, b"authority").unwrap();
-            assert_eq!(
-                std::fs::metadata(destination.join("nested"))
-                    .unwrap()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
-        let mut resumed = Destination::open(&destination, &store).unwrap();
-        resumed.directory(&row, &store, b"authority").unwrap();
-        resumed.finish_directories(&store).unwrap();
-        assert_eq!(
-            std::fs::metadata(destination.join("nested"))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o555
-        );
-    }
-}
+mod tests;

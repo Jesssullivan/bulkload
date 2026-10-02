@@ -142,7 +142,7 @@ updated.
 | W3 v3 engine wins | Destination BLAKE3 ≤ 1× payload. Full flushes ≤ groups + 1. The bench median improves. The < 1.5 s target moved to W4. | R-N77, R-N95 |
 | W4 single pass (wire v5) | Gate (a): the loopback native engine beats rclone as shipped, 3-rep medians. Median < 1.5 s on the TinylandState corpus. File I/O ≤ 2.05× payload and hash ≤ 2× payload. Warm resume reads 0 bytes. A refused live-writer capture leaves no source ledger row. | R-N57, R-N58, R-N86, R-N95, R-N118 |
 | W5 parallel and wire | Gate (b): a neo→sting pull beats rclone over sftp, 3 reps. Each result reports its percentage of the calibrated link ceiling. | R-N57, R-N64 |
-| W6 M1 git carry | Sent bytes ≤ 1.1× `missing_thin_pack_bytes`, and sent objects ≤ the estimate's object count (the estimate is an upper bound). M1 sends every destination-held tip as a have in its first round, ordered ancestors first. On every fixture, the sent object set equals what `upload-pack` sends for exactly that have set. The estimate and the sender both pin `pack.useSparse=false` and `pack.useBitmaps=false`, and add `--shallow` with `--objects-edge-aggressive` when the destination is shallow. A shallow source with a full destination is refused (`GIT_HAVES_UNPROVABLE`, `source_shallow_destination_full`) by both, before anything is sent; a shallow file is never written into a full destination. Extra haves beyond the held tips can make a shallow pack larger, so M1 sends exactly the held tips. A crash in segment k re-sends only segments ≥ k. | R-N60, R-N74, R-N75, R-N97, R-N113, R-N116, R-N131 |
+| W6 M1 git carry | Sent bytes ≤ 1.1× `missing_thin_pack_bytes`, and sent objects ≤ the estimate's object count (the estimate is an upper bound). M1 sends every destination-held tip as a have in its first round, ordered ancestors first. On every fixture, the sent object set equals what `upload-pack` sends for exactly that have set. The estimate and the sender both pin `pack.useSparse=false` and `pack.useBitmaps=false`, and add `--shallow` with `--objects-edge-aggressive` when the destination is shallow. A shallow source with a full destination is refused (`GIT_HAVES_UNPROVABLE`, `source_shallow_destination_full`) by both, before anything is sent; a shallow file is never written into a full destination. Extra haves beyond the held tips can make a shallow pack larger, so M1 sends exactly the held tips. A crash in segment k re-sends only segments ≥ k. Ingest destinations must be local filesystems: a destination whose `objects/` or common dir is on NFS, SMB, WebDAV or another network filesystem is refused (`GIT_DESTINATION_FILESYSTEM_UNSUPPORTED`) before anything is written, since the ingest's `flock` locks cannot be trusted there (OI-1001-Q17). | R-N60, R-N74, R-N75, R-N97, R-N113, R-N116, R-N131 |
 | W6 M2 git carry | `census_walks == 1`. `bytes_read` equals the total size of the changed seats. The live-writer test passes. | R-N58 |
 | W7 proofs | I1 (a record implies its bytes), I2 (no partial leaves) and I3 (a committed file means 0 source reads on resume) hold at every process-crash fault point. Power-loss ordering is proven by a syscall-trace crash-state checker. Darwin barriers are modelled device-wide, with the per-fd model available as a strict option. | R-N86, R-N88, R-N103 |
 
@@ -150,6 +150,81 @@ Gated benchmark samples require AC power and a 1-minute load below 2.5,
 and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
 counts toward a gate (R-N57, R-N63).
+
+## Wire v5
+
+The transfer wire is protocol 5, a hard cut with no dual stack (R-N59,
+R-N118). `bulkload-proto` holds the codec and its schema text, `WIRE_SCHEMA`;
+a peer whose `Open` names another protocol or another BLAKE3 of the schema
+(`wire_id`) is refused before anything else. Every frame is a 4-byte
+big-endian length, a tag byte and a body: tag 1 is a postcard control
+message, tag 2 a content chunk (a fixed 64-byte little-endian header, then the
+payload, sent with `writev`), tag 3 a Git pack piece (reserved).
+
+- **Entries.** The source offers each walked seat as a numbered `Entry`, up to
+  1024 undecided, and the destination answers each with `Decide`: `Skip` (a
+  directory or symlink it made), `Reuse` (it holds this exact stat identity
+  durably; the source reads nothing), `Refuse`, `Send` or `WantManifest`.
+- **Send.** The source reads the file once, chunks it, hashes each chunk and
+  streams it as a data frame (entry, chunk index, offset, size, digest), then
+  sends `End` with the manifest root, chunk count and size. The destination
+  verifies every chunk against its digest, writes it at its offset, and checks
+  coverage and the root before the output is queued for its group commit.
+- **WantManifest.** Chosen only when the destination could fill chunks
+  itself: the output path already exists (adopt or refuse), or published
+  outputs hold chunks (resume, incremental). The source sends `Manifest`, from
+  its ledger without reading when the stat identity is recorded; the
+  destination fills what it can from verified local chunks and asks for the
+  rest by index (`NeedChunks`); the source sends only those, then `End`. A
+  fresh manifest is built from one read whose chunks are all kept in memory
+  (512 MiB budget); a file past the budget is streamed as for `Send`
+  instead, so no seat is read twice in a session.
+- **Credit.** The destination grants 16 MiB of data payload and returns
+  credit as it writes; the source never has more than the granted bytes in
+  flight, and at most 16 entries' content. Available credit never exceeds
+  the window; a grant past it is refused.
+- **Ledger.** The source ledger is digest-only (R-N58): a capture records its
+  row key and manifest (digests, sizes and `manifest_root`), never bytes, and
+  only after its final stat check, so a refused live-writer capture leaves no
+  row (R-N86). `manifest_root` (BLAKE3 in derive-key mode over each chunk's
+  digest and size) replaces the whole-file hash. `SourceDone` follows the
+  ledger's last commit.
+- **Held.** The destination answers every `End` with `Held`. A capture is
+  committed to the ledger only when the destination holds its bytes
+  durably: `Held{true}` is sent once the output's group commit has
+  returned (file and directory sealed, then the store commit), for a
+  written output or an existing one verified against the manifest. No
+  flush is added for it. So a committed capture is never read from the
+  source again (R25, OI-1001-Q15): a resume reuses or adopts the final
+  name, or salvages a temporary. The sweep keeps every one of this
+  store's orphaned file temporaries as a chunk source, under a name of the
+  new session, and removes them when the session finishes, unless the
+  destination refused an entry, in which case they are kept for the next.
+- **Hints.** The destination records, per digest, every published output
+  holding it, newest first; a hint is re-read and re-verified on use, and a
+  miss falls through to the next.
+
+Known limit: a fresh destination is streamed with no cross-file
+deduplication, so a chunk repeated across files crosses the wire once per
+file. Deduplication applies when the destination asks for a manifest.
+
+### Reserved Git sub-stream (W6)
+
+Control variants 12 to 19 and tag 3 are reserved for W6 git carry over the
+same session and are refused today. A sub-stream carries negotiated thin
+packs for one repository (R-N60):
+
+| Frame | Direction | Meaning |
+|---|---|---|
+| `SubOpen{sub, GitPack{repo, refs_digest}}` | source → destination | Opens sub-stream `sub` for a repository and the ref inventory it will carry. |
+| `GitHaves{sub, haves, done}` | destination → source | Object ids the destination holds, in rounds, ancestors first; `done` closes negotiation. |
+| `GitSegmentStart{sub, segment, objects, bytes}` | source → destination | A thin-pack segment begins, with its object and byte counts. |
+| tag 3 `PackData{sub, segment, offset, size}` | source → destination | Raw pack bytes of a segment at an offset, under the same credit as data frames. |
+| `SegmentEnd{sub, segment, pack_digest, objects, bytes}` | source → destination | A segment's bytes are all sent, with their BLAKE3. |
+| `SegmentDurable{sub, segment}` | destination → source | The segment is ingested durably in quarantine. |
+| `GitRefs{sub, updates}` | source → destination | The ref transaction to apply after every segment: name, expected old value, new value. |
+| `GitCommitted{sub, transaction_digest}` | destination → source | The ref transaction committed. |
+| `GitResume{sub, durable_segments}` | destination → source | On a resumed sub-stream, the segments already durable, so only the others are re-sent (W6 M1: a crash in segment k re-sends only segments ≥ k). |
 
 ## Durability
 

@@ -80,9 +80,11 @@ fn w3_engine_properties() {
     same_tree(base, "destination", &names);
     assert_eq!(first.completed, 4);
     assert_eq!(first.source_bytes_read, payload);
-    assert!(
-        first.bytes_received < payload,
-        "cross- and intra-file dedup"
+    // Wire v5: a fresh destination has nothing to fill from, so every file is
+    // streamed (`Send`) in one read, with no cross-file deduplication.
+    assert_eq!(
+        first.bytes_received, payload,
+        "single pass, every byte once"
     );
     assert!(
         counted.blake3_destination() <= payload,
@@ -146,8 +148,8 @@ fn w3_engine_properties() {
 
     // A new file sharing a prefix with published outputs is built from their
     // chunks, re-read and re-verified through committed hints; only its new
-    // tail crosses the wire. (Hints are keyed by digest, newest writer wins;
-    // every output holding the prefix still exists, so any hint is valid.)
+    // tail crosses the wire. (Hints keep every holder of a digest, newest
+    // first, and a miss falls through to the next.)
     let mut extended = shared.get(..1 << 20).unwrap().to_vec();
     extended.extend(noise(4, 1 << 20));
     std::fs::write(source.join("extended"), &extended).unwrap();

@@ -108,4 +108,4 @@ pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
 
-pub use bulkload_proto::{BulkloadRefusal, Frame, FrameKind, Result, RowSchema};
+pub use bulkload_proto::{BulkloadRefusal, Control, Decision, Frame, Result, RowSchema};

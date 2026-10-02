@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode, Stdio};
 use bulkload_agent::freshness::{Freshness, FreshnessCache as _, MemoryCache, StatIdentity};
 use bulkload_agent::hash;
 use bulkload_agent::walk::{self, HashPolicy, WalkOptions};
-use bulkload_proto::{BulkloadRefusal, FileKind, Frame, FrameKind, Result, RowSchema};
+use bulkload_proto::{BulkloadRefusal, Control, FileKind, Frame, Result, RowSchema};
 
 const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
@@ -203,7 +203,9 @@ fn main() -> ExitCode {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
             bulkload_agent::transfer::tune_stream(&output);
-            bulkload_agent::transfer::serve(&mut input.lock(), &mut output.lock())
+            // The reader thread owns stdin for the session; the process
+            // exit closes the transport.
+            bulkload_agent::transfer::serve(input, &mut output.lock())
         }
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
@@ -985,7 +987,7 @@ fn selftest() -> Result<()> {
     }
     println!("  freshness     stale -> record -> fresh (ok)");
 
-    let frame = Frame::new(FrameKind::Row(row));
+    let frame = Frame::Control(Control::Entry { entry: 0, row });
     let encoded = frame.encode()?;
     let (decoded, consumed) = Frame::decode(&encoded)?;
     if decoded != frame || consumed != encoded.len() {

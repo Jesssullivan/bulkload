@@ -193,7 +193,7 @@ pub fn configure_sqlite(conn: &rusqlite::Connection) -> Result<()> {
 /// Which store a sink commits to, for per-side test limits (F3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupSide {
-    /// The source store (captures and the source pack).
+    /// The source store (the digest-only capture ledger).
     Source,
     /// The destination store (outputs).
     Destination,

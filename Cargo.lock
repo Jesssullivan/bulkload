@@ -172,6 +172,7 @@ dependencies = [
 name = "bulkload-proto"
 version = "0.2.0"
 dependencies = [
+ "blake3",
  "postcard",
  "serde",
 ]
