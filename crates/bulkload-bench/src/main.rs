@@ -585,10 +585,11 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
     );
     if let (Some(chunk), Some(transfer)) = (sample.chunk_timing, sample.transfer_timing) {
         println!(
-            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} {}",
+            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} {}",
             sample.sequence,
             sample.phase,
             transfer.walk_ns,
+            transfer.walk_wait_ns,
             transfer.reuse_census_ns,
             transfer.cdc_hash_ns,
             transfer.queue_wait_ns,
