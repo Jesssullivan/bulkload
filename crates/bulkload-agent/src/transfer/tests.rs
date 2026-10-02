@@ -265,6 +265,20 @@ fn salvage_survives_a_destination_refusal() {
     assert_eq!(refused.refusals.len(), 1, "{:?}", refused.refusals);
     assert_eq!(refused.temporaries_removed, 0);
     assert_eq!(refused.temporaries_left.len(), 1);
+    // The kept orphan is reported under the session name it was renamed to
+    // (#77 round 3, F1), and that is where it is.
+    let left = &refused.temporaries_left[0];
+    assert_ne!(
+        left.as_slice(),
+        temporary.file_name().unwrap().as_bytes(),
+        "reported under its pre-rename name"
+    );
+    assert!(!temporary.exists());
+    assert!(corpus
+        .base
+        .join("destination")
+        .join(std::ffi::OsStr::from_bytes(left))
+        .is_file());
     std::fs::remove_dir(corpus.base.join("destination/held")).unwrap();
     let resumed = corpus.run().unwrap();
     assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
@@ -410,10 +424,10 @@ fn interrupted_transport_rereads_only_the_in_flight_file() {
     let (sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
     for stream in [&sender, &receiver] {
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_read_timeout(Some(std::time::Duration::from_mins(1)))
             .unwrap();
         stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_write_timeout(Some(std::time::Duration::from_mins(1)))
             .unwrap();
     }
     std::thread::scope(|scope| {

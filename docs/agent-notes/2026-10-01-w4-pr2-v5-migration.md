@@ -198,6 +198,24 @@ Rulings: OI-1001-Q18 (fix round, then re-review), R-N13.
   #88. With `Held` after the group commit, the seal is off the receive
   thread again.
 
+## Review round 3 (dad307e)
+
+No correctness, durability or R25 defect was found. The review was BLOCK
+only because CI's clippy failed (OI-1001-Q18).
+
+- G1: `clippy::duration_suboptimal_units` fired on CI's toolchain (1.96.1),
+  not on sting's plain-shell cargo (1.93). Fixed with
+  `Duration::from_mins(1)`.
+- F1: `temporaries_left` now reports a kept orphan under its renamed path,
+  and `salvage_survives_a_destination_refusal` checks it.
+- From here on every gate runs through
+  `nix develop .#default --command just ...`.
+- Follow-ups:
+  - #97 (F2): salvage kept after any destination refusal.
+  - #98 (F3): salvage no longer carries R25; update design.md and tests.
+  - #99 (F4): a device node swapped in at a salvage reopen.
+  - #100: a fault test for `Held{false}`.
+
 ## Open
 
 - Adversarial review of #77 (R-N71), then CI on GloriousFlywheel.

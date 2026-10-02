@@ -607,6 +607,12 @@ impl Destination {
                     shared = Some(Arc::new(directory.try_clone()?));
                 }
                 let parent = Arc::clone(shared.as_ref().ok_or(BulkloadRefusal::Io(None))?);
+                // Report the name it now has (#77 round 3, F1).
+                let mut rel_path = rel_dir.to_vec();
+                if !rel_path.is_empty() {
+                    rel_path.push(b'/');
+                }
+                rel_path.extend_from_slice(name.as_bytes());
                 self.salvage.push(Salvaged {
                     parent,
                     name,
