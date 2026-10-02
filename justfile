@@ -109,6 +109,39 @@ flake-check:
 # Source gates owned by this repository's development shell.
 check-source: repo-manifest-validate python-lint shell-lint workflow-lint secrets-scan-dir rust-check
 
+# Local-first test tiers (OI-1001-Q2, 2026-10-01). GloriousFlywheel CI is under
+# contention, so these run locally first and CI is the backstop. Run them
+# inside `nix develop` so actionlint and gitleaks are on PATH.
+#   check-fast      mandatory tier: every ratified-contract guard (R23/R25/
+#                   R-N58 resume counters, durability and the R-N88/R-N119
+#                   power-loss proofs, refusal taxonomy, R34 dependency wall,
+#                   R33 lint wall, CI contract). PR CI runs this tier through
+#                   its source, fault-harness and test gates.
+#   check-optional  optional tier: spike evidence, bench-script stubs, the
+#                   history secret scan and the Nix/Bazel graph. On demand.
+#   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
+
+# The repository and CI contract tests, run directly instead of through
+# Bazel's //:tests (CI's `test` gate runs the same two files).
+contract-test:
+    cd {{ root }} && python3 scripts/validate_repo_manifest.py --self-test tinyland.repo.json
+    cd {{ root }} && python3 tests/test_ci_contract.py
+
+# Mandatory tier, local-first: what PR CI runs (OI-1001-Q2).
+check-fast: check-source fault-harness contract-test
+
+# Optional tier: on demand, never a PR gate (OI-1001-Q2).
+check-optional:
+    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features m1-spike -- -D warnings
+    cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
+    cd {{ root }} && {{ just_executable() }} secrets-scan-history
+    cd {{ root }} && {{ just_executable() }} flake-check
+    cd {{ root }} && {{ just_executable() }} test-local
+
+# Both tiers.
+check-full: check-fast check-optional
+
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.
 check:

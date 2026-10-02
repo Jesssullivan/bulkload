@@ -128,6 +128,15 @@ no longer true (R-N55).
 
 ## Validation
 
+Local first (OI-1001-Q2, 2026-10-01): run `just check-fast` (the mandatory
+tier: every ratified-contract guard, and what PR CI runs) inside
+`nix develop` before pushing; GloriousFlywheel CI is a contended backstop,
+not the first signal. `just check-optional` runs the optional tier (the W6 M1
+spike behind the `m1-spike` feature, bench-script stubs, the history secret
+scan, the flake and Bazel graph) on demand; `just check-full` runs both. The
+fault harness, the R-N88/R-N119 power-loss proofs and the R25 counter tests
+are mandatory and never move to the optional tier.
+
 `just check` runs the repository contract checks, `just rust-check`
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`) and the W7 fault harness (`just fault-harness`). CI remains on GloriousFlywheel tinyland-nix; keep
