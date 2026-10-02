@@ -1,17 +1,25 @@
-//! Power-loss regression for the R-N119 resume path (#74 review, B1).
+//! Power-loss regressions for the directory resume paths.
 //!
-//! A crash at `directory.after_fallback_mkdir` leaves an intent record and a
-//! fresh 0700 directory whose parent entry was never sealed. The resume
-//! adopts that directory and binds its record. The binding must come after
-//! the parent entry is sealed, or a power loss can leave a durable record
-//! naming an inode no directory holds (the N3 hazard, R-N102).
+//! A resume adopts a directory a crashed run left behind, then commits
+//! outputs inside it. Whatever unsealed directory entry the crash left must
+//! be sealed before any record that depends on it commits, or a power loss
+//! can keep the record and lose the entry.
 //!
-//! The crashed run is replayed with the real calls `fallback_directory` makes
-//! before its fault point (the intent commit, then `mkdirat`). The resume
-//! then runs through `Destination::directory`, a staged write, a
-//! `PublishSink` group commit, `finish_directories` and `flush_session`,
-//! all under one process-wide recorder. `check_view` enumerates every
-//! power-loss state of that resume.
+//! - #74 review B1 (R-N119): a crash at `directory.after_fallback_mkdir`
+//!   leaves an intent record and a fresh 0700 directory whose `mkdirat`
+//!   entry was never sealed. The resume binds the record, which must come
+//!   after the seal, or a durable record can name an inode no directory holds
+//!   (the N3 hazard, R-N102).
+//! - #74 round 2 N1: a crash at `directory.after_rename` leaves a bound record
+//!   and a directory whose rename into place was never sealed. The resume
+//!   adopts it through the bound-record arm; an output committed inside it
+//!   must not outlive the rename.
+//!
+//! Each crashed run is replayed with the real calls the engine makes before
+//! its fault point. The resume then runs through `Destination::directory`, a
+//! staged write, a `PublishSink` group commit, `finish_directories` and
+//! `flush_session`, all under one process-wide recorder. `check_view`
+//! enumerates every power-loss state of that resume.
 
 #![allow(
     clippy::unwrap_used,
@@ -47,9 +55,21 @@ fn rows(source: &Path) -> Vec<RowSchema> {
     .rows
 }
 
-#[test]
-fn an_adopted_fallback_directory_is_sealed_before_its_record_binds() {
-    let base = scratch("seal");
+static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What a crashed run needs to replay its calls.
+struct Crash<'a> {
+    store: &'a Store,
+    destination: &'a Path,
+    key: &'a [u8],
+    row: &'a RowSchema,
+}
+
+/// Replay `crash`, resume the copy of `d/f`, and check every power-loss
+/// state of the resume: a committed output names a file holding its bytes,
+/// and a bound directory record names a directory.
+fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
+    let base = scratch(tag);
     let (source, destination, state) = (
         base.join("source"),
         base.join("destination"),
@@ -75,19 +95,23 @@ fn an_adopted_fallback_directory_is_sealed_before_its_record_binds() {
 
     let image = Image::scan(&destination).unwrap();
     let recorder = Recorder::new();
+    // A process-wide recorder also records every other test thread with no
+    // recorder of its own, so these proofs run one at a time.
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let _attached = recorder.attach_process();
-        // The crashed run: `fallback_directory` up to its fault point.
-        store
-            .record_directory_created(&key, INTENT.0, INTENT.1, row_d.mode & 0o7777)
-            .unwrap();
-        let root = File::from(crate::io::sys::open_dir_path_nofollow(&destination).unwrap());
-        crate::io::sys::mkdirat(&root, c"d", 0o700).unwrap();
-        drop(root);
+        crash(&Crash {
+            store: &store,
+            destination: &destination,
+            key: &key,
+            row: &row_d,
+        });
         // The resume.
         let mut target = Destination::open(&destination, &store).unwrap();
         target.directory(&row_d, &store, authority).unwrap();
-        assert_eq!(target.directories.len(), 1, "the intent adopted d");
+        assert_eq!(target.directories.len(), 1, "the resume adopted d");
         let staged = target.stage(&row_f).unwrap();
         crate::io::sys::pwrite_all(&**staged.file(), b"payload", 0).unwrap();
         crate::io::sys::fchmod(&**staged.file(), row_f.mode & 0o7777).unwrap();
@@ -156,4 +180,43 @@ fn an_adopted_fallback_directory_is_sealed_before_its_record_binds() {
         "a committed record outlives its directory entry on power loss:\n{}",
         report.summary(&events)
     );
+}
+
+/// #74 review B1: the crashed run is `fallback_directory` up to its fault
+/// point (the intent commit, then `mkdirat`).
+#[test]
+fn an_adopted_fallback_directory_is_sealed_before_its_record_binds() {
+    resume_after("seal", |crash| {
+        crash
+            .store
+            .record_directory_created(crash.key, INTENT.0, INTENT.1, crash.row.mode & 0o7777)
+            .unwrap();
+        let root = File::from(crate::io::sys::open_dir_path_nofollow(crash.destination).unwrap());
+        crate::io::sys::mkdirat(&root, c"d", 0o700).unwrap();
+    });
+}
+
+/// #74 round 2 N1 (probe P4): the crashed run is the rename path of
+/// `directory` up to `directory.after_rename` (a sealed temporary, its bound
+/// record, then the rename into place, never sealed).
+#[test]
+fn a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit() {
+    resume_after("rename", |crash| {
+        let crashed = Destination::open(crash.destination, crash.store).unwrap();
+        let root = File::from(crate::io::sys::open_dir_path_nofollow(crash.destination).unwrap());
+        let temporary = crashed.temporary(Some(DIRECTORY_MARK)).unwrap();
+        crate::io::sys::mkdirat(&root, &temporary, 0o700).unwrap();
+        let metadata = open_dir(&root, &temporary).unwrap().metadata().unwrap();
+        crashed.seal_entry(&root).unwrap();
+        crash
+            .store
+            .record_directory_created(
+                crash.key,
+                metadata.dev(),
+                metadata.ino(),
+                crash.row.mode & 0o7777,
+            )
+            .unwrap();
+        crate::io::rename_exclusive(&root, &temporary, c"d").unwrap();
+    });
 }
