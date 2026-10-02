@@ -19,6 +19,10 @@ fault-injection = []
 # unlink, mkdir, fchmod) into a trace for the crash-state checker. Off by
 # default; with it off the recording sites compile to nothing.
 io-trace = []
+# Optional test tier (OI-1001-Q2): the W6 M1 git-internals spike. It tests no
+# product verb; the product sender is gated by `tests/git_carry_v2.rs`. Run it
+# with `just check-optional`.
+m1-spike = []
 
 # Crash-resume and live-writer harness; needs the fault points compiled in.
 [[test]]
@@ -32,6 +36,13 @@ required-features = ["fault-injection"]
 name = "power_loss"
 path = "tests/power_loss.rs"
 required-features = ["io-trace"]
+
+# W6 M1 spike evidence (docs/evidence/w6-m1-spike-2026-09-23.md); optional
+# tier, out of the mandatory `cargo test --workspace` run.
+[[test]]
+name = "git_m1_spike"
+path = "tests/git_m1_spike.rs"
+required-features = ["m1-spike"]
 
 # R34 dependency wall. This list is closed: the `dep_graph` integration test
 # asserts that tokio, opendal, reqwest, ring and tonic are absent from

@@ -9640,25 +9640,9 @@ mod review_pr53c {
         }
     }
 
-    // K. Legacy key: print for a fixture made once, outside, so the same
-    // bytes and inode can be keyed by main and by this head.
-    #[test]
-    #[ignore = "reviewer probe: RV3_FIXTURE=<repo>"]
-    fn rv3_print_legacy_key() {
-        let Some(fixture) = std::env::var_os("RV3_FIXTURE") else {
-            return;
-        };
-        let fixture = PathBuf::from(fixture);
-        let hex = |key: [u8; 32]| blake3::Hash::from_bytes(key).to_hex().to_string();
-        println!(
-            "RV3KEY default={} full={}",
-            hex(reusable_capture_key(&fixture).unwrap()),
-            hex(
-                reusable_capture_key_with_policy(&fixture, CapturePolicy::including_rebuildable())
-                    .unwrap()
-            )
-        );
-    }
+    // (K, the RV3 reviewer key-print probe, was removed 2026-10-01: it asserted
+    // nothing and returned early without RV3_FIXTURE. Key bit-identity is
+    // asserted by estate.rs `KeyParts::digest must be bit-identical`.)
     // L. A nest's populated submodule is a nest-in-nest the census never
     // walks. R-N115 now refuses the nest by name, so R-N83 (stash), N1
     // (hidden index flags) and R-N89 (ignored files) cannot be skipped there.

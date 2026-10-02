@@ -20,6 +20,8 @@ issues #42–#49.
 
 ```bash
 nix develop            # toolchain, linters
+just check-fast        # mandatory tier (what PR CI runs); run before pushing
+just check-full        # mandatory + optional tier (spikes, history scan, Nix/Bazel)
 just rust-check        # fmt, clippy -D warnings, tests
 cargo build --release -p bulkload-agent -p bulkload-bench
 target/release/bulkload-agent        # prints the verb list
