@@ -93,6 +93,7 @@ const HINT_FILES: usize = 16;
 const MAX_MANIFEST_CHUNKS: usize = 131_072;
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
+static WALK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static REUSE_CENSUS_NS: AtomicU64 = AtomicU64::new(0);
 static CDC_HASH_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -130,7 +131,12 @@ pub struct TransferStats {
 /// Cumulative process-scope phase counters; concurrent transfers may overlap.
 #[derive(Clone, Copy, Debug)]
 pub struct TransferTiming {
+    /// Walk thread work: listing, stat and hand-over, excluding
+    /// [`Self::walk_wait_ns`].
     pub walk_ns: u64,
+    /// Walk thread time blocked on a walk-ahead slot, waiting for the wire
+    /// (back-pressure, #112).
+    pub walk_wait_ns: u64,
     pub reuse_census_ns: u64,
     pub cdc_hash_ns: u64,
     pub queue_wait_ns: u64,
@@ -143,6 +149,7 @@ impl TransferTiming {
     pub fn snapshot() -> Self {
         Self {
             walk_ns: WALK_NS.load(Ordering::Relaxed),
+            walk_wait_ns: WALK_WAIT_NS.load(Ordering::Relaxed),
             reuse_census_ns: REUSE_CENSUS_NS.load(Ordering::Relaxed),
             cdc_hash_ns: CDC_HASH_NS.load(Ordering::Relaxed),
             queue_wait_ns: QUEUE_WAIT_NS.load(Ordering::Relaxed),
@@ -155,8 +162,9 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={}",
             self.walk_ns,
+            self.walk_wait_ns,
             self.reuse_census_ns,
             self.cdc_hash_ns,
             self.queue_wait_ns,
@@ -169,6 +177,7 @@ impl TransferTiming {
     pub const fn since(self, before: Self) -> Self {
         Self {
             walk_ns: self.walk_ns.saturating_sub(before.walk_ns),
+            walk_wait_ns: self.walk_wait_ns.saturating_sub(before.walk_wait_ns),
             reuse_census_ns: self.reuse_census_ns.saturating_sub(before.reuse_census_ns),
             cdc_hash_ns: self.cdc_hash_ns.saturating_sub(before.cdc_hash_ns),
             queue_wait_ns: self.queue_wait_ns.saturating_sub(before.queue_wait_ns),
@@ -467,28 +476,40 @@ struct SourceWork<'a> {
 struct WalkGate {
     state: Mutex<(usize, bool)>,
     ready: Condvar,
+    limit: usize,
 }
 
 impl WalkGate {
     const fn new() -> Self {
+        Self::with_limit(WALK_AHEAD)
+    }
+
+    const fn with_limit(limit: usize) -> Self {
         Self {
             state: Mutex::new((0, false)),
             ready: Condvar::new(),
+            limit,
         }
     }
 
-    /// Take one slot, waiting while [`WALK_AHEAD`] are out; `false` once the
-    /// session is over.
-    fn take(&self) -> bool {
+    /// Take one slot, waiting while `limit` ([`WALK_AHEAD`]) are out; `false`
+    /// once the session is over. Time spent blocked is added to `waited_ns`;
+    /// the clock is read only when the gate is full.
+    fn take(&self, waited_ns: &mut u64) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut blocked = None;
         loop {
-            if state.1 {
-                return false;
-            }
-            if state.0 < WALK_AHEAD {
+            if state.1 || state.0 < self.limit {
+                if let Some(started) = blocked {
+                    *waited_ns = waited_ns.saturating_add(elapsed_ns(started));
+                }
+                if state.1 {
+                    return false;
+                }
                 state.0 += 1;
                 return true;
             }
+            blocked.get_or_insert_with(Instant::now);
             state = self
                 .ready
                 .wait(state)
@@ -511,16 +532,37 @@ impl WalkGate {
     }
 }
 
+/// One walk thread's time: `walk_ns` is walk work (listing, stat and
+/// hand-over), `wait_ns` is time blocked on a walk-ahead slot. Their sum is
+/// the walk thread's lifetime (#112).
+#[derive(Clone, Copy, Debug)]
+struct WalkTime {
+    walk_ns: u64,
+    wait_ns: u64,
+}
+
 /// The walk thread: hand every walked item to the sending thread, at most
 /// [`WALK_AHEAD`] ahead of the wire, then say the walk has ended.
-fn walk_source(walker: Walker<'_>, gate: &WalkGate, events: &Sender<Event>) {
-    let _timer = PhaseTimer(&WALK_NS, Instant::now());
-    for item in walker {
-        if !gate.take() || events.send(Event::Walked(item)).is_err() {
-            return;
-        }
+fn walk_source<I: IntoIterator<Item = WalkItem>>(
+    walker: I,
+    gate: &WalkGate,
+    events: &Sender<Event>,
+) -> WalkTime {
+    let started = Instant::now();
+    let mut wait_ns = 0;
+    let finished = walker
+        .into_iter()
+        .all(|item| gate.take(&mut wait_ns) && events.send(Event::Walked(item)).is_ok());
+    if finished {
+        let _ = events.send(Event::WalkEnded);
     }
-    let _ = events.send(Event::WalkEnded);
+    let time = WalkTime {
+        walk_ns: elapsed_ns(started).saturating_sub(wait_ns),
+        wait_ns,
+    };
+    WALK_NS.fetch_add(time.walk_ns, Ordering::Relaxed);
+    WALK_WAIT_NS.fetch_add(time.wait_ns, Ordering::Relaxed);
+    time
 }
 
 /// Serve one transfer request from a caller-authenticated stdio transport.
@@ -590,7 +632,9 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
             let (events, gate) = (events_sender.clone(), &gate);
             std::thread::Builder::new()
                 .name("bulkload-serve-walk".to_owned())
-                .spawn_scoped(scope, move || walk_source(walker, gate, &events))?;
+                .spawn_scoped(scope, move || {
+                    walk_source(walker, gate, &events);
+                })?;
         }
         for _ in 0..CAPTURE_WORKERS {
             let events = events_sender.clone();

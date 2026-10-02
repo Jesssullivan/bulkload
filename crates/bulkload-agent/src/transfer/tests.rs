@@ -1062,3 +1062,60 @@ fn a_walk_longer_than_the_walk_ahead_bound_completes() {
         b"carried"
     );
 }
+
+/// #112: time the walk thread spends blocked on a walk-ahead slot is
+/// accounted as `wait_ns`, not as walk work. A one-slot gate and a slow
+/// consumer force a wait before every item after the first.
+#[test]
+fn walk_ahead_wait_is_accounted_apart_from_walk_work() {
+    const FILES: usize = 8;
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(25);
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    for serial in 0..FILES {
+        std::fs::write(source.join(format!("file-{serial}")), b"x").unwrap();
+    }
+    let root = crate::io::sys::open_root(&source).unwrap();
+    let walker = crate::walk::Walker::new(root.as_fd(), true).unwrap();
+    let gate = WalkGate::with_limit(1);
+    let (sender, events) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let (time, items) = std::thread::scope(|scope| {
+        let gate = &gate;
+        let walk = scope.spawn(move || walk_source(walker, gate, &sender));
+        let mut items = 0_u64;
+        loop {
+            match events.recv().unwrap() {
+                Event::Walked(_) => {
+                    items += 1;
+                    std::thread::sleep(HOLD);
+                    gate.give();
+                }
+                Event::WalkEnded => break,
+                _ => panic!("unexpected event"),
+            }
+        }
+        (walk.join().unwrap(), items)
+    });
+    let lifetime = elapsed_ns(started);
+    assert!(items >= FILES as u64, "{FILES} files, got {items}");
+    let hold = u64::try_from(HOLD.as_nanos()).unwrap();
+    // Each item after the first waits for most of one hold.
+    assert!(
+        time.wait_ns >= (items - 1) * hold / 2,
+        "wait {} for {items} items",
+        time.wait_ns
+    );
+    // Walk work excludes the wait: listing a few seats is far below it.
+    assert!(
+        time.walk_ns < time.wait_ns / 4,
+        "walk {} wait {}",
+        time.walk_ns,
+        time.wait_ns
+    );
+    assert!(time.walk_ns + time.wait_ns <= lifetime);
+    // The same split reaches the process counters.
+    let after = TransferTiming::snapshot();
+    assert!(after.walk_wait_ns >= time.wait_ns);
+    assert!(after.render().contains("walk_wait_ns="));
+}
