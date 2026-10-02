@@ -52,6 +52,9 @@ pub enum BulkloadRefusal {
     FieldDomainViolation,
     /// Readiness or completeness disagrees with the recorded blockers.
     ContractSelfInconsistent,
+    /// A closure report found planned items whose durable ledger does not end
+    /// as applied, a typed refusal or referenced-only (OI-1001-Q2).
+    ClosureUnaccounted,
 
     // ---- path handling ----------------------------------------------------
     /// A path that must be absolute is not.
@@ -134,6 +137,10 @@ pub enum BulkloadRefusal {
     // ---- budgets / transport ------------------------------------------------
     /// A capture, row, or spill budget was exceeded.
     BudgetExceeded,
+    /// Writing the planned bytes would leave the destination filesystem with
+    /// less free space than the configured floor (`--min-free-percent`,
+    /// default 25%), or with no room at all (OI-1001-Q2).
+    DestinationSpaceInsufficient,
     /// The transport authority differs from the captured authority.
     TransportAuthorityMismatch,
     /// The frame could not be encoded or decoded.
@@ -173,6 +180,7 @@ impl BulkloadRefusal {
             Self::RequiredFieldMissing => "REQUIRED_FIELD_MISSING",
             Self::FieldDomainViolation => "FIELD_DOMAIN_VIOLATION",
             Self::ContractSelfInconsistent => "CONTRACT_SELF_INCONSISTENT",
+            Self::ClosureUnaccounted => "CLOSURE_UNACCOUNTED",
             Self::PathNotAbsolute => "PATH_NOT_ABSOLUTE",
             Self::PathNotPortable => "PATH_NOT_PORTABLE",
             Self::PathMapDetached => "PATH_MAP_DETACHED",
@@ -200,11 +208,73 @@ impl BulkloadRefusal {
             Self::JournalAlreadyRolledBack => "JOURNAL_ALREADY_ROLLED_BACK",
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
+            Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::TransportAuthorityMismatch => "TRANSPORT_AUTHORITY_MISMATCH",
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
+    }
+}
+
+impl BulkloadRefusal {
+    /// Every stable refusal code, in taxonomy order. A closure report uses it
+    /// to tell a typed refusal from free text; the unit tests hold it equal to
+    /// the set of [`BulkloadRefusal::code`] values.
+    pub const CODES: &'static [&'static str] = &[
+        "SNAPSHOT_CUSTODY_UNAVAILABLE",
+        "SNAPSHOT_CUSTODY_ESCAPE",
+        "SNAPSHOT_ROOTS_OVERLAP",
+        "SOURCE_CHANGED_AFTER_SNAPSHOT",
+        "SNAPSHOT_OWNERSHIP_UNPROVEN",
+        "CAPTURE_DRIFTED",
+        "DIGEST_MISMATCH",
+        "SEALED_OBJECT_MISSING",
+        "SEALED_OBJECT_CHANGED",
+        "RECEIPT_BINDING_INVALID",
+        "SCHEMA_MISMATCH",
+        "REQUIRED_FIELD_MISSING",
+        "FIELD_DOMAIN_VIOLATION",
+        "CONTRACT_SELF_INCONSISTENT",
+        "CLOSURE_UNACCOUNTED",
+        "PATH_NOT_ABSOLUTE",
+        "PATH_NOT_PORTABLE",
+        "PATH_MAP_DETACHED",
+        "PATH_ESCAPES_ROOT",
+        "GIT_UNAVAILABLE",
+        "GIT_AUTHORITY_OUTSIDE_ROOT",
+        "GIT_AUTHORITY_CHANGED",
+        "GIT_INVENTORY_MALFORMED",
+        "GIT_DESTINATION_OCCUPIED",
+        "GIT_IGNORE_POLICY_CONFLICT",
+        "GIT_DESTINATION_PARENT_MISSING",
+        "GIT_NEST_STASHED",
+        "GIT_NEST_DETACHED_UNREACHABLE",
+        "GIT_NEST_INNER_REPOSITORY",
+        "GIT_NEST_CONVERSION_ATTRIBUTE",
+        "GIT_NEST_POPULATED_SUBMODULE",
+        "GIT_NEST_CARRIER_REFUSED",
+        "GIT_REPOSITORY_NOT_AT_PATH",
+        "GIT_HAVES_UNPROVABLE",
+        "SQLITE_INTEGRITY_CHECK_FAILED",
+        "SQLITE_UNSUPPORTED_VALUE",
+        "SQLITE_STATE_CHANGED",
+        "ROLLBACK_SNAPSHOT_MISSING",
+        "ROLLBACK_END_STATE_DIVERGED",
+        "JOURNAL_ALREADY_ROLLED_BACK",
+        "JOURNAL_OWNERSHIP_CONFLICT",
+        "BUDGET_EXCEEDED",
+        "DESTINATION_SPACE_INSUFFICIENT",
+        "TRANSPORT_AUTHORITY_MISMATCH",
+        "FRAME_CODEC",
+        "PROBE_FAILED",
+        "IO",
+    ];
+
+    /// Whether `code` is one of [`BulkloadRefusal::CODES`].
+    #[must_use]
+    pub fn is_code(code: &str) -> bool {
+        Self::CODES.contains(&code)
     }
 }
 
@@ -263,6 +333,7 @@ mod tests {
             BulkloadRefusal::RequiredFieldMissing,
             BulkloadRefusal::FieldDomainViolation,
             BulkloadRefusal::ContractSelfInconsistent,
+            BulkloadRefusal::ClosureUnaccounted,
             BulkloadRefusal::PathNotAbsolute,
             BulkloadRefusal::PathNotPortable,
             BulkloadRefusal::PathMapDetached,
@@ -290,6 +361,7 @@ mod tests {
             BulkloadRefusal::JournalAlreadyRolledBack,
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
+            BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::TransportAuthorityMismatch,
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProbeFailed,
@@ -302,6 +374,12 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), total, "refusal codes must be unique");
+
+        let mut listed: Vec<&'static str> = BulkloadRefusal::CODES.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, codes, "CODES must list exactly the variant codes");
+        assert!(BulkloadRefusal::is_code("DESTINATION_SPACE_INSUFFICIENT"));
+        assert!(!BulkloadRefusal::is_code("IO (errno 2)"));
 
         for code in codes {
             assert!(

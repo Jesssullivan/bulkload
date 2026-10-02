@@ -11,6 +11,16 @@ Coverage includes both hosts' unique Git and agent state, credentials, dots,
 SQLite and worktrees. Unsupported items remain outstanding with preserved
 custody; nothing is silently excluded.
 
+Closure is bulkload's own gate, never a metric defined outside it
+(OI-1001-Q2). `closure-report PLAN PRIVATE_STATE...` reads the plan and the
+apply ledger (outcome records and `.done` journals) and ends every planned
+item as `applied` (workspace restored, journal present), `refused` (a typed
+refusal code) or `referenced-only` (ref custody imported, journal present, no
+working bytes). Anything else is `unaccounted`; the report passes only when
+`unaccounted` is 0 and otherwise exits nonzero with `CLOSURE_UNACCOUNTED`.
+A pass is necessary for completion, not sufficient: the daily-work bar above
+still applies.
+
 ## Live union
 
 Both hosts stay usable. Bulkload never signals sessions, never requires a
@@ -158,6 +168,16 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+Space preflight (OI-1001-Q2): a write that would leave its destination
+filesystem (`statvfs`) with less than `--min-free-percent` free (default
+25%; 0 still refuses a write larger than the space available) refuses
+`DESTINATION_SPACE_INSUFFICIENT` before it starts. `copy` and `pull` check
+each batch's needed bytes before requesting its content, because wire v4
+does not give the receiver the cohort total up front; a refused cohort
+stays resumable. `estate-apply` checks every pending item's bundle size per
+destination filesystem, plus the staging peak on the corpus's, before any
+item runs; bundle size is a lower bound on a checkout.
 
 ## Reclaim
 

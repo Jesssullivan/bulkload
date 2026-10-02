@@ -1286,11 +1286,7 @@ fn apply_item(
     // pass extends it clean. Key-only drift leaves a coherent snapshot, which
     // applies. R-N29 (apply proceeds on an occupied destination, recording
     // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
-    let journal = state.join(format!(
-        "{identity}-{}-{}.done",
-        blake3::hash(source.as_bytes()).to_hex(),
-        blake3::Hash::from_bytes(captured.digest).to_hex()
-    ));
+    let journal = journal_path(state, &identity, source, &captured.digest);
     if journal.try_exists()? {
         let done: String = read(&journal)?;
         let outcome = match done.as_str() {
@@ -1337,6 +1333,162 @@ fn apply_item(
     Ok(Completion::clean(outcome).naming(nested))
 }
 
+/// One planned item as its durable apply ledger records it (OI-1001-Q2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerEntry {
+    /// The plan item's identity, as every receipt names it.
+    pub item: String,
+    /// The plan item's source checkout.
+    pub source: PathBuf,
+    /// `(outcome, reason)` from the last state directory holding an
+    /// `{item}.outcome` record; `None` when none does.
+    pub record: Option<(String, Option<String>)>,
+    /// An `{item}.outcome` record exists but does not decode.
+    pub record_unreadable: bool,
+    /// The body of every `{item}-*.done` apply journal across the state
+    /// directories (`workspace-restored` or `refs-imported`); an unreadable
+    /// journal contributes an empty string.
+    pub journals: Vec<String>,
+}
+
+/// A plan's items joined with their outcome records and apply journals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ledger {
+    /// One entry per distinct plan item, in plan order.
+    pub entries: Vec<LedgerEntry>,
+    /// Item identities with an outcome record but no place in the plan.
+    pub foreign: Vec<String>,
+}
+
+fn is_identity(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read a plan's durable apply ledger.
+///
+/// Joins the plan with each state directory's `{item}.outcome` records and
+/// `{item}-{source}-{digest}.done` journals. Later state directories override earlier ones' outcome records, as a
+/// later apply attempt overrides an earlier one; journals accumulate. Reads
+/// only; it never takes the apply lock or writes anything.
+///
+/// # Errors
+/// Refuses a malformed plan or an unreadable state directory.
+pub fn ledger(plan: &Path, states: &[PathBuf]) -> Result<Ledger> {
+    let contents: Plan = read(plan)?;
+    let mut records = std::collections::BTreeMap::<String, Option<(String, Option<String>)>>::new();
+    let mut journals = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for state in states {
+        for entry in fs::read_dir(state)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(item) = name
+                .strip_suffix(".outcome")
+                .filter(|item| is_identity(item))
+            {
+                let record = read::<(PathBuf, String, Option<String>)>(&entry.path())
+                    .ok()
+                    .map(|(_, outcome, reason)| (outcome, reason));
+                records.insert(item.to_owned(), record);
+            } else if let Some(stem) = name.strip_suffix(".done") {
+                let Some(item) = stem.split('-').next().filter(|item| is_identity(item)) else {
+                    continue;
+                };
+                let body = read::<String>(&entry.path()).unwrap_or_default();
+                journals.entry(item.to_owned()).or_default().push(body);
+            }
+        }
+    }
+    let mut ledger = Ledger::default();
+    let mut planned = std::collections::BTreeSet::new();
+    for item in &contents.items {
+        let identity = id(item)?;
+        if !planned.insert(identity.clone()) {
+            continue;
+        }
+        let record = records.get(&identity);
+        ledger.entries.push(LedgerEntry {
+            source: item.source.clone(),
+            record: record.cloned().flatten(),
+            record_unreadable: matches!(record, Some(None)),
+            journals: journals.remove(&identity).unwrap_or_default(),
+            item: identity,
+        });
+    }
+    ledger.foreign = records
+        .into_keys()
+        .filter(|item| !planned.contains(item))
+        .collect();
+    Ok(ledger)
+}
+
+// The apply journal for one item, source and capture digest. Its presence
+// means the item's restore or import completed; its body is that outcome.
+fn journal_path(state: &Path, identity: &str, source: &str, digest: &[u8; 32]) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}-{}.done",
+        blake3::hash(source.as_bytes()).to_hex(),
+        blake3::Hash::from_bytes(*digest).to_hex()
+    ))
+}
+
+/// OI-1001-Q2: the bytes an apply would write, per destination filesystem,
+/// before it writes any of them. Each pending item (a capture record and
+/// bundle present, no journal yet) charges its bundle size to the
+/// filesystem of its restore target (the workspace, else the repository):
+/// a lower bound, since a checkout expands past its pack. Staging copies a
+/// bundle next to the corpus and holds at most `jobs` at once, so the
+/// corpus filesystem is charged the `jobs` largest bundles. Items without
+/// a record or bundle are left to refuse on their own, by type.
+fn space_plan(
+    plan: &Plan,
+    corpus: &Path,
+    state: &Path,
+    source: &str,
+    jobs: usize,
+) -> Result<Vec<(PathBuf, u64)>> {
+    let mut by_device = std::collections::BTreeMap::<u64, (PathBuf, u64)>::new();
+    let mut charge = |path: &Path, bytes: u64| -> Result<()> {
+        let probe = crate::space::existing_ancestor(path)?;
+        let device = fs::metadata(&probe)?.dev();
+        let entry = by_device.entry(device).or_insert((probe, 0));
+        entry.1 = entry.1.saturating_add(bytes);
+        Ok(())
+    };
+    let mut staged = Vec::new();
+    for item in &plan.items {
+        let identity = id(item)?;
+        let record = corpus.join(format!("{identity}.capture"));
+        if !record.try_exists()? {
+            continue;
+        }
+        let captured: Capture = read(&record)?;
+        if !filename(&captured.bundle)
+            || journal_path(state, &identity, source, &captured.digest).try_exists()?
+        {
+            continue;
+        }
+        let Ok(bundle) = fs::metadata(corpus.join(&captured.bundle)) else {
+            continue;
+        };
+        let target = item.workspace.as_ref().unwrap_or(&item.repository);
+        charge(target, bundle.len())?;
+        staged.push(bundle.len());
+    }
+    staged.sort_unstable_by(|left, right| right.cmp(left));
+    let peak = staged
+        .iter()
+        .take(jobs)
+        .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+    charge(corpus, peak)?;
+    Ok(by_device.into_values().collect())
+}
+
 /// Apply explicit restores only; common Git administration is serialized.
 ///
 /// # Errors
@@ -1353,6 +1505,11 @@ pub fn apply(
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
+    // OI-1001-Q2: refuse before any item writes when the planned bytes would
+    // take a destination filesystem under its free-space floor.
+    for (probe, planned) in space_plan(&contents, corpus, state, source, jobs)? {
+        crate::space::preflight(&probe, planned)?;
+    }
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
@@ -1517,6 +1674,91 @@ mod tests {
         assert_eq!(
             fs::read(second_target.join("file")).unwrap(),
             b"second dirty"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1001-Q2: the space plan charges pending bundles before apply writes,
+    // and the closure report reads apply's own ledger back, failing closed on
+    // a planned item apply never recorded.
+    #[test]
+    fn space_plan_and_closure_report_read_the_durable_ledger() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-closure-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let applied = root.join("applied");
+        fs::DirBuilder::new().mode(0o700).create(&applied).unwrap();
+
+        // Before apply: one pending bundle, charged to the target's
+        // filesystem and (staging) to the corpus's; same device here.
+        let contents: Plan = read(&plan).unwrap();
+        let record: Capture = read(&corpus.join(format!(
+            "{}.capture",
+            id(contents.items.first().unwrap()).unwrap()
+        )))
+        .unwrap();
+        let bundle = fs::metadata(corpus.join(&record.bundle)).unwrap().len();
+        let planned = space_plan(&contents, &corpus, &applied, "neo", 1).unwrap();
+        assert_eq!(planned.len(), 1);
+        let (probe, bytes) = planned.first().unwrap();
+        assert_eq!(*bytes, 2 * bundle);
+        let space = crate::space::probe(probe).unwrap();
+        assert_eq!(
+            crate::space::check(*bytes, space, 100),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
+        assert_eq!(crate::space::check(*bytes, space, 0), Ok(()));
+
+        // Before apply the ledger holds nothing: unaccounted, fail.
+        let report = crate::closure::Report::from_ledger(
+            &ledger(&plan, std::slice::from_ref(&applied)).unwrap(),
+        );
+        assert_eq!((report.planned(), report.unaccounted), (1, 1));
+        assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
+
+        apply(&plan, &corpus, &applied, "neo", 1, &|_| Ok(())).unwrap();
+        let report = crate::closure::Report::from_ledger(
+            &ledger(&plan, std::slice::from_ref(&applied)).unwrap(),
+        );
+        assert_eq!((report.applied, report.unaccounted), (1, 0));
+        assert!(report.passes());
+        // A done item is not charged again.
+        let planned = space_plan(&contents, &corpus, &applied, "neo", 1).unwrap();
+        assert!(planned.iter().all(|(_, bytes)| *bytes == 0));
+
+        // A newly planned item apply has not run yet is unaccounted, and the
+        // capture state's records are not apply outcomes.
+        let second = root.join("second");
+        fs::create_dir(&second).unwrap();
+        git(&second, &["init", "--template="]);
+        add(&plan, &second, &root.join("second-target"), None).unwrap();
+        let ledger_now = ledger(&plan, &[state.clone(), applied]).unwrap();
+        let report = crate::closure::Report::from_ledger(&ledger_now);
+        assert_eq!(
+            (report.planned(), report.applied, report.unaccounted),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            report.rows.last().unwrap().disposition,
+            crate::closure::Disposition::Unaccounted("no-outcome-record")
+        );
+        let capture_only = crate::closure::Report::from_ledger(
+            &ledger(&plan, std::slice::from_ref(&state)).unwrap(),
+        );
+        assert_eq!(
+            capture_only.rows.first().unwrap().disposition,
+            crate::closure::Disposition::Unaccounted("not-an-apply-outcome")
         );
         fs::remove_dir_all(root).unwrap();
     }

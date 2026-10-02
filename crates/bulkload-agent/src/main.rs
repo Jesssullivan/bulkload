@@ -18,7 +18,7 @@ const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
-    bulkload-agent [--durability=group|strict] <SUBCOMMAND>
+    bulkload-agent [--durability=group|strict] [--min-free-percent=N] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -55,6 +55,13 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
+    closure-report PLAN PRIVATE_STATE [PRIVATE_STATE ...]
+                Read-only: join PLAN with the apply outcome records and journals
+                in each PRIVATE_STATE (later directories override earlier
+                outcome records) and print a bulkload.closure.v1 JSON ledger:
+                every planned item is applied, refused (typed code) or
+                referenced-only, else unaccounted. Exits nonzero with
+                CLOSURE_UNACCOUNTED when unaccounted > 0
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -85,6 +92,10 @@ BOUNDARIES:
     --durability=group (the default) seals each file with a barrier and makes
     each group of files durable with one SQLite commit; --durability=strict
     fully flushes every file (A/B comparison). pull passes strict to serve.
+    --min-free-percent=N (0-100, default 25): copy/pull refuse a batch, and
+    estate-apply refuses before any item, with DESTINATION_SPACE_INSUFFICIENT
+    when the planned bytes would leave the destination filesystem (statvfs)
+    with less than N% free. estate-apply plans bundle sizes, a lower bound.
     copy/pull require an existing destination directory.
     copy/pull preserve divergent destinations and refuse live SQLite files.
     They enumerate the source each run; completed content is resumable.
@@ -138,7 +149,9 @@ fn main() -> ExitCode {
     let started = std::time::Instant::now();
     // macOS starts at 256 open files; take the hard limit the host allows.
     let _ = bulkload_agent::limits::raise_descriptor_limit();
-    let mut args = match durability_flag(std::env::args_os().skip(1).collect()) {
+    // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
+    bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
+    let mut args = match global_flags(std::env::args_os().skip(1).collect()) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
@@ -185,6 +198,7 @@ fn main() -> ExitCode {
             | "estate-apply"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
+        Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("serve") => {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
@@ -216,7 +230,7 @@ fn main() -> ExitCode {
 }
 
 /// Remove `--durability=MODE` from the arguments and apply it process-wide.
-fn durability_flag(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
+fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
         match arg
@@ -224,10 +238,34 @@ fn durability_flag(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsStri
             .and_then(|value| value.strip_prefix("--durability="))
         {
             Some(mode) => bulkload_agent::durable::set_durability(mode.parse()?),
-            None => rest.push(arg),
+            None => match arg
+                .to_str()
+                .and_then(|value| value.strip_prefix("--min-free-percent="))
+            {
+                Some(percent) => bulkload_agent::space::set_min_free_percent(
+                    bulkload_agent::space::parse_percent(percent)?,
+                ),
+                None => rest.push(arg),
+            },
         }
     }
     Ok(rest)
+}
+
+// OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
+// whether or not it passes; the verdict is the exit status.
+fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (plan, states) = args
+        .split_first()
+        .filter(|(_, states)| !states.is_empty())
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
+    let ledger = bulkload_agent::estate::ledger(Path::new(plan), &states)?;
+    let report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", report.to_json())?;
+    stdout.flush()?;
+    report.gate()
 }
 
 // The only capture-policy word the agent accepts; anything else is a typo, and

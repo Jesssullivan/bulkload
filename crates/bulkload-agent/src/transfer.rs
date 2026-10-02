@@ -217,7 +217,13 @@ pub fn copy(
             )
         };
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        let served = producer.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        // The space preflight refuses on the receiving side, and the source
+        // then sees only a closed stream: the receiver's refusal is the cause.
+        if matches!(result, Err(BulkloadRefusal::DestinationSpaceInsufficient)) {
+            return result;
+        }
+        served?;
         result
     })
 }
@@ -724,6 +730,18 @@ pub fn receive<R: Read, W: Write>(
                     .map(|row| prepare_row(&mut target, &store, &output_authority, row, &mut stats))
                     .collect::<Result<Vec<_>>>()?;
                 REUSE_CENSUS_NS.fetch_add(elapsed_ns(census_started), Ordering::Relaxed);
+                // OI-1001-Q2: before asking for any content, the bytes this
+                // batch would write must leave the destination above its
+                // free-space floor. Wire v4 does not tell the receiver the
+                // cohort total up front, so the plan is checked batch by
+                // batch, against a fresh statvfs that already counts every
+                // earlier batch's writes. A refusal leaves a resumable cohort.
+                let planned = batch
+                    .iter()
+                    .zip(&needed)
+                    .filter(|(_, needed)| **needed)
+                    .fold(0u64, |total, (row, _)| total.saturating_add(row.size));
+                crate::space::preflight(target.path(), planned)?;
                 write_frame(
                     output,
                     FrameKind::WantFiles {
