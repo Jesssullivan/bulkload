@@ -5,7 +5,7 @@ mandatory / optional / superseded), OI-1001-Q6 (sign with the global key on
 sting), R-N13, R-N69, R-N122.
 
 Branch `chore/local-first-test-tiers`, worktree
-`bulkload.worktrees/local-first-tiers-20261001`, PR listed below once opened.
+`bulkload.worktrees/local-first-tiers-20261001`, PR #81 (unmerged), commit d2717bc.
 
 ## Done
 
