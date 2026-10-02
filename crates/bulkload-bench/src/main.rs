@@ -27,7 +27,7 @@ use bulkload_agent::freshness::NullCache;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
 use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
-use bulkload_proto::{FileKind, Frame, FrameKind, RowSchema};
+use bulkload_proto::{Control, FileKind, Frame, RowSchema};
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -461,7 +461,7 @@ struct StopBeforeDone<W>(W);
 impl<W: io::Write> io::Write for StopBeforeDone<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if Frame::decode(data).is_ok_and(|(frame, consumed)| {
-            consumed == data.len() && matches!(frame.kind, FrameKind::TransferDone { .. })
+            consumed == data.len() && matches!(frame, Frame::Control(Control::SourceDone { .. }))
         }) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -485,8 +485,13 @@ fn interrupt_after_payload(
     transfer::tune_stream(&receiver);
     std::thread::scope(|scope| -> io::Result<()> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let mut input = sender.try_clone()?;
-            transfer::serve(&mut input, &mut StopBeforeDone(sender))
+            let input = sender.try_clone()?;
+            let closer = sender.try_clone()?;
+            let served = transfer::serve(input, &mut StopBeforeDone(sender));
+            // The source's reader thread holds a clone of this end; closing
+            // it lets the destination see the interruption.
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+            served
         })?;
         let mut output = receiver.try_clone()?;
         let receive_outcome = transfer::receive(
@@ -580,7 +585,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
     );
     if let (Some(chunk), Some(transfer)) = (sample.chunk_timing, sample.transfer_timing) {
         println!(
-            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} publish_groups={} pack_append_ns={} file_syncs={} file_sync_ns={} sqlite_commits={} sqlite_commit_ns={} legacy_put_calls={} legacy_put_ns={} legacy_dir_syncs={} legacy_dir_sync_ns={}",
+            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} {}",
             sample.sequence,
             sample.phase,
             transfer.walk_ns,
@@ -589,16 +594,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
             transfer.queue_wait_ns,
             transfer.transfer_ns,
             transfer.materialize_ns,
-            chunk.publish_groups,
-            chunk.pack_append_ns,
-            chunk.file_syncs,
-            chunk.file_sync_ns,
-            chunk.sqlite_commits,
-            chunk.sqlite_commit_ns,
-            chunk.put_calls,
-            chunk.put_ns,
-            chunk.dir_syncs,
-            chunk.dir_sync_ns,
+            chunk.render(),
         );
     }
     if let Some(counters) = sample.counters {

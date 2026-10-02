@@ -112,6 +112,11 @@ pub enum BulkloadRefusal {
     /// A destination's refs do not prove it holds their history: it is a
     /// partial clone, or shallow at a frontier other than the source's (R-N75).
     GitHavesUnprovable,
+    /// A Git destination's object store or common dir is on a filesystem
+    /// the ingest does not support: a network filesystem (NFS, SMB, `WebDAV`
+    /// and the like), where its `flock` locks cannot be trusted. Ingest
+    /// destinations must be local filesystems (operator ruling OI-1001-Q17).
+    GitDestinationFilesystemUnsupported,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -192,6 +197,7 @@ impl BulkloadRefusal {
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
+            Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -282,6 +288,7 @@ mod tests {
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
+            BulkloadRefusal::GitDestinationFilesystemUnsupported,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

@@ -1684,6 +1684,9 @@ mod tests {
         .unwrap();
         let result = estimate(&source, &Destination::Local(destination)).unwrap();
         assert_eq!(result.source_shallow_count, 1);
+        // #73 round-2 D4: the copied frontier is load-bearing; without it
+        // R-N131 refuses this pair.
+        assert_eq!(result.destination_shallow_count, 1);
         assert_eq!(result.haves_used, 1);
         // The shallow closure is one commit, one tree and three blobs.
         assert_eq!(result.source.objects() - result.missing.objects(), 5);
@@ -1695,8 +1698,6 @@ mod tests {
         assert_eq!(result.missing.objects(), 3);
     }
 
-    /// R-N75 (F2): a shallow destination whose frontier differs from the
-    /// source's cannot prove it holds its tips' history, so the verb refuses.
     /// R-N131: a shallow source with a full destination is refused, with no
     /// size, whether or not the destination holds the boundary's parents.
     #[test]
@@ -1731,6 +1732,8 @@ mod tests {
         assert!(estimate(&source, &Destination::Local(matching)).is_ok());
     }
 
+    /// R-N75 (F2): a shallow destination whose frontier differs from the
+    /// source's cannot prove it holds its tips' history, so the verb refuses.
     #[test]
     fn shallow_destination_with_a_different_frontier_is_refused() {
         let fixture = Fixture::new("shallow-destination");
