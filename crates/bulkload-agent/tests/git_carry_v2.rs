@@ -3646,7 +3646,13 @@ fn pr75_r4_n1_contending_opens_yield_exactly_one_live_session() {
             // contend; the collect is what makes that so.
             #[allow(clippy::needless_collect)]
             let threads: Vec<_> = (0..6)
-                .map(|_| scope.spawn(|| Ingest::open(&target, &journals, pair.ingest_plan(), None)))
+                .map(|_| {
+                    // `Refused` is large (result_large_err): boxed, as the
+                    // clippy help for it suggests.
+                    scope.spawn(|| {
+                        Ingest::open(&target, &journals, pair.ingest_plan(), None).map_err(Box::new)
+                    })
+                })
                 .collect();
             threads.into_iter().map(|t| t.join().unwrap()).collect()
         });

@@ -492,7 +492,13 @@ fn names(directory: &File, name: &std::ffi::CString, file: &File) -> crate::Resu
     }
     // SAFETY: `fstatat` succeeded, so it filled `at`.
     let at = unsafe { at.assume_init() };
-    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+    // `dev_t` is `i32` on Darwin and `u64` on Linux; a device number is
+    // never negative, so the cast loses nothing.
+    #[allow(
+        clippy::useless_conversion,
+        clippy::unnecessary_cast,
+        clippy::cast_sign_loss
+    )]
     let same = at.st_dev as u64 == held.dev() && at.st_ino as u64 == held.ino();
     Ok(same)
 }
