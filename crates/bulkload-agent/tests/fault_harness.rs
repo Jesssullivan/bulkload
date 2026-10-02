@@ -19,9 +19,13 @@
 //! - **I4** (R-N79) after the resume no `.bulkload-*` temporary remains: the
 //!   sweep removed exactly the ones the crash left and recorded none as
 //!   ambiguous;
-//! - **I3** the resume reads exactly the source bytes of files that had neither
-//!   an output record nor a committed capture before the crash, so every
-//!   committed file costs 0 source bytes;
+//! - **I3** the resume reads exactly the source bytes of files that had no
+//!   output record before the crash, each once, so every committed file costs
+//!   0 source bytes (R25). The source ledger is digest-only (R-N58): a
+//!   committed capture saves its manifest, never its bytes, so a file whose
+//!   capture committed but whose output did not is read again, unless the
+//!   crash left it complete under its final name: the resume then adopts it
+//!   against the ledger's manifest and reads nothing;
 //! - the resume converges with only the fixture's own refusal, and the final
 //!   destination is byte-identical to the source.
 //!
@@ -43,11 +47,11 @@
 //! engine breaks today. They are listed in `KNOWN_VIOLATIONS`, not fixed,
 //! and never count as coverage. `every_fault_point_has_a_scenario` compares
 //! the list with the tests this binary reports under `--list --ignored`, and
-//! checks each listed test's ignore reason:
+//! checks each listed test's ignore reason.
 //!
-//! - `live_writer_*_leaves_no_source_pack_bytes` (four, R-N86): a refused
-//!   capture leaves the victim's bytes, unindexed, in the source pack. W4
-//!   PR 2 removes the source pack (R-N58).
+//! The list is empty. The four R-N86 tests it held (a refused capture left
+//! the victim's bytes in the source pack) pass since W4 PR 2 removed the
+//! pack (R-N58), as `live_writer_*_leaves_no_source_ledger_row`.
 //!
 //! # Hung scenarios
 //!
@@ -98,15 +102,16 @@ use bulkload_agent::transfer_store::Manifest;
 use bulkload_agent::walk::{walk, WalkOptions};
 use bulkload_proto::{BulkloadRefusal, RowSchema};
 
-/// `transfer_store::PERSIST_BATCH` (crate-private): chunks per durable batch.
-const PERSIST_BATCH: usize = 256;
-/// `transfer::BATCH_ROWS` (crate-private): rows offered per batch.
-const BATCH_ROWS: usize = 32;
+/// Maximal chunks in the large fixture file (the v4 pack's batch size).
+const LARGE_CHUNKS: usize = 256;
 /// `io::durable::GROUP_FILES`: the most outputs one destination group holds.
 const GROUP_FILES: usize = 64;
-/// One byte past `PERSIST_BATCH × CDC_MAX`, so the file spans several batches.
-const LARGE_BYTES: usize = PERSIST_BATCH * bulkload_agent::hash::CDC_MAX_BYTES as usize + 1;
+/// One byte past `LARGE_CHUNKS × CDC_MAX`, so the file spans many credit
+/// returns (64 MiB against a 16 MiB window).
+const LARGE_BYTES: usize = LARGE_CHUNKS * bulkload_agent::hash::CDC_MAX_BYTES as usize + 1;
 const SMALL_FILES: usize = 48;
+/// More than the fixture's entries: every directory and file of [`populate`].
+const ENTRIES: usize = SMALL_FILES + 8;
 const REFUSED: &str = "refused.db";
 const REFUSED_PREFIX_BYTES: u64 = 16;
 const TEMP_PREFIX: &[u8] = b".bulkload-";
@@ -230,6 +235,20 @@ fn digest(path: &Path) -> [u8; 32] {
     *blake3::hash(&fs::read(path).unwrap()).as_bytes()
 }
 
+/// Whether `bytes` are exactly the chunks `manifest` names, in order, and
+/// the manifest's root is the root of those chunks.
+fn matches_manifest(bytes: &[u8], manifest: &Manifest) -> bool {
+    let mut rest = bytes;
+    for chunk in &manifest.chunks {
+        let size = usize::try_from(chunk.size).unwrap();
+        if rest.len() < size || *blake3::hash(&rest[..size]).as_bytes() != chunk.digest {
+            return false;
+        }
+        rest = &rest[size..];
+    }
+    rest.is_empty() && manifest.is_consistent()
+}
+
 fn relative(path: &[u8]) -> &Path {
     Path::new(std::ffi::OsStr::from_bytes(path))
 }
@@ -298,9 +317,12 @@ fn committed(state: &Path, scratch: &Path, table: &str) -> Vec<(RowSchema, Vec<u
 }
 
 /// Committed `chunk_locations` of one store, digest to size, read from a copy
-/// like [`committed`].
+/// like [`committed`]. A v5 store has no such table: empty.
 fn chunk_index(state: &Path, scratch: &Path) -> BTreeMap<[u8; 32], u64> {
     let database = state.join("transfer.sqlite");
+    if !database.exists() {
+        return BTreeMap::new();
+    }
     let copy = scratch.join(format!(
         "chunk-locations-{}.sqlite",
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -313,6 +335,16 @@ fn chunk_index(state: &Path, scratch: &Path) -> BTreeMap<[u8; 32], u64> {
     }
     let index = {
         let connection = rusqlite::Connection::open(&copy).unwrap();
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_locations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !exists {
+            return BTreeMap::new();
+        }
         let mut statement = connection
             .prepare("SELECT digest, size FROM chunk_locations")
             .unwrap();
@@ -381,15 +413,14 @@ fn assert_i1(label: &str, scratch: &Scratch, state: &CrashState) {
             observed, *identity,
             "{label} I1: identity of {target:?} drifted from its record"
         );
-        let content = digest(&target);
         if let Some(manifest) = state.captures.get(path) {
-            assert_eq!(
-                content, manifest.digest,
-                "{label} I1: {target:?} does not hash to its manifest"
+            assert!(
+                matches_manifest(&fs::read(&target).unwrap(), manifest),
+                "{label} I1: {target:?} does not match its manifest"
             );
         }
         assert_eq!(
-            content,
+            digest(&target),
             digest(&scratch.source().join(relative(path))),
             "{label} I1: {target:?} differs from its source"
         );
@@ -568,11 +599,10 @@ const fn directory_path(point: Point) -> Option<&'static str> {
 
 /// `group capture_ids=<ids> chunks=<n>` for one committer group.
 ///
-/// A source pack group lists the distinct, ascending batch indices of the
-/// captures whose chunks or refusals it carries; a group can span batches, so
-/// indices from two batches merge, and a group holding only completions lists
-/// none. A destination group lists one index per output, `0..n` with
-/// `1 <= n <= GROUP_FILES`, and the distinct chunks those outputs hold.
+/// A source ledger group lists the distinct, ascending entry numbers of its
+/// captures, and no chunks: the ledger is digest-only (R-N58). A destination
+/// group lists one index per output, `0..n` with `1 <= n <= GROUP_FILES`, and
+/// the distinct chunks those outputs hold.
 fn assert_group(point: Point, source: bool, line: &str) {
     let label = point.name();
     let rest = line
@@ -589,7 +619,7 @@ fn assert_group(point: Point, source: bool, line: &str) {
                 .unwrap_or_else(|_| panic!("{label}: id in {line:?}"))
         })
         .collect();
-    let _: usize = chunks
+    let chunks: usize = chunks
         .parse()
         .unwrap_or_else(|_| panic!("{label}: chunk count in {line:?}"));
     assert!(
@@ -598,9 +628,10 @@ fn assert_group(point: Point, source: bool, line: &str) {
     );
     if source {
         assert!(
-            ids.iter().all(|id| *id < BATCH_ROWS),
-            "{label}: source group ids outside a batch: {line:?}"
+            !ids.is_empty() && ids.iter().all(|id| *id < ENTRIES),
+            "{label}: source group ids are not entries of the fixture: {line:?}"
         );
+        assert_eq!(chunks, 0, "{label}: the ledger holds no chunk bytes");
     } else {
         assert!(
             !ids.is_empty() && ids.len() <= GROUP_FILES,
@@ -681,10 +712,15 @@ fn crash_resume_with(
     let crash_temporaries = assert_i2(&label, &scratch);
 
     let files = source_files(&scratch);
+    // A final name a crash left unrecorded holds complete content (I2); with
+    // its capture committed, the resume adopts it against the ledger's
+    // manifest and reads nothing.
+    let named = tree(&scratch.destination());
     let uncommitted: u64 = files
         .iter()
         .filter(|(path, _)| {
-            !before.outputs.contains_key(*path) && !before.captures.contains_key(*path)
+            !before.outputs.contains_key(*path)
+                && (!before.captures.contains_key(*path) || !named.contains_key(*path))
         })
         .map(|(_, size)| *size)
         .sum();
@@ -712,7 +748,8 @@ fn crash_resume_with(
         "{label}: resume refused {:?}",
         resumed.refusals
     );
-    // I3: committed files cost 0 source bytes; the rest are read exactly once.
+    // I3: committed outputs cost 0 source bytes; the rest are read exactly
+    // once, whether or not their capture committed (R-N58: no byte pack).
     assert_eq!(
         resumed.source_bytes_read,
         uncommitted + refused_read,
@@ -825,12 +862,6 @@ macro_rules! scenarios {
 }
 
 scenarios! {
-    publish_source_after_append_first => PublishSourceAfterAppend: 1, WITH_REFUSAL;
-    publish_source_after_append_mid => PublishSourceAfterAppend: 8, WITH_REFUSAL;
-    publish_source_after_pack_sync_first => PublishSourceAfterPackSync: 1, WITH_REFUSAL;
-    publish_source_after_pack_sync_mid => PublishSourceAfterPackSync: 8, WITH_REFUSAL;
-    publish_source_after_location_insert_first => PublishSourceAfterLocationInsert: 1, WITH_REFUSAL;
-    publish_source_after_location_insert_mid => PublishSourceAfterLocationInsert: 8, WITH_REFUSAL;
     publish_source_after_manifest_insert_first => PublishSourceAfterManifestInsert: 1, WITH_REFUSAL;
     publish_source_after_manifest_insert_mid => PublishSourceAfterManifestInsert: 8, WITH_REFUSAL;
     publish_source_before_commit_first => PublishSourceBeforeCommit: 1, WITH_REFUSAL;
@@ -859,10 +890,10 @@ scenarios! {
     directory_after_fallback_mkdir => DirectoryAfterFallbackMkdir: 1, NO_REFUSAL;
     serve_after_content_mid => ServeAfterContent: 25, WITH_REFUSAL;
     serve_before_done => ServeBeforeDone: 1, WITH_REFUSAL;
-    receive_after_want_files_first => ReceiveAfterWantFiles: 1, WITH_REFUSAL;
-    receive_after_want_files_second => ReceiveAfterWantFiles: 2, WITH_REFUSAL;
+    receive_after_decide_first => ReceiveAfterDecide: 1, WITH_REFUSAL;
+    receive_after_decide_mid => ReceiveAfterDecide: 30, WITH_REFUSAL;
     receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
-    receive_after_applied_mid => ReceiveAfterApplied: 25, WITH_REFUSAL;
+    receive_after_end_mid => ReceiveAfterEnd: 25, WITH_REFUSAL;
 }
 
 #[test]
@@ -886,12 +917,15 @@ fn fault_spec_parsing_rejects_typos_and_zero() {
         Some((Point::PublishSourceAfterCommit, 1))
     );
     assert_eq!(
-        parse("receive.after_applied:7"),
-        Some((Point::ReceiveAfterApplied, 7))
+        parse("receive.after_end:7"),
+        Some((Point::ReceiveAfterEnd, 7))
     );
-    assert_eq!(parse("receive.after_applied:0"), None);
-    assert_eq!(parse("receive.after_applied:x"), None);
-    assert_eq!(parse("receive.after_aplied"), None);
+    assert_eq!(parse("receive.after_end:0"), None);
+    assert_eq!(parse("receive.after_end:x"), None);
+    assert_eq!(parse("receive.after_edn"), None);
+    // The v4 pack and batch points are gone with the pack (R-N58).
+    assert_eq!(parse("publish.source.after_append"), None);
+    assert_eq!(parse("receive.after_applied"), None);
     assert_eq!(parse("publish.after_commit"), None);
     assert_eq!(parse(""), None);
 }
@@ -948,22 +982,8 @@ const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 /// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
 /// today, with the fault point each one is the only scenario for, if any.
 /// Listed, never counted as coverage.
-const KNOWN_VIOLATIONS: [(&str, Option<Point>); 4] = [
-    // R-N86: a refused capture leaves unindexed bytes in the source pack.
-    (
-        "live_writer_in_place_overwrite_leaves_no_source_pack_bytes",
-        None,
-    ),
-    ("live_writer_truncate_leaves_no_source_pack_bytes", None),
-    (
-        "live_writer_rename_replace_leaves_no_source_pack_bytes",
-        None,
-    ),
-    (
-        "live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes",
-        None,
-    ),
-];
+/// Empty since W4 PR 2: the four R-N86 source-pack tests pass (R-N58).
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 0] = [];
 
 /// The attributes directly above `fn <name>(` (or `pub fn <name>(`): the
 /// text between the preceding item's end and the function.
@@ -1212,8 +1232,10 @@ fn wait_for_later_ctime(reference: &Path, tick: &Path) {
     }
 }
 
-/// Run one mutation; assert the typed refusal and a clean destination. The
-/// scratch is returned for the known-violation source-index checks.
+/// Run one mutation; assert the typed refusal, a clean destination, and no
+/// chunk index or chunk bytes in either store (this subsumes the four v4
+/// `*_leaves_no_source_index` tests). The scratch is returned for the R-N86
+/// ledger checks.
 fn live_writer(mutation: Mutation) -> Scratch {
     let label = format!("{mutation:?}");
     let scratch = Scratch::new("live-writer");
@@ -1267,34 +1289,23 @@ fn live_writer(mutation: Mutation) -> Scratch {
         "{label}: capture committed"
     );
     assert_eq!(assert_i2(&label, &scratch), 0);
-    // The destination keeps no byte pack (M2 W3): no chunk rows, no pack bytes.
-    assert_index_is(
-        &format!("{label} destination"),
-        &scratch,
-        &scratch.destination_state(),
-        &BTreeMap::new(),
-    );
-    assert_pack_is(
-        &format!("{label} destination"),
-        &scratch.destination_state(),
-        0,
-    );
+    // Neither store keeps chunk bytes (R-N58): no chunk rows, no pack.
+    for (side, state) in [
+        ("destination", scratch.destination_state()),
+        ("source", scratch.source_state()),
+    ] {
+        assert_index_is(
+            &format!("{label} {side}"),
+            &scratch,
+            &state,
+            &BTreeMap::new(),
+        );
+        assert_no_chunk_bytes(&format!("{label} {side}"), &state);
+    }
     scratch
 }
 
-/// Distinct chunks of every committed capture, which must all be bystanders.
-fn bystander_chunks(label: &str, recorded: &CrashState) -> BTreeMap<[u8; 32], u64> {
-    let mut chunks = BTreeMap::new();
-    for (path, manifest) in &recorded.captures {
-        assert_ne!(path, VICTIM.as_bytes(), "{label}: victim captured");
-        for chunk in &manifest.chunks {
-            chunks.insert(chunk.digest, chunk.size);
-        }
-    }
-    chunks
-}
-
-/// A store's committed chunk rows are exactly `expected`.
+/// A store's committed `chunk_locations` rows are exactly `expected`.
 fn assert_index_is(
     label: &str,
     scratch: &Scratch,
@@ -1311,40 +1322,51 @@ fn assert_index_is(
     );
 }
 
-/// A store's `chunks.pack` holds exactly `bytes`.
-fn assert_pack_is(label: &str, state: &Path, bytes: u64) {
-    let pack = fs::metadata(state.join("chunks.pack")).unwrap().len();
+/// A store holds no chunk bytes: no `chunks.pack` and no `chunks/` objects.
+fn assert_no_chunk_bytes(label: &str, state: &Path) {
+    assert!(
+        fs::symlink_metadata(state.join("chunks.pack")).is_err(),
+        "{label}: a chunks.pack exists"
+    );
+    assert!(
+        fs::symlink_metadata(state.join("chunks")).is_err(),
+        "{label}: a chunks directory exists"
+    );
+}
+
+/// R-N86, under the digest-only ledger (R-N58): a refused live-writer
+/// capture leaves no source ledger row and no byte anywhere in the source
+/// store, while every bystander's capture is recorded.
+fn assert_no_victim_ledger_row(mutation: Mutation) {
+    let label = format!("{mutation:?}");
+    let scratch = live_writer(mutation);
+    let recorded = crash_state(&scratch);
+    assert!(
+        !recorded.captures.contains_key(VICTIM.as_bytes()),
+        "{label}: the refused capture has a ledger row"
+    );
+    let mut bystanders: Vec<&Vec<u8>> = recorded.captures.keys().collect();
+    bystanders.sort();
     assert_eq!(
-        pack, bytes,
-        "{label}: chunks.pack holds {pack} bytes; expected {bytes}"
+        bystanders,
+        [
+            &b"bystander-0".to_vec(),
+            &b"bystander-1".to_vec(),
+            &b"bystander-2".to_vec()
+        ],
+        "{label}: every bystander capture is recorded"
     );
-}
-
-/// The source store indexes no chunk of a refused capture (R-N86).
-fn assert_source_index_only_bystanders(mutation: Mutation) {
-    let label = format!("{mutation:?}");
-    let scratch = live_writer(mutation);
-    let recorded = crash_state(&scratch);
-    let bystanders = bystander_chunks(&label, &recorded);
-    assert_index_is(
-        &format!("{label} source"),
-        &scratch,
-        &scratch.source_state(),
-        &bystanders,
-    );
-}
-
-/// The source pack holds no byte of a refused capture.
-fn assert_source_pack_only_bystanders(mutation: Mutation) {
-    let label = format!("{mutation:?}");
-    let scratch = live_writer(mutation);
-    let recorded = crash_state(&scratch);
-    let bystanders = bystander_chunks(&label, &recorded);
-    assert_pack_is(
-        &format!("{label} source"),
-        &scratch.source_state(),
-        bystanders.values().sum(),
-    );
+    for (path, manifest) in &recorded.captures {
+        assert!(
+            matches_manifest(
+                &fs::read(scratch.source().join(relative(path))).unwrap(),
+                manifest
+            ),
+            "{label}: ledger row for {:?} does not describe its source",
+            relative(path)
+        );
+    }
+    assert_no_chunk_bytes(&format!("{label} source"), &scratch.source_state());
 }
 
 #[test]
@@ -1367,51 +1389,26 @@ fn live_writer_same_size_mtime_restored_refuses() {
     live_writer(Mutation::SameSizeMtimeRestored);
 }
 
+// R-N86, formerly four known violations: the source committer appended each
+// captured chunk to `chunks.pack` before the capture's final stat check, so a
+// refused capture left its bytes in the pack, unindexed. W4 PR 2 removes the
+// pack (R-N58); the ledger records a capture only after that check passes.
 #[test]
-fn live_writer_in_place_overwrite_leaves_no_source_index() {
-    assert_source_index_only_bystanders(Mutation::InPlaceOverwrite);
+fn live_writer_in_place_overwrite_leaves_no_source_ledger_row() {
+    assert_no_victim_ledger_row(Mutation::InPlaceOverwrite);
 }
 
 #[test]
-fn live_writer_truncate_leaves_no_source_index() {
-    assert_source_index_only_bystanders(Mutation::Truncate);
+fn live_writer_truncate_leaves_no_source_ledger_row() {
+    assert_no_victim_ledger_row(Mutation::Truncate);
 }
 
 #[test]
-fn live_writer_rename_replace_leaves_no_source_index() {
-    assert_source_index_only_bystanders(Mutation::RenameReplace);
+fn live_writer_rename_replace_leaves_no_source_ledger_row() {
+    assert_no_victim_ledger_row(Mutation::RenameReplace);
 }
 
 #[test]
-fn live_writer_same_size_mtime_restored_leaves_no_source_index() {
-    assert_source_index_only_bystanders(Mutation::SameSizeMtimeRestored);
-}
-
-// KNOWN VIOLATION (R-N86), recorded rather than fixed. The source committer
-// appends each captured chunk to `chunks.pack` as it arrives and indexes it
-// only with a capture that passed its final stat check, so a refused capture
-// leaves no `chunk_locations` row (tested above) but its bytes stay in the
-// pack, unindexed. W4 removes the source pack (R-N58).
-#[test]
-#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
-fn live_writer_in_place_overwrite_leaves_no_source_pack_bytes() {
-    assert_source_pack_only_bystanders(Mutation::InPlaceOverwrite);
-}
-
-#[test]
-#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
-fn live_writer_truncate_leaves_no_source_pack_bytes() {
-    assert_source_pack_only_bystanders(Mutation::Truncate);
-}
-
-#[test]
-#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
-fn live_writer_rename_replace_leaves_no_source_pack_bytes() {
-    assert_source_pack_only_bystanders(Mutation::RenameReplace);
-}
-
-#[test]
-#[ignore = "known violation (R-N86): refused capture leaves unindexed victim bytes in the source pack; W4 removes the source pack (R-N58)"]
-fn live_writer_same_size_mtime_restored_leaves_no_source_pack_bytes() {
-    assert_source_pack_only_bystanders(Mutation::SameSizeMtimeRestored);
+fn live_writer_same_size_mtime_restored_leaves_no_source_ledger_row() {
+    assert_no_victim_ledger_row(Mutation::SameSizeMtimeRestored);
 }

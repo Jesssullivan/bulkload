@@ -44,15 +44,13 @@
 //!
 //! # Fault points
 //!
-//! Source pack groups, in `PackSink::publish` and `StorePublisher::commit`
-//! (the source store's committer thread):
+//! Source ledger groups, in `StorePublisher::commit_captures` (the source
+//! store's committer thread). The ledger is digest-only (R-N58): there is no
+//! pack, so nothing is written or sealed before the transaction.
 //!
 //! | Name | Crash leaves (in the source store) |
 //! |------|------------------------------------|
-//! | `publish.source.after_append` | chunk bytes appended to `chunks.pack`, not sealed, not indexed |
-//! | `publish.source.after_pack_sync` | the pack tail sealed, not indexed |
-//! | `publish.source.after_location_insert` | an open transaction with chunk locations |
-//! | `publish.source.after_manifest_insert` | an open transaction with locations and captures |
+//! | `publish.source.after_manifest_insert` | an open transaction with the group's captures |
 //! | `publish.source.before_commit` | the whole group staged, `COMMIT` not issued |
 //! | `publish.source.after_commit` | the group committed |
 //!
@@ -86,11 +84,11 @@
 //!
 //! | Name | Crash leaves |
 //! |------|--------------|
-//! | `serve.after_content` | one file sent and acknowledged `Applied`; its capture may not be committed |
-//! | `serve.before_done` | every capture committed, `TransferDone` not sent |
-//! | `receive.after_want_files` | a batch census answered, no content received for it |
-//! | `receive.after_chunks` | one file's chunks verified and written to its temporary |
-//! | `receive.after_applied` | `Applied` sent; the output may still be waiting on its group |
+//! | `serve.after_content` | one entry's `End` sent; its capture may not be committed |
+//! | `serve.before_done` | every capture committed, `SourceDone` not sent |
+//! | `receive.after_decide` | one entry decided, no content received for it |
+//! | `receive.after_chunks` | one file's chunks verified, covering it, and written to its temporary |
+//! | `receive.after_end` | an entry's `End` handled; its output may still be waiting on its group |
 //!
 //! # Group size
 //!
@@ -178,12 +176,6 @@ pub fn group_files() -> Option<u64> {
 /// A named crash point in the durability path. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Point {
-    /// `publish.source.after_append`
-    PublishSourceAfterAppend,
-    /// `publish.source.after_pack_sync`
-    PublishSourceAfterPackSync,
-    /// `publish.source.after_location_insert`
-    PublishSourceAfterLocationInsert,
     /// `publish.source.after_manifest_insert`
     PublishSourceAfterManifestInsert,
     /// `publish.source.before_commit`
@@ -216,20 +208,17 @@ pub enum Point {
     ServeAfterContent,
     /// `serve.before_done`
     ServeBeforeDone,
-    /// `receive.after_want_files`
-    ReceiveAfterWantFiles,
+    /// `receive.after_decide`
+    ReceiveAfterDecide,
     /// `receive.after_chunks`
     ReceiveAfterChunks,
-    /// `receive.after_applied`
-    ReceiveAfterApplied,
+    /// `receive.after_end`
+    ReceiveAfterEnd,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 22] = [
-        Self::PublishSourceAfterAppend,
-        Self::PublishSourceAfterPackSync,
-        Self::PublishSourceAfterLocationInsert,
+    pub const ALL: [Self; 19] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -246,18 +235,15 @@ impl Point {
         Self::DirectoryBeforeComplete,
         Self::ServeAfterContent,
         Self::ServeBeforeDone,
-        Self::ReceiveAfterWantFiles,
+        Self::ReceiveAfterDecide,
         Self::ReceiveAfterChunks,
-        Self::ReceiveAfterApplied,
+        Self::ReceiveAfterEnd,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::PublishSourceAfterAppend => "publish.source.after_append",
-            Self::PublishSourceAfterPackSync => "publish.source.after_pack_sync",
-            Self::PublishSourceAfterLocationInsert => "publish.source.after_location_insert",
             Self::PublishSourceAfterManifestInsert => "publish.source.after_manifest_insert",
             Self::PublishSourceBeforeCommit => "publish.source.before_commit",
             Self::PublishSourceAfterCommit => "publish.source.after_commit",
@@ -274,9 +260,9 @@ impl Point {
             Self::DirectoryBeforeComplete => "directory.before_complete",
             Self::ServeAfterContent => "serve.after_content",
             Self::ServeBeforeDone => "serve.before_done",
-            Self::ReceiveAfterWantFiles => "receive.after_want_files",
+            Self::ReceiveAfterDecide => "receive.after_decide",
             Self::ReceiveAfterChunks => "receive.after_chunks",
-            Self::ReceiveAfterApplied => "receive.after_applied",
+            Self::ReceiveAfterEnd => "receive.after_end",
         }
     }
 
@@ -355,8 +341,8 @@ impl Drop for GroupNote {
 /// A crash receipt for a publication point records it. Each store's committer
 /// publishes on its own thread, so the note is thread-local; it is cleared
 /// per group, so no receipt names a finished group. A source group lists the
-/// batch indices of its captures (a group can span batches, so indices from
-/// different batches merge); a destination group lists one index per output,
+/// entry numbers of its captures, distinct and ascending, with no chunks (the
+/// ledger is digest-only); a destination group lists one index per output,
 /// `0..n`.
 pub fn note_group(capture_ids: &[usize], chunks: usize) -> GroupNote {
     let ids: Vec<String> = capture_ids.iter().map(ToString::to_string).collect();

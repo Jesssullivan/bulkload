@@ -957,7 +957,10 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 }
 
-/// Verify an existing output byte-for-byte against `manifest` before adopting it.
+/// Verify an existing output byte-for-byte against `manifest` before adopting
+/// it: every chunk, read at its place, hashes to its manifest digest, and the
+/// chunks cover the file exactly. The manifest's root is checked by the
+/// caller, so this is equivalent to recomputing `manifest_root`.
 ///
 /// Only the adopt path uses this; freshly written outputs are built from
 /// verified chunks and are not read back.
@@ -972,27 +975,27 @@ pub(crate) fn verify_existing(
     let mut file = file;
     file.rewind()?;
     let before = file.metadata()?;
-    if before.len() != row.size || before.mode() & 0o7777 != row.mode & 0o7777 {
+    if before.len() != row.size
+        || manifest.size() != Some(row.size)
+        || before.mode() & 0o7777 != row.mode & 0o7777
+    {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let identity = StatIdentity::from_metadata(&before);
-    let mut buffer = vec![0; 256 * 1024];
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let mut buffer = vec![0; crate::hash::CDC_MAX_BYTES as usize];
+    for chunk in &manifest.chunks {
+        let size = usize::try_from(chunk.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let slot = buffer
+            .get_mut(..size)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        file.read_exact(slot)?;
+        counters::add_len(Counter::DestVerifyRead, size);
+        if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
         }
-        counters::add_len(Counter::DestVerifyRead, read);
-        counters::update(
-            &mut hasher,
-            Counter::HashVerifyExisting,
-            buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?,
-        );
     }
-    if *hasher.finalize().as_bytes() != manifest.digest
-        || StatIdentity::from_metadata(&file.metadata()?) != identity
-    {
+    let mut tail = [0_u8; 1];
+    if file.read(&mut tail)? != 0 || StatIdentity::from_metadata(&file.metadata()?) != identity {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     Ok(identity)

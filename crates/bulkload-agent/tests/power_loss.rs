@@ -21,14 +21,15 @@
 //!   the whole source tree, with its modes.
 //!
 //! The store databases are not modelled: a store commit is an
-//! `Event::Commit`, durable once it returns. A source-side store's own files
-//! are foreign to the destination image and are dropped and counted, never
-//! silently.
+//! `Event::Commit`, durable once it returns. Writes outside the destination
+//! image would be foreign, dropped and counted, never silently; since the
+//! source keeps no pack (R-N58) a copy makes none, and the test asserts so.
 //!
 //! Two syscall-order checks cover what the destination image cannot see: the
-//! source pack is sealed before every capture commit (PR #59 review, M3), and
-//! `--durability=strict` seals every destination file and directory with a
-//! full flush (M8).
+//! source writes no content bytes at all, so a capture commit references
+//! nothing that could be lost (the digest-only ledger, R-N58, which replaces
+//! the PR #59 review's M3 pack-seal order), and `--durability=strict` seals
+//! every destination file and directory with a full flush (M8).
 //!
 //! Tests run one at a time (`SERIAL`): the recorder is process-wide.
 
@@ -327,10 +328,9 @@ fn every_power_loss_state_of_a_copy_is_consistent() {
     })
     .unwrap();
     eprintln!("{}", report.summary(&events));
-    assert!(
-        report.foreign > 0,
-        "the source side's store writes are foreign"
-    );
+    // Wire v5 keeps no source pack (R-N58): the source side makes no traced
+    // write at all, so nothing is foreign to the destination image.
+    assert_eq!(report.foreign, 0, "the source side writes no content");
     assert!(
         report.states > report.crash_points,
         "crash points have several states"
@@ -451,14 +451,15 @@ fn strict_mode_seals_every_destination_node_with_a_full_flush() {
     }
 }
 
-/// PR #59 review, M3: the source pack is sealed before every capture commit.
-/// Every pack write (a traced write to a file the trace never created) is
-/// followed, before the next capture commit, by a sync of that file.
+/// R-N58 (formerly PR #59 review, M3, the pack-seal order): the source keeps
+/// no byte pack. Every traced write lands in a file the trace itself created
+/// (a destination temporary), so no capture commit can reference bytes a
+/// power loss could take away; and captures are still committed.
 #[test]
-fn the_source_pack_is_sealed_before_every_capture_commit() {
+fn the_source_writes_no_content_bytes() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     set_durability(Durability::Group);
-    let scratch = Scratch::new("pack-order");
+    let scratch = Scratch::new("ledger-only");
     populate(&scratch.source());
     let (_, events) = traced_copy(&scratch);
     let created: HashSet<NodeId> = events
@@ -470,17 +471,12 @@ fn the_source_pack_is_sealed_before_every_capture_commit() {
             _ => None,
         })
         .collect();
-    let mut unsealed: BTreeMap<(u64, u64), usize> = BTreeMap::new();
     let mut captures = 0;
-    let mut pack_writes = 0;
+    let mut foreign_writes: BTreeMap<(u64, u64), usize> = BTreeMap::new();
     for (index, event) in events.iter().enumerate() {
         match event {
             Event::Write { node, .. } if !created.contains(node) => {
-                pack_writes += 1;
-                unsealed.entry((node.dev, node.ino)).or_insert(index);
-            }
-            Event::Sync { node, kind } if *kind != SyncKind::Kick => {
-                unsealed.remove(&(node.dev, node.ino));
+                foreign_writes.entry((node.dev, node.ino)).or_insert(index);
             }
             Event::Commit { records, .. }
                 if records
@@ -488,14 +484,14 @@ fn the_source_pack_is_sealed_before_every_capture_commit() {
                     .any(|record| matches!(record, CommitRecord::Capture { .. })) =>
             {
                 captures += 1;
-                assert!(
-                    unsealed.is_empty(),
-                    "capture commit at event {index} while pack writes {unsealed:?} are unsealed"
-                );
             }
             _ => {}
         }
     }
-    assert!(pack_writes > 0, "the source pack was written");
+    assert!(
+        foreign_writes.is_empty(),
+        "content written outside the destination's own files: {foreign_writes:?}"
+    );
     assert!(captures > 0, "captures were committed");
+    assert!(!scratch.base.join("source-state/chunks.pack").exists());
 }
