@@ -85,18 +85,49 @@ io-partial-write-alone:
     fi
 
 # W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature, and the R-N88 power-loss harness, which runs the
+# `fault-injection` feature; the R-N88 power-loss harness, which runs the
 # crash-state checker on the syscall trace of a real copy and needs
-# `io-trace`, plus the in-crate R-N119 resume proof (#74 review, B1). CI runs both as the separate `fault-harness` terminal gate, in
-# parallel with the source gate and under its own 15-minute cap (R-N122). The
-# harness builds go to their own target dir, so `target/debug/bulkload-agent`
-# is never replaced by a fault-enabled binary. The feature clippy pass stays in
-# the shared dir: it only type-checks and writes no executables.
+# `io-trace`; and the in-crate directory resume proofs (#74 review B1 and
+# round 2 N1). CI runs all three as the separate `fault-harness` terminal
+# gate, in parallel with the source gate and under its own 15-minute cap
+# (R-N122). The harness builds go to their own target dir, so
+# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
+# The feature clippy pass stays in the shared dir: it only type-checks and
+# writes no executables.
 fault-harness:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings
     cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
     cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss
-    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace --target-dir target/fault materialize::adoption_power_loss
+    cd {{ root }} && {{ just_executable() }} resume-power-loss
+
+# Directory resume power-loss proofs (#74 review B1 and round 2 N1), lib tests
+# that need `io-trace`. A name filter that matches nothing still reports `0
+# passed`, so this recipe fails unless both proofs ran: on a cargo failure, on
+# anything but one `2 passed; 0 failed` result, or when either proof is not
+# among the passing tests (#74 round 2 N2, R-N122).
+resume-power-loss:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    status=0
+    output=$(cargo test -p bulkload-agent --lib --locked --features io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?
+    printf '%s\n' "$output"
+    if [[ $status -ne 0 ]]; then
+        echo "resume-power-loss: cargo test failed with status $status" >&2
+        exit "$status"
+    fi
+    results=$(grep -c '^test result: ' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 2 passed; 0 failed;' <<<"$output" || true)
+    if [[ $results -ne 1 || $passed -ne 1 ]]; then
+        echo "resume-power-loss: expected exactly one '2 passed; 0 failed' result" >&2
+        exit 1
+    fi
+    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit; do
+        if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
+            echo "resume-power-loss: $proof was not among the passing tests" >&2
+            exit 1
+        fi
+    done
 
 # Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
 # current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.

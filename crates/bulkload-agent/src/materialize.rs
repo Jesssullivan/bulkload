@@ -188,6 +188,22 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
+    /// This store's orphaned file temporaries, kept for their chunks and
+    /// removed only when the session finishes (R25: bytes the destination
+    /// already holds are never read from the source again). Every one is
+    /// kept, however many: a session can leave up to a whole committer group
+    /// and queue of sealed, held temporaries unrenamed (#77 round 2, N2). No
+    /// descriptor is held; each is opened by name when read.
+    salvage: Vec<Salvaged>,
+}
+
+/// An orphaned file temporary of this store, renamed to a name of this
+/// session (so a restarted agent with the same pid never collides with it,
+/// #77 round 2, N3) and kept until the session finishes.
+struct Salvaged {
+    parent: Arc<File>,
+    name: CString,
+    rel_path: Vec<u8>,
 }
 
 /// How this invocation created directories (R-N119).
@@ -226,7 +242,56 @@ impl Destination {
             unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
             created: Creation::default(),
+            salvage: Vec::new(),
         })
+    }
+
+    /// How many orphaned file temporaries the sweep has salvaged so far.
+    pub(crate) const fn salvaged(&self) -> usize {
+        self.salvage.len()
+    }
+
+    /// Open the salvaged temporary at `index` read-only, by name, following
+    /// no link; `None` once it is gone or is not a regular file.
+    pub(crate) fn salvaged_file(&self, index: usize) -> Option<File> {
+        let salvaged = self.salvage.get(index)?;
+        open_regular(&salvaged.parent, &salvaged.name).ok()
+    }
+
+    /// Keep every salvaged temporary for a later session: a refused entry
+    /// may hold its only durable copy there (#77 round 2, N4).
+    pub fn keep_salvaged(&mut self) {
+        for salvaged in std::mem::take(&mut self.salvage) {
+            self.swept.left.push(salvaged.rel_path);
+        }
+    }
+
+    /// Remove every salvaged temporary by name, as the sweep would have, and
+    /// seal each directory that lost one. Call once the session's outputs
+    /// are queued: their bytes no longer depend on the temporaries.
+    ///
+    /// # Errors
+    /// Refuses a failed directory seal.
+    pub fn remove_salvaged(&mut self) -> Result<()> {
+        let mut touched: Vec<Arc<File>> = Vec::new();
+        for salvaged in std::mem::take(&mut self.salvage) {
+            match crate::io::sys::unlinkat(&salvaged.parent, &salvaged.name, false) {
+                Ok(()) => {
+                    self.swept.removed += 1;
+                    touched.push(salvaged.parent);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(_) => self.swept.left.push(salvaged.rel_path),
+            }
+        }
+        let mut sealed = std::collections::HashSet::new();
+        for directory in touched {
+            let metadata = directory.metadata()?;
+            if sealed.insert((metadata.dev(), metadata.ino())) {
+                directory.sync_dir_counted()?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove this store's orphaned temporaries from the root. Call only
@@ -414,7 +479,14 @@ impl Destination {
         let metadata = existing.metadata()?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
         let owned = match store.directory_record(key) {
-            Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => true,
+            Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => {
+                // A crash at `directory.after_rename` leaves the rename into
+                // place unsealed. Seal it before any output inside the
+                // directory can commit, or a power loss can keep the output
+                // record and lose the directory's name (#74 round 2, N1).
+                self.seal_entry(parent)?;
+                true
+            }
             // A fallback `mkdirat` whose intent committed but whose binding
             // did not (R-N119): adopt the directory only while it is still
             // exactly what `mkdirat` left, then bind the record to it.
@@ -483,6 +555,8 @@ impl Destination {
     fn sweep(&mut self, directory: &File, rel_dir: &[u8], store: &Store) -> Result<()> {
         let euid = crate::io::sys::effective_uid();
         let mut removed = false;
+        let mut renamed = false;
+        let mut shared: Option<Arc<File>> = None;
         for (name, kind) in temporary_candidates(directory)? {
             let mut rel_path = rel_dir.to_vec();
             if !rel_path.is_empty() {
@@ -514,6 +588,37 @@ impl Destination {
             // once the inode is gone its number may be reused (N3).
             if want_directory {
                 store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
+            } else if stat.nlink == 1 {
+                // An orphan with no other name may hold a whole staged
+                // output: keep it for its chunks and remove it when the
+                // session finishes. It takes a name of this session first,
+                // so no temporary this session stages can collide with it.
+                // A second link to a published output is removed at once;
+                // the output keeps the bytes.
+                let fresh = self.temporary(None)?;
+                let name = match crate::io::publish_noreplace(directory, &name, &fresh) {
+                    Ok(_) => {
+                        renamed = true;
+                        fresh
+                    }
+                    Err(_) => name,
+                };
+                if shared.is_none() {
+                    shared = Some(Arc::new(directory.try_clone()?));
+                }
+                let parent = Arc::clone(shared.as_ref().ok_or(BulkloadRefusal::Io(None))?);
+                // Report the name it now has (#77 round 3, F1).
+                let mut rel_path = rel_dir.to_vec();
+                if !rel_path.is_empty() {
+                    rel_path.push(b'/');
+                }
+                rel_path.extend_from_slice(name.as_bytes());
+                self.salvage.push(Salvaged {
+                    parent,
+                    name,
+                    rel_path,
+                });
+                continue;
             }
             // `unlinkat` removes this one name: without AT_REMOVEDIR never a
             // directory (the inode survives under any other link), with it
@@ -527,7 +632,7 @@ impl Destination {
                 Err(_) => self.swept.left.push(rel_path),
             }
         }
-        if removed {
+        if removed || renamed {
             directory.sync_dir_counted()?;
         }
         Ok(())
@@ -647,17 +752,29 @@ impl Destination {
     /// Refuses an unsafe ancestor or a failed create.
     pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
         let (parent, leaf) = self.shared_parent(&row.rel_path)?;
-        let temporary = self.temporary(None)?;
-        let file = File::from(crate::io::sys::create_excl_at(
-            parent.as_fd(),
-            &temporary,
-            0o600,
-        )?);
+        // A name of this pid and counter can exist already, left by an
+        // earlier agent that had the same pid (a container's pid 1): take
+        // the next name rather than refusing the file (#77 round 2, N3).
+        let mut attempts = 0;
+        let (temporary, file) = loop {
+            let temporary = self.temporary(None)?;
+            match crate::io::sys::create_excl_at(parent.as_fd(), &temporary, 0o600) {
+                Ok(file) => break (temporary, File::from(file)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempts < STAGE_ATTEMPTS =>
+                {
+                    attempts += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         Ok(StagedFile {
             parent,
             temporary,
             leaf,
             file: Arc::new(file),
+            sealed: false,
         })
     }
 
@@ -720,9 +837,26 @@ pub(crate) struct StagedFile {
     temporary: CString,
     leaf: CString,
     file: Arc<File>,
+    /// Sealed by [`StagedFile::seal`] already; publication does not seal it
+    /// again.
+    sealed: bool,
 }
 
 impl StagedFile {
+    /// Seal the complete data under the temporary name, once. A sealed
+    /// temporary is what the destination reports as held: a crash before its
+    /// rename leaves it for the next session to salvage.
+    ///
+    /// # Errors
+    /// Returns the failed seal; the temporary is left for the caller.
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        if !self.sealed {
+            crate::io::durable::seal_file(&self.file)?;
+            self.sealed = true;
+            fault_point!(MaterializeAfterTempSeal);
+        }
+        Ok(())
+    }
     /// The open temporary file. It stays readable after publication.
     pub(crate) const fn file(&self) -> &Arc<File> {
         &self.file
@@ -738,12 +872,11 @@ impl StagedFile {
 
     /// Seal the data, then rename into place without replacing anything.
     /// The identity is taken from the open file after the rename.
-    fn publish(self) -> Result<(StatIdentity, Arc<File>)> {
-        if let Err(error) = crate::io::durable::seal_file(&self.file) {
+    fn publish(mut self) -> Result<(StatIdentity, Arc<File>)> {
+        if let Err(error) = self.seal() {
             let _ = unlink(&self.parent, &self.temporary);
-            return Err(error.into());
+            return Err(error);
         }
-        fault_point!(MaterializeAfterTempSeal);
         if let Err(error) = crate::io::publish_noreplace(&self.parent, &self.temporary, &self.leaf)
         {
             let _ = unlink(&self.parent, &self.temporary);
@@ -774,6 +907,15 @@ fn unlink(parent: &File, name: &CString) -> Result<()> {
     // Without AT_REMOVEDIR this removes only a non-directory entry.
     Ok(crate::io::sys::unlinkat(parent, name, false)?)
 }
+
+/// The serial the next temporary name of this process takes.
+#[cfg(test)]
+pub(crate) fn next_temporary_serial() -> u64 {
+    NEXT_TEMPORARY.load(Ordering::Relaxed)
+}
+
+/// Names a stage tries before an occupied name is a refusal.
+const STAGE_ATTEMPTS: u32 = 64;
 
 /// One destination output for a group commit.
 pub(crate) enum Publication {
@@ -808,7 +950,13 @@ pub(crate) struct PublishSink {
     /// Device of the store. Its commit's full flush drains only this device.
     store_device: u64,
     outcomes: Vec<(Vec<u8>, Result<()>)>,
+    /// Told each group's outcomes, by relative path, once the group's
+    /// commit has returned: what the receiving side reports as held.
+    notify: Option<std::sync::mpsc::Sender<GroupOutcomes>>,
 }
+
+/// One group's outcomes by relative path: `true` when committed.
+pub(crate) type GroupOutcomes = Vec<(Vec<u8>, bool)>;
 
 impl PublishSink {
     /// `publisher` holds the destination store's single-writer guard.
@@ -821,7 +969,14 @@ impl PublishSink {
             publisher,
             store_device,
             outcomes: Vec::new(),
+            notify: None,
         })
+    }
+
+    /// Report every group's outcomes on `notify` after its commit.
+    pub(crate) fn with_notify(mut self, notify: std::sync::mpsc::Sender<GroupOutcomes>) -> Self {
+        self.notify = Some(notify);
+        self
     }
 
     /// Treat the store as if it lived on `device` (tests of the
@@ -888,6 +1043,7 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 
     fn commit(&mut self, items: Vec<Publication>) {
+        let reported = self.outcomes.len();
         #[cfg(feature = "fault-injection")]
         let _note = {
             let ids: Vec<usize> = (0..items.len()).collect();
@@ -939,6 +1095,18 @@ impl crate::io::durable::GroupSink for PublishSink {
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
+        if let Some(notify) = &self.notify {
+            let group = self
+                .outcomes
+                .get(reported..)
+                .unwrap_or_default()
+                .iter()
+                .map(|(rel_path, outcome)| (rel_path.clone(), outcome.is_ok()))
+                .collect();
+            // The receiving side may have stopped; its outcomes still reach
+            // `finish`.
+            let _ = notify.send(group);
+        }
     }
 
     fn failure(&self) -> Option<BulkloadRefusal> {
@@ -950,7 +1118,10 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 }
 
-/// Verify an existing output byte-for-byte against `manifest` before adopting it.
+/// Verify an existing output byte-for-byte against `manifest` before adopting
+/// it: every chunk, read at its place, hashes to its manifest digest, and the
+/// chunks cover the file exactly. The manifest's root is checked by the
+/// caller, so this is equivalent to recomputing `manifest_root`.
 ///
 /// Only the adopt path uses this; freshly written outputs are built from
 /// verified chunks and are not read back.
@@ -965,27 +1136,27 @@ pub(crate) fn verify_existing(
     let mut file = file;
     file.rewind()?;
     let before = file.metadata()?;
-    if before.len() != row.size || before.mode() & 0o7777 != row.mode & 0o7777 {
+    if before.len() != row.size
+        || manifest.size() != Some(row.size)
+        || before.mode() & 0o7777 != row.mode & 0o7777
+    {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let identity = StatIdentity::from_metadata(&before);
-    let mut buffer = vec![0; 256 * 1024];
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let mut buffer = vec![0; crate::hash::CDC_MAX_BYTES as usize];
+    for chunk in &manifest.chunks {
+        let size = usize::try_from(chunk.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let slot = buffer
+            .get_mut(..size)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        file.read_exact(slot)?;
+        counters::add_len(Counter::DestVerifyRead, size);
+        if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
         }
-        counters::add_len(Counter::DestVerifyRead, read);
-        counters::update(
-            &mut hasher,
-            Counter::HashVerifyExisting,
-            buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?,
-        );
     }
-    if *hasher.finalize().as_bytes() != manifest.digest
-        || StatIdentity::from_metadata(&file.metadata()?) != identity
-    {
+    let mut tail = [0_u8; 1];
+    if file.read(&mut tail)? != 0 || StatIdentity::from_metadata(&file.metadata()?) != identity {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     Ok(identity)
