@@ -3391,6 +3391,25 @@ fn pr75_r3_m1_an_unrelated_carry_ref_change_never_wedges_a_resume() {
     assert_clean(&pair.destination, "r3-m1-unrelated");
 }
 
+/// Finish `session`; a finish refused `repository_fenced` (#75 r4 N3: the
+/// fence's wait is bounded) resumes and tries again.
+fn finish_retrying<'t>(
+    target: &'t Target,
+    mut session: Ingest<'t>,
+    journals: &JournalStore,
+    pack_id: &str,
+) -> IngestReceipt {
+    loop {
+        match session.finish() {
+            Ok(receipt) => return receipt,
+            Err(refused) if refused.reason == Some("repository_fenced") => {
+                session = Ingest::resume(target, journals, pack_id, None).unwrap();
+            }
+            Err(refused) => panic!("finish refused: {refused}"),
+        }
+    }
+}
+
 /// r3 M1: two sessions of different plans finishing into one repository at
 /// once are fenced; both publish, each with equal digests, and neither
 /// sees the other's publication as a moved ref.
@@ -3424,11 +3443,10 @@ fn pr75_r3_m1_concurrent_finishes_into_one_repository_both_publish() {
         b.receive(index, &mut &pack[..]).unwrap();
     }
     let (ra, rb) = std::thread::scope(|scope| {
-        let ta = scope.spawn(move || a.finish());
-        let tb = scope.spawn(move || b.finish());
+        let ta = scope.spawn(|| finish_retrying(&target, a, &journals_a, first.plan.pack_id()));
+        let tb = scope.spawn(|| finish_retrying(&target, b, &journals_b, other.pack_id()));
         (ta.join().unwrap(), tb.join().unwrap())
     });
-    let (ra, rb) = (ra.unwrap(), rb.unwrap());
     assert_eq!(ra.carry_refs_before, ra.carry_refs_after);
     assert_eq!(rb.carry_refs_before, rb.carry_refs_after);
     assert_eq!(
@@ -3600,6 +3618,157 @@ fn pr75_r2_n5_a_done_session_returns_its_receipt_without_republishing() {
         .unwrap();
     assert_eq!(again, receipt);
     assert_eq!(rev(&pair.destination, name), pair.held, "left as moved");
+}
+
+/// r4 N1 (reviewer probe 1): an abandoned journal, then six threads opening
+/// the same plan at once. The stale journal is emptied in place under a
+/// lock proven to be on the file at its name, so exactly one session is
+/// live and every other open refuses `JOURNAL_OWNERSHIP_CONFLICT` (never a
+/// raw I/O error). The live session's acked segments are all journaled:
+/// a resume continues at the right `next_segment` and re-sends nothing.
+#[test]
+fn pr75_r4_n1_contending_opens_yield_exactly_one_live_session() {
+    for run in 0..4 {
+        let pair = pair(&format!("pr75-r4-n1-contend-{run}"), 64 * 1024);
+        assert!(pair.plan.segments() >= 3);
+        let state = pair.scratch.state("destination-state");
+        let journals = JournalStore::open(&state).unwrap();
+        let target = Target::probe(&pair.destination, None).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        let first = pair.segment(0);
+        session.receive(0, &mut &first[..]).unwrap();
+        session.abandon("test_abandoned").unwrap();
+
+        let opened: Vec<_> = std::thread::scope(|scope| {
+            // Every thread is spawned before any is joined, so the opens
+            // contend; the collect is what makes that so.
+            #[allow(clippy::needless_collect)]
+            let threads: Vec<_> = (0..6)
+                .map(|_| scope.spawn(|| Ingest::open(&target, &journals, pair.ingest_plan(), None)))
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let mut live = Vec::new();
+        for outcome in opened {
+            match outcome {
+                Ok(session) => live.push(session),
+                Err(refused) => assert_eq!(
+                    refused.refusal,
+                    BulkloadRefusal::JournalOwnershipConflict,
+                    "run {run}: {refused:?}"
+                ),
+            }
+        }
+        assert_eq!(live.len(), 1, "run {run}: exactly one live session");
+        let mut session = live.pop().unwrap();
+        assert_eq!(session.next_segment(), 0);
+        for index in 0..2 {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+        let acked = quarantine_entries(&pair);
+        drop(session);
+        let mut session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+        assert_eq!(
+            session.next_segment(),
+            2,
+            "run {run}: no acked segment lost"
+        );
+        assert_eq!(quarantine_entries(&pair), acked, "run {run}");
+        for index in 2..pair.plan.segments() {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+        session.finish().unwrap();
+        assert_clean(&pair.destination, "r4-n1-contend");
+    }
+}
+
+/// r4 N1 (reviewer probe 2): the journal's name is pointed at another file
+/// while session A is live (an empty file, or a copy of A's journal). A
+/// second open from the same state dir locks the new file, but A holds its
+/// quarantine's lock, so the open refuses `JOURNAL_OWNERSHIP_CONFLICT`
+/// before discarding or sweeping anything; A's acked pack, idx, keep and
+/// rev files survive, and A finishes.
+#[test]
+fn pr75_r4_n1_a_replaced_journal_name_never_wipes_a_live_sessions_packs() {
+    for copy in [false, true] {
+        let pair = pair(&format!("pr75-r4-n1-replaced-{copy}"), 64 * 1024);
+        let state = pair.scratch.state("destination-state");
+        let journals = JournalStore::open(&state).unwrap();
+        let target = Target::probe(&pair.destination, None).unwrap();
+        let mut a = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        let first = pair.segment(0);
+        a.receive(0, &mut &first[..]).unwrap();
+        let acked = quarantine_entries(&pair);
+        assert!(
+            acked
+                .iter()
+                .any(|name| Path::new(name).extension().is_some_and(|x| x == "keep")),
+            "{acked:?}"
+        );
+        let journal = journal_path(&pair, &state);
+        let other = state.join("git-carry-v2/ingest/replacement");
+        if copy {
+            fs::copy(&journal, &other).unwrap();
+        } else {
+            fs::write(&other, b"").unwrap();
+        }
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::rename(&other, &journal).unwrap();
+        let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+        assert_eq!(
+            refused.refusal,
+            BulkloadRefusal::JournalOwnershipConflict,
+            "copy={copy}: {refused:?}"
+        );
+        assert_eq!(refused.reason, Some("quarantine_held"), "copy={copy}");
+        assert_eq!(quarantine_entries(&pair), acked, "copy={copy}: A's packs");
+        for index in 1..pair.plan.segments() {
+            let segment = pair.segment(index);
+            a.receive(index, &mut &segment[..]).unwrap();
+        }
+        a.finish().unwrap();
+        assert!(published(&pair));
+    }
+}
+
+/// r4 N3: the repository fence is a lock file, and its wait is bounded: a
+/// finish while another holder keeps it refuses `JOURNAL_OWNERSHIP_CONFLICT`
+/// / `repository_fenced` in about two seconds instead of hanging, and
+/// finishes once it is released.
+#[test]
+fn pr75_r4_n3_a_held_fence_refuses_in_bounded_time() {
+    use std::os::unix::io::AsRawFd as _;
+    let pair = pair("pr75-r4-n3", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let session = received(&pair, &target, &journals);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(pair.destination.join("bulkload-ingest.lock"))
+        .unwrap();
+    // SAFETY: `lock` is an open descriptor; flock takes no pointers.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let started = std::time::Instant::now();
+    let refused = session.finish().unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+    assert_eq!(refused.reason, Some("repository_fenced"));
+    assert!(!published(&pair));
+    drop(lock);
+    Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert!(published(&pair));
 }
 
 // ---------------------------------------------------------------------------

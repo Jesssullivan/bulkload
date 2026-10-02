@@ -280,13 +280,22 @@ pub(super) enum Found {
 
 impl Journal {
     /// Open (creating when absent) and lock `<pack_id>.journal`. A journal
-    /// whose plan block never sealed, or that was abandoned, is removed and
-    /// a fresh one created; a torn final line is cut off.
+    /// whose plan block never sealed, or that was abandoned, is truncated in
+    /// place (never unlinked and recreated: #75 r4 N1) and returned as
+    /// [`Found::Fresh`]; a torn final line is cut off.
+    ///
+    /// #75 r4 N1: the lock is proven exclusive before anything is read. After
+    /// `flock`, the locked descriptor must still be the file at the name
+    /// (same device and inode); one whose name was removed or now names
+    /// another file is dropped and the open retried. So two openers never
+    /// both believe they own a journal, and a loser refuses
+    /// `JOURNAL_OWNERSHIP_CONFLICT`, never a raw I/O error.
     ///
     /// # Errors
-    /// `JOURNAL_OWNERSHIP_CONFLICT` when another session holds the lock,
-    /// `SCHEMA_MISMATCH` for a complete line that does not parse or check,
-    /// the private-file checks, and any I/O failure.
+    /// `JOURNAL_OWNERSHIP_CONFLICT` when another session holds the lock (or
+    /// the name keeps changing under the open), `SCHEMA_MISMATCH` for a
+    /// complete line that does not parse or check, the private-file checks,
+    /// and any I/O failure.
     pub(super) fn open(store: &JournalStore, pack_id: &str) -> crate::Result<Found> {
         // #75 r1 B2: the name is built from `pack_id`, so only a plan id
         // (64 lowercase hex digits) may name a journal.
@@ -295,20 +304,7 @@ impl Journal {
         }
         let directory = store.directory(true)?.ok_or(BulkloadRefusal::Io(None))?;
         let name = cstring(format!("{pack_id}.journal").as_bytes())?;
-        let file = match open_rw(&directory, &name) {
-            Ok(file) => file,
-            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
-                return Self::create(directory, name).map(Found::Fresh);
-            }
-            Err(error) => return Err(error),
-        };
-        private_file(&file)?;
-        let journal = Self {
-            file,
-            directory,
-            name,
-        };
-        journal.lock()?;
+        let journal = Self::claim(directory, name)?;
         let records = journal.read()?;
         let sealed = records
             .iter()
@@ -320,46 +316,45 @@ impl Journal {
             return Ok(Found::Existing(journal, records));
         }
         // No plan was ever sealed, or the session was abandoned: nothing it
-        // recorded is still in force. Remove it and start again.
-        journal.remove()?;
-        let Self {
-            directory, name, ..
-        } = journal;
-        Self::create(directory, name).map(Found::Fresh)
+        // recorded is still in force. Empty it in place, under the lock.
+        journal.file.set_len(0)?;
+        seal_file(&journal.file)?;
+        Ok(Found::Fresh(journal))
     }
 
-    fn create(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
-        let file = create_private(&directory, &name)?;
-        seal_dir(&directory)?;
-        let journal = Self {
-            file,
-            directory,
-            name,
-        };
-        journal.lock()?;
-        Ok(journal)
-    }
-
-    /// Take the exclusive lock, retrying briefly: a child that another
-    /// thread of this process spawns shares every open file description
-    /// until its `exec` closes the close-on-exec ones, so a lock just
-    /// released by a closed session can look held for that instant. A
-    /// session that really holds it for the whole window refuses
-    /// `JOURNAL_OWNERSHIP_CONFLICT`.
-    fn lock(&self) -> crate::Result<()> {
-        const ATTEMPTS: u32 = 100;
-        for attempt in 1..=ATTEMPTS {
-            // SAFETY: the descriptor is open for the life of `self.file`.
-            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(());
+    /// Open or create the file at `name` and lock it, until the locked
+    /// descriptor is the file the name holds.
+    fn claim(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
+        const ATTEMPTS: u32 = 50;
+        for _ in 0..ATTEMPTS {
+            let file = match open_rw(&directory, &name) {
+                Ok(file) => file,
+                Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
+                    match create_private(&directory, &name) {
+                        Ok(file) => {
+                            seal_dir(&directory)?;
+                            file
+                        }
+                        // Another opener created it first: open theirs.
+                        Err(BulkloadRefusal::Io(Some(libc::EEXIST))) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            private_file(&file)?;
+            if !lock_exclusive(&file)? {
+                return Err(BulkloadRefusal::JournalOwnershipConflict);
             }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                return Err(error.into());
+            if names(&directory, &name, &file)? {
+                return Ok(Self {
+                    file,
+                    directory,
+                    name,
+                });
             }
-            if attempt < ATTEMPTS {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            // The name was removed or replaced while this open waited: the
+            // lock is on a file no session will use. Drop it and retry.
         }
         Err(BulkloadRefusal::JournalOwnershipConflict)
     }
@@ -425,7 +420,13 @@ impl Journal {
     }
 
     /// Remove the journal file (a session that never sealed a plan).
+    ///
+    /// #75 r4 N1: only while the name still holds this session's file; one
+    /// that names another file is left alone.
     pub(super) fn remove(&self) -> crate::Result<()> {
+        if !self.owned()? {
+            return Ok(());
+        }
         // SAFETY: the name is NUL-terminated and relative to the open
         // journal directory.
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) } != 0 {
@@ -434,6 +435,66 @@ impl Journal {
         seal_dir(&self.directory)?;
         Ok(())
     }
+
+    /// Whether the name still holds this session's file (#75 r4 N1).
+    pub(super) fn owned(&self) -> crate::Result<bool> {
+        names(&self.directory, &self.name, &self.file)
+    }
+}
+
+/// Take an exclusive `flock` on `file`, retrying for about two seconds: a
+/// child that another thread of this process spawns shares every open file
+/// description until its `exec` closes the close-on-exec ones, so a lock
+/// just released can look held for that instant. `false` when it stayed
+/// held for the whole window.
+pub(super) fn lock_exclusive(file: &File) -> crate::Result<bool> {
+    const ATTEMPTS: u32 = 100;
+    for attempt in 1..=ATTEMPTS {
+        // SAFETY: `file` is open for the duration of the call; flock takes
+        // no pointers.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK | libc::EINTR) => {}
+            _ => return Err(error.into()),
+        }
+        if attempt < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `name` in `directory` (not followed) is `file`: same device and
+/// inode. `false` when the name is gone.
+fn names(directory: &File, name: &std::ffi::CString, file: &File) -> crate::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    let mut at = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `directory` is open, `name` NUL-terminated, and `at` is valid
+    // writable storage for one `stat`.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            at.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    // SAFETY: `fstatat` succeeded, so it filled `at`.
+    let at = unsafe { at.assume_init() };
+    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+    let same = at.st_dev as u64 == held.dev() && at.st_ino as u64 == held.ino();
+    Ok(same)
 }
 
 /// Open an existing journal for reading and appending, never following a

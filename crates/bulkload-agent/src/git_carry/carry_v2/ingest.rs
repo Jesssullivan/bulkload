@@ -29,8 +29,9 @@
 //!    (Git finds a pack by its `.idx`) are renamed into `objects/pack` without
 //!    replacement; `objects/pack` is sealed, the quarantine removed, and
 //!    `objects/` sealed.
-//! 6. **Publish**: under a per-repository fence (a `flock` on the common
-//!    dir, #75 r3 M1), one `update-ref --stdin -z` transaction outside the
+//! 6. **Publish**: under a per-repository fence (a bounded `flock` on
+//!    `<common>/bulkload-ingest.lock`, #75 r3 M1, r4 N3), one
+//!    `update-ref --stdin -z` transaction outside the
 //!    quarantine. Each update is a `create` when the ref is absent and a
 //!    `verify` when it already names the oid; any other value refuses
 //!    `GIT_DESTINATION_OCCUPIED`. No existing ref is ever moved or deleted, so
@@ -69,7 +70,7 @@ use super::super::estimate::{
     child_refusal, cstring, drain, hardened, has_control, local_probe, run_probe, Refused,
     Repository,
 };
-use super::journal::{plan_digest, Found, Journal, JournalStore, Record};
+use super::journal::{lock_exclusive, plan_digest, Found, Journal, JournalStore, Record};
 use super::{is_oid, lines, overlap, run_child, Offer, Outcome, PackPlan, StderrStore};
 use crate::durable::{seal_dir, seal_file};
 use crate::BulkloadRefusal;
@@ -204,22 +205,51 @@ impl Target {
         command
     }
 
-    /// #75 r3 M1: an exclusive `flock` on the repository's common dir, held
-    /// by a finish or a post-migration abandon until the returned descriptor
-    /// closes, so two ingests into one repository never publish at once.
-    fn fence(&self) -> crate::Result<File> {
+    /// #75 r3 M1: an exclusive `flock` held by a finish or an abandon until
+    /// the returned descriptor closes, so two ingests into one repository
+    /// never publish at once.
+    ///
+    /// #75 r4 N3: it is taken on a dedicated lock file,
+    /// `<common>/bulkload-ingest.lock` (created 0600, opened read-write,
+    /// never followed, never removed), not on the directory: `flock` on NFS
+    /// is emulated with `fcntl` locks, which need a descriptor open for
+    /// writing. The wait is bounded like the journal lock's (about two
+    /// seconds); a fence held longer (another finish, or a hung git child)
+    /// refuses `JOURNAL_OWNERSHIP_CONFLICT` / `repository_fenced`, and the
+    /// caller retries later.
+    fn fence(&self) -> Outcome<File> {
         let common = open_dir(&self.common)?;
-        loop {
-            // SAFETY: `common` is an open descriptor for the life of this
-            // call; flock takes no pointers.
-            if unsafe { libc::flock(common.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(common);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                return Err(error.into());
-            }
+        let name = cstring(b"bulkload-ingest.lock")?;
+        // SAFETY: `common` is an open directory, `name` NUL-terminated, and
+        // the mode accompanies O_CREAT; O_NONBLOCK keeps a planted FIFO from
+        // blocking the open.
+        let fd = unsafe {
+            libc::openat(
+                common.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(BulkloadRefusal::from(std::io::Error::last_os_error()).into());
         }
+        // SAFETY: `fd` was just opened and is owned by nothing else.
+        let lock = unsafe { File::from_raw_fd(fd) };
+        if !lock.metadata()?.is_file() {
+            return Err(BulkloadRefusal::GitInventoryMalformed.into());
+        }
+        if !lock_exclusive(&lock)? {
+            return Err(Refused::because(
+                BulkloadRefusal::JournalOwnershipConflict,
+                "repository_fenced",
+            ));
+        }
+        Ok(lock)
     }
 
     /// [`Target::git`] inside the quarantine `dir`: new objects go there,
@@ -534,6 +564,10 @@ pub struct Ingest<'a> {
     carry: Option<(String, String)>,
     /// `incoming-bulkload-<pack_id>-<state key>` (#75 r2 N4).
     quarantine: String,
+    /// The quarantine directory, held under an exclusive `flock` for as long
+    /// as this session lives (#75 r4 N1): no other open discards or sweeps
+    /// it, whatever happened to the journal's name.
+    claim: Option<File>,
     store: Option<&'a StderrStore>,
 }
 
@@ -613,14 +647,16 @@ impl<'a> Ingest<'a> {
         // was removed and never recreated (a crash or ENOSPC in between), or
         // a lost state dir's recreated at the same path. Only a session
         // holding this journal's lock may use it, and this one does, so it
-        // is discarded, never adopted.
-        discard_quarantine(&target.objects, &quarantine)?;
+        // is discarded, never adopted. #75 r4 N1: only once its own `flock`
+        // is taken: a live session holds it, so a session whose journal name
+        // was replaced under it keeps its packs and this open refuses.
+        discard_quarantine(&target.objects, &quarantine, None)?;
         let Some(plan) = plan else {
             // A resume found nothing sealed; leave no empty journal.
             journal.remove()?;
             return Err(BulkloadRefusal::SealedObjectMissing.into());
         };
-        let session = Self {
+        let mut session = Self {
             target,
             plan,
             journal,
@@ -628,6 +664,7 @@ impl<'a> Ingest<'a> {
             stage: Stage::Receiving,
             carry: None,
             quarantine,
+            claim: None,
             store,
         };
         // A refusal here leaves nothing: no plan, no quarantine, no
@@ -674,9 +711,13 @@ impl<'a> Ingest<'a> {
             stage: Stage::Receiving,
             carry: None,
             quarantine,
+            claim: None,
             store,
         };
         session.replay(records.get(start..).unwrap_or_default())?;
+        // #75 r4 N1: hold the quarantine before sweeping, migrating or
+        // discarding it.
+        session.claim = claim_quarantine(&target.objects, &session.quarantine)?;
         if session.stage != Stage::Receiving {
             return Ok(session);
         }
@@ -684,6 +725,9 @@ impl<'a> Ingest<'a> {
         if session.acks.is_empty() {
             // The plan sealed; the quarantine may not have been made yet.
             session.quarantine(true)?;
+            if session.claim.is_none() {
+                session.claim = claim_quarantine(&target.objects, &session.quarantine)?;
+            }
         } else if session.lost()? {
             session.abandon_journaled("quarantine_lost")?;
             drop(session);
@@ -761,7 +805,7 @@ impl<'a> Ingest<'a> {
 
     /// Create the quarantine and its `pack/` for a new session, refusing
     /// `GIT_DESTINATION_OCCUPIED` if the name already exists (#75 r1 B1).
-    fn make_quarantine(&self) -> Outcome<()> {
+    fn make_quarantine(&mut self) -> Outcome<()> {
         let objects = open_dir(&self.target.objects)?;
         let name = cstring(self.quarantine.as_bytes())?;
         // SAFETY: `objects` is an open directory and `name` NUL-terminated.
@@ -774,6 +818,12 @@ impl<'a> Ingest<'a> {
                 ));
             }
             return Err(BulkloadRefusal::from(error).into());
+        }
+        self.claim = claim_quarantine(&self.target.objects, &self.quarantine)?;
+        if self.claim.is_none() {
+            // Removed between `mkdirat` and the claim: another open is
+            // racing this one.
+            return Err(BulkloadRefusal::JournalOwnershipConflict.into());
         }
         self.quarantine(true)?;
         Ok(())
@@ -1123,14 +1173,14 @@ impl<'a> Ingest<'a> {
     /// the next open discards what is left; a torn
     /// `abandoned` line leaves a session whose quarantine is whole or
     /// partly gone, which resume abandons again.
-    fn abandon_journaled(&self, reason: &'static str) -> crate::Result<()> {
+    fn abandon_journaled(&self, reason: &'static str) -> Outcome<()> {
         self.journal
             .append(&[Record::Abandoned(reason.to_owned())])?;
         self.discard_quarantine()
     }
 
-    fn discard_quarantine(&self) -> crate::Result<()> {
-        discard_quarantine(&self.target.objects, &self.quarantine)
+    fn discard_quarantine(&self) -> Outcome<()> {
+        discard_quarantine(&self.target.objects, &self.quarantine, self.claim.as_ref())
     }
 
     /// Finish: connectivity, migration, the ref transaction and the keeps,
@@ -1240,7 +1290,7 @@ impl<'a> Ingest<'a> {
     /// Move every journaled pack into `objects/pack`, `.keep` first and
     /// `.idx` last, without replacing anything; then seal `objects/pack`,
     /// remove the quarantine and seal `objects/`.
-    fn migrate(&self) -> crate::Result<()> {
+    fn migrate(&self) -> Outcome<()> {
         let objects = open_dir(&self.target.objects)?;
         let target = open_dir_at(&objects, &cstring(b"pack")?)?;
         let from = self.quarantine(false)?;
@@ -1263,10 +1313,10 @@ impl<'a> Ingest<'a> {
                     Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
                         let present = open_file_at(&target, &name).is_ok();
                         if !present && extension != "rev" {
-                            return Err(BulkloadRefusal::SealedObjectMissing);
+                            return Err(BulkloadRefusal::SealedObjectMissing.into());
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
@@ -1657,30 +1707,60 @@ fn index_pack(
     Ok((hash, bytes, blake3))
 }
 
+/// Open the quarantine `name` under `objects` and take its exclusive
+/// `flock` (#75 r4 N1); `None` when there is none. The lock stays held while
+/// the returned descriptor is open.
+///
+/// # Errors
+/// `JOURNAL_OWNERSHIP_CONFLICT` / `quarantine_held` while another session
+/// holds it; I/O failures.
+fn claim_quarantine(objects: &Path, name: &str) -> Outcome<Option<File>> {
+    let objects = open_dir(objects)?;
+    let quarantine = match open_dir_at(&objects, &cstring(name.as_bytes())?) {
+        Ok(quarantine) => quarantine,
+        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !lock_exclusive(&quarantine)? {
+        return Err(Refused::because(
+            BulkloadRefusal::JournalOwnershipConflict,
+            "quarantine_held",
+        ));
+    }
+    Ok(Some(quarantine))
+}
+
 /// Remove the quarantine `name` under `objects`: every file in its `pack/`,
 /// then `pack/` and the quarantine; then seal `objects/`. Any part already
 /// gone is skipped, so a discard cut short is finished by the next one.
-fn discard_quarantine(objects: &Path, name: &str) -> crate::Result<()> {
+/// `held` is the caller's claim on it; without one the quarantine is
+/// claimed first, and one another session holds refuses (#75 r4 N1).
+fn discard_quarantine(objects: &Path, name: &str, held: Option<&File>) -> Outcome<()> {
+    let claimed;
+    let quarantine = match held {
+        Some(held) => held,
+        None => match claim_quarantine(objects, name)? {
+            Some(quarantine) => {
+                claimed = quarantine;
+                &claimed
+            }
+            None => return Ok(()),
+        },
+    };
     let objects = open_dir(objects)?;
     let name = cstring(name.as_bytes())?;
-    let quarantine = match open_dir_at(&objects, &name) {
-        Ok(quarantine) => quarantine,
-        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => return Ok(()),
-        Err(error) => return Err(error),
-    };
     let pack = cstring(b"pack")?;
-    match open_dir_at(&quarantine, &pack) {
+    match open_dir_at(quarantine, &pack) {
         Ok(directory) => {
             for entry in entries(&directory)? {
                 unlink_at(&directory, &cstring(&entry)?)?;
             }
             drop(directory);
-            remove_dir_at(&quarantine, &pack)?;
+            remove_dir_at(quarantine, &pack)?;
         }
         Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
-    drop(quarantine);
     remove_dir_at(&objects, &name)?;
     seal_dir(&objects)?;
     Ok(())
