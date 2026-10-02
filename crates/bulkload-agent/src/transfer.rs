@@ -1448,7 +1448,20 @@ struct Inbound<'a, W> {
     granted: u64,
     /// Received payload bytes not yet returned as credit.
     consumed: u64,
+    /// OI-1001-Q2 space preflight: payload bytes of entries decided `Send` or
+    /// `WantManifest` whose `Held` is not yet sent, by entry, and their sum.
+    reserved: HashMap<u64, u64>,
+    reserved_bytes: u64,
+    /// The destination filesystem as last probed; `None` after a group
+    /// commit, so the next admission sees the committed bytes.
+    space: Option<crate::space::Space>,
+    /// Bytes admitted since the last probe.
+    since_probe: u64,
 }
+
+/// Re-probe the destination filesystem after admitting this many bytes,
+/// even without a group commit in between.
+const SPACE_REPROBE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Receive an ordinary-file carry without replacing divergent outputs.
 ///
@@ -1517,6 +1530,10 @@ pub fn receive<R: Read, W: Write>(
         walk_done: false,
         granted: CREDIT_WINDOW,
         consumed: 0,
+        reserved: HashMap::new(),
+        reserved_bytes: 0,
+        space: None,
+        since_probe: 0,
     };
     let source_bytes_read = receiver.run(input)?;
     let Inbound {
@@ -1642,6 +1659,16 @@ impl<W: Write> Inbound<'_, W> {
             _ => Err(BulkloadRefusal::FieldDomainViolation),
         };
         REUSE_CENSUS_NS.fetch_add(elapsed_ns(census_started), Ordering::Relaxed);
+        // OI-1001-Q2: an entry whose bytes would take the destination under
+        // its free-space floor is refused as a value, before any of its
+        // content is requested. The session continues and stays resumable;
+        // nothing durable is read again (R25).
+        let decided = decided.and_then(|decision| match decision {
+            Decision::Send | Decision::WantManifest => {
+                self.admit(entry, row.size).map(|()| decision)
+            }
+            other => Ok(other),
+        });
         let decision = match decided {
             Ok(decision) => decision,
             Err(refusal) => {
@@ -1667,8 +1694,45 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    /// Reserve an entry's bytes against the destination's free-space floor
+    /// (OI-1001-Q2). The cached probe already counts every committed byte;
+    /// the reservation counts every byte decided and not yet `Held`, so a
+    /// partly staged entry is counted twice: conservative, never short.
+    fn admit(&mut self, entry: u64, size: u64) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let space = match self.space {
+            Some(space) if self.since_probe < SPACE_REPROBE_BYTES => space,
+            _ => {
+                let space = crate::space::probe(self.target.path())?;
+                self.space = Some(space);
+                self.since_probe = 0;
+                space
+            }
+        };
+        crate::space::check(
+            self.reserved_bytes.saturating_add(size),
+            space,
+            crate::space::min_free_percent(),
+        )?;
+        self.reserved.insert(entry, size);
+        self.reserved_bytes = self.reserved_bytes.saturating_add(size);
+        self.since_probe = self.since_probe.saturating_add(size);
+        Ok(())
+    }
+
+    /// An entry left the decided-not-Held set: its bytes are durable, or it
+    /// will write none.
+    fn release(&mut self, entry: u64) {
+        if let Some(size) = self.reserved.remove(&entry) {
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(size);
+        }
+    }
+
     /// The source refused an entry's capture after any of its data.
     fn refused(&mut self, entry: u64, rel_path: &[u8], code: String) -> Result<()> {
+        self.release(entry);
         let incoming = self
             .incoming
             .remove(&entry)
@@ -1871,6 +1935,7 @@ impl<W: Write> Inbound<'_, W> {
             }
             Err(refusal) => {
                 self.refuse(rel_path, &refusal);
+                self.release(entry);
                 write_control(self.output, &Control::Held { entry, held: false })?;
             }
         }
@@ -1882,6 +1947,8 @@ impl<W: Write> Inbound<'_, W> {
     /// Send `Held` for every entry whose group commit has returned.
     fn answer_held(&mut self) -> Result<()> {
         while let Ok(group) = self.committed.try_recv() {
+            // A group committed: the next admission re-probes (OI-1001-Q2).
+            self.space = None;
             for (rel_path, held) in group {
                 let Some(entry) = self.pending_held.remove(&rel_path) else {
                     continue;
@@ -1889,6 +1956,7 @@ impl<W: Write> Inbound<'_, W> {
                 if !held {
                     self.destination_refused = true;
                 }
+                self.release(entry);
                 write_control(self.output, &Control::Held { entry, held })?;
             }
         }

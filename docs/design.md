@@ -11,6 +11,25 @@ Coverage includes both hosts' unique Git and agent state, credentials, dots,
 SQLite and worktrees. Unsupported items remain outstanding with preserved
 custody; nothing is silently excluded.
 
+Closure is bulkload's own gate, never a metric defined outside it
+(OI-1001-Q2). `closure-report PLAN CORPUS SOURCE PRIVATE_STATE...` reads the
+plan, the corpus's capture records and the apply ledger (outcome records and
+`.done` journals). It ends every planned item as one of:
+
+- `applied`: the item plans a workspace, and the exact journal for its
+  current capture and SOURCE says `workspace-restored`.
+- `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
+  cause and does not close an item.
+- `referenced-only`: the item plans no workspace, and the exact
+  current-capture journal says `refs-imported`.
+
+Anything else is `unaccounted`: a stale journal from an earlier capture, a
+record naming another source, or refs only for an item that plans a
+workspace. Stale and foreign journals are listed. The report passes only
+when `unaccounted` is 0, and otherwise exits nonzero with
+`CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
+the daily-work bar above still applies.
+
 ## Live union
 
 Both hosts stay usable. Bulkload never signals sessions, never requires a
@@ -233,6 +252,26 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+Space preflight (OI-1001-Q2): a write that would leave its destination
+filesystem (`statvfs`; `statfs` on Darwin) with less than
+`--min-free-percent` free (default 25%; 0 still refuses a write larger than
+the space available) refuses `DESTINATION_SPACE_INSUFFICIENT` before it
+starts.
+
+- `copy` and `pull` decide it per entry on wire v5. An entry decided
+  `Send` or `WantManifest` reserves its size until its `Held`. Each
+  admission checks every reserved byte against a probe that is refreshed on
+  each group commit and every 256 MiB admitted. An entry that does not fit
+  is answered `Decision::Refuse` with that code: no new frame, the session
+  continues, and a later run resumes it without re-reading durable bytes
+  (R25).
+- `estate-apply` checks before any item runs. Each pending item's bundle
+  size is charged to its repository's filesystem and, for a linked worktree,
+  to its workspace's. The corpus's filesystem is charged twice the `jobs`
+  largest bundles, for bundle and base staging. Bundle size is a lower
+  bound on a checkout. An item the plan cannot read is skipped and refuses
+  on its own.
 
 ## Reclaim
 

@@ -60,6 +60,7 @@ macro_rules! fault_mid_read {
     ($first:expr, $path:expr) => {{}};
 }
 
+pub mod closure;
 pub mod counters;
 pub mod estate;
 #[cfg(feature = "fault-injection")]
@@ -102,6 +103,7 @@ pub mod crash_check {
 }
 pub mod materialize;
 pub mod provider_sqlite;
+pub mod space;
 pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
