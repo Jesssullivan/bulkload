@@ -25,8 +25,10 @@ Preconditions (gated mode, the default):
     reports power=unknown and refuses every gated sample.
   - --coordinator-quiet: the operator or coordinator holds other lanes quiet
     (R-N91). It is recorded, not checked.
-  - The corpus has the shape of the corpus of record (23 regular files,
-    242,605,606 bytes) unless --expect-files/--expect-bytes say otherwise.
+  - The corpus is R23 corpus v1 (r23_corpus.py, OI-1002-Q28): 23 regular
+    files, 239,819,837 bytes, and `r23_corpus.py verify` matches the
+    committed manifest (content identity f4a7619f...). With other
+    --expect-files/--expect-bytes only the shape is checked.
   - The work root does not exist yet. Its parent should be on the volume
     under test (TinylandState for gate a).
   - After the builds, the harness waits up to --settle-seconds for load1 to
@@ -71,8 +73,12 @@ import time
 from pathlib import Path
 
 LOAD_LIMIT = 2.5
+# Corpus v1 from r23_corpus.py (OI-1002-Q28); the 09-18 corpus is gone.
 RECORD_FILES = 23
-RECORD_BYTES = 242_605_606
+RECORD_BYTES = 239_819_837
+DEFAULT_CORPUS = (
+    "/Volumes/TinylandState/tinyland-state/bulkload-r23-corpus-f4a7619f7b88/corpus"
+)
 DEFAULT_A = "7c3ecc7"
 DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
@@ -130,6 +136,19 @@ def pairs(line: str) -> dict[str, object]:
             value = raw == "true"
         out[key] = value
     return out
+
+
+def corpus_verify(corpus: Path) -> int:
+    """Content identity check of the v1 corpus (r23_corpus.py verify)."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parent / "r23_corpus.py"),
+            "verify",
+            str(corpus),
+        ],
+        check=False,
+    ).returncode
 
 
 def power_source() -> str:
@@ -663,7 +682,9 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]))
-    parser.add_argument("--corpus", help="sealed corpus root (gated mode)")
+    parser.add_argument(
+        "--corpus", default=DEFAULT_CORPUS, help="sealed corpus root (gated mode)"
+    )
     parser.add_argument(
         "--work-root", required=True, help="new directory on the volume under test"
     )
@@ -720,6 +741,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{args.expect_files}/{args.expect_bytes}"
             )
             return 2
+        if (args.expect_files, args.expect_bytes) == (RECORD_FILES, RECORD_BYTES):
+            if corpus_verify(Path(args.corpus)) != 0:
+                say("refused: corpus does not match r23_corpus.manifest.tsv")
+                return 2
     evidence_path = (
         Path(args.evidence)
         if args.evidence

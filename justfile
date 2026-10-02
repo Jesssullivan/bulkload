@@ -143,6 +143,13 @@ bench-io-chunker:
 bench-r23-ab *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_ab.py {{ args }}
 
+# `generate OUT` writes OUT/corpus plus a protected README; `verify CORPUS`
+# checks the committed manifest and content identity f4a7619f... Byte-identical
+# on every host: SHAKE-256 counter mode from a fixed seed, no live files.
+# R23 corpus v1 generator / verifier (OI-1002-Q28)
+bench-r23-corpus *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_corpus.py {{ args }}
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
@@ -176,6 +183,7 @@ check-optional:
     cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
     cd {{ root }} && {{ just_executable() }} test-local
