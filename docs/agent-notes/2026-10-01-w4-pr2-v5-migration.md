@@ -61,9 +61,8 @@ E0432, E0609, E0599; TIN-4543 diagnosis comment). Re-confirmed here with
   known violations are un-ignored and reworded as
   `live_writer_*_leaves_no_source_ledger_row`; `KNOWN_VIOLATIONS` is empty.
   The four `*_leaves_no_source_index` tests are folded into `live_writer`,
-  which now checks both stores for chunk rows and bytes. I3 now reads: the
-  resume reads exactly the bytes of files with no output record (a committed
-  capture saves a manifest, not bytes). power_loss M3 (pack sealed before
+  which now checks both stores for chunk rows and bytes. I3 keeps its
+  strict form (see the fix round below). power_loss M3 (pack sealed before
   capture commit) became `the_source_writes_no_content_bytes`. New unit
   tests: wrong-wire refusal, short data frame, credit waiters, hint fallback
   (`a_lost_output_does_not_lose_reuse_of_its_chunks`), store holds no chunk
@@ -84,7 +83,8 @@ E0432, E0609, E0599; TIN-4543 diagnosis comment). Re-confirmed here with
 - The destination's credit check is weak: it returns credit as it writes,
   so it cannot tell a fast honest source from one that ignores credit. It
   bounds nothing the destination buffers (frames are processed one at a
-  time); the real bound is on the source.
+  time). The real bound is on the source, which caps available credit at
+  the window (F3).
 - The streaming walk and component-wise `openat` source stay in PR 3.
 
 ## Gates (local, sting)
@@ -99,15 +99,63 @@ host load average was about 100–117 on 32 cores (not a benchmark sample).
 | `just resume-power-loss` | not reached | exit 0; 2 passed |
 | `tests/test_ci_contract.py` | — | 22 passed |
 
-The first fault-harness run failed 9 scenarios on I3, all under-reads: a
-crash after a rename but before the output commit left a complete final
-name whose capture was committed, and the resume adopted it against the
-ledger's manifest with 0 source reads. I3 now counts that case (still
-exact equality). The power_loss `report.foreign > 0` check became
-`== 0`: with no pack the source makes no traced write.
+These are the 7c3ecc7 results; the fix round's are on the PR. The
+power_loss `report.foreign > 0` check became `== 0`: with no pack the
+source makes no traced write.
 
 No benchmark sample was taken (R-N81: gated samples need AC power and load
 below 2.5).
+
+## Review round 1 (BLOCK at 7c3ecc7) and fix round
+
+Rulings: OI-1001-Q15 (R25 stays strict), OI-1001-Q16 (fix round, then
+re-review), R-N13.
+
+- **F1 (R25 double read).** A fresh manifest now keeps every chunk it read.
+  When the 512 MiB retention budget cannot hold the file, the source does
+  not build a manifest: it streams the file as for `Send`, and the
+  destination accepts data in place of the manifest. If an existing output
+  sits at the path, it is adopted against the streamed chunks. No seat is
+  read twice in a session. Regression test:
+  `a_file_past_the_retention_budget_is_read_once` (a test-only per-root
+  budget knob, 1 MiB, with a 4 MiB file plus a 2 MiB adopted file; reads
+  equal the file sizes).
+- **F2 (R25 strict).**
+  - New control frame `Held{entry, held}` (control 20, `wire_id` re-pinned).
+    The destination answers every `End` with it.
+  - The source commits a capture to the ledger only on `held`, which means
+    the bytes are durable at the destination: either a temporary sealed at
+    `End` (the seal moved from the committer to the receive side, done once),
+    or an existing output verified against the manifest.
+  - On resume the sweep keeps this store's orphaned file temporaries (single
+    link, at most 64) open as a chunk source, indexed by CDC and re-verified
+    on use, and removes them when the session finishes. A committed capture
+    is filled from the final name or from the salvaged temporary against the
+    ledger's manifest, with 0 source reads.
+  - The original test `interrupted_transport_resumes_completed_captures_without_source_reads`
+    is restored and asserts 0 reads. Its cut is now at `SourceDone`, after
+    every capture committed.
+  - Strict I3 is restored verbatim in its accounting: files with neither an
+    output nor a committed capture are read once, every other file 0.
+  - New tests: `a_held_temporary_is_salvaged_without_source_reads`, and
+    `interrupted_transport_rereads_only_the_in_flight_file`, kept as an extra
+    test for a file whose capture never committed.
+- **F3.** `Credit::grant` refuses (`BUDGET_EXCEEDED`) a grant that would take
+  available credit past the 16 MiB window; the reader ends the session.
+  Test: `credit_past_the_window_is_refused`.
+- **F4.** A stream reaching `MAX_MANIFEST_CHUNKS` ends the session with
+  `BUDGET_EXCEEDED` before anything grows. Test:
+  `a_stream_past_the_chunk_bound_ends_the_session`.
+- **F5 follow-ups:**
+  - #86: racy-stat guard for the transfer ledger.
+  - #87: postcard trailing bytes.
+  - #88: measure the cost of no cross-file dedup before the gate (a) sample.
+- **design.md.** The Resume paragraph is unchanged. The Wire v5 section
+  gains `Held`, salvage, the streaming fallback and the credit cap.
+
+Fix-round gates are on the PR and TIN-4543. The session scratchpad is
+shared with other lanes, so lane logs moved to a private subdirectory after
+one log was overwritten mid-run.
 
 ## Open
 

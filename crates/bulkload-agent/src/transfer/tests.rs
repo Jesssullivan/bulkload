@@ -99,9 +99,194 @@ impl<W: Write> Write for Interrupted<W> {
     }
 }
 
+/// Breaks the serve side's transport at `SourceDone`: every capture of the
+/// session is committed, and the destination never hears the source is done.
+struct StopAtDone<W>(W);
+impl<W: Write> Write for StopAtDone<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if Frame::decode(data).is_ok_and(|(frame, consumed)| {
+            consumed == data.len() && matches!(frame, Frame::Control(Control::SourceDone { .. }))
+        }) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.0.write(data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// R25, strict (OI-1001-Q15): a capture the source committed is never read
+/// again. The source records a capture only once the destination holds its
+/// bytes durably (`Held`), so after an interrupted transport whose every
+/// capture committed, the resume reads 0 source bytes.
+#[test]
+fn interrupted_transport_resumes_completed_captures_without_source_reads() {
+    const FILES: usize = 3;
+    let corpus = Corpus::new();
+    for index in 0..FILES {
+        std::fs::write(
+            corpus.base.join("source").join(format!("file-{index}")),
+            noise(index as u64 + 1, 524_288),
+        )
+        .unwrap();
+    }
+    let (sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            let input = sender.try_clone().unwrap();
+            let closer = sender.try_clone().unwrap();
+            let served = serve(input, &mut StopAtDone(sender));
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+            served
+        });
+        let mut output = receiver.try_clone().unwrap();
+        let outcome = receive(
+            &mut receiver,
+            &mut output,
+            &corpus.base.join("source"),
+            &corpus.base.join("source-state"),
+            &corpus.base.join("destination"),
+            &corpus.base.join("destination-state"),
+        );
+        let _ = receiver.shutdown(std::net::Shutdown::Both);
+        drop(output);
+        drop(receiver);
+        assert!(producer.join().unwrap().is_err());
+        assert!(outcome.is_err());
+    });
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.reused + resumed.completed, FILES as u64);
+    assert_eq!(resumed.source_bytes_read, 0);
+    for index in 0..FILES {
+        let relative = format!("file-{index}");
+        assert_eq!(
+            std::fs::read(corpus.base.join("source").join(&relative)).unwrap(),
+            std::fs::read(corpus.base.join("destination").join(relative)).unwrap()
+        );
+    }
+}
+
+/// A file the destination staged and sealed but never published (a crash
+/// before its rename) is salvaged: the resume fills it from the orphaned
+/// temporary against the ledger's manifest, with no source read and nothing
+/// on the wire, and then removes the temporary.
+#[test]
+fn a_held_temporary_is_salvaged_without_source_reads() {
+    let corpus = Corpus::new();
+    let bytes = noise(21, 3 << 20);
+    std::fs::write(corpus.base.join("source/held"), &bytes).unwrap();
+    std::fs::write(corpus.base.join("source/other"), noise(22, 70_000)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    // Turn the published output back into this store's orphaned temporary,
+    // as a crash between the seal and the rename leaves it.
+    let tag = {
+        let store = Store::open(&corpus.base.join("destination-state")).unwrap();
+        crate::materialize::temporary_tag(&store.authority().unwrap())
+    };
+    let mut name = b".bulkload-".to_vec();
+    name.extend_from_slice(&tag);
+    name.extend_from_slice(b"-1-1");
+    let temporary = corpus
+        .base
+        .join("destination")
+        .join(std::ffi::OsString::from_vec(name));
+    std::fs::rename(corpus.base.join("destination/held"), &temporary).unwrap();
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!((resumed.reused, resumed.completed), (1, 1));
+    assert_eq!(resumed.source_bytes_read, 0);
+    assert_eq!(resumed.bytes_received, 0);
+    assert_eq!(resumed.temporaries_removed, 1);
+    assert!(!temporary.exists());
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/held")).unwrap(),
+        bytes
+    );
+}
+
+/// #77 review F1: with no ledger row and no room to keep a manifest's
+/// chunks, an incremental run streams the file instead of reading it once
+/// for the manifest and again for the chunks.
+#[test]
+fn a_file_past_the_retention_budget_is_read_once() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/small"), noise(31, 100_000)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let root = std::fs::canonicalize(corpus.base.join("source")).unwrap();
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap()
+        .push((root.clone(), 1 << 20));
+    let large = noise(32, 4 << 20);
+    std::fs::write(corpus.base.join("source/large"), &large).unwrap();
+    // An existing identical output at the path is adopted against the
+    // streamed chunks rather than refused.
+    std::fs::write(corpus.base.join("source/copied"), noise(33, 2 << 20)).unwrap();
+    std::fs::copy(
+        corpus.base.join("source/copied"),
+        corpus.base.join("destination/copied"),
+    )
+    .unwrap();
+    let second = corpus.run();
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap()
+        .retain(|(other, _)| *other != root);
+    let second = second.unwrap();
+    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
+    assert_eq!((second.reused, second.completed), (1, 2));
+    assert_eq!(second.source_bytes_read, (4 << 20) + (2 << 20));
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/large")).unwrap(),
+        large
+    );
+}
+
+/// #77 review F4: a stream may not carry more chunks than any manifest can.
+#[test]
+fn a_stream_past_the_chunk_bound_ends_the_session() {
+    let corpus = Corpus::new();
+    let store = Store::open(&corpus.base.join("destination-state")).unwrap();
+    let target = Destination::open(&corpus.base.join("destination"), &store).unwrap();
+    std::fs::write(corpus.base.join("source/file"), b"x").unwrap();
+    let row = walk(
+        &WalkOptions::new(std::fs::canonicalize(corpus.base.join("source")).unwrap()),
+        &mut NullCache,
+    )
+    .unwrap()
+    .rows
+    .remove(0);
+    let mut streaming = Streaming::new(row, Vec::new(), false);
+    streaming.specs = vec![
+        ChunkSpec {
+            digest: [0; 32],
+            size: 0,
+        };
+        MAX_MANIFEST_CHUNKS
+    ];
+    let header = DataHeader {
+        entry: 0,
+        index: u32::try_from(MAX_MANIFEST_CHUNKS).unwrap(),
+        size: 1,
+        offset: 0,
+        digest: [0; 32],
+    };
+    let mut open = 0;
+    assert_eq!(
+        streaming
+            .accept(&target, &mut open, &header, b"x", false)
+            .unwrap_err(),
+        BulkloadRefusal::BudgetExceeded
+    );
+    assert_eq!(streaming.specs.len(), MAX_MANIFEST_CHUNKS);
+    assert_eq!(open, 0);
+}
+
 /// R25 under digest-only custody (R-N58): a resume after a broken transport
 /// reuses every applied output with no source read, and reads again only the
-/// file that was in flight, exactly once.
+/// file that was in flight, whose capture was never committed, exactly once.
 #[test]
 fn interrupted_transport_rereads_only_the_in_flight_file() {
     const FILES: usize = 3;
@@ -137,7 +322,9 @@ fn interrupted_transport_rereads_only_the_in_flight_file() {
                     state: Cut::Passing,
                 },
             );
-            let _ = closer.shutdown(std::net::Shutdown::Both);
+            // Close only the source's sending half: the destination still
+            // answers every `End` it got with `Held`, deterministically.
+            let _ = closer.shutdown(std::net::Shutdown::Write);
             served
         });
         let mut output = receiver.try_clone().unwrap();
@@ -427,17 +614,30 @@ fn a_short_data_frame_is_refused_without_reading_on() {
 #[test]
 fn credit_waiters_wake_on_grant_and_on_close() {
     let credit = Credit::new();
-    credit.grant(10);
+    credit.grant(10).unwrap();
     credit.acquire(4).unwrap();
     credit.acquire(6).unwrap();
     std::thread::scope(|scope| {
         let waiter = scope.spawn(|| credit.acquire(5));
-        credit.grant(5);
+        credit.grant(5).unwrap();
         assert_eq!(waiter.join().unwrap(), Ok(()));
         let waiter = scope.spawn(|| credit.acquire(1));
         credit.close();
         assert_eq!(waiter.join().unwrap(), Err(BulkloadRefusal::Io(None)));
     });
+}
+
+/// #77 review F3: available credit never exceeds the window. A grant past
+/// it is refused and changes nothing.
+#[test]
+fn credit_past_the_window_is_refused() {
+    let credit = Credit::new();
+    credit.grant(CREDIT_WINDOW).unwrap();
+    assert_eq!(credit.grant(1), Err(BulkloadRefusal::BudgetExceeded));
+    assert_eq!(credit.grant(u64::MAX), Err(BulkloadRefusal::BudgetExceeded));
+    credit.acquire(CREDIT_WINDOW).unwrap();
+    credit.grant(CREDIT_WINDOW).unwrap();
+    assert_eq!(credit.grant(1), Err(BulkloadRefusal::BudgetExceeded));
 }
 
 #[test]

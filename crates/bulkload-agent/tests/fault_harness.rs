@@ -19,13 +19,13 @@
 //! - **I4** (R-N79) after the resume no `.bulkload-*` temporary remains: the
 //!   sweep removed exactly the ones the crash left and recorded none as
 //!   ambiguous;
-//! - **I3** the resume reads exactly the source bytes of files that had no
-//!   output record before the crash, each once, so every committed file costs
-//!   0 source bytes (R25). The source ledger is digest-only (R-N58): a
-//!   committed capture saves its manifest, never its bytes, so a file whose
-//!   capture committed but whose output did not is read again, unless the
-//!   crash left it complete under its final name: the resume then adopts it
-//!   against the ledger's manifest and reads nothing;
+//! - **I3** the resume reads exactly the source bytes of files that had neither
+//!   an output record nor a committed capture before the crash, so every
+//!   committed file costs 0 source bytes (R25, strict per OI-1001-Q15). The
+//!   ledger is digest-only (R-N58), so a capture commits only after the
+//!   destination reports it holds the bytes durably (`Held`): a sealed
+//!   temporary the resume salvages, or a final name it adopts, against the
+//!   ledger's manifest;
 //! - the resume converges with only the fixture's own refusal, and the final
 //!   destination is byte-identical to the source.
 //!
@@ -712,15 +712,10 @@ fn crash_resume_with(
     let crash_temporaries = assert_i2(&label, &scratch);
 
     let files = source_files(&scratch);
-    // A final name a crash left unrecorded holds complete content (I2); with
-    // its capture committed, the resume adopts it against the ledger's
-    // manifest and reads nothing.
-    let named = tree(&scratch.destination());
     let uncommitted: u64 = files
         .iter()
         .filter(|(path, _)| {
-            !before.outputs.contains_key(*path)
-                && (!before.captures.contains_key(*path) || !named.contains_key(*path))
+            !before.outputs.contains_key(*path) && !before.captures.contains_key(*path)
         })
         .map(|(_, size)| *size)
         .sum();
@@ -748,8 +743,7 @@ fn crash_resume_with(
         "{label}: resume refused {:?}",
         resumed.refusals
     );
-    // I3: committed outputs cost 0 source bytes; the rest are read exactly
-    // once, whether or not their capture committed (R-N58: no byte pack).
+    // I3: committed files cost 0 source bytes; the rest are read exactly once.
     assert_eq!(
         resumed.source_bytes_read,
         uncommitted + refused_read,

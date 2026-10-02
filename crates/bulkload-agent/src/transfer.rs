@@ -258,12 +258,21 @@ impl Credit {
         }
     }
 
-    fn grant(&self, bytes: u64) {
+    /// Add credit the destination returned. Available credit never exceeds
+    /// [`CREDIT_WINDOW`]: an honest destination only returns what the source
+    /// spent, so a grant past the window is refused.
+    fn grant(&self, bytes: u64) -> Result<()> {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.0 = state.0.saturating_add(bytes);
+            let granted = state
+                .0
+                .checked_add(bytes)
+                .filter(|granted| *granted <= CREDIT_WINDOW)
+                .ok_or(BulkloadRefusal::BudgetExceeded)?;
+            state.0 = granted;
         }
         self.ready.notify_all();
+        Ok(())
     }
 
     /// Stop every waiter: the session is over.
@@ -334,6 +343,8 @@ enum Job {
         manifest: Manifest,
         indices: Vec<u32>,
         retained: Option<Retained>,
+        /// The row key to record once the destination holds the bytes.
+        record: Option<Vec<u8>>,
     },
 }
 
@@ -347,6 +358,10 @@ enum Event {
     NeedChunks {
         entry: u64,
         indices: Vec<u32>,
+    },
+    Held {
+        entry: u64,
+        held: bool,
     },
     PeerFailed(BulkloadRefusal),
     /// One chunk, its credit already taken.
@@ -364,7 +379,8 @@ enum Event {
     },
     End {
         entry: u64,
-        /// The capture to record, for a streamed capture.
+        /// The capture to record once the destination holds the bytes, for
+        /// a capture not yet in the ledger.
         record: Option<(Vec<u8>, Manifest)>,
         root: [u8; 32],
         chunks: u32,
@@ -387,9 +403,31 @@ enum SourceEntry {
     Offered {
         manifest: Manifest,
         retained: Option<Retained>,
+        record: Option<Vec<u8>>,
     },
     Done,
 }
+
+/// The source's retention budget.
+#[cfg(not(test))]
+const fn retain_budget(_root: &Path) -> u64 {
+    RETAIN_BYTES
+}
+
+/// The source's retention budget; tests set a smaller one per source root.
+#[cfg(test)]
+fn retain_budget(root: &Path) -> u64 {
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(override_root, _)| override_root == root)
+        .map_or(RETAIN_BYTES, |(_, bytes)| *bytes)
+}
+
+/// Test-only retention budgets by canonical source root.
+#[cfg(test)]
+static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// What every capture thread shares.
 struct SourceWork<'a> {
@@ -480,7 +518,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         state: store.root(),
         rows: &census.rows,
         credit: &credit,
-        retain: Arc::new(AtomicU64::new(RETAIN_BYTES)),
+        retain: Arc::new(AtomicU64::new(retain_budget(&root))),
     };
     let (jobs, job_queue) = std::sync::mpsc::channel();
     let job_queue = Mutex::new(job_queue);
@@ -525,11 +563,16 @@ fn spawn_reader<R: Read + Send + 'static>(
             let failure = loop {
                 let event = match read_frame(&mut input) {
                     Ok(Frame::Control(Control::Credit { bytes })) => {
-                        credit.grant(bytes);
+                        if let Err(refusal) = credit.grant(bytes) {
+                            break refusal;
+                        }
                         continue;
                     }
                     Ok(Frame::Control(Control::Decide { entry, decision })) => {
                         Event::Decide { entry, decision }
+                    }
+                    Ok(Frame::Control(Control::Held { entry, held })) => {
+                        Event::Held { entry, held }
                     }
                     Ok(Frame::Control(Control::NeedChunks { entry, indices })) => {
                         Event::NeedChunks { entry, indices }
@@ -560,6 +603,9 @@ struct Outbound<'a, W> {
     queue: VecDeque<Job>,
     active: usize,
     bytes_read: u64,
+    /// Entries whose `End` is sent and whose `Held` is awaited, with the
+    /// capture to record once the destination holds the bytes.
+    awaiting: HashMap<u64, Option<(Vec<u8>, Manifest)>>,
 }
 
 /// The sending thread: offer entries, act on decisions and chunk requests,
@@ -583,6 +629,7 @@ fn send_entries<W: Write>(
         queue: VecDeque::new(),
         active: 0,
         bytes_read: 0,
+        awaiting: HashMap::new(),
     };
     loop {
         outbound.offer()?;
@@ -636,7 +683,11 @@ impl<W: Write> Outbound<'_, W> {
     }
 
     fn finished(&self) -> bool {
-        self.walk_done && self.undecided == 0 && self.queue.is_empty() && self.active == 0
+        self.walk_done
+            && self.undecided == 0
+            && self.queue.is_empty()
+            && self.active == 0
+            && self.awaiting.is_empty()
     }
 
     fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &RowSchema)> {
@@ -675,13 +726,6 @@ impl<W: Write> Outbound<'_, W> {
                 bytes_read,
             } => {
                 self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-                if let Some(key) = record {
-                    self.committer.submit(LedgerItem {
-                        entry,
-                        key,
-                        manifest: manifest.clone(),
-                    })?;
-                }
                 write_control(
                     self.output,
                     &Control::Manifest {
@@ -694,7 +738,27 @@ impl<W: Write> Outbound<'_, W> {
                 if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
                     return Err(BulkloadRefusal::Io(None));
                 }
-                *slot = SourceEntry::Offered { manifest, retained };
+                *slot = SourceEntry::Offered {
+                    manifest,
+                    retained,
+                    record,
+                };
+            }
+            Event::Held { entry, held } => {
+                let record = self
+                    .awaiting
+                    .remove(&entry)
+                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                // A capture is recorded only once the destination holds its
+                // bytes durably, so a committed capture never costs a source
+                // read again (R25, OI-1001-Q15).
+                if let (true, Some((key, manifest))) = (held, record) {
+                    self.committer.submit(LedgerItem {
+                        entry,
+                        key,
+                        manifest,
+                    })?;
+                }
             }
             Event::End {
                 entry,
@@ -705,14 +769,8 @@ impl<W: Write> Outbound<'_, W> {
                 bytes_read,
             } => {
                 self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-                if let Some((key, manifest)) = record {
-                    self.committer.submit(LedgerItem {
-                        entry,
-                        key,
-                        manifest,
-                    })?;
-                }
                 self.finish_entry(entry)?;
+                self.awaiting.insert(entry, record);
                 write_control(
                     self.output,
                     &Control::End {
@@ -766,8 +824,11 @@ impl<W: Write> Outbound<'_, W> {
 
     fn need_chunks(&mut self, entry: u64, indices: Vec<u32>) -> Result<()> {
         let (slot, _) = self.slot(entry)?;
-        let SourceEntry::Offered { manifest, retained } =
-            std::mem::replace(slot, SourceEntry::Working)
+        let SourceEntry::Offered {
+            manifest,
+            retained,
+            record,
+        } = std::mem::replace(slot, SourceEntry::Working)
         else {
             return Err(BulkloadRefusal::FrameCodec);
         };
@@ -783,6 +844,7 @@ impl<W: Write> Outbound<'_, W> {
                 manifest,
                 indices,
                 retained,
+                record,
             })
             .map_err(|_| BulkloadRefusal::Io(None))
     }
@@ -820,21 +882,27 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
         Job::Send { entry } => (entry, send_capture(work, entry, events, &mut bytes_read)),
         Job::Manifest { entry } => (
             entry,
-            manifest_capture(work, store, entry, &mut bytes_read).map(
-                |(record, manifest, retained)| Event::Manifest {
+            match manifest_capture(work, store, entry, &mut bytes_read) {
+                Ok(Some((record, manifest, retained))) => Ok(Event::Manifest {
                     entry,
                     record,
                     manifest,
                     retained,
                     bytes_read,
-                },
-            ),
+                }),
+                // No ledger row and no room to keep the chunks: building a
+                // manifest first would read the seat twice (R25). Stream it
+                // instead; the destination takes data in place of a manifest.
+                Ok(None) => send_capture(work, entry, events, &mut bytes_read),
+                Err(refusal) => Err(refusal),
+            },
         ),
         Job::Serve {
             entry,
             manifest,
             indices,
             retained,
+            record,
         } => (
             entry,
             serve_chunks(
@@ -845,7 +913,25 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
                 retained.as_ref(),
                 events,
                 &mut bytes_read,
-            ),
+            )
+            .map(|event| match event {
+                Event::End {
+                    entry,
+                    root,
+                    chunks,
+                    size,
+                    bytes_read,
+                    ..
+                } => Event::End {
+                    entry,
+                    record: record.map(|key| (key, manifest)),
+                    root,
+                    chunks,
+                    size,
+                    bytes_read,
+                },
+                other => other,
+            }),
         ),
     };
     outcome.unwrap_or_else(|refusal| Event::Refused {
@@ -898,31 +984,38 @@ fn send_capture(
     })
 }
 
+/// A manifest to offer: the row key to record (none when it came from the
+/// ledger), the manifest, and its retained chunks.
+type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>);
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
-/// chunks are kept in memory for the requests that follow when the budget
-/// allows.
+/// chunks are all kept in memory for the requests that follow. `None` when
+/// the retention budget cannot hold the file: the caller streams it instead
+/// of reading it twice (#77 review F1).
 fn manifest_capture(
     work: &SourceWork<'_>,
     store: &Store,
     entry: u64,
     bytes_read: &mut u64,
-) -> Result<(Option<Vec<u8>>, Manifest, Option<Retained>)> {
+) -> Result<Option<Offer>> {
     let row = job_row(work, entry)?;
     let key = row_key(work.authority, row)?;
     if let Some(manifest) = store.capture(&key)? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
-            return Ok((None, manifest, None));
+            return Ok(Some((None, manifest, None)));
         }
     }
-    let mut retained = Retained::reserve(&work.retain, row.size);
+    // Every chunk a fresh manifest names must be kept, so the requests that
+    // follow are served from memory: a seat is read at most once a session.
+    let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
+        return Ok(None);
+    };
     let chunks = capture_file(work.root, row, bytes_read, |_, _, _, data| {
-        if let Some(held) = retained.as_mut() {
-            held.chunks.push(Arc::new(data));
-        }
+        retained.chunks.push(Arc::new(data));
         Ok(())
     })?;
-    Ok((Some(key), Manifest::new(chunks), retained))
+    Ok(Some((Some(key), Manifest::new(chunks), Some(retained))))
 }
 
 /// Send the requested chunks of an offered manifest, from memory when they
@@ -1098,6 +1191,62 @@ struct ReceiveContext<'a> {
     target: &'a Destination,
     store: &'a Store,
     session: &'a SessionChunks,
+    salvage: &'a Salvage,
+}
+
+/// Chunks of this store's orphaned temporaries (see
+/// [`Destination::salvaged`]): what a crashed session staged and sealed but
+/// never published. A resume fills from them instead of asking the source,
+/// so a capture the source recorded as held is never read again (R25).
+#[derive(Default)]
+struct Salvage {
+    /// Digest to (salvaged file, offset, size). Hints only: re-verified on use.
+    index: HashMap<[u8; 32], (usize, u64, u64)>,
+    /// Salvaged files indexed so far.
+    indexed: usize,
+}
+
+impl Salvage {
+    /// Index any temporaries the sweep has salvaged since the last call, by
+    /// chunking them as the source does. Unreadable bytes only cost reuse.
+    fn refresh(&mut self, target: &Destination) {
+        let files: Vec<&std::fs::File> = target.salvaged().collect();
+        for (at, file) in files.iter().enumerate().skip(self.indexed) {
+            let mut offset = 0_u64;
+            let reader = SalvageReader { file, offset: 0 };
+            for chunk in fastcdc::v2020::StreamCDC::new(
+                reader,
+                crate::hash::CDC_MIN_BYTES,
+                crate::hash::CDC_AVG_BYTES,
+                crate::hash::CDC_MAX_BYTES,
+            ) {
+                let Ok(chunk) = chunk else {
+                    break;
+                };
+                counters::add_len(Counter::DestLocalReuseRead, chunk.data.len());
+                let digest = counters::hash(Counter::HashDestReuse, &chunk.data);
+                let size = chunk.data.len() as u64;
+                self.index.entry(digest).or_insert((at, offset, size));
+                offset = offset.saturating_add(size);
+            }
+        }
+        self.indexed = files.len();
+    }
+}
+
+/// Sequential reads of a salvaged temporary through `pread`, leaving the
+/// shared descriptor's offset alone.
+struct SalvageReader<'a> {
+    file: &'a std::fs::File,
+    offset: u64,
+}
+
+impl Read for SalvageReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(buffer, self.offset)?;
+        self.offset = self.offset.saturating_add(read as u64);
+        Ok(read)
+    }
 }
 
 /// End a receive: record the sweep and directory-creation outcomes, commit
@@ -1108,18 +1257,21 @@ fn finish_receive(
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
 ) -> Result<()> {
-    stats.temporaries_removed = target.swept().removed;
-    stats.temporaries_left.clone_from(&target.swept().left);
-    stats.directories_renamed = target.created().renamed;
-    stats
-        .directories_fallback
-        .clone_from(&target.created().fallback);
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
             Ok(()) => stats.completed += 1,
             Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
         }
     }
+    // Every output is committed, so no output needs a salvaged temporary any
+    // more: remove them as the sweep would have.
+    target.remove_salvaged()?;
+    stats.temporaries_removed = target.swept().removed;
+    stats.temporaries_left.clone_from(&target.swept().left);
+    stats.directories_renamed = target.created().renamed;
+    stats
+        .directories_fallback
+        .clone_from(&target.created().fallback);
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
     }
@@ -1151,6 +1303,84 @@ struct Streaming {
     hints: Vec<ChunkHint>,
     seen: HashSet<[u8; 32]>,
     failure: Option<BulkloadRefusal>,
+    /// Streamed in answer to `WantManifest` (the source could not keep the
+    /// chunks for a manifest): an existing output at the path is adopted
+    /// against the streamed chunks instead of refused.
+    adopt: bool,
+}
+
+impl Streaming {
+    /// One streamed chunk: it must be the next index at the next offset.
+    /// It is written once verified; a content fault becomes the entry's
+    /// refusal and the stream stays in step.
+    fn accept(
+        &mut self,
+        target: &Destination,
+        open: &mut usize,
+        header: &DataHeader,
+        payload: &[u8],
+        verified: bool,
+    ) -> Result<()> {
+        if header.index as usize != self.specs.len() || header.offset != self.offset {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        // More chunks than any manifest may hold ends the session: nothing
+        // grows past the bound (#77 review F4).
+        if self.specs.len() >= MAX_MANIFEST_CHUNKS {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let size = payload.len() as u64;
+        let end = self.offset.saturating_add(size);
+        if self.failure.is_none() && (!verified || end > self.row.size) {
+            self.failure = Some(BulkloadRefusal::DigestMismatch);
+        }
+        if self.failure.is_none() && self.staged.is_none() {
+            if *open >= MAX_OPEN_ENTRIES {
+                return Err(BulkloadRefusal::FrameCodec);
+            }
+            match target.stage(&self.row) {
+                Ok(staged) => {
+                    *open += 1;
+                    self.staged = Some(staged);
+                }
+                Err(refusal) => self.failure = Some(refusal),
+            }
+        }
+        if self.failure.is_none() {
+            if let Some(staged) = &self.staged {
+                if let Err(refusal) = place(staged.file(), payload, &[self.offset]) {
+                    self.failure = Some(refusal);
+                }
+            }
+        }
+        self.specs.push(ChunkSpec {
+            digest: header.digest,
+            size,
+        });
+        if self.seen.insert(header.digest) {
+            self.hints.push(ChunkHint {
+                digest: header.digest,
+                offset: self.offset,
+                size,
+            });
+        }
+        self.offset = end;
+        Ok(())
+    }
+
+    fn new(row: RowSchema, key: Vec<u8>, adopt: bool) -> Self {
+        Self {
+            row,
+            key,
+            staged: None,
+            specs: Vec::new(),
+            offset: 0,
+            hints: Vec::new(),
+            seen: HashSet::new(),
+            failure: None,
+            adopt,
+        }
+    }
 }
 
 /// An entry filled from its manifest: local chunks first, then the
@@ -1184,6 +1414,7 @@ struct Inbound<'a, W> {
     incoming: HashMap<u64, Incoming>,
     open: usize,
     fill_locally: bool,
+    salvage: Salvage,
     /// Granted payload bytes not yet received.
     granted: u64,
     /// Received payload bytes not yet returned as credit.
@@ -1249,6 +1480,7 @@ pub fn receive<R: Read, W: Write>(
         incoming: HashMap::new(),
         open: 0,
         fill_locally,
+        salvage: Salvage::default(),
         granted: CREDIT_WINDOW,
         consumed: 0,
     };
@@ -1349,11 +1581,16 @@ impl<W: Write> Inbound<'_, W> {
                 // A manifest first only when something here could fill it:
                 // an existing output to adopt, or chunks held by published
                 // outputs. Otherwise the source reads the file exactly once.
-                Ok(if identity.is_some() || self.fill_locally {
-                    Decision::WantManifest
-                } else {
-                    Decision::Send
-                })
+                Ok(
+                    if identity.is_some()
+                        || self.fill_locally
+                        || self.target.salvaged().next().is_some()
+                    {
+                        Decision::WantManifest
+                    } else {
+                        Decision::Send
+                    },
+                )
             }),
             _ => Err(BulkloadRefusal::FieldDomainViolation),
         };
@@ -1369,19 +1606,8 @@ impl<W: Write> Inbound<'_, W> {
         };
         match decision {
             Decision::Send => {
-                self.incoming.insert(
-                    entry,
-                    Incoming::Streaming(Streaming {
-                        row,
-                        key,
-                        staged: None,
-                        specs: Vec::new(),
-                        offset: 0,
-                        hints: Vec::new(),
-                        seen: HashSet::new(),
-                        failure: None,
-                    }),
-                );
+                self.incoming
+                    .insert(entry, Incoming::Streaming(Streaming::new(row, key, false)));
             }
             Decision::WantManifest => {
                 self.incoming
@@ -1440,6 +1666,7 @@ impl<W: Write> Inbound<'_, W> {
             offset = offset.saturating_add(chunk.size);
         }
         let materialize_started = Instant::now();
+        self.salvage.refresh(self.target);
         let plan = if manifest.is_consistent() {
             if self.open >= MAX_OPEN_ENTRIES {
                 return Err(BulkloadRefusal::FrameCodec);
@@ -1449,6 +1676,7 @@ impl<W: Write> Inbound<'_, W> {
                     target: self.target,
                     store: self.store,
                     session: &self.session,
+                    salvage: &self.salvage,
                 },
                 &row,
                 &manifest,
@@ -1500,52 +1728,20 @@ impl<W: Write> Inbound<'_, W> {
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
         let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
             && counters::hash(Counter::HashWireVerify, payload) == header.digest;
+        // A source that could not keep a manifest's chunks streams the entry
+        // in place of the manifest (#77 review F1).
+        if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {
+            if let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&header.entry)
+            {
+                self.incoming.insert(
+                    header.entry,
+                    Incoming::Streaming(Streaming::new(row, key, true)),
+                );
+            }
+        }
         match self.incoming.get_mut(&header.entry) {
             Some(Incoming::Streaming(streaming)) => {
-                if header.index as usize != streaming.specs.len()
-                    || header.offset != streaming.offset
-                {
-                    return Err(BulkloadRefusal::FrameCodec);
-                }
-                let end = streaming.offset.saturating_add(size);
-                if streaming.failure.is_none() {
-                    if !verified || end > streaming.row.size {
-                        streaming.failure = Some(BulkloadRefusal::DigestMismatch);
-                    } else if streaming.specs.len() >= MAX_MANIFEST_CHUNKS {
-                        streaming.failure = Some(BulkloadRefusal::BudgetExceeded);
-                    }
-                }
-                if streaming.failure.is_none() && streaming.staged.is_none() {
-                    if self.open >= MAX_OPEN_ENTRIES {
-                        return Err(BulkloadRefusal::FrameCodec);
-                    }
-                    match self.target.stage(&streaming.row) {
-                        Ok(staged) => {
-                            self.open += 1;
-                            streaming.staged = Some(staged);
-                        }
-                        Err(refusal) => streaming.failure = Some(refusal),
-                    }
-                }
-                if streaming.failure.is_none() {
-                    if let Some(staged) = &streaming.staged {
-                        if let Err(refusal) = place(staged.file(), payload, &[streaming.offset]) {
-                            streaming.failure = Some(refusal);
-                        }
-                    }
-                }
-                streaming.specs.push(ChunkSpec {
-                    digest: header.digest,
-                    size,
-                });
-                if streaming.seen.insert(header.digest) {
-                    streaming.hints.push(ChunkHint {
-                        digest: header.digest,
-                        offset: streaming.offset,
-                        size,
-                    });
-                }
-                streaming.offset = end;
+                streaming.accept(self.target, &mut self.open, header, payload, verified)?;
             }
             Some(Incoming::Filling(filling)) => {
                 if filling.expected.pop_front() != Some(header.index) {
@@ -1617,9 +1813,15 @@ impl<W: Write> Inbound<'_, W> {
                 (rel_path, self.end_filling(filling))
             }
         };
+        let held = outcome.is_ok();
         if let Err(refusal) = outcome {
             self.refuse(rel_path, &refusal);
         }
+        // Every End is answered. `held` means the bytes are durable here (a
+        // sealed temporary or a verified existing output), so the source may
+        // record the capture: a committed capture never costs a source read
+        // again, because a resume salvages or adopts what is held.
+        write_control(self.output, &Control::Held { entry, held })?;
         fault_point!(ReceiveAfterEnd);
         Ok(())
     }
@@ -1633,6 +1835,7 @@ impl<W: Write> Inbound<'_, W> {
             offset,
             hints,
             failure,
+            adopt,
             ..
         } = streaming;
         if staged.is_some() {
@@ -1645,6 +1848,40 @@ impl<W: Write> Inbound<'_, W> {
                 Ok(())
             }
         });
+        if checked.is_ok() && adopt {
+            // Streamed in place of a manifest: an existing output at the
+            // path is adopted against the streamed chunks, as a manifest
+            // would have been checked, and the staged copy is dropped.
+            match self.target.existing(&row) {
+                Ok(Some((file, parent))) => {
+                    if let Some(staged) = staged {
+                        let _ = staged.discard();
+                    }
+                    let manifest = Manifest {
+                        root,
+                        chunks: specs,
+                    };
+                    let identity = verify_existing(&file, &row, &manifest)?;
+                    return self.committer.submit(Publication::Adopted {
+                        record: OutputRecord {
+                            key,
+                            rel_path: row.rel_path.clone(),
+                            identity,
+                            hints: Vec::new(),
+                        },
+                        file,
+                        parent,
+                    });
+                }
+                Ok(None) => (),
+                Err(refusal) => {
+                    if let Some(staged) = staged {
+                        let _ = staged.discard();
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
         let staged = match (checked, staged) {
             (Ok(()), Some(staged)) => staged,
             // An empty file has no data frame; it is staged here.
@@ -1697,10 +1934,11 @@ impl<W: Write> Inbound<'_, W> {
         }
     }
 
-    /// Apply the final mode and queue a fully written staged file.
+    /// Apply the final mode, seal the temporary (the bytes are now held
+    /// durably, see [`Control::Held`]) and queue it for its group commit.
     fn publish(
         &mut self,
-        staged: StagedFile,
+        mut staged: StagedFile,
         row: &RowSchema,
         key: Vec<u8>,
         hints: Vec<ChunkHint>,
@@ -1712,6 +1950,10 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refusal);
         }
         fault_point!(MaterializeAfterTempWrite);
+        if let Err(refusal) = staged.seal() {
+            let _ = staged.discard();
+            return Err(refusal);
+        }
         self.session.insert(Arc::clone(staged.file()), &hints);
         self.committer.submit(Publication::Staged {
             staged,
@@ -1886,6 +2128,17 @@ fn local_chunk(
     if let Some((file, offset, held)) = context.session.get(digest) {
         if held == size {
             if let Some(data) = read_verified(file, offset, size, digest) {
+                return Ok(Some(data));
+            }
+        }
+    }
+    if let Some((at, offset, held)) = context.salvage.index.get(digest) {
+        if *held == size {
+            if let Some(data) = context
+                .target
+                .salvaged_file(*at)
+                .and_then(|file| read_verified(file, *offset, size, digest))
+            {
                 return Ok(Some(data));
             }
         }

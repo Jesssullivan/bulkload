@@ -165,16 +165,27 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   outputs hold chunks (resume, incremental). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
   destination fills what it can from verified local chunks and asks for the
-  rest by index (`NeedChunks`); the source sends only those, then `End`.
+  rest by index (`NeedChunks`); the source sends only those, then `End`. A
+  fresh manifest is built from one read whose chunks are all kept in memory
+  (512 MiB budget); a file past the budget is streamed as for `Send`
+  instead, so no seat is read twice in a session.
 - **Credit.** The destination grants 16 MiB of data payload and returns
   credit as it writes; the source never has more than the granted bytes in
-  flight, and at most 16 entries' content.
+  flight, and at most 16 entries' content. Available credit never exceeds
+  the window; a grant past it is refused.
 - **Ledger.** The source ledger is digest-only (R-N58): a capture records its
   row key and manifest (digests, sizes and `manifest_root`), never bytes, and
   only after its final stat check, so a refused live-writer capture leaves no
   row (R-N86). `manifest_root` (BLAKE3 in derive-key mode over each chunk's
   digest and size) replaces the whole-file hash. `SourceDone` follows the
   ledger's last commit.
+- **Held.** The destination answers every `End` with `Held`. A capture is
+  committed to the ledger only when the destination holds its bytes
+  durably (a sealed temporary, or an existing output verified against the
+  manifest), so a committed capture is never read from the source again
+  (R25, OI-1001-Q15): a resume adopts the final name, or salvages the
+  sealed temporary (the sweep keeps this store's orphaned file temporaries
+  open as a chunk source and removes them when the session finishes).
 - **Hints.** The destination records, per digest, every published output
   holding it, newest first; a hint is re-read and re-verified on use, and a
   miss falls through to the next.

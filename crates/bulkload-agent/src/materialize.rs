@@ -188,6 +188,23 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
+    /// This store's orphaned file temporaries, held open for their chunks
+    /// and removed only when the session finishes (R25: bytes the
+    /// destination already holds are never read from the source again).
+    salvage: Vec<Salvaged>,
+}
+
+/// Orphaned file temporaries held open at once; past this they are removed
+/// at sweep time as before.
+const SALVAGE_FILES: usize = 64;
+
+/// An orphaned file temporary of this store, kept readable for chunk reuse
+/// until the session that found it finishes.
+struct Salvaged {
+    parent: File,
+    name: CString,
+    rel_path: Vec<u8>,
+    file: File,
 }
 
 /// How this invocation created directories (R-N119).
@@ -226,7 +243,46 @@ impl Destination {
             unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
             created: Creation::default(),
+            salvage: Vec::new(),
         })
+    }
+
+    /// The orphaned file temporaries found so far, held open for reuse.
+    pub(crate) fn salvaged(&self) -> impl Iterator<Item = &File> {
+        self.salvage.iter().map(|salvaged| &salvaged.file)
+    }
+
+    /// The salvaged temporary at `index` in [`Destination::salvaged`] order.
+    pub(crate) fn salvaged_file(&self, index: usize) -> Option<&File> {
+        self.salvage.get(index).map(|salvaged| &salvaged.file)
+    }
+
+    /// Remove every salvaged temporary by name, as the sweep would have, and
+    /// seal each directory that lost one. Call once the session's outputs
+    /// are queued: their bytes no longer depend on the temporaries.
+    ///
+    /// # Errors
+    /// Refuses a failed directory seal.
+    pub fn remove_salvaged(&mut self) -> Result<()> {
+        let mut touched: Vec<File> = Vec::new();
+        for salvaged in std::mem::take(&mut self.salvage) {
+            match crate::io::sys::unlinkat(&salvaged.parent, &salvaged.name, false) {
+                Ok(()) => {
+                    self.swept.removed += 1;
+                    touched.push(salvaged.parent);
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(_) => self.swept.left.push(salvaged.rel_path),
+            }
+        }
+        let mut sealed = std::collections::HashSet::new();
+        for directory in touched {
+            let metadata = directory.metadata()?;
+            if sealed.insert((metadata.dev(), metadata.ino())) {
+                directory.sync_dir_counted()?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove this store's orphaned temporaries from the root. Call only
@@ -521,6 +577,20 @@ impl Destination {
             // once the inode is gone its number may be reused (N3).
             if want_directory {
                 store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
+            } else if stat.nlink == 1 && self.salvage.len() < SALVAGE_FILES {
+                // An orphan with no other name may hold a whole staged
+                // output: keep it open for its chunks and remove it when the
+                // session finishes. A second link to a published output is
+                // removed at once; the output keeps the bytes.
+                if let Ok(file) = crate::io::sys::open_read_at(directory, &name) {
+                    self.salvage.push(Salvaged {
+                        parent: directory.try_clone()?,
+                        name,
+                        rel_path,
+                        file: File::from(file),
+                    });
+                    continue;
+                }
             }
             // `unlinkat` removes this one name: without AT_REMOVEDIR never a
             // directory (the inode survives under any other link), with it
@@ -665,6 +735,7 @@ impl Destination {
             temporary,
             leaf,
             file: Arc::new(file),
+            sealed: false,
         })
     }
 
@@ -727,9 +798,26 @@ pub(crate) struct StagedFile {
     temporary: CString,
     leaf: CString,
     file: Arc<File>,
+    /// Sealed by [`StagedFile::seal`] already; publication does not seal it
+    /// again.
+    sealed: bool,
 }
 
 impl StagedFile {
+    /// Seal the complete data under the temporary name, once. A sealed
+    /// temporary is what the destination reports as held: a crash before its
+    /// rename leaves it for the next session to salvage.
+    ///
+    /// # Errors
+    /// Returns the failed seal; the temporary is left for the caller.
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        if !self.sealed {
+            crate::io::durable::seal_file(&self.file)?;
+            self.sealed = true;
+            fault_point!(MaterializeAfterTempSeal);
+        }
+        Ok(())
+    }
     /// The open temporary file. It stays readable after publication.
     pub(crate) const fn file(&self) -> &Arc<File> {
         &self.file
@@ -745,12 +833,11 @@ impl StagedFile {
 
     /// Seal the data, then rename into place without replacing anything.
     /// The identity is taken from the open file after the rename.
-    fn publish(self) -> Result<(StatIdentity, Arc<File>)> {
-        if let Err(error) = crate::io::durable::seal_file(&self.file) {
+    fn publish(mut self) -> Result<(StatIdentity, Arc<File>)> {
+        if let Err(error) = self.seal() {
             let _ = unlink(&self.parent, &self.temporary);
-            return Err(error.into());
+            return Err(error);
         }
-        fault_point!(MaterializeAfterTempSeal);
         if let Err(error) = crate::io::publish_noreplace(&self.parent, &self.temporary, &self.leaf)
         {
             let _ = unlink(&self.parent, &self.temporary);

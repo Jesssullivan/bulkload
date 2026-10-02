@@ -79,6 +79,7 @@ control 16 SegmentDurable{sub u32, segment u32} (reserved, W6)
 control 17 GitRefs{sub u32, updates Vec<RefUpdate>} (reserved, W6)
 control 18 GitCommitted{sub u32, transaction_digest [u8;32]} (reserved, W6)
 control 19 GitResume{sub u32, durable_segments Vec<u32>} (reserved, W6)
+control 20 Held{entry u64, held bool}
 decision 0 Skip, 1 Reuse, 2 Send, 3 WantManifest, 4 Refuse{code string}
 subkind 0 GitPack{repo bytes, refs_digest [u8;32]}
 chunkspec {digest [u8;32], size u64}
@@ -248,6 +249,13 @@ pub enum Control {
         sub: u32,
         durable_segments: Vec<u32>,
     },
+    /// →S. The answer to every [`Control::End`]: with `held`, the
+    /// destination holds the entry's bytes durably (a sealed temporary, or an
+    /// existing output verified against the manifest), so the source may
+    /// commit the capture to its ledger. Without it, the entry was refused
+    /// and the capture is not recorded (R25: a committed capture never
+    /// costs a source read again).
+    Held { entry: u64, held: bool },
 }
 
 /// The fixed header of a [`TAG_DATA`] frame.

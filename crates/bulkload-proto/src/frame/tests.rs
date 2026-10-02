@@ -142,6 +142,10 @@ fn every_control() -> Vec<Control> {
             sub: 1,
             durable_segments: vec![0, 1],
         },
+        Control::Held {
+            entry: 4,
+            held: true,
+        },
     ]
 }
 
@@ -316,7 +320,7 @@ fn wire_id_is_pinned() {
     assert_eq!(wire_id(), *blake3::hash(WIRE_SCHEMA.as_bytes()).as_bytes());
     assert_eq!(
         hex(&wire_id()),
-        "743c8a9eb3b6b4991b1938b1340b0a50831ee9ba09fa46360ff712bbd669e6d0",
+        "4697b82f3a5d29589220e46b14de5eadc6f0e81177511bffde66992ad1b7b63b",
         "WIRE_SCHEMA changed: update this pin and treat it as a wire change"
     );
 }
