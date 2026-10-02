@@ -18,7 +18,8 @@
 //! 6. Byte identity of the state commit on an unchanged re-run.
 //!
 //! Measurements are printed as `m1 <question> key=value ...` lines; run
-//! `cargo test -p bulkload-agent --test git_m1_spike -- --nocapture` to see
+//! `cargo test -p bulkload-agent --features m1-spike --test git_m1_spike --
+//! --nocapture` (or `just check-optional`) to see
 //! them.
 //!
 //! #55's hardened invocation, pack pins, estimate (`thin_pack`) and
