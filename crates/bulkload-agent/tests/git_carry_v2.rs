@@ -2630,13 +2630,14 @@ fn entries_of(dir: &Path) -> Vec<String> {
     names
 }
 
-/// B1: a quarantine whose journal is gone (the state dir kept) is refused by
-/// a fresh open, `quarantine_exists`, before any plan is sealed. One left by
-/// a lost state dir has that state dir's name (#75 r2 N4): a fresh open from
-/// another state dir makes its own, never adopts it, and leaves it as it
-/// was.
+/// B1: a quarantine whose journal is gone (the state dir kept) is never
+/// adopted: a fresh open discards it (#75 r3 M2; it refused
+/// `quarantine_exists` before, which wedged the pack id) and starts empty.
+/// One left by a lost state dir has that state dir's name (#75 r2 N4): a
+/// fresh open from another state dir makes its own, never adopts it, and
+/// leaves it as it was.
 #[test]
-fn pr75_b1b_a_preexisting_quarantine_is_refused_at_a_fresh_open() {
+fn pr75_b1b_a_preexisting_quarantine_is_never_adopted() {
     let pair = pair("pr75-b1b", DEFAULT_SEGMENT_CAP);
     let state = pair.scratch.state("state-a");
     let journals = JournalStore::open(&state).unwrap();
@@ -2655,20 +2656,26 @@ fn pr75_b1b_a_preexisting_quarantine_is_refused_at_a_fresh_open() {
             .join(format!("{}.journal", pair.plan.pack_id())),
     )
     .unwrap();
-    let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
-    assert_eq!(refused.refusal, BulkloadRefusal::GitDestinationOccupied);
-    assert_eq!(refused.reason, Some("quarantine_exists"));
-    assert_eq!(quarantine_entries(&pair), leftover, "left as it was");
-    assert_eq!(
-        fs::read_dir(state.join("git-carry-v2/ingest"))
-            .unwrap()
-            .count(),
-        0,
-        "no journal"
+    let session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    assert_eq!(session.next_segment(), 0);
+    assert!(
+        quarantine_entries(&pair).is_empty(),
+        "discarded, not adopted"
     );
+    drop(session);
     drop(journals);
 
-    // The whole state dir is lost: another state dir starts its own.
+    // Refill it, then lose the whole state dir: another state dir starts
+    // its own.
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        for index in 0..pair.plan.segments() {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+    }
+    assert_eq!(quarantine_entries(&pair), leftover);
     let orphan = quarantine_dir(&pair);
     fs::remove_dir_all(&state).unwrap();
     let state = pair.scratch.state("state-b");
@@ -3261,8 +3268,8 @@ fn pr75_r2_n3_a_unicode_alias_of_a_plan_ref_is_refused() {
         session.receive(index, &mut &segment[..]).unwrap();
     }
     session.finish().unwrap();
-    let cut = cut_journal(&pair, &state, 3);
-    assert!(cut[0].starts_with("publishing "), "{cut:?}");
+    let cut = cut_journal(&pair, &state, 2);
+    assert!(cut[0].starts_with("published "), "{cut:?}");
     run(
         args(
             &pair.destination,
@@ -3287,48 +3294,236 @@ fn pr75_r2_n3_a_unicode_alias_of_a_plan_ref_is_refused() {
     assert_eq!(rev(&pair.destination, &alias), pair.held);
 }
 
-/// N3: a ref transaction that moves another carry ref (here a dangling
-/// symbolic carry ref, invisible to `for-each-ref`, that the new plan ref
-/// brings to life) refuses `carry_ref_moved` instead of finishing Done with
-/// unequal digests, and a resume compares against the journaled
-/// `publishing` digest, so it refuses again.
-#[test]
-fn pr75_r2_n3_a_carry_ref_moved_by_publication_refuses() {
-    let pair = pair("pr75-r2-n3-moved", DEFAULT_SEGMENT_CAP);
-    run(
-        args(
-            &pair.destination,
-            [
-                "symbolic-ref",
-                "refs/carry/v1/follower",
-                &pair.updates[0].name,
-            ],
-        ),
-        "dangling carry symref",
-    );
-    let state = pair.scratch.state("destination-state");
-    let journals = JournalStore::open(&state).unwrap();
-    let target = Target::probe(&pair.destination, None).unwrap();
-    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+/// Whether any `.keep` in `repo`'s `objects/pack` is a bulkload one.
+fn bulkload_keeps(repo: &Path) -> usize {
+    fs::read_dir(objects_dir(repo).join("pack"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|x| x == "keep"))
+        .filter(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .starts_with("bulkload git-carry-v2")
+        })
+        .count()
+}
+
+/// Receive every segment of `pair`'s plan in a new session from `state`.
+fn received<'a>(pair: &Pair, target: &'a Target, journals: &JournalStore) -> Ingest<'a> {
+    let mut session = Ingest::open(target, journals, pair.ingest_plan(), None).unwrap();
     for index in 0..pair.plan.segments() {
         let segment = pair.segment(index);
         session.receive(index, &mut &segment[..]).unwrap();
     }
-    let refused = session.finish().unwrap_err();
+    session
+}
+
+/// N3 / r3 M1: a ref that could alias a plan ref (here a dangling symbolic
+/// ref differing only in case, invisible to `for-each-ref` until the new
+/// plan ref brings it to life) changing in the transaction refuses
+/// `carry_ref_moved`. The session is not wedged: a resume refuses again
+/// (the alias now exists, `carry_ref_occupied`), and it can be abandoned
+/// past migration, which drops its `.keep`s and moves no ref.
+#[test]
+fn pr75_r3_m1_a_moved_alias_refuses_and_the_session_can_be_abandoned() {
+    let pair = pair("pr75-r3-m1-moved", DEFAULT_SEGMENT_CAP);
+    let name = pair.updates[0].name.clone();
+    let alias = name
+        .to_ascii_uppercase()
+        .replacen("REFS/CARRY/", "refs/carry/", 1);
+    run(
+        args(&pair.destination, ["symbolic-ref", &alias, &name]),
+        "dangling alias symref",
+    );
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let refused = received(&pair, &target, &journals).finish().unwrap_err();
     assert_eq!(refused.refusal, BulkloadRefusal::GitDestinationOccupied);
     assert_eq!(refused.reason, Some("carry_ref_moved"));
+    assert!(bulkload_keeps(&pair.destination) > 0);
+    let session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+    assert_eq!(
+        session.finish().unwrap_err().reason,
+        Some("carry_ref_occupied")
+    );
+    Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
+        .unwrap()
+        .abandon("carry_ref_moved")
+        .unwrap();
+    assert_eq!(bulkload_keeps(&pair.destination), 0, "keeps dropped");
+    assert!(quarantines(&pair).is_empty());
+    assert_eq!(rev(&pair.destination, &name), pair.updates[0].oid, "kept");
     let journal = fs::read_to_string(journal_path(&pair, &state)).unwrap();
-    assert!(journal.lines().last().unwrap().starts_with("publishing "));
+    assert!(journal
+        .lines()
+        .last()
+        .unwrap()
+        .starts_with("abandoned carry_ref_moved "));
+}
+
+/// r3 M1: a crash after the transaction and before `published` is
+/// journaled, then another carry ref changing (another session, the
+/// operator), no longer wedges the session: the digests cover only refs
+/// that could alias the plan, `before` is taken afresh on resume, and the
+/// resumed finish returns a receipt and drops the keeps.
+#[test]
+fn pr75_r3_m1_an_unrelated_carry_ref_change_never_wedges_a_resume() {
+    let pair = pair("pr75-r3-m1-unrelated", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    received(&pair, &target, &journals).finish().unwrap();
+    let cut = cut_journal(&pair, &state, 2);
+    assert!(cut[0].starts_with("published "), "{cut:?}");
+    run(
+        args(
+            &pair.destination,
+            ["update-ref", "refs/carry/v1/another/session", &pair.held],
+        ),
+        "another carry ref",
+    );
+    let receipt = Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(receipt.carry_refs_before, receipt.carry_refs_after);
+    assert_clean(&pair.destination, "r3-m1-unrelated");
+}
+
+/// r3 M1: two sessions of different plans finishing into one repository at
+/// once are fenced; both publish, each with equal digests, and neither
+/// sees the other's publication as a moved ref.
+#[test]
+fn pr75_r3_m1_concurrent_finishes_into_one_repository_both_publish() {
+    let first = pair("pr75-r3-m1-concurrent", DEFAULT_SEGMENT_CAP);
+    let offer = Offer::probe(&first.destination, None).unwrap();
+    let round = first_round(&first.sender, &offer, &first.sender.wants().unwrap(), None).unwrap();
+    let other = PackPlan::build(&first.sender, &round, 64 * 1024, None).unwrap();
+    assert_ne!(other.pack_id(), first.plan.pack_id());
+    let other_updates = vec![RefUpdate {
+        name: "refs/carry/v1/test/pr75-r3-m1-concurrent/other".to_owned(),
+        oid: other.wants()[0].clone(),
+    }];
+    let target = Target::probe(&first.destination, None).unwrap();
+    let journals_a = JournalStore::open(&first.scratch.state("state-a")).unwrap();
+    let journals_b = JournalStore::open(&first.scratch.state("state-b")).unwrap();
+    let a = received(&first, &target, &journals_a);
+    let mut b = Ingest::open(
+        &target,
+        &journals_b,
+        IngestPlan::of(&other, other_updates.clone()).unwrap(),
+        None,
+    )
+    .unwrap();
+    for index in 0..other.segments() {
+        let mut pack = Vec::new();
+        other
+            .send_segment(&first.sender, index, &mut pack, None)
+            .unwrap();
+        b.receive(index, &mut &pack[..]).unwrap();
+    }
+    let (ra, rb) = std::thread::scope(|scope| {
+        let ta = scope.spawn(move || a.finish());
+        let tb = scope.spawn(move || b.finish());
+        (ta.join().unwrap(), tb.join().unwrap())
+    });
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(ra.carry_refs_before, ra.carry_refs_after);
+    assert_eq!(rb.carry_refs_before, rb.carry_refs_after);
+    assert_eq!(
+        rev(&first.destination, &first.updates[0].name),
+        first.updates[0].oid
+    );
+    assert_eq!(
+        rev(&first.destination, &other_updates[0].name),
+        other_updates[0].oid
+    );
+    assert_clean(&first.destination, "r3-m1-concurrent");
+}
+
+/// r3 M2: a stale journal is removed before its replacement is created; a
+/// crash (or ENOSPC) in that gap leaves a quarantine under this state dir's
+/// name and no journal. The next open discards it and starts afresh
+/// instead of refusing `quarantine_exists` on every open.
+#[test]
+fn pr75_r3_m2_a_quarantine_without_a_journal_is_discarded_not_wedged() {
+    let pair = pair("pr75-r3-m2", 64 * 1024);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    let first = pair.segment(0);
+    session.receive(0, &mut &first[..]).unwrap();
+    let quarantine = quarantine_dir(&pair);
+    session.abandon("test_abandoned").unwrap();
+    // As if the abandoned journal was removed and the discard and the
+    // replacement never happened.
+    fs::create_dir_all(quarantine.join("pack")).unwrap();
+    fs::write(quarantine.join("pack/tmp_pack_left"), b"x").unwrap();
+    fs::remove_file(journal_path(&pair, &state)).unwrap();
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    assert_eq!(session.next_segment(), 0);
+    assert!(quarantine_entries(&pair).is_empty(), "discarded");
+    for index in 0..pair.plan.segments() {
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    session.finish().unwrap();
+    assert_clean(&pair.destination, "r3-m2");
+}
+
+/// r3 M3: a state dir lost and recreated at the same path has the same key,
+/// so its orphaned quarantine has this session's name; the fresh open
+/// discards it rather than wedging every open of that plan.
+#[test]
+fn pr75_r3_m3_a_recreated_state_dir_discards_its_orphaned_quarantine() {
+    let pair = pair("pr75-r3-m3", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let target = Target::probe(&pair.destination, None).unwrap();
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        drop(received(&pair, &target, &journals));
+    }
+    assert!(!quarantine_entries(&pair).is_empty());
+    fs::remove_dir_all(&state).unwrap();
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let session = received(&pair, &target, &journals);
+    assert_eq!(quarantines(&pair).len(), 1, "the same name, reused");
+    session.finish().unwrap();
+    assert_clean(&pair.destination, "r3-m3");
+}
+
+/// r3 M4: re-publishing a lost ref runs the full held-tip preflight, not
+/// only the refs-only check (which trusts the held tips): with a held tip's
+/// parent deleted since, the reopen refuses and nothing is republished, so
+/// `fsck --strict` is never handed a published ref over a broken closure.
+#[test]
+fn pr75_r3_m4_republication_runs_the_full_preflight() {
+    let pair = pair("pr75-r3-m4", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    received(&pair, &target, &journals).finish().unwrap();
+    let cut = cut_journal(&pair, &state, 1);
+    assert!(cut[0].starts_with("done "), "{cut:?}");
+    run(
+        args(
+            &pair.destination,
+            ["update-ref", "-d", &pair.updates[0].name],
+        ),
+        "lose the ref",
+    );
+    let parent = rev(&pair.destination, &format!("{}~1", pair.held));
+    fs::remove_file(pair.loose(&parent)).unwrap();
     let refused = Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
         .unwrap()
         .finish()
         .unwrap_err();
-    assert_eq!(refused.reason, Some("carry_ref_moved"));
-    let journal = fs::read_to_string(journal_path(&pair, &state)).unwrap();
-    assert!(
-        !journal.contains("\npublished "),
-        "never journaled published"
-    );
+    assert_eq!(refused.refusal, BulkloadRefusal::GitHavesUnprovable);
+    assert_eq!(refused.reason, Some("held_tip_closure_incomplete"));
+    assert!(!published(&pair), "not republished");
 }
 
 /// N4: two state dirs ingesting the same plan keep separate quarantines: a

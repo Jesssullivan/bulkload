@@ -113,10 +113,6 @@ pub(super) enum Record {
     Connected,
     /// `migrated`
     Migrated,
-    /// `publishing <carry refs before>`: the digest taken before the ref
-    /// transaction, journaled before it runs (#75 r2 N3), so a resume
-    /// compares against the state before any publication attempt.
-    Publishing(String),
     /// `published <carry refs before> <carry refs after>`
     Published(String, String),
     /// `done`
@@ -173,7 +169,6 @@ impl Record {
             } => format!("segment {index} {pack} {bytes} {blake3}"),
             Self::Connected => "connected".to_owned(),
             Self::Migrated => "migrated".to_owned(),
-            Self::Publishing(before) => format!("publishing {before}"),
             Self::Published(before, after) => format!("published {before} {after}"),
             Self::Done => "done".to_owned(),
             Self::Abandoned(reason) => format!("abandoned {reason}"),
@@ -219,7 +214,6 @@ impl Record {
             }
             ["connected"] => Self::Connected,
             ["migrated"] => Self::Migrated,
-            ["publishing", before] if digest(before) => Self::Publishing((*before).to_owned()),
             ["published", before, after] if digest(before) && digest(after) => {
                 Self::Published((*before).to_owned(), (*after).to_owned())
             }
@@ -276,12 +270,10 @@ pub(super) struct Journal {
 
 /// What an existing journal held when it was opened.
 pub(super) enum Found {
-    /// No journal existed.
+    /// No journal, or one with no sealed plan or abandoned (replaced by an
+    /// empty one). Either way any quarantine under this state dir's name is
+    /// garbage, and the session discards it (#75 r2 N2, r3 M2).
     Fresh(Journal),
-    /// A journal existed with no sealed plan, or abandoned; it was replaced
-    /// by an empty one. Whatever quarantine its session made under this
-    /// state dir's name is that session's, and is discarded (#75 r2 N2).
-    Stale(Journal),
     /// A journal with a sealed plan, and every record after it.
     Existing(Journal, Vec<Record>),
 }
@@ -289,7 +281,7 @@ pub(super) enum Found {
 impl Journal {
     /// Open (creating when absent) and lock `<pack_id>.journal`. A journal
     /// whose plan block never sealed, or that was abandoned, is removed and
-    /// a fresh one created ([`Found::Stale`]); a torn final line is cut off.
+    /// a fresh one created; a torn final line is cut off.
     ///
     /// # Errors
     /// `JOURNAL_OWNERSHIP_CONFLICT` when another session holds the lock,
@@ -333,7 +325,7 @@ impl Journal {
         let Self {
             directory, name, ..
         } = journal;
-        Self::create(directory, name).map(Found::Stale)
+        Self::create(directory, name).map(Found::Fresh)
     }
 
     fn create(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
@@ -488,7 +480,6 @@ mod tests {
             },
             Record::Connected,
             Record::Migrated,
-            Record::Publishing("3".repeat(64)),
             Record::Published("1".repeat(64), "2".repeat(64)),
             Record::Done,
             Record::Abandoned("connectivity_missing".to_owned()),

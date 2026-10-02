@@ -29,15 +29,15 @@
 //!    (Git finds a pack by its `.idx`) are renamed into `objects/pack` without
 //!    replacement; `objects/pack` is sealed, the quarantine removed, and
 //!    `objects/` sealed.
-//! 6. **Publish**: the before digest is journaled (`publishing`), then one
-//!    `update-ref --stdin -z` transaction outside the
+//! 6. **Publish**: under a per-repository fence (a `flock` on the common
+//!    dir, #75 r3 M1), one `update-ref --stdin -z` transaction outside the
 //!    quarantine. Each update is a `create` when the ref is absent and a
 //!    `verify` when it already names the oid; any other value refuses
 //!    `GIT_DESTINATION_OCCUPIED`. No existing ref is ever moved or deleted, so
 //!    existing `refs/carry/*` refs keep their digests; the receipt proves it
-//!    with a digest of every `refs/carry/*` ref outside the plan, taken
-//!    before and after the transaction; unequal digests refuse
-//!    `carry_ref_moved` (#75 r2 N3).
+//!    with a digest of every existing ref that could alias a plan ref,
+//!    taken before and after the transaction; unequal digests refuse
+//!    `carry_ref_moved` (#75 r2 N3, r3 M1).
 //! 7. **Keeps**: each migrated pack's `.keep` is dropped if it still holds
 //!    this session's message, and `objects/pack` is sealed.
 //!
@@ -46,8 +46,9 @@
 //! already moved; publication re-plans each `create` as a `verify` once the
 //! ref holds its oid; dropping a keep that is gone is a no-op. A receiving
 //! session whose quarantine lost a journaled pack is abandoned (#75 r2 N2);
-//! abandonment is journaled before the quarantine is discarded, and the next
-//! open discards what an abandoned or never-sealed session left.
+//! abandonment is journaled before the quarantine is discarded, and a fresh
+//! open discards whatever quarantine carries its own name (#75 r3 M2). A
+//! session past migration can still be abandoned (#75 r3 M1).
 //!
 //! Refusals: `held_tip_closure_incomplete` (preflight), `segment_invalid`
 //! (index-pack), `connectivity_missing`; all three are `GIT_HAVES_UNPROVABLE`
@@ -201,6 +202,24 @@ impl Target {
             .env("GIT_GRAFT_FILE", "/dev/null")
             .env("GIT_COMMIT_GRAPH_PARANOIA", "1");
         command
+    }
+
+    /// #75 r3 M1: an exclusive `flock` on the repository's common dir, held
+    /// by a finish or a post-migration abandon until the returned descriptor
+    /// closes, so two ingests into one repository never publish at once.
+    fn fence(&self) -> crate::Result<File> {
+        let common = open_dir(&self.common)?;
+        loop {
+            // SAFETY: `common` is an open descriptor for the life of this
+            // call; flock takes no pointers.
+            if unsafe { libc::flock(common.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(common);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error.into());
+            }
+        }
     }
 
     /// [`Target::git`] inside the quarantine `dir`: new objects go there,
@@ -457,10 +476,11 @@ pub struct IngestReceipt {
     pub segments: Vec<SegmentAck>,
     /// The refs published (created or verified), sorted by name.
     pub published: Vec<RefUpdate>,
-    /// BLAKE3 of every `refs/carry/*` ref outside the plan, before the
-    /// transaction.
+    /// BLAKE3 of every existing ref that could alias a plan ref (and is not
+    /// one), before the transaction (#75 r3 M1: no other ref is covered).
     pub carry_refs_before: String,
-    /// The same digest after it; equal when no existing carry ref moved.
+    /// The same digest after it; always equal in a receipt (unequal refuses
+    /// `carry_ref_moved`).
     pub carry_refs_after: String,
 }
 
@@ -512,8 +532,6 @@ pub struct Ingest<'a> {
     acks: Vec<SegmentAck>,
     stage: Stage,
     carry: Option<(String, String)>,
-    /// The journaled `publishing` digest, once the ref transaction began.
-    before: Option<String>,
     /// `incoming-bulkload-<pack_id>-<state key>` (#75 r2 N4).
     quarantine: String,
     store: Option<&'a StderrStore>,
@@ -581,22 +599,22 @@ impl<'a> Ingest<'a> {
         }
         let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key());
         let git_dir = target.repository.git_dir.as_path();
-        let (journal, stale) = match Journal::open(journals, &pack_id)? {
+        let journal = match Journal::open(journals, &pack_id)? {
             Found::Existing(journal, records) => {
                 return Self::existing(
                     target, journals, plan, journal, &records, quarantine, store,
                 );
             }
-            Found::Fresh(journal) => (journal, false),
-            Found::Stale(journal) => (journal, true),
+            Found::Fresh(journal) => journal,
         };
-        if stale {
-            // #75 r2 N2: an abandoned session, or one whose plan never
-            // sealed (a torn `planned` line), may have left its quarantine.
-            // The name is this state dir's, and the journal file is still
-            // here until the quarantine is gone, so it is ours to discard.
-            discard_quarantine(&target.objects, &quarantine)?;
-        }
+        // #75 r2 N2, r3 M2/M3: a quarantine under this state dir's name with
+        // no sealed journal is garbage: an abandoned session's, one whose
+        // plan never sealed (a torn `planned` line), one whose stale journal
+        // was removed and never recreated (a crash or ENOSPC in between), or
+        // a lost state dir's recreated at the same path. Only a session
+        // holding this journal's lock may use it, and this one does, so it
+        // is discarded, never adopted.
+        discard_quarantine(&target.objects, &quarantine)?;
         let Some(plan) = plan else {
             // A resume found nothing sealed; leave no empty journal.
             journal.remove()?;
@@ -609,25 +627,14 @@ impl<'a> Ingest<'a> {
             acks: Vec::new(),
             stage: Stage::Receiving,
             carry: None,
-            before: None,
             quarantine,
             store,
         };
         // A refusal here leaves nothing: no plan, no quarantine, no
-        // journal.
-        // #75 r1 B1: a fresh session never adopts a quarantine it did not
-        // make (a lost journal's; another state dir's has another name).
-        let fresh = session
-            .occupied()
-            .and_then(|()| session.preflight())
-            .and_then(|()| match open_dir(&session.quarantine_path()) {
-                Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(()),
-                Ok(_) => Err(Refused::because(
-                    BulkloadRefusal::GitDestinationOccupied,
-                    "quarantine_exists",
-                )),
-                Err(error) => Err(error.into()),
-            });
+        // journal. #75 r1 B1: a fresh session never adopts a quarantine it
+        // did not make (its own name's was discarded above; another state
+        // dir's has another name).
+        let fresh = session.occupied().and_then(|()| session.preflight());
         if let Err(refused) = fresh {
             session.journal.remove()?;
             return Err(refused);
@@ -666,7 +673,6 @@ impl<'a> Ingest<'a> {
             acks: Vec::new(),
             stage: Stage::Receiving,
             carry: None,
-            before: None,
             quarantine,
             store,
         };
@@ -720,15 +726,7 @@ impl<'a> Ingest<'a> {
                     self.stage = Stage::Connected;
                 }
                 (Record::Migrated, Stage::Connected) => self.stage = Stage::Migrated,
-                (Record::Publishing(before), Stage::Migrated) if self.before.is_none() => {
-                    self.before = Some(before.clone());
-                }
-                (Record::Published(before, after), Stage::Migrated)
-                    if self
-                        .before
-                        .as_ref()
-                        .is_none_or(|journaled| journaled == before) =>
-                {
+                (Record::Published(before, after), Stage::Migrated) => {
                     self.carry = Some((before.clone(), after.clone()));
                     self.stage = Stage::Published;
                 }
@@ -1095,24 +1093,34 @@ impl<'a> Ingest<'a> {
         Ok(ack)
     }
 
-    /// Give up a session that has not migrated: remove its quarantine and
-    /// journal it abandoned (the next open of the same `pack_id` starts
-    /// fresh).
+    /// Give up a session that is not done: journal it abandoned with
+    /// `reason`, then remove its quarantine, and, past migration, drop this
+    /// session's `.keep`s so the migrated packs are ordinary (unreferenced
+    /// ones become Git's to prune). The next open of the same `pack_id`
+    /// starts fresh.
+    ///
+    /// #75 r3 M1: a session past migration can be abandoned, so one whose
+    /// publication refuses (a plan ref occupied, a carry ref moved) is never
+    /// wedged. No ref is ever moved or deleted: a plan ref the transaction
+    /// already published stays.
     ///
     /// # Errors
-    /// `FIELD_DOMAIN_VIOLATION` once packs have migrated (such a session
-    /// can only finish); I/O failures.
+    /// `FIELD_DOMAIN_VIOLATION` for a done session; I/O failures.
     pub fn abandon(self, reason: &'static str) -> Outcome<()> {
-        if self.stage >= Stage::Migrated {
+        if self.stage == Stage::Done {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        let _fence = self.target.fence()?;
         self.abandon_journaled(reason)?;
+        if self.stage >= Stage::Migrated {
+            self.drop_keeps()?;
+        }
         Ok(())
     }
 
     /// #75 r2 N2: the abandonment is journaled before the quarantine is
     /// discarded. A crash between the two leaves an abandoned journal, and
-    /// the next open discards what is left ([`Found::Stale`]); a torn
+    /// the next open discards what is left; a torn
     /// `abandoned` line leaves a session whose quarantine is whole or
     /// partly gone, which resume abandons again.
     fn abandon_journaled(&self, reason: &'static str) -> crate::Result<()> {
@@ -1139,6 +1147,9 @@ impl<'a> Ingest<'a> {
         if self.acks.len() != self.plan.segments {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #75 r3 M1: one finish at a time per repository, so another
+        // session's publication never lands between this one's digests.
+        let _fence = self.target.fence()?;
         if self.stage == Stage::Receiving {
             // #75 r1 B1: the check sees exactly the journaled packs, and
             // every one of them is there.
@@ -1272,11 +1283,13 @@ impl<'a> Ingest<'a> {
     /// `refs/carry/*` refs outside the plan before and after.
     ///
     /// #75 r2 N3: [`Ingest::occupied`] runs first (a resume from `migrated`
-    /// reaches here without it). From `migrated`, the before digest is
-    /// journaled (`publishing`) before the transaction and a resume reuses
-    /// it; a transaction that moved any other carry ref (before != after)
-    /// refuses `GIT_DESTINATION_OCCUPIED` / `carry_ref_moved`, and nothing
-    /// is journaled published.
+    /// reaches here without it), and a transaction that changed a ref that
+    /// could alias a plan ref (before != after) refuses
+    /// `GIT_DESTINATION_OCCUPIED` / `carry_ref_moved`; nothing is journaled
+    /// published. #75 r3 M1: the digests cover only those refs
+    /// ([`Ingest::carry_digest`]) and are both taken now, under the
+    /// repository fence, so an unrelated carry ref changing never refuses,
+    /// and a resume takes `before` afresh.
     fn publish(&self) -> Outcome<(String, String)> {
         self.occupied()?;
         let current = self.current()?;
@@ -1299,15 +1312,7 @@ impl<'a> Ingest<'a> {
             transaction.extend_from_slice(update.oid.as_bytes());
             transaction.push(0);
         }
-        let before = match (&self.before, self.stage) {
-            (Some(journaled), Stage::Migrated) => journaled.clone(),
-            (None, Stage::Migrated) => {
-                let before = self.carry_digest()?;
-                self.journal.append(&[Record::Publishing(before.clone())])?;
-                before
-            }
-            _ => self.carry_digest()?,
-        };
+        let before = self.carry_digest()?;
         if !transaction.is_empty() {
             // #75 r1 D2: `--no-deref`, so a symref at a plan name is never
             // followed (and `occupied` refuses one before this).
@@ -1402,12 +1407,14 @@ impl<'a> Ingest<'a> {
 
     /// A journaled publication whose refs no longer resolve (lost to power
     /// loss after the journal record) is published again, once the objects
-    /// are shown complete without the quarantine (#75 r1 D1(b)).
+    /// are shown complete without the quarantine (#75 r1 D1(b)). #75 r3 M4:
+    /// the full preflight runs first: the refs-only check trusts the held
+    /// tips, so a held tip whose parent was deleted since would pass it.
     fn ensure_published(&self) -> Outcome<()> {
         if self.all_published()? {
             return Ok(());
         }
-        self.frontier()?;
+        self.preflight()?;
         self.connected_in_store()?;
         self.publish()?;
         Ok(())
@@ -1486,21 +1493,24 @@ impl<'a> Ingest<'a> {
         Ok(values)
     }
 
-    /// BLAKE3 over `<oid> <refname>` lines of every `refs/carry/*` ref whose
-    /// name the plan does not publish, in ref-name order, each oid resolved
-    /// byte-exactly by name ([`Ingest::resolve`]), so a ref that a
-    /// case-folded loose file now shadows changes the digest (#75 r1 B4).
+    /// BLAKE3 over `<oid> <refname>` lines of every existing ref that could
+    /// alias a plan ref ([`clashes`]) but is not one, in ref-name order, each
+    /// oid resolved byte-exactly by name ([`Ingest::resolve`]), so a ref that
+    /// a case-folded loose file now shadows changes the digest (#75 r1 B4).
+    /// #75 r3 M1: only those refs; another session's or the operator's
+    /// change to any other carry ref is not this transaction's doing.
     fn carry_digest(&self) -> Outcome<String> {
-        let ours: BTreeSet<&str> = self
-            .plan
-            .updates
-            .iter()
-            .map(|update| update.name.as_str())
-            .collect();
         let names: Vec<String> = self
-            .all_refs(Some("refs/carry/"))?
+            .all_refs(None)?
             .into_iter()
-            .filter(|name| !ours.contains(name.as_str()))
+            .filter(|name| {
+                self.plan.updates.iter().all(|update| update.name != *name)
+                    && self
+                        .plan
+                        .updates
+                        .iter()
+                        .any(|update| clashes(&update.name, name))
+            })
             .collect();
         let values = self.resolve(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
         let mut hasher = blake3::Hasher::new();
