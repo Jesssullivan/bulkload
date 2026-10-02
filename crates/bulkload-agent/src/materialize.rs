@@ -188,23 +188,22 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
-    /// This store's orphaned file temporaries, held open for their chunks
-    /// and removed only when the session finishes (R25: bytes the
-    /// destination already holds are never read from the source again).
+    /// This store's orphaned file temporaries, kept for their chunks and
+    /// removed only when the session finishes (R25: bytes the destination
+    /// already holds are never read from the source again). Every one is
+    /// kept, however many: a session can leave up to a whole committer group
+    /// and queue of sealed, held temporaries unrenamed (#77 round 2, N2). No
+    /// descriptor is held; each is opened by name when read.
     salvage: Vec<Salvaged>,
 }
 
-/// Orphaned file temporaries held open at once; past this they are removed
-/// at sweep time as before.
-const SALVAGE_FILES: usize = 64;
-
-/// An orphaned file temporary of this store, kept readable for chunk reuse
-/// until the session that found it finishes.
+/// An orphaned file temporary of this store, renamed to a name of this
+/// session (so a restarted agent with the same pid never collides with it,
+/// #77 round 2, N3) and kept until the session finishes.
 struct Salvaged {
-    parent: File,
+    parent: Arc<File>,
     name: CString,
     rel_path: Vec<u8>,
-    file: File,
 }
 
 /// How this invocation created directories (R-N119).
@@ -247,14 +246,24 @@ impl Destination {
         })
     }
 
-    /// The orphaned file temporaries found so far, held open for reuse.
-    pub(crate) fn salvaged(&self) -> impl Iterator<Item = &File> {
-        self.salvage.iter().map(|salvaged| &salvaged.file)
+    /// How many orphaned file temporaries the sweep has salvaged so far.
+    pub(crate) const fn salvaged(&self) -> usize {
+        self.salvage.len()
     }
 
-    /// The salvaged temporary at `index` in [`Destination::salvaged`] order.
-    pub(crate) fn salvaged_file(&self, index: usize) -> Option<&File> {
-        self.salvage.get(index).map(|salvaged| &salvaged.file)
+    /// Open the salvaged temporary at `index` read-only, by name, following
+    /// no link; `None` once it is gone or is not a regular file.
+    pub(crate) fn salvaged_file(&self, index: usize) -> Option<File> {
+        let salvaged = self.salvage.get(index)?;
+        open_regular(&salvaged.parent, &salvaged.name).ok()
+    }
+
+    /// Keep every salvaged temporary for a later session: a refused entry
+    /// may hold its only durable copy there (#77 round 2, N4).
+    pub fn keep_salvaged(&mut self) {
+        for salvaged in std::mem::take(&mut self.salvage) {
+            self.swept.left.push(salvaged.rel_path);
+        }
     }
 
     /// Remove every salvaged temporary by name, as the sweep would have, and
@@ -264,7 +273,7 @@ impl Destination {
     /// # Errors
     /// Refuses a failed directory seal.
     pub fn remove_salvaged(&mut self) -> Result<()> {
-        let mut touched: Vec<File> = Vec::new();
+        let mut touched: Vec<Arc<File>> = Vec::new();
         for salvaged in std::mem::take(&mut self.salvage) {
             match crate::io::sys::unlinkat(&salvaged.parent, &salvaged.name, false) {
                 Ok(()) => {
@@ -546,6 +555,8 @@ impl Destination {
     fn sweep(&mut self, directory: &File, rel_dir: &[u8], store: &Store) -> Result<()> {
         let euid = crate::io::sys::effective_uid();
         let mut removed = false;
+        let mut renamed = false;
+        let mut shared: Option<Arc<File>> = None;
         for (name, kind) in temporary_candidates(directory)? {
             let mut rel_path = rel_dir.to_vec();
             if !rel_path.is_empty() {
@@ -577,20 +588,31 @@ impl Destination {
             // once the inode is gone its number may be reused (N3).
             if want_directory {
                 store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
-            } else if stat.nlink == 1 && self.salvage.len() < SALVAGE_FILES {
+            } else if stat.nlink == 1 {
                 // An orphan with no other name may hold a whole staged
-                // output: keep it open for its chunks and remove it when the
-                // session finishes. A second link to a published output is
-                // removed at once; the output keeps the bytes.
-                if let Ok(file) = crate::io::sys::open_read_at(directory, &name) {
-                    self.salvage.push(Salvaged {
-                        parent: directory.try_clone()?,
-                        name,
-                        rel_path,
-                        file: File::from(file),
-                    });
-                    continue;
+                // output: keep it for its chunks and remove it when the
+                // session finishes. It takes a name of this session first,
+                // so no temporary this session stages can collide with it.
+                // A second link to a published output is removed at once;
+                // the output keeps the bytes.
+                let fresh = self.temporary(None)?;
+                let name = match crate::io::publish_noreplace(directory, &name, &fresh) {
+                    Ok(_) => {
+                        renamed = true;
+                        fresh
+                    }
+                    Err(_) => name,
+                };
+                if shared.is_none() {
+                    shared = Some(Arc::new(directory.try_clone()?));
                 }
+                let parent = Arc::clone(shared.as_ref().ok_or(BulkloadRefusal::Io(None))?);
+                self.salvage.push(Salvaged {
+                    parent,
+                    name,
+                    rel_path,
+                });
+                continue;
             }
             // `unlinkat` removes this one name: without AT_REMOVEDIR never a
             // directory (the inode survives under any other link), with it
@@ -604,7 +626,7 @@ impl Destination {
                 Err(_) => self.swept.left.push(rel_path),
             }
         }
-        if removed {
+        if removed || renamed {
             directory.sync_dir_counted()?;
         }
         Ok(())
@@ -724,12 +746,23 @@ impl Destination {
     /// Refuses an unsafe ancestor or a failed create.
     pub(crate) fn stage(&self, row: &RowSchema) -> Result<StagedFile> {
         let (parent, leaf) = self.shared_parent(&row.rel_path)?;
-        let temporary = self.temporary(None)?;
-        let file = File::from(crate::io::sys::create_excl_at(
-            parent.as_fd(),
-            &temporary,
-            0o600,
-        )?);
+        // A name of this pid and counter can exist already, left by an
+        // earlier agent that had the same pid (a container's pid 1): take
+        // the next name rather than refusing the file (#77 round 2, N3).
+        let mut attempts = 0;
+        let (temporary, file) = loop {
+            let temporary = self.temporary(None)?;
+            match crate::io::sys::create_excl_at(parent.as_fd(), &temporary, 0o600) {
+                Ok(file) => break (temporary, File::from(file)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempts < STAGE_ATTEMPTS =>
+                {
+                    attempts += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         Ok(StagedFile {
             parent,
             temporary,
@@ -869,6 +902,15 @@ fn unlink(parent: &File, name: &CString) -> Result<()> {
     Ok(crate::io::sys::unlinkat(parent, name, false)?)
 }
 
+/// The serial the next temporary name of this process takes.
+#[cfg(test)]
+pub(crate) fn next_temporary_serial() -> u64 {
+    NEXT_TEMPORARY.load(Ordering::Relaxed)
+}
+
+/// Names a stage tries before an occupied name is a refusal.
+const STAGE_ATTEMPTS: u32 = 64;
+
 /// One destination output for a group commit.
 pub(crate) enum Publication {
     /// A fully written staged file to seal, rename into place and record.
@@ -902,7 +944,13 @@ pub(crate) struct PublishSink {
     /// Device of the store. Its commit's full flush drains only this device.
     store_device: u64,
     outcomes: Vec<(Vec<u8>, Result<()>)>,
+    /// Told each group's outcomes, by relative path, once the group's
+    /// commit has returned: what the receiving side reports as held.
+    notify: Option<std::sync::mpsc::Sender<GroupOutcomes>>,
 }
+
+/// One group's outcomes by relative path: `true` when committed.
+pub(crate) type GroupOutcomes = Vec<(Vec<u8>, bool)>;
 
 impl PublishSink {
     /// `publisher` holds the destination store's single-writer guard.
@@ -915,7 +963,14 @@ impl PublishSink {
             publisher,
             store_device,
             outcomes: Vec::new(),
+            notify: None,
         })
+    }
+
+    /// Report every group's outcomes on `notify` after its commit.
+    pub(crate) fn with_notify(mut self, notify: std::sync::mpsc::Sender<GroupOutcomes>) -> Self {
+        self.notify = Some(notify);
+        self
     }
 
     /// Treat the store as if it lived on `device` (tests of the
@@ -982,6 +1037,7 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 
     fn commit(&mut self, items: Vec<Publication>) {
+        let reported = self.outcomes.len();
         #[cfg(feature = "fault-injection")]
         let _note = {
             let ids: Vec<usize> = (0..items.len()).collect();
@@ -1032,6 +1088,18 @@ impl crate::io::durable::GroupSink for PublishSink {
         });
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
+        }
+        if let Some(notify) = &self.notify {
+            let group = self
+                .outcomes
+                .get(reported..)
+                .unwrap_or_default()
+                .iter()
+                .map(|(rel_path, outcome)| (rel_path.clone(), outcome.is_ok()))
+                .collect();
+            // The receiving side may have stopped; its outcomes still reach
+            // `finish`.
+            let _ = notify.send(group);
         }
     }
 

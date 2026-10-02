@@ -14,6 +14,9 @@
 //!   made durable names a file holding the source's bytes; a completed
 //!   directory record names a directory with the source's mode; a directory
 //!   record bound to an inode names a directory that exists;
+//! - **captured ⇒ held** (R25 strict, OI-1001-Q15): every source capture a
+//!   completed ledger commit made durable has its bytes in the destination
+//!   view, under the final name or a temporary the resume salvages;
 //! - **no torn final names**: every regular file under a final (non
 //!   `.bulkload-*`) name holds exactly the source's bytes, and every symlink
 //!   the source's target;
@@ -54,6 +57,7 @@ use bulkload_agent::durable::{set_durability, Durability};
 use bulkload_agent::trace::recorder::Recorder;
 use bulkload_agent::trace::{CommitRecord, Event, NodeId, SyncKind};
 use bulkload_agent::transfer::copy;
+use bulkload_proto::RowSchema;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -255,8 +259,25 @@ fn invariant(
                         return Err(format!("recorded directory inode {node:?} is not named"));
                     }
                 }
-                CommitRecord::DirectoryCreated { node: None, .. }
-                | CommitRecord::Capture { .. } => {}
+                // R25 strict (OI-1001-Q15, #77 round 2, N1): a committed
+                // capture means its bytes are held durably here, under the
+                // final name or a salvageable temporary, so the resume never
+                // reads them from the source again.
+                CommitRecord::Capture { key } => {
+                    let (_, row): (Vec<u8>, RowSchema) = postcard::from_bytes(key).unwrap();
+                    if let Some(want) = expected.files.get(&row.rel_path) {
+                        let held = view.walk().into_iter().any(|(_, entry)| {
+                            matches!(entry, Entry::File { data, .. } if data == want.as_slice())
+                        });
+                        if !held {
+                            return Err(format!(
+                                "committed capture {} has no held bytes",
+                                name(&row.rel_path)
+                            ));
+                        }
+                    }
+                }
+                CommitRecord::DirectoryCreated { node: None, .. } => {}
             }
         }
     }

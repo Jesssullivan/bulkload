@@ -181,11 +181,15 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   ledger's last commit.
 - **Held.** The destination answers every `End` with `Held`. A capture is
   committed to the ledger only when the destination holds its bytes
-  durably (a sealed temporary, or an existing output verified against the
-  manifest), so a committed capture is never read from the source again
-  (R25, OI-1001-Q15): a resume adopts the final name, or salvages the
-  sealed temporary (the sweep keeps this store's orphaned file temporaries
-  open as a chunk source and removes them when the session finishes).
+  durably: `Held{true}` is sent once the output's group commit has
+  returned (file and directory sealed, then the store commit), for a
+  written output or an existing one verified against the manifest. No
+  flush is added for it. So a committed capture is never read from the
+  source again (R25, OI-1001-Q15): a resume reuses or adopts the final
+  name, or salvages a temporary. The sweep keeps every one of this
+  store's orphaned file temporaries as a chunk source, under a name of the
+  new session, and removes them when the session finishes, unless the
+  destination refused an entry, in which case they are kept for the next.
 - **Hints.** The destination records, per digest, every published output
   holding it, newest first; a hint is re-read and re-verified on use, and a
   miss falls through to the next.

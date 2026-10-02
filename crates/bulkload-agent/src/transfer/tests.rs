@@ -168,6 +168,114 @@ fn interrupted_transport_resumes_completed_captures_without_source_reads() {
     }
 }
 
+/// This store's temporary name `<tag>-<pid>-<serial>`.
+fn own_temporary(corpus: &Corpus, pid: u32, serial: u64) -> PathBuf {
+    let tag = {
+        let store = Store::open(&corpus.base.join("destination-state")).unwrap();
+        crate::materialize::temporary_tag(&store.authority().unwrap())
+    };
+    let mut name = b".bulkload-".to_vec();
+    name.extend_from_slice(&tag);
+    name.extend_from_slice(format!("-{pid}-{serial}").as_bytes());
+    corpus
+        .base
+        .join("destination")
+        .join(std::ffi::OsString::from_vec(name))
+}
+
+/// #77 round 2, N2: a crash can leave a whole committer group and queue of
+/// held temporaries unrenamed. Every one is salvaged, however many: 70
+/// orphans whose captures committed cost 0 source reads.
+#[test]
+fn every_held_temporary_is_salvaged() {
+    const FILES: u64 = 70;
+    let corpus = Corpus::new();
+    for index in 0..FILES {
+        std::fs::write(
+            corpus.base.join("source").join(format!("file-{index:03}")),
+            noise(100 + index, 20_000),
+        )
+        .unwrap();
+    }
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    for index in 0..FILES {
+        std::fs::rename(
+            corpus
+                .base
+                .join("destination")
+                .join(format!("file-{index:03}")),
+            own_temporary(&corpus, 1, index),
+        )
+        .unwrap();
+    }
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.completed, FILES);
+    assert_eq!(resumed.source_bytes_read, 0);
+    assert_eq!(resumed.bytes_received, 0);
+    assert_eq!(resumed.temporaries_removed, FILES);
+}
+
+/// #77 round 2, N3: orphans named with this process's pid and the serials
+/// it is about to use (an agent restarted with the same pid) never make a
+/// stage collide: the sweep renames salvaged orphans to names of this
+/// session, and a stage that still meets an occupied name takes the next.
+#[test]
+fn orphans_with_this_pid_never_block_a_stage() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/seed"), b"seed").unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    for index in 0..5 {
+        std::fs::write(
+            corpus.base.join("source").join(format!("new-{index}")),
+            noise(200 + index, 10_000),
+        )
+        .unwrap();
+    }
+    let next = crate::materialize::next_temporary_serial();
+    let orphans: Vec<PathBuf> = (next..next + 100)
+        .map(|serial| own_temporary(&corpus, std::process::id(), serial))
+        .collect();
+    for orphan in &orphans {
+        std::fs::write(orphan, b"left by an earlier agent").unwrap();
+    }
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.completed, 5);
+    assert_eq!(resumed.temporaries_removed, 100);
+    for orphan in &orphans {
+        assert!(!orphan.exists());
+    }
+}
+
+/// #77 round 2, N4: after a destination-side refusal, salvaged temporaries
+/// are kept, so a refused entry whose only durable copy is one of them is
+/// not read from the source on the next run.
+#[test]
+fn salvage_survives_a_destination_refusal() {
+    let corpus = Corpus::new();
+    let bytes = noise(41, 1 << 20);
+    std::fs::write(corpus.base.join("source/held"), &bytes).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let temporary = own_temporary(&corpus, 1, 7);
+    std::fs::rename(corpus.base.join("destination/held"), &temporary).unwrap();
+    // The path is taken by a directory: the destination refuses the entry.
+    std::fs::create_dir(corpus.base.join("destination/held")).unwrap();
+    let refused = corpus.run().unwrap();
+    assert_eq!(refused.refusals.len(), 1, "{:?}", refused.refusals);
+    assert_eq!(refused.temporaries_removed, 0);
+    assert_eq!(refused.temporaries_left.len(), 1);
+    std::fs::remove_dir(corpus.base.join("destination/held")).unwrap();
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.source_bytes_read, 0);
+    assert_eq!(resumed.bytes_received, 0);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/held")).unwrap(),
+        bytes
+    );
+}
+
 /// A file the destination staged and sealed but never published (a crash
 /// before its rename) is salvaged: the resume fills it from the orphaned
 /// temporary against the ledger's manifest, with no source read and nothing

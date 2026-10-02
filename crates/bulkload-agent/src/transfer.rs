@@ -1210,10 +1210,16 @@ impl Salvage {
     /// Index any temporaries the sweep has salvaged since the last call, by
     /// chunking them as the source does. Unreadable bytes only cost reuse.
     fn refresh(&mut self, target: &Destination) {
-        let files: Vec<&std::fs::File> = target.salvaged().collect();
-        for (at, file) in files.iter().enumerate().skip(self.indexed) {
+        let salvaged = target.salvaged();
+        for at in self.indexed..salvaged {
+            let Some(file) = target.salvaged_file(at) else {
+                continue;
+            };
             let mut offset = 0_u64;
-            let reader = SalvageReader { file, offset: 0 };
+            let reader = SalvageReader {
+                file: &file,
+                offset: 0,
+            };
             for chunk in fastcdc::v2020::StreamCDC::new(
                 reader,
                 crate::hash::CDC_MIN_BYTES,
@@ -1230,7 +1236,7 @@ impl Salvage {
                 offset = offset.saturating_add(size);
             }
         }
-        self.indexed = files.len();
+        self.indexed = salvaged;
     }
 }
 
@@ -1256,16 +1262,26 @@ fn finish_receive(
     store: &Store,
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
+    mut destination_refused: bool,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
             Ok(()) => stats.completed += 1,
-            Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
+            Err(refusal) => {
+                destination_refused = true;
+                stats.refusals.push((rel_path, refusal.code().to_owned()));
+            }
         }
     }
-    // Every output is committed, so no output needs a salvaged temporary any
-    // more: remove them as the sweep would have.
-    target.remove_salvaged()?;
+    // With every output committed, no output needs a salvaged temporary:
+    // remove them as the sweep would have. After a destination-side refusal
+    // keep them: the refused entry's only durable copy may be one of them
+    // (#77 round 2, N4). Source-side refusals never held bytes here.
+    if destination_refused {
+        target.keep_salvaged();
+    } else {
+        target.remove_salvaged()?;
+    }
     stats.temporaries_removed = target.swept().removed;
     stats.temporaries_left.clone_from(&target.swept().left);
     stats.directories_renamed = target.created().renamed;
@@ -1281,10 +1297,15 @@ fn finish_receive(
 /// The destination's committer, sized to the descriptor budget: a quarter
 /// for session reuse, a quarter for staged files queued or grouped for
 /// commit, which hold one descriptor each.
-fn publication_committer(state: &Path, budget: u64) -> Result<Committer<PublishSink>> {
+fn publication_committer(
+    state: &Path,
+    budget: u64,
+    notify: Sender<crate::materialize::GroupOutcomes>,
+) -> Result<Committer<PublishSink>> {
     let staged = (budget / 8).clamp(2, crate::io::durable::GROUP_FILES);
     Committer::spawn_with(
-        PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?,
+        PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?
+            .with_notify(notify),
         crate::io::durable::Limits {
             group_files: staged,
             queue_depth: usize::try_from(staged).unwrap_or(1),
@@ -1415,6 +1436,14 @@ struct Inbound<'a, W> {
     open: usize,
     fill_locally: bool,
     salvage: Salvage,
+    /// The destination refused an entry itself (not the source).
+    destination_refused: bool,
+    /// Entries queued for their group commit, by relative path, awaiting
+    /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
+    pending_held: HashMap<Vec<u8>, u64>,
+    committed: Receiver<crate::materialize::GroupOutcomes>,
+    /// The source has offered every entry.
+    walk_done: bool,
     /// Granted payload bytes not yet received.
     granted: u64,
     /// Received payload bytes not yet returned as credit.
@@ -1439,7 +1468,8 @@ pub fn receive<R: Read, W: Write>(
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
     let budget = crate::io::limits::descriptor_budget();
-    let committer = publication_committer(destination_state, budget)?;
+    let (notify, group_outcomes) = std::sync::mpsc::channel();
+    let committer = publication_committer(destination_state, budget, notify)?;
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
@@ -1481,16 +1511,29 @@ pub fn receive<R: Read, W: Write>(
         open: 0,
         fill_locally,
         salvage: Salvage::default(),
+        destination_refused: false,
+        pending_held: HashMap::new(),
+        committed: group_outcomes,
+        walk_done: false,
         granted: CREDIT_WINDOW,
         consumed: 0,
     };
     let source_bytes_read = receiver.run(input)?;
     let Inbound {
-        mut stats, session, ..
+        mut stats,
+        session,
+        destination_refused,
+        ..
     } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
-    finish_receive(&mut target, &store, committer, &mut stats)?;
+    finish_receive(
+        &mut target,
+        &store,
+        committer,
+        &mut stats,
+        destination_refused,
+    )?;
     Ok(stats)
 }
 
@@ -1503,6 +1546,10 @@ impl<W: Write> Inbound<'_, W> {
         let mut offered = 0_u64;
         let mut walk_done = None;
         loop {
+            // Before blocking on the next frame: answer what has committed,
+            // and once the stream is drained, commit and answer the rest
+            // (the source waits for every `Held` before it finishes).
+            self.settle_held()?;
             match read_frame(input)? {
                 Frame::Control(Control::Entry { entry, row }) => {
                     if entry != offered || walk_done.is_some() {
@@ -1529,6 +1576,8 @@ impl<W: Write> Inbound<'_, W> {
                         return Err(BulkloadRefusal::FrameCodec);
                     }
                     walk_done = Some(entries);
+                    self.walk_done = true;
+                    self.settle_held()?;
                 }
                 Frame::Control(Control::Manifest {
                     entry,
@@ -1556,6 +1605,7 @@ impl<W: Write> Inbound<'_, W> {
 
 impl<W: Write> Inbound<'_, W> {
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
+        self.destination_refused = true;
         self.stats
             .refusals
             .push((rel_path, refusal.code().to_owned()));
@@ -1582,10 +1632,7 @@ impl<W: Write> Inbound<'_, W> {
                 // an existing output to adopt, or chunks held by published
                 // outputs. Otherwise the source reads the file exactly once.
                 Ok(
-                    if identity.is_some()
-                        || self.fill_locally
-                        || self.target.salvaged().next().is_some()
-                    {
+                    if identity.is_some() || self.fill_locally || self.target.salvaged() > 0 {
                         Decision::WantManifest
                     } else {
                         Decision::Send
@@ -1813,17 +1860,55 @@ impl<W: Write> Inbound<'_, W> {
                 (rel_path, self.end_filling(filling))
             }
         };
-        let held = outcome.is_ok();
-        if let Err(refusal) = outcome {
-            self.refuse(rel_path, &refusal);
+        // Every End is answered. `held` is sent once the output's group
+        // has committed: its file and directory are sealed and the store
+        // commit has drained them, so the bytes are durable here under the
+        // final name (#77 round 2, N1). Only then may the source record the
+        // capture, which therefore never costs a source read again.
+        match outcome {
+            Ok(()) => {
+                self.pending_held.insert(rel_path, entry);
+            }
+            Err(refusal) => {
+                self.refuse(rel_path, &refusal);
+                write_control(self.output, &Control::Held { entry, held: false })?;
+            }
         }
-        // Every End is answered. `held` means the bytes are durable here (a
-        // sealed temporary or a verified existing output), so the source may
-        // record the capture: a committed capture never costs a source read
-        // again, because a resume salvages or adopts what is held.
-        write_control(self.output, &Control::Held { entry, held })?;
+        self.settle_held()?;
         fault_point!(ReceiveAfterEnd);
         Ok(())
+    }
+
+    /// Send `Held` for every entry whose group commit has returned.
+    fn answer_held(&mut self) -> Result<()> {
+        while let Ok(group) = self.committed.try_recv() {
+            for (rel_path, held) in group {
+                let Some(entry) = self.pending_held.remove(&rel_path) else {
+                    continue;
+                };
+                if !held {
+                    self.destination_refused = true;
+                }
+                write_control(self.output, &Control::Held { entry, held })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Once nothing more can arrive before the source waits for its `Held`
+    /// answers (every entry offered, none with content outstanding), commit
+    /// the open group now and answer every entry.
+    fn settle_held(&mut self) -> Result<()> {
+        if self.pending_held.is_empty() || !self.walk_done || !self.incoming.is_empty() {
+            return self.answer_held();
+        }
+        self.committer.sync()?;
+        self.answer_held()?;
+        if self.pending_held.is_empty() {
+            Ok(())
+        } else {
+            Err(BulkloadRefusal::Io(None))
+        }
     }
 
     fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32]) -> Result<()> {
@@ -1862,16 +1947,7 @@ impl<W: Write> Inbound<'_, W> {
                         chunks: specs,
                     };
                     let identity = verify_existing(&file, &row, &manifest)?;
-                    return self.committer.submit(Publication::Adopted {
-                        record: OutputRecord {
-                            key,
-                            rel_path: row.rel_path.clone(),
-                            identity,
-                            hints: Vec::new(),
-                        },
-                        file,
-                        parent,
-                    });
+                    return self.adopt(file, parent, &row, key, identity);
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -1909,18 +1985,8 @@ impl<W: Write> Inbound<'_, W> {
         match plan {
             Plan::Refuse(refusal) => Err(refusal),
             Plan::Adopt(file, parent) => {
-                verify_existing(&file, &row, &manifest).and_then(|identity| {
-                    self.committer.submit(Publication::Adopted {
-                        record: OutputRecord {
-                            key,
-                            rel_path: row.rel_path.clone(),
-                            identity,
-                            hints: Vec::new(),
-                        },
-                        file,
-                        parent,
-                    })
-                })
+                let identity = verify_existing(&file, &row, &manifest)?;
+                self.adopt(file, parent, &row, key, identity)
             }
             Plan::Write(staging) => {
                 self.open -= 1;
@@ -1934,11 +2000,34 @@ impl<W: Write> Inbound<'_, W> {
         }
     }
 
-    /// Apply the final mode, seal the temporary (the bytes are now held
-    /// durably, see [`Control::Held`]) and queue it for its group commit.
+    /// Queue a verified existing output for its group commit, which seals
+    /// it and its directory before the commit (#77 round 2, N4: an adopted
+    /// output is reported held only after that commit).
+    fn adopt(
+        &self,
+        file: std::fs::File,
+        parent: Arc<std::fs::File>,
+        row: &RowSchema,
+        key: Vec<u8>,
+        identity: StatIdentity,
+    ) -> Result<()> {
+        self.committer.submit(Publication::Adopted {
+            record: OutputRecord {
+                key,
+                rel_path: row.rel_path.clone(),
+                identity,
+                hints: Vec::new(),
+            },
+            file,
+            parent,
+        })
+    }
+
+    /// Apply the final mode and queue a fully written staged file for its
+    /// group commit, which seals it, renames it and seals its directory.
     fn publish(
         &mut self,
-        mut staged: StagedFile,
+        staged: StagedFile,
         row: &RowSchema,
         key: Vec<u8>,
         hints: Vec<ChunkHint>,
@@ -1950,10 +2039,6 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refusal);
         }
         fault_point!(MaterializeAfterTempWrite);
-        if let Err(refusal) = staged.seal() {
-            let _ = staged.discard();
-            return Err(refusal);
-        }
         self.session.insert(Arc::clone(staged.file()), &hints);
         self.committer.submit(Publication::Staged {
             staged,
@@ -2137,7 +2222,7 @@ fn local_chunk(
             if let Some(data) = context
                 .target
                 .salvaged_file(*at)
-                .and_then(|file| read_verified(file, *offset, size, digest))
+                .and_then(|file| read_verified(&file, *offset, size, digest))
             {
                 return Ok(Some(data));
             }

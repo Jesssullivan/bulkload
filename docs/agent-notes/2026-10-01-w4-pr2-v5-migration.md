@@ -157,6 +157,47 @@ Fix-round gates are on the PR and TIN-4543. The session scratchpad is
 shared with other lanes, so lane logs moved to a private subdirectory after
 one log was overwritten mid-run.
 
+## Review round 2 (BLOCK at e99a768) and fix round
+
+Rulings: OI-1001-Q18 (fix round, then re-review), R-N13.
+
+- **N1.** `Held` was sent before the temporary's directory entry was
+  durable.
+  - `Held{true}` is now sent only after the output's group commit returns.
+    The committer reports each group's outcomes on a channel; the receive
+    side answers between frames, and once the stream is drained (walk done,
+    no content outstanding) it syncs the committer and answers the rest.
+  - The group commit already seals the file and directory and drains them
+    with the store commit, so no flush is added.
+  - The receive-side seal from round 1 is gone, back in the committer. This
+    also settles the deferred receive-thread stall.
+  - An adopted output is likewise reported only after its commit (N4).
+  - An interim batched directory-seal design was dropped: it added a full
+    flush per batch and broke `w3_engine`'s "full flushes ≤ groups + 2".
+  - The first version of this answered the stream's tail only after an
+    `End`. When the session's last event was a source-side refusal (the
+    live-writer victim), the session hung. The receive loop now settles
+    `Held` before every blocking read, and the live-writer tests cover it.
+    That hung test run, under the pinned `target/fault`, was left to the
+    harness's own time limit (never signalled; R-N11). The rerun used
+    `target/fault2`.
+  - The power-loss invariant "captured ⇒ held" is permanent in
+    `power_loss.rs`. Two mutants are caught by both
+    `every_power_loss_state_*` tests ("committed capture … has no held
+    bytes"): `Held` at `End`, and the interim batch without its flush.
+- **N2.** Salvage has no cap: every orphan is kept, and none holds a
+  descriptor (each is opened by name when read). Test:
+  `every_held_temporary_is_salvaged` (70 orphans, 0 source reads).
+- **N3.** The sweep renames each salvaged orphan to a name of this session.
+  `stage` retries a fresh name on `EEXIST`, up to 64 times. Test:
+  `orphans_with_this_pid_never_block_a_stage` (100 orphans on this pid's
+  next serials).
+- **N4.** Salvage is kept, not removed, after a destination-side refusal.
+  Test: `salvage_survives_a_destination_refusal`.
+- **Deferred.** The reviewer's gate (a) measurement plan is recorded on
+  #88. With `Held` after the group commit, the seal is off the receive
+  thread again.
+
 ## Open
 
 - Adversarial review of #77 (R-N71), then CI on GloriousFlywheel.
