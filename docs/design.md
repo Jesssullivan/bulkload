@@ -174,6 +174,14 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   1024 undecided, and the destination answers each with `Decide`: `Skip` (a
   directory or symlink it made), `Reuse` (it holds this exact stat identity
   durably; the source reads nothing), `Refuse`, `Send` or `WantManifest`.
+- **Walk.** The source walk is a stream: each seat is offered as it is
+  found, a directory before anything beneath it, names in byte order within
+  a directory and no global sort, so the first `Entry` leaves before the
+  walk ends. The walk runs at most 4096 items ahead of the wire. Every seat
+  is walked and read beneath one descriptor of the source root, opened
+  component by component with `O_NOFOLLOW` at each one, so a directory
+  swapped for a symlink is refused, never followed out of the root. Content
+  is read with `pread`, never mapped.
 - **Send.** The source reads the file once, chunks it, hashes each chunk and
   streams it as a data frame (entry, chunk index, offset, size, digest), then
   sends `End` with the manifest root, chunk count and size. The destination

@@ -22,11 +22,21 @@
 //! its ledger records digests and sizes only, so a refused capture leaves
 //! nothing behind (R-N86). The destination writes each output from
 //! digest-verified chunks and publishes it through group commit
-//! ([`crate::io::durable`]). Enumeration still walks the whole tree first;
-//! the streaming walk is W4 PR 3.
+//! ([`crate::io::durable`]).
+//!
+//! The source walk is a stream (W4 PR 3): a walk thread yields seats as it
+//! finds them, a directory before anything beneath it, and the sending
+//! thread offers each as soon as the entry window has room, so the first
+//! `Entry` leaves before the walk ends. The walk runs at most
+//! [`WALK_AHEAD`] items ahead of the wire. Every source seat, walked or
+//! read, is resolved component by component beneath one descriptor of the
+//! source root (`openat` with `O_NOFOLLOW` at every component): an
+//! intermediate directory swapped for a symlink is refused, never followed
+//! out of the root. Content is read with `pread`, never mapped.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IoSlice, Read, Write};
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
@@ -42,7 +52,7 @@ use bulkload_proto::frame::{
 use bulkload_proto::{FileKind, PROTO_VERSION};
 
 use crate::counters::{self, Counter};
-use crate::freshness::{NullCache, StatIdentity};
+use crate::freshness::StatIdentity;
 use crate::io::durable::Committer;
 use crate::materialize::{
     verify_existing, Destination, PendingOutput, Publication, PublishSink, StagedFile,
@@ -50,13 +60,16 @@ use crate::materialize::{
 use crate::transfer_store::{
     row_key, ChunkHint, LedgerItem, LedgerSink, Manifest, OutputRecord, PublisherSide, Store,
 };
-use crate::walk::{walk, WalkOptions};
+use crate::walk::{WalkItem, Walker};
 use crate::{BulkloadRefusal, Result, RowSchema};
 
 /// Capture threads on the source.
 const CAPTURE_WORKERS: usize = 4;
 /// Entries offered but not yet decided, at most.
 const ENTRY_WINDOW: usize = 1024;
+/// Walked items not yet written to the wire, at most: the streaming walk
+/// runs this far ahead of the sending thread and then waits.
+const WALK_AHEAD: usize = 4 * ENTRY_WINDOW;
 /// Entries whose content is in flight on the source, at most. Each may hold
 /// one staged file open on the destination.
 const ACTIVE_ENTRIES: usize = CAPTURE_WORKERS * 4;
@@ -75,7 +88,8 @@ const RETAIN_BYTES: u64 = 512 * 1024 * 1024;
 const SESSION_FILES: u64 = 256;
 // Outputs held open while one manifest is filled from committed hints.
 const HINT_FILES: usize = 16;
-// Manifests are bounded separately. The existing full census remains O(N).
+// Manifests are bounded separately. The walk is streamed; the source keeps
+// one small slot per offered entry and drops each row once it is retired.
 const MAX_MANIFEST_CHUNKS: usize = 131_072;
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
@@ -334,12 +348,13 @@ impl Drop for Retained {
 /// Work for a capture thread.
 enum Job {
     /// Read, chunk and stream entry `entry`.
-    Send { entry: u64 },
+    Send { entry: u64, row: Arc<RowSchema> },
     /// Produce entry `entry`'s manifest, from the ledger when it can.
-    Manifest { entry: u64 },
+    Manifest { entry: u64, row: Arc<RowSchema> },
     /// Send the requested chunks of an offered manifest, then `End`.
     Serve {
         entry: u64,
+        row: Arc<RowSchema>,
         manifest: Manifest,
         indices: Vec<u32>,
         retained: Option<Retained>,
@@ -364,6 +379,10 @@ enum Event {
         held: bool,
     },
     PeerFailed(BulkloadRefusal),
+    /// One item of the streaming walk, its walk-ahead slot already taken.
+    Walked(WalkItem),
+    /// The streaming walk has yielded its last item.
+    WalkEnded,
     /// One chunk, its credit already taken.
     Chunk {
         header: DataHeader,
@@ -396,7 +415,6 @@ enum Event {
 
 /// Where one entry stands on the source.
 enum SourceEntry {
-    Unoffered,
     Undecided,
     Queued,
     Working,
@@ -431,12 +449,78 @@ static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// What every capture thread shares.
 struct SourceWork<'a> {
+    #[cfg_attr(
+        not(feature = "fault-injection"),
+        allow(dead_code, reason = "only the mid-read fault hook names the path")
+    )]
     root: &'a Path,
+    /// The source root every read resolves beneath, component by component.
+    root_fd: BorrowedFd<'a>,
     authority: &'a [u8],
     state: &'a Path,
-    rows: &'a [RowSchema],
     credit: &'a Credit,
     retain: Arc<AtomicU64>,
+}
+
+/// Walk-ahead slots: the walk thread takes one per item it hands over, and
+/// the sending thread gives it back once the item is on the wire.
+struct WalkGate {
+    state: Mutex<(usize, bool)>,
+    ready: Condvar,
+}
+
+impl WalkGate {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Take one slot, waiting while [`WALK_AHEAD`] are out; `false` once the
+    /// session is over.
+    fn take(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if state.1 {
+                return false;
+            }
+            if state.0 < WALK_AHEAD {
+                state.0 += 1;
+                return true;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn give(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.0 = state.0.saturating_sub(1);
+        }
+        self.ready.notify_one();
+    }
+
+    /// Stop the walk thread: the session is over.
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.ready.notify_all();
+    }
+}
+
+/// The walk thread: hand every walked item to the sending thread, at most
+/// [`WALK_AHEAD`] ahead of the wire, then say the walk has ended.
+fn walk_source(walker: Walker<'_>, gate: &WalkGate, events: &Sender<Event>) {
+    let _timer = PhaseTimer(&WALK_NS, Instant::now());
+    for item in walker {
+        if !gate.take() || events.send(Event::Walked(item)).is_err() {
+            return;
+        }
+    }
+    let _ = events.send(Event::WalkEnded);
 }
 
 /// Serve one transfer request from a caller-authenticated stdio transport.
@@ -467,12 +551,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     if store.root().starts_with(&root) || root.starts_with(store.root()) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    let meta = std::fs::metadata(&root)?;
+    // Every source seat is walked and read beneath this one descriptor
+    // (W4 PR 3); its identity is the root's in the authority.
+    let root_fd = crate::io::sys::open_root(&root)?;
+    let meta = crate::io::sys::fstat(&root_fd)?;
     let authority = postcard::to_stdvec(&(
         store.authority()?,
         root.as_os_str().as_bytes(),
-        meta.dev(),
-        meta.ino(),
+        meta.node.dev,
+        meta.node.ino,
     ))?;
     let committer = Committer::spawn(LedgerSink::new(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
@@ -483,59 +570,43 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
             authority: authority.clone(),
         },
     )?;
-    let walk_started = Instant::now();
-    let mut census = walk(
-        &WalkOptions {
-            cross_device: true,
-            ..WalkOptions::new(root.clone())
-        },
-        &mut NullCache,
-    )?;
-    WALK_NS.fetch_add(elapsed_ns(walk_started), Ordering::Relaxed);
-    census
-        .rows
-        .sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    for refused in census.refusals {
-        write_control(
-            output,
-            &Control::Refused {
-                entry: None,
-                rel_path: refused.rel_path,
-                code: refused.refusal.code().to_owned(),
-            },
-        )?;
-    }
-    // Recorded, never carried: the receiver reports each one (R-N79).
-    for rel_path in census.engine_temporaries {
-        write_control(output, &Control::EngineTemporary { rel_path })?;
-    }
+    let walker = Walker::new(root_fd.as_fd(), true)?;
     let credit = Arc::new(Credit::new());
+    let gate = WalkGate::new();
     let (events_sender, events) = std::sync::mpsc::channel();
     spawn_reader(input, events_sender.clone(), Arc::clone(&credit))?;
     let work = SourceWork {
         root: &root,
+        root_fd: root_fd.as_fd(),
         authority: &authority,
         state: store.root(),
-        rows: &census.rows,
         credit: &credit,
         retain: Arc::new(AtomicU64::new(retain_budget(&root))),
     };
     let (jobs, job_queue) = std::sync::mpsc::channel();
     let job_queue = Mutex::new(job_queue);
-    let served = std::thread::scope(|scope| -> Result<u64> {
+    let served = std::thread::scope(|scope| -> Result<(u64, u64)> {
+        {
+            let (events, gate) = (events_sender.clone(), &gate);
+            std::thread::Builder::new()
+                .name("bulkload-serve-walk".to_owned())
+                .spawn_scoped(scope, move || walk_source(walker, gate, &events))?;
+        }
         for _ in 0..CAPTURE_WORKERS {
             let events = events_sender.clone();
             let (work, job_queue) = (&work, &job_queue);
             std::thread::Builder::new()
                 .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))?;
         }
-        let sent = send_entries(output, &work, &committer, &events, jobs);
-        // Wake any capture thread waiting on credit; its job is moot now.
+        let sent = send_entries(output, &committer, &events, jobs, &gate);
+        // Wake any capture thread waiting on credit, and the walk thread
+        // waiting on a walk-ahead slot; their work is moot now.
         credit.close();
+        gate.close();
         sent
     });
     drop(events_sender);
-    let source_bytes_read = served?;
+    let (source_bytes_read, entries) = served?;
     // Every capture of this transfer is committed, or the transfer fails,
     // before the receiver is told the source is done.
     committer.sync()?;
@@ -543,7 +614,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     write_control(
         output,
         &Control::SourceDone {
-            entries: census.rows.len() as u64,
+            entries,
             source_bytes_read,
         },
     )?;
@@ -593,11 +664,17 @@ fn spawn_reader<R: Read + Send + 'static>(
 /// The sending thread's view of the session.
 struct Outbound<'a, W> {
     output: &'a mut W,
-    rows: &'a [RowSchema],
     committer: &'a Committer<LedgerSink>,
     jobs: Sender<Job>,
+    gate: &'a WalkGate,
+    /// Walked rows not yet offered, in walk order.
+    pending: VecDeque<RowSchema>,
+    /// Whether the walk thread has yielded its last item.
+    walked: bool,
+    /// One slot per offered entry, by entry number.
     entries: Vec<SourceEntry>,
-    offered: usize,
+    /// Each offered entry's row, dropped once the entry is retired.
+    rows: Vec<Option<Arc<RowSchema>>>,
     undecided: usize,
     walk_done: bool,
     queue: VecDeque<Job>,
@@ -608,22 +685,25 @@ struct Outbound<'a, W> {
     awaiting: HashMap<u64, Option<(Vec<u8>, Manifest)>>,
 }
 
-/// The sending thread: offer entries, act on decisions and chunk requests,
-/// and write capture output as it arrives. Returns the source bytes read.
+/// The sending thread: offer walked entries, act on decisions and chunk
+/// requests, and write capture output as it arrives. Returns the source
+/// bytes read and the entries offered.
 fn send_entries<W: Write>(
     output: &mut W,
-    work: &SourceWork<'_>,
     committer: &Committer<LedgerSink>,
     events: &Receiver<Event>,
     jobs: Sender<Job>,
-) -> Result<u64> {
+    gate: &WalkGate,
+) -> Result<(u64, u64)> {
     let mut outbound = Outbound {
         output,
-        rows: work.rows,
         committer,
         jobs,
-        entries: work.rows.iter().map(|_| SourceEntry::Unoffered).collect(),
-        offered: 0,
+        gate,
+        pending: VecDeque::new(),
+        walked: false,
+        entries: Vec::new(),
+        rows: Vec::new(),
         undecided: 0,
         walk_done: false,
         queue: VecDeque::new(),
@@ -634,7 +714,7 @@ fn send_entries<W: Write>(
     loop {
         outbound.offer()?;
         if outbound.finished() {
-            return Ok(outbound.bytes_read);
+            return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
         let event = events.recv().map_err(|_| BulkloadRefusal::Io(None))?;
         outbound.handle(event)?;
@@ -642,32 +722,32 @@ fn send_entries<W: Write>(
 }
 
 impl<W: Write> Outbound<'_, W> {
-    /// Offer entries up to the window, close the walk once all are offered,
-    /// and start queued jobs up to the active bound.
+    /// Offer walked entries up to the window, close the walk once it has
+    /// ended and every row is offered, and start queued jobs up to the
+    /// active bound.
     fn offer(&mut self) -> Result<()> {
-        while self.offered < self.rows.len() && self.undecided < ENTRY_WINDOW {
-            let row = self
-                .rows
-                .get(self.offered)
-                .ok_or(BulkloadRefusal::FrameCodec)?;
+        while self.undecided < ENTRY_WINDOW {
+            let Some(row) = self.pending.pop_front() else {
+                break;
+            };
+            let entry = self.entries.len() as u64;
             write_control(
                 self.output,
                 &Control::Entry {
-                    entry: self.offered as u64,
+                    entry,
                     row: row.clone(),
                 },
             )?;
-            if let Some(slot) = self.entries.get_mut(self.offered) {
-                *slot = SourceEntry::Undecided;
-            }
-            self.offered += 1;
+            self.gate.give();
+            self.entries.push(SourceEntry::Undecided);
+            self.rows.push(Some(Arc::new(row)));
             self.undecided += 1;
         }
-        if self.offered == self.rows.len() && !self.walk_done {
+        if self.walked && self.pending.is_empty() && !self.walk_done {
             write_control(
                 self.output,
                 &Control::WalkDone {
-                    entries: self.rows.len() as u64,
+                    entries: self.entries.len() as u64,
                 },
             )?;
             self.walk_done = true;
@@ -690,31 +770,60 @@ impl<W: Write> Outbound<'_, W> {
             && self.awaiting.is_empty()
     }
 
-    fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &RowSchema)> {
+    fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &mut Option<Arc<RowSchema>>)> {
         let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?;
         Ok((
             self.entries
                 .get_mut(index)
                 .ok_or(BulkloadRefusal::FrameCodec)?,
-            self.rows.get(index).ok_or(BulkloadRefusal::FrameCodec)?,
+            self.rows
+                .get_mut(index)
+                .ok_or(BulkloadRefusal::FrameCodec)?,
         ))
     }
 
-    /// Retire an entry whose job a capture thread held.
-    fn finish_entry(&mut self, entry: u64) -> Result<RowSchema> {
+    /// Retire an entry whose job a capture thread held, returning its row.
+    fn finish_entry(&mut self, entry: u64) -> Result<Arc<RowSchema>> {
         let (slot, row) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
             return Err(BulkloadRefusal::Io(None));
         }
         *slot = SourceEntry::Done;
-        let row = row.clone();
+        let row = row.take().ok_or(BulkloadRefusal::Io(None))?;
         self.active -= 1;
         Ok(row)
+    }
+
+    /// One walked item: a row waits for the window, the rest go out now.
+    fn walked(&mut self, item: WalkItem) -> Result<()> {
+        match item {
+            WalkItem::Row(row) => {
+                // Its walk-ahead slot is given back once it is offered.
+                self.pending.push_back(row);
+                return Ok(());
+            }
+            WalkItem::Refused(seat) => write_control(
+                self.output,
+                &Control::Refused {
+                    entry: None,
+                    rel_path: seat.rel_path,
+                    code: seat.refusal.code().to_owned(),
+                },
+            )?,
+            // Recorded, never carried: the receiver reports each one (R-N79).
+            WalkItem::Engine(rel_path) => {
+                write_control(self.output, &Control::EngineTemporary { rel_path })?;
+            }
+        }
+        self.gate.give();
+        Ok(())
     }
 
     fn handle(&mut self, event: Event) -> Result<()> {
         match event {
             Event::PeerFailed(refusal) => return Err(refusal),
+            Event::Walked(item) => self.walked(item)?,
+            Event::WalkEnded => self.walked = true,
             Event::Decide { entry, decision } => self.decide(entry, &decision)?,
             Event::NeedChunks { entry, indices } => self.need_chunks(entry, indices)?,
             Event::Chunk { header, data } => write_data(self.output, &header, &data)?,
@@ -793,7 +902,7 @@ impl<W: Write> Outbound<'_, W> {
                     self.output,
                     &Control::Refused {
                         entry: Some(entry),
-                        rel_path: row.rel_path,
+                        rel_path: row.rel_path.clone(),
                         code: refusal.code().to_owned(),
                     },
                 )?;
@@ -803,18 +912,35 @@ impl<W: Write> Outbound<'_, W> {
     }
 
     fn decide(&mut self, entry: u64, decision: &Decision) -> Result<()> {
-        let (slot, row) = self.slot(entry)?;
+        let (slot, held) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Undecided) {
             return Err(BulkloadRefusal::FrameCodec);
         }
+        let row = held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?;
         let regular = row.kind == FileKind::Regular;
         let (next, job) = match decision {
-            Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => (SourceEntry::Done, None),
+            Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => {
+                // Retired: nothing more is read or sent for it.
+                *held = None;
+                (SourceEntry::Done, None)
+            }
             Decision::Send | Decision::WantManifest if !regular => {
                 return Err(BulkloadRefusal::FrameCodec);
             }
-            Decision::Send => (SourceEntry::Queued, Some(Job::Send { entry })),
-            Decision::WantManifest => (SourceEntry::Queued, Some(Job::Manifest { entry })),
+            Decision::Send => (
+                SourceEntry::Queued,
+                Some(Job::Send {
+                    entry,
+                    row: Arc::clone(row),
+                }),
+            ),
+            Decision::WantManifest => (
+                SourceEntry::Queued,
+                Some(Job::Manifest {
+                    entry,
+                    row: Arc::clone(row),
+                }),
+            ),
         };
         *slot = next;
         self.undecided -= 1;
@@ -823,7 +949,8 @@ impl<W: Write> Outbound<'_, W> {
     }
 
     fn need_chunks(&mut self, entry: u64, indices: Vec<u32>) -> Result<()> {
-        let (slot, _) = self.slot(entry)?;
+        let (slot, held) = self.slot(entry)?;
+        let row = Arc::clone(held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?);
         let SourceEntry::Offered {
             manifest,
             retained,
@@ -841,6 +968,7 @@ impl<W: Write> Outbound<'_, W> {
         self.jobs
             .send(Job::Serve {
                 entry,
+                row,
                 manifest,
                 indices,
                 retained,
@@ -862,9 +990,9 @@ fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &S
             Ok(store) => run_job(work, store, job, events),
             Err(refusal) => Event::Refused {
                 entry: match job {
-                    Job::Send { entry } | Job::Manifest { entry } | Job::Serve { entry, .. } => {
-                        entry
-                    }
+                    Job::Send { entry, .. }
+                    | Job::Manifest { entry, .. }
+                    | Job::Serve { entry, .. } => entry,
                 },
                 refusal: refusal.clone(),
                 bytes_read: 0,
@@ -879,10 +1007,13 @@ fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &S
 fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event>) -> Event {
     let mut bytes_read = 0;
     let (entry, outcome) = match job {
-        Job::Send { entry } => (entry, send_capture(work, entry, events, &mut bytes_read)),
-        Job::Manifest { entry } => (
+        Job::Send { entry, row } => (
             entry,
-            match manifest_capture(work, store, entry, &mut bytes_read) {
+            send_capture(work, entry, &row, events, &mut bytes_read),
+        ),
+        Job::Manifest { entry, row } => (
+            entry,
+            match manifest_capture(work, store, &row, &mut bytes_read) {
                 Ok(Some((record, manifest, retained))) => Ok(Event::Manifest {
                     entry,
                     record,
@@ -893,12 +1024,13 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
                 // No ledger row and no room to keep the chunks: building a
                 // manifest first would read the seat twice (R25). Stream it
                 // instead; the destination takes data in place of a manifest.
-                Ok(None) => send_capture(work, entry, events, &mut bytes_read),
+                Ok(None) => send_capture(work, entry, &row, events, &mut bytes_read),
                 Err(refusal) => Err(refusal),
             },
         ),
         Job::Serve {
             entry,
+            row,
             manifest,
             indices,
             retained,
@@ -908,6 +1040,7 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
             serve_chunks(
                 work,
                 entry,
+                &row,
                 &manifest,
                 &indices,
                 retained.as_ref(),
@@ -941,22 +1074,16 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
     })
 }
 
-fn job_row<'a>(work: &SourceWork<'a>, entry: u64) -> Result<&'a RowSchema> {
-    work.rows
-        .get(usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?)
-        .ok_or(BulkloadRefusal::FrameCodec)
-}
-
 /// Read, chunk and stream one file; its `End` carries the capture to record.
 fn send_capture(
     work: &SourceWork<'_>,
     entry: u64,
+    row: &RowSchema,
     events: &Sender<Event>,
     bytes_read: &mut u64,
 ) -> Result<Event> {
-    let row = job_row(work, entry)?;
     let key = row_key(work.authority, row)?;
-    let chunks = capture_file(work.root, row, bytes_read, |index, offset, digest, data| {
+    let chunks = capture_file(work, row, bytes_read, |index, offset, digest, data| {
         let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
         work.credit.acquire(u64::from(size))?;
         events
@@ -996,10 +1123,9 @@ type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>);
 fn manifest_capture(
     work: &SourceWork<'_>,
     store: &Store,
-    entry: u64,
+    row: &RowSchema,
     bytes_read: &mut u64,
 ) -> Result<Option<Offer>> {
-    let row = job_row(work, entry)?;
     let key = row_key(work.authority, row)?;
     if let Some(manifest) = store.capture(&key)? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
@@ -1011,7 +1137,7 @@ fn manifest_capture(
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
         return Ok(None);
     };
-    let chunks = capture_file(work.root, row, bytes_read, |_, _, _, data| {
+    let chunks = capture_file(work, row, bytes_read, |_, _, _, data| {
         retained.chunks.push(Arc::new(data));
         Ok(())
     })?;
@@ -1021,16 +1147,20 @@ fn manifest_capture(
 /// Send the requested chunks of an offered manifest, from memory when they
 /// were retained, otherwise read again at their offsets and re-verified
 /// against the manifest under an unchanged stat identity.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one capture job's inputs, each used once"
+)]
 fn serve_chunks(
     work: &SourceWork<'_>,
     entry: u64,
+    row: &RowSchema,
     manifest: &Manifest,
     indices: &[u32],
     retained: Option<&Retained>,
     events: &Sender<Event>,
     bytes_read: &mut u64,
 ) -> Result<Event> {
-    let row = job_row(work, entry)?;
     let mut offsets = Vec::with_capacity(manifest.chunks.len());
     let mut offset = 0_u64;
     for chunk in &manifest.chunks {
@@ -1041,7 +1171,7 @@ fn serve_chunks(
     }
     let held = retained.filter(|held| held.chunks.len() == manifest.chunks.len());
     let opened = if held.is_none() && !indices.is_empty() {
-        let file = crate::hash::open_nofollow(&work.root.join(path(row.rel_path.clone())))?;
+        let file = open_source(work, row)?;
         if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
             return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
         }
@@ -1062,8 +1192,12 @@ fn serve_chunks(
                 usize::try_from(spec.size)
                     .map_err(|_| BulkloadRefusal::BudgetExceeded)?
             ];
-            file.read_exact_at(&mut data, offset)
+            // A live truncate gives a short count, never a signal.
+            let read = crate::io::sys::pread_full(file, &mut data, offset)
                 .map_err(|_| BulkloadRefusal::SourceChangedAfterSnapshot)?;
+            if read != data.len() {
+                return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+            }
             *bytes_read = bytes_read.saturating_add(spec.size);
             counters::add_len(Counter::SourceFileRead, data.len());
             if counters::hash(Counter::HashCaptureChunk, &data) != spec.digest {
@@ -1108,7 +1242,7 @@ fn serve_chunks(
 /// fails either check is refused, and only its caller decides what any
 /// already-handed chunk means.
 fn capture_file(
-    root: &Path,
+    work: &SourceWork<'_>,
     row: &RowSchema,
     bytes_read: &mut u64,
     mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
@@ -1122,15 +1256,19 @@ fn capture_file(
     {
         return Err(BulkloadRefusal::SqliteStateChanged);
     }
-    let file_path = root.join(path(row.rel_path.clone()));
-    let mut file = crate::hash::open_nofollow(&file_path)?;
+    #[cfg(feature = "fault-injection")]
+    let file_path = work.root.join(crate::walk::rel_path(&row.rel_path));
+    let file = open_source(work, row)?;
     let expected = StatIdentity::from_row(row);
     if StatIdentity::from_metadata(&file.metadata()?) != expected {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut prefix = Vec::new();
     let mut reader = CountReader {
-        input: &mut file,
+        input: SourceReader {
+            file: &file,
+            offset: 0,
+        },
         count: bytes_read,
     };
     (&mut reader).take(16).read_to_end(&mut prefix)?;
@@ -1167,6 +1305,32 @@ fn capture_file(
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     Ok(chunks)
+}
+
+/// Open a source seat for reading, component by component beneath the
+/// source root descriptor (W4 PR 3): a symlink at any component is refused.
+fn open_source(work: &SourceWork<'_>, row: &RowSchema) -> Result<std::fs::File> {
+    let fd = crate::io::sys::openat_beneath(
+        work.root_fd,
+        crate::walk::rel_path(&row.rel_path),
+        crate::io::OpenMode::Read,
+    )?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Sequential `pread`s of one source file: no shared descriptor offset, no
+/// mapping, and a short count at a live truncate.
+struct SourceReader<'a> {
+    file: &'a std::fs::File,
+    offset: u64,
+}
+
+impl Read for SourceReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = crate::io::sys::pread_full(self.file, buffer, self.offset)?;
+        self.offset = self.offset.saturating_add(read as u64);
+        Ok(read)
+    }
 }
 
 struct CountReader<'a, R> {
