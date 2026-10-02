@@ -8,10 +8,14 @@
 //!    every segment. Any object their closure lacks refuses before anything
 //!    is written: the connectivity check below trusts refs, so without this a
 //!    ref with a broken closure could be published.
-//! 2. **Begin**: the plan (pack id, segment count, haves, ref updates, the
-//!    destination's git dir) is sealed into the journal, then the quarantine
-//!    `objects/incoming-bulkload-<pack_id>/` is made (receive-pack's
-//!    tmp-objdir pattern) and sealed.
+//!    The destination's shallow file must hold exactly the negotiated
+//!    frontier first (#75 r2 N1), and every Git walk here runs with grafts
+//!    and the commit-graph off, so neither can hide a missing parent.
+//! 2. **Begin**: the plan (pack id, segment count, haves, shallow frontier,
+//!    ref updates, the destination's git dir) is sealed into the journal,
+//!    then the quarantine `objects/incoming-bulkload-<pack_id>-<state key>/`
+//!    is made (receive-pack's tmp-objdir pattern; the key names the state dir,
+//!    #75 r2 N4) and sealed.
 //! 3. **Segments**, in order: `index-pack --stdin --fix-thin --keep` into the
 //!    quarantine (`GIT_OBJECT_DIRECTORY` the quarantine, the main store its
 //!    alternate, `GIT_QUARANTINE_PATH` set, so Git refuses any ref update).
@@ -25,20 +29,25 @@
 //!    (Git finds a pack by its `.idx`) are renamed into `objects/pack` without
 //!    replacement; `objects/pack` is sealed, the quarantine removed, and
 //!    `objects/` sealed.
-//! 6. **Publish**: one `update-ref --stdin -z` transaction outside the
+//! 6. **Publish**: the before digest is journaled (`publishing`), then one
+//!    `update-ref --stdin -z` transaction outside the
 //!    quarantine. Each update is a `create` when the ref is absent and a
 //!    `verify` when it already names the oid; any other value refuses
 //!    `GIT_DESTINATION_OCCUPIED`. No existing ref is ever moved or deleted, so
 //!    existing `refs/carry/*` refs keep their digests; the receipt proves it
 //!    with a digest of every `refs/carry/*` ref outside the plan, taken
-//!    before and after the transaction.
+//!    before and after the transaction; unequal digests refuse
+//!    `carry_ref_moved` (#75 r2 N3).
 //! 7. **Keeps**: each migrated pack's `.keep` is dropped if it still holds
 //!    this session's message, and `objects/pack` is sealed.
 //!
 //! Recovery re-runs from the last journaled step: stray `tmp_*` files and
 //! unjournaled packs in the quarantine are swept; migration skips files
 //! already moved; publication re-plans each `create` as a `verify` once the
-//! ref holds its oid; dropping a keep that is gone is a no-op.
+//! ref holds its oid; dropping a keep that is gone is a no-op. A receiving
+//! session whose quarantine lost a journaled pack is abandoned (#75 r2 N2);
+//! abandonment is journaled before the quarantine is discarded, and the next
+//! open discards what an abandoned or never-sealed session left.
 //!
 //! Refusals: `held_tip_closure_incomplete` (preflight), `segment_invalid`
 //! (index-pack), `connectivity_missing`; all three are `GIT_HAVES_UNPROVABLE`
@@ -168,6 +177,13 @@ impl Target {
     /// that made a held tip parentless hid a deleted parent from both the
     /// preflight and the connectivity check; the history they walk is now
     /// the one the objects record (and the repository's real shallow file).
+    ///
+    /// #75 r2 N1: the commit-graph is off too (`core.commitGraph=false`,
+    /// and `GIT_COMMIT_GRAPH_PARANOIA=1` should a graph still be read). A
+    /// graph written before a parent was deleted hands Git the parent's tree
+    /// without reading the parent, so a walk over it never notices the
+    /// commit is gone. The shallow file is checked against the negotiated
+    /// frontier instead ([`Ingest::frontier`]).
     fn git(&self) -> Command {
         let mut command = hardened(&self.repository);
         command
@@ -176,11 +192,14 @@ impl Target {
                 "core.fsync=committed,derived-metadata",
                 "-c",
                 "core.fsyncMethod=fsync",
+                "-c",
+                "core.commitGraph=false",
             ])
             .env_remove("GIT_QUARANTINE_PATH")
             .env_remove("GIT_SHALLOW_FILE")
             .env_remove("GIT_REPLACE_REF_BASE")
-            .env("GIT_GRAFT_FILE", "/dev/null");
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .env("GIT_COMMIT_GRAPH_PARANOIA", "1");
         command
     }
 
@@ -206,12 +225,14 @@ pub struct RefUpdate {
 }
 
 /// What a destination is asked to ingest: the sender's plan (its `pack_id`,
-/// segment count and haves) and the refs to publish.
+/// segment count, haves and the negotiated shallow frontier) and the refs to
+/// publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestPlan {
     pack_id: String,
     segments: usize,
     haves: Vec<String>,
+    shallow: Vec<String>,
     updates: Vec<RefUpdate>,
 }
 
@@ -225,15 +246,19 @@ impl IngestPlan {
             plan.pack_id(),
             plan.segments(),
             plan.haves().to_vec(),
+            plan.shallow().to_vec(),
             updates,
         )
     }
 
-    /// Build a plan from its parts, as the wire will carry them.
+    /// Build a plan from its parts, as the wire will carry them. `shallow`
+    /// is the frontier the round negotiated (empty for a full destination);
+    /// the destination's shallow file must still hold exactly it (#75 r2 N1).
     ///
     /// # Errors
     /// `FIELD_DOMAIN_VIOLATION` for a `pack_id` that is not 64 lowercase hex
-    /// digits, a have or oid that is not an object name, a ref name outside
+    /// digits, a have, shallow line or oid that is not an object name, a
+    /// ref name outside
     /// the conservative set (`refs/carry/`, then `[A-Za-z0-9._/+@-]`
     /// components, no empty, dot-leading or `.lock` component, no `..`; #75
     /// r1 D7), or two names that clash: equal once ASCII case is folded, or
@@ -242,15 +267,22 @@ impl IngestPlan {
         pack_id: &str,
         segments: usize,
         haves: Vec<String>,
+        mut shallow: Vec<String>,
         mut updates: Vec<RefUpdate>,
     ) -> crate::Result<Self> {
         let bad = || BulkloadRefusal::FieldDomainViolation;
         if !pack_id_ok(pack_id) {
             return Err(bad());
         }
-        if !haves.iter().all(|value| is_oid(value.as_bytes())) {
+        if !haves
+            .iter()
+            .chain(&shallow)
+            .all(|value| is_oid(value.as_bytes()))
+        {
             return Err(bad());
         }
+        shallow.sort();
+        shallow.dedup();
         updates.sort();
         for (index, update) in updates.iter().enumerate() {
             if !ref_name(&update.name) || !is_oid(update.oid.as_bytes()) {
@@ -268,6 +300,7 @@ impl IngestPlan {
             pack_id: pack_id.to_owned(),
             segments,
             haves,
+            shallow,
             updates,
         })
     }
@@ -291,6 +324,7 @@ impl IngestPlan {
             git_dir: git_dir.as_os_str().as_bytes().to_vec(),
         }];
         block.extend(self.haves.iter().cloned().map(Record::Have));
+        block.extend(self.shallow.iter().cloned().map(Record::Shallow));
         block.extend(
             self.updates
                 .iter()
@@ -327,10 +361,14 @@ impl IngestPlan {
             return Err(bad());
         };
         let mut haves = Vec::new();
+        let mut shallow = Vec::new();
         let mut updates = Vec::new();
         for record in body {
             match record {
-                Record::Have(oid) if updates.is_empty() => haves.push(oid.clone()),
+                Record::Have(oid) if shallow.is_empty() && updates.is_empty() => {
+                    haves.push(oid.clone());
+                }
+                Record::Shallow(oid) if updates.is_empty() => shallow.push(oid.clone()),
                 Record::Ref(name, oid) => updates.push(RefUpdate {
                     name: String::from_utf8(name.clone()).map_err(|_| bad())?,
                     oid: oid.clone(),
@@ -338,7 +376,7 @@ impl IngestPlan {
                 _ => return Err(bad()),
             }
         }
-        let plan = Self::new(pack_id, *segments, haves, updates).map_err(|_| bad())?;
+        let plan = Self::new(pack_id, *segments, haves, shallow, updates).map_err(|_| bad())?;
         Ok((plan, git_dir.clone(), end + 1))
     }
 }
@@ -356,13 +394,19 @@ pub(super) fn pack_id_ok(pack_id: &str) -> bool {
 /// destination: equal once ASCII case is folded (a case-insensitive file
 /// system maps both to one loose file, #75 r1 B4), or one is a directory of
 /// the other (a directory/file conflict, #75 r1 D3). Equal names clash too.
+///
+/// #75 r2 N3: a component holding any non-ASCII character is taken to alias
+/// every component at its depth. Darwin file systems fold Unicode case and
+/// normalization (U+212A KELVIN SIGN names the same loose file as `K`; HFS+
+/// also ignores some code points), and a correct fold would need tables this
+/// crate does not carry. Plan names are ASCII ([`ref_name`]), so this only
+/// widens the check against existing refs: a plan ref beside, under or over
+/// a non-ASCII ref name refuses.
 fn clashes(a: &str, b: &str) -> bool {
-    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
-    a == b
-        || b.strip_prefix(a.as_str())
-            .is_some_and(|rest| rest.starts_with('/'))
-        || a.strip_prefix(b.as_str())
-            .is_some_and(|rest| rest.starts_with('/'))
+    let (a, b): (Vec<&str>, Vec<&str>) = (a.split('/').collect(), b.split('/').collect());
+    a.iter()
+        .zip(&b)
+        .all(|(x, y)| !x.is_ascii() || !y.is_ascii() || x.eq_ignore_ascii_case(y))
 }
 
 /// Git's ref-name rules, narrowed to a conservative byte set and, for M1, to
@@ -468,6 +512,10 @@ pub struct Ingest<'a> {
     acks: Vec<SegmentAck>,
     stage: Stage,
     carry: Option<(String, String)>,
+    /// The journaled `publishing` digest, once the ref transaction began.
+    before: Option<String>,
+    /// `incoming-bulkload-<pack_id>-<state key>` (#75 r2 N4).
+    quarantine: String,
     store: Option<&'a StderrStore>,
 }
 
@@ -531,72 +579,120 @@ impl<'a> Ingest<'a> {
         if !pack_id_ok(&pack_id) {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key());
         let git_dir = target.repository.git_dir.as_path();
-        match Journal::open(journals, &pack_id)? {
-            Found::Fresh(journal) => {
-                let Some(plan) = plan else {
-                    // A resume found nothing sealed; leave no empty journal.
-                    journal.remove()?;
-                    return Err(BulkloadRefusal::SealedObjectMissing.into());
-                };
-                let session = Self {
-                    target,
-                    plan,
-                    journal,
-                    acks: Vec::new(),
-                    stage: Stage::Receiving,
-                    carry: None,
-                    store,
-                };
-                // A refusal here leaves nothing: no plan, no quarantine, no
-                // journal.
-                // #75 r1 B1: a fresh session never adopts a quarantine it did
-                // not make (a lost state dir's, or another state dir's).
-                let fresh = session
-                    .occupied()
-                    .and_then(|()| session.preflight())
-                    .and_then(|()| match open_dir(&session.quarantine_path()) {
-                        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(()),
-                        Ok(_) => Err(Refused::because(
-                            BulkloadRefusal::GitDestinationOccupied,
-                            "quarantine_exists",
-                        )),
-                        Err(error) => Err(error.into()),
-                    });
-                if let Err(refused) = fresh {
-                    session.journal.remove()?;
-                    return Err(refused);
-                }
-                let block = session.plan.block(git_dir);
-                session.journal.append(&block)?;
-                session.make_quarantine()?;
-                Ok(session)
-            }
+        let (journal, stale) = match Journal::open(journals, &pack_id)? {
             Found::Existing(journal, records) => {
-                let (journaled, recorded_dir, start) = IngestPlan::from_records(&records)?;
-                if recorded_dir != git_dir.as_os_str().as_bytes()
-                    || plan.as_ref().is_some_and(|plan| plan != &journaled)
-                {
-                    return Err(BulkloadRefusal::JournalOwnershipConflict.into());
-                }
-                let mut session = Self {
-                    target,
-                    plan: journaled,
-                    journal,
-                    acks: Vec::new(),
-                    stage: Stage::Receiving,
-                    carry: None,
-                    store,
-                };
-                session.replay(records.get(start..).unwrap_or_default())?;
-                if session.stage == Stage::Receiving {
-                    session.preflight()?;
-                    session.quarantine(true)?;
-                    session.sweep()?;
-                }
-                Ok(session)
+                return Self::existing(
+                    target, journals, plan, journal, &records, quarantine, store,
+                );
             }
+            Found::Fresh(journal) => (journal, false),
+            Found::Stale(journal) => (journal, true),
+        };
+        if stale {
+            // #75 r2 N2: an abandoned session, or one whose plan never
+            // sealed (a torn `planned` line), may have left its quarantine.
+            // The name is this state dir's, and the journal file is still
+            // here until the quarantine is gone, so it is ours to discard.
+            discard_quarantine(&target.objects, &quarantine)?;
         }
+        let Some(plan) = plan else {
+            // A resume found nothing sealed; leave no empty journal.
+            journal.remove()?;
+            return Err(BulkloadRefusal::SealedObjectMissing.into());
+        };
+        let session = Self {
+            target,
+            plan,
+            journal,
+            acks: Vec::new(),
+            stage: Stage::Receiving,
+            carry: None,
+            before: None,
+            quarantine,
+            store,
+        };
+        // A refusal here leaves nothing: no plan, no quarantine, no
+        // journal.
+        // #75 r1 B1: a fresh session never adopts a quarantine it did not
+        // make (a lost journal's; another state dir's has another name).
+        let fresh = session
+            .occupied()
+            .and_then(|()| session.preflight())
+            .and_then(|()| match open_dir(&session.quarantine_path()) {
+                Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(()),
+                Ok(_) => Err(Refused::because(
+                    BulkloadRefusal::GitDestinationOccupied,
+                    "quarantine_exists",
+                )),
+                Err(error) => Err(error.into()),
+            });
+        if let Err(refused) = fresh {
+            session.journal.remove()?;
+            return Err(refused);
+        }
+        let block = session.plan.block(git_dir);
+        session.journal.append(&block)?;
+        session.make_quarantine()?;
+        Ok(session)
+    }
+
+    /// Continue the session a sealed journal records. One still receiving
+    /// runs the preflight again and sweeps its quarantine; one whose
+    /// quarantine lost a journaled pack (or is gone) is abandoned, since it
+    /// can never finish (#75 r2 N2), and an open then starts afresh.
+    #[allow(clippy::too_many_arguments)]
+    fn existing(
+        target: &'a Target,
+        journals: &JournalStore,
+        plan: Option<IngestPlan>,
+        journal: Journal,
+        records: &[Record],
+        quarantine: String,
+        store: Option<&'a StderrStore>,
+    ) -> Outcome<Self> {
+        let git_dir = target.repository.git_dir.as_path();
+        let (journaled, recorded_dir, start) = IngestPlan::from_records(records)?;
+        if recorded_dir != git_dir.as_os_str().as_bytes()
+            || plan.as_ref().is_some_and(|plan| plan != &journaled)
+        {
+            return Err(BulkloadRefusal::JournalOwnershipConflict.into());
+        }
+        let mut session = Self {
+            target,
+            plan: journaled,
+            journal,
+            acks: Vec::new(),
+            stage: Stage::Receiving,
+            carry: None,
+            before: None,
+            quarantine,
+            store,
+        };
+        session.replay(records.get(start..).unwrap_or_default())?;
+        if session.stage != Stage::Receiving {
+            return Ok(session);
+        }
+        session.preflight()?;
+        if session.acks.is_empty() {
+            // The plan sealed; the quarantine may not have been made yet.
+            session.quarantine(true)?;
+        } else if session.lost()? {
+            session.abandon_journaled("quarantine_lost")?;
+            drop(session);
+            return plan.map_or_else(
+                || {
+                    Err(Refused::because(
+                        BulkloadRefusal::SealedObjectMissing,
+                        "quarantine_lost",
+                    ))
+                },
+                |plan| Self::start(target, journals, Some(plan), None, store),
+            );
+        }
+        session.sweep()?;
+        Ok(session)
     }
 
     /// Apply the journaled steps after the plan block, in order.
@@ -624,7 +720,15 @@ impl<'a> Ingest<'a> {
                     self.stage = Stage::Connected;
                 }
                 (Record::Migrated, Stage::Connected) => self.stage = Stage::Migrated,
-                (Record::Published(before, after), Stage::Migrated) => {
+                (Record::Publishing(before), Stage::Migrated) if self.before.is_none() => {
+                    self.before = Some(before.clone());
+                }
+                (Record::Published(before, after), Stage::Migrated)
+                    if self
+                        .before
+                        .as_ref()
+                        .is_none_or(|journaled| journaled == before) =>
+                {
                     self.carry = Some((before.clone(), after.clone()));
                     self.stage = Stage::Published;
                 }
@@ -654,16 +758,14 @@ impl<'a> Ingest<'a> {
     }
 
     fn quarantine_path(&self) -> PathBuf {
-        self.target
-            .objects
-            .join(format!("incoming-bulkload-{}", self.plan.pack_id))
+        self.target.objects.join(&self.quarantine)
     }
 
     /// Create the quarantine and its `pack/` for a new session, refusing
     /// `GIT_DESTINATION_OCCUPIED` if the name already exists (#75 r1 B1).
     fn make_quarantine(&self) -> Outcome<()> {
         let objects = open_dir(&self.target.objects)?;
-        let name = cstring(format!("incoming-bulkload-{}", self.plan.pack_id).as_bytes())?;
+        let name = cstring(self.quarantine.as_bytes())?;
         // SAFETY: `objects` is an open directory and `name` NUL-terminated.
         if unsafe { libc::mkdirat(objects.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
             let error = std::io::Error::last_os_error();
@@ -680,10 +782,11 @@ impl<'a> Ingest<'a> {
     }
 
     /// Open the quarantine directory and its `pack/`, creating and sealing
-    /// them when `create` is set.
+    /// them when `create` is set. Without `create`, a quarantine or `pack/`
+    /// that is gone (a discard cut short) is `None`.
     fn quarantine(&self, create: bool) -> crate::Result<Option<(File, File)>> {
         let objects = open_dir(&self.target.objects)?;
-        let name = cstring(format!("incoming-bulkload-{}", self.plan.pack_id).as_bytes())?;
+        let name = cstring(self.quarantine.as_bytes())?;
         if create {
             make_dir(&objects, &name)?;
         }
@@ -698,12 +801,77 @@ impl<'a> Ingest<'a> {
             seal_dir(&quarantine)?;
             seal_dir(&objects)?;
         }
-        let pack = open_dir_at(&quarantine, &pack)?;
+        let pack = match open_dir_at(&quarantine, &pack) {
+            Ok(pack) => pack,
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) if !create => return Ok(None),
+            Err(error) => return Err(error),
+        };
         Ok(Some((quarantine, pack)))
     }
 
-    /// R-N75 held-tip closure preflight over the plan's haves.
+    /// Whether a journaled pack's `.pack` or `.idx` is gone from the
+    /// quarantine, or the quarantine itself is (#75 r2 N2).
+    fn lost(&self) -> crate::Result<bool> {
+        let Some((_, pack)) = self.quarantine(false)? else {
+            return Ok(true);
+        };
+        for ack in &self.acks {
+            for extension in ["pack", "idx"] {
+                let name = cstring(format!("pack-{}.{extension}", ack.pack).as_bytes())?;
+                match open_file_at(&pack, &name) {
+                    Ok(_) => {}
+                    Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => return Ok(true),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The destination's shallow file must hold exactly the negotiated
+    /// frontier (#75 r2 N1, R-N75, R-N131): a shallow file that appeared or
+    /// changed after negotiation makes a held commit parentless, hiding a
+    /// deleted parent from the preflight and the connectivity check. A full
+    /// plan therefore refuses any shallow destination.
+    fn frontier(&self) -> Outcome<()> {
+        let common = open_dir(&self.target.common)?;
+        let mut held = Vec::new();
+        match open_file_at(&common, &cstring(b"shallow")?) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(BulkloadRefusal::GitInventoryMalformed.into());
+                }
+                (&file).take(16 << 20).read_to_end(&mut held)?;
+            }
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut frontier = BTreeSet::new();
+        for line in held.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            let oid = std::str::from_utf8(line)
+                .ok()
+                .filter(|oid| is_oid(oid.as_bytes()))
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+            frontier.insert(oid);
+        }
+        if !frontier
+            .iter()
+            .copied()
+            .eq(self.plan.shallow.iter().map(String::as_str))
+        {
+            return Err(Refused::because(
+                BulkloadRefusal::GitHavesUnprovable,
+                "destination_shallow_frontier_differs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// R-N75 held-tip closure preflight over the plan's haves, after the
+    /// shallow frontier check.
     fn preflight(&self) -> Outcome<()> {
+        self.frontier()?;
         if self.plan.haves.is_empty() {
             return Ok(());
         }
@@ -938,29 +1106,23 @@ impl<'a> Ingest<'a> {
         if self.stage >= Stage::Migrated {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
-        self.discard_quarantine()?;
-        self.journal
-            .append(&[Record::Abandoned(reason.to_owned())])?;
+        self.abandon_journaled(reason)?;
         Ok(())
     }
 
+    /// #75 r2 N2: the abandonment is journaled before the quarantine is
+    /// discarded. A crash between the two leaves an abandoned journal, and
+    /// the next open discards what is left ([`Found::Stale`]); a torn
+    /// `abandoned` line leaves a session whose quarantine is whole or
+    /// partly gone, which resume abandons again.
+    fn abandon_journaled(&self, reason: &'static str) -> crate::Result<()> {
+        self.journal
+            .append(&[Record::Abandoned(reason.to_owned())])?;
+        self.discard_quarantine()
+    }
+
     fn discard_quarantine(&self) -> crate::Result<()> {
-        let objects = open_dir(&self.target.objects)?;
-        let Some((quarantine, pack)) = self.quarantine(false)? else {
-            return Ok(());
-        };
-        for name in entries(&pack)? {
-            unlink_at(&pack, &cstring(&name)?)?;
-        }
-        drop(pack);
-        remove_dir_at(&quarantine, &cstring(b"pack")?)?;
-        drop(quarantine);
-        remove_dir_at(
-            &objects,
-            &cstring(format!("incoming-bulkload-{}", self.plan.pack_id).as_bytes())?,
-        )?;
-        seal_dir(&objects)?;
-        Ok(())
+        discard_quarantine(&self.target.objects, &self.quarantine)
     }
 
     /// Finish: connectivity, migration, the ref transaction and the keeps,
@@ -981,10 +1143,9 @@ impl<'a> Ingest<'a> {
             // #75 r1 B1: the check sees exactly the journaled packs, and
             // every one of them is there.
             self.sweep()?;
+            self.frontier()?;
             if let Err(refused) = self.connected() {
-                self.discard_quarantine()?;
-                self.journal
-                    .append(&[Record::Abandoned("connectivity_missing".to_owned())])?;
+                self.abandon_journaled("connectivity_missing")?;
                 return Err(refused);
             }
             self.journal.append(&[Record::Connected])?;
@@ -1009,12 +1170,13 @@ impl<'a> Ingest<'a> {
             self.carry = Some((before, after));
             self.stage = Stage::Published;
         }
-        if self.stage >= Stage::Published {
+        if self.stage == Stage::Published {
             // #75 r1 D1(b): a journaled publication is re-checked; a ref lost
             // to power loss is published again (its objects checked first).
+            // #75 r2 N5: a Done session is not: its refs were sealed and the
+            // device flushed before `done`, so a ref gone or moved since is
+            // the operator's doing, and finish only returns the receipt.
             self.ensure_published()?;
-        }
-        if self.stage == Stage::Published {
             self.drop_keeps()?;
             fault_point!(GitIngestBeforeDone);
             self.journal.append(&[Record::Done])?;
@@ -1108,7 +1270,15 @@ impl<'a> Ingest<'a> {
     /// One `update-ref --stdin -z` transaction: `create` for an absent ref,
     /// `verify` for one already naming its oid. Returns the digests of the
     /// `refs/carry/*` refs outside the plan before and after.
+    ///
+    /// #75 r2 N3: [`Ingest::occupied`] runs first (a resume from `migrated`
+    /// reaches here without it). From `migrated`, the before digest is
+    /// journaled (`publishing`) before the transaction and a resume reuses
+    /// it; a transaction that moved any other carry ref (before != after)
+    /// refuses `GIT_DESTINATION_OCCUPIED` / `carry_ref_moved`, and nothing
+    /// is journaled published.
     fn publish(&self) -> Outcome<(String, String)> {
+        self.occupied()?;
         let current = self.current()?;
         let mut transaction = Vec::new();
         for update in &self.plan.updates {
@@ -1129,7 +1299,15 @@ impl<'a> Ingest<'a> {
             transaction.extend_from_slice(update.oid.as_bytes());
             transaction.push(0);
         }
-        let before = self.carry_digest()?;
+        let before = match (&self.before, self.stage) {
+            (Some(journaled), Stage::Migrated) => journaled.clone(),
+            (None, Stage::Migrated) => {
+                let before = self.carry_digest()?;
+                self.journal.append(&[Record::Publishing(before.clone())])?;
+                before
+            }
+            _ => self.carry_digest()?,
+        };
         if !transaction.is_empty() {
             // #75 r1 D2: `--no-deref`, so a symref at a plan name is never
             // followed (and `occupied` refuses one before this).
@@ -1156,6 +1334,12 @@ impl<'a> Ingest<'a> {
             return Err(Refused::because(
                 BulkloadRefusal::GitDestinationOccupied,
                 "published_ref_missing",
+            ));
+        }
+        if before != after {
+            return Err(Refused::because(
+                BulkloadRefusal::GitDestinationOccupied,
+                "carry_ref_moved",
             ));
         }
         Ok((before, after))
@@ -1223,7 +1407,7 @@ impl<'a> Ingest<'a> {
         if self.all_published()? {
             return Ok(());
         }
-        self.occupied()?;
+        self.frontier()?;
         self.connected_in_store()?;
         self.publish()?;
         Ok(())
@@ -1461,6 +1645,35 @@ fn index_pack(
     let hash =
         String::from_utf8(hash.to_vec()).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     Ok((hash, bytes, blake3))
+}
+
+/// Remove the quarantine `name` under `objects`: every file in its `pack/`,
+/// then `pack/` and the quarantine; then seal `objects/`. Any part already
+/// gone is skipped, so a discard cut short is finished by the next one.
+fn discard_quarantine(objects: &Path, name: &str) -> crate::Result<()> {
+    let objects = open_dir(objects)?;
+    let name = cstring(name.as_bytes())?;
+    let quarantine = match open_dir_at(&objects, &name) {
+        Ok(quarantine) => quarantine,
+        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let pack = cstring(b"pack")?;
+    match open_dir_at(&quarantine, &pack) {
+        Ok(directory) => {
+            for entry in entries(&directory)? {
+                unlink_at(&directory, &cstring(&entry)?)?;
+            }
+            drop(directory);
+            remove_dir_at(&quarantine, &pack)?;
+        }
+        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
+        Err(error) => return Err(error),
+    }
+    drop(quarantine);
+    remove_dir_at(&objects, &name)?;
+    seal_dir(&objects)?;
+    Ok(())
 }
 
 /// A full flush of `file`'s device, counted as one (`F_FULLFSYNC` on Darwin,

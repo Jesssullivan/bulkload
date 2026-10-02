@@ -53,6 +53,22 @@ impl JournalStore {
         self.state.is_inside(path)
     }
 
+    /// A short name for this state dir: the first 16 hex digits of BLAKE3
+    /// over its canonical spelling. It keys the quarantine, so two state dirs
+    /// ingesting one plan never share (or adopt) a quarantine (#75 r2 N4).
+    pub(super) fn key(&self) -> String {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"bulkload git-carry-v2 quarantine key\0");
+        hasher.update(self.state.root().as_os_str().as_bytes());
+        hasher
+            .finalize()
+            .to_hex()
+            .get(..16)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     /// `git-carry-v2/ingest/`, created (0700, sealed) when `create` is set.
     fn directory(&self, create: bool) -> crate::Result<Option<File>> {
         let Some(carry) = private_subdirectory(self.state.directory(), "git-carry-v2", create)?
@@ -79,6 +95,9 @@ pub(super) enum Record {
     },
     /// `have <oid>`
     Have(String),
+    /// `shallow <oid>`: one line of the negotiated shallow frontier (#75 r2
+    /// N1).
+    Shallow(String),
     /// `ref <name hex> <oid>`
     Ref(Vec<u8>, String),
     /// `planned <digest of the block so far>`
@@ -94,6 +113,10 @@ pub(super) enum Record {
     Connected,
     /// `migrated`
     Migrated,
+    /// `publishing <carry refs before>`: the digest taken before the ref
+    /// transaction, journaled before it runs (#75 r2 N3), so a resume
+    /// compares against the state before any publication attempt.
+    Publishing(String),
     /// `published <carry refs before> <carry refs after>`
     Published(String, String),
     /// `done`
@@ -139,6 +162,7 @@ impl Record {
                 git_dir,
             } => format!("v1 begin {pack_id} {segments} {}", hex(git_dir)),
             Self::Have(oid) => format!("have {oid}"),
+            Self::Shallow(oid) => format!("shallow {oid}"),
             Self::Ref(name, oid) => format!("ref {} {oid}", hex(name)),
             Self::Planned(value) => format!("planned {value}"),
             Self::Segment {
@@ -149,6 +173,7 @@ impl Record {
             } => format!("segment {index} {pack} {bytes} {blake3}"),
             Self::Connected => "connected".to_owned(),
             Self::Migrated => "migrated".to_owned(),
+            Self::Publishing(before) => format!("publishing {before}"),
             Self::Published(before, after) => format!("published {before} {after}"),
             Self::Done => "done".to_owned(),
             Self::Abandoned(reason) => format!("abandoned {reason}"),
@@ -177,6 +202,7 @@ impl Record {
                 git_dir: unhex(git_dir).ok_or_else(bad)?,
             },
             ["have", oid] if is_oid(oid.as_bytes()) => Self::Have((*oid).to_owned()),
+            ["shallow", oid] if is_oid(oid.as_bytes()) => Self::Shallow((*oid).to_owned()),
             ["ref", name, oid] if is_oid(oid.as_bytes()) => {
                 Self::Ref(unhex(name).ok_or_else(bad)?, (*oid).to_owned())
             }
@@ -193,6 +219,7 @@ impl Record {
             }
             ["connected"] => Self::Connected,
             ["migrated"] => Self::Migrated,
+            ["publishing", before] if digest(before) => Self::Publishing((*before).to_owned()),
             ["published", before, after] if digest(before) && digest(after) => {
                 Self::Published((*before).to_owned(), (*after).to_owned())
             }
@@ -230,7 +257,11 @@ fn after_plan(line: &[u8]) -> bool {
         .is_some_and(|record| {
             !matches!(
                 record,
-                Record::Begin { .. } | Record::Have(_) | Record::Ref(..) | Record::Planned(_)
+                Record::Begin { .. }
+                    | Record::Have(_)
+                    | Record::Shallow(_)
+                    | Record::Ref(..)
+                    | Record::Planned(_)
             )
         })
 }
@@ -245,8 +276,12 @@ pub(super) struct Journal {
 
 /// What an existing journal held when it was opened.
 pub(super) enum Found {
-    /// No journal, or one with no sealed plan (discarded).
+    /// No journal existed.
     Fresh(Journal),
+    /// A journal existed with no sealed plan, or abandoned; it was replaced
+    /// by an empty one. Whatever quarantine its session made under this
+    /// state dir's name is that session's, and is discarded (#75 r2 N2).
+    Stale(Journal),
     /// A journal with a sealed plan, and every record after it.
     Existing(Journal, Vec<Record>),
 }
@@ -254,7 +289,7 @@ pub(super) enum Found {
 impl Journal {
     /// Open (creating when absent) and lock `<pack_id>.journal`. A journal
     /// whose plan block never sealed, or that was abandoned, is removed and
-    /// a fresh one created; a torn final line is cut off.
+    /// a fresh one created ([`Found::Stale`]); a torn final line is cut off.
     ///
     /// # Errors
     /// `JOURNAL_OWNERSHIP_CONFLICT` when another session holds the lock,
@@ -298,7 +333,7 @@ impl Journal {
         let Self {
             directory, name, ..
         } = journal;
-        Self::create(directory, name).map(Found::Fresh)
+        Self::create(directory, name).map(Found::Stale)
     }
 
     fn create(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
@@ -442,6 +477,7 @@ mod tests {
                 git_dir: b"/tmp/x y\n.git".to_vec(),
             },
             Record::Have("b".repeat(40)),
+            Record::Shallow("9".repeat(40)),
             Record::Ref(b"refs/carry/v1/x".to_vec(), "c".repeat(64)),
             Record::Planned("d".repeat(64)),
             Record::Segment {
@@ -452,6 +488,7 @@ mod tests {
             },
             Record::Connected,
             Record::Migrated,
+            Record::Publishing("3".repeat(64)),
             Record::Published("1".repeat(64), "2".repeat(64)),
             Record::Done,
             Record::Abandoned("connectivity_missing".to_owned()),
