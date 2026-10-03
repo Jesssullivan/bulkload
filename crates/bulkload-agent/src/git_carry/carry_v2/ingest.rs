@@ -15,7 +15,8 @@
 //!    ref updates, the destination's git dir) is sealed into the journal,
 //!    then the quarantine `objects/incoming-bulkload-<pack_id>-<state key>/`
 //!    is made (receive-pack's tmp-objdir pattern; the key names the state dir,
-//!    #75 r2 N4, by its identity token rather than its path, #82) and sealed.
+//!    #75 r2 N4, by its identity token rather than its path, #82, bound to
+//!    the state dir's inodes so a copy mints its own, #120) and sealed.
 //! 3. **Segments**, in order: `index-pack --stdin --fix-thin --keep` into the
 //!    quarantine (`GIT_OBJECT_DIRECTORY` the quarantine, the main store its
 //!    alternate, `GIT_QUARANTINE_PATH` set, so Git refuses any ref update).
@@ -643,13 +644,25 @@ impl<'a> Ingest<'a> {
         if !pack_id_ok(&pack_id) {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
-        // #82: keyed by the state dir's identity token, not its path.
-        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key()?);
+        // #82: keyed by the state dir's identity token, not its path; #120:
+        // a copied state dir has a token of its own, and knows the one it
+        // was copied with.
+        let keys = journals.keys()?;
+        let quarantine = format!("incoming-bulkload-{pack_id}-{}", keys.current);
+        let predecessor = keys
+            .predecessor
+            .map(|key| format!("incoming-bulkload-{pack_id}-{key}"));
         let git_dir = target.repository.git_dir.as_path();
         let journal = match Journal::open(journals, &pack_id)? {
             Found::Existing(journal, records) => {
                 return Self::existing(
-                    target, journals, plan, journal, &records, quarantine, store,
+                    target,
+                    journals,
+                    plan,
+                    journal,
+                    &records,
+                    (quarantine, predecessor),
+                    store,
                 );
             }
             Found::Fresh(journal) => journal,
@@ -663,6 +676,8 @@ impl<'a> Ingest<'a> {
         // is discarded, never adopted. #75 r4 N1: only once its own `flock`
         // is taken: a live session holds it, so a session whose journal name
         // was replaced under it keeps its packs and this open refuses.
+        // #120: only this state dir's own name; a copied state dir's
+        // predecessor's quarantine is never touched.
         if let Err(refused) = discard_quarantine(&target.objects, &quarantine, None) {
             // #75 r5: the journal is this open's own and empty (created, or
             // emptied in place, under its lock); leave none behind. #94: the
@@ -705,6 +720,17 @@ impl<'a> Ingest<'a> {
     /// runs the preflight again and sweeps its quarantine; one whose
     /// quarantine lost a journaled pack (or is gone) is abandoned, since it
     /// can never finish (#75 r2 N2), and an open then starts afresh.
+    ///
+    /// #120: `quarantines` is this state dir's quarantine name and, for a
+    /// copied state dir, its predecessor's. A journal with acked segments
+    /// whose own quarantine is absent while the predecessor's exists was
+    /// copied mid-session (or its state dir moved across file systems): the
+    /// acked packs are durable in a quarantine another state dir owns. It
+    /// refuses `JOURNAL_OWNERSHIP_CONFLICT` / `state_dir_copied`, abandoning
+    /// nothing and adopting nothing, rather than re-sending what the
+    /// destination durably holds (R25) or sharing a quarantine with the
+    /// original. Once that quarantine is gone, the journal is abandoned as
+    /// lost like any other.
     #[allow(clippy::too_many_arguments)]
     fn existing(
         target: &'a Target,
@@ -712,9 +738,10 @@ impl<'a> Ingest<'a> {
         plan: Option<IngestPlan>,
         journal: Journal,
         records: &[Record],
-        quarantine: String,
+        quarantines: (String, Option<String>),
         store: Option<&'a StderrStore>,
     ) -> Outcome<Self> {
+        let (quarantine, predecessor) = quarantines;
         let git_dir = target.repository.git_dir.as_path();
         let (journaled, recorded_dir, start) = IngestPlan::from_records(records)?;
         if recorded_dir != git_dir.as_os_str().as_bytes()
@@ -737,6 +764,20 @@ impl<'a> Ingest<'a> {
         // #75 r4 N1: hold the quarantine before sweeping, migrating or
         // discarding it.
         session.claim = claim_quarantine(&target.objects, &session.quarantine)?;
+        if session.claim.is_none()
+            && session.stage < Stage::Migrated
+            && !session.acks.is_empty()
+            && predecessor
+                .as_deref()
+                .map(|name| quarantine_exists(&target.objects, name))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err(Refused::because(
+                BulkloadRefusal::JournalOwnershipConflict,
+                "state_dir_copied",
+            ));
+        }
         if session.stage != Stage::Receiving {
             return Ok(session);
         }
@@ -1795,6 +1836,16 @@ fn claim_quarantine(objects: &Path, name: &str) -> Outcome<Option<File>> {
         ));
     }
     Ok(Some(quarantine))
+}
+
+/// Whether a quarantine `name` exists under `objects` (not followed).
+fn quarantine_exists(objects: &Path, name: &str) -> crate::Result<bool> {
+    let objects = open_dir(objects)?;
+    match open_dir_at(&objects, &cstring(name.as_bytes())?) {
+        Ok(_) => Ok(true),
+        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Remove the quarantine `name` under `objects`: every file in its `pack/`,

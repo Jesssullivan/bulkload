@@ -3562,6 +3562,136 @@ fn issue82_a_renamed_state_dir_resumes_its_own_quarantine() {
     assert_clean(&pair.destination, "issue82");
 }
 
+/// Copy a state dir byte for byte (`cp -a`), as an operator's backup,
+/// rsync or Finder copy would: its quarantine token comes along.
+fn copy_state(pair: &Pair, state: &Path, name: &str) -> PathBuf {
+    let copy = pair.scratch.path(name);
+    run(
+        {
+            let mut command = Command::new("cp");
+            command.arg("-a").arg(state).arg(&copy);
+            command
+        },
+        "copy state dir",
+    );
+    let token = |dir: &Path| fs::read(dir.join("git-carry-v2/quarantine-key")).unwrap();
+    assert_eq!(token(&copy), token(state), "the token is copied");
+    copy
+}
+
+/// #120 (R25 / R-N58): a state dir copied before its session's journal
+/// existed carries the original's token. The original's session receives
+/// two segments and crashes, leaving its quarantine unlocked; the copy then
+/// opens the same plan fresh. The copy mints its own key, so its fresh open
+/// discards only its own name: the original's quarantine survives, and the
+/// original's resume continues at `next_segment` and re-sends nothing it
+/// acked.
+#[test]
+fn issue120_a_copied_state_dir_never_discards_the_originals_quarantine() {
+    let pair = pair("issue120-copied", 64 * 1024);
+    assert!(pair.plan.segments() >= 3);
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let state = pair.scratch.state("destination-state");
+    // The original's token exists before the copy (an earlier session).
+    Ingest::open(
+        &target,
+        &JournalStore::open(&state).unwrap(),
+        pair.ingest_plan(),
+        None,
+    )
+    .unwrap()
+    .abandon("test_abandoned")
+    .unwrap();
+    let copy = copy_state(&pair, &state, "copied-state");
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        for index in 0..2 {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+        // Crash: the session is gone, its quarantine unlocked.
+    }
+    let original = quarantine_dir(&pair);
+    let acked = entries_of(&original);
+    assert!(!acked.is_empty());
+
+    let copied = JournalStore::open(&copy).unwrap();
+    let fresh = Ingest::open(&target, &copied, pair.ingest_plan(), None).unwrap();
+    assert_eq!(fresh.next_segment(), 0);
+    assert_eq!(quarantines(&pair).len(), 2, "the copy has its own");
+    assert_eq!(entries_of(&original), acked, "the original's survives");
+    fresh.abandon("test_abandoned").unwrap();
+    assert_eq!(entries_of(&original), acked, "the original's survives");
+
+    let journals = JournalStore::open(&state).unwrap();
+    let mut session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+    assert_eq!(session.next_segment(), 2, "resumes at next_segment");
+    assert_eq!(entries_of(&original), acked, "its own quarantine");
+    let mut resent = 0;
+    for index in session.next_segment()..pair.plan.segments() {
+        assert!(index >= 2, "an acked segment re-sent");
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+        resent += 1;
+    }
+    assert_eq!(resent, pair.plan.segments() - 2, "nothing acked re-sent");
+    session.finish().unwrap();
+    assert!(published(&pair));
+    assert_clean(&pair.destination, "issue120-copied");
+}
+
+/// #120: a state dir copied mid-session carries the original's journal.
+/// Its resume finds its own (new) quarantine name absent and the
+/// original's present: it refuses `state_dir_copied`, abandoning nothing,
+/// and leaves the original's packs alone; the original then resumes and
+/// finishes without re-sending. With the original's quarantine gone, the
+/// copy's journal is abandoned as lost, and an open starts afresh.
+#[test]
+fn issue120_a_state_dir_copied_mid_session_refuses_rather_than_resends() {
+    let pair = pair("issue120-mid", 64 * 1024);
+    assert!(pair.plan.segments() >= 3);
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let state = pair.scratch.state("destination-state");
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        let first = pair.segment(0);
+        session.receive(0, &mut &first[..]).unwrap();
+    }
+    let copy = copy_state(&pair, &state, "copied-state");
+    let original = quarantine_dir(&pair);
+    let acked = entries_of(&original);
+
+    let copied = JournalStore::open(&copy).unwrap();
+    for _ in 0..2 {
+        let refused = Ingest::resume(&target, &copied, pair.plan.pack_id(), None).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+        assert_eq!(refused.reason, Some("state_dir_copied"));
+        let refused = Ingest::open(&target, &copied, pair.ingest_plan(), None).unwrap_err();
+        assert_eq!(refused.reason, Some("state_dir_copied"));
+    }
+    assert_eq!(quarantines(&pair), vec![original.clone()]);
+    assert_eq!(entries_of(&original), acked, "the original's survives");
+    let journal = fs::read_to_string(journal_path(&pair, &copy)).unwrap();
+    assert!(!journal.contains("abandoned"), "nothing abandoned");
+
+    let journals = JournalStore::open(&state).unwrap();
+    let mut session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+    assert_eq!(session.next_segment(), 1);
+    for index in 1..pair.plan.segments() {
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    session.finish().unwrap();
+    assert!(published(&pair));
+
+    let refused = Ingest::resume(&target, &copied, pair.plan.pack_id(), None).unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::SealedObjectMissing);
+    assert_eq!(refused.reason, Some("quarantine_lost"));
+    assert_clean(&pair.destination, "issue120-mid");
+}
+
 /// Point the journal's name at a copy of the journal, as reviewer probe 2
 /// of #75 r4 N1 does: the session's own file is no longer at the name.
 fn replace_journal_with_copy(pair: &Pair, state: &Path) {

@@ -20,6 +20,7 @@ ingest, #75).
   out and is rewritten; a longer one refuses `PATH_ESCAPES_ROOT`. Device and
   inode were rejected (Darwin `st_dev` is not stable across reboots, per the
   issue). A renamed or remounted state dir resumes its own quarantine.
+  (#120 later binds the token to inode numbers, not `st_dev`.)
 - **#92** `finish` and `abandon` call `still_owned()` at the top;
   `finish` again before migration, publication and dropping keeps;
   `abandon_journaled` before and after its `abandoned` append. A replaced
@@ -45,8 +46,11 @@ itself when directory modes are not enforced, i.e. a privileged runner), and
   unowned, since a moved state dir keeps its key. Reclaiming orphans needs an
   explicit operator sweep (unlocked `incoming-bulkload-*` with no journal
   anywhere); not built here.
-- A state dir copied byte-for-byte (token included) shares its quarantine
-  names with the original; the quarantine `flock` still keeps two live
-  sessions apart.
+- (Corrected 2026-10-03, #120.) A state dir copied byte-for-byte (token
+  included) shared its quarantine names with the original. The quarantine
+  `flock` kept only two *live* sessions apart: a sequential fresh open from
+  the copy discarded the original's unlocked quarantine, and the original's
+  resume then re-sent every segment (R25). Fixed by #120; see
+  `2026-10-03-ingest-token.md`.
 - No legacy path-keyed fallback: estate operations are frozen (R-N56), so no
   deployed state dir holds a path-keyed quarantine.

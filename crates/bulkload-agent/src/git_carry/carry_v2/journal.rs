@@ -53,34 +53,38 @@ impl JournalStore {
         self.state.is_inside(path)
     }
 
-    /// A short name for this state dir: the first 16 hex digits of BLAKE3
-    /// over its identity token. It keys the quarantine, so two state dirs
-    /// ingesting one plan never share (or adopt) a quarantine (#75 r2 N4).
+    /// Short names for this state dir: the first 16 hex digits of BLAKE3
+    /// over its identity token. The current one keys the quarantine, so two
+    /// state dirs ingesting one plan never share (or adopt) a quarantine
+    /// (#75 r2 N4).
     ///
-    /// #82 (R25 / R-N58): the token is 32 random bytes created once as
-    /// `git-carry-v2/quarantine-key` ([`state_token`]), never the state
+    /// #82 (R25 / R-N58): the token is 32 random bytes created once in
+    /// `git-carry-v2/quarantine-key` ([`state_binding`]), never the state
     /// dir's path, so a state dir renamed or remounted elsewhere keeps its
     /// key and resumes its own quarantine instead of re-sending every
-    /// segment. Device and inode numbers are not used: Darwin's `st_dev`
-    /// can change across reboots. A state dir lost and recreated gets a new
-    /// token, so it never adopts the lost one's quarantine.
+    /// segment. A state dir lost and recreated gets a new token, so it never
+    /// adopts the lost one's quarantine.
+    ///
+    /// #120: the token is bound to the inode numbers of the state dir and of
+    /// the token file. A copy of the state dir (token included) has other
+    /// inodes, so its first open mints a token of its own and records the
+    /// one it was copied with as its predecessor: the copy and the original
+    /// never name (or discard) each other's quarantine, however their
+    /// sessions are ordered. The predecessor's key lets a copied in-flight
+    /// journal refuse instead of re-sending what the original's quarantine
+    /// durably holds ([`StateKeys::predecessor`]).
     ///
     /// # Errors
-    /// As [`state_token`].
-    pub(super) fn key(&self) -> crate::Result<String> {
+    /// As [`state_binding`].
+    pub(super) fn keys(&self) -> crate::Result<StateKeys> {
         let carry = private_subdirectory(self.state.directory(), "git-carry-v2", true)?
             .ok_or(BulkloadRefusal::Io(None))?;
         seal_dir(self.state.directory())?;
-        let token = state_token(&carry)?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"bulkload git-carry-v2 quarantine key\0");
-        hasher.update(&token);
-        Ok(hasher
-            .finalize()
-            .to_hex()
-            .get(..16)
-            .unwrap_or_default()
-            .to_owned())
+        let binding = state_binding(self.state.directory(), &carry)?;
+        Ok(StateKeys {
+            current: quarantine_key(&binding.token),
+            predecessor: binding.predecessor.as_ref().map(quarantine_key),
+        })
     }
 
     /// `git-carry-v2/ingest/`, created (0700, sealed) when `create` is set.
@@ -98,29 +102,168 @@ impl JournalStore {
     }
 }
 
+/// The quarantine keys [`JournalStore::keys`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StateKeys {
+    /// This state dir's key: it names the quarantine.
+    pub(super) current: String,
+    /// #120: the key of the state dir this one was copied from (or moved
+    /// from across file systems, which is a copy), when its binding records
+    /// one. That quarantine is never this state dir's to adopt, sweep or
+    /// discard.
+    pub(super) predecessor: Option<String>,
+}
+
+/// The first 16 hex digits of BLAKE3 over a domain tag and `token`.
+fn quarantine_key(token: &[u8; TOKEN_BYTES]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bulkload git-carry-v2 quarantine key\0");
+    hasher.update(token);
+    hasher
+        .finalize()
+        .to_hex()
+        .get(..16)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Bytes in the state dir's identity token.
 const TOKEN_BYTES: usize = 32;
 
-/// The state dir's identity token (#82): `quarantine-key` in `carry`
-/// (`git-carry-v2/`), created 0600 on first use with [`TOKEN_BYTES`] random
-/// bytes and read back after the private-file checks every time after.
+/// Bytes in a binding record (#120): the token, the predecessor's token
+/// (zeros for none), the state dir's inode number, the token file's inode
+/// number (both little-endian `u64`), and the first 8 bytes of a BLAKE3
+/// check over the rest.
+const BINDING_BYTES: usize = 2 * TOKEN_BYTES + 3 * 8;
+
+/// A state dir's identity token and the token it was copied with, if any.
+struct Binding {
+    token: [u8; TOKEN_BYTES],
+    predecessor: Option<[u8; TOKEN_BYTES]>,
+}
+
+/// The inode numbers a binding records: the state dir's and the token
+/// file's.
 ///
-/// It is only ever read or written under an exclusive `flock` on the file,
-/// and both the file and `carry` are sealed before the lock is released or
-/// the token returned, so no quarantine is ever named by a token that a
-/// power loss could take back. A file shorter than a token (its creator
-/// died between the create and the sealed write) was never handed to
-/// anyone, so the holder of the lock writes a fresh token into it.
+/// #120: these, and not the device number, decide whether a token is the
+/// state dir's own. Both survive a rename within a file system, a remount
+/// and a reboot on Linux and Darwin. The device number does not: Darwin's
+/// `st_dev` is assigned at mount and can change across reboots, and on
+/// Linux it can follow device-mapper or probe order, so a binding that
+/// checked it would read a reboot as a copy. A file-level copy (`cp -a`,
+/// rsync, tar, Finder, a clonefile, a restore from a file backup, a move
+/// across file systems) makes new inodes for both and so is caught.
+/// A block-level clone (a disk image, a file system snapshot) keeps inode
+/// numbers and is not distinguished; it clones a destination on the same
+/// volume with it, so its quarantines live in another repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bound {
+    state: u64,
+    file: u64,
+}
+
+impl Bound {
+    fn of(state: &File, file: &File) -> crate::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Self {
+            state: state.metadata()?.ino(),
+            file: file.metadata()?.ino(),
+        })
+    }
+}
+
+fn binding_check(body: &[u8]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bulkload git-carry-v2 quarantine binding\0");
+    hasher.update(body);
+    let mut check = [0_u8; 8];
+    check.copy_from_slice(hasher.finalize().as_bytes().get(..8).unwrap_or(&[0; 8]));
+    check
+}
+
+fn encode_binding(binding: &Binding, bound: Bound) -> [u8; BINDING_BYTES] {
+    let mut record = [0_u8; BINDING_BYTES];
+    let (body, check) = record.split_at_mut(BINDING_BYTES - 8);
+    let (token, rest) = body.split_at_mut(TOKEN_BYTES);
+    token.copy_from_slice(&binding.token);
+    let (predecessor, rest) = rest.split_at_mut(TOKEN_BYTES);
+    predecessor.copy_from_slice(&binding.predecessor.unwrap_or([0; TOKEN_BYTES]));
+    let (state, file) = rest.split_at_mut(8);
+    state.copy_from_slice(&bound.state.to_le_bytes());
+    file.copy_from_slice(&bound.file.to_le_bytes());
+    check.copy_from_slice(&binding_check(body));
+    record
+}
+
+/// A binding record and the inodes it is bound to; `None` when its check
+/// fails.
+fn decode_binding(record: &[u8]) -> Option<(Binding, Bound)> {
+    if record.len() != BINDING_BYTES {
+        return None;
+    }
+    let (body, check) = record.split_at(BINDING_BYTES - 8);
+    if binding_check(body) != check {
+        return None;
+    }
+    let token: [u8; TOKEN_BYTES] = body.get(..TOKEN_BYTES)?.try_into().ok()?;
+    let predecessor: [u8; TOKEN_BYTES] = body.get(TOKEN_BYTES..2 * TOKEN_BYTES)?.try_into().ok()?;
+    let state = u64::from_le_bytes(
+        body.get(2 * TOKEN_BYTES..2 * TOKEN_BYTES + 8)?
+            .try_into()
+            .ok()?,
+    );
+    let file = u64::from_le_bytes(body.get(2 * TOKEN_BYTES + 8..)?.try_into().ok()?);
+    Some((
+        Binding {
+            token,
+            predecessor: (predecessor != [0; TOKEN_BYTES]).then_some(predecessor),
+        },
+        Bound { state, file },
+    ))
+}
+
+fn random_token() -> crate::Result<[u8; TOKEN_BYTES]> {
+    let mut token = [0_u8; TOKEN_BYTES];
+    File::open("/dev/urandom")?.read_exact(&mut token)?;
+    Ok(token)
+}
+
+/// The state dir's identity token (#82) and its binding (#120):
+/// `quarantine-key` in `carry` (`git-carry-v2/`), created 0600 on first use
+/// and read back after the private-file checks every time after. It holds
+/// one [`BINDING_BYTES`] record.
+///
+/// - Shorter than a token: its creator died between the create and the
+///   sealed write, so it was never handed to anyone; a fresh token is bound.
+/// - Exactly a token: a #82 token from before #120 (none is deployed:
+///   R-N56), bound in place to this state dir, keeping its token.
+/// - A record bound to this state dir's inodes: its token.
+/// - A record bound to other inodes: this state dir is a copy. A fresh token
+///   is bound, with the record's token as its predecessor; the original
+///   keeps its token, so neither ever discards the other's quarantine.
+/// - Anything else (another length, or a record failing its check):
+///   `PATH_ESCAPES_ROOT`; no crash leaves it (see below).
+///
+/// A record is written whole with one `pwrite` at offset 0 and never
+/// truncated first, so a crash leaves the old record or the new one: it is
+/// far smaller than a sector, and the file only grows (0 or 32 bytes to a
+/// record, or a record over a record). It is only ever read or written
+/// under an exclusive `flock` on the file, and both the file and `carry`
+/// are sealed before the lock is released or the token returned, so no
+/// quarantine is ever named by a token that a power loss could take back.
 ///
 /// # Errors
 /// `JOURNAL_OWNERSHIP_CONFLICT` when the lock stays held, `PATH_ESCAPES_ROOT`
-/// for a file that fails the private-file checks or is longer than a token,
+/// for a file that fails the private-file checks or holds no valid record,
 /// and I/O failures.
-fn state_token(carry: &File) -> crate::Result<[u8; TOKEN_BYTES]> {
+fn state_binding(state: &File, carry: &File) -> crate::Result<Binding> {
+    use std::os::unix::fs::FileExt as _;
     const ATTEMPTS: u32 = 50;
     let name = cstring(b"quarantine-key")?;
     for _ in 0..ATTEMPTS {
-        let file = match open_rw(carry, &name) {
+        // Never `O_APPEND`: a record is written at offset 0, and Linux
+        // appends a `pwrite` to a file opened for appending.
+        let file = match open_rw_flags(carry, &name, 0) {
             Ok(file) => file,
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => match create_private(carry, &name) {
                 Ok(file) => file,
@@ -134,26 +277,55 @@ fn state_token(carry: &File) -> crate::Result<[u8; TOKEN_BYTES]> {
         if !lock_exclusive(&file)? {
             return Err(BulkloadRefusal::JournalOwnershipConflict);
         }
-        let mut token = [0_u8; TOKEN_BYTES];
-        let mut held = Vec::with_capacity(TOKEN_BYTES + 1);
+        let mut held = Vec::with_capacity(BINDING_BYTES + 1);
         (&file)
-            .take(u64::try_from(TOKEN_BYTES + 1).map_err(|_| BulkloadRefusal::BudgetExceeded)?)
+            .take(u64::try_from(BINDING_BYTES + 1).map_err(|_| BulkloadRefusal::BudgetExceeded)?)
             .read_to_end(&mut held)?;
-        if held.len() > TOKEN_BYTES {
-            return Err(BulkloadRefusal::PathEscapesRoot);
-        }
-        if held.len() == TOKEN_BYTES {
-            token.copy_from_slice(&held);
-        } else {
-            File::open("/dev/urandom")?.read_exact(&mut token)?;
-            file.set_len(0)?;
-            (&file).write_all(&token)?;
+        let bound = Bound::of(state, &file)?;
+        let (binding, write) = match held.len() {
+            length if length < TOKEN_BYTES => (
+                Binding {
+                    token: random_token()?,
+                    predecessor: None,
+                },
+                true,
+            ),
+            TOKEN_BYTES => {
+                let mut token = [0_u8; TOKEN_BYTES];
+                token.copy_from_slice(&held);
+                (
+                    Binding {
+                        token,
+                        predecessor: None,
+                    },
+                    true,
+                )
+            }
+            BINDING_BYTES => {
+                let (binding, recorded) =
+                    decode_binding(&held).ok_or(BulkloadRefusal::PathEscapesRoot)?;
+                if recorded == bound {
+                    (binding, false)
+                } else {
+                    (
+                        Binding {
+                            token: random_token()?,
+                            predecessor: Some(binding.token),
+                        },
+                        true,
+                    )
+                }
+            }
+            _ => return Err(BulkloadRefusal::PathEscapesRoot),
+        };
+        if write {
+            file.write_all_at(&encode_binding(&binding, bound), 0)?;
         }
         // Sealed by whoever reads it, too: a creator that died after its
         // write and before its seal left the bytes only in the page cache.
         seal_file(&file)?;
         seal_dir(carry)?;
-        return Ok(token);
+        return Ok(binding);
     }
     Err(BulkloadRefusal::JournalOwnershipConflict)
 }
@@ -580,13 +752,23 @@ fn names(directory: &File, name: &std::ffi::CString, file: &File) -> crate::Resu
 /// Open an existing journal for reading and appending, never following a
 /// symlink at its name.
 fn open_rw(directory: &File, name: &std::ffi::CString) -> crate::Result<File> {
+    open_rw_flags(directory, name, libc::O_APPEND)
+}
+
+/// Open an existing file for reading and writing with `extra` flags, never
+/// following a symlink at its name.
+fn open_rw_flags(
+    directory: &File,
+    name: &std::ffi::CString,
+    extra: libc::c_int,
+) -> crate::Result<File> {
     // SAFETY: `directory` is open and `name` NUL-terminated; no create flag,
     // so no mode argument. O_NONBLOCK keeps a planted FIFO from blocking.
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDWR | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            libc::O_RDWR | extra | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -607,46 +789,109 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn key_of(state: &Path) -> String {
+        JournalStore::open(state).unwrap().keys().unwrap().current
+    }
+
     /// #82: the quarantine key follows the state dir's identity token, not
     /// its path. It is stable across opens, survives a rename, differs
     /// between state dirs (and for a state dir recreated at the same path),
     /// and a token file its creator never finished is written afresh; one
-    /// longer than a token refuses.
+    /// that is neither a token nor a binding record refuses.
     #[test]
     fn the_quarantine_key_follows_the_state_dirs_token_not_its_path() {
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = tempfile::tempdir().unwrap();
         let state = scratch.path().join("state");
         private_dir(&state);
-        let key = JournalStore::open(&state).unwrap().key().unwrap();
+        let keys = JournalStore::open(&state).unwrap().keys().unwrap();
+        let key = keys.current.clone();
         assert_eq!(key.len(), 16);
-        assert_eq!(JournalStore::open(&state).unwrap().key().unwrap(), key);
+        assert_eq!(keys.predecessor, None);
+        assert_eq!(key_of(&state), key);
         let token = state.join("git-carry-v2/quarantine-key");
         let metadata = std::fs::metadata(&token).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
-        assert_eq!(metadata.len(), 32);
+        assert_eq!(metadata.len(), 88);
 
         let moved = scratch.path().join("moved");
         std::fs::rename(&state, &moved).unwrap();
-        assert_eq!(JournalStore::open(&moved).unwrap().key().unwrap(), key);
+        let after = JournalStore::open(&moved).unwrap().keys().unwrap();
+        assert_eq!(after.current, key, "a rename keeps the key");
+        assert_eq!(after.predecessor, None, "a rename is not a copy");
 
         private_dir(&state);
-        let recreated = JournalStore::open(&state).unwrap().key().unwrap();
+        let recreated = key_of(&state);
         assert_ne!(recreated, key, "a recreated state dir is a new one");
 
         // A creator that died between the create and the write.
         let torn = state.join("git-carry-v2/quarantine-key");
         std::fs::write(&torn, b"short").unwrap();
-        let rewritten = JournalStore::open(&state).unwrap().key().unwrap();
-        assert_eq!(std::fs::metadata(&torn).unwrap().len(), 32);
-        assert_eq!(
-            JournalStore::open(&state).unwrap().key().unwrap(),
-            rewritten
-        );
+        let rewritten = key_of(&state);
+        assert_eq!(std::fs::metadata(&torn).unwrap().len(), 88);
+        assert_eq!(key_of(&state), rewritten);
 
-        std::fs::write(&torn, [7_u8; 33]).unwrap();
+        for length in [33, 87, 89] {
+            std::fs::write(&torn, vec![7_u8; length]).unwrap();
+            assert_eq!(
+                JournalStore::open(&state).unwrap().keys(),
+                Err(BulkloadRefusal::PathEscapesRoot),
+                "{length}"
+            );
+        }
+    }
+
+    /// #120: a byte-for-byte copy of a state dir (its token included) gets a
+    /// token of its own on its first open and names the original's as its
+    /// predecessor; the original keeps its key, and both are stable after.
+    /// A #82 token from before the binding is bound in place; a record that
+    /// fails its check refuses.
+    #[test]
+    fn issue120_a_copied_state_dir_mints_its_own_key() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = scratch.path().join("state");
+        private_dir(&state);
+        let original = key_of(&state);
+        let copy = scratch.path().join("copy");
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&state)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let token = |dir: &Path| std::fs::read(dir.join("git-carry-v2/quarantine-key")).unwrap();
+        assert_eq!(token(&copy), token(&state), "a byte-for-byte copy");
+
+        let copied = JournalStore::open(&copy).unwrap().keys().unwrap();
+        assert_ne!(copied.current, original, "the copy mints its own key");
+        assert_eq!(copied.predecessor.as_deref(), Some(original.as_str()));
         assert_eq!(
-            JournalStore::open(&state).unwrap().key(),
+            JournalStore::open(&copy).unwrap().keys().unwrap(),
+            copied,
+            "stable once bound"
+        );
+        let kept = JournalStore::open(&state).unwrap().keys().unwrap();
+        assert_eq!(kept.current, original, "the original keeps its key");
+        assert_eq!(kept.predecessor, None);
+
+        // A #82 token (32 bytes, unbound) is bound in place.
+        let legacy = scratch.path().join("legacy");
+        private_dir(&legacy);
+        let _ = key_of(&legacy);
+        let path = legacy.join("git-carry-v2/quarantine-key");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..32]).unwrap();
+        let mut token32 = [0_u8; TOKEN_BYTES];
+        token32.copy_from_slice(&bytes[..32]);
+        assert_eq!(key_of(&legacy), quarantine_key(&token32));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 88);
+
+        let mut bad = std::fs::read(&path).unwrap();
+        bad[40] ^= 1;
+        std::fs::write(&path, &bad).unwrap();
+        assert_eq!(
+            JournalStore::open(&legacy).unwrap().keys(),
             Err(BulkloadRefusal::PathEscapesRoot)
         );
     }
