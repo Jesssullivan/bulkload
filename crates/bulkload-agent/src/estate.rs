@@ -815,6 +815,83 @@ fn attempt_directory(state: &Path, identity: &str, key: [u8; 32]) -> Result<Path
     }
 }
 
+/// The bytes one item's capture is expected to publish (#101): the larger of
+/// its census's regular-file bytes (the worktree payload before compression)
+/// and the retained bundle it extends, if any (a lower bound on its history).
+/// An estimate, not a promise: compression can make the bundle smaller, and
+/// history the retained bundle does not hold can make it larger.
+fn estimated_bundle(parts: &git_carry::KeyParts, retained: Option<&Path>) -> Result<u64> {
+    let retained = match retained {
+        Some(bundle) => fs::metadata(bundle)?.len(),
+        None => 0,
+    };
+    Ok(parts.census_bytes().max(retained))
+}
+
+/// CORPUS free space for one capture pass (#101, OI-1002-Q11).
+///
+/// Each item reserves its estimated bundle before its export writes; the
+/// estimate plus every byte still reserved by in-flight items (`jobs` is at
+/// most 2) is checked against a fresh `statvfs` of CORPUS under the
+/// process-wide floor. A fresh probe per item sees what completed items
+/// already wrote, so a completed item's reservation is released, not kept.
+/// Bytes an in-flight item has already written are counted twice (on disk
+/// and reserved), which errs towards refusing.
+struct CorpusSpace<'a> {
+    corpus: &'a Path,
+    floor: u8,
+    probe: fn(&Path) -> Result<crate::space::Space>,
+    reserved: Mutex<u64>,
+}
+
+impl<'a> CorpusSpace<'a> {
+    fn live(corpus: &'a Path) -> Self {
+        Self {
+            corpus,
+            floor: crate::space::min_free_percent(),
+            probe: crate::space::probe,
+            reserved: Mutex::new(0),
+        }
+    }
+
+    /// Reserve `bytes` on CORPUS until the returned guard drops.
+    ///
+    /// # Errors
+    /// `DESTINATION_SPACE_INSUFFICIENT` when they do not fit beside every
+    /// in-flight reservation, or the probe's refusal.
+    fn reserve(&self, bytes: u64) -> Result<Reservation<'_, 'a>> {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .map_err(|_| BulkloadRefusal::ContractSelfInconsistent)?;
+        if bytes > 0 {
+            let space = (self.probe)(self.corpus)?;
+            crate::space::check(reserved.saturating_add(bytes), space, self.floor)?;
+            *reserved = reserved.saturating_add(bytes);
+        }
+        drop(reserved);
+        Ok(Reservation { owner: self, bytes })
+    }
+}
+
+/// One in-flight item's CORPUS reservation; released when it drops, whether
+/// the item captured or refused.
+struct Reservation<'s, 'a> {
+    owner: &'s CorpusSpace<'a>,
+    bytes: u64,
+}
+
+impl Drop for Reservation<'_, '_> {
+    fn drop(&mut self) {
+        // A poisoned lock means another item panicked, which R33 forbids;
+        // there is nothing left to release into.
+        if let Ok(mut reserved) = self.owner.reserved.lock() {
+            *reserved = reserved.saturating_sub(self.bytes);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
 fn capture_item(
     item: &Item,
     state: &Path,
@@ -823,6 +900,7 @@ fn capture_item(
     policy: git_carry::CapturePolicy,
     owners: &Owners,
     refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
+    space: &CorpusSpace<'_>,
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
@@ -848,6 +926,10 @@ fn capture_item(
             } => (Some(bundle), started_ns, extends),
             Retained::None => (None, None, false),
         };
+    // #101 (OI-1002-Q11): before this item's export writes a byte, charge its
+    // estimated bundle to CORPUS. An item that does not fit refuses
+    // DESTINATION_SPACE_INSUFFICIENT as its own receipt; the pass goes on.
+    let _reservation = space.reserve(estimated_bundle(&parts, retained.as_deref())?)?;
     let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
     // A future-stamped seat blocked the whole-capture reuse above, and will on
     // every pass until the clock passes it: say so (round-3 N5).
@@ -1164,6 +1246,27 @@ pub fn capture_with_policy(
 ) -> Result<()> {
     private_directory(state)?;
     private_directory(corpus)?;
+    capture_in(
+        plan,
+        state,
+        corpus,
+        jobs,
+        policy,
+        &CorpusSpace::live(corpus),
+        receipt,
+    )
+}
+
+// [`capture_with_policy`] once both directories exist, against `space`.
+fn capture_in(
+    plan: &Path,
+    state: &Path,
+    corpus: &Path,
+    jobs: usize,
+    policy: git_carry::CapturePolicy,
+    space: &CorpusSpace<'_>,
+    receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
+) -> Result<()> {
     let contents: Plan = read(plan)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let groups = capture_groups(&contents)?;
@@ -1182,6 +1285,7 @@ pub fn capture_with_policy(
                 policy,
                 &owners,
                 &refused,
+                space,
             )
         });
         if result.is_err() {
@@ -1331,6 +1435,113 @@ fn apply_item(
     };
     write(&journal, &outcome.to_owned())?;
     Ok(Completion::clean(outcome).naming(nested))
+}
+
+/// The outcome `git-repair-missing-index` records into a state dir (#95).
+///
+/// Its journal says `refs-imported`:
+/// the repair imports the capture's ref custody exactly as apply does, and
+/// creates the missing index; it lays down no working bytes.
+pub const INDEX_REPAIRED: &str = "index-repaired";
+
+/// Where a repair records its outcome (#95): the plan and corpus that name
+/// the repaired capture, and the private state directory that holds apply's
+/// outcome records and journals.
+#[derive(Debug, Clone, Copy)]
+pub struct RepairLedger<'a> {
+    pub plan: &'a Path,
+    pub corpus: &'a Path,
+    pub state: &'a Path,
+}
+
+// The one planned item whose current capture is exactly the bundle being
+// repaired (by digest) and whose repository or workspace is `repository`.
+// An unreadable capture record names no item here; it refuses on its own in
+// apply and in the closure report.
+fn repair_item(
+    plan: &Plan,
+    corpus: &Path,
+    repository: &Path,
+    digest: &[u8; 32],
+) -> Result<(Item, String, [u8; 32])> {
+    let same = |path: &Path| fs::canonicalize(path).is_ok_and(|path| path == repository);
+    let mut found = None;
+    for item in &plan.items {
+        let identity = id(item)?;
+        let Ok(captured) = read::<Capture>(&corpus.join(format!("{identity}.capture"))) else {
+            continue;
+        };
+        if captured.digest != *digest
+            || !(same(&item.repository) || item.workspace.as_deref().is_some_and(same))
+        {
+            continue;
+        }
+        if found.is_some() {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        found = Some((item.clone(), identity, captured.digest));
+    }
+    found.ok_or(BulkloadRefusal::ReceiptBindingInvalid)
+}
+
+/// `git-repair-missing-index` with apply-style records (#95, OI-1002-Q5).
+///
+/// Binds the bundle to the one planned item whose current capture record in
+/// CORPUS has the bundle's digest and whose repository (or workspace) is
+/// `repository`, under the state directory's estate lock, then repairs. Once
+/// the index is published and durable it writes the item's exact
+/// current-capture journal (`refs-imported`, unless one is already there) and
+/// then its `{item}.outcome` = `index-repaired`, so `closure-report` reads
+/// the item as referenced-only natively. A repair that refuses after binding
+/// records `refused` with the typed code, unless the item's current-capture
+/// journal already exists: an item already closed by an earlier repair or
+/// apply keeps its records (a second repair of a repaired index refuses).
+///
+/// # Errors
+/// `RECEIPT_BINDING_INVALID` when the bundle names no planned item (or more
+/// than one), then everything [`git_carry::repair_missing_index`] refuses.
+pub fn repair_missing_index(
+    bundle: &Path,
+    repository: &Path,
+    source: &str,
+    receipt: &Path,
+    ledger: &RepairLedger<'_>,
+) -> Result<()> {
+    private_directory(ledger.state)?;
+    let _lock = exclusive(&ledger.state.join("estate.lock"))?;
+    let contents: Plan = read(ledger.plan)?;
+    let canonical = fs::canonicalize(repository)?;
+    let mut bound = None;
+    let result =
+        git_carry::repair_missing_index_bound(bundle, repository, source, receipt, |digest| {
+            bound = Some(repair_item(&contents, ledger.corpus, &canonical, digest)?);
+            Ok(())
+        });
+    let Some((item, identity, digest)) = bound else {
+        return result;
+    };
+    let journal = journal_path(ledger.state, &identity, source, &digest);
+    let outcome = ledger.state.join(format!("{identity}.outcome"));
+    match result {
+        Ok(()) => {
+            // Durability order: the index is published and synced, then the
+            // journal, then the outcome record that names it.
+            if !journal.try_exists()? {
+                write(&journal, &"refs-imported".to_owned())?;
+            }
+            write(&outcome, &(&item.source, INDEX_REPAIRED, &None::<String>))?;
+            Ok(())
+        }
+        Err(refusal) => {
+            if !journal.try_exists()? {
+                write(
+                    &outcome,
+                    &(&item.source, "refused", &Some(refusal.to_string())),
+                )?;
+            }
+            Err(refusal)
+        }
+    }
 }
 
 /// What the corpus and state directories hold for one item's current
@@ -3804,5 +4015,235 @@ mod review_pr53g_r7 {
                 assert_eq!(rev, expected, "R7-1 rev ({a:?},{b:?})");
             }
         }
+    }
+}
+
+// #101 (OI-1002-Q11) and #95 (OI-1002-Q5): per-item CORPUS space refusal in
+// estate-capture, and git-repair-missing-index records read natively by the
+// closure report.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod closure_lane_20261002 {
+    use super::*;
+    use crate::closure::{classify, Disposition};
+    use std::process::Command;
+
+    fn git(path: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Bulkload test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null"
+            ])
+            .args(args)
+            .output()
+            .expect("git command")
+            .status
+            .success());
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn repository(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let source = root.join(name);
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), bytes).unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-q", "-m", "base"]);
+        source
+    }
+
+    // 1 TiB filesystem with 32 KiB available: a small checkout fits, a
+    // 64 KiB one does not.
+    #[allow(clippy::unnecessary_wraps)]
+    fn tight(_: &Path) -> Result<crate::space::Space> {
+        Ok(crate::space::Space {
+            total: 1 << 40,
+            available: 32 * 1024,
+        })
+    }
+
+    #[test]
+    fn one_item_refuses_for_space_while_another_in_the_pass_captures() {
+        let root = fresh("space-101");
+        let small = repository(&root, "small", b"small");
+        let large = repository(&root, "large", &vec![7u8; 64 * 1024]);
+        let plan = root.join("plan");
+        add(&plan, &small, &root.join("small-dest"), None).unwrap();
+        add(&plan, &large, &root.join("large-dest"), None).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        private_directory(&state).unwrap();
+        private_directory(&corpus).unwrap();
+        let space = CorpusSpace {
+            corpus: &corpus,
+            floor: 0,
+            probe: tight,
+            reserved: Mutex::new(0),
+        };
+        let rows = Mutex::new(Vec::new());
+        let outcome = capture_in(
+            &plan,
+            &state,
+            &corpus,
+            2,
+            git_carry::CapturePolicy::default(),
+            &space,
+            &|row| {
+                rows.lock()
+                    .unwrap()
+                    .push((row.source.clone(), row.outcome, row.reason.clone()));
+                Ok(())
+            },
+        );
+        // Any refused item makes the pass refuse, after every item ran.
+        assert_eq!(outcome, Err(BulkloadRefusal::ContractSelfInconsistent));
+        let mut rows = rows.into_inner().unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    large.clone(),
+                    "refused",
+                    Some("DESTINATION_SPACE_INSUFFICIENT".to_owned())
+                ),
+                (small, "captured", None),
+            ]
+        );
+        // Every reservation was released.
+        assert_eq!(*space.reserved.lock().unwrap(), 0);
+        // The refused item's durable receipt carries the typed code, so the
+        // closure report counts it as refused.
+        let read = ledger(&plan, &corpus, "neo", std::slice::from_ref(&state)).unwrap();
+        let refused = read
+            .entries
+            .iter()
+            .find(|entry| entry.source == large)
+            .unwrap();
+        assert_eq!(
+            classify(refused),
+            Disposition::Refused("DESTINATION_SPACE_INSUFFICIENT".into())
+        );
+        // The next pass, with room, captures the refused item and reuses the
+        // other.
+        let rows = Mutex::new(Vec::new());
+        capture(&plan, &state, &corpus, 2, &|row| {
+            rows.lock().unwrap().push((row.source.clone(), row.outcome));
+            Ok(())
+        })
+        .unwrap();
+        let rows = rows.into_inner().unwrap();
+        assert!(rows.contains(&(large, "captured")), "{rows:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repaired_items_record_apply_style_outcomes_read_natively() {
+        let root = fresh("repair-95");
+        let source = repository(&root, "source", b"base");
+        fs::write(source.join("file"), b"staged edit").unwrap();
+        git(&source, &["add", "file"]);
+        let destination = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &destination, None).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let contents: Plan = read(&plan).unwrap();
+        let identity = id(contents.items.first().unwrap()).unwrap();
+        let captured: Capture = read(&corpus.join(format!("{identity}.capture"))).unwrap();
+        let bundle = corpus.join(&captured.bundle);
+        // The destination already holds the payload; only its index is gone.
+        git_carry::restore_bundle(&bundle, &destination, "neo").unwrap();
+        fs::remove_file(destination.join(".git/index")).unwrap();
+        let applied = root.join("applied");
+        let led = RepairLedger {
+            plan: &plan,
+            corpus: &corpus,
+            state: &applied,
+        };
+        // An unplanned repository binds no item: refused, nothing recorded.
+        let elsewhere = repository(&root, "elsewhere", b"other");
+        assert_eq!(
+            repair_missing_index(&bundle, &elsewhere, "neo", &root.join("r0"), &led),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert!(!applied.join(format!("{identity}.outcome")).exists());
+
+        repair_missing_index(&bundle, &destination, "neo", &root.join("r1"), &led).unwrap();
+        let entry = |states: &[PathBuf]| {
+            ledger(&plan, &corpus, "neo", states)
+                .unwrap()
+                .entries
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let repaired = entry(std::slice::from_ref(&applied));
+        assert_eq!(
+            repaired
+                .record
+                .as_ref()
+                .map(|(_, outcome, _)| outcome.as_str()),
+            Some(INDEX_REPAIRED)
+        );
+        assert_eq!(
+            repaired.journal,
+            JournalState::Present("refs-imported".into())
+        );
+        assert_eq!(classify(&repaired), Disposition::ReferencedOnly);
+
+        // A second repair refuses (the index exists) and keeps the records.
+        assert!(
+            repair_missing_index(&bundle, &destination, "neo", &root.join("r2"), &led).is_err()
+        );
+        assert_eq!(
+            classify(&entry(std::slice::from_ref(&applied))),
+            Disposition::ReferencedOnly
+        );
+        // A later estate-apply sees the journal and replays nothing.
+        let rows = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            rows.lock().unwrap().push(row.outcome);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows.into_inner().unwrap(),
+            vec!["previous-ref-custody-not-workspace-parity"]
+        );
+
+        // A repair that refuses after binding records the typed refusal.
+        let refused_state = root.join("refused");
+        let refused_led = RepairLedger {
+            state: &refused_state,
+            ..led
+        };
+        assert!(
+            repair_missing_index(&bundle, &destination, "neo", &root.join("r3"), &refused_led)
+                .is_err()
+        );
+        let refused = entry(std::slice::from_ref(&refused_state));
+        assert!(
+            matches!(classify(&refused), Disposition::Refused(_)),
+            "{refused:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

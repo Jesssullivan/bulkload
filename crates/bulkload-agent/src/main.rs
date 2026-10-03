@@ -55,7 +55,7 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
-    closure-report PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    closure-report PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...] [--attest LEDGER.json]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's apply outcome records and journals (later
                 directories override earlier outcome records), with SOURCE
@@ -65,15 +65,25 @@ SUBCOMMANDS:
                 FRAME_CODEC is not typed), or referenced-only (no workspace
                 planned, exact refs journal), else unaccounted. Stale and
                 foreign journals are listed. Exits nonzero with
-                CLOSURE_UNACCOUNTED when unaccounted > 0
+                CLOSURE_UNACCOUNTED when unaccounted > 0.
+                --attest LEDGER.json: join a bulkload.closure-ledger.v1
+                attestation ledger for items closed by audit, not by a verb.
+                Its rows are reported in a separate attested block and never
+                override a native record; the gate then passes only if every
+                item is native-accounted or attested (typed refusal, basis
+                other than native-closure-report, evidence, matching source)
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
                 Restore captured staged/unstaged work into a new repository
     git-restore-linked BUNDLE REPOSITORY ABSENT_DEST SOURCE
                 Restore captured work into a new linked worktree without switching others
-    git-repair-missing-index BUNDLE REPOSITORY SOURCE NEW_RECEIPT
-                Create a missing same-HEAD staged index only; never rewrite payload
+    git-repair-missing-index BUNDLE REPOSITORY SOURCE NEW_RECEIPT [PLAN CORPUS PRIVATE_STATE]
+                Create a missing same-HEAD staged index only; never rewrite payload.
+                With PLAN CORPUS PRIVATE_STATE, bind BUNDLE to the planned item
+                whose CORPUS capture it is and record apply-style receipts in
+                PRIVATE_STATE: journal refs-imported, outcome index-repaired
+                (or refused with its code), so closure-report reads it natively
     git-attach-matching-payload BUNDLE REPOSITORY DESTINATION SOURCE NEW_RECEIPT
                 Attach exact matching payload using existing common Git administration
     git-attach-standalone-payload BUNDLE DESTINATION SOURCE NEW_RECEIPT ORIGIN_FROM ORIGIN_TO
@@ -264,7 +274,25 @@ fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
 // whether or not it passes; the verdict is the exit status.
 fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
-    let [plan, corpus, source, states @ ..] = args else {
+    // #95: `--attest LEDGER.json` may appear once, anywhere after the verb.
+    let mut attest = None;
+    let mut positional = Vec::with_capacity(args.len());
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--attest" {
+            if attest.is_some() {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            attest = Some(
+                rest.next()
+                    .map(PathBuf::from)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
+            );
+        } else {
+            positional.push(arg);
+        }
+    }
+    let [plan, corpus, source, states @ ..] = positional.as_slice() else {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     };
     if states.is_empty() {
@@ -274,7 +302,14 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
     let ledger =
         bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
-    let report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    if let Some(attest) = attest {
+        report.attest(&bulkload_agent::closure::AttestationLedger::read(
+            &attest,
+            Path::new(plan),
+            source,
+        )?)?;
+    }
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", report.to_json())?;
     stdout.flush()?;
@@ -475,7 +510,7 @@ fn emit(stdout: &mut impl std::io::Write, index: usize, block: &[String]) -> Res
 }
 
 fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
-    if args.len() != 4 {
+    if args.len() != 4 && args.len() != 7 {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     }
     let path = |i| {
@@ -487,8 +522,27 @@ fn repair_index_command(args: &[std::ffi::OsString]) -> Result<()> {
         .get(2)
         .and_then(|value| value.to_str())
         .ok_or(BulkloadRefusal::PathNotPortable)?;
-    bulkload_agent::git_carry::repair_missing_index(path(0)?, path(1)?, source, path(3)?)?;
-    println!("missing index repaired; payload parity not asserted");
+    if args.len() == 7 {
+        // #95: record the repair in an apply state directory, bound to its
+        // plan item through CORPUS's capture record.
+        bulkload_agent::estate::repair_missing_index(
+            path(0)?,
+            path(1)?,
+            source,
+            path(3)?,
+            &bulkload_agent::estate::RepairLedger {
+                plan: path(4)?,
+                corpus: path(5)?,
+                state: path(6)?,
+            },
+        )?;
+        println!(
+            "missing index repaired; outcome index-repaired recorded; payload parity not asserted"
+        );
+    } else {
+        bulkload_agent::git_carry::repair_missing_index(path(0)?, path(1)?, source, path(3)?)?;
+        println!("missing index repaired; payload parity not asserted");
+    }
     Ok(())
 }
 
