@@ -210,10 +210,9 @@ fn a_capture_counts_its_pack_its_censuses_and_its_reuse_reads() {
         applied["read_bundle_stage_bytes"],
         applied["blake3_bundle_stage_bytes"]
     );
-    assert_eq!(
-        applied["read_bundle_stage_bytes"],
-        applied["write_bundle_stage_bytes"]
-    );
+    // Every staged copy writes what it read; a chained capture also writes
+    // its flattened bundle (WP2 PR 2).
+    assert!(applied["write_bundle_stage_bytes"] >= applied["read_bundle_stage_bytes"]);
     // Apply never packs from a source.
     assert_eq!(applied["write_source_pack_bytes"], 0);
     // The chained capture restored exactly: HEAD and every byte.
