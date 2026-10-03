@@ -369,6 +369,8 @@ enum Job {
         retained: Option<Retained>,
         /// The row key to record once the destination holds the bytes.
         record: Option<Vec<u8>>,
+        /// The manifest's capture was racy (#86).
+        racy: bool,
     },
 }
 
@@ -403,6 +405,8 @@ enum Event {
         record: Option<Vec<u8>>,
         manifest: Manifest,
         retained: Option<Retained>,
+        /// The capture was racy: neither side records it (#86).
+        racy: bool,
         bytes_read: u64,
     },
     End {
@@ -413,6 +417,8 @@ enum Event {
         root: [u8; 32],
         chunks: u32,
         size: u64,
+        /// The capture was racy: neither side records it (#86).
+        racy: bool,
         bytes_read: u64,
     },
     Refused {
@@ -431,6 +437,7 @@ enum SourceEntry {
         manifest: Manifest,
         retained: Option<Retained>,
         record: Option<Vec<u8>>,
+        racy: bool,
     },
     Done,
 }
@@ -456,12 +463,99 @@ fn retain_budget(root: &Path) -> u64 {
 #[cfg(test)]
 static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
+/// Timestamp granularity the racy-capture guard allows for (#86): the Git
+/// carry's own [`crate::git_carry::RACY_GRANULARITY_NS`], 2 s.
+pub const RACY_GRANULARITY_NS: i128 = crate::git_carry::RACY_GRANULARITY_NS;
+
+/// Wait until no seat beneath `root` is racy against the wall clock: until
+/// the clock is past every seat's mtime and ctime by more than
+/// [`RACY_GRANULARITY_NS`]. Returns the time waited.
+///
+/// For a corpus written just before it is copied (a benchmark fixture or a
+/// test), so that its first copy records every capture and a warm run can
+/// show 0 source reads. The copy itself never waits: a racy seat is sent
+/// and read again by a later run (#86). The tree is walked without
+/// following symlinks.
+///
+/// # Errors
+/// Refuses an unreadable tree.
+pub fn settle_racy_window(root: &Path) -> Result<std::time::Duration> {
+    fn newest(directory: &Path, stamp: &mut i128) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let identity = StatIdentity::from_metadata(&meta);
+            *stamp = (*stamp).max(identity.mtime_ns).max(identity.ctime_ns);
+            if meta.is_dir() {
+                newest(&entry.path(), stamp)?;
+            }
+        }
+        Ok(())
+    }
+    let started = Instant::now();
+    let mut stamp = StatIdentity::from_metadata(&std::fs::symlink_metadata(root)?).ctime_ns;
+    newest(root, &mut stamp)?;
+    let settled = stamp.saturating_add(RACY_GRANULARITY_NS);
+    // A seat stamped far in the future would never settle: refuse rather
+    // than wait for it.
+    if settled.saturating_sub(crate::git_carry::pass_start_ns()) > 30 * RACY_GRANULARITY_NS {
+        return Err(BulkloadRefusal::BudgetExceeded);
+    }
+    loop {
+        let now = crate::git_carry::pass_start_ns();
+        if now > settled {
+            return Ok(started.elapsed());
+        }
+        let wait = u64::try_from(settled.saturating_sub(now))
+            .unwrap_or(u64::MAX)
+            .saturating_add(1_000_000);
+        std::thread::sleep(std::time::Duration::from_nanos(wait));
+    }
+}
+
+/// The clock a capture is judged racy against: the capturing host's wall
+/// clock, in nanoseconds since the epoch (see the design's known limit on
+/// filesystem clocks).
+#[cfg(not(test))]
+fn capture_clock(_root: &Path) -> i128 {
+    crate::git_carry::pass_start_ns()
+}
+
+/// The clock a capture is judged racy against. Unit tests write their
+/// fixtures just before they copy them, so every seat would be racy against
+/// the real clock and no warm resume could be shown: by default they read a
+/// clock one hour ahead. A test of the guard itself pins the clock for its
+/// source root with [`set_capture_clock`].
+#[cfg(test)]
+fn capture_clock(root: &Path) -> i128 {
+    CAPTURE_CLOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(pinned_root, _)| pinned_root == root)
+        .map_or_else(
+            || crate::git_carry::pass_start_ns() + 3_600_000_000_000,
+            |(_, clock)| *clock,
+        )
+}
+
+/// Pin (or, with `None`, unpin) the capture clock for a canonical source root.
+#[cfg(test)]
+fn set_capture_clock(root: &Path, clock: Option<i128>) {
+    let mut pinned = CAPTURE_CLOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    pinned.retain(|(pinned_root, _)| pinned_root != root);
+    if let Some(clock) = clock {
+        pinned.push((root.to_path_buf(), clock));
+    }
+}
+
+/// Test-only capture clocks by canonical source root.
+#[cfg(test)]
+static CAPTURE_CLOCK: Mutex<Vec<(PathBuf, i128)>> = Mutex::new(Vec::new());
+
 /// What every capture thread shares.
 struct SourceWork<'a> {
-    #[cfg_attr(
-        not(feature = "fault-injection"),
-        allow(dead_code, reason = "only the mid-read fault hook names the path")
-    )]
+    /// The canonical source root, which keys test-only hooks and clocks.
     root: &'a Path,
     /// The source root every read resolves beneath, component by component.
     root_fd: BorrowedFd<'a>,
@@ -876,6 +970,7 @@ impl<W: Write> Outbound<'_, W> {
                 record,
                 manifest,
                 retained,
+                racy,
                 bytes_read,
             } => {
                 self.bytes_read = self.bytes_read.saturating_add(bytes_read);
@@ -895,6 +990,7 @@ impl<W: Write> Outbound<'_, W> {
                     manifest,
                     retained,
                     record,
+                    racy,
                 };
             }
             Event::Held { entry, held } => {
@@ -919,6 +1015,7 @@ impl<W: Write> Outbound<'_, W> {
                 root,
                 chunks,
                 size,
+                racy,
                 bytes_read,
             } => {
                 self.bytes_read = self.bytes_read.saturating_add(bytes_read);
@@ -931,6 +1028,7 @@ impl<W: Write> Outbound<'_, W> {
                         root,
                         chunks,
                         size,
+                        racy,
                     },
                 )?;
                 fault_point!(ServeAfterContent);
@@ -999,6 +1097,7 @@ impl<W: Write> Outbound<'_, W> {
             manifest,
             retained,
             record,
+            racy,
         } = std::mem::replace(slot, SourceEntry::Working)
         else {
             return Err(BulkloadRefusal::FrameCodec);
@@ -1017,6 +1116,7 @@ impl<W: Write> Outbound<'_, W> {
                 indices,
                 retained,
                 record,
+                racy,
             })
             .map_err(|_| BulkloadRefusal::Io(None))
     }
@@ -1058,11 +1158,12 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
         Job::Manifest { entry, row } => (
             entry,
             match manifest_capture(work, store, &row, &mut bytes_read) {
-                Ok(Some((record, manifest, retained))) => Ok(Event::Manifest {
+                Ok(Some((record, manifest, retained, racy))) => Ok(Event::Manifest {
                     entry,
                     record,
                     manifest,
                     retained,
+                    racy,
                     bytes_read,
                 }),
                 // No ledger row and no room to keep the chunks: building a
@@ -1079,6 +1180,7 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
             indices,
             retained,
             record,
+            racy,
         } => (
             entry,
             serve_chunks(
@@ -1105,6 +1207,7 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
                     root,
                     chunks,
                     size,
+                    racy,
                     bytes_read,
                 },
                 other => other,
@@ -1127,7 +1230,7 @@ fn send_capture(
     bytes_read: &mut u64,
 ) -> Result<Event> {
     let key = row_key(work.authority, row)?;
-    let chunks = capture_file(work, row, bytes_read, |index, offset, digest, data| {
+    let (chunks, racy) = capture_file(work, row, bytes_read, |index, offset, digest, data| {
         let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
         work.credit.acquire(u64::from(size))?;
         events
@@ -1150,14 +1253,18 @@ fn send_capture(
         chunks: u32::try_from(manifest.chunks.len())
             .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
         size: row.size,
-        record: Some((key, manifest)),
+        // A racy capture is sent, never recorded (#86): its stat identity
+        // cannot vouch for the bytes, so the next run reads it again.
+        record: (!racy).then_some((key, manifest)),
+        racy,
         bytes_read: *bytes_read,
     })
 }
 
 /// A manifest to offer: the row key to record (none when it came from the
-/// ledger), the manifest, and its retained chunks.
-type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>);
+/// ledger, or when the capture was racy), the manifest, its retained chunks,
+/// and whether the capture was racy (#86).
+type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>, bool);
 
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
@@ -1173,7 +1280,7 @@ fn manifest_capture(
     let key = row_key(work.authority, row)?;
     if let Some(manifest) = store.capture(&key)? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
-            return Ok(Some((None, manifest, None)));
+            return Ok(Some((None, manifest, None, false)));
         }
     }
     // Every chunk a fresh manifest names must be kept, so the requests that
@@ -1181,11 +1288,16 @@ fn manifest_capture(
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
         return Ok(None);
     };
-    let chunks = capture_file(work, row, bytes_read, |_, _, _, data| {
+    let (chunks, racy) = capture_file(work, row, bytes_read, |_, _, _, data| {
         retained.chunks.push(Arc::new(data));
         Ok(())
     })?;
-    Ok(Some((Some(key), Manifest::new(chunks), Some(retained))))
+    Ok(Some((
+        (!racy).then_some(key),
+        Manifest::new(chunks),
+        Some(retained),
+        racy,
+    )))
 }
 
 /// Send the requested chunks of an offered manifest, from memory when they
@@ -1276,6 +1388,8 @@ fn serve_chunks(
         chunks: u32::try_from(manifest.chunks.len())
             .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
         size: row.size,
+        // The caller sets the offer's own `racy`.
+        racy: false,
         bytes_read: *bytes_read,
     })
 }
@@ -1285,12 +1399,20 @@ fn serve_chunks(
 /// identity must match its row before and after the read; a capture that
 /// fails either check is refused, and only its caller decides what any
 /// already-handed chunk means.
+///
+/// Returns the chunks and whether the capture was racy (#86): the seat's
+/// mtime or ctime falls within [`RACY_GRANULARITY_NS`] of the clock read
+/// before the file was opened, or later than the clock read after the final
+/// stat check. A same-size rewrite in that tick can keep the stat identity,
+/// so the identity cannot vouch for the bytes read, exactly as in the Git
+/// carry census (R-N76): the capture is sent, but never recorded as a reuse
+/// key on either side.
 fn capture_file(
     work: &SourceWork<'_>,
     row: &RowSchema,
     bytes_read: &mut u64,
     mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
-) -> Result<Vec<ChunkSpec>> {
+) -> Result<(Vec<ChunkSpec>, bool)> {
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
@@ -1302,6 +1424,7 @@ fn capture_file(
     }
     #[cfg(feature = "fault-injection")]
     let file_path = work.root.join(crate::walk::rel_path(&row.rel_path));
+    let started_ns = capture_clock(work.root);
     let file = open_source(work, row)?;
     let expected = StatIdentity::from_row(row);
     if StatIdentity::from_metadata(&file.metadata()?) != expected {
@@ -1348,7 +1471,11 @@ fn capture_file(
     if offset != row.size || StatIdentity::from_metadata(&file.metadata()?) != expected {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
-    Ok(chunks)
+    let racy = crate::git_carry::racy(row, started_ns, capture_clock(work.root));
+    if racy {
+        counters::bump(Counter::TransferRacyCaptures);
+    }
+    Ok((chunks, racy))
 }
 
 /// Open a source seat for reading, component by component beneath the
@@ -1404,8 +1531,8 @@ struct ReceiveContext<'a> {
 
 /// Chunks of this store's orphaned temporaries (see
 /// [`Destination::salvaged`]): what a crashed session staged and sealed but
-/// never published. A resume fills from them instead of asking the source,
-/// so a capture the source recorded as held is never read again (R25).
+/// never published. A resume fills from them instead of asking the source
+/// for those chunks, and removes them when it finishes (#97).
 #[derive(Default)]
 struct Salvage {
     /// Digest to (salvaged file, offset, size). Hints only: re-verified on use.
@@ -1470,26 +1597,22 @@ fn finish_receive(
     store: &Store,
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
-    mut destination_refused: bool,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
             Ok(()) => stats.completed += 1,
-            Err(refusal) => {
-                destination_refused = true;
-                stats.refusals.push((rel_path, refusal.code().to_owned()));
-            }
+            Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
         }
     }
-    // With every output committed, no output needs a salvaged temporary:
-    // remove them as the sweep would have. After a destination-side refusal
-    // keep them: the refused entry's only durable copy may be one of them
-    // (#77 round 2, N4). Source-side refusals never held bytes here.
-    if destination_refused {
-        target.keep_salvaged();
-    } else {
-        target.remove_salvaged()?;
-    }
+    // Every salvaged temporary is removed when the session finishes, refused
+    // entries or not (#97). Salvage only saves wire bytes: a capture is
+    // recorded only after its output's group commit returned (`Held`), so no
+    // recorded capture's bytes live only in a temporary, and a refused
+    // entry's capture was never recorded, so the next run reads it from the
+    // source anyway. Keeping them after a refusal (#77 round 2, N4) made
+    // every later session re-index all of them and ask for a manifest for
+    // every file, and a path refused on every run kept them forever.
+    target.remove_salvaged()?;
     stats.temporaries_removed = target.swept().removed;
     stats.temporaries_left.clone_from(&target.swept().left);
     stats.directories_renamed = target.created().renamed;
@@ -1644,8 +1767,6 @@ struct Inbound<'a, W> {
     open: usize,
     fill_locally: bool,
     salvage: Salvage,
-    /// The destination refused an entry itself (not the source).
-    destination_refused: bool,
     /// Entries queued for their group commit, by relative path, awaiting
     /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
     pending_held: HashMap<Vec<u8>, u64>,
@@ -1732,7 +1853,6 @@ pub fn receive<R: Read, W: Write>(
         open: 0,
         fill_locally,
         salvage: Salvage::default(),
-        destination_refused: false,
         pending_held: HashMap::new(),
         committed: group_outcomes,
         walk_done: false,
@@ -1745,20 +1865,11 @@ pub fn receive<R: Read, W: Write>(
     };
     let source_bytes_read = receiver.run(input)?;
     let Inbound {
-        mut stats,
-        session,
-        destination_refused,
-        ..
+        mut stats, session, ..
     } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
-    finish_receive(
-        &mut target,
-        &store,
-        committer,
-        &mut stats,
-        destination_refused,
-    )?;
+    finish_receive(&mut target, &store, committer, &mut stats)?;
     Ok(stats)
 }
 
@@ -1814,7 +1925,8 @@ impl<W: Write> Inbound<'_, W> {
                     root,
                     chunks,
                     size,
-                }) => self.end(entry, root, chunks, size)?,
+                    racy,
+                }) => self.end(entry, root, chunks, size, racy)?,
                 Frame::Data { header, payload } => self.data(&header, &payload)?,
                 Frame::Control(Control::SourceDone {
                     entries,
@@ -1830,7 +1942,6 @@ impl<W: Write> Inbound<'_, W> {
 
 impl<W: Write> Inbound<'_, W> {
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
-        self.destination_refused = true;
         self.stats
             .refusals
             .push((rel_path, refusal.code().to_owned()));
@@ -2106,7 +2217,16 @@ impl<W: Write> Inbound<'_, W> {
 
     /// An entry's data is complete: check coverage and the manifest root,
     /// then queue the output for its group commit, or record its refusal.
-    fn end(&mut self, entry: u64, root: [u8; 32], chunks: u32, size: u64) -> Result<()> {
+    /// A `racy` capture is published, but its output row is never kept as a
+    /// reuse key (#86).
+    fn end(
+        &mut self,
+        entry: u64,
+        root: [u8; 32],
+        chunks: u32,
+        size: u64,
+        racy: bool,
+    ) -> Result<()> {
         let incoming = self
             .incoming
             .remove(&entry)
@@ -2118,7 +2238,7 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(BulkloadRefusal::FrameCodec);
                 }
                 let rel_path = streaming.row.rel_path.clone();
-                (rel_path, self.end_streaming(streaming, root))
+                (rel_path, self.end_streaming(streaming, root, racy))
             }
             Incoming::Filling(filling) => {
                 if !filling.expected.is_empty()
@@ -2129,7 +2249,7 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(BulkloadRefusal::FrameCodec);
                 }
                 let rel_path = filling.row.rel_path.clone();
-                (rel_path, self.end_filling(filling))
+                (rel_path, self.end_filling(filling, racy))
             }
         };
         // Every End is answered. `held` is sent once the output's group
@@ -2161,9 +2281,6 @@ impl<W: Write> Inbound<'_, W> {
                 let Some(entry) = self.pending_held.remove(&rel_path) else {
                     continue;
                 };
-                if !held {
-                    self.destination_refused = true;
-                }
                 self.release(entry);
                 write_control(self.output, &Control::Held { entry, held })?;
             }
@@ -2187,7 +2304,7 @@ impl<W: Write> Inbound<'_, W> {
         }
     }
 
-    fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32]) -> Result<()> {
+    fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {
         let Streaming {
             row,
             key,
@@ -2223,7 +2340,7 @@ impl<W: Write> Inbound<'_, W> {
                         chunks: specs,
                     };
                     let identity = verify_existing(&file, &row, &manifest)?;
-                    return self.adopt(file, parent, &row, key, identity);
+                    return self.adopt(file, parent, &row, (key, racy), identity);
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -2246,10 +2363,10 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
-        self.publish(staged, &row, key, hints)
+        self.publish(staged, &row, (key, racy), hints)
     }
 
-    fn end_filling(&mut self, filling: Filling) -> Result<()> {
+    fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
         let Filling {
             row,
             key,
@@ -2262,7 +2379,7 @@ impl<W: Write> Inbound<'_, W> {
             Plan::Refuse(refusal) => Err(refusal),
             Plan::Adopt(file, parent) => {
                 let identity = verify_existing(&file, &row, &manifest)?;
-                self.adopt(file, parent, &row, key, identity)
+                self.adopt(file, parent, &row, (key, racy), identity)
             }
             Plan::Write(staging) => {
                 self.open -= 1;
@@ -2271,7 +2388,7 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
-                self.publish(staging.staged, &row, key, staging.hints)
+                self.publish(staging.staged, &row, (key, racy), staging.hints)
             }
         }
     }
@@ -2284,7 +2401,7 @@ impl<W: Write> Inbound<'_, W> {
         file: std::fs::File,
         parent: Arc<std::fs::File>,
         row: &RowSchema,
-        key: Vec<u8>,
+        (key, racy): (Vec<u8>, bool),
         identity: StatIdentity,
     ) -> Result<()> {
         self.committer.submit(Publication::Adopted {
@@ -2292,6 +2409,7 @@ impl<W: Write> Inbound<'_, W> {
                 key,
                 rel_path: row.rel_path.clone(),
                 identity,
+                racy,
                 hints: Vec::new(),
             },
             file,
@@ -2305,7 +2423,7 @@ impl<W: Write> Inbound<'_, W> {
         &mut self,
         staged: StagedFile,
         row: &RowSchema,
-        key: Vec<u8>,
+        (key, racy): (Vec<u8>, bool),
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
         if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
@@ -2322,6 +2440,7 @@ impl<W: Write> Inbound<'_, W> {
                 key,
                 rel_path: row.rel_path.clone(),
                 size: row.size,
+                racy,
                 hints,
             },
         })

@@ -54,9 +54,9 @@ pub const PACK_HEADER_BYTES: usize = 32;
 
 /// The wire schema whose BLAKE3 is [`wire_id`]. Any change to a frame's
 /// layout, a [`Control`] variant or its order must change this text.
-pub const WIRE_SCHEMA: &str = "bulkload wire v5 (2026-09-25)
+pub const WIRE_SCHEMA: &str = "bulkload wire v5 (2026-10-02)
 frame: u32be body_len, u8 tag, body
-tag 0x01 control: postcard Control
+tag 0x01 control: postcard Control, the whole body and nothing after it
 tag 0x02 data: 64-byte header (u64le entry, u32le index, u32le size, u64le offset, [u8;32] digest, [u8;8] zero) + size payload bytes
 tag 0x03 pack_data (reserved, W6): 32-byte header (u32le sub, u32le segment, u64le offset, u32le size, [u8;12] zero) + size payload bytes
 control 0 Open{proto u16, wire_id [u8;32], root bytes, state bytes}
@@ -68,7 +68,7 @@ control 5 WalkDone{entries u64}
 control 6 Decide{entry u64, decision Decision}
 control 7 Manifest{entry u64, root [u8;32], chunks Vec<ChunkSpec>}
 control 8 NeedChunks{entry u64, indices Vec<u32>}
-control 9 End{entry u64, root [u8;32], chunks u32, size u64}
+control 9 End{entry u64, root [u8;32], chunks u32, size u64, racy bool}
 control 10 Credit{bytes u64}
 control 11 SourceDone{entries u64, source_bytes_read u64}
 control 12 SubOpen{sub u32, kind SubKind} (reserved, W6)
@@ -196,12 +196,18 @@ pub enum Control {
     /// →S. The chunk indices the destination still needs after a manifest.
     NeedChunks { entry: u64, indices: Vec<u32> },
     /// →D. An entry's data is complete: its manifest root, chunk count and
-    /// size, for the destination to check coverage against.
+    /// size, for the destination to check coverage against. `racy`: the
+    /// seat was stamped within one timestamp tick of its capture (or later
+    /// than the source's clock), so a same-size rewrite in that tick could
+    /// keep its stat identity. Its identity cannot vouch for these bytes, so
+    /// neither side records it as a reuse key (R25, R-N58, R-N76); the next
+    /// run reads the seat again.
     End {
         entry: u64,
         root: [u8; 32],
         chunks: u32,
         size: u64,
+        racy: bool,
     },
     /// →S. Permission to send this many more data payload bytes.
     Credit { bytes: u64 },
@@ -384,6 +390,20 @@ impl Fields<'_> {
     }
 }
 
+/// Decode one postcard value that fills `bytes` exactly. Trailing bytes
+/// after the value are refused, never ignored: a frame body or a record
+/// with garbage after it is corrupt, not valid (#87, R33).
+///
+/// # Errors
+/// [`BulkloadRefusal::FrameCodec`] for a malformed value or a non-empty
+/// remainder.
+pub fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    match postcard::take_from_bytes(bytes) {
+        Ok((value, [])) => Ok(value),
+        _ => Err(BulkloadRefusal::FrameCodec),
+    }
+}
+
 /// One decoded frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -505,13 +525,13 @@ impl Frame {
     /// Decode one frame body: `tag` and the `body` bytes after it.
     ///
     /// # Errors
-    /// [`BulkloadRefusal::FrameCodec`] for an unknown tag, a malformed body
-    /// or a payload length that differs from its header;
+    /// [`BulkloadRefusal::FrameCodec`] for an unknown tag, a malformed body,
+    /// a control body with bytes after its message, or a payload length that differs from its header;
     /// [`BulkloadRefusal::BudgetExceeded`] for a data payload over
     /// [`MAX_DATA_PAYLOAD`].
     pub fn decode_body(tag: u8, body: &[u8]) -> Result<Self> {
         match tag {
-            TAG_CONTROL => Ok(Self::Control(postcard::from_bytes(body)?)),
+            TAG_CONTROL => Ok(Self::Control(decode_exact(body)?)),
             TAG_DATA => {
                 let (header, payload) = body
                     .split_at_checked(DATA_HEADER_BYTES)

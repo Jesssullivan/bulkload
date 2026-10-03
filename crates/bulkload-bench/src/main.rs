@@ -726,6 +726,11 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
             "native fixture payload differs from sealed corpus",
         ));
     }
+    // The fixture was written just now, so every seat is racy for one
+    // timestamp tick and its captures would not be recorded (#86). Settle it
+    // outside timing, so the initial runs record every capture and the warm
+    // resume measures R25, not the racy guard.
+    transfer::settle_racy_window(&source).map_err(io::Error::other)?;
     Ok(Fixture {
         source,
         private_identity: corpus_identity(&expected)?,
