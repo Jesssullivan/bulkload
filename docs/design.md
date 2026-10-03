@@ -25,26 +25,34 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
   whose current capture it is (by digest and repository) and writes the same
   journal, then the outcome `index-repaired` (or `refused` with its code), so
-  a repaired item reads as referenced-only natively (#95).
+  a repaired item reads as referenced-only natively (#95). An item that plans
+  a workspace never binds: the repair refuses `RECEIPT_BINDING_INVALID`
+  before writing anything, and estate-apply restores the workspace (#132).
 
 Anything else is `unaccounted`: a stale journal from an earlier capture, a
 record naming another source, or refs only for an item that plans a
-workspace. Stale and foreign journals are listed. The report passes only
-when `unaccounted` is 0, and otherwise exits nonzero with
-`CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
+workspace. Stale and foreign journals are listed. The native `verdict`
+passes only when `unaccounted` is 0. The report's `gate` is the exit
+status: without an attestation ledger it equals `verdict`, and a failing
+gate exits nonzero with `CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
 the daily-work bar above still applies.
 
-`--attest LEDGER.json` (#95) joins a `bulkload.closure-ledger.v1`
-attestation ledger for items closed by audit rather than by a verb. A row
+`closure-report --attest LEDGER.json PLAN ...` (#95; the option is
+recognised only before PLAN, #133) joins a `bulkload.closure-ledger.v1`
+attestation ledger for items closed by audit rather than by a verb. The
+ledger must name this plan (`plan`) and SOURCE label (`source_label`). A row
 closes a planned item only when the native ledger leaves it unaccounted, and
-only with a matching source, a known disposition (`applied`, `refused` with
+only with a matching source, the item's current capture digest (`capture`,
+as the native item row prints it; `null` only when the corpus holds no
+capture record), a known disposition (`applied`, `refused` with
 a typed code, `referenced-only`, `present`, `source-absent`), a basis other
 than `native-closure-report`, and non-empty evidence. Rows are reported in a
 separate `attested` block with their evidence; native totals are unchanged
 and a native record is never overridden (rows for natively closed items are
-counted as superseded, and disagreements listed). The gate then passes only
-when every item is native-accounted or attested. A ledger naming another
-plan or SOURCE label, or listing an item twice, refuses.
+counted as superseded, and disagreements listed). The top-level `verdict`
+stays native; `gate` passes only when every item is native-accounted or
+attested (#133). A ledger missing or naming another plan or SOURCE label,
+or listing an item twice, refuses.
 
 ## Live union
 

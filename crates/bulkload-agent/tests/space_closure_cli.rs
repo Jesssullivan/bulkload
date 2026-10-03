@@ -113,3 +113,106 @@ fn closure_report_fails_when_a_planned_item_is_unaccounted() {
     assert!(!missing.status.success());
     assert!(missing.stdout.is_empty());
 }
+
+// #133: a bound attestation ledger, given first, closes the item. The exit
+// status follows `gate`; `verdict` stays the native one.
+#[test]
+fn closure_report_attestation_is_bound_and_never_changes_the_verdict() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = root.path().join("plan");
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    assert!(agent(&[
+        "estate-add".as_ref(),
+        plan.as_os_str(),
+        root.path().join("source").as_os_str(),
+        root.path().join("repository").as_os_str(),
+    ])
+    .status
+    .success());
+    let native = agent(&[
+        "closure-report".as_ref(),
+        plan.as_os_str(),
+        root.path().join("corpus").as_os_str(),
+        "neo".as_ref(),
+        state.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&native.stdout);
+    let item = stdout
+        .split("\"item\":\"")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .unwrap()
+        .to_owned();
+    let source = std::fs::canonicalize(root.path().join("source")).unwrap();
+    let ledger = root.path().join("ledger.json");
+    let write_ledger = |label: &str| {
+        std::fs::write(
+            &ledger,
+            format!(
+                r#"{{"schema":"bulkload.closure-ledger.v1","plan":"{}","source_label":"{label}","items":[{{"item":"{item}","source":"{}","capture":null,"disposition":"source-absent","basis":"audit","evidence":"test"}}]}}"#,
+                plan.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+    };
+    write_ledger("neo");
+    let attested = agent(&[
+        "closure-report".as_ref(),
+        "--attest".as_ref(),
+        ledger.as_os_str(),
+        plan.as_os_str(),
+        root.path().join("corpus").as_os_str(),
+        "neo".as_ref(),
+        state.as_os_str(),
+    ]);
+    let out = String::from_utf8_lossy(&attested.stdout);
+    assert!(
+        attested.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&attested.stderr)
+    );
+    assert!(
+        out.contains("\"verdict\":\"fail\",\"gate\":\"pass\"") && out.contains("\"attested\":1"),
+        "{out}"
+    );
+    // A ledger for another SOURCE label refuses before any report.
+    write_ledger("sting");
+    let other = agent(&[
+        "closure-report".as_ref(),
+        "--attest".as_ref(),
+        ledger.as_os_str(),
+        plan.as_os_str(),
+        root.path().join("corpus").as_os_str(),
+        "neo".as_ref(),
+        state.as_os_str(),
+    ]);
+    assert!(!other.status.success());
+    assert!(other.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&other.stderr).contains("RECEIPT_BINDING_INVALID"));
+
+    // After PLAN, `--attest` is positional: a state directory may carry
+    // that name.
+    let named = root.path().join("--attest");
+    std::fs::create_dir(&named).unwrap();
+    let positional = std::process::Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .current_dir(root.path())
+        .args([
+            "closure-report".as_ref(),
+            plan.as_os_str(),
+            root.path().join("corpus").as_os_str(),
+            "neo".as_ref(),
+            state.as_os_str(),
+            "--attest".as_ref(),
+        ])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&positional.stdout);
+    assert!(
+        out.contains("\"verdict\":\"fail\",\"gate\":\"fail\"") && !out.contains("\"attested\""),
+        "{out}{}",
+        String::from_utf8_lossy(&positional.stderr)
+    );
+}

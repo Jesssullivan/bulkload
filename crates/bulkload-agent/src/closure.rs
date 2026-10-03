@@ -22,8 +22,15 @@
 //! a record naming another source, an untyped refusal, an outcome that does
 //! not match whether the item plans a workspace, a missing or mismatched
 //! current-capture journal (a stale journal from an earlier capture proves
-//! nothing), or an outcome that is not an apply outcome at all. The report
-//! passes only when `unaccounted` is 0.
+//! nothing), or an outcome that is not an apply outcome at all. The native
+//! `verdict` passes only when `unaccounted` is 0.
+//!
+//! An attestation ledger (`--attest`, #95, #133) may close natively
+//! unaccounted items in its own `attested` block. It never changes the
+//! native `verdict` or totals, and never overrides a native record; the
+//! separate top-level `gate` passes when every planned item is accounted for
+//! natively or by an accepted attestation row bound to the plan, the SOURCE
+//! label, the item's source and its current capture digest.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -120,6 +127,27 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     }
 }
 
+/// What the corpus holds for a planned item's current capture (#133).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureId {
+    /// No `{item}.capture` record.
+    None,
+    /// A capture record that does not decode.
+    Unreadable,
+    /// The current capture's bundle digest, lowercase hex.
+    Digest(String),
+}
+
+impl CaptureId {
+    fn of(entry: &LedgerEntry) -> Self {
+        match (&entry.journal, &entry.capture) {
+            (JournalState::NoCapture, _) => Self::None,
+            (_, Some(digest)) => Self::Digest(digest.clone()),
+            (_, None) => Self::Unreadable,
+        }
+    }
+}
+
 /// One planned item in the report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -127,6 +155,8 @@ pub struct Row {
     pub source: PathBuf,
     pub outcome: Option<String>,
     pub disposition: Disposition,
+    /// The item's current capture, which an attestation row must name.
+    pub capture: CaptureId,
 }
 
 /// The per-item closure ledger and its totals.
@@ -174,6 +204,7 @@ impl Report {
                 source: entry.source.clone(),
                 outcome: entry.record.as_ref().map(|(_, outcome, _)| outcome.clone()),
                 disposition,
+                capture: CaptureId::of(entry),
             });
         }
         report
@@ -185,8 +216,17 @@ impl Report {
         self.rows.len() as u64
     }
 
-    /// The closure gate: every planned item is accounted for natively, or,
-    /// when an attestation ledger was given, natively or by attestation.
+    /// The native verdict (`verdict`): every planned item is accounted for
+    /// by its own durable records. An attestation never changes it (#133).
+    #[must_use]
+    pub const fn native_passes(&self) -> bool {
+        self.unaccounted == 0
+    }
+
+    /// The closure gate (`gate`, the exit status): every planned item is
+    /// accounted for natively, or, when an attestation ledger was given,
+    /// natively or by an accepted, bound attestation row. Without an
+    /// attestation ledger it is exactly the native verdict.
     #[must_use]
     pub const fn passes(&self) -> bool {
         self.remaining_unaccounted() == 0
@@ -203,12 +243,13 @@ impl Report {
 
     /// Join an attestation ledger (`bulkload.closure-ledger.v1`, #95) to this
     /// native report. A row closes a planned item only when the native ledger
-    /// leaves it unaccounted; a native record is never overridden. Rows are
-    /// reported in their own block, never in the native totals.
+    /// leaves it unaccounted and the row names the item's source and current
+    /// capture digest (#133); a native record is never overridden. Rows are
+    /// reported in their own block, never in the native totals or verdict.
     ///
     /// # Errors
-    /// Refuses a ledger that is not `bulkload.closure-ledger.v1`, names
-    /// another plan or SOURCE label, lists an item twice, or does not parse.
+    /// `FIELD_DOMAIN_VIOLATION` for a ledger that lists an item twice. The
+    /// ledger's schema, plan and SOURCE label bind when it is read.
     pub fn attest(&mut self, ledger: &AttestationLedger) -> Result<()> {
         let mut attested = Attested {
             ledger: ledger.path.clone(),
@@ -231,7 +272,7 @@ impl Report {
                 }
                 continue;
             }
-            match row.verdict(&native.source) {
+            match row.verdict(&native.source, &native.capture) {
                 Ok(()) => {
                     *attested
                         .dispositions
@@ -249,7 +290,8 @@ impl Report {
     /// The gate as a value: `CLOSURE_UNACCOUNTED` when any item is.
     ///
     /// # Errors
-    /// `CLOSURE_UNACCOUNTED` when `unaccounted > 0`.
+    /// `CLOSURE_UNACCOUNTED` when an item is accounted for neither natively
+    /// nor by an accepted attestation row.
     pub const fn gate(&self) -> Result<()> {
         if self.passes() {
             Ok(())
@@ -264,7 +306,8 @@ impl Report {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"{}\",\"totals\":{{\"planned\":{},\"applied\":{},\"refused\":{},\"referenced_only\":{},\"unaccounted\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"applied\":{},\"refused\":{},\"referenced_only\":{},\"unaccounted\":{}}},\"refusals\":{{",
+            if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
             self.applied,
@@ -287,9 +330,13 @@ impl Report {
             }
             let _ = write!(
                 out,
-                "{{\"item\":{},\"source\":{},\"outcome\":{},\"disposition\":\"{}\"",
+                "{{\"item\":{},\"source\":{},\"capture\":{},\"outcome\":{},\"disposition\":\"{}\"",
                 json_string(&row.item),
                 json_string(&row.source.to_string_lossy()),
+                match &row.capture {
+                    CaptureId::Digest(digest) => json_string(digest),
+                    CaptureId::None | CaptureId::Unreadable => "null".to_owned(),
+                },
                 row.outcome
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), json_string),
@@ -340,11 +387,25 @@ pub const ATTESTED_DISPOSITIONS: &[&str] = &[
     "source-absent",
 ];
 
+/// The capture an attestation row names (#133).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestedCapture {
+    /// No `capture` member: the row is bound to no capture.
+    Missing,
+    /// `"capture": null`: the row attests an item the corpus holds no
+    /// capture record for.
+    Null,
+    /// A 64-hex capture digest, lowercased.
+    Digest(String),
+}
+
 /// One attestation ledger row (`bulkload.closure-ledger.v1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationRow {
     pub item: String,
     pub source: Option<String>,
+    /// The item's current capture digest, as the row binds it.
+    pub capture: AttestedCapture,
     pub disposition: String,
     pub basis: Option<String>,
     pub refusal: Option<String>,
@@ -354,10 +415,23 @@ pub struct AttestationRow {
 
 impl AttestationRow {
     // Whether this row may close a natively unaccounted item whose plan
-    // source is `source`, and why not.
-    fn verdict(&self, source: &std::path::Path) -> std::result::Result<(), &'static str> {
+    // source is `source` and whose current capture is `capture`, and why not.
+    fn verdict(
+        &self,
+        source: &std::path::Path,
+        capture: &CaptureId,
+    ) -> std::result::Result<(), &'static str> {
         if self.source.as_deref().map(std::path::Path::new) != Some(source) {
             return Err("source-mismatch");
+        }
+        // #133: a row binds to the exact capture the corpus holds now; a
+        // row written against an earlier capture proves nothing about it.
+        match (&self.capture, capture) {
+            (AttestedCapture::Missing, _) => return Err("capture-missing"),
+            (_, CaptureId::Unreadable) => return Err("capture-record-unreadable"),
+            (AttestedCapture::Null, CaptureId::None) => {}
+            (AttestedCapture::Digest(named), CaptureId::Digest(current)) if named == current => {}
+            _ => return Err("capture-mismatch"),
         }
         if !ATTESTED_DISPOSITIONS.contains(&self.disposition.as_str()) {
             return Err("disposition-unknown");
@@ -393,12 +467,13 @@ pub struct AttestationLedger {
 
 impl AttestationLedger {
     /// Read and parse an attestation ledger, binding it to `plan` and the
-    /// SOURCE label: a ledger that names another plan (`plan`) or another
-    /// label (`source_label`) refuses. Either field may be absent.
+    /// SOURCE label: the ledger must name both (`plan`, `source_label`, #133),
+    /// and a ledger that names another plan or label refuses.
     ///
     /// # Errors
     /// `SCHEMA_MISMATCH` for another schema, `REQUIRED_FIELD_MISSING` without
-    /// `items`, `RECEIPT_BINDING_INVALID` for another plan or label,
+    /// `plan`, `source_label` or `items`, `RECEIPT_BINDING_INVALID` for
+    /// another plan or label,
     /// `FIELD_DOMAIN_VIOLATION` for a malformed row or document, and the read's
     /// refusal.
     pub fn read(path: &std::path::Path, plan: &std::path::Path, source: &str) -> Result<Self> {
@@ -429,24 +504,28 @@ impl AttestationLedger {
         if document.get("schema").and_then(Json::as_str) != Some("bulkload.closure-ledger.v1") {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
-        if let Some(named) = document.get("plan") {
-            let named = std::path::Path::new(
-                named
-                    .as_str()
-                    .ok_or(BulkloadRefusal::FieldDomainViolation)?,
-            );
-            let same = match (std::fs::canonicalize(named), std::fs::canonicalize(plan)) {
-                (Ok(named), Ok(plan)) => named == plan,
-                _ => named == plan,
-            };
-            if !same {
-                return Err(BulkloadRefusal::ReceiptBindingInvalid);
-            }
+        // #133: both bindings are required; a ledger naming neither would
+        // otherwise be accepted for any plan.
+        let named = document
+            .get("plan")
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let named = std::path::Path::new(
+            named
+                .as_str()
+                .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+        );
+        let same = match (std::fs::canonicalize(named), std::fs::canonicalize(plan)) {
+            (Ok(named), Ok(plan)) => named == plan,
+            _ => named == plan,
+        };
+        if !same {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
-        if let Some(label) = document.get("source_label") {
-            if label.as_str() != Some(source) {
-                return Err(BulkloadRefusal::ReceiptBindingInvalid);
-            }
+        let label = document
+            .get("source_label")
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        if label.as_str() != Some(source) {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
         let Some(Json::Array(items)) = document.get("items") else {
             return Err(BulkloadRefusal::RequiredFieldMissing);
@@ -463,9 +542,20 @@ impl AttestationLedger {
             let item = text(row, "item")?
                 .filter(|item| item.len() == 64 && item.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            let capture = match row.get("capture") {
+                None => AttestedCapture::Missing,
+                Some(Json::Null) => AttestedCapture::Null,
+                Some(Json::String(digest))
+                    if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    AttestedCapture::Digest(digest.to_ascii_lowercase())
+                }
+                Some(_) => return Err(BulkloadRefusal::FieldDomainViolation),
+            };
             rows.push(AttestationRow {
                 item,
                 source: text(row, "source")?,
+                capture,
                 disposition: text(row, "disposition")?
                     .ok_or(BulkloadRefusal::FieldDomainViolation)?,
                 basis: text(row, "basis")?,
@@ -505,9 +595,8 @@ impl Attested {
     fn write_json(&self, out: &mut String, report: &Report) {
         let _ = write!(
             out,
-            ",\"attested\":{{\"schema\":\"bulkload.closure-ledger.v1\",\"ledger\":{},\"native_verdict\":\"{}\",\"totals\":{{\"attested\":{},\"rejected\":{},\"superseded\":{},\"foreign\":{},\"unaccounted_after_attestation\":{}}},\"dispositions\":{{",
+            ",\"attested\":{{\"schema\":\"bulkload.closure-ledger.v1\",\"ledger\":{},\"totals\":{{\"attested\":{},\"rejected\":{},\"superseded\":{},\"foreign\":{},\"unaccounted_after_attestation\":{}}},\"dispositions\":{{",
             json_string(&self.ledger.to_string_lossy()),
-            if report.unaccounted == 0 { "pass" } else { "fail" },
             self.items.len(),
             self.rejected.len(),
             self.superseded,
@@ -529,11 +618,15 @@ impl Attested {
             }
             let _ = write!(
                 out,
-                "{{\"item\":{},\"source\":{},\"disposition\":{},\"basis\":{}",
+                "{{\"item\":{},\"source\":{},\"capture\":{},\"disposition\":{},\"basis\":{}",
                 json_string(&row.item),
                 row.source
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), json_string),
+                match &row.capture {
+                    AttestedCapture::Digest(digest) => json_string(digest),
+                    AttestedCapture::Null | AttestedCapture::Missing => "null".to_owned(),
+                },
                 json_string(&row.disposition),
                 row.basis
                     .as_deref()
@@ -928,6 +1021,10 @@ mod tests {
         journal: JournalState,
     ) -> LedgerEntry {
         let source = PathBuf::from(format!("/src/{item}"));
+        let capture = match journal {
+            JournalState::NoCapture | JournalState::CaptureUnreadable => None,
+            JournalState::Absent | JournalState::Present(_) => Some(digest(item)),
+        };
         LedgerEntry {
             item: item.to_string().repeat(64),
             source: source.clone(),
@@ -936,7 +1033,16 @@ mod tests {
                 .map(|(outcome, reason)| (source, outcome.to_owned(), reason.map(str::to_owned))),
             record_unreadable: false,
             journal,
+            capture,
         }
+    }
+
+    // A stand-in current capture digest for test item `item`.
+    fn digest(item: char) -> String {
+        blake3::hash(item.to_string().as_bytes())
+            .to_hex()
+            .as_str()
+            .to_owned()
     }
 
     #[test]
@@ -1158,7 +1264,18 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"totals\":{\"planned\":4,\"applied\":1,\"refused\":1,\"referenced_only\":1,\"unaccounted\":1},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"applied\":1,\"refused\":1,\"referenced_only\":1,\"unaccounted\":1},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+        ));
+        // Each native row names its current capture, so an attestation
+        // ledger can bind to it.
+        assert!(json.contains(&format!(
+            "\"source\":\"/src/a\",\"capture\":\"{}\",\"outcome\":\"workspace-restored\"",
+            digest('a')
+        )));
+        assert!(json.contains(
+            "\"source\":\"/src/d\",\"capture\":\"{}\",\"outcome\":null"
+                .replace("{}", &digest('d'))
+                .as_str()
         ));
         assert!(json.contains(
             "\"disposition\":\"unaccounted\",\"unaccounted_reason\":\"no-outcome-record\""
@@ -1191,8 +1308,11 @@ mod tests {
         };
         let report = Report::from_ledger(&ledger);
         assert!(report.passes());
+        assert!(report.native_passes());
         assert_eq!(report.gate(), Ok(()));
-        assert!(report.to_json().contains("\"verdict\":\"pass\""));
+        assert!(report
+            .to_json()
+            .contains("\"verdict\":\"pass\",\"gate\":\"pass\""));
         // An empty plan is trivially closed.
         assert!(Report::from_ledger(&Ledger::default()).passes());
     }
@@ -1227,8 +1347,9 @@ mod tests {
         );
     }
 
-    // #95: an attestation row closes only a natively unaccounted item, in
-    // its own block; native records are never overridden.
+    // #95, #133: an attestation row closes only a natively unaccounted item,
+    // in its own block; native records, totals and the native verdict are
+    // never changed.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn attestation_closes_only_natively_unaccounted_items() {
@@ -1247,20 +1368,20 @@ mod tests {
                     'e',
                     true,
                     Some(("refused", Some("IO (errno 2)"))),
-                    JournalState::NoCapture,
+                    JournalState::Absent,
                 ),
             ],
             ..Ledger::default()
         };
         let id = |c: char| c.to_string().repeat(64);
         let document = format!(
-            r#"{{"schema":"bulkload.closure-ledger.v1","source_label":"neo","items":[
-              {{"item":"{a}","source":"/src/a","disposition":"refused","basis":"native-closure-report","refusal":"CAPTURE_DRIFTED"}},
-              {{"item":"{b}","source":"/src/b","disposition":"referenced-only","basis":"index-repaired","evidence":{{"receipt_dir":"/r/b","ruling":"R-N39"}}}},
-              {{"item":"{c}","source":"/src/c","disposition":"refused","basis":"capture-refused","refusal":"GIT_INVENTORY_MALFORMED","evidence":"/r/c.log"}},
-              {{"item":"{d}","source":"/src/d","disposition":"present","basis":"native-closure-report","evidence":"x"}},
-              {{"item":"{e}","source":"/src/e","disposition":"source-absent","basis":"audit","evidence":{{"neo":"absent \u00e9\n"}}}},
-              {{"item":"{f}","source":"/src/f","disposition":"present","basis":"audit","evidence":"y"}}
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[
+              {{"item":"{a}","source":"/src/a","capture":"{ea}","disposition":"refused","basis":"native-closure-report","refusal":"CAPTURE_DRIFTED"}},
+              {{"item":"{b}","source":"/src/b","capture":null,"disposition":"referenced-only","basis":"index-repaired","evidence":{{"receipt_dir":"/r/b","ruling":"R-N39"}}}},
+              {{"item":"{c}","source":"/src/c","capture":null,"disposition":"refused","basis":"capture-refused","refusal":"GIT_INVENTORY_MALFORMED","evidence":"/r/c.log"}},
+              {{"item":"{d}","source":"/src/d","capture":null,"disposition":"present","basis":"native-closure-report","evidence":"x"}},
+              {{"item":"{e}","source":"/src/e","capture":"{ee}","disposition":"source-absent","basis":"audit","evidence":{{"neo":"absent é\n"}}}},
+              {{"item":"{f}","source":"/src/f","capture":null,"disposition":"present","basis":"audit","evidence":"y"}}
             ]}}"#,
             a = id('a'),
             b = id('b'),
@@ -1268,6 +1389,8 @@ mod tests {
             d = id('d'),
             e = id('e'),
             f = id('f'),
+            ea = digest('a'),
+            ee = digest('e').to_ascii_uppercase(),
         );
         let attestation =
             AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap();
@@ -1295,11 +1418,16 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"referenced_only\":1,\"unaccounted\":4}"
+            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"referenced_only\":1,\"unaccounted\":4}"
         ));
         assert!(json.contains(
-            "\"native_verdict\":\"fail\",\"totals\":{\"attested\":3,\"rejected\":1,\"superseded\":1,\"foreign\":1,\"unaccounted_after_attestation\":1},\"dispositions\":{\"referenced-only\":1,\"refused\":1,\"source-absent\":1}"
+            "\"totals\":{\"attested\":3,\"rejected\":1,\"superseded\":1,\"foreign\":1,\"unaccounted_after_attestation\":1},\"dispositions\":{\"referenced-only\":1,\"refused\":1,\"source-absent\":1}"
         ), "{json}");
+        // The attested block carries each row's bound capture.
+        assert!(json.contains(&format!(
+            "\"source\":\"/src/e\",\"capture\":\"{}\",\"disposition\":\"source-absent\"",
+            digest('e')
+        )));
         // Evidence is carried back verbatim, re-escaped.
         assert!(
             json.contains("\"evidence\":{\"neo\":\"absent \u{e9}\\n\"}"),
@@ -1307,18 +1435,20 @@ mod tests {
         );
         assert!(json.contains("\"evidence\":{\"receipt_dir\":\"/r/b\",\"ruling\":\"R-N39\"}"));
 
-        // With the last unaccounted item attested, the gate passes.
+        // With the last unaccounted item attested, the gate passes, while
+        // the top-level verdict stays the native one (#133).
         let closing = format!(
-            r#"{{"schema":"bulkload.closure-ledger.v1","items":[
-              {{"item":"{b}","source":"/src/b","disposition":"referenced-only","basis":"index-repaired","evidence":"/r/b"}},
-              {{"item":"{c}","source":"/src/c","disposition":"refused","basis":"capture-refused","refusal":"GIT_INVENTORY_INTENT_TO_ADD","evidence":"/r/c"}},
-              {{"item":"{d}","source":"/src/d","disposition":"present","basis":"parity-audit","evidence":["/r/d"]}},
-              {{"item":"{e}","source":"/src/e","disposition":"source-absent","basis":"audit","evidence":"/r/e"}}
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[
+              {{"item":"{b}","source":"/src/b","capture":null,"disposition":"referenced-only","basis":"index-repaired","evidence":"/r/b"}},
+              {{"item":"{c}","source":"/src/c","capture":null,"disposition":"refused","basis":"capture-refused","refusal":"GIT_INVENTORY_INTENT_TO_ADD","evidence":"/r/c"}},
+              {{"item":"{d}","source":"/src/d","capture":null,"disposition":"present","basis":"parity-audit","evidence":["/r/d"]}},
+              {{"item":"{e}","source":"/src/e","capture":"{ee}","disposition":"source-absent","basis":"audit","evidence":"/r/e"}}
             ]}}"#,
             b = id('b'),
             c = id('c'),
             d = id('d'),
             e = id('e'),
+            ee = digest('e'),
         );
         let mut report = Report::from_ledger(&ledger);
         report
@@ -1327,70 +1457,232 @@ mod tests {
             )
             .unwrap();
         assert!(report.passes());
-        assert!(report.to_json().contains("\"verdict\":\"pass\""));
+        assert!(!report.native_passes());
+        assert_eq!(report.gate(), Ok(()));
+        let json = report.to_json();
+        assert!(
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"referenced_only\":1,\"unaccounted\":4}"),
+            "{json}"
+        );
+    }
+
+    // #133: an attestation never overrides a native applied, refused or
+    // referenced-only record, whatever it claims; such rows close nothing
+    // and the native disposition stands.
+    #[test]
+    fn attestation_never_overrides_a_native_record() {
+        let ledger = Ledger {
+            entries: vec![
+                entry(
+                    'a',
+                    true,
+                    Some(("workspace-restored", None)),
+                    present("workspace-restored"),
+                ),
+                entry(
+                    'b',
+                    true,
+                    Some(("refused", Some("GIT_DESTINATION_OCCUPIED"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'c',
+                    false,
+                    Some(("refs-imported", None)),
+                    present("refs-imported"),
+                ),
+                entry('d', false, None, JournalState::Absent),
+            ],
+            ..Ledger::default()
+        };
+        let id = |c: char| c.to_string().repeat(64);
+        let row = |item: char, disposition: &str| {
+            format!(
+                r#"{{"item":"{}","source":"/src/{item}","capture":"{}","disposition":"{disposition}","basis":"audit","evidence":"e","refusal":"GIT_INVENTORY_MALFORMED"}}"#,
+                id(item),
+                digest(item)
+            )
+        };
+        let document = format!(
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{},{},{}]}}"#,
+            row('a', "refused"),
+            row('b', "present"),
+            row('c', "applied"),
+        );
+        let mut report = Report::from_ledger(&ledger);
+        report
+            .attest(
+                &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap(),
+            )
+            .unwrap();
+        let attested = report.attested.clone().unwrap();
+        assert!(attested.items.is_empty());
+        assert_eq!(attested.superseded, 3);
+        assert_eq!(attested.disagreements, vec![id('a'), id('b'), id('c')]);
+        // The native dispositions and totals stand.
+        assert_eq!(report.rows[0].disposition, Disposition::Applied);
+        assert_eq!(
+            report.rows[1].disposition,
+            Disposition::Refused("GIT_DESTINATION_OCCUPIED".into())
+        );
+        assert_eq!(report.rows[2].disposition, Disposition::ReferencedOnly);
+        assert_eq!(
+            (
+                report.applied,
+                report.refused,
+                report.referenced_only,
+                report.unaccounted
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(report.refusals.get("GIT_INVENTORY_MALFORMED"), None);
+        // The one natively unaccounted item is still open: both verdicts fail.
+        assert_eq!(report.remaining_unaccounted(), 1);
+        assert!(!report.passes());
+        assert!(report
+            .to_json()
+            .contains("\"verdict\":\"fail\",\"gate\":\"fail\""));
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn attestation_rows_that_prove_nothing_are_rejected() {
         let ledger = Ledger {
-            entries: vec![entry('b', false, None, JournalState::NoCapture)],
+            entries: vec![
+                entry('b', false, None, JournalState::NoCapture),
+                entry('c', false, None, JournalState::Absent),
+                entry('a', false, None, JournalState::CaptureUnreadable),
+            ],
             ..Ledger::default()
         };
-        let row = |fields: &str| {
+        let row = |item: char, fields: &str| {
             format!(
-                r#"{{"schema":"bulkload.closure-ledger.v1","items":[{{"item":"{}",{fields}}}]}}"#,
-                "b".repeat(64)
+                r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/p","source_label":"neo","items":[{{"item":"{}",{fields}}}]}}"#,
+                item.to_string().repeat(64)
             )
         };
-        for (fields, why) in [
+        let current = format!(
+            r#""source":"/src/c","capture":"{}","disposition":"present","basis":"audit","evidence":"e""#,
+            digest('c')
+        );
+        let stale = format!(
+            r#""source":"/src/c","capture":"{}","disposition":"present","basis":"audit","evidence":"e""#,
+            digest('z')
+        );
+        let named_for_none = format!(
+            r#""source":"/src/b","capture":"{}","disposition":"present","basis":"audit","evidence":"e""#,
+            digest('b')
+        );
+        let cases: Vec<(char, String, &str)> = vec![
             (
-                r#""source":"/src/other","disposition":"present","basis":"audit","evidence":"e""#,
+                'b',
+                r#""source":"/src/other","capture":null,"disposition":"present","basis":"audit","evidence":"e""#.into(),
                 "source-mismatch",
             ),
             (
-                r#""disposition":"present","basis":"audit","evidence":"e""#,
+                'b',
+                r#""capture":null,"disposition":"present","basis":"audit","evidence":"e""#.into(),
                 "source-mismatch",
             ),
+            // #133: a row must name the item's current capture.
             (
-                r#""source":"/src/b","disposition":"fine","basis":"audit","evidence":"e""#,
+                'b',
+                r#""source":"/src/b","disposition":"present","basis":"audit","evidence":"e""#.into(),
+                "capture-missing",
+            ),
+            ('b', named_for_none, "capture-mismatch"),
+            (
+                'c',
+                r#""source":"/src/c","capture":null,"disposition":"present","basis":"audit","evidence":"e""#.into(),
+                "capture-mismatch",
+            ),
+            ('c', stale, "capture-mismatch"),
+            (
+                'a',
+                r#""source":"/src/a","capture":null,"disposition":"present","basis":"audit","evidence":"e""#.into(),
+                "capture-record-unreadable",
+            ),
+            (
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"fine","basis":"audit","evidence":"e""#.into(),
                 "disposition-unknown",
             ),
             (
-                r#""source":"/src/b","disposition":"present","evidence":"e""#,
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"present","evidence":"e""#.into(),
                 "basis-missing",
             ),
             (
-                r#""source":"/src/b","disposition":"present","basis":"audit""#,
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"present","basis":"audit""#.into(),
                 "evidence-missing",
             ),
             (
-                r#""source":"/src/b","disposition":"present","basis":"audit","evidence":{}"#,
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"present","basis":"audit","evidence":{}"#.into(),
                 "evidence-missing",
             ),
             (
-                r#""source":"/src/b","disposition":"refused","basis":"audit","evidence":"e","refusal":"IO"}"#
-                    .trim_end_matches('}'),
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"refused","basis":"audit","evidence":"e","refusal":"IO""#.into(),
                 "refusal-untyped",
             ),
             (
-                r#""source":"/src/b","disposition":"refused","basis":"audit","evidence":"e","refusal":"disk gone""#,
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"refused","basis":"audit","evidence":"e","refusal":"disk gone""#.into(),
                 "refusal-untyped",
             ),
             (
-                r#""source":"/src/b","disposition":"refused","basis":"audit","evidence":"e""#,
+                'b',
+                r#""source":"/src/b","capture":null,"disposition":"refused","basis":"audit","evidence":"e""#.into(),
                 "refusal-untyped",
             ),
-        ] {
+        ];
+        for (item, fields, why) in cases {
             let mut report = Report::from_ledger(&ledger);
             report
                 .attest(
-                    &AttestationLedger::parse(&row(fields), std::path::Path::new("/p"), "neo")
-                        .unwrap(),
+                    &AttestationLedger::parse(
+                        &row(item, &fields),
+                        std::path::Path::new("/p"),
+                        "neo",
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             let attested = report.attested.clone().unwrap();
-            assert_eq!(attested.rejected, vec![("b".repeat(64), why)], "{fields}");
+            assert_eq!(
+                attested.rejected,
+                vec![(item.to_string().repeat(64), why)],
+                "{fields}"
+            );
+            assert!(attested.items.is_empty(), "{fields}");
             assert!(!report.passes());
+        }
+        // The row bound to the current capture closes its item.
+        let mut report = Report::from_ledger(&ledger);
+        report
+            .attest(
+                &AttestationLedger::parse(&row('c', &current), std::path::Path::new("/p"), "neo")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(report.attested.unwrap().items.len(), 1);
+        // A capture member that is not a 64-hex digest or null refuses the
+        // whole ledger.
+        for bad in [r#""capture":"abc""#, r#""capture":7"#] {
+            assert_eq!(
+                AttestationLedger::parse(
+                    &row(
+                        'b',
+                        &format!(r#""source":"/src/b",{bad},"disposition":"present""#)
+                    ),
+                    std::path::Path::new("/p"),
+                    "neo"
+                ),
+                Err(BulkloadRefusal::FieldDomainViolation),
+                "{bad}"
+            );
         }
     }
 
@@ -1399,33 +1691,59 @@ mod tests {
         let plan = std::path::Path::new("/plan");
         let parse = |text: &str| AttestationLedger::parse(text, plan, "neo");
         assert_eq!(
-            parse(r#"{"schema":"bulkload.closure.v1","items":[]}"#),
+            parse(
+                r#"{"schema":"bulkload.closure.v1","plan":"/plan","source_label":"neo","items":[]}"#
+            ),
             Err(BulkloadRefusal::SchemaMismatch)
         );
         assert_eq!(
-            parse(r#"{"schema":"bulkload.closure-ledger.v1"}"#),
+            parse(r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo"}"#),
+            Err(BulkloadRefusal::RequiredFieldMissing)
+        );
+        // #133: both the plan and the SOURCE label are required.
+        assert_eq!(
+            parse(r#"{"schema":"bulkload.closure-ledger.v1","items":[]}"#),
             Err(BulkloadRefusal::RequiredFieldMissing)
         );
         assert_eq!(
-            parse(r#"{"schema":"bulkload.closure-ledger.v1","source_label":"sting","items":[]}"#),
-            Err(BulkloadRefusal::ReceiptBindingInvalid)
+            parse(r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","items":[]}"#),
+            Err(BulkloadRefusal::RequiredFieldMissing)
         );
         assert_eq!(
-            parse(r#"{"schema":"bulkload.closure-ledger.v1","plan":"/other","items":[]}"#),
-            Err(BulkloadRefusal::ReceiptBindingInvalid)
-        );
-        assert!(
-            parse(r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","items":[]}"#).is_ok()
+            parse(r#"{"schema":"bulkload.closure-ledger.v1","source_label":"neo","items":[]}"#),
+            Err(BulkloadRefusal::RequiredFieldMissing)
         );
         assert_eq!(
             parse(
-                r#"{"schema":"bulkload.closure-ledger.v1","items":[{"item":"short","disposition":"present"}]}"#
+                r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"sting","items":[]}"#
+            ),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert_eq!(
+            parse(
+                r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":null,"items":[]}"#
+            ),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert_eq!(
+            parse(
+                r#"{"schema":"bulkload.closure-ledger.v1","plan":"/other","source_label":"neo","items":[]}"#
+            ),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert!(parse(
+            r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[]}"#
+        )
+        .is_ok());
+        assert_eq!(
+            parse(
+                r#"{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{"item":"short","disposition":"present"}]}"#
             ),
             Err(BulkloadRefusal::FieldDomainViolation)
         );
         // An item listed twice is ambiguous: the whole ledger refuses.
         let twice = format!(
-            r#"{{"schema":"bulkload.closure-ledger.v1","items":[{{"item":"{b}","disposition":"present"}},{{"item":"{b}","disposition":"present"}}]}}"#,
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{{"item":"{b}","disposition":"present"}},{{"item":"{b}","disposition":"present"}}]}}"#,
             b = "b".repeat(64)
         );
         let mut report = Report::from_ledger(&Ledger {
@@ -1436,10 +1754,11 @@ mod tests {
             report.attest(&parse(&twice).unwrap()),
             Err(BulkloadRefusal::FieldDomainViolation)
         );
-        // Without an attestation ledger the report is exactly the native one.
-        assert!(!Report::from_ledger(&Ledger::default())
-            .to_json()
-            .contains("attested"));
+        // Without an attestation ledger the report is exactly the native one,
+        // and its gate is the native verdict.
+        let native = Report::from_ledger(&Ledger::default()).to_json();
+        assert!(!native.contains("attested"));
+        assert!(native.contains("\"verdict\":\"pass\",\"gate\":\"pass\""));
     }
 
     #[test]
