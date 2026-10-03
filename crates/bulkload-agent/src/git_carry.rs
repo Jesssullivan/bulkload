@@ -19,6 +19,7 @@ use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
 pub mod carry_v2;
+pub mod chain;
 pub mod estimate;
 mod raw_tree;
 pub mod registered;
@@ -1040,6 +1041,7 @@ pub fn export_repository_with_policy(
             policy,
             reuse: None,
             planned: &[],
+            chain: None,
         },
     )?)
 }
@@ -1064,6 +1066,7 @@ pub fn export_repository_with_prerequisite(
             policy: CapturePolicy::default(),
             reuse: None,
             planned: &[],
+            chain: None,
         },
     )?)?
     .bundle)
@@ -1205,7 +1208,12 @@ fn export_repository_inner(
     }
     mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    let pack = shared::write_bundle(&private, &bundle, options.prerequisite)?;
+    // A plan base wins; otherwise a retained capture's source-held tips are
+    // the prerequisites (WP2); otherwise the bundle is self-contained.
+    let (pack, chained) = match (options.prerequisite, options.chain) {
+        (None, Some(prior)) => shared::write_chained(&private, &bundle, &repo, prior)?,
+        (base, _) => (shared::write_bundle(&private, &bundle, base)?, false),
+    };
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
     mid_pass::fire(&repo, mid_pass::Stage::AfterPass);
@@ -1221,6 +1229,7 @@ fn export_repository_inner(
         authority,
         nested_repositories,
         pack,
+        chained,
     })
 }
 
@@ -1775,6 +1784,11 @@ pub struct ExportOptions<'a> {
     /// items (R-N114). Such a nest keeps its custody row and every refusal,
     /// but its seats belong to its own item, never to this capture.
     pub planned: &'a [PathBuf],
+    /// A retained capture bundle of this checkout whose source-held tips
+    /// become this bundle's prerequisites, so only what is new since it is
+    /// packed (WP2, see [`chain`]). Ignored when `prerequisite` is set. The
+    /// caller owns the chain's custody and depth bound.
+    pub chain: Option<&'a Path>,
 }
 
 /// A retained capture offered for blob reuse, with the instant its pass began.
@@ -1870,6 +1884,10 @@ pub struct Export {
     /// What packing the bundle cost (WP2): its pack's bytes and objects, and
     /// the packing child's storage reads.
     pub pack: shared::PackStats,
+    /// Whether the bundle declares a retained capture's source-held tips as
+    /// prerequisites ([`ExportOptions::chain`]). A restore must then supply
+    /// that capture's chain ([`chain::flatten`]).
+    pub chained: bool,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -11704,6 +11722,7 @@ mod review_pr53e {
                 policy: CapturePolicy::default(),
                 reuse: None,
                 planned: &[],
+                chain: None,
             },
         );
         let outcome = match &export {

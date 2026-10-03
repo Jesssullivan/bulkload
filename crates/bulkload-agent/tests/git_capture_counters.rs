@@ -186,8 +186,14 @@ fn a_capture_counts_its_pack_its_censuses_and_its_reuse_reads() {
     // The retained capture is fetched once for blob reuse, and counted.
     assert_eq!(changed["read_source_capture_reuse_bytes"], size);
     assert!(changed["write_source_pack_objects"] >= 1);
-    // Without a prerequisite, a changed rerun packs all of history again.
-    assert!(changed["write_source_pack_bytes"] >= HISTORY as u64);
+    // WP2 PR 2: the rerun declares the retained capture's source-held tips
+    // as prerequisites, so it packs only the new commit, its tree and blob,
+    // and the capture's own metadata: never the history blob again.
+    assert!(
+        changed["write_source_pack_bytes"] < (HISTORY / 8) as u64,
+        "{changed:?}"
+    );
+    assert!(changed["write_source_pack_objects"] < first["write_source_pack_objects"] + 8);
 
     let (ok, applied) = verb(&[
         "estate-apply".as_ref(),
@@ -210,4 +216,17 @@ fn a_capture_counts_its_pack_its_censuses_and_its_reuse_reads() {
     );
     // Apply never packs from a source.
     assert_eq!(applied["write_source_pack_bytes"], 0);
+    // The chained capture restored exactly: HEAD and every byte.
+    let head = |repo: &Path| {
+        let out = git(repo).args(["rev-parse", "HEAD"]).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let target = estate.source.with_file_name("target");
+    assert_eq!(head(&target), head(&estate.source));
+    assert_eq!(
+        std::fs::read(target.join("history")).unwrap(),
+        noise(HISTORY, 7)
+    );
+    assert_eq!(std::fs::read(target.join("file")).unwrap(), b"changed");
 }

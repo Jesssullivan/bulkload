@@ -108,4 +108,7 @@ pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use bulkload_proto::{BulkloadRefusal, Control, Decision, Frame, Result, RowSchema};
