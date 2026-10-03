@@ -60,6 +60,7 @@ macro_rules! fault_mid_read {
     ($first:expr, $path:expr) => {{}};
 }
 
+pub mod child;
 pub mod closure;
 pub mod counters;
 pub mod estate;
@@ -67,7 +68,6 @@ pub mod estate;
 pub mod fault;
 pub mod freshness;
 pub mod git_carry;
-pub mod handoff;
 pub mod hash;
 // The engine's io layer (R-N90, R-N54, R-N88). W3's group commit
 // (`io::durable`), the destination's materializer and the counted syncs run on
@@ -104,6 +104,8 @@ pub mod crash_check {
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod space;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transfer;
 pub mod transfer_store;
 pub mod walk;

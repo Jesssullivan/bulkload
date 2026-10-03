@@ -1017,25 +1017,9 @@ pub(super) type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal
 /// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
 /// them all, and stream them all into `capture`. A capture write failure is
 /// recorded, and the stream is still drained so the child never blocks.
-pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
-    let mut head = Vec::new();
-    let mut total = 0_u64;
+pub(super) fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained {
     let mut failure = None;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = match stderr.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                failure.get_or_insert_with(|| BulkloadRefusal::from(error));
-                break;
-            }
-        };
-        let chunk = buffer.get(..read).unwrap_or_default();
-        let room = CLASSIFY_LIMIT.saturating_sub(head.len()).min(chunk.len());
-        head.extend_from_slice(chunk.get(..room).unwrap_or_default());
-        total += u64::try_from(read).unwrap_or(u64::MAX);
+    let drained = crate::child::drain_bounded(stderr, CLASSIFY_LIMIT, |chunk| {
         if failure.is_none() {
             if let Some(capture) = capture.as_mut() {
                 if let Err(error) = capture.write(chunk) {
@@ -1043,8 +1027,11 @@ pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drai
                 }
             }
         }
+    });
+    if let Some(error) = drained.error {
+        failure.get_or_insert_with(|| BulkloadRefusal::from(error));
     }
-    (head, total, capture, failure)
+    (drained.head, drained.total, capture, failure)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<Probe> {

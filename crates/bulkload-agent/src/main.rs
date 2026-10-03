@@ -22,10 +22,6 @@ USAGE:
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
-    handoff-verify [--json PATH] [--sops-fixture PATH] [--state-root PATH]
-                   [--probe-timeout SECONDS] [--skip-ssh-host ALIAS]...
-                Prove each credential class (sops, kubeconfig, ssh, gpg, gh,
-                git, claude, codex) and emit a tcfs.bulkload.handoff.v1 receipt
     walk PATH   Stat-walk PATH and print the row and refusal counts
     copy SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores
@@ -155,8 +151,6 @@ BOUNDARIES:
     nested-worktree or nested-repository changes under a pass still refuse
     GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
-    handoff-verify probes; it never signals a child process (R-N11).
-    Receipt evidence is exit statuses, counts and operator-known identifiers only.
 
 COUNTERS:
     Every verb ends with machine-readable key=value lines: `counters` (bytes
@@ -188,7 +182,6 @@ fn main() -> ExitCode {
         .to_owned();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
         Some("selftest") => selftest(),
-        Some("handoff-verify") => handoff_command(&args.collect::<Vec<_>>()),
         Some("walk") => {
             if let Some(path) = args.next() {
                 walk_command(Path::new(&path))
@@ -955,64 +948,6 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
 /// Exercise the pieces M1 actually ships: hash a real file off disk, put its
 /// row in a frame, encode it with postcard, decode it back, and prove the
 /// round trip is exact.
-/// Parse `handoff-verify` flags, run the probe set, and emit the receipt.
-///
-/// The table always goes to stdout, pass or fail: an operator reading a failed
-/// handoff needs the measurements more than a clean exit. `--json PATH` writes
-/// the machine-readable receipt beside it.
-fn handoff_command(args: &[std::ffi::OsString]) -> Result<()> {
-    use bulkload_agent::handoff;
-
-    let mut options = handoff::Options::from_environment();
-    let mut state_root = std::env::temp_dir();
-    let mut receipt_path: Option<PathBuf> = None;
-    let mut index = 0_usize;
-    while let Some(flag) = args.get(index) {
-        let value = || {
-            args.get(index + 1)
-                .ok_or(BulkloadRefusal::RequiredFieldMissing)
-        };
-        match flag.to_str() {
-            Some("--json") => receipt_path = Some(PathBuf::from(value()?)),
-            Some("--sops-fixture") => options.sops_fixture = Some(PathBuf::from(value()?)),
-            Some("--state-root") => state_root = PathBuf::from(value()?),
-            Some("--skip-ssh-host") => {
-                let alias = value()?
-                    .to_str()
-                    .ok_or(BulkloadRefusal::PathNotPortable)?
-                    .to_owned();
-                options.ssh_exclude.insert(alias);
-            }
-            Some("--probe-timeout") => options.probe_timeout = seconds(value()?)?,
-            _ => return Err(BulkloadRefusal::FieldDomainViolation),
-        }
-        index += 2;
-    }
-
-    let probes = handoff::verify(&state_root, &options)?;
-    print!("{}", handoff::render_table(&probes));
-    let receipt = handoff::receipt(probes);
-    if let Some(path) = receipt_path {
-        write_scratch(&path, handoff::render_json(&receipt).as_bytes())?;
-        println!("receipt  {}", path.display());
-    }
-    if handoff::summarize(&receipt.probes).verdict == handoff::Outcome::Pass {
-        Ok(())
-    } else {
-        Err(BulkloadRefusal::ProbeFailed)
-    }
-}
-
-/// A whole-second duration flag value.
-fn seconds(value: &std::ffi::OsString) -> Result<std::time::Duration> {
-    let parsed: u64 = value
-        .to_str()
-        .ok_or(BulkloadRefusal::PathNotPortable)?
-        .parse()
-        .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
-    Ok(std::time::Duration::from_secs(parsed))
-}
-
 fn selftest() -> Result<()> {
     println!("bulkload-agent selftest");
 
