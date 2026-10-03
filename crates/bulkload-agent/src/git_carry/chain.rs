@@ -38,8 +38,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    bundle_object_format, copy_hashing, git, input, oid, output, shared, text, verify_bundle,
-    PrivateDir, StagedBundle,
+    bundle_object_format, copy_hashing, estimate, git, input, oid, output, shared, text,
+    verify_bundle, PrivateDir, StagedBundle,
 };
 use crate::{BulkloadRefusal, Result};
 
@@ -114,11 +114,15 @@ pub(super) fn source_held_tips(source: &Path, prior: &Path) -> Result<BTreeSet<S
         lines.push_str("^{commit}\n");
         lines
     });
-    // A read-only batch query of the source object store. Lazy fetch is off,
-    // so a promisor source never fetches to answer it (S2).
+    // A read-only batch query of the source object store through the
+    // estimate's hardened source wrapper (WP0(b), S2): resolved git dir,
+    // ceiling-fenced discovery, no optional locks, no maintenance, and lazy
+    // fetch off, so a promisor source never fetches to answer it. `input`
+    // drains answers while it writes requests, so a prior advertising
+    // thousands of refs cannot fill the answer pipe and hang the capture.
+    let repository = estimate::Repository::local(source)?;
     let answer = input(
-        git(source)
-            .env("GIT_NO_LAZY_FETCH", "1")
+        estimate::hardened(&repository)
             .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
     )?;
@@ -246,4 +250,73 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
         bundle: flat,
         digest,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::process::Command;
+
+    /// Liveness (R33: a refusal is a value, never a hang): a prior that
+    /// advertises thousands of refs answers in full. Writing every
+    /// `cat-file --batch-check` request before reading any answer blocked
+    /// both processes once the answer pipe filled (about 2-4k refs on
+    /// Linux, fewer on Darwin), holding the plan lock forever.
+    #[test]
+    fn source_held_tips_answers_a_prior_with_many_refs() {
+        const TIPS: usize = 12_000;
+        let root =
+            std::env::temp_dir().join(format!("tcfs-chain-many-refs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args([
+                    "-c",
+                    "user.name=Bulkload test",
+                    "-c",
+                    "user.email=test@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--template=", "-b", "main"]);
+        fs::write(source.join("file"), b"held").unwrap();
+        git(&["add", "file"]);
+        git(&["commit", "-m", "held"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        // A header-only prior: one held tip and thousands the source lacks.
+        let mut header = String::from("# v2 git bundle\n");
+        header.push_str(&format!("{head} refs/heads/main\n"));
+        for index in 0..TIPS {
+            let missing = blake3::hash(format!("tip {index}").as_bytes()).to_hex();
+            header.push_str(&format!("{} refs/tags/t{index}\n", &missing[..40]));
+        }
+        header.push('\n');
+        let prior = root.join("prior.bundle");
+        fs::write(&prior, header).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (thread_source, thread_prior) = (source.clone(), prior.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(source_held_tips(&thread_source, &thread_prior));
+        });
+        let held = receiver
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("source_held_tips must return, not block on a full pipe")
+            .unwrap();
+        assert_eq!(held, BTreeSet::from([head]));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

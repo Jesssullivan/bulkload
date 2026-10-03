@@ -274,7 +274,26 @@ pub(super) fn write_chained(
 // is packed by `pack-objects`, and the header (signature, prerequisites,
 // every private ref) is written here, as the shared-base path rewrites it.
 // `bundle verify` in the caller checks the result like any other bundle.
+//
+// A failed write removes its pending object list and header, so a refused
+// pass leaves no partial file beside the bundle path.
 fn write_excluding_tip_trees(
+    private: &Path,
+    bundle: &Path,
+    commits: &BTreeSet<String>,
+) -> Result<PackStats> {
+    let written = write_excluding_tip_trees_pending(private, bundle, commits);
+    if written.is_err() {
+        for leftover in ["objects-pending", "header-pending"] {
+            // Best effort: the refusal being returned is the one that matters,
+            // and a path never created is already clean.
+            let _ = fs::remove_file(bundle.with_extension(leftover));
+        }
+    }
+    written
+}
+
+fn write_excluding_tip_trees_pending(
     private: &Path,
     bundle: &Path,
     commits: &BTreeSet<String>,

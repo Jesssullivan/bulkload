@@ -62,12 +62,16 @@ Rulings cited:
   re-bases to a self-contained bundle.
 - **Broken chains.** A broken chain is never a hit and never extended; the
   next pass re-bases.
-- **Apply.** `chain::flatten` verifies every link (digest, identity,
-  depth −1 per step, self-contained root, prerequisites satisfied in order).
-  It writes one self-contained bundle whose sorted `list-heads` must equal
-  the head's.
+- **Apply.** `chain::flatten` verifies every link (digest, depth −1 per
+  step, self-contained root, prerequisites satisfied in order). It writes one
+  self-contained bundle whose sorted `list-heads` must equal the head's.
   - A missing link refuses with `SEALED_OBJECT_MISSING`.
-  - A replaced link or a bad depth refuses with `RECEIPT_BINDING_INVALID`.
+  - A link with other bytes refuses with `DIGEST_MISMATCH`.
+  - A bad depth refuses with `RECEIPT_BINDING_INVALID`.
+  - Stat identity binds only on the capture side (`LinkBinding::Custody`:
+    reuse, chaining, sidecar publication). Apply and the space preflight
+    bind by name and digest (`LinkBinding::Digest`), so a corpus pulled from
+    the capture host applies (review round 1, finding 1).
 - **Space plan.** The space plan charges the whole chain.
 - **Proptest helper.** `test_support::prop_config` is the proptest helper:
   a fixed CI seed, and 20x random cases under `BULKLOAD_PROPTEST_DEEP=1`.
@@ -78,12 +82,23 @@ Rulings cited:
     in 333 s.
   - The depth-limit re-base test.
   - The broken-chain test (typed apply refusal, then a re-base).
-  - The replaced-link test.
+  - The replaced-link test (refused for reuse, still restorable).
+  - The pulled-corpus tests: a `cp -a` copy of a depth-1 chain applies, and
+    a pulled link with other bytes refuses `DIGEST_MISMATCH`.
+  - The many-refs test: `source_held_tips` on a prior advertising 12,001
+    refs returns. `git_carry::input` now writes stdin from a scoped thread
+    while it drains stdout, for every caller; `estimate::feed`, its
+    duplicate, is gone (review round 1, finding 2). The tip query runs
+    through `estimate::hardened` via `Repository::local` (WP0(b)).
   - The CLI counter test. A changed rerun now writes less than 1/8 of the
     256 KiB history it used to re-pack, and apply restores HEAD and bytes
     exactly.
 
 ## Open
+
+- Review round 1 follow-ups: #147 (chained apply staging footprint and
+  location), #148 (side doors and chained captures, WP4, pre-migration),
+  #149 (ruling: may a drift-marked bundle be a chain link, R-N72).
 
 - `git-repair-missing-index` and the `git-attach-*` / `git-import` side doors
   still take a single bundle. For a chained capture they need the

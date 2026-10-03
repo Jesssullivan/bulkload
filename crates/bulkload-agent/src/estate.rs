@@ -62,19 +62,40 @@ fn prior_sidecar(corpus: &Path, bundle: &str) -> PathBuf {
     corpus.join(format!("{bundle}.prior"))
 }
 
+/// How [`chain_links`] binds each link it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkBinding {
+    /// Capture side (reuse, chaining, sidecar publication) on the capture
+    /// host: every link must also sit at the `StatIdentity` its `.prior`
+    /// recorded, so a link replaced in place is never extended or reused.
+    Custody,
+    /// Apply side (restore, space preflight): a link is bound by its corpus
+    /// name and recorded digest only. A corpus pulled to another host gives
+    /// every file a new device, inode and ctime, so identity cannot bind
+    /// there; [`git_carry::chain::flatten`] digest-checks every staged link,
+    /// as `import_base` digest-checks a shared base (R-N72).
+    Digest,
+}
+
 /// The bundles a chained capture's bundle depends on, oldest first, each with
 /// its recorded digest. Empty for a bundle without a `.prior` sidecar.
 ///
-/// Every link must be retained at its recorded identity, and depths must fall
-/// by exactly one per link to a depth-0 root within
-/// [`git_carry::chain::CHAIN_DEPTH_LIMIT`]; the walk is therefore bounded.
-/// Digests and prerequisites are checked when the chain is flattened.
+/// Every link must be retained (and, under [`LinkBinding::Custody`], at its
+/// recorded identity), and depths must fall by exactly one per link to a
+/// depth-0 root within [`git_carry::chain::CHAIN_DEPTH_LIMIT`]; the walk is
+/// therefore bounded. Digests and prerequisites are checked when the chain is
+/// flattened.
 ///
 /// # Errors
 /// `SEALED_OBJECT_MISSING` for a link the corpus no longer holds,
-/// `RECEIPT_BINDING_INVALID` for a replaced link or inconsistent depths, and
-/// `PATH_ESCAPES_ROOT` for a link name that is not a corpus file name.
-fn chain_links(corpus: &Path, bundle: &str) -> Result<Vec<(PathBuf, [u8; 32])>> {
+/// `RECEIPT_BINDING_INVALID` for inconsistent depths or (under `Custody`) a
+/// replaced link, and `PATH_ESCAPES_ROOT` for a link name that is not a
+/// corpus file name.
+fn chain_links(
+    corpus: &Path,
+    bundle: &str,
+    binding: LinkBinding,
+) -> Result<Vec<(PathBuf, [u8; 32])>> {
     let mut links = Vec::new();
     let mut current = bundle.to_owned();
     let mut expected: Option<u32> = None;
@@ -99,8 +120,9 @@ fn chain_links(corpus: &Path, bundle: &str) -> Result<Vec<(PathBuf, [u8; 32])>> 
         if !path.try_exists()? {
             return Err(BulkloadRefusal::SealedObjectMissing);
         }
-        if prior.identity
-            != crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(&path)?)
+        if binding == LinkBinding::Custody
+            && prior.identity
+                != crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(&path)?)
         {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
@@ -122,7 +144,7 @@ fn chain_links(corpus: &Path, bundle: &str) -> Result<Vec<(PathBuf, [u8; 32])>> 
 /// it already sits at the depth limit (the next capture re-bases).
 fn chainable(corpus: &Path, previous: &Capture, bundle: &Path) -> Result<Option<Prior>> {
     let depth = if prior_sidecar(corpus, &previous.bundle).try_exists()? {
-        match chain_links(corpus, &previous.bundle) {
+        match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
             Ok(links) => u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
             // A broken chain is never extended; the next bundle re-bases.
             Err(_) => return Ok(None),
@@ -855,7 +877,8 @@ fn retained_capture(
     // A chained bundle is a hit only while its whole chain is retained: a
     // broken chain recaptures (self-contained) instead of standing as custody
     // no restore can satisfy.
-    let restorable = !chained || chain_links(corpus, &previous.bundle).is_ok();
+    let restorable =
+        !chained || chain_links(corpus, &previous.bundle, LinkBinding::Custody).is_ok();
     if previous.key == key && drift.is_empty() && settled && restorable {
         if !chained && git_carry::shared::requires_base(&bundle)? {
             let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
@@ -1186,7 +1209,7 @@ fn publish_prior(corpus: &Path, name: &str, link: Option<&Prior>, chained: bool)
             // Identical bundle bytes declare identical prerequisites, so an
             // intact chain already recorded for this name stands as it is.
             let sidecar = prior_sidecar(corpus, name);
-            if !(sidecar.try_exists()? && chain_links(corpus, name).is_ok()) {
+            if !(sidecar.try_exists()? && chain_links(corpus, name, LinkBinding::Custody).is_ok()) {
                 if link.bundle == name {
                     return Err(BulkloadRefusal::ContractSelfInconsistent);
                 }
@@ -1585,7 +1608,10 @@ fn apply_item(
     // WP2: a chained capture restores from its verified, flattened chain; a
     // capture on a shared plan base imports that base first.
     let staged = if prior_sidecar(corpus, &captured.bundle).try_exists()? {
-        git_carry::chain::flatten(staged, &chain_links(corpus, &captured.bundle)?)?
+        git_carry::chain::flatten(
+            staged,
+            &chain_links(corpus, &captured.bundle, LinkBinding::Digest)?,
+        )?
     } else {
         import_base(item, &captured, staged.path(), corpus, source, imported)?;
         staged
@@ -1878,12 +1904,14 @@ fn item_space(item: &Item, corpus: &Path, state: &Path, source: &str) -> Result<
         return Ok(None);
     }
     // A chained capture lands its whole chain's objects (WP2).
-    let bundle = chain_links(corpus, &captured.bundle)?.iter().try_fold(
-        fs::metadata(corpus.join(&captured.bundle))?.len(),
-        |total, (link, _)| {
-            Ok::<_, BulkloadRefusal>(total.saturating_add(fs::metadata(link)?.len()))
-        },
-    )?;
+    let bundle = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?
+        .iter()
+        .try_fold(
+            fs::metadata(corpus.join(&captured.bundle))?.len(),
+            |total, (link, _)| {
+                Ok::<_, BulkloadRefusal>(total.saturating_add(fs::metadata(link)?.len()))
+            },
+        )?;
     // Objects land in the repository; a checkout lands in the workspace.
     // For a linked worktree those are two places, possibly two filesystems.
     let mut writes = vec![(item.repository.clone(), bundle)];
@@ -4649,7 +4677,7 @@ mod wp2_chain {
             let head = fixture.corpus.join(&previous.0);
             let flat = git_carry::chain::flatten(
                 git_carry::stage_bundle(&head).unwrap(),
-                &chain_links(&fixture.corpus, &previous.0).unwrap(),
+                &chain_links(&fixture.corpus, &previous.0, LinkBinding::Digest).unwrap(),
             )
             .unwrap();
             let standalone = git_carry::export_repository_with_policy(
@@ -4784,8 +4812,121 @@ mod wp2_chain {
         fs::remove_file(&path).unwrap();
         fs::write(&path, bytes).unwrap();
         assert_eq!(
-            chain_links(&fixture.corpus, &chained).err(),
+            chain_links(&fixture.corpus, &chained, LinkBinding::Custody).err(),
             Some(BulkloadRefusal::ReceiptBindingInvalid)
         );
+        // Capture never extends or reuses it, but the bytes are the recorded
+        // ones, so restore (bound by name and digest) still applies.
+        assert!(chain_links(&fixture.corpus, &chained, LinkBinding::Digest).is_ok());
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+    }
+
+    // A chained capture of `fixture` (depth 1), with its corpus copied as
+    // `pull` copies one to the apply host: every file a new inode, and a new
+    // ctime, so no link sits at its recorded `StatIdentity`.
+    fn chained_and_pulled(fixture: &ChainFixture) -> (String, String, PathBuf) {
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let root = chain_record(fixture).bundle;
+        apply_step(&fixture.source, &ChainStep::Commit(1, 5));
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let chained = chain_record(fixture).bundle;
+        assert_eq!(chain_depth(&fixture.corpus, &chained), 1);
+        let pulled = fixture.root.join("pulled");
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&fixture.corpus)
+            .arg(&pulled)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        (root, chained, pulled)
+    }
+
+    /// R-N72 restore custody: a chain captured on one host applies from a
+    /// pulled copy of its corpus on another. Links bind by name and digest
+    /// at apply; the capture-side identity check refuses only the reuse.
+    #[test]
+    fn a_chained_capture_applies_from_a_pulled_corpus() {
+        let fixture = chain_fixture("pulled");
+        let (_, chained, pulled) = chained_and_pulled(&fixture);
+        assert_eq!(
+            chain_links(&pulled, &chained, LinkBinding::Custody).err(),
+            Some(BulkloadRefusal::ReceiptBindingInvalid),
+            "the copy must move every link off its recorded identity"
+        );
+        // The space preflight charges the whole chain from the copy, too.
+        let item = inspect(&fixture.plan).unwrap().remove(0);
+        let (_, charged) = item_space(&item, &pulled, &fixture.root.join("applied"), "neo")
+            .unwrap()
+            .expect("the pulled chained capture is pending");
+        assert!(charged > fs::metadata(pulled.join(&chained)).unwrap().len());
+        let reasons = Mutex::new(Vec::new());
+        apply(
+            &fixture.plan,
+            &pulled,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|row| {
+                reasons.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*reasons.lock().unwrap(), vec![None]);
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+        for name in ["history", "file-0", "file-1"] {
+            assert_eq!(
+                fs::read(fixture.target.join(name)).unwrap(),
+                fs::read(fixture.source.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Digest binding is still binding: a pulled link whose bytes are not
+    /// the recorded ones refuses DIGEST_MISMATCH and restores nothing.
+    #[test]
+    fn a_pulled_chain_link_with_other_bytes_refuses_by_type() {
+        let fixture = chain_fixture("pulled-tampered");
+        let (root, _, pulled) = chained_and_pulled(&fixture);
+        let link = pulled.join(&root);
+        let mut bytes = fs::read(&link).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&link, bytes).unwrap();
+        let reasons = Mutex::new(Vec::new());
+        assert!(apply(
+            &fixture.plan,
+            &pulled,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|row| {
+                reasons.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            *reasons.lock().unwrap(),
+            vec![Some(BulkloadRefusal::DigestMismatch.to_string())]
+        );
+        assert!(!fixture.target.exists(), "nothing is restored");
     }
 }

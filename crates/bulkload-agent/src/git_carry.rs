@@ -107,6 +107,13 @@ fn text(command: &mut Command) -> Result<String> {
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
 }
 
+/// Run `command` with `bytes` on stdin and return its stdout.
+///
+/// `bytes` are written from a scoped thread while this thread drains stdout:
+/// a child that answers per request (`cat-file --batch-check`, `hash-object
+/// --stdin`) stops reading once its stdout pipe fills, so writing every
+/// request before reading any answer would block both processes forever
+/// (64 KiB pipes on Linux, 16 KiB on Darwin; a few thousand refs).
 fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::process::Stdio;
@@ -115,12 +122,16 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or(BulkloadRefusal::Io(None))?
-        .write_all(bytes)?;
-    let result = child.wait_with_output()?;
+    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
+    let (written, result) = std::thread::scope(|scope| {
+        // `stdin` moves into the writer and closes when it returns, so the
+        // child sees end of input exactly once every request is written.
+        let writer = scope.spawn(move || stdin.write_all(bytes));
+        let result = child.wait_with_output();
+        (writer.join(), result)
+    });
+    let result = result?;
+    written.map_err(|_| BulkloadRefusal::Io(None))??;
     if !result.status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
