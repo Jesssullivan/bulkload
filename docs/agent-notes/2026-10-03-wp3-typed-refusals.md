@@ -43,7 +43,53 @@ refusals, not per-entry wire codes.
 Validation: `nix develop .#default --command just check-fast` green (rustc
 1.96.1).
 
+## PR 2 — no blanket conversions (branch feat/wp3-typed-refusals-20261003-pr2, stacked on PR 1)
+
+- Removed `From<std::io::Error>` and `From<postcard::Error>` for
+  `BulkloadRefusal` (bulkload-proto) and `From<std::io::Error>` for
+  `estimate::Refused`. Added `crate::refuse::RefuseAt::refuse_at(site)`
+  (plus `refuse::io` / `refuse::codec` for non-`?` sites). The change is
+  compiler-driven: about 600 `?` sites were rewritten by a script fed by rustc's
+  JSON diagnostics, with `site = module::function`. The macOS-only blocks,
+  which do not compile on sting, were audited by hand (`space::counts`,
+  `stderr_store::extended_acl`). carry_v2 changed only mechanically, because
+  the removal forced it.
+- `tests/refusal_taxonomy.rs::bare_io_none_sites_only_shrink`: an allowlist
+  of non-test `Io(None)` sites per file, 70 in total. A rise fails, and a fall
+  fails until the table is lowered.
+- v1 Git children are routed through the estimate classifier. New helpers:
+  `estimate::run_git` (stdin and stdout piped, stderr drained into
+  `StderrClass`), `estimate::StderrTap` for streaming children and
+  `estimate::child_failed` for `Command::output` sites. A non-zero exit
+  refuses `GIT_CHILD_FAILED(class)` instead of `GIT_INVENTORY_MALFORMED`.
+  The routed sites:
+  - `git_carry::{output,input,text}` and `estimate::{feed,run,walk,thin_pack}`
+  - `raw_tree::{capture,prune}`, `shallow::{write_bundle,unpack}` and
+    `batch_objects`
+  - the status catch-alls in `read_authority`, `nested_head`,
+    `nest_index_hides_changes`, `filter_drivers`, `nest_has_stash`,
+    `nest_detached_unreachable`, `collapsed_gitlinks` and `retained_blobs`
+  - `nest_has_stash` and `shallow::write_bundle` no longer inherit the
+    agent's stderr.
+- design.md: one paragraph on the refusal contract.
+- Wire: no bump. Transfer refusals keep their codes: `.refuse_at` maps to
+  the same `IO(errno)` / `FRAME_CODEC`. `GIT_CHILD_FAILED` is raised only
+  by local Git verbs and their ledgers, never inside a frame.
+
+Validation passed: `just check-fast` and `just resume-power-loss`, both run with
+`nix develop .#default`.
+
 ## Open
 
+- Deferred: `verify_bundle`'s residual `GIT_INVENTORY_MALFORMED` (the
+  documented #106 split), and the `.status()` probes whose exit code is the
+  answer (`show-ref --verify --quiet`, `diff --cached --quiet`). They
+  inherit or discard stderr but are not catch-alls over a failed child.
+  They belong to WP7's `SourceRepo::git(ReadCmd)`.
+- The `refuse_at` site is carried only at the call site today. WP3 PR 3
+  persists it in `Refusal{code, site, errno}`.
+- PR #145 (WP1) rewrites `git_carry::git()` and `estimate::hardened`. Expect
+  textual conflicts in `git_carry.rs` and `estimate.rs` against this lane.
+  After the merge, the compiler lists every new bare `?` the merge brings in.
 - PR #145 (WP1) adds `GitSourcePartialClone` next to the same lines in
   `refusal.rs`: a trivial textual merge for whichever lands second.

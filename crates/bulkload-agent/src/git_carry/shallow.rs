@@ -5,6 +5,7 @@
 //! in new/private administration; no source parent or history is fabricated.
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -33,7 +34,7 @@ pub(super) fn frontier(repository: &Path) -> Result<Vec<u8>> {
             Ok(bytes)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "git_carry::shallow::frontier")),
     }
 }
 
@@ -56,16 +57,25 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&pack)?;
-    let status = git(private)
+        .open(&pack)
+        .refuse_at("git_carry::shallow::write_bundle")?;
+    // stdout goes to the pack file; stderr is captured for the classifier
+    // only (R-N121), never inherited.
+    let packed = git(private)
         .args(["pack-objects", "--stdout", "--revs", "--all"])
         .stdin(Stdio::null())
-        .stdout(Stdio::from(file.try_clone()?))
-        .status()?;
-    if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        .stdout(Stdio::from(
+            file.try_clone()
+                .refuse_at("git_carry::shallow::write_bundle")?,
+        ))
+        .stderr(Stdio::piped())
+        .output()
+        .refuse_at("git_carry::shallow::write_bundle")?;
+    if !packed.status.success() {
+        return Err(super::estimate::child_failed(&packed.stderr));
     }
-    file.sync_file_counted()?;
+    file.sync_file_counted()
+        .refuse_at("git_carry::shallow::write_bundle")?;
     let envelope = parent.join("shallow-envelope.git");
     let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
     output(
@@ -169,7 +179,9 @@ fn ensure_custody_objects(repository: &Path, bundle: &Path, value: &str) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // WP3: every foreign-error site names itself.
 pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Option<String>> {
+    const SITE: &str = "git_carry::shallow::unpack";
     let Some(value) = custody_oid(heads) else {
         return Ok(None);
     };
@@ -228,28 +240,31 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path)?;
-        file.write_all(&boundary)?;
-        file.sync_file_counted()?;
+            .open(&path)
+            .refuse_at(SITE)?;
+        file.write_all(&boundary).refuse_at(SITE)?;
+        file.sync_file_counted().refuse_at(SITE)?;
     }
     let mut objects = super::batch_objects::BatchObjects::new(repository)?;
     let mut child = git(repository)
         .args(["index-pack", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at(SITE)?;
+    let stderr = super::estimate::StderrTap::attach(child.stderr.take());
     let copied = child
         .stdin
         .take()
         .map_or(Err(BulkloadRefusal::Io(None)), |mut stdin| {
             objects.copy_into(&pack_oid, &mut stdin, None)
         });
-    let status = child.wait()?;
+    let status = child.wait().refuse_at(SITE)?;
     copied?;
     objects.finish()?;
     if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stderr.failed());
     }
     output(git(repository).args([
         "fsck",
@@ -264,8 +279,10 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
         Path::new(&path)
             .parent()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
-    )?
-    .sync_dir_counted()?;
+    )
+    .refuse_at(SITE)?
+    .sync_dir_counted()
+    .refuse_at(SITE)?;
     if let Some(reservation) = reservation {
         reservation.release()?;
     }

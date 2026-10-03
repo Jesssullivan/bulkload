@@ -103,6 +103,7 @@ pub mod crash_check {
 }
 pub mod materialize;
 pub mod provider_sqlite;
+pub mod refuse;
 pub mod space;
 pub mod transfer;
 pub mod transfer_store;

@@ -54,6 +54,7 @@
 // same shape for the same reason.
 #![allow(clippy::result_large_err)]
 
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -133,7 +134,9 @@ impl Source {
             "git_version_failed",
             |stdout| {
                 let mut text = String::new();
-                stdout.read_to_string(&mut text)?;
+                stdout
+                    .read_to_string(&mut text)
+                    .refuse_at("git_carry::carry_v2::probe")?;
                 Ok(text)
             },
         )?;
@@ -284,7 +287,7 @@ fn run_child<T>(
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        child.wait()?;
+        child.wait().refuse_at("git_carry::carry_v2::run_child")?;
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
@@ -297,7 +300,7 @@ fn run_child<T>(
         drop(stdout);
         (writer.join(), reader.join(), result)
     });
-    let status = child.wait()?;
+    let status = child.wait().refuse_at("git_carry::carry_v2::run_child")?;
     let drained = drained.map_err(|_| BulkloadRefusal::Io(None))?;
     if let Err(error) = result {
         if let (Some(store), (_, _, Some(capture), _)) = (store, drained) {
@@ -318,7 +321,9 @@ fn run_child<T>(
     }
     // A child that succeeded without reading all of its input did not see
     // the whole request.
-    written.map_err(|_| BulkloadRefusal::Io(None))??;
+    written
+        .map_err(|_| BulkloadRefusal::Io(None))?
+        .refuse_at("git_carry::carry_v2::run_child")?;
     result.map_err(Refused::from)
 }
 
@@ -340,7 +345,8 @@ fn lines(
     let mut buffer = Vec::with_capacity(256);
     loop {
         buffer.clear();
-        let read = std::io::BufRead::read_until(&mut reader, b'\n', &mut buffer)?;
+        let read = std::io::BufRead::read_until(&mut reader, b'\n', &mut buffer)
+            .refuse_at("git_carry::carry_v2::lines")?;
         if read == 0 {
             return Ok(());
         }

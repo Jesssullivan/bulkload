@@ -33,6 +33,7 @@
 //! `libc::kill`, and no signal of any kind in this file. // agent-process-safety: allow (prose asserting absence of process control)
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -664,8 +665,10 @@ impl Scratch {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            .create(&dir)
+            .refuse_at("handoff::create")?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .refuse_at("handoff::create")?;
         Ok(Self(dir))
     }
 
@@ -677,9 +680,10 @@ impl Scratch {
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
-        file.write_all(payload)?;
-        file.sync_file_counted()?;
+            .open(&path)
+            .refuse_at("handoff::write")?;
+        file.write_all(payload).refuse_at("handoff::write")?;
+        file.sync_file_counted().refuse_at("handoff::write")?;
         Ok(path)
     }
 }

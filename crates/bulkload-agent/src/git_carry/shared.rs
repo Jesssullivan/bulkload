@@ -4,6 +4,7 @@
 //! workspace's staged, dirty, ignored and filesystem metadata capture.
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,9 +31,12 @@ fn stash_history(repo: &Path, inventory: &str) -> Result<Vec<u8>> {
 /// # Errors
 /// Refuses changing refs/stashes/HEAD, invalid Git state or occupied capture paths.
 pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
-    let repo = fs::canonicalize(repo)?;
-    fs::DirBuilder::new().mode(0o700).create(capture)?;
-    let capture = fs::canonicalize(capture)?;
+    let repo = fs::canonicalize(repo).refuse_at("git_carry::shared::export_base")?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(capture)
+        .refuse_at("git_carry::shared::export_base")?;
+    let capture = fs::canonicalize(capture).refuse_at("git_carry::shared::export_base")?;
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
@@ -105,7 +109,8 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(bundle)?;
+        .open(bundle)
+        .refuse_at("git_carry::shared::prerequisites")?;
     let mut source = BufReader::new(file);
     let mut consumed = 0usize;
     let mut prerequisite = Vec::new();
@@ -114,7 +119,8 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
         let count = source
             .by_ref()
             .take(1024 * 1024)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .refuse_at("git_carry::shared::prerequisites")?;
         if consumed == 0 && line != b"# v2 git bundle\n" && line != b"# v3 git bundle\n" {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
@@ -174,7 +180,8 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
     // a base tip, and staged/worktree commits deliberately have no parents.
     // Retain every advertised workspace ref and explicitly declare the base
     // commits needed by their trees. The pack remains entirely Git-generated.
-    let mut source = BufReader::new(fs::File::open(bundle)?);
+    let mut source =
+        BufReader::new(fs::File::open(bundle).refuse_at("git_carry::shared::write_bundle")?);
     let mut header = Vec::new();
     let mut consumed = 0usize;
     loop {
@@ -182,7 +189,8 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
         let count = source
             .by_ref()
             .take(1024 * 1024)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .refuse_at("git_carry::shared::write_bundle")?;
         consumed = consumed
             .checked_add(count)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -200,20 +208,28 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     for value in commits {
-        writeln!(header, "-{value} shared base")?;
+        writeln!(header, "-{value} shared base").refuse_at("git_carry::shared::write_bundle")?;
     }
-    writeln!(header, "{}\n", refs(private)?)?;
+    writeln!(header, "{}\n", refs(private)?).refuse_at("git_carry::shared::write_bundle")?;
     let pending = bundle.with_extension("header-pending");
     let mut target = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&pending)?;
-    target.write_all(&header)?;
-    std::io::copy(&mut source, &mut target)?;
-    target.sync_file_counted()?;
-    fs::rename(&pending, bundle)?;
-    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
+        .open(&pending)
+        .refuse_at("git_carry::shared::write_bundle")?;
+    target
+        .write_all(&header)
+        .refuse_at("git_carry::shared::write_bundle")?;
+    std::io::copy(&mut source, &mut target).refuse_at("git_carry::shared::write_bundle")?;
+    target
+        .sync_file_counted()
+        .refuse_at("git_carry::shared::write_bundle")?;
+    fs::rename(&pending, bundle).refuse_at("git_carry::shared::write_bundle")?;
+    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at("git_carry::shared::write_bundle")?
+        .sync_dir_counted()
+        .refuse_at("git_carry::shared::write_bundle")?;
     Ok(())
 }
 

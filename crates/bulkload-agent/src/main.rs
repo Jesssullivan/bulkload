@@ -5,6 +5,7 @@
 //! closed dependency graph should not grow a parser crate to read one
 //! subcommands.
 
+use bulkload_agent::refuse::RefuseAt as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -306,8 +307,8 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
         )?)?;
     }
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{}", report.to_json())?;
-    stdout.flush()?;
+    writeln!(stdout, "{}", report.to_json()).refuse_at("main::closure_command")?;
+    stdout.flush().refuse_at("main::closure_command")?;
     report.gate()
 }
 
@@ -495,12 +496,12 @@ fn estimate_command(args: &[std::ffi::OsString]) -> Result<()> {
 
 fn emit(stdout: &mut impl std::io::Write, index: usize, block: &[String]) -> Result<()> {
     if index > 0 {
-        writeln!(stdout)?;
+        writeln!(stdout).refuse_at("main::emit")?;
     }
     for line in block {
-        writeln!(stdout, "{line}")?;
+        writeln!(stdout, "{line}").refuse_at("main::emit")?;
     }
-    stdout.flush()?;
+    stdout.flush().refuse_at("main::emit")?;
     Ok(())
 }
 
@@ -636,31 +637,32 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             output,
             "item={} source={:?} outcome={} reason={:?} source_bytes_read={}",
             row.item, row.source, row.outcome, row.reason, row.bytes_read
-        )?;
+        )
+        .refuse_at("main::estate_command")?;
         if let Some(why) = row.reuse_unavailable {
-            write!(output, " reuse_unavailable={why}")?;
+            write!(output, " reuse_unavailable={why}").refuse_at("main::estate_command")?;
         }
-        writeln!(output)?;
+        writeln!(output).refuse_at("main::estate_command")?;
         // One line per drifted ref or seat, after the item line, so a clean
         // item stays one line.
         for line in &row.drift {
-            writeln!(output, "item={} drift={line}", row.item)?;
+            writeln!(output, "item={} drift={line}", row.item).refuse_at("main::estate_command")?;
         }
         // One line per nest after the item line, so a nest-free item stays
         // one line (R-N73). Paths inside are byte-escaped.
         for line in &row.nested {
-            writeln!(output, "item={} {line}", row.item)?;
+            writeln!(output, "item={} {line}", row.item).refuse_at("main::estate_command")?;
         }
-        output.flush()?;
+        output.flush().refuse_at("main::estate_command")?;
         Ok(())
     };
     match command {
         "estate-show" if args.len() == 1 => {
             let mut output = std::io::stdout().lock();
             for item in estate::inspect(path(0)?)? {
-                writeln!(output, "{item:?}")?;
+                writeln!(output, "{item:?}").refuse_at("main::estate_command")?;
             }
-            output.flush()?;
+            output.flush().refuse_at("main::estate_command")?;
             Ok(())
         }
         "estate-add" if (3..=4).contains(&args.len()) => {
@@ -737,8 +739,9 @@ fn apply_state_command(args: &[std::ffi::OsString]) -> Result<()> {
                 output,
                 "table={} inserted={} corrected={} conflicts={}",
                 receipt.table, receipt.inserted, receipt.corrected, receipt.conflicts
-            )?;
-            output.flush()?;
+            )
+            .refuse_at("main::apply_state_command")?;
+            output.flush().refuse_at("main::apply_state_command")?;
             Ok(())
         },
     )
@@ -782,8 +785,9 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
             report.source_identity,
             report.path.as_os_str().as_bytes().escape_ascii(),
             report.source.as_os_str().as_bytes().escape_ascii()
-        )?;
-        output.flush()?;
+        )
+        .refuse_at("main::hydrate_command")?;
+        output.flush().refuse_at("main::hydrate_command")?;
         Ok(())
     };
     let reports = bulkload_agent::provider_sqlite::hydrate::hydrate_state(
@@ -837,7 +841,8 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn()
+        .refuse_at("main::pull_command")?;
     let result = {
         let mut output = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
@@ -852,7 +857,7 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
             path(4)?,
         )
     };
-    let exit_status = child.wait()?;
+    let exit_status = child.wait().refuse_at("main::pull_command")?;
     let stats = result?;
     if !exit_status.success() {
         return Err(BulkloadRefusal::Io(None));
@@ -1025,8 +1030,8 @@ fn selftest() -> Result<()> {
     let cleanup = std::fs::remove_file(&path);
 
     let digest = digest?;
-    let meta = meta?;
-    cleanup?;
+    let meta = meta.refuse_at("main::selftest")?;
+    cleanup.refuse_at("main::selftest")?;
 
     if digest != hash::hash_bytes(payload) {
         return Err(BulkloadRefusal::DigestMismatch);
@@ -1062,7 +1067,7 @@ fn selftest() -> Result<()> {
 }
 
 fn walk_command(root: &Path) -> Result<()> {
-    let root = std::fs::canonicalize(root)?;
+    let root = std::fs::canonicalize(root).refuse_at("main::walk_command")?;
     let mut cache = MemoryCache::new();
     let options = WalkOptions {
         hash_policy: HashPolicy::Never,
@@ -1130,9 +1135,9 @@ fn scratch_path(name: &str) -> PathBuf {
 }
 
 fn write_scratch(path: &std::path::Path, payload: &[u8]) -> Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(payload)?;
-    bulkload_agent::counters::sync_full(&file)?;
+    let mut file = std::fs::File::create(path).refuse_at("main::write_scratch")?;
+    file.write_all(payload).refuse_at("main::write_scratch")?;
+    bulkload_agent::counters::sync_full(&file).refuse_at("main::write_scratch")?;
     Ok(())
 }
 

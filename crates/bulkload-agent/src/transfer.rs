@@ -34,6 +34,7 @@
 //! intermediate directory swapped for a symlink is refused, never followed
 //! out of the root. Content is read with `pread`, never mapped.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsFd as _, BorrowedFd};
@@ -223,12 +224,13 @@ pub fn copy(
     source_state: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
-    let source_root = std::fs::canonicalize(source)?;
-    let destination_root = std::fs::canonicalize(destination)?;
+    let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
+    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
     if source_root.starts_with(&destination_root) || destination_root.starts_with(&source_root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair()?;
+    let (mut sender, mut receiver) =
+        std::os::unix::net::UnixStream::pair().refuse_at("transfer::copy")?;
     for stream in [&sender, &receiver] {
         tune_stream(stream);
     }
@@ -236,21 +238,27 @@ pub fn copy(
     // the suite, which on a loaded host can be many seconds.
     #[cfg(test)]
     for stream in [&sender, &receiver] {
-        stream.set_read_timeout(Some(std::time::Duration::from_mins(5)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_mins(5)))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_mins(5)))
+            .refuse_at("transfer::copy")?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_mins(5)))
+            .refuse_at("transfer::copy")?;
     }
     std::thread::scope(|scope| -> Result<TransferStats> {
-        let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let input = sender.try_clone()?;
-            let served = serve(input, &mut sender);
-            // The source's reader thread holds a clone of this end; shutting
-            // it down ends that thread and tells the destination the source
-            // is gone, whatever `serve` returned.
-            let _ = sender.shutdown(std::net::Shutdown::Both);
-            served
-        })?;
+        let producer = std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                let input = sender.try_clone().refuse_at("transfer::copy")?;
+                let served = serve(input, &mut sender);
+                // The source's reader thread holds a clone of this end; shutting
+                // it down ends that thread and tells the destination the source
+                // is gone, whatever `serve` returned.
+                let _ = sender.shutdown(std::net::Shutdown::Both);
+                served
+            })
+            .refuse_at("transfer::copy")?;
         let result = {
-            let mut output = receiver.try_clone()?;
+            let mut output = receiver.try_clone().refuse_at("transfer::copy")?;
             receive(
                 &mut receiver,
                 &mut output,
@@ -495,9 +503,9 @@ pub const RACY_GRANULARITY_NS: i128 = crate::git_carry::RACY_GRANULARITY_NS;
 /// Refuses an unreadable tree.
 pub fn settle_racy_window(root: &Path) -> Result<std::time::Duration> {
     fn newest(directory: &Path, stamp: &mut i128) -> Result<()> {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
+        for entry in std::fs::read_dir(directory).refuse_at("transfer::newest")? {
+            let entry = entry.refuse_at("transfer::newest")?;
+            let meta = entry.metadata().refuse_at("transfer::newest")?;
             let identity = StatIdentity::from_metadata(&meta);
             *stamp = (*stamp).max(identity.mtime_ns).max(identity.ctime_ns);
             if meta.is_dir() {
@@ -507,7 +515,10 @@ pub fn settle_racy_window(root: &Path) -> Result<std::time::Duration> {
         Ok(())
     }
     let started = Instant::now();
-    let mut stamp = StatIdentity::from_metadata(&std::fs::symlink_metadata(root)?).ctime_ns;
+    let mut stamp = StatIdentity::from_metadata(
+        &std::fs::symlink_metadata(root).refuse_at("transfer::newest")?,
+    )
+    .ctime_ns;
     newest(root, &mut stamp)?;
     let settled = stamp.saturating_add(RACY_GRANULARITY_NS);
     // A seat stamped far in the future would never settle: refuse rather
@@ -695,7 +706,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     if proto != PROTO_VERSION || id != wire_id() {
         return Err(BulkloadRefusal::FrameCodec);
     }
-    let root = std::fs::canonicalize(path(root))?;
+    let root = std::fs::canonicalize(path(root)).refuse_at("transfer::serve")?;
     let state = path(state);
     let store = Store::open(&state)?;
     if store.root().starts_with(&root) || root.starts_with(store.root()) {
@@ -703,14 +714,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     }
     // Every source seat is walked and read beneath this one descriptor
     // (W4 PR 3); its identity is the root's in the authority.
-    let root_fd = crate::io::sys::open_root(&root)?;
-    let meta = crate::io::sys::fstat(&root_fd)?;
+    let root_fd = crate::io::sys::open_root(&root).refuse_at("transfer::serve")?;
+    let meta = crate::io::sys::fstat(&root_fd).refuse_at("transfer::serve")?;
     let authority = postcard::to_stdvec(&(
         store.authority()?,
         root.as_os_str().as_bytes(),
         meta.node.dev,
         meta.node.ino,
-    ))?;
+    ))
+    .refuse_at("transfer::serve")?;
     let committer = Committer::spawn(LedgerSink::new(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
     ))?;
@@ -742,13 +754,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
                 .name("bulkload-serve-walk".to_owned())
                 .spawn_scoped(scope, move || {
                     walk_source(walker, gate, &events);
-                })?;
+                })
+                .refuse_at("transfer::serve")?;
         }
         for _ in 0..CAPTURE_WORKERS {
             let events = events_sender.clone();
             let (work, job_queue) = (&work, &job_queue);
             std::thread::Builder::new()
-                .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))?;
+                .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))
+                .refuse_at("transfer::serve")?;
         }
         let sent = send_entries(output, &committer, &events, jobs, &gate);
         // Wake any capture thread waiting on credit, and the walk thread
@@ -809,7 +823,8 @@ fn spawn_reader<R: Read + Send + 'static>(
             };
             credit.close();
             let _ = events.send(Event::PeerFailed(failure));
-        })?;
+        })
+        .refuse_at("transfer::spawn_reader")?;
     Ok(())
 }
 
@@ -1349,7 +1364,9 @@ fn serve_chunks(
     let held = retained.filter(|held| held.chunks.len() == manifest.chunks.len());
     let opened = if held.is_none() && !indices.is_empty() {
         let file = open_source(work, row)?;
-        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+        if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
+            != StatIdentity::from_row(row)
+        {
             return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
         }
         Some(file)
@@ -1409,7 +1426,9 @@ fn serve_chunks(
             .map_err(|_| BulkloadRefusal::WorkerLost)?;
     }
     if let Some(file) = &opened {
-        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+        if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
+            != StatIdentity::from_row(row)
+        {
             return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
         }
     }
@@ -1459,7 +1478,9 @@ fn capture_file(
     let started_ns = capture_clock(work.root);
     let file = open_source(work, row)?;
     let expected = StatIdentity::from_row(row);
-    if StatIdentity::from_metadata(&file.metadata()?) != expected {
+    if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::capture_file")?)
+        != expected
+    {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut prefix = Vec::new();
@@ -1470,7 +1491,10 @@ fn capture_file(
         },
         count: bytes_read,
     };
-    (&mut reader).take(16).read_to_end(&mut prefix)?;
+    (&mut reader)
+        .take(16)
+        .read_to_end(&mut prefix)
+        .refuse_at("transfer::capture_file")?;
     if prefix.starts_with(b"SQLite format 3\0")
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
@@ -1500,7 +1524,10 @@ fn capture_file(
             .checked_add(size)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
     }
-    if offset != row.size || StatIdentity::from_metadata(&file.metadata()?) != expected {
+    if offset != row.size
+        || StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::capture_file")?)
+            != expected
+    {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let racy = crate::git_carry::racy(row, started_ns, capture_clock(work.root));
@@ -1517,7 +1544,8 @@ fn open_source(work: &SourceWork<'_>, row: &RowSchema) -> Result<std::fs::File> 
         work.root_fd,
         crate::walk::rel_path(&row.rel_path),
         crate::io::OpenMode::Read,
-    )?;
+    )
+    .refuse_at("transfer::open_source")?;
     Ok(std::fs::File::from(fd))
 }
 
@@ -1860,13 +1888,14 @@ pub fn receive<R: Read, W: Write>(
     let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
         return Err(BulkloadRefusal::ProtocolStateViolation);
     };
-    let target_meta = std::fs::metadata(target.path())?;
+    let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
         authority,
         target.path().as_os_str().as_bytes(),
         target_meta.dev(),
         target_meta.ino(),
-    ))?;
+    ))
+    .refuse_at("transfer::receive")?;
     write_control(
         output,
         &Control::Credit {
@@ -2459,7 +2488,7 @@ impl<W: Write> Inbound<'_, W> {
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
         if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
-            .map_err(BulkloadRefusal::from)
+            .refuse_at("transfer::publish")
         {
             let _ = staged.discard();
             return Err(refusal);
@@ -2693,7 +2722,7 @@ fn read_verified(
 
 fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
     for offset in offsets {
-        crate::io::sys::pwrite_all(file, data, *offset)?;
+        crate::io::sys::pwrite_all(file, data, *offset).refuse_at("transfer::place")?;
         counters::add_len(Counter::DestMaterializeWrite, data.len());
     }
     Ok(())
@@ -2710,7 +2739,9 @@ fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
 /// Refuses truncated, oversized or invalid frames.
 pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
     let mut prefix = [0_u8; FRAME_HEADER_BYTES];
-    input.read_exact(&mut prefix)?;
+    input
+        .read_exact(&mut prefix)
+        .refuse_at("transfer::read_frame")?;
     let [a, b, c, d, tag] = prefix;
     let length = u32::from_be_bytes([a, b, c, d]) as usize;
     if length > MAX_FRAME_BYTES {
@@ -2727,17 +2758,23 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
         let mut header = [0_u8; DATA_HEADER_BYTES];
-        input.read_exact(&mut header)?;
+        input
+            .read_exact(&mut header)
+            .refuse_at("transfer::read_frame")?;
         let header = DataHeader::from_bytes(&header)?;
         if header.size as usize != size {
             return Err(BulkloadRefusal::FrameCodec);
         }
         let mut payload = vec![0_u8; size];
-        input.read_exact(&mut payload)?;
+        input
+            .read_exact(&mut payload)
+            .refuse_at("transfer::read_frame")?;
         Frame::Data { header, payload }
     } else {
         let mut bytes = vec![0_u8; body];
-        input.read_exact(&mut bytes)?;
+        input
+            .read_exact(&mut bytes)
+            .refuse_at("transfer::read_frame")?;
         Frame::decode_body(tag, &bytes)?
     };
     counters::bump(Counter::WireFramesReceived);
@@ -2756,13 +2793,18 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     let mut remaining: &mut [IoSlice<'_>] = &mut slices;
     while !remaining.is_empty() {
         match output.write_vectored(remaining) {
-            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(0) => {
+                return Err(crate::refuse::io(
+                    &std::io::Error::from(std::io::ErrorKind::WriteZero),
+                    "transfer::write_data",
+                ))
+            }
             Ok(written) => IoSlice::advance_slices(&mut remaining, written),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "transfer::write_data")),
         }
     }
-    output.flush()?;
+    output.flush().refuse_at("transfer::write_data")?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, prefix.len() + payload.len());
     Ok(())
@@ -2774,8 +2816,10 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
 /// Refuses oversized messages and broken transports.
 pub fn write_control<W: Write>(output: &mut W, control: &Control) -> Result<()> {
     let encoded = control.encode()?;
-    output.write_all(&encoded)?;
-    output.flush()?;
+    output
+        .write_all(&encoded)
+        .refuse_at("transfer::write_control")?;
+    output.flush().refuse_at("transfer::write_control")?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, encoded.len());
     Ok(())

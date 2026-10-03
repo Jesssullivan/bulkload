@@ -20,6 +20,14 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   current capture and SOURCE says `workspace-restored`.
 - `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
   cause and does not close an item.
+
+  Refusal codes stay typed at the source (WP3, 2026-10-03). Every taxonomy
+  code is raised by product code, never kept as unused vocabulary. A Git
+  child that exits non-zero refuses `GIT_CHILD_FAILED` with a
+  `stderr_class=` from a closed set; its stderr is classified, never echoed
+  or kept (R-N121). No blanket conversion turns an OS or codec error into a
+  refusal: each site names itself with `.refuse_at(site)`. The sites that
+  still raise a bare `IO` with no errno are an allowlist that only shrinks.
 - `referenced-only`: the item plans no workspace, and the exact
   current-capture journal says `refs-imported`. `git-repair-missing-index`
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
