@@ -189,11 +189,11 @@ pub struct Destination {
     swept: Sweep,
     created: Creation,
     /// This store's orphaned file temporaries, kept for their chunks and
-    /// removed only when the session finishes (R25: bytes the destination
-    /// already holds are never read from the source again). Every one is
-    /// kept, however many: a session can leave up to a whole committer group
-    /// and queue of sealed, held temporaries unrenamed (#77 round 2, N2). No
-    /// descriptor is held; each is opened by name when read.
+    /// removed when the session finishes, whatever it refused (#97): bytes
+    /// the destination already holds are not sent again within the session.
+    /// Every one is kept, however many: a session can leave up to a whole
+    /// committer group and queue of sealed temporaries unrenamed (#77 round
+    /// 2, N2). No descriptor is held; each is opened by name when read.
     salvage: Vec<Salvaged>,
 }
 
@@ -256,14 +256,6 @@ impl Destination {
     pub(crate) fn salvaged_file(&self, index: usize) -> Option<File> {
         let salvaged = self.salvage.get(index)?;
         open_regular(&salvaged.parent, &salvaged.name).ok()
-    }
-
-    /// Keep every salvaged temporary for a later session: a refused entry
-    /// may hold its only durable copy there (#77 round 2, N4).
-    pub fn keep_salvaged(&mut self) {
-        for salvaged in std::mem::take(&mut self.salvage) {
-            self.swept.left.push(salvaged.rel_path);
-        }
     }
 
     /// Remove every salvaged temporary by name, as the sweep would have, and
@@ -939,6 +931,8 @@ pub(crate) struct PendingOutput {
     pub key: Vec<u8>,
     pub rel_path: Vec<u8>,
     pub size: u64,
+    /// See [`OutputRecord::racy`].
+    pub racy: bool,
     pub hints: Vec<ChunkHint>,
 }
 
@@ -1067,10 +1061,13 @@ impl crate::io::durable::GroupSink for PublishSink {
                             key: record.key,
                             rel_path: record.rel_path,
                             identity,
+                            racy: record.racy,
                             hints: record.hints,
                         });
                     }
-                    Err(refusal) => self.outcomes.push((record.rel_path, Err(refusal))),
+                    Err(refusal) => self
+                        .outcomes
+                        .push((record.rel_path, Err(space_refusal(refusal)))),
                 },
                 Publication::Adopted {
                     record,
@@ -1081,7 +1078,9 @@ impl crate::io::durable::GroupSink for PublishSink {
                         touched.directory(parent);
                         records.push(record);
                     }
-                    Err(error) => self.outcomes.push((record.rel_path, Err(error.into()))),
+                    Err(error) => self
+                        .outcomes
+                        .push((record.rel_path, Err(space_refusal(error.into())))),
                 },
             }
         }
@@ -1092,6 +1091,9 @@ impl crate::io::durable::GroupSink for PublishSink {
             );
             self.publisher.commit_outputs(&records)
         });
+        // A full disk under the group (a seal or the store commit) is the
+        // typed space refusal, not a bare IO (#100).
+        let committed = committed.map_err(space_refusal);
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
@@ -1115,6 +1117,16 @@ impl crate::io::durable::GroupSink for PublishSink {
 
     fn finish(self) -> Self::Report {
         self.outcomes
+    }
+}
+
+/// `ENOSPC` (or `SQLite`'s full-disk code, which the store reports as it)
+/// is [`BulkloadRefusal::DestinationSpaceInsufficient`]: the group could not
+/// be made durable for lack of space (OI-1001-Q2, #100).
+fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
+    match refusal {
+        BulkloadRefusal::Io(Some(libc::ENOSPC)) => BulkloadRefusal::DestinationSpaceInsufficient,
+        other => other,
     }
 }
 
@@ -1261,6 +1273,7 @@ mod tests {
                 key: b"key".to_vec(),
                 rel_path: b"file".to_vec(),
                 size: 4,
+                racy: false,
                 hints: Vec::new(),
             },
         }]);
@@ -1316,6 +1329,7 @@ mod tests {
                 key: b"key".to_vec(),
                 rel_path: b"file".to_vec(),
                 size: 4,
+                racy: false,
                 hints: Vec::new(),
             },
         }]);
@@ -1420,6 +1434,7 @@ mod tests {
                     key: row.rel_path.clone(),
                     rel_path: row.rel_path.clone(),
                     size: 4,
+                    racy: false,
                     hints: Vec::new(),
                 },
             });

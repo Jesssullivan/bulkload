@@ -123,6 +123,9 @@ counters! {
     // Destination publication events.
     FilesMaterialized => "files_materialized",
     DirectoriesFinished => "directories_finished",
+    // Source captures sent but never recorded: stamped within one timestamp
+    // tick of their capture (#86).
+    TransferRacyCaptures => "transfer_racy_captures",
 }
 
 const COUNT: usize = Counter::ALL.len();

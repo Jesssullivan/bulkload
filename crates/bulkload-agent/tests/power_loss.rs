@@ -130,6 +130,10 @@ fn populate(source: &Path) {
     )
     .unwrap();
     std::os::unix::fs::symlink("a", source.join("link")).unwrap();
+    // Fresh seats are racy for one timestamp tick and their captures are
+    // never recorded (#86); settle them so every capture commits and the
+    // R25 check on committed captures is not vacuous.
+    bulkload_agent::transfer::settle_racy_window(source).unwrap();
 }
 
 /// The source tree the invariants compare against.
