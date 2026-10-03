@@ -477,6 +477,39 @@ fn retain_budget(root: &Path) -> u64 {
 #[cfg(test)]
 static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
+/// At most this many salvaged temporaries outlive a session (#124,
+/// OI-1002-Q33): those whose chunks a refused entry staged.
+///
+/// Both salvage bounds are unruled engineering defaults: OI-1002-Q33 ruled
+/// that salvage is bounded, not these values.
+const SALVAGE_KEEP_FILES: usize = 1024;
+/// At most this many bytes of salvaged temporaries outlive a session.
+const SALVAGE_KEEP_BYTES: u64 = 4 << 30;
+
+/// How many salvaged temporaries, and how many bytes of them, may outlive a
+/// session at the destination root `root`.
+#[cfg(not(test))]
+const fn salvage_bound(_root: &Path) -> (usize, u64) {
+    (SALVAGE_KEEP_FILES, SALVAGE_KEEP_BYTES)
+}
+
+/// The salvage bound; tests set a smaller one per destination root.
+#[cfg(test)]
+fn salvage_bound(root: &Path) -> (usize, u64) {
+    SALVAGE_BOUND_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(override_root, _)| override_root == root)
+        .map_or((SALVAGE_KEEP_FILES, SALVAGE_KEEP_BYTES), |(_, bound)| {
+            *bound
+        })
+}
+
+/// Test-only salvage bounds by canonical destination root.
+#[cfg(test)]
+static SALVAGE_BOUND_OVERRIDE: Mutex<Vec<(PathBuf, (usize, u64))>> = Mutex::new(Vec::new());
+
 /// Timestamp granularity the racy-capture guard allows for (#86): the Git
 /// carry's own [`crate::git_carry::RACY_GRANULARITY_NS`], 2 s.
 pub const RACY_GRANULARITY_NS: i128 = crate::git_carry::RACY_GRANULARITY_NS;
@@ -1546,7 +1579,8 @@ struct ReceiveContext<'a> {
 /// Chunks of this store's orphaned temporaries (see
 /// [`Destination::salvaged`]): what a crashed session staged and sealed but
 /// never published. A resume fills from them instead of asking the source
-/// for those chunks, and removes them when it finishes (#97).
+/// for those chunks. When it finishes it removes them, except those a
+/// refused entry staged chunks from, within a bound (#97, #124).
 #[derive(Default)]
 struct Salvage {
     /// Digest to (salvaged file, offset, size). Hints only: re-verified on use.
@@ -1605,12 +1639,14 @@ impl Read for SalvageReader<'_> {
 }
 
 /// End a receive: record the sweep and directory-creation outcomes, commit
-/// every pending output group, then finish directories and flush the session.
+/// every pending output group, retire the salvage, then finish directories
+/// and flush the session.
 fn finish_receive(
     target: &mut Destination,
     store: &Store,
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
+    salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
@@ -1618,15 +1654,8 @@ fn finish_receive(
             Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
         }
     }
-    // Every salvaged temporary is removed when the session finishes, refused
-    // entries or not (#97). Salvage only saves wire bytes: a capture is
-    // recorded only after its output's group commit returned (`Held`), so no
-    // recorded capture's bytes live only in a temporary, and a refused
-    // entry's capture was never recorded, so the next run reads it from the
-    // source anyway. Keeping them after a refusal (#77 round 2, N4) made
-    // every later session re-index all of them and ask for a manifest for
-    // every file, and a path refused on every run kept them forever.
-    target.remove_salvaged()?;
+    let keep = salvage_to_keep(target, stats, salvage_staged);
+    target.retire_salvaged(&keep)?;
     stats.temporaries_removed = target.swept().removed;
     stats.temporaries_left.clone_from(&target.swept().left);
     stats.directories_renamed = target.created().renamed;
@@ -1637,6 +1666,78 @@ fn finish_receive(
         target.finish_directories(store)?;
     }
     target.flush_session()
+}
+
+/// Which salvaged temporaries outlive the session (#124, OI-1002-Q33).
+///
+/// Salvage saves wire bytes only: a capture is recorded only after its
+/// output's group commit returned (`Held`), so no recorded capture's bytes
+/// live only in a temporary (R25 strict for what the destination durably
+/// held, OI-1001-Q15). A temporary is kept only when an entry refused in
+/// this session had staged chunks from it (a byte-touching refusal: the
+/// entry got as far as filling its staged file, then failed its
+/// verification, publication or group commit), so the retry can fill from
+/// it again. An entry refused before it staged anything (a path conflict at
+/// its decision, a space preflight, a source-side refusal before content)
+/// keeps nothing: those temporaries are removed, so a path refused on every
+/// run never keeps them (#97).
+///
+/// What is kept is bounded by [`SALVAGE_KEEP_FILES`] and
+/// [`SALVAGE_KEEP_BYTES`], in salvage order. A temporary past the bound is
+/// removed and refused as a value, `SALVAGE_BOUND_EXCEEDED` under its
+/// current name: its chunks are sent again by the next run.
+fn salvage_to_keep(
+    target: &Destination,
+    stats: &mut TransferStats,
+    salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
+) -> Vec<usize> {
+    let mut wanted: Vec<usize> = stats
+        .refusals
+        .iter()
+        .filter_map(|(rel_path, _)| salvage_staged.get(rel_path))
+        .flatten()
+        .copied()
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let (max_files, max_bytes) = salvage_bound(target.path());
+    // A temporary that is gone has nothing left to keep.
+    let sized = wanted
+        .into_iter()
+        .filter_map(|at| target.salvaged_size(at).map(|size| (at, size)));
+    let (keep, over) = bound_salvage(sized, max_files, max_bytes);
+    for at in over {
+        if let Some(rel_path) = target.salvaged_path(at) {
+            stats.refusals.push((
+                rel_path.to_vec(),
+                BulkloadRefusal::SalvageBoundExceeded.code().to_owned(),
+            ));
+        }
+    }
+    keep
+}
+
+/// Split `(index, size)` salvage candidates, in order, into those kept
+/// within `max_files` and `max_bytes` and those over the bound. Greedy in
+/// order: a candidate is kept if it fits beside every one kept before it.
+fn bound_salvage(
+    sized: impl IntoIterator<Item = (usize, u64)>,
+    max_files: usize,
+    max_bytes: u64,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut keep = Vec::new();
+    let mut over = Vec::new();
+    let mut kept_bytes = 0_u64;
+    for (at, size) in sized {
+        let bytes = kept_bytes.saturating_add(size);
+        if keep.len() < max_files && bytes <= max_bytes {
+            keep.push(at);
+            kept_bytes = bytes;
+        } else {
+            over.push(at);
+        }
+    }
+    (keep, over)
 }
 
 /// The destination's committer, sized to the descriptor budget: a quarter
@@ -1781,6 +1882,9 @@ struct Inbound<'a, W> {
     open: usize,
     fill_locally: bool,
     salvage: Salvage,
+    /// Salvaged temporaries each entry staged chunks from, by relative path
+    /// (#124): kept past the session only if that entry is refused.
+    salvage_staged: HashMap<Vec<u8>, Vec<usize>>,
     /// Entries queued for their group commit, by relative path, awaiting
     /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
     pending_held: HashMap<Vec<u8>, u64>,
@@ -1867,6 +1971,7 @@ pub fn receive<R: Read, W: Write>(
         open: 0,
         fill_locally,
         salvage: Salvage::default(),
+        salvage_staged: HashMap::new(),
         pending_held: HashMap::new(),
         committed: group_outcomes,
         walk_done: false,
@@ -1879,11 +1984,14 @@ pub fn receive<R: Read, W: Write>(
     };
     let source_bytes_read = receiver.run(input)?;
     let Inbound {
-        mut stats, session, ..
+        mut stats,
+        session,
+        salvage_staged,
+        ..
     } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
-    finish_receive(&mut target, &store, committer, &mut stats)?;
+    finish_receive(&mut target, &store, committer, &mut stats, &salvage_staged)?;
     Ok(stats)
 }
 
@@ -2111,6 +2219,7 @@ impl<W: Write> Inbound<'_, W> {
         }
         let materialize_started = Instant::now();
         self.salvage.refresh(self.target);
+        let mut salvaged_from = Vec::new();
         let plan = if manifest.is_consistent() {
             if self.open >= MAX_OPEN_ENTRIES {
                 return Err(BulkloadRefusal::FrameCodec);
@@ -2124,10 +2233,17 @@ impl<W: Write> Inbound<'_, W> {
                 },
                 &row,
                 &manifest,
+                &mut salvaged_from,
             )
         } else {
             Plan::Refuse(BulkloadRefusal::DigestMismatch)
         };
+        if !salvaged_from.is_empty() {
+            salvaged_from.sort_unstable();
+            salvaged_from.dedup();
+            self.salvage_staged
+                .insert(row.rel_path.clone(), salvaged_from);
+        }
         MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
         let indices = match &plan {
             Plan::Write(staging) => {
@@ -2533,8 +2649,14 @@ struct Staging {
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
-/// new one and fill every chunk this destination already holds.
-fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest) -> Plan {
+/// new one and fill every chunk this destination already holds. Every
+/// salvaged temporary a chunk was staged from is added to `salvaged_from`.
+fn plan_file(
+    context: &ReceiveContext<'_>,
+    row: &RowSchema,
+    manifest: &Manifest,
+    salvaged_from: &mut Vec<usize>,
+) -> Plan {
     let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
     let mut order = Vec::new();
     let mut offset = 0_u64;
@@ -2588,10 +2710,11 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
                 size: *size,
             });
         }
-        let filled = local_chunk(context, &mut outputs, &digest, *size).and_then(|data| {
-            data.map(|data| place(staged.file(), &data, offsets))
-                .transpose()
-        });
+        let filled =
+            local_chunk(context, &mut outputs, &digest, *size, salvaged_from).and_then(|data| {
+                data.map(|data| place(staged.file(), &data, offsets))
+                    .transpose()
+            });
         match filled {
             Ok(Some(())) => (),
             Ok(None) => missing.push(index),
@@ -2612,12 +2735,14 @@ fn plan_file(context: &ReceiveContext<'_>, row: &RowSchema, manifest: &Manifest)
 /// A chunk this destination already holds, re-read and re-verified: from a
 /// file written earlier in this session, or from a published output through
 /// a committed hint, newest first. Any mismatch is a miss, never an error,
-/// and a miss on one hint falls through to the next.
+/// and a miss on one hint falls through to the next. A chunk read from a
+/// salvaged temporary adds its index to `salvaged_from`.
 fn local_chunk(
     context: &ReceiveContext<'_>,
     outputs: &mut HashMap<Vec<u8>, Option<std::fs::File>>,
     digest: &[u8; 32],
     size: u64,
+    salvaged_from: &mut Vec<usize>,
 ) -> Result<Option<Vec<u8>>> {
     if let Some((file, offset, held)) = context.session.get(digest) {
         if held == size {
@@ -2633,6 +2758,7 @@ fn local_chunk(
                 .salvaged_file(*at)
                 .and_then(|file| read_verified(&file, *offset, size, digest))
             {
+                salvaged_from.push(*at);
                 return Ok(Some(data));
             }
         }

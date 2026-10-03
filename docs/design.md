@@ -277,6 +277,28 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
+- **Rows from before the racy guard.** A store created by this engine
+  carries a `racy_guard` marker from its first commit. A store without it was
+  written before #86, so none of its ledger or output rows is proven
+  non-racy. The first writable open deletes every `captures` and `outputs`
+  row in the transaction that adds the marker, and counts them in
+  `transfer_legacy_rows_invalidated`; a read-only handle on an unmarked store
+  serves none of them. Each such seat is read from the source once more,
+  which R25 allows (its row cannot show it was not racy), and recorded under
+  the guard; chunk hints are kept, so content the destination still holds is
+  adopted after verification and never crosses the wire again (#125). The
+  single migration run (OI-1002-Q24) may therefore start from existing
+  pre-migration state.
+- **Known limit: clocks.** The racy predicate compares the source
+  filesystem's mtime and ctime with the capturing host's wall clock, as in
+  the Git carry. Destinations are local filesystems (OI-1001-Q17), but a
+  source may not be: a source on NFS or SMB whose server clock runs behind
+  the capturing host by more than the 2 s allowance can stamp a rewrite made
+  during a capture earlier than the window, and the guard cannot see it; a
+  server clock running ahead only makes more captures racy (fail-closed).
+  Bulkload never writes into a source to read its filesystem's clock. Keep
+  network-mounted sources NTP-synchronised with the capturing host, or carry
+  them from a host where they are local.
 - **Held.** The destination answers every `End` with `Held`. A capture is
   committed to the ledger only when the destination holds its bytes
   durably: `Held{true}` is sent once the output's group commit has
@@ -289,9 +311,18 @@ miss (#87).
   `Held{false}`: neither store records them, the session finishes with the
   refusals, and the next run reads them once (#100). The sweep keeps every
   one of this store's orphaned file temporaries as a chunk source, under a
-  name of the new session, and removes them when the session finishes,
-  whatever it refused (#97). They only save wire bytes: no recorded capture's
-  bytes live only in a temporary.
+  name of the new session. They only save wire bytes: no recorded capture's
+  bytes live only in a temporary. When the session finishes it removes them,
+  except those an entry refused in that session had staged chunks from (a
+  byte-touching refusal: verification, publication or the group commit
+  failed after the entry was filled), which are kept for the retry and
+  reported as left (#124, OI-1002-Q33). An entry refused before it staged
+  anything keeps nothing, so a path refused on every run never keeps
+  temporaries (#97). What is kept is bounded, 1024 temporaries and 4 GiB per
+  session (unruled engineering defaults: OI-1002-Q33 ruled that salvage is
+  bounded, not these numbers; a ruling may change them); a temporary past the bound is removed and refused as a value,
+  `SALVAGE_BOUND_EXCEEDED` under its current name, and its chunks are sent
+  again.
 - **Hints.** The destination records, per digest, every published output
   holding it, newest first; a hint is re-read and re-verified on use, and a
   miss falls through to the next.

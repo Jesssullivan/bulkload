@@ -104,6 +104,8 @@ pub mod crash_check {
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod space;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
