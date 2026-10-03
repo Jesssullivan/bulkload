@@ -17,7 +17,7 @@ pub mod refusal;
 pub mod row;
 
 pub use frame::{Control, Decision, Frame, PROTO_VERSION};
-pub use refusal::BulkloadRefusal;
+pub use refusal::{BulkloadRefusal, StderrClass};
 pub use row::{FileKind, RowSchema};
 
 /// Convenience alias: every fallible bulkload operation refuses with a code.
