@@ -36,8 +36,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bulkload_agent::git_carry::carry_v2::{
-    first_round, FirstRound, Ingest, IngestPlan, IngestReceipt, JournalStore, ListStore, Offer,
-    PackPlan, RefUpdate, Source, Target, DEFAULT_SEGMENT_CAP,
+    first_round, retryable, FenceRetry, FirstRound, Ingest, IngestPlan, IngestReceipt,
+    JournalStore, ListStore, Offer, PackPlan, RefUpdate, Source, Target, DEFAULT_SEGMENT_CAP,
 };
 use bulkload_agent::git_carry::estimate::{estimate, Destination, StderrStore};
 use bulkload_agent::BulkloadRefusal;
@@ -2315,13 +2315,15 @@ fn the_journal_is_exclusive_ordered_and_recovers_a_torn_tail() {
     let journals = JournalStore::open(&state).unwrap();
     let target = Target::probe(&pair.destination, None).unwrap();
     let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    let locked_out = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
     assert_eq!(
-        Ingest::open(&target, &journals, pair.ingest_plan(), None)
-            .unwrap_err()
-            .refusal,
+        locked_out.refusal,
         BulkloadRefusal::JournalOwnershipConflict,
         "a second session is locked out"
     );
+    // #89: a held journal is named, and retryable.
+    assert_eq!(locked_out.reason, Some("journal_held"));
+    assert!(retryable(&locked_out));
     let segment = pair.segment(1);
     assert_eq!(
         session.receive(1, &mut &segment[..]).unwrap_err().refusal,
@@ -2342,6 +2344,9 @@ fn the_journal_is_exclusive_ordered_and_recovers_a_torn_tail() {
     )
     .unwrap_err();
     assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+    // #89: another plan is no held lock; retrying cannot change it.
+    assert_eq!(refused.reason, None);
+    assert!(!retryable(&refused));
     // A torn append is cut off; resume carries on from segment 1.
     let journal = state
         .join("git-carry-v2/ingest")
@@ -3391,23 +3396,13 @@ fn pr75_r3_m1_an_unrelated_carry_ref_change_never_wedges_a_resume() {
     assert_clean(&pair.destination, "r3-m1-unrelated");
 }
 
-/// Finish `session`; a finish refused `repository_fenced` (#75 r4 N3: the
-/// fence's wait is bounded) resumes and tries again.
-fn finish_retrying<'t>(
-    target: &'t Target,
-    mut session: Ingest<'t>,
-    journals: &JournalStore,
-    pack_id: &str,
-) -> IngestReceipt {
-    loop {
-        match session.finish() {
-            Ok(receipt) => return receipt,
-            Err(refused) if refused.reason == Some("repository_fenced") => {
-                session = Ingest::resume(target, journals, pack_id, None).unwrap();
-            }
-            Err(refused) => panic!("finish refused: {refused}"),
-        }
-    }
+/// Finish `session` under the caller retry contract (#89): a finish refused
+/// `repository_fenced` (#75 r4 N3: the fence's wait is bounded) resumes and
+/// tries again, with a jittered backoff, a bounded number of times.
+fn finish_retrying(session: Ingest<'_>, journals: &JournalStore) -> IngestReceipt {
+    session
+        .finish_retrying(journals, &FenceRetry::DEFAULT)
+        .unwrap()
 }
 
 /// r3 M1: two sessions of different plans finishing into one repository at
@@ -3443,8 +3438,8 @@ fn pr75_r3_m1_concurrent_finishes_into_one_repository_both_publish() {
         b.receive(index, &mut &pack[..]).unwrap();
     }
     let (ra, rb) = std::thread::scope(|scope| {
-        let ta = scope.spawn(|| finish_retrying(&target, a, &journals_a, first.plan.pack_id()));
-        let tb = scope.spawn(|| finish_retrying(&target, b, &journals_b, other.pack_id()));
+        let ta = scope.spawn(|| finish_retrying(a, &journals_a));
+        let tb = scope.spawn(|| finish_retrying(b, &journals_b));
         (ta.join().unwrap(), tb.join().unwrap())
     });
     assert_eq!(ra.carry_refs_before, ra.carry_refs_after);
@@ -3976,6 +3971,79 @@ fn pr75_r4_n3_a_held_fence_refuses_in_bounded_time() {
     Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
         .unwrap()
         .finish()
+        .unwrap();
+    assert!(published(&pair));
+}
+
+/// Hold the repository fence of `pair`'s destination from another
+/// descriptor, as a concurrent finish would.
+fn hold_fence(pair: &Pair) -> fs::File {
+    use std::os::unix::io::AsRawFd as _;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(pair.destination.join("bulkload-ingest.lock"))
+        .unwrap();
+    // SAFETY: `lock` is an open descriptor; flock takes no pointers.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    lock
+}
+
+/// #89: a fence held for longer than one bounded wait no longer refuses the
+/// caller: `finish_retrying` backs off, resumes and finishes once the holder
+/// lets go.
+#[test]
+fn issue89_a_fence_held_past_one_window_is_waited_out() {
+    let pair = pair("issue89-waited-out", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let session = received(&pair, &target, &journals);
+    let lock = hold_fence(&pair);
+    let hold = std::time::Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let receipt = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(hold);
+            drop(lock);
+        });
+        session
+            .finish_retrying(&journals, &FenceRetry::DEFAULT)
+            .unwrap()
+    });
+    assert!(started.elapsed() >= hold);
+    assert_eq!(receipt.carry_refs_before, receipt.carry_refs_after);
+    assert!(published(&pair));
+    assert_clean(&pair.destination, "issue89-waited-out");
+}
+
+/// #89: a fence held through every attempt surfaces one typed refusal that
+/// names it, publishes nothing, and leaves the session resumable.
+#[test]
+fn issue89_a_fence_held_through_every_attempt_refuses_typed() {
+    let pair = pair("issue89-exhausted", DEFAULT_SEGMENT_CAP);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let session = received(&pair, &target, &journals);
+    let lock = hold_fence(&pair);
+    let policy = FenceRetry::new(
+        2,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_millis(20),
+    )
+    .unwrap();
+    let refused = session.finish_retrying(&journals, &policy).unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+    assert_eq!(refused.reason, Some("repository_fenced_retries_exhausted"));
+    assert!(!retryable(&refused));
+    assert!(!published(&pair));
+    drop(lock);
+    Ingest::resume(&target, &journals, pair.plan.pack_id(), None)
+        .unwrap()
+        .finish_retrying(&journals, &policy)
         .unwrap();
     assert!(published(&pair));
 }
