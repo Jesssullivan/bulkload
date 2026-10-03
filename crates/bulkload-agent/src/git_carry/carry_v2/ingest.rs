@@ -51,6 +51,14 @@
 //! open discards whatever quarantine carries its own name (#75 r3 M2). A
 //! session past migration can still be abandoned (#75 r3 M1).
 //!
+//! Held locks (#89): the fence, the quarantine claim and the journal lock
+//! each wait about two seconds and then refuse `JOURNAL_OWNERSHIP_CONFLICT`
+//! with reason `repository_fenced`, `quarantine_held` or `journal_held`.
+//! The caller retries those, resuming the session each time, under a
+//! bounded jittered backoff; the contract is documented on
+//! [`super::FenceRetry`]'s module, and [`Ingest::finish_retrying`]
+//! implements it.
+//!
 //! Refusals: `held_tip_closure_incomplete` (preflight), `segment_invalid`
 //! (index-pack), `connectivity_missing`; all three are `GIT_HAVES_UNPROVABLE`
 //! and mean re-negotiate (spike Q3: a stale have fails at one of the last two).
@@ -643,10 +651,23 @@ impl<'a> Ingest<'a> {
         if !pack_id_ok(&pack_id) {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
+        // #89: a journal (or identity token) lock still held at the end of
+        // its bounded wait is another live session's: retryable, so it is
+        // named. Every other refusal keeps its own shape.
+        let held = |refusal: BulkloadRefusal| {
+            if refusal == BulkloadRefusal::JournalOwnershipConflict {
+                Refused::because(refusal, "journal_held")
+            } else {
+                refusal.into()
+            }
+        };
         // #82: keyed by the state dir's identity token, not its path.
-        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key()?);
+        let quarantine = format!(
+            "incoming-bulkload-{pack_id}-{}",
+            journals.key().map_err(held)?
+        );
         let git_dir = target.repository.git_dir.as_path();
-        let journal = match Journal::open(journals, &pack_id)? {
+        let journal = match Journal::open(journals, &pack_id).map_err(held)? {
             Found::Existing(journal, records) => {
                 return Self::existing(
                     target, journals, plan, journal, &records, quarantine, store,
@@ -1225,6 +1246,35 @@ impl<'a> Ingest<'a> {
 
     fn discard_quarantine(&self) -> Outcome<()> {
         discard_quarantine(&self.target.objects, &self.quarantine, self.claim.as_ref())
+    }
+
+    /// [`Ingest::finish`] under the caller retry contract (#89, see
+    /// [`super::FenceRetry`]): a finish, or a resume, refused by a lock
+    /// another live session holds (`repository_fenced`, `quarantine_held`,
+    /// `journal_held`) waits a jittered, exponentially growing delay and
+    /// resumes the session from `journals`, at most `retry.attempts()`
+    /// times in all.
+    ///
+    /// # Errors
+    /// As [`Ingest::finish`] and [`Ingest::resume`] for any refusal that is
+    /// not a held lock; once the attempts run out,
+    /// `JOURNAL_OWNERSHIP_CONFLICT` with a `*_retries_exhausted` reason. The
+    /// journal and quarantine stay, so a later resume carries on.
+    pub fn finish_retrying(
+        self,
+        journals: &JournalStore,
+        retry: &super::FenceRetry,
+    ) -> Outcome<IngestReceipt> {
+        let (target, store) = (self.target, self.store);
+        let pack_id = self.plan.pack_id.clone();
+        let mut session = Some(self);
+        retry.run(|| {
+            let current = match session.take() {
+                Some(current) => current,
+                None => Self::resume(target, journals, &pack_id, store)?,
+            };
+            current.finish()
+        })
     }
 
     /// Finish: connectivity, migration, the ref transaction and the keeps,

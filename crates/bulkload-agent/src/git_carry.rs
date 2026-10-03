@@ -2810,21 +2810,28 @@ fn nest_ignored_seats(
 // checkout, or a split index means status may not see every change.
 fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
     let debug = output(git(directory).args(["--git-dir=.git", "ls-files", "--debug"]))?;
-    let flagged: Vec<&[u8]> = debug
+    // #131: classified as the enclosing repository's entries are, so the
+    // fsmonitor validity bit is no flag here either.
+    let flagged: Vec<Result<EntryFlags>> = debug
         .split(|b| *b == b'\n')
         .filter_map(|line| {
             line.windows(8)
                 .position(|window| window == b"\tflags: ")
                 .and_then(|at| line.get(at + 8..))
         })
-        .filter(|flags| *flags != b"0")
+        .map(|flags| {
+            std::str::from_utf8(flags)
+                .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
+                .and_then(entry_flags)
+        })
+        .filter(|flags| *flags != Ok(EntryFlags::Plain))
         .collect();
     if !flagged.is_empty() {
         // #106: a nest's index is not carried, so its intent-to-add entries
         // cannot be; say so by cause rather than as a malformed inventory.
         if flagged
             .iter()
-            .all(|flags| *flags == INTENT_TO_ADD_FLAGS.as_bytes())
+            .all(|flags| *flags == Ok(EntryFlags::IntentToAdd))
         {
             return Err(BulkloadRefusal::GitInventoryIntentToAdd);
         }
@@ -3668,7 +3675,39 @@ const INTENT_TO_ADD_METADATA: &str = "intent-to-add-v1";
 
 /// `ls-files --debug` flags of an intent-to-add entry and nothing else:
 /// `CE_INTENT_TO_ADD | CE_EXTENDED`.
-const INTENT_TO_ADD_FLAGS: &str = "20004000";
+const INTENT_TO_ADD_FLAGS: u32 = 0x2000_4000;
+
+/// `CE_FSMONITOR_VALID` (#131): Git's in-memory mark that fsmonitor last
+/// reported the entry unchanged. It is cache validity, not index state: it
+/// changes nothing a capture carries, and a restore builds a fresh index
+/// with no fsmonitor extension, so it is masked before an entry is
+/// classified. The hardened `git()` pins `core.fsmonitor=false`, under
+/// which Git does not set it, so this only guards a Git that still does.
+const CE_FSMONITOR_VALID: u32 = 0x0020_0000;
+
+/// What an index entry's `ls-files --debug` flags make it (#106, #131).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryFlags {
+    /// No state flag: an ordinary entry.
+    Plain,
+    /// `git add -N`, and nothing else.
+    IntentToAdd,
+}
+
+// Classify one entry's flags, hex as `ls-files --debug` prints them, less
+// the fsmonitor validity bit. Anything else (assume-unchanged,
+// skip-worktree, a stage or a flag this code does not know) refuses
+// GIT_INVENTORY_MALFORMED: status may not see every change under it.
+fn entry_flags(flags: &str) -> Result<EntryFlags> {
+    let flags = u32::from_str_radix(flags, 16)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        & !CE_FSMONITOR_VALID;
+    match flags {
+        0 => Ok(EntryFlags::Plain),
+        INTENT_TO_ADD_FLAGS => Ok(EntryFlags::IntentToAdd),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+}
 
 /// One intent-to-add (`git add -N`) index entry, carried as custody (#106).
 ///
@@ -3697,18 +3736,13 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     let listed = |args: &[&str]| output(git(repo).env("GIT_INDEX_FILE", index).args(args));
     let debug = String::from_utf8(listed(&["ls-files", "--debug"])?)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let flags: Vec<&str> = debug
+    let flags = debug
         .lines()
         .filter_map(|line| line.split_once("\tflags: ").map(|(_, flags)| flags))
-        .collect();
-    if flags.iter().all(|flags| *flags == "0") {
+        .map(entry_flags)
+        .collect::<Result<Vec<EntryFlags>>>()?;
+    if flags.iter().all(|flags| *flags == EntryFlags::Plain) {
         return Ok(Vec::new());
-    }
-    if flags
-        .iter()
-        .any(|flags| *flags != "0" && *flags != INTENT_TO_ADD_FLAGS)
-    {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let stage = listed(&["ls-files", "--stage", "-z"])?;
     let entries: Vec<&[u8]> = stage
@@ -3720,7 +3754,7 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     }
     let mut carried = Vec::new();
     for (entry, flags) in entries.into_iter().zip(flags) {
-        if flags != INTENT_TO_ADD_FLAGS {
+        if flags != EntryFlags::IntentToAdd {
             continue;
         }
         let tab = entry
@@ -3759,10 +3793,29 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     Ok(carried)
 }
 
+// The index mode `git add` gives a new entry for a seat with this row:
+// a symlink is 120000, a regular file 100755 when its owner may execute it
+// and 100644 otherwise. `None` for any other kind.
+const fn index_mode_of(row: &crate::RowSchema) -> Option<u32> {
+    match row.kind {
+        bulkload_proto::FileKind::Symlink => Some(0o120_000),
+        bulkload_proto::FileKind::Regular if row.mode & 0o100 != 0 => Some(0o100_755),
+        bulkload_proto::FileKind::Regular => Some(0o100_644),
+        _ => None,
+    }
+}
+
 // The capture's intent-to-add custody, recorded only when there is any, so
 // every other capture's bundle is unchanged. Each entry's seat must be a
 // carried file or symlink: Git can mark only an existing path intent-to-add,
 // so an entry whose seat is gone (`git add -N`, then `rm`) refuses by cause.
+//
+// #131: the seat's mode must also be the one the entry records. Restore
+// re-marks the path with `git add -N`, which takes the mode from the
+// restored seat, so an entry whose seat changed mode after it was marked
+// (`git add -N f; chmod +x f`: the index keeps 100644, the seat is 0755)
+// cannot be restored as captured. It refuses here, at capture, before any
+// destination is written, rather than after a restore laid one down.
 fn record_intent_to_add(
     private: &Path,
     repo: &Path,
@@ -3774,14 +3827,10 @@ fn record_intent_to_add(
         return Ok(());
     }
     for entry in &entries {
-        let carried = seats.iter().any(|row| {
-            row.rel_path == entry.rel_path
-                && matches!(
-                    row.kind,
-                    bulkload_proto::FileKind::Regular | bulkload_proto::FileKind::Symlink
-                )
-        });
-        if !carried {
+        let restorable = seats
+            .iter()
+            .any(|row| row.rel_path == entry.rel_path && index_mode_of(row) == Some(entry.mode));
+        if !restorable {
             return Err(BulkloadRefusal::GitInventoryIntentToAdd);
         }
     }
@@ -3810,6 +3859,46 @@ fn carried_intent_to_add(repo: &Path, heads: &str) -> Result<Vec<IntentToAdd>> {
         git(repo).args(["show", &format!("{value}:value")]),
     )?)
     .map_err(|_| BulkloadRefusal::FrameCodec)
+}
+
+// #131: every carried intent-to-add entry must name a file or symlink the
+// worktree tree (`ls-tree -r -z` output) restores at the entry's own mode,
+// since restore re-marks it with `git add -N`, which reads the mode from the
+// restored seat. Checked before a worktree byte is laid down, so a capture
+// taken before the capture-side check refuses here, by cause, not after
+// its destination is written.
+fn intent_to_add_restorable(custody: &[IntentToAdd], worktree: &[u8]) -> Result<()> {
+    if custody.is_empty() {
+        return Ok(());
+    }
+    let mut modes = std::collections::BTreeMap::new();
+    for entry in worktree
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let mode = entry
+            .get(..tab)
+            .and_then(|header| header.split(|b| *b == b' ').next())
+            .and_then(|mode| std::str::from_utf8(mode).ok())
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let path = entry
+            .get(tab + 1..)
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        modes.insert(path, mode);
+    }
+    if custody
+        .iter()
+        .all(|entry| modes.get(entry.rel_path.as_slice()) == Some(&entry.mode))
+    {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::GitInventoryIntentToAdd)
+    }
 }
 
 // Re-mark the captured intent-to-add paths in the index `index` (the
@@ -4834,6 +4923,8 @@ pub fn restore_staged(
     fs::write(destination.join(".git/info/exclude"), exclude)?;
     let worktree = find("worktree")?;
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
+    // #131: before any worktree byte.
+    intent_to_add_restorable(&carried_intent_to_add(&destination, &heads)?, &entries)?;
     restore_entries(&destination, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&destination, &staged, &heads)?;
@@ -4936,6 +5027,10 @@ pub fn restore_linked_staged(
     if exclude != existing_exclude {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
     }
+    // #131: before the worktree is added, so a capture whose intent-to-add
+    // custody cannot be restored refuses with nothing laid down.
+    let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
+    intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
     let attached = text(git(&repository).args(["worktree", "list", "--porcelain"]))?;
     let source_tip = text(git(&repository).args(["rev-parse", "--verify", &symbolic]));
     let reuse = symbolic.starts_with("refs/heads/")
@@ -4967,7 +5062,6 @@ pub fn restore_linked_staged(
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     restore_entries(&destination, &entries)?;
     restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
@@ -12045,6 +12139,145 @@ mod intent_to_add_106 {
             nested_repositories(&outer),
             Err(BulkloadRefusal::GitInventoryIntentToAdd)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #131 (1): `git add -N f; chmod +x f` keeps 100644 in the index while
+    // the seat is 0755, so a restore's `git add -N` would read 100755. The
+    // capture refuses by cause, before anything is restored; restoring the
+    // executable bit lets the same checkout capture and restore.
+    #[test]
+    fn an_intent_to_add_entry_whose_seat_changed_mode_refuses_at_capture() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fresh("mode-change");
+        let source = checkout_with_intent_to_add(&root);
+        fs::set_permissions(source.join("new"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            export_repository(&source, &root.join("capture")),
+            Err(BulkloadRefusal::GitInventoryIntentToAdd)
+        );
+        assert!(!root.join("restored").exists());
+        fs::set_permissions(source.join("new"), fs::Permissions::from_mode(0o644)).unwrap();
+        let before = status(&source);
+        let bundle = export_repository(&source, &root.join("capture-clean")).unwrap();
+        restore_bundle(&bundle, &root.join("restored"), "neo").unwrap();
+        assert_eq!(status(&root.join("restored")), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #131 (1): the restore-side check, for custody recorded before the
+    // capture-side one: an entry the worktree tree restores at another mode,
+    // or not at all, refuses before any worktree byte is laid down.
+    #[test]
+    fn intent_to_add_custody_is_checked_against_the_worktree_tree() {
+        let entry = |path: &[u8], mode| IntentToAdd {
+            rel_path: path.to_vec(),
+            mode,
+            empty_blob: true,
+        };
+        let blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        let tree = format!(
+            "100755 blob {blob}\tbin/run\0100644 blob {blob}\tnew\0120000 blob {blob}\tlink\0"
+        );
+        let tree = tree.as_bytes();
+        assert_eq!(intent_to_add_restorable(&[], b"garbage"), Ok(()));
+        assert_eq!(
+            intent_to_add_restorable(
+                &[
+                    entry(b"bin/run", 0o100_755),
+                    entry(b"new", 0o100_644),
+                    entry(b"link", 0o120_000)
+                ],
+                tree
+            ),
+            Ok(())
+        );
+        for custody in [
+            entry(b"new", 0o100_755),
+            entry(b"bin/run", 0o100_644),
+            entry(b"absent", 0o100_644),
+        ] {
+            assert_eq!(
+                intent_to_add_restorable(std::slice::from_ref(&custody), tree),
+                Err(BulkloadRefusal::GitInventoryIntentToAdd),
+                "{custody:?}"
+            );
+        }
+    }
+
+    // #131 (2): fsmonitor's validity bit is masked before an entry is
+    // classified; every other flag still refuses as a malformed inventory.
+    #[test]
+    fn the_fsmonitor_valid_bit_is_masked_from_entry_flags() {
+        assert_eq!(entry_flags("0"), Ok(EntryFlags::Plain));
+        assert_eq!(entry_flags("200000"), Ok(EntryFlags::Plain));
+        assert_eq!(entry_flags("20004000"), Ok(EntryFlags::IntentToAdd));
+        assert_eq!(entry_flags("20204000"), Ok(EntryFlags::IntentToAdd));
+        for flags in [
+            "8000", "208000", "40004000", "40204000", "1000", "4000", "", "zz",
+        ] {
+            assert_eq!(
+                entry_flags(flags),
+                Err(BulkloadRefusal::GitInventoryMalformed),
+                "{flags}"
+            );
+        }
+    }
+
+    // #131 (2): a checkout whose own config enables a hook fsmonitor, and
+    // whose index carries the fsmonitor extension and validity bits, captures
+    // and restores its intent-to-add entries. The hook never runs under the
+    // capture or the restore, and the restored index carries no fsmonitor
+    // state.
+    #[test]
+    fn a_checkout_with_fsmonitor_state_carries_intent_to_add() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fresh("fsmonitor");
+        let source = checkout_with_intent_to_add(&root);
+        let marker = root.join("fsmonitor-ran");
+        let hook = root.join("fsmonitor-hook");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n: > '{}'\nprintf 'token-1\\0'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        g(
+            &source,
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+        // Git as a person runs it, honouring the repository's fsmonitor, so
+        // the index gains the extension and the validity bits.
+        let plain = |args: &[&str]| {
+            let done = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{args:?}");
+            done.stdout
+        };
+        plain(&["status", "--porcelain=v2"]);
+        plain(&["status", "--porcelain=v2"]);
+        let debug = String::from_utf8(plain(&["ls-files", "--debug"])).unwrap();
+        assert!(debug.contains("flags: 200000"), "{debug}");
+        let index = fs::read(source.join(".git/index")).unwrap();
+        assert!(index.windows(4).any(|window| window == b"FSMN"));
+        fs::remove_file(&marker).unwrap();
+        let before = status(&source);
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&bundle, &restored, "neo").unwrap();
+        assert_eq!(status(&restored), before);
+        assert!(!marker.exists(), "the source's fsmonitor hook ran");
+        let index = fs::read(restored.join(".git/index")).unwrap();
+        assert!(!index.windows(4).any(|window| window == b"FSMN"));
         fs::remove_dir_all(root).unwrap();
     }
 

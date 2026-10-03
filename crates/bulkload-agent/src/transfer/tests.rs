@@ -1366,3 +1366,32 @@ fn a_failed_group_commit_answers_held_false_and_records_nothing() {
         );
     }
 }
+
+/// #129: a subtree past the walk's depth cap reaches the transfer's
+/// refusals by path and code, is counted as capped, and is never counted as
+/// carried; an empty directory at the cap refuses nothing.
+#[test]
+fn a_capped_subtree_is_reported_never_carried() {
+    use crate::walk::MAX_WALK_DEPTH;
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    let capped = vec!["d"; MAX_WALK_DEPTH].join("/");
+    std::fs::create_dir_all(source.join(&capped)).unwrap();
+    std::fs::write(source.join(&capped).join("hidden"), b"beyond the cap").unwrap();
+    let empty = format!("e/{}", vec!["d"; MAX_WALK_DEPTH - 1].join("/"));
+    std::fs::create_dir_all(source.join(&empty)).unwrap();
+    std::fs::write(source.join("kept"), b"carried").unwrap();
+    let stats = corpus.run().unwrap();
+    assert_eq!(
+        stats.refusals,
+        vec![(
+            capped.clone().into_bytes(),
+            "PATH_DEPTH_EXCEEDED".to_owned()
+        )]
+    );
+    assert_eq!(stats.capped_subtrees(), 1);
+    assert_eq!(stats.completed, 1, "only `kept` is a completed file");
+    let destination = corpus.base.join("destination");
+    assert!(!destination.join(&capped).join("hidden").exists());
+    assert_eq!(std::fs::read(destination.join("kept")).unwrap(), b"carried");
+}

@@ -1652,6 +1652,13 @@ pub struct RepairLedger<'a> {
 // repaired (by digest) and whose repository or workspace is `repository`.
 // An unreadable capture record names no item here; it refuses on its own in
 // apply and in the closure report.
+//
+// #132: an item that plans a workspace never binds. A repair lays down no
+// working bytes, so its `refs-imported` journal would close nothing (the
+// closure report leaves it unaccounted) and would make a later estate-apply
+// replay `previous-ref-custody-not-workspace-parity` instead of restoring the
+// workspace. Such an item refuses here, before the repair writes anything,
+// and stays pending for estate-apply.
 fn repair_item(
     plan: &Plan,
     corpus: &Path,
@@ -1670,7 +1677,7 @@ fn repair_item(
         {
             continue;
         }
-        if found.is_some() {
+        if found.is_some() || item.workspace.is_some() {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
         found = Some((item.clone(), identity, captured.digest));
@@ -1682,7 +1689,9 @@ fn repair_item(
 ///
 /// Binds the bundle to the one planned item whose current capture record in
 /// CORPUS has the bundle's digest and whose repository (or workspace) is
-/// `repository`, under the state directory's estate lock, then repairs. Once
+/// `repository`, under the state directory's estate lock, then repairs. An
+/// item that plans a workspace never binds (#132): its restore belongs to
+/// estate-apply, and a repair journal would block it. Once
 /// the index is published and durable it writes the item's exact
 /// current-capture journal (`refs-imported`, unless one is already there) and
 /// then its `{item}.outcome` = `index-repaired`, so `closure-report` reads
@@ -1692,8 +1701,9 @@ fn repair_item(
 /// apply keeps its records (a second repair of a repaired index refuses).
 ///
 /// # Errors
-/// `RECEIPT_BINDING_INVALID` when the bundle names no planned item (or more
-/// than one), then everything [`git_carry::repair_missing_index`] refuses.
+/// `RECEIPT_BINDING_INVALID` when the bundle names no planned item, more
+/// than one, or an item that plans a workspace, before anything is written;
+/// then everything [`git_carry::repair_missing_index`] refuses.
 pub fn repair_missing_index(
     bundle: &Path,
     repository: &Path,
@@ -1771,6 +1781,10 @@ pub struct LedgerEntry {
     /// The apply journal for the item's current capture, at its exact path
     /// `{item}-{blake3(SOURCE)}-{capture digest}.done`.
     pub journal: JournalState,
+    /// The current capture's bundle digest (lowercase hex), when the corpus
+    /// holds a readable `{item}.capture` record. An attestation row binds to
+    /// it (#133).
+    pub capture: Option<String>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -1838,9 +1852,16 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             continue;
         }
         let record_path = corpus.join(format!("{identity}.capture"));
+        let mut capture = None;
         let journal = if !record_path.try_exists()? {
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
+            capture = Some(
+                blake3::Hash::from_bytes(captured.digest)
+                    .to_hex()
+                    .as_str()
+                    .to_owned(),
+            );
             let expected = journal_path(Path::new(""), &identity, source, &captured.digest);
             let name = expected.to_string_lossy().into_owned();
             let found = states
@@ -1862,6 +1883,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             record: record.cloned().flatten(),
             record_unreadable: matches!(record, Some(None)),
             journal,
+            capture,
             item: identity,
         });
     }
@@ -4446,6 +4468,71 @@ mod closure_lane_20261002 {
             matches!(classify(&refused), Disposition::Refused(_)),
             "{refused:?}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #132: a repair run on the main repository of an item that plans a
+    // linked workspace binds through `item.repository`. It must refuse
+    // before writing anything, so a later estate-apply still restores the
+    // workspace instead of replaying a refs-only journal.
+    #[test]
+    fn a_repair_never_binds_a_workspace_item_and_apply_still_restores_it() {
+        let root = fresh("repair-132");
+        let source = repository(&root, "source", b"base");
+        fs::write(source.join("file"), b"staged edit").unwrap();
+        git(&source, &["add", "file"]);
+        let repository = root.join("repository");
+        let workspace = root.join("linked");
+        let plan = root.join("plan");
+        add(&plan, &source, &repository, Some(&workspace)).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let contents: Plan = read(&plan).unwrap();
+        let identity = id(contents.items.first().unwrap()).unwrap();
+        let captured: Capture = read(&corpus.join(format!("{identity}.capture"))).unwrap();
+        let bundle = corpus.join(&captured.bundle);
+        // The main repository holds the captured HEAD with its index gone:
+        // exactly what a repair accepts.
+        git_carry::restore_bundle(&bundle, &repository, "neo").unwrap();
+        fs::remove_file(repository.join(".git/index")).unwrap();
+        let applied = root.join("applied");
+        let led = RepairLedger {
+            plan: &plan,
+            corpus: &corpus,
+            state: &applied,
+        };
+        let receipt = root.join("r1");
+        assert_eq!(
+            repair_missing_index(&bundle, &repository, "neo", &receipt, &led),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        // Nothing was written: no receipt, no outcome, no journal, and the
+        // index is still missing.
+        assert!(!receipt.exists());
+        assert!(!repository.join(".git/index").exists());
+        let written: Vec<_> = fs::read_dir(&applied)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "estate.lock")
+            .collect();
+        assert!(written.is_empty(), "{written:?}");
+        // The workspace is still pending, and estate-apply restores it.
+        let rows = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            rows.lock().unwrap().push(row.outcome);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.into_inner().unwrap(), vec!["workspace-restored"]);
+        assert_eq!(fs::read(workspace.join("file")).unwrap(), b"staged edit");
+        let entry = ledger(&plan, &corpus, "neo", std::slice::from_ref(&applied))
+            .unwrap()
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(classify(&entry), Disposition::Applied);
         fs::remove_dir_all(root).unwrap();
     }
 }
