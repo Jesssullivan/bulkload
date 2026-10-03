@@ -194,6 +194,9 @@ pub struct Refused {
     pub reason: Option<&'static str>,
     /// The child's stderr, classified (and, with a store, digested and kept).
     pub stderr: Option<StderrReceipt>,
+    /// #94: a cleanup the refusing step attempted after it refused, and why
+    /// that failed. Secondary: `refusal` is still what the caller acts on.
+    pub cleanup: Option<BulkloadRefusal>,
 }
 
 /// A child's stderr as a receipt may show it. It holds no stderr bytes.
@@ -325,6 +328,7 @@ impl Refused {
             refusal,
             reason: None,
             stderr: None,
+            cleanup: None,
         }
     }
 
@@ -333,12 +337,13 @@ impl Refused {
             refusal,
             reason: Some(reason),
             stderr: None,
+            cleanup: None,
         }
     }
 
     /// Receipt lines: `refused=`, then `refused_reason=`, `stderr_class=`,
-    /// `stderr_keyed_blake3=`, `stderr_file=` and `stderr_file_refused=` when
-    /// present. None carries a byte of stderr.
+    /// `stderr_keyed_blake3=`, `stderr_file=`, `stderr_file_refused=` and
+    /// `cleanup_refused=` (#94) when present. None carries a byte of stderr.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!("refused={}", self.refusal.code())];
@@ -356,6 +361,9 @@ impl Refused {
             if let Some(refusal) = &stderr.file_refused {
                 lines.push(format!("stderr_file_refused={}", refusal.code()));
             }
+        }
+        if let Some(cleanup) = &self.cleanup {
+            lines.push(format!("cleanup_refused={}", cleanup.code()));
         }
         lines
     }
@@ -381,6 +389,9 @@ impl fmt::Display for Refused {
         }
         if let Some(stderr) = &self.stderr {
             write!(f, " [stderr {}]", stderr.class.code())?;
+        }
+        if let Some(cleanup) = &self.cleanup {
+            write!(f, " [cleanup refused {}]", cleanup.code())?;
         }
         Ok(())
     }
@@ -995,6 +1006,7 @@ pub(super) fn child_refusal(
         refusal,
         reason,
         stderr: (total > 0).then_some(receipt),
+        cleanup: None,
     }
 }
 
