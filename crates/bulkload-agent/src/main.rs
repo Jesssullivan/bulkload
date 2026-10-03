@@ -55,7 +55,7 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
-    closure-report PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...] [--attest LEDGER.json]
+    closure-report [--attest LEDGER.json] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's apply outcome records and journals (later
                 directories override earlier outcome records), with SOURCE
@@ -64,14 +64,17 @@ SUBCOMMANDS:
                 current-capture journal), refused (typed code; a bare IO or
                 FRAME_CODEC is not typed), or referenced-only (no workspace
                 planned, exact refs journal), else unaccounted. Stale and
-                foreign journals are listed. Exits nonzero with
-                CLOSURE_UNACCOUNTED when unaccounted > 0.
-                --attest LEDGER.json: join a bulkload.closure-ledger.v1
-                attestation ledger for items closed by audit, not by a verb.
-                Its rows are reported in a separate attested block and never
-                override a native record; the gate then passes only if every
-                item is native-accounted or attested (typed refusal, basis
-                other than native-closure-report, evidence, matching source)
+                foreign journals are listed. `verdict` is always the native
+                one. Exits nonzero with CLOSURE_UNACCOUNTED when `gate` fails.
+                --attest LEDGER.json (only first, before PLAN): join a
+                bulkload.closure-ledger.v1 attestation ledger for items closed
+                by audit, not by a verb. The ledger must name this PLAN and
+                SOURCE (plan, source_label). Its rows are reported in a
+                separate attested block and never override a native record
+                or change `verdict`; `gate` then passes only if every item is
+                native-accounted or attested (matching source and current
+                capture digest, typed refusal, basis other than
+                native-closure-report, evidence)
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -83,7 +86,9 @@ SUBCOMMANDS:
                 With PLAN CORPUS PRIVATE_STATE, bind BUNDLE to the planned item
                 whose CORPUS capture it is and record apply-style receipts in
                 PRIVATE_STATE: journal refs-imported, outcome index-repaired
-                (or refused with its code), so closure-report reads it natively
+                (or refused with its code), so closure-report reads it natively.
+                An item that plans a workspace never binds (estate-apply
+                restores it)
     git-attach-matching-payload BUNDLE REPOSITORY DESTINATION SOURCE NEW_RECEIPT
                 Attach exact matching payload using existing common Git administration
     git-attach-standalone-payload BUNDLE DESTINATION SOURCE NEW_RECEIPT ORIGIN_FROM ORIGIN_TO
@@ -274,25 +279,15 @@ fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
 // whether or not it passes; the verdict is the exit status.
 fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
-    // #95: `--attest LEDGER.json` may appear once, anywhere after the verb.
-    let mut attest = None;
-    let mut positional = Vec::with_capacity(args.len());
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        if arg == "--attest" {
-            if attest.is_some() {
-                return Err(BulkloadRefusal::FieldDomainViolation);
-            }
-            attest = Some(
-                rest.next()
-                    .map(PathBuf::from)
-                    .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
-            );
-        } else {
-            positional.push(arg);
-        }
-    }
-    let [plan, corpus, source, states @ ..] = positional.as_slice() else {
+    // #95, #133: `--attest LEDGER.json` is an option only as the first
+    // argument after the verb. Everywhere else every argument is positional,
+    // so a PRIVATE_STATE literally named `--attest` is still a state.
+    let (attest, positional) = match args {
+        [flag, ledger, rest @ ..] if flag == "--attest" => (Some(PathBuf::from(ledger)), rest),
+        [flag] if flag == "--attest" => return Err(BulkloadRefusal::RequiredFieldMissing),
+        rest => (None, rest),
+    };
+    let [plan, corpus, source, states @ ..] = positional else {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     };
     if states.is_empty() {
