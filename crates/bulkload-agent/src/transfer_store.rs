@@ -53,6 +53,39 @@ fn inject_fault(point: PublishFault) -> Result<()> {
     Ok(())
 }
 
+/// Destination store roots whose output group commits fail, as a full disk
+/// would fail them (#100). Keyed by store root, so tests running in parallel
+/// never see each other's faults; the committer runs on its own thread, so a
+/// thread-local hook cannot reach it.
+#[cfg(test)]
+static FAIL_OUTPUT_COMMITS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: while `on`, every output group commit of the store at `root`
+/// (canonical) fails with `ENOSPC` before `COMMIT`, and rolls back.
+#[cfg(test)]
+pub(crate) fn fail_output_commits(root: &Path, on: bool) {
+    let mut roots = FAIL_OUTPUT_COMMITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    roots.retain(|failing| failing != root);
+    if on {
+        roots.push(root.to_path_buf());
+    }
+}
+
+#[cfg(test)]
+fn output_commit_fault(root: &Path) -> Result<()> {
+    let failing = FAIL_OUTPUT_COMMITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|failing| failing == root);
+    if failing {
+        return Err(BulkloadRefusal::Io(Some(libc::ENOSPC)));
+    }
+    Ok(())
+}
+
 // A publication crash point is named per store: the source ledger committer
 // and the destination output committer hit `publish.source.*` and
 // `publish.destination.*` respectively, and the crash receipt records the
@@ -198,6 +231,11 @@ pub(crate) struct OutputRecord {
     pub key: Vec<u8>,
     pub rel_path: Vec<u8>,
     pub identity: StatIdentity,
+    /// The source seat was racy when captured (#86): its stat identity
+    /// cannot vouch for these bytes, so no output row is kept under `key`
+    /// and the next run asks for a manifest instead of reusing it. Its
+    /// chunk hints are still recorded; they are re-verified on use.
+    pub racy: bool,
     /// First occurrence of each distinct chunk in this output.
     pub hints: Vec<ChunkHint>,
 }
@@ -374,8 +412,8 @@ impl Store {
     }
 
     /// The ledger's manifest for a row key, without opening source content.
-    /// A row whose root does not match its chunks (a pre-v5 whole-file hash)
-    /// is not a capture.
+    /// A row whose root does not match its chunks (a pre-v5 whole-file hash),
+    /// or that does not decode exactly, is not a capture.
     ///
     /// # Errors
     /// Refuses database errors.
@@ -389,8 +427,10 @@ impl Store {
             )
             .optional()
             .map_err(sqlite_error)?;
+        // A row with bytes after its manifest is corrupt, not a capture
+        // (#87): it is a miss, and the seat is read again.
         Ok(bytes
-            .and_then(|value| postcard::from_bytes::<Manifest>(&value).ok())
+            .and_then(|value| bulkload_proto::frame::decode_exact::<Manifest>(&value).ok())
             .filter(Manifest::is_consistent))
     }
 
@@ -409,6 +449,20 @@ impl Store {
                 records: records(),
             })
         });
+    }
+
+    /// How many ledger captures and output rows the store holds.
+    #[cfg(test)]
+    pub(crate) fn row_counts(&self) -> Result<(u64, u64)> {
+        let count = |table: &str| -> Result<u64> {
+            self.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(sqlite_error)
+                .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
+        };
+        Ok((count("captures")?, count("outputs")?))
     }
 
     /// Commit one identity-checked capture on its own.
@@ -670,14 +724,23 @@ impl StorePublisher {
             .map_err(sqlite_error)?;
         let staged = (|| -> Result<()> {
             for output in outputs {
-                self.store
-                    .conn
-                    .execute(
-                        "INSERT INTO outputs VALUES (?1, ?2)
-                         ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                        (&output.key, identity_bytes(&output.identity)?),
-                    )
-                    .map_err(sqlite_error)?;
+                if output.racy {
+                    // Never a reuse key (#86): drop any row an earlier
+                    // capture left under it, too.
+                    self.store
+                        .conn
+                        .execute("DELETE FROM outputs WHERE key = ?1", [&output.key])
+                        .map_err(sqlite_error)?;
+                } else {
+                    self.store
+                        .conn
+                        .execute(
+                            "INSERT INTO outputs VALUES (?1, ?2)
+                             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                            (&output.key, identity_bytes(&output.identity)?),
+                        )
+                        .map_err(sqlite_error)?;
+                }
                 for hint in &output.hints {
                     // REPLACE gives the row a new rowid, so the newest
                     // writer of a digest is tried first.
@@ -710,6 +773,14 @@ impl StorePublisher {
             PublishDestinationBeforeCommit
         );
         let started = Instant::now();
+        #[cfg(test)]
+        let committed = output_commit_fault(self.store.root()).and_then(|()| {
+            self.store
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(sqlite_error)
+        });
+        #[cfg(not(test))]
         let committed = self
             .store
             .conn
@@ -921,7 +992,16 @@ fn private_dir(path: &Path) -> Result<()> {
     }
 }
 
-fn sqlite_error(_: rusqlite::Error) -> BulkloadRefusal {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback shape every store call uses"
+)]
+fn sqlite_error(error: rusqlite::Error) -> BulkloadRefusal {
+    // A full disk is reported as the `ENOSPC` it is, so a failed group
+    // commit names its cause (#100); anything else is the store's fault.
+    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+        return BulkloadRefusal::Io(Some(libc::ENOSPC));
+    }
     BulkloadRefusal::SqliteIntegrityCheckFailed
 }
 
@@ -1176,6 +1256,7 @@ mod tests {
             key: b"key".to_vec(),
             rel_path: b"nested/output".to_vec(),
             identity,
+            racy: false,
             hints: vec![hint],
         }])?;
         drop(publisher);
@@ -1193,6 +1274,60 @@ mod tests {
         Ok(())
     }
 
+    /// #86: a racy output keeps no row under its key, and drops one an
+    /// earlier capture left there, so it is never a `Reuse`; its chunk hints
+    /// are still recorded.
+    #[test]
+    fn a_racy_output_is_never_a_reuse_key() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        let file = root.0.join("output");
+        fs::write(&file, b"output")?;
+        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        let record = |racy: bool| OutputRecord {
+            key: b"key".to_vec(),
+            rel_path: b"output".to_vec(),
+            identity,
+            racy,
+            hints: vec![ChunkHint {
+                digest: [5; 32],
+                offset: 0,
+                size: 6,
+            }],
+        };
+        publisher.commit_outputs(&[record(false)])?;
+        assert!(publisher.store().output_matches(b"key", &identity)?);
+        publisher.commit_outputs(&[record(true)])?;
+        assert!(!publisher.store().output_matches(b"key", &identity)?);
+        assert_eq!(publisher.store().row_counts()?, (0, 0));
+        assert_eq!(publisher.store().output_chunks(&[5; 32])?.len(), 1);
+        Ok(())
+    }
+
+    /// #87: a ledger row with bytes after its manifest is a miss, never a
+    /// capture; the exact row is served.
+    #[test]
+    fn a_ledger_row_with_trailing_bytes_is_a_miss() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let store = Store::open(&state)?;
+        let exact = manifest(b"exact");
+        store.record_capture(b"exact", &exact)?;
+        let mut padded = postcard::to_stdvec(&exact)?;
+        padded.push(0);
+        store
+            .conn
+            .execute(
+                "INSERT INTO captures VALUES (?1, ?2)",
+                (b"padded".as_slice(), padded),
+            )
+            .map_err(sqlite_error)?;
+        assert_eq!(store.capture(b"exact")?, Some(exact));
+        assert_eq!(store.capture(b"padded")?, None);
+        Ok(())
+    }
+
     /// Hint ordering (#59 review): several outputs holding one digest are all
     /// kept, newest first, and re-recording an output moves it to the front.
     #[test]
@@ -1207,6 +1342,7 @@ mod tests {
             key: path.to_vec(),
             rel_path: path.to_vec(),
             identity,
+            racy: false,
             hints: vec![ChunkHint {
                 digest: [9; 32],
                 offset,

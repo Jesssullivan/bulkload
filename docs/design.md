@@ -99,7 +99,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   (records from before the start was recorded), takes the per-seat path
   instead (R-N76).
 - An incremental pass reuses a retained blob only for a seat whose stat
-  identity is unchanged and which was not racy. A seat stamped within one
+  identity is unchanged and which was not racy. The transfer applies the
+  same rule to its ledger and output rows (see Wire v5, racy captures). A seat stamped within one
   timestamp tick (a 2 s allowance) of the retained pass start can be
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
@@ -168,7 +169,10 @@ a peer whose `Open` names another protocol or another BLAKE3 of the schema
 (`wire_id`) is refused before anything else. Every frame is a 4-byte
 big-endian length, a tag byte and a body: tag 1 is a postcard control
 message, tag 2 a content chunk (a fixed 64-byte little-endian header, then the
-payload, sent with `writev`), tag 3 a Git pack piece (reserved).
+payload, sent with `writev`), tag 3 a Git pack piece (reserved). A control
+body is exactly one postcard message: bytes after it are refused
+`FRAME_CODEC`, as are bytes after a record in either store, which read as a
+miss (#87).
 
 - **Entries.** The source offers each walked seat as a numbered `Entry`, up to
   1024 undecided, and the destination answers each with `Decide`: `Skip` (a
@@ -187,7 +191,8 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   directory descriptors (#110). Content is read with `pread`, never mapped.
 - **Send.** The source reads the file once, chunks it, hashes each chunk and
   streams it as a data frame (entry, chunk index, offset, size, digest), then
-  sends `End` with the manifest root, chunk count and size. The destination
+  sends `End` with the manifest root, chunk count, size and whether the
+  capture was racy. The destination
   verifies every chunk against its digest, writes it at its offset, and checks
   coverage and the root before the output is queued for its group commit.
 - **WantManifest.** Chosen only when the destination could fill chunks
@@ -209,6 +214,14 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   row (R-N86). `manifest_root` (BLAKE3 in derive-key mode over each chunk's
   digest and size) replaces the whole-file hash. `SourceDone` follows the
   ledger's last commit.
+- **Racy captures.** A capture whose seat's mtime or ctime falls within the
+  2 s allowance of the clock read before the file was opened, or later than
+  the clock read after its final stat check, is racy, exactly as in the Git
+  carry (R-N76): a same-size rewrite in that tick can keep its stat
+  identity. It is sent and published, but never recorded: the source keeps
+  no ledger row, and `End{racy}` tells the destination to keep no output row
+  under its key (its chunk hints are kept; they are re-verified on use). The
+  next run reads the seat again (#86).
 - **Held.** The destination answers every `End` with `Held`. A capture is
   committed to the ledger only when the destination holds its bytes
   durably: `Held{true}` is sent once the output's group commit has
@@ -216,10 +229,14 @@ payload, sent with `writev`), tag 3 a Git pack piece (reserved).
   written output or an existing one verified against the manifest. No
   flush is added for it. So a committed capture is never read from the
   source again (R25, OI-1001-Q15): a resume reuses or adopts the final
-  name, or salvages a temporary. The sweep keeps every one of this
-  store's orphaned file temporaries as a chunk source, under a name of the
-  new session, and removes them when the session finishes, unless the
-  destination refused an entry, in which case they are kept for the next.
+  name. A group whose seal or store commit fails (a full disk refuses
+  `DESTINATION_SPACE_INSUFFICIENT`) answers each of its entries
+  `Held{false}`: neither store records them, the session finishes with the
+  refusals, and the next run reads them once (#100). The sweep keeps every
+  one of this store's orphaned file temporaries as a chunk source, under a
+  name of the new session, and removes them when the session finishes,
+  whatever it refused (#97). They only save wire bytes: no recorded capture's
+  bytes live only in a temporary.
 - **Hints.** The destination records, per digest, every published output
   holding it, newest first; a hint is re-read and re-verified on use, and a
   miss falls through to the next.

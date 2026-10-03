@@ -128,6 +128,7 @@ fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
                 key: b"output-key".to_vec(),
                 rel_path: b"d/f".to_vec(),
                 size: 7,
+                racy: false,
                 hints: Vec::new(),
             },
         }]);

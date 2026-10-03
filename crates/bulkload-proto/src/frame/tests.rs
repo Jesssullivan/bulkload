@@ -94,6 +94,14 @@ fn every_control() -> Vec<Control> {
             root: [9; 32],
             chunks: 1,
             size: 3,
+            racy: false,
+        },
+        Control::End {
+            entry: 8,
+            root: [9; 32],
+            chunks: 1,
+            size: 3,
+            racy: true,
         },
         Control::Credit { bytes: 16 << 20 },
         Control::SourceDone {
@@ -314,13 +322,61 @@ fn a_pre_v5_frame_is_refused() {
     assert!(Frame::decode(&wire).is_err());
 }
 
+/// #87: postcard ignores whatever follows a value, so a control body with
+/// trailing bytes used to decode as valid. Every control message with any
+/// trailing byte is refused, as a whole frame and as a body.
+#[test]
+fn a_control_body_with_trailing_bytes_is_refused() {
+    for control in every_control() {
+        let body = postcard::to_stdvec(&control).unwrap();
+        assert_eq!(
+            Frame::decode_body(TAG_CONTROL, &body).unwrap(),
+            Frame::Control(control.clone())
+        );
+        for trailing in [&[0_u8][..], &[0xff], &[1, 2, 3]] {
+            let mut padded = body.clone();
+            padded.extend_from_slice(trailing);
+            assert_eq!(
+                Frame::decode_body(TAG_CONTROL, &padded),
+                Err(BulkloadRefusal::FrameCodec),
+                "{control:?} + {trailing:?}"
+            );
+            let mut wire = frame_header(TAG_CONTROL, padded.len()).unwrap().to_vec();
+            wire.extend_from_slice(&padded);
+            assert_eq!(Frame::decode(&wire), Err(BulkloadRefusal::FrameCodec));
+        }
+    }
+}
+
+/// `decode_exact` is the strict decode every record uses: the value alone
+/// decodes, a value with any byte after it does not.
+#[test]
+fn decode_exact_refuses_a_remainder() {
+    let spec = ChunkSpec {
+        digest: [7; 32],
+        size: 11,
+    };
+    let bytes = postcard::to_stdvec(&spec).unwrap();
+    assert_eq!(decode_exact::<ChunkSpec>(&bytes).unwrap(), spec);
+    let mut padded = bytes.clone();
+    padded.push(0);
+    assert_eq!(
+        decode_exact::<ChunkSpec>(&padded),
+        Err(BulkloadRefusal::FrameCodec)
+    );
+    assert_eq!(
+        decode_exact::<ChunkSpec>(bytes.get(..bytes.len() - 1).unwrap()),
+        Err(BulkloadRefusal::FrameCodec)
+    );
+}
+
 /// `wire_id` is pinned: a change to `WIRE_SCHEMA` must be deliberate.
 #[test]
 fn wire_id_is_pinned() {
     assert_eq!(wire_id(), *blake3::hash(WIRE_SCHEMA.as_bytes()).as_bytes());
     assert_eq!(
         hex(&wire_id()),
-        "4697b82f3a5d29589220e46b14de5eadc6f0e81177511bffde66992ad1b7b63b",
+        "070bb548f74916265d03283e2034dcbc0d43ae3c37dcb05729e0209a919e9e03",
         "WIRE_SCHEMA changed: update this pin and treat it as a wire change"
     );
 }

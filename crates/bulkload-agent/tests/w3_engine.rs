@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::durable::{set_durability, Durability};
-use bulkload_agent::transfer::{copy, TransferStats};
+use bulkload_agent::transfer::{copy, settle_racy_window, TransferStats};
 
 struct Scratch(PathBuf);
 
@@ -74,6 +74,9 @@ fn w3_engine_properties() {
     std::fs::write(source.join("empty"), b"").unwrap();
     let names = ["shared", "partial", "repeated", "empty"];
     let payload = (shared.len() + partial.len() + repeated.len()) as u64;
+    // Fresh seats are racy for one timestamp tick and never recorded (#86);
+    // settle them so the warm run below can show 0 source reads.
+    settle_racy_window(&source).unwrap();
 
     // Initial copy: outputs are written from verified wire chunks.
     let (first, counted) = run(base, "destination", "destination-state");
