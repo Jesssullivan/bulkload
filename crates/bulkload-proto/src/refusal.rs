@@ -80,8 +80,18 @@ pub enum BulkloadRefusal {
     GitAuthorityOutsideRoot,
     /// Git bytes or refs changed while the live snapshot was being taken.
     GitAuthorityChanged,
-    /// A git inventory (index, refs, worktrees) is malformed.
+    /// A git inventory (index, refs, worktrees) is malformed. The cause is
+    /// none of the more specific `GIT_INVENTORY_*` sub-codes below (#106).
     GitInventoryMalformed,
+    /// A bundle names prerequisite commits the receiving repository does not
+    /// hold, so it cannot be verified or imported there (#106). Fetching the
+    /// named commits as objects and retrying is the documented recovery.
+    GitInventoryMissingPrerequisite,
+    /// An intent-to-add (`git add -N`) index entry cannot be carried: its
+    /// seat is absent from the captured worktree, or it lies in a nested
+    /// repository, whose index is not carried (#106). Intent-to-add entries
+    /// of a captured checkout are otherwise carried as index custody.
+    GitInventoryIntentToAdd,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
@@ -203,6 +213,8 @@ impl BulkloadRefusal {
             Self::GitAuthorityOutsideRoot => "GIT_AUTHORITY_OUTSIDE_ROOT",
             Self::GitAuthorityChanged => "GIT_AUTHORITY_CHANGED",
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
+            Self::GitInventoryMissingPrerequisite => "GIT_INVENTORY_MISSING_PREREQUISITE",
+            Self::GitInventoryIntentToAdd => "GIT_INVENTORY_INTENT_TO_ADD",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
             Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
@@ -262,6 +274,8 @@ impl BulkloadRefusal {
         "GIT_AUTHORITY_OUTSIDE_ROOT",
         "GIT_AUTHORITY_CHANGED",
         "GIT_INVENTORY_MALFORMED",
+        "GIT_INVENTORY_MISSING_PREREQUISITE",
+        "GIT_INVENTORY_INTENT_TO_ADD",
         "GIT_DESTINATION_OCCUPIED",
         "GIT_IGNORE_POLICY_CONFLICT",
         "GIT_DESTINATION_PARENT_MISSING",
@@ -362,6 +376,8 @@ mod tests {
             BulkloadRefusal::GitAuthorityOutsideRoot,
             BulkloadRefusal::GitAuthorityChanged,
             BulkloadRefusal::GitInventoryMalformed,
+            BulkloadRefusal::GitInventoryMissingPrerequisite,
+            BulkloadRefusal::GitInventoryIntentToAdd,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
             BulkloadRefusal::GitDestinationParentMissing,

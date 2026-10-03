@@ -21,7 +21,11 @@ plan, the corpus's capture records and the apply ledger (outcome records and
 - `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
   cause and does not close an item.
 - `referenced-only`: the item plans no workspace, and the exact
-  current-capture journal says `refs-imported`.
+  current-capture journal says `refs-imported`. `git-repair-missing-index`
+  given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
+  whose current capture it is (by digest and repository) and writes the same
+  journal, then the outcome `index-repaired` (or `refused` with its code), so
+  a repaired item reads as referenced-only natively (#95).
 
 Anything else is `unaccounted`: a stale journal from an earlier capture, a
 record naming another source, or refs only for an item that plans a
@@ -29,6 +33,18 @@ workspace. Stale and foreign journals are listed. The report passes only
 when `unaccounted` is 0, and otherwise exits nonzero with
 `CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
 the daily-work bar above still applies.
+
+`--attest LEDGER.json` (#95) joins a `bulkload.closure-ledger.v1`
+attestation ledger for items closed by audit rather than by a verb. A row
+closes a planned item only when the native ledger leaves it unaccounted, and
+only with a matching source, a known disposition (`applied`, `refused` with
+a typed code, `referenced-only`, `present`, `source-absent`), a basis other
+than `native-closure-report`, and non-empty evidence. Rows are reported in a
+separate `attested` block with their evidence; native totals are unchanged
+and a native record is never overridden (rows for natively closed items are
+counted as superseded, and disagreements listed). The gate then passes only
+when every item is native-accounted or attested. A ledger naming another
+plan or SOURCE label, or listing an item twice, refuses.
 
 ## Live union
 
@@ -69,6 +85,19 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   unless both key parts name exactly what the export carried, so authority
   that moves away and back outside the export's window can never leave a
   stale bundle behind an equal key.
+- Index entry flags (#106): an intent-to-add entry (`git add -N`) is
+  carried as index custody, `refs/carry-export/intent-to-add-v1` (path,
+  mode, empty-blob flag), recorded only when there is one; its seat's bytes
+  ride in the worktree tree. `git-restore`, `git-restore-linked`, estate
+  apply and `git-repair-missing-index` re-mark the paths after reading the
+  staged tree and check them back, so `git status --porcelain=v2` matches.
+  An intent-to-add entry whose seat is gone, or one in a nest (whose index
+  is not carried), refuses `GIT_INVENTORY_INTENT_TO_ADD`; the `git-attach-*`
+  verbs refuse a capture carrying any. Any other entry flag
+  (assume-unchanged, skip-worktree) still refuses `GIT_INVENTORY_MALFORMED`.
+  A bundle whose prerequisite commits the receiving repository lacks
+  refuses `GIT_INVENTORY_MISSING_PREREQUISITE`; fetch them as objects and
+  retry.
 - There are two drift classes. Export drift moved under the export itself:
   the bundle omits the drifted seats' bytes and carries the in-band
   `refs/carry-export/capture-drift-v1` marker. Every restore and import verb
@@ -300,6 +329,14 @@ starts.
   largest bundles, for bundle and base staging. Bundle size is a lower
   bound on a checkout. An item the plan cannot read is skipped and refuses
   on its own.
+- `estate-capture` checks per item (#101, OI-1002-Q11). Before an item's
+  export writes, its estimated bundle (the larger of its census's
+  regular-file bytes and the retained bundle it extends) plus every byte
+  still reserved by in-flight items is checked against a fresh probe of
+  CORPUS. An item that does not fit refuses
+  `DESTINATION_SPACE_INSUFFICIENT` as its own receipt; the other items run
+  and the next pass retries it. A reuse hit writes nothing and reserves
+  nothing. Shared-base preparation is not charged.
 
 ## Reclaim
 

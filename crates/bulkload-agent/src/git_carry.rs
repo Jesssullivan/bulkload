@@ -72,6 +72,34 @@ fn output(command: &mut Command) -> Result<Vec<u8>> {
     Ok(stdout)
 }
 
+// `git bundle verify`, with the refusal split by cause (#106): a bundle whose
+// declared prerequisite commits the repository does not hold refuses
+// GIT_INVENTORY_MISSING_PREREQUISITE, so a run report names the cause and its
+// recovery (fetch the named commits as objects, then retry). Any other
+// failure stays GIT_INVENTORY_MALFORMED.
+fn verify_bundle(repo: &Path, bundle: &Path) -> Result<()> {
+    if git(repo)
+        .args(["bundle", "verify"])
+        .arg(bundle)
+        .output()?
+        .status
+        .success()
+    {
+        return Ok(());
+    }
+    for prerequisite in shared::prerequisites(bundle)? {
+        let held = git(repo)
+            .args(["cat-file", "-e", &format!("{prerequisite}^{{commit}}")])
+            .output()?
+            .status
+            .success();
+        if !held {
+            return Err(BulkloadRefusal::GitInventoryMissingPrerequisite);
+        }
+    }
+    Err(BulkloadRefusal::GitInventoryMalformed)
+}
+
 fn text(command: &mut Command) -> Result<String> {
     String::from_utf8(output(command)?)
         .map(|s| s.trim_end().to_owned())
@@ -284,6 +312,18 @@ fn framed(hash: &mut blake3::Hasher, bytes: &[u8]) -> Result<()> {
 }
 
 impl KeyParts {
+    /// The apparent bytes of every regular-file seat this census names: the
+    /// worktree payload a capture under these parts would stream, before
+    /// compression and without history. An estimate for space planning
+    /// (#101), never a byte count of a bundle.
+    #[must_use]
+    pub fn census_bytes(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == bulkload_proto::FileKind::Regular)
+            .fold(0u64, |total, row| total.saturating_add(row.size))
+    }
+
     /// Foreign nested repositories and gitlinks these parts were computed
     /// over: the custody a capture under the same key records (R-N73). A
     /// receipt for a reuse hit names exactly these.
@@ -699,7 +739,24 @@ pub fn repair_missing_index(
     source: &str,
     receipt: &Path,
 ) -> Result<()> {
-    repair_missing_index_inner(bundle, repo, source, receipt, |_| Ok(()))
+    repair_missing_index_inner(bundle, repo, source, receipt, |_| Ok(()), |_| Ok(()))
+}
+
+/// [`repair_missing_index`], first handing `bind` the staged digest (#95).
+///
+/// `bind` runs before anything is written, so a caller that records the repair
+/// in an apply ledger can name the exact capture, or refuse an unplanned one.
+///
+/// # Errors
+/// `bind`'s refusal, then everything [`repair_missing_index`] refuses.
+pub fn repair_missing_index_bound(
+    bundle: &Path,
+    repo: &Path,
+    source: &str,
+    receipt: &Path,
+    bind: impl FnOnce(&[u8; 32]) -> Result<()>,
+) -> Result<()> {
+    repair_missing_index_inner(bundle, repo, source, receipt, bind, |_| Ok(()))
 }
 
 fn repair_missing_index_inner(
@@ -707,10 +764,12 @@ fn repair_missing_index_inner(
     repo: &Path,
     source: &str,
     receipt: &Path,
+    bind: impl FnOnce(&[u8; 32]) -> Result<()>,
     before_publish: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let staged = stage_bundle(bundle)?;
+    bind(&staged.digest())?;
     let bundle = staged.path();
     let repo = fs::canonicalize(repo)?;
     let admin = PathBuf::from(text(git(&repo).args(["rev-parse", "--absolute-git-dir"]))?);
@@ -778,6 +837,7 @@ fn repair_missing_index_inner(
             .env("GIT_INDEX_FILE", &private_index)
             .args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]),
     )?;
+    restore_intent_to_add(&repo, Some(&private_index), &heads)?;
     fs::set_permissions(&private_index, fs::Permissions::from_mode(0o600))?;
     fs::File::open(&private_index)?.sync_file_counted()?;
     fs::File::open(&receipt)?.sync_dir_counted()?;
@@ -1074,6 +1134,9 @@ fn export_repository_inner(
         "filesystem-v1",
         &postcard::to_allocvec(&carried).map_err(|_| BulkloadRefusal::FrameCodec)?,
     )?;
+    // #106: intent-to-add entries, which the staged tree cannot hold, are
+    // carried as index custody beside it, read from the carried index bytes.
+    record_intent_to_add(&private, &repo, &index, &carried)?;
     let nested_repositories = custody_metadata(&private, &census, &authority)?;
     // Omission is recorded, never silent. Sizes are measured once, here, and
     // deliberately excluded from both the reusable key and the before/after
@@ -2651,15 +2714,24 @@ fn nest_ignored_seats(
 // checkout, or a split index means status may not see every change.
 fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
     let debug = output(git(directory).args(["--git-dir=.git", "ls-files", "--debug"]))?;
-    let flagged = debug
+    let flagged: Vec<&[u8]> = debug
         .split(|b| *b == b'\n')
         .filter_map(|line| {
             line.windows(8)
                 .position(|window| window == b"\tflags: ")
                 .and_then(|at| line.get(at + 8..))
         })
-        .any(|flags| flags != b"0");
-    if flagged {
+        .filter(|flags| *flags != b"0")
+        .collect();
+    if !flagged.is_empty() {
+        // #106: a nest's index is not carried, so its intent-to-add entries
+        // cannot be; say so by cause rather than as a malformed inventory.
+        if flagged
+            .iter()
+            .all(|flags| *flags == INTENT_TO_ADD_FLAGS.as_bytes())
+        {
+            return Err(BulkloadRefusal::GitInventoryIntentToAdd);
+        }
         return Ok(true);
     }
     let sparse = git(directory)
@@ -3494,6 +3566,219 @@ fn safe_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Metadata ref carrying a capture's intent-to-add index entries (#106).
+const INTENT_TO_ADD_METADATA: &str = "intent-to-add-v1";
+
+/// `ls-files --debug` flags of an intent-to-add entry and nothing else:
+/// `CE_INTENT_TO_ADD | CE_EXTENDED`.
+const INTENT_TO_ADD_FLAGS: &str = "20004000";
+
+/// One intent-to-add (`git add -N`) index entry, carried as custody (#106).
+///
+/// Git stores such an entry with the empty blob and omits it from
+/// `write-tree`, so the staged tree cannot hold it; the worktree tree holds
+/// its seat's bytes, and restore re-marks the path intent-to-add.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct IntentToAdd {
+    /// Path relative to the checkout root, raw bytes.
+    pub rel_path: Vec<u8>,
+    /// The index entry's mode (`100644`, `100755` or `120000`).
+    pub mode: u32,
+    /// The entry names the empty blob, as every Git since 2.x writes it.
+    pub empty_blob: bool,
+}
+
+const EMPTY_BLOB_SHA1: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+const EMPTY_BLOB_SHA256: &str = "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
+
+// Every intent-to-add entry of the index file `index`, read against `repo`.
+// Any other non-zero entry flag (assume-unchanged, skip-worktree) refuses
+// GIT_INVENTORY_MALFORMED: status may not see every change under it.
+// `ls-files --debug` and `ls-files --stage` list the same entries in the same
+// order; a count that differs refuses rather than pair them wrongly.
+fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> {
+    let listed = |args: &[&str]| output(git(repo).env("GIT_INDEX_FILE", index).args(args));
+    let debug = String::from_utf8(listed(&["ls-files", "--debug"])?)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let flags: Vec<&str> = debug
+        .lines()
+        .filter_map(|line| line.split_once("\tflags: ").map(|(_, flags)| flags))
+        .collect();
+    if flags.iter().all(|flags| *flags == "0") {
+        return Ok(Vec::new());
+    }
+    if flags
+        .iter()
+        .any(|flags| *flags != "0" && *flags != INTENT_TO_ADD_FLAGS)
+    {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let stage = listed(&["ls-files", "--stage", "-z"])?;
+    let entries: Vec<&[u8]> = stage
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.len() != flags.len() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let mut carried = Vec::new();
+    for (entry, flags) in entries.into_iter().zip(flags) {
+        if flags != INTENT_TO_ADD_FLAGS {
+            continue;
+        }
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header = std::str::from_utf8(
+            entry
+                .get(..tab)
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?,
+        )
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let mut fields = header.split(' ');
+        let mode = fields
+            .next()
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+            .filter(|mode| matches!(mode, 0o100_644 | 0o100_755 | 0o120_000))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let value = fields
+            .next()
+            .filter(|value| oid(value))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if fields.next() != Some("0") || fields.next().is_some() {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let rel_path = entry
+            .get(tab + 1..)
+            .filter(|path| !path.is_empty())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        carried.push(IntentToAdd {
+            rel_path: rel_path.to_vec(),
+            mode,
+            empty_blob: value == EMPTY_BLOB_SHA1 || value == EMPTY_BLOB_SHA256,
+        });
+    }
+    Ok(carried)
+}
+
+// The capture's intent-to-add custody, recorded only when there is any, so
+// every other capture's bundle is unchanged. Each entry's seat must be a
+// carried file or symlink: Git can mark only an existing path intent-to-add,
+// so an entry whose seat is gone (`git add -N`, then `rm`) refuses by cause.
+fn record_intent_to_add(
+    private: &Path,
+    repo: &Path,
+    index: &Path,
+    seats: &[&crate::RowSchema],
+) -> Result<()> {
+    let entries = intent_to_add_entries(repo, index)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    for entry in &entries {
+        let carried = seats.iter().any(|row| {
+            row.rel_path == entry.rel_path
+                && matches!(
+                    row.kind,
+                    bulkload_proto::FileKind::Regular | bulkload_proto::FileKind::Symlink
+                )
+        });
+        if !carried {
+            return Err(BulkloadRefusal::GitInventoryIntentToAdd);
+        }
+    }
+    metadata(
+        private,
+        INTENT_TO_ADD_METADATA,
+        &postcard::to_allocvec(&entries).map_err(|_| BulkloadRefusal::FrameCodec)?,
+    )
+}
+
+// The intent-to-add custody a capture's bundle names; empty for a capture
+// with none (and for every capture taken before #106).
+fn carried_intent_to_add(repo: &Path, heads: &str) -> Result<Vec<IntentToAdd>> {
+    let name = format!("refs/carry-export/{INTENT_TO_ADD_METADATA}");
+    let Some(value) = heads.lines().find_map(|line| {
+        line.split_once(' ')
+            .filter(|(_, reference)| *reference == name)
+            .map(|(value, _)| value)
+    }) else {
+        return Ok(Vec::new());
+    };
+    if !oid(value) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    postcard::from_bytes(&output(
+        git(repo).args(["show", &format!("{value}:value")]),
+    )?)
+    .map_err(|_| BulkloadRefusal::FrameCodec)
+}
+
+// Re-mark the captured intent-to-add paths in the index `index` (the
+// repository's own when `None`) of the checkout at `repo`, after its staged
+// tree is read and its worktree laid down (#106). Literal pathspecs, NUL
+// separated, so no path is a glob or an option; `-f` because an ignored path
+// can be intent-to-add. The result is read back: every path must come back
+// intent-to-add at its captured mode, or the restore refuses by cause.
+fn restore_intent_to_add(repo: &Path, index: Option<&Path>, heads: &str) -> Result<()> {
+    let entries = carried_intent_to_add(repo, heads)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let command = || {
+        let mut command = git(repo);
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+        command
+    };
+    let mut paths = Vec::new();
+    for entry in &entries {
+        if entry.rel_path.contains(&0) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        paths.extend_from_slice(&entry.rel_path);
+        paths.push(0);
+    }
+    input(
+        command().args([
+            "add",
+            "--intent-to-add",
+            "--force",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]),
+        &paths,
+    )
+    .map_err(|_| BulkloadRefusal::GitInventoryIntentToAdd)?;
+    let index_path = match index {
+        Some(index) => index.to_owned(),
+        None => PathBuf::from(text(git(repo).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ]))?),
+    };
+    let mut restored = intent_to_add_entries(repo, &index_path)?;
+    let mut expected: Vec<(Vec<u8>, u32)> = entries
+        .into_iter()
+        .map(|entry| (entry.rel_path, entry.mode))
+        .collect();
+    expected.sort();
+    restored.sort();
+    if restored
+        .into_iter()
+        .map(|entry| (entry.rel_path, entry.mode))
+        .ne(expected)
+    {
+        return Err(BulkloadRefusal::GitInventoryIntentToAdd);
+    }
+    Ok(())
+}
+
 // The source index path, its exact bytes, and every gitlink it holds as
 // custody. A gitlink names a submodule commit this repository's objects need
 // not contain; the entry stays in the staged tree (Git bundles and restores a
@@ -3517,15 +3802,9 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
     let checked = |args: &[&str]| -> Result<Vec<u8>> {
         output(git(repo).env("GIT_INDEX_FILE", &carried).args(args))
     };
-    let flags = String::from_utf8(checked(&["ls-files", "--debug"])?)
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    if flags
-        .lines()
-        .filter_map(|line| line.split_once("\tflags: "))
-        .any(|(_, flags)| flags != "0")
-    {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
+    // #106: intent-to-add entries are carried as index custody; any other
+    // entry flag still refuses.
+    intent_to_add_entries(repo, &carried)?;
     if !checked(&["rev-parse", "--shared-index-path"])?
         .trim_ascii()
         .is_empty()
@@ -3708,7 +3987,7 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let bundle = fs::canonicalize(bundle)?;
-    output(git(repo).args(["bundle", "verify"]).arg(&bundle))?;
+    verify_bundle(repo, &bundle)?;
     let heads = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
     let unpacked = shallow::unpack(repo, &bundle, &heads)?;
     let heads = unpacked.as_ref().unwrap_or(&heads);
@@ -4261,6 +4540,12 @@ fn attach_payload(
     }
     let before = filesystem_rows(&destination)?;
     let (private, heads) = prepare_attachment(bundle, &destination, source, &receipt)?;
+    // #106: attachment adopts an existing payload under the staged index
+    // only; it does not re-mark intent-to-add paths, so it refuses a capture
+    // carrying any rather than drop them.
+    if !carried_intent_to_add(&private, &heads)?.is_empty() {
+        return Err(BulkloadRefusal::GitInventoryIntentToAdd);
+    }
     let expected: Vec<crate::RowSchema> = postcard::from_bytes(&output(git(&private).args([
         "show",
         &format!("{}:value", capture_revision(&heads, "filesystem-v1")?),
@@ -4456,6 +4741,7 @@ pub fn restore_staged(
     let staged = find("staged")?;
     restore_gitlink_directories(&destination, &staged, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
+    restore_intent_to_add(&destination, None, &heads)?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let config_receipt = destination.join(".git/carry-config");
     fs::DirBuilder::new().mode(0o700).create(&config_receipt)?;
@@ -4588,6 +4874,7 @@ pub fn restore_linked_staged(
     restore_entries(&destination, &entries)?;
     restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
+    restore_intent_to_add(&destination, None, &heads)?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
     let final_exclude = match fs::read(exclude_path) {
         Ok(value) => value,
@@ -5346,6 +5633,7 @@ mod tests {
             &restored,
             "neo",
             &root.join("repair-race"),
+            |_| Ok(()),
             |index| {
                 assert!(restored.join(".git/index.lock").is_file());
                 assert!(output(git(&restored).args(["read-tree", "HEAD"])).is_err());
@@ -11471,5 +11759,247 @@ mod review_pr53e {
             added.get(1),
             Some(&Err(BulkloadRefusal::GitDestinationOccupied))
         );
+    }
+}
+
+// #106 (OI-1002-Q25): intent-to-add entries are carried as index custody,
+// and GIT_INVENTORY_MALFORMED is split by cause.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod intent_to_add_106 {
+    use super::*;
+
+    fn g(repo: &Path, args: &[&str]) -> Vec<u8> {
+        output(git(repo).args(args)).unwrap()
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ita106-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn init(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        g(repo, &["init", "--template=", "-b", "main"]);
+        g(repo, &["config", "user.name", "T"]);
+        g(repo, &["config", "user.email", "t@localhost"]);
+        g(repo, &["config", "commit.gpgsign", "false"]);
+    }
+
+    // A committed checkout whose index holds three intent-to-add entries: a
+    // plain file, an executable in a subdirectory and a force-added ignored
+    // file, beside an ordinary staged edit and an untracked file.
+    fn checkout_with_intent_to_add(root: &Path) -> PathBuf {
+        let source = root.join("source");
+        init(&source);
+        fs::write(source.join("tracked"), b"v1").unwrap();
+        fs::write(source.join(".gitignore"), b"ignored.txt\n").unwrap();
+        g(&source, &["add", "tracked", ".gitignore"]);
+        g(&source, &["commit", "-q", "-m", "base"]);
+        fs::write(source.join("tracked"), b"v2 staged").unwrap();
+        g(&source, &["add", "tracked"]);
+        fs::write(source.join("new"), b"intent to add").unwrap();
+        fs::create_dir(source.join("bin")).unwrap();
+        fs::write(source.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            source.join("bin/run"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(source.join("ignored.txt"), b"ignored but intended").unwrap();
+        fs::write(source.join("untracked"), b"plain untracked").unwrap();
+        g(&source, &["add", "-N", "new", "bin/run"]);
+        g(&source, &["add", "-N", "-f", "ignored.txt"]);
+        source
+    }
+
+    fn status(repo: &Path) -> Vec<u8> {
+        g(repo, &["status", "--porcelain=v2", "--untracked-files=all"])
+    }
+
+    #[test]
+    fn intent_to_add_entries_capture_and_restore_with_equal_status() {
+        let root = fresh("standalone");
+        let source = checkout_with_intent_to_add(&root);
+        let before = status(&source);
+        assert_eq!(
+            before
+                .split(|b| *b == b'\n')
+                .filter(|line| line.starts_with(b"1 .A "))
+                .count(),
+            3,
+            "{}",
+            String::from_utf8_lossy(&before)
+        );
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&bundle, &restored, "neo").unwrap();
+        let after = status(&restored);
+        assert_eq!(
+            blake3::hash(&before),
+            blake3::hash(&after),
+            "before:\n{}\nafter:\n{}",
+            String::from_utf8_lossy(&before),
+            String::from_utf8_lossy(&after)
+        );
+        let custody = carried_intent_to_add(
+            &restored,
+            &text(git(&restored).args(["bundle", "list-heads"]).arg(&bundle)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            custody
+                .iter()
+                .map(|entry| (entry.rel_path.as_slice(), entry.mode, entry.empty_blob))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"bin/run".as_slice(), 0o100_755, true),
+                (b"ignored.txt".as_slice(), 0o100_644, true),
+                (b"new".as_slice(), 0o100_644, true),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn intent_to_add_entries_restore_into_a_linked_worktree() {
+        let root = fresh("linked");
+        let source = checkout_with_intent_to_add(&root);
+        let before = status(&source);
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let repository = root.join("repository");
+        init(&repository);
+        let destination = root.join("linked");
+        restore_linked(&bundle, &repository, &destination, "neo").unwrap();
+        assert_eq!(status(&destination), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A capture without intent-to-add entries carries no custody ref, so
+    // every other capture's bundle is unchanged by #106.
+    #[test]
+    fn a_capture_without_intent_to_add_records_no_custody() {
+        let root = fresh("none");
+        let source = root.join("source");
+        init(&source);
+        fs::write(source.join("tracked"), b"v1").unwrap();
+        g(&source, &["add", "tracked"]);
+        g(&source, &["commit", "-q", "-m", "base"]);
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let heads = text(git(&source).args(["bundle", "list-heads"]).arg(&bundle)).unwrap();
+        assert!(!heads.contains(INTENT_TO_ADD_METADATA), "{heads}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Git can mark only an existing path intent-to-add: an entry whose seat
+    // is gone refuses by cause, not as a malformed inventory.
+    #[test]
+    fn an_intent_to_add_entry_without_its_seat_refuses_by_cause() {
+        let root = fresh("seatless");
+        let source = checkout_with_intent_to_add(&root);
+        fs::remove_file(source.join("new")).unwrap();
+        assert_eq!(
+            export_repository(&source, &root.join("capture")),
+            Err(BulkloadRefusal::GitInventoryIntentToAdd)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Other entry flags can hide an edit from status and still refuse as a
+    // malformed inventory.
+    #[test]
+    fn skip_worktree_and_assume_unchanged_still_refuse_as_malformed() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let root = fresh(flag.trim_start_matches('-'));
+            let source = checkout_with_intent_to_add(&root);
+            g(&source, &["update-index", flag, "tracked"]);
+            assert_eq!(
+                export_repository(&source, &root.join("capture")),
+                Err(BulkloadRefusal::GitInventoryMalformed),
+                "{flag}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    // A nest's index is not carried, so its intent-to-add entries refuse by
+    // cause.
+    #[test]
+    fn intent_to_add_in_a_nest_refuses_by_cause() {
+        let root = fresh("nest");
+        let outer = root.join("outer");
+        init(&outer);
+        fs::write(outer.join("file"), b"outer").unwrap();
+        g(&outer, &["add", "file"]);
+        g(&outer, &["commit", "-q", "-m", "outer"]);
+        let inner = outer.join("vendor/inner");
+        init(&inner);
+        fs::write(inner.join("lib.c"), b"v1").unwrap();
+        g(&inner, &["add", "lib.c"]);
+        g(&inner, &["commit", "-q", "-m", "v1"]);
+        fs::write(inner.join("extra.c"), b"intended").unwrap();
+        g(&inner, &["add", "-N", "extra.c"]);
+        assert_eq!(
+            nested_repositories(&outer),
+            Err(BulkloadRefusal::GitInventoryIntentToAdd)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A thin bundle whose prerequisite the repository lacks refuses
+    // GIT_INVENTORY_MISSING_PREREQUISITE; once its commits are fetched the
+    // same bundle verifies.
+    #[test]
+    fn a_missing_prerequisite_refuses_by_cause() {
+        let root = fresh("prerequisite");
+        let source = root.join("source");
+        init(&source);
+        fs::write(source.join("tracked"), b"v1").unwrap();
+        g(&source, &["add", "tracked"]);
+        g(&source, &["commit", "-q", "-m", "one"]);
+        fs::write(source.join("tracked"), b"v2").unwrap();
+        g(&source, &["commit", "-q", "-a", "-m", "two"]);
+        let thin = root.join("thin.bundle");
+        g(
+            &source,
+            &["bundle", "create", thin.to_str().unwrap(), "HEAD~1..main"],
+        );
+        assert_eq!(
+            shared::prerequisites(&thin).unwrap(),
+            vec![text(git(&source).args(["rev-parse", "HEAD~1"])).unwrap()]
+        );
+        let destination = root.join("destination");
+        init(&destination);
+        assert_eq!(
+            verify_bundle(&destination, &thin),
+            Err(BulkloadRefusal::GitInventoryMissingPrerequisite)
+        );
+        assert_eq!(
+            import_bundle(&destination, &thin, "neo"),
+            Err(BulkloadRefusal::GitInventoryMissingPrerequisite)
+        );
+        g(
+            &destination,
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                source.to_str().unwrap(),
+                "refs/heads/main:refs/prereq",
+            ],
+        );
+        assert_eq!(verify_bundle(&destination, &thin), Ok(()));
+        // A self-contained bundle declares no prerequisite.
+        let full = root.join("full.bundle");
+        g(
+            &source,
+            &["bundle", "create", full.to_str().unwrap(), "main"],
+        );
+        assert!(shared::prerequisites(&full).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }

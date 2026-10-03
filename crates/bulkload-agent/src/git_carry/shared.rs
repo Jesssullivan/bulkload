@@ -93,13 +93,22 @@ fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<String>>
 /// # Errors
 /// Refuses malformed or oversized bundle headers and unavailable files.
 pub fn requires_base(bundle: &Path) -> Result<bool> {
+    Ok(!prerequisites(bundle)?.is_empty())
+}
+
+/// The prerequisite object names a bundle's header declares (`-<oid>` lines),
+/// in header order. Empty for a self-contained bundle.
+///
+/// # Errors
+/// Refuses malformed or oversized bundle headers and unavailable files.
+pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(bundle)?;
     let mut source = BufReader::new(file);
     let mut consumed = 0usize;
-    let mut prerequisite = false;
+    let mut prerequisite = Vec::new();
     loop {
         let mut line = Vec::new();
         let count = source
@@ -118,7 +127,15 @@ pub fn requires_base(bundle: &Path) -> Result<bool> {
         if line == b"\n" {
             return Ok(prerequisite);
         }
-        prerequisite |= line.starts_with(b"-");
+        if let Some(rest) = line.strip_prefix(b"-") {
+            let name = rest
+                .split(|b| *b == b' ' || *b == b'\n')
+                .next()
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .filter(|name| oid(name))
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+            prerequisite.push(name.to_owned());
+        }
     }
 }
 
