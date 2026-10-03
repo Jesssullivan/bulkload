@@ -25,9 +25,14 @@ pub mod registered;
 mod shallow;
 pub mod shared;
 
-fn git(repo: &Path) -> Command {
-    let mut command = Command::new("git");
-    for key in [
+/// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
+/// the v1 carry and the estimate spawn is built from it by [`git`], and the
+/// estimate's [`estimate::PROBE_SCRIPT`] preamble is tested against it, so
+/// the local builder and the remote probe cannot drift apart again.
+pub(crate) mod git_env {
+    /// Inherited variables that would redirect Git at another repository,
+    /// object store, ceiling or configuration. Each is removed.
+    pub const CLEARED: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
@@ -37,31 +42,193 @@ fn git(repo: &Path) -> Command {
         "GIT_NAMESPACE",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",
-    ] {
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+
+    /// Variables every Git child runs with: no prompt, no system or global
+    /// configuration, no replace objects, no lazy (promisor) fetch, no
+    /// optional locks, and the C locale so every parsed line is stable.
+    pub const SET: &[(&str, &str)] = &[
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("LC_ALL", "C"),
+        ("LANGUAGE", ""),
+    ];
+
+    /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
+    /// automatic gc or maintenance, and bounded pack resources.
+    pub const CONFIG: &[&str] = &[
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "gc.auto=0",
+        "maintenance.auto=false",
+        "pack.threads=2",
+        "pack.windowMemory=64m",
+    ];
+}
+
+/// A Git child for the repository at `repo`, hardened from [`git_env`]:
+/// `--no-optional-locks`, every `-c` override, every cleared and set
+/// variable, and `GIT_CEILING_DIRECTORIES` at `repo`'s parent, so discovery
+/// never climbs above the path it was given.
+fn git(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    for key in git_env::CLEARED {
         command.env_remove(key);
     }
+    command.arg("--no-optional-locks");
+    for value in git_env::CONFIG {
+        command.args(["-c", value]);
+    }
+    command.arg("-C").arg(repo);
+    for (key, value) in git_env::SET {
+        command.env(key, value);
+    }
+    // A relative or root path has no absolute parent to stop at; Git then
+    // discovers as it would have, and the explicit `-C` still names the root.
+    if let Some(ceiling) = std::path::absolute(repo)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
     command
-        .args([
-            "--no-optional-locks",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "pack.threads=2",
-            "-c",
-            "pack.windowMemory=64m",
-            "-C",
-        ])
-        .arg(repo);
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    command
+}
+
+/// Whether the repository at `repo` is a partial clone.
+///
+/// That is a promisor remote, a partial-clone filter or
+/// `extensions.partialClone` in its configuration (common, worktree and every
+/// linked worktree's), or a `.promisor` pack in its object store or any
+/// alternate (depth 5, as the estimate probe reads).
+///
+/// Reading such a repository can fault in a lazy fetch, a network write the
+/// source never asked for; v1 carry refuses it before reading anything else
+/// (`GIT_SOURCE_PARTIAL_CLONE`, WP1 PR 1, S2).
+///
+/// # Errors
+/// Refuses a repository Git cannot read.
+pub fn partial_clone(repo: &Path) -> Result<bool> {
+    let common = common_repository(repo)?;
+    let mut scopes = vec![
+        None,
+        Some(common.join("config")),
+        Some(common.join("config.worktree")),
+    ];
+    if let Ok(worktrees) = fs::read_dir(common.join("worktrees")) {
+        for admin in worktrees {
+            scopes.push(Some(admin?.path().join("config.worktree")));
+        }
+    }
+    for scope in scopes {
+        if scope.as_ref().is_some_and(|file| !file.is_file()) {
+            continue;
+        }
+        for (promisor, query) in [
+            (false, &["--get-regexp", r"^extensions\.partialclone$"][..]),
+            (
+                true,
+                &["--type=bool", "--get-regexp", r"^remote\..*\.promisor$"][..],
+            ),
+            (
+                false,
+                &["--get-regexp", r"^(remote\..*|core)\.partialclonefilter$"][..],
+            ),
+        ] {
+            let mut command = git(repo);
+            command.arg("config");
+            if let Some(file) = &scope {
+                command.args(["--includes", "--file"]).arg(file);
+            }
+            let result = command.args(query).output()?;
+            match result.status.code() {
+                Some(0) => {}
+                Some(1) => continue,
+                _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+            }
+            // `key value` lines; a promisor counts only when it is true.
+            if result.stdout.split(|byte| *byte == b'\n').any(|line| {
+                let value = line
+                    .iter()
+                    .position(|byte| *byte == b' ')
+                    .and_then(|space| line.get(space + 1..))
+                    .unwrap_or_default();
+                if promisor {
+                    value == b"true"
+                } else {
+                    !value.is_empty()
+                }
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    let objects = PathBuf::from(text(git(repo).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ]))?);
+    promisor_packs(&objects, 0)
+}
+
+// A `.promisor` pack in `store` or, through `info/alternates`, in any store it
+// borrows from, at most five levels deep (the estimate probe's bound).
+fn promisor_packs(store: &Path, depth: u8) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    match fs::read_dir(store.join("pack")) {
+        Ok(entries) => {
+            for entry in entries {
+                if Path::new(&entry?.file_name())
+                    .extension()
+                    .is_some_and(|extension| extension == "promisor")
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let alternates = match fs::read(store.join("info/alternates")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if depth >= 5 {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    for line in alternates.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        if line.starts_with(b"\"") {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let alternate = store.join(std::ffi::OsStr::from_bytes(line));
+        if alternate.is_dir() && promisor_packs(&alternate, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Refuse a partial-clone source before any other read (WP1 PR 1).
+///
+/// # Errors
+/// `GIT_SOURCE_PARTIAL_CLONE` for a partial clone; whatever
+/// [`partial_clone`] refuses.
+pub fn refuse_partial_clone(repo: &Path) -> Result<()> {
+    if partial_clone(repo)? {
+        return Err(BulkloadRefusal::GitSourcePartialClone);
+    }
+    Ok(())
 }
 
 fn output(command: &mut Command) -> Result<Vec<u8>> {
@@ -1036,23 +1203,89 @@ pub fn export_repository_with_drift(
     capture: &Path,
     options: &ExportOptions<'_>,
 ) -> Result<Export> {
+    match export_repository_inner(repo, capture, options)? {
+        Exported::Captured(export) => Ok(*export),
+        Exported::ObjectStoreRewritten(_) => Err(BulkloadRefusal::GitAuthorityChanged),
+    }
+}
+
+/// What a drift-tolerant export produced (WP1 PR 4).
+#[derive(Debug)]
+pub enum Exported {
+    /// A bundle, clean or with drift rows.
+    Captured(Box<Export>),
+    /// No bundle: a Git child failed while the source's pack listing changed
+    /// under the pass (a `gc`, `repack` or `prune` racing the capture), so the
+    /// failure is the rewrite, not the repository. Drift custody with one
+    /// [`DriftKind::ObjectStoreRewritten`] row; the next pass captures the
+    /// rewritten store. Never a refusal (S5, R-N30).
+    ObjectStoreRewritten(CaptureDrift),
+}
+
+/// The estate capture's export: [`export_repository_with_drift`], plus
+/// object-store rewrites as custody.
+///
+/// A Git child failure under an object-store rewrite is reported as
+/// [`Exported::ObjectStoreRewritten`] drift custody instead of a refusal.
+///
+/// # Errors
+/// Refuses everything [`export_repository_with_drift`] refuses, except a Git
+/// child failure while the source's pack listing changed.
+pub fn export_repository_with_custody(
+    repo: &Path,
+    capture: &Path,
+    options: &ExportOptions<'_>,
+) -> Result<Exported> {
     export_repository_inner(repo, capture, options)
 }
 
 // The pre-drift contract for callers that never asked for tolerance.
-fn refusing_drift(export: Export) -> Result<Export> {
-    if export.drift.is_empty() {
-        Ok(export)
-    } else {
-        Err(BulkloadRefusal::GitAuthorityChanged)
+fn refusing_drift(export: Exported) -> Result<Export> {
+    match export {
+        Exported::Captured(export) if export.drift.is_empty() => Ok(*export),
+        _ => Err(BulkloadRefusal::GitAuthorityChanged),
     }
+}
+
+/// The identity of the source's pack listing: every entry of
+/// `<common>/objects/pack` by name, inode and size, hashed in name order. A
+/// `gc`, `repack` or `prune --expire` writes or removes packs, so it changes
+/// this; reading through the store never does. A missing pack directory is
+/// the empty listing.
+fn pack_listing(common: &Path) -> Result<[u8; 32]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let mut entries = Vec::new();
+    match fs::read_dir(common.join("objects/pack")) {
+        Ok(listing) => {
+            for entry in listing {
+                let entry = entry?;
+                // A pack removed between the listing and its stat is the
+                // rewrite itself; record it as absent.
+                let (ino, size) = entry
+                    .metadata()
+                    .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
+                entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    entries.sort_unstable();
+    let mut hash = blake3::Hasher::new();
+    for (name, ino, size) in &entries {
+        framed(&mut hash, name)?;
+        hash.update(&ino.to_le_bytes());
+        hash.update(&size.to_le_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 fn export_repository_inner(
     repo: &Path,
     capture: &Path,
     options: &ExportOptions<'_>,
-) -> Result<Export> {
+) -> Result<Exported> {
     use std::os::unix::fs::DirBuilderExt;
     let repo = fs::canonicalize(repo)?;
     fs::DirBuilder::new().mode(0o700).create(capture)?;
@@ -1060,29 +1293,58 @@ fn export_repository_inner(
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
+    // S2 (WP1 PR 1): a partial clone could lazily fetch under any read below.
+    refuse_partial_clone(&repo)?;
     #[cfg(test)]
     mid_pass::fire(&repo, mid_pass::Stage::Snapshot);
+    // WP1 PR 4: the pack listing is read with the authority, before any Git
+    // child of the pass. The private repository reads the source's objects
+    // through `alternates`, so a `gc` or `prune` racing the pass can make one
+    // of its children fail; when the listing moved, that failure is drift
+    // custody, not a malformed repository.
+    let common = common_repository(&repo)?;
+    let packs = pack_listing(&common)?;
+    match export_pass(&repo, &capture, &common, options) {
+        Err(BulkloadRefusal::GitInventoryMalformed) if pack_listing(&common)? != packs => {
+            let mut drift = CaptureDrift::default();
+            drift.extend([DriftRow::seat(
+                DriftKind::ObjectStoreRewritten,
+                b"objects/pack",
+            )]);
+            drift.seal()?;
+            Ok(Exported::ObjectStoreRewritten(drift))
+        }
+        exported => exported.map(|export| Exported::Captured(Box::new(export))),
+    }
+}
+
+// One export pass over the canonical `repo` into the canonical `capture`.
+fn export_pass(
+    repo: &Path,
+    capture: &Path,
+    common: &Path,
+    options: &ExportOptions<'_>,
+) -> Result<Export> {
     // Before the census, so every seat the census stamps is judged against it.
     let started_ns = pass_start_ns();
-    let before_refs = refs(&repo)?;
+    let before_refs = refs(repo)?;
     // Read once and carried exactly: nothing below re-reads HEAD, the symbolic
     // HEAD, the index, exclude, the stash reflog, configuration or the frontier
     // for the bundle's content, only to compare at the end of the pass.
-    let authority = read_authority(&repo, &before_refs)?;
-    let common = common_repository(&repo)?;
-    let census = capture_census_planned(&repo, &common, options.policy, options.planned)?;
+    let authority = read_authority(repo, &before_refs)?;
+    let census = capture_census_planned(repo, common, options.policy, options.planned)?;
     let seats = &census.rows;
-    let private = carry_authority(&repo, &capture, &before_refs, &authority)?;
+    let private = carry_authority(repo, capture, &before_refs, &authority)?;
     let index = capture.join("index");
     fs::write(&index, &authority.index)?;
-    let staged = text(snapshot_command(&private, &repo, &index).arg("write-tree"))?;
+    let staged = text(snapshot_command(&private, repo, &index).arg("write-tree"))?;
     set_ref(
         &private,
         "refs/carry-export/staged",
         &commit_tree(&private, &staged, "bulkload staged tree")?,
     )?;
     #[cfg(test)]
-    mid_pass::fire(&repo, mid_pass::Stage::BytePass);
+    mid_pass::fire(repo, mid_pass::Stage::BytePass);
     // Seats a retained capture already holds at this exact identity are emitted
     // by object name. Nothing is opened for them and no source byte is re-read.
     let (reuse, reuse_unavailable) = offered_reuse(
@@ -1092,16 +1354,16 @@ fn export_repository_inner(
         seats,
         started_ns,
     )?;
-    let pass = raw_tree::capture(&private, &repo, seats, &reuse)?;
-    let after = capture_census_planned(&repo, &common, options.policy, options.planned)?;
+    let pass = raw_tree::capture(&private, repo, seats, &reuse)?;
+    let after = capture_census_planned(repo, common, options.policy, options.planned)?;
     // Git authority moving under the capture is never drift. The nested
     // worktree and nested repository censuses are compared apart from the
     // seats precisely because they carry each nested HEAD (and a foreign
     // nest's cleanliness, unpushed count and carried-ignored count), which
     // must keep its refusal (R-N73, B4); so is the omitted set, because it is
     // a key input a rebuild can move.
-    let refs_after = refs(&repo)?;
-    if !authority_held(&repo, &authority, &refs_after)?
+    let refs_after = refs(repo)?;
+    if !authority_held(repo, &authority, &refs_after)?
         || census.nested_worktrees != after.nested_worktrees
         || census.nested_repositories != after.nested_repositories
         || census.omitted != after.omitted
@@ -1136,13 +1398,13 @@ fn export_repository_inner(
     )?;
     // #106: intent-to-add entries, which the staged tree cannot hold, are
     // carried as index custody beside it, read from the carried index bytes.
-    record_intent_to_add(&private, &repo, &index, &carried)?;
+    record_intent_to_add(&private, repo, &index, &carried)?;
     let nested_repositories = custody_metadata(&private, &census, &authority)?;
     // Omission is recorded, never silent. Sizes are measured once, here, and
     // deliberately excluded from both the reusable key and the before/after
     // census comparison: they are custody evidence about bytes this capture
     // chose not to carry, not an assertion that those bytes held still.
-    let omitted = measure_omissions(&repo, &census.omitted)?;
+    let omitted = measure_omissions(repo, &census.omitted)?;
     if !omitted.is_empty() {
         metadata(
             &private,
@@ -1155,7 +1417,7 @@ fn export_repository_inner(
     shared::write_bundle(&private, &bundle, options.prerequisite)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
-    mid_pass::fire(&repo, mid_pass::Stage::AfterPass);
+    mid_pass::fire(repo, mid_pass::Stage::AfterPass);
     Ok(Export {
         bundle,
         omitted,
@@ -1960,6 +2222,11 @@ pub enum DriftKind {
     SeatChanged,
     /// A seat in the pre-pass census was removed.
     SeatRemoved,
+    /// The source's object store was rewritten under the pass (a `gc`,
+    /// `repack` or `prune` changed its pack listing) and a Git child reading
+    /// through it failed: nothing was captured, and the next pass captures
+    /// the rewritten store (WP1 PR 4, S5). Named `objects/pack`.
+    ObjectStoreRewritten,
 }
 
 impl DriftKind {
@@ -5081,6 +5348,120 @@ fn restore_entry(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ---- WP1 PR 1: one hardening table, partial-clone refusal (S2) ------
+
+    #[test]
+    fn every_git_child_carries_the_one_hardening_table() {
+        let command = git(Path::new("/estate/repo"));
+        let args: Vec<_> = command.get_args().filter_map(|arg| arg.to_str()).collect();
+        assert_eq!(args.first(), Some(&"--no-optional-locks"));
+        for config in git_env::CONFIG {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-c", *config]),
+                "{config}: {args:?}"
+            );
+        }
+        assert!(args.ends_with(&["-C", "/estate/repo"]), "{args:?}");
+        let envs: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for (key, value) in git_env::SET {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsStr::new(value))),
+                "{key}"
+            );
+        }
+        for key in git_env::CLEARED {
+            let expected =
+                (*key == "GIT_CEILING_DIRECTORIES").then_some(std::ffi::OsStr::new("/estate"));
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&expected),
+                "{key}"
+            );
+        }
+    }
+
+    // A clone of `origin` with `--filter=blob:none`, never checked out, so
+    // making the fixture faults in nothing either.
+    fn partial_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-partial-{name}-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let origin = root.join("origin");
+        fs::create_dir(&origin).unwrap();
+        output(git(&origin).args(["init", "--template="])).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@localhost"),
+            ("commit.gpgsign", "false"),
+            ("uploadpack.allowFilter", "true"),
+        ] {
+            output(git(&origin).args(["config", key, value])).unwrap();
+        }
+        fs::write(origin.join("tracked"), b"blob the clone leaves behind").unwrap();
+        output(git(&origin).args(["add", "tracked"])).unwrap();
+        output(git(&origin).args(["commit", "-m", "base"])).unwrap();
+        let clone = root.join("clone");
+        output(
+            git(&root)
+                .args(["clone", "--quiet", "--template=", "--no-checkout"])
+                .args(["--filter=blob:none"])
+                .arg(format!("file://{}", origin.display()))
+                .arg(&clone),
+        )
+        .unwrap();
+        (root, clone)
+    }
+
+    #[test]
+    fn a_partial_clone_source_is_refused_before_any_read() {
+        let (root, clone) = partial_fixture("export");
+        assert!(partial_clone(&clone).unwrap());
+        let origin = root.join("origin");
+        assert!(!partial_clone(&origin).unwrap());
+        let objects_before = filesystem_rows(&clone.join(".git/objects")).unwrap();
+        let capture = root.join("capture");
+        assert_eq!(
+            export_repository(&clone, &capture).unwrap_err(),
+            BulkloadRefusal::GitSourcePartialClone
+        );
+        // Refused before the private repository exists, and the clone's object
+        // store is exactly as it was: nothing was fetched into it.
+        assert!(!capture.join("repository.git").exists());
+        assert_eq!(
+            objects_before,
+            filesystem_rows(&clone.join(".git/objects")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn promisor_configuration_alone_marks_a_partial_clone() {
+        let (root, _) = partial_fixture("config");
+        let origin = root.join("origin");
+        output(git(&origin).args(["config", "remote.lane.promisor", "false"])).unwrap();
+        assert!(!partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "remote.lane.promisor", "true"])).unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "--unset", "remote.lane.promisor"])).unwrap();
+        output(git(&origin).args(["config", "core.partialCloneFilter", "blob:none"])).unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "--unset", "core.partialCloneFilter"])).unwrap();
+        // A `.promisor` pack reached only through an alternate.
+        let borrowed = root.join("borrowed");
+        fs::create_dir_all(borrowed.join("pack")).unwrap();
+        fs::write(borrowed.join("pack/pack-0.promisor"), b"").unwrap();
+        fs::create_dir_all(origin.join(".git/objects/info")).unwrap();
+        fs::write(
+            origin.join(".git/objects/info/alternates"),
+            format!("{}\n", borrowed.display()),
+        )
+        .unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn standalone_attachment_maps_origin_and_retains_tracking_without_executable_config() {
         let root = std::env::temp_dir().join(format!("bulkload-config-{}", std::process::id()));

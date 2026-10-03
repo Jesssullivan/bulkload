@@ -51,6 +51,23 @@ plan or SOURCE label, or listing an item twice, refuses.
 Both hosts stay usable. Bulkload never signals sessions, never requires a
 stillness pair and never requires writers to pause.
 
+Source safety (S2, WP1):
+
+- Every Git child is built from one hardening table (`git_carry::git_env`):
+  no hooks, fsmonitor, automatic gc or maintenance, optional locks, lazy
+  fetch, system or global config, or replace objects; the C locale; and a
+  discovery ceiling at the given path's parent. The estimate's remote probe
+  is tested against the same table.
+- A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
+  read, in `git-export` and `estate-capture`.
+- Source-side verbs (`serve`, `estate-capture`, `snapshot`,
+  `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
+  priority before anything else (WP0(f)), inherited by every thread and
+  child. `--priority=normal` is the explicit, recorded opt-out; every
+  counters line and the bench header record the class.
+- `serve` and `copy` refuse a private state root that overlaps the source
+  (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
 paths. Import preserves divergence and leaves active HEADs, indexes and
@@ -72,6 +89,13 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
+- An object-store rewrite is drift too (WP1, S5). The export reads the
+  source's pack listing with its authority; when a Git child of the pass
+  fails and that listing has changed (a `gc`, `repack` or `prune` racing
+  the pass through the private repository's `alternates`), the item is
+  `deferred-with-drift` with one `ObjectStoreRewritten` row, no capture
+  record is written, and the next pass captures the rewritten store. The
+  same failure under an unchanged listing still refuses.
 - The pass window runs from the pre-pass key to the post-pass key, not only
   across the export's own snapshot. A capture is clean only when the
   pre-pass key parts, the export's own before and after ref inventories, and
