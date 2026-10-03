@@ -184,8 +184,11 @@ miss (#87).
   walk ends. The walk runs at most 4096 items ahead of the wire. Every seat
   is walked and read beneath one descriptor of the source root, opened
   component by component with `O_NOFOLLOW` at each one, so a directory
-  swapped for a symlink is refused, never followed out of the root. Content
-  is read with `pread`, never mapped.
+  swapped for a symlink is refused, never followed out of the root. A seat
+  more than 256 components below the root, or with a relative path over 4095
+  bytes, is refused as a value (`PATH_DEPTH_EXCEEDED`, `PATH_TOO_LONG`) with
+  its subtree, and its siblings are carried; the walk so holds at most 256
+  directory descriptors (#110). Content is read with `pread`, never mapped.
 - **Send.** The source reads the file once, chunks it, hashes each chunk and
   streams it as a data frame (entry, chunk index, offset, size, digest), then
   sends `End` with the manifest root, chunk count, size and whether the
