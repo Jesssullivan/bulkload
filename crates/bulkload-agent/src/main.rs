@@ -918,13 +918,14 @@ fn report_counters(verb: &str, started: std::time::Instant) {
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
-         source_engine_temporaries={}",
+         source_engine_temporaries={} capped_subtrees={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
         stats.source_bytes_read,
         stats.refusals.len(),
-        stats.source_engine_temporaries.len()
+        stats.source_engine_temporaries.len(),
+        stats.capped_subtrees()
     );
     for (path, code) in &stats.refusals {
         eprintln!("refused {}: {code}", path.escape_ascii());
@@ -1071,6 +1072,14 @@ fn walk_command(root: &Path) -> Result<()> {
     println!("rows                     {}", outcome.rows.len());
     println!("refusals                 {}", outcome.refusals.len());
     println!(
+        "capped_subtrees          {}",
+        outcome
+            .refusals
+            .iter()
+            .filter(|seat| walk::is_cap_refusal(seat.refusal.code()))
+            .count()
+    );
+    println!(
         "engine_temporaries       {}",
         outcome.engine_temporaries.len()
     );
@@ -1085,6 +1094,15 @@ fn walk_command(root: &Path) -> Result<()> {
         "files_statted_twice      {}",
         outcome.stats.files_statted_twice
     );
+    // Every declined seat by path and code, so a capped subtree (#129) is
+    // attributable, never only a count.
+    for seat in &outcome.refusals {
+        eprintln!(
+            "refused {}: {}",
+            seat.rel_path.escape_ascii(),
+            seat.refusal.code()
+        );
+    }
     Ok(())
 }
 
