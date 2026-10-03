@@ -84,6 +84,54 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
   touched bytes. Salvage is bounded, with a typed refusal when the bound is hit.
   R25 stays strict for anything the destination held durably.
 
+## Amendments 2026-10-03: architecture rulings (WP0, OI-1003-Q15..Q20)
+
+The [architecture review](plans/2026-10-03-architecture-review.md) work package
+WP0 was ratified as follows. The
+[property-test plan](plans/2026-10-03-property-test-plan.md) implements S2 and S3
+as properties.
+
+- **(a) Git carry engine: measure first (OI-1003-Q15).**
+  - Land counted v1 pack reads, a `census_walks` counter, and v1 bundles that
+    derive their prerequisite from the previous retained capture's tips.
+  - Then measure S3 on the estate-shaped corpus (e).
+  - Choose v1, hybrid (v1 estate layer with v2 negotiation) or v2 on the numbers.
+  - Until then, carry_v2 stays frozen behind a feature. Its open PRs (#136) are
+    held, and new work avoids it.
+- **(b) S2 typed source access (OI-1003-Q16).**
+  - Every source access is typed by kind: file read, an allowlisted git read
+    command, or SQLite backup.
+  - The SQLite backup API's shared read lock on a live provider database is the
+    one stated exception to "no locks". It is shared-read only, bounded in
+    duration, and counted. Everything else stays lock-free.
+- **(c) S3 delta, restated as two inequalities (OI-1003-Q18).**
+  - Source content bytes read ≤ the sum of sizes of changed or racy seats.
+  - Wire content bytes ≤ the sum of absent chunks.
+  - The unchanged-estate clause (0 content bytes, ≤ 10 % wall-clock) is
+    unchanged.
+- **(d) Superseding publish (OI-1003-Q18).**
+  - A rerun may replace a destination output only when the output's
+    (dev, ino, stat) equals this store's own ledger row: bulkload wrote it, and
+    nothing has touched it since.
+  - Anything else stays no-clobber.
+  - New crash traces prove the replacement ordering.
+- **(e) Estate-shaped S1 corpus (OI-1003-Q19).** A deterministic, sealed
+  generator of git-heavy, many-small-file trees. S1 is measured on it in
+  addition to R23's corpus v1.
+- **(f) Background priority by default (OI-1003-Q17).**
+  - Source-side verbs (serve, estate-capture, snapshot, estimate) enter
+    background CPU and IO priority at startup:
+    - Linux: nice 19 and ioprio IDLE.
+    - Darwin: IOPOL_THROTTLE and QoS background.
+  - Every S1 sample records its class.
+  - Gate (a) may opt out only with an explicit, recorded flag.
+- **(g) Relaxed source-ledger durability (OI-1003-Q20).**
+  - The source-side ledger may run with `synchronous=NORMAL` and
+    `fullfsync=OFF`.
+  - Losing a source row costs at most a re-read. R25 is carried by the
+    destination's durable records.
+  - This holds only if proven in the formal model.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
