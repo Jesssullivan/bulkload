@@ -56,10 +56,50 @@ installer are retired and are not recreated.
 - `crates/bulkload-bench`: the R23 benchmark against rclone.
 
 Product bar: [#34](https://github.com/Jesssullivan/bulkload/issues/34) (R25).
-Current engineering work: Linear project "Bulkload M2: SLO engine"
-(P-TIN-177) and GitHub issues #42–#49. [docs/design.md](docs/design.md) is
-the product contract; `docs/evidence/` holds measured results and the
-historical rulings ledger (evidence, not current instructions).
+[docs/design.md](docs/design.md) is the product contract; `docs/evidence/` holds
+measured results and the historical rulings ledger (evidence, not current
+instructions).
+
+## Sources of truth
+
+Point to these; do not copy their content into agent files or notes.
+
+- **Product shape, real goals, SLO summary, proof package and the live
+  workstream ledger:** the Linear document
+  [Bulkload — product shape, SLOs, proofs and live workstreams (SSOT)](https://linear.app/tinyland/document/bulkload-product-shape-slos-proofs-and-live-workstreams-ssot-5e4bab288565)
+  in project P-TIN-177.
+- **SLO definitions S1–S5, the completion bar and policy rulings
+  (versioned):** [docs/slo.md](docs/slo.md) (OI-1003-Q1..Q13).
+- **Engine history and gate receipts:** Linear TIN-4543. **Estate and cohort
+  history:** TIN-3692.
+- **Work items:** GitHub issues, labelled `gate-a`, `pre-migration` or `later`.
+
+The completion bar is confidence in the code and the product. A full neo→sting
+migration is one more run of a trusted tool, not a scheduled event
+(OI-1003-Q13).
+
+## Live workstreams
+
+Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
+2026-10-03:
+
+- **Restate the workstreams every context.** At least once in every context,
+  including after compaction or recovery, visibly restate the live, queued and
+  held bulkload workstreams. For each, give:
+  - its ticket or goal;
+  - its owner (seat, agent or workflow);
+  - its repo and branch, PR or worktree;
+  - its current state and evidence;
+  - its dependency or blocker;
+  - its next action.
+
+  Mark reported facts separately from verified ones, and label unknowns
+  explicitly.
+- **Keep the ledger current.** Reconcile the ledger in the Linear SSOT document
+  when a stream changes state: a PR opened or merged, a gate run, a hold lifted.
+  The chat restatement and the document must agree.
+- **Compact format is allowed.** A compact table works after a readable
+  explanation, provided holds and unfinished work stay visible.
 
 ## Engine rules
 
