@@ -250,46 +250,65 @@ fn orphans_with_this_pid_never_block_a_stage() {
     }
 }
 
-/// #77 round 2, N4: after a destination-side refusal, salvaged temporaries
-/// are kept, so a refused entry whose only durable copy is one of them is
-/// not read from the source on the next run.
+/// #97: salvaged temporaries are removed when a session finishes, even one
+/// with a destination-side refusal, so a path refused on every run never
+/// keeps them: no later session re-indexes them or asks for a manifest of
+/// every file because of them. Salvage only ever saved wire bytes: a
+/// refused entry's capture was never recorded, so it is read again anyway.
 #[test]
-fn salvage_survives_a_destination_refusal() {
+fn salvage_is_removed_even_when_a_path_is_refused_every_run() {
     let corpus = Corpus::new();
     let bytes = noise(41, 1 << 20);
     std::fs::write(corpus.base.join("source/held"), &bytes).unwrap();
-    assert!(corpus.run().unwrap().refusals.is_empty());
+    std::fs::write(corpus.base.join("source/blocked"), noise(42, 4_096)).unwrap();
+    // The path is taken by a directory: the destination refuses the entry
+    // on every run.
+    std::fs::create_dir(corpus.base.join("destination/blocked")).unwrap();
+    let first = corpus.run().unwrap();
+    assert_eq!(first.refusals.len(), 1, "{:?}", first.refusals);
     let temporary = own_temporary(&corpus, 1, 7);
     std::fs::rename(corpus.base.join("destination/held"), &temporary).unwrap();
-    // The path is taken by a directory: the destination refuses the entry.
-    std::fs::create_dir(corpus.base.join("destination/held")).unwrap();
-    let refused = corpus.run().unwrap();
-    assert_eq!(refused.refusals.len(), 1, "{:?}", refused.refusals);
-    assert_eq!(refused.temporaries_removed, 0);
-    assert_eq!(refused.temporaries_left.len(), 1);
-    // The kept orphan is reported under the session name it was renamed to
-    // (#77 round 3, F1), and that is where it is.
-    let left = &refused.temporaries_left[0];
-    assert_ne!(
-        left.as_slice(),
-        temporary.file_name().unwrap().as_bytes(),
-        "reported under its pre-rename name"
-    );
-    assert!(!temporary.exists());
-    assert!(corpus
-        .base
-        .join("destination")
-        .join(std::ffi::OsStr::from_bytes(left))
-        .is_file());
-    std::fs::remove_dir(corpus.base.join("destination/held")).unwrap();
-    let resumed = corpus.run().unwrap();
-    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
-    assert_eq!(resumed.source_bytes_read, 0);
-    assert_eq!(resumed.bytes_received, 0);
+    for run in 0..2 {
+        let refused = corpus.run().unwrap();
+        assert_eq!(
+            refused.refusals.len(),
+            1,
+            "run {run}: {:?}",
+            refused.refusals
+        );
+        assert_eq!(refused.refusals[0].0, b"blocked".to_vec());
+        assert_eq!(
+            refused.temporaries_removed,
+            u64::from(run == 0),
+            "run {run}"
+        );
+        assert!(
+            refused.temporaries_left.is_empty(),
+            "run {run}: {:?}",
+            refused.temporaries_left
+        );
+        assert!(!temporary.exists());
+        let orphans = std::fs::read_dir(corpus.base.join("destination"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".bulkload-")
+            })
+            .count();
+        assert_eq!(orphans, 0, "run {run}");
+    }
     assert_eq!(
         std::fs::read(corpus.base.join("destination/held")).unwrap(),
         bytes
     );
+    std::fs::remove_dir(corpus.base.join("destination/blocked")).unwrap();
+    let clean = corpus.run().unwrap();
+    assert!(clean.refusals.is_empty(), "{:?}", clean.refusals);
+    assert!(clean.temporaries_left.is_empty());
 }
 
 /// A file the destination staged and sealed but never published (a crash
@@ -1118,4 +1137,232 @@ fn walk_ahead_wait_is_accounted_apart_from_walk_work() {
     let after = TransferTiming::snapshot();
     assert!(after.walk_wait_ns >= time.wait_ns);
     assert!(after.render().contains("walk_wait_ns="));
+}
+
+/// Pins the capture clock for one source root while it lives.
+struct PinnedClock(PathBuf);
+impl PinnedClock {
+    fn at(corpus: &Corpus, clock: i128) -> Self {
+        let root = std::fs::canonicalize(corpus.base.join("source")).unwrap();
+        set_capture_clock(&root, Some(clock));
+        Self(root)
+    }
+}
+impl Drop for PinnedClock {
+    fn drop(&mut self) {
+        set_capture_clock(&self.0, None);
+    }
+}
+
+fn stamp_ns(path: &Path) -> i128 {
+    let identity = StatIdentity::from_metadata(&std::fs::metadata(path).unwrap());
+    identity.mtime_ns.max(identity.ctime_ns)
+}
+
+/// Captures and output rows held by the source and destination stores.
+fn rows(corpus: &Corpus) -> (u64, u64) {
+    let (captures, _) = Store::open(&corpus.base.join("source-state"))
+        .unwrap()
+        .row_counts()
+        .unwrap();
+    let (_, outputs) = Store::open(&corpus.base.join("destination-state"))
+        .unwrap()
+        .row_counts()
+        .unwrap();
+    (captures, outputs)
+}
+
+/// #86 (R25, R-N58, R-N76): a seat stamped within one timestamp tick of its
+/// capture can be rewritten at the same size without its stat identity
+/// moving, so a ledger or output row for it could describe old content and
+/// answer the next run with `Reuse`. Such a capture is sent but never
+/// recorded on either side. A same-size rewrite with its mtime restored is
+/// then never answered from a row: it is read again and, since outputs are
+/// never replaced, surfaces as a typed conflict. Once the clock is past the
+/// tick, the capture is recorded and a warm run reads nothing.
+#[test]
+fn a_racy_capture_is_sent_but_never_recorded() {
+    const SIZE: usize = 300_000;
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    let first_bytes = noise(86, SIZE);
+    std::fs::write(&seat, &first_bytes).unwrap();
+    let mtime = std::fs::metadata(&seat).unwrap().modified().unwrap();
+
+    // Captured inside the seat's tick: racy.
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 500_000_000);
+    let first = corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert_eq!(first.source_bytes_read, SIZE as u64);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/seat")).unwrap(),
+        first_bytes
+    );
+    assert_eq!(rows(&corpus), (0, 0), "a racy capture is never recorded");
+
+    // A same-size rewrite with its mtime restored, inside the tick.
+    std::fs::write(&seat, noise(87, SIZE)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&seat)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    drop(clock);
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 500_000_000);
+    let second = corpus.run().unwrap();
+    assert_eq!(second.reused, 0, "no row answers a racy seat");
+    assert_eq!(second.source_bytes_read, SIZE as u64);
+    assert_eq!(
+        second.refusals,
+        [(b"seat".to_vec(), "GIT_DESTINATION_OCCUPIED".to_owned())]
+    );
+    assert_eq!(rows(&corpus), (0, 0));
+
+    // The conflict resolved and the clock past the tick: read once more
+    // (nothing was recorded), and recorded this time.
+    drop(clock);
+    std::fs::remove_file(corpus.base.join("destination/seat")).unwrap();
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 60 * RACY_GRANULARITY_NS);
+    let settled = corpus.run().unwrap();
+    assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
+    assert_eq!(settled.source_bytes_read, SIZE as u64);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/seat")).unwrap(),
+        std::fs::read(&seat).unwrap()
+    );
+    assert_eq!(rows(&corpus), (1, 1));
+    let warm = corpus.run().unwrap();
+    assert_eq!((warm.reused, warm.source_bytes_read), (1, 0));
+    drop(clock);
+}
+
+/// #86: a seat stamped later than the capture's own clock reading comes
+/// from a clock the capture cannot order against, and is racy too.
+#[test]
+fn a_capture_stamped_in_the_future_is_never_recorded() {
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    std::fs::write(&seat, noise(88, 50_000)).unwrap();
+    let _clock = PinnedClock::at(&corpus, stamp_ns(&seat) - 60 * RACY_GRANULARITY_NS);
+    let first = corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert_eq!(rows(&corpus), (0, 0));
+    let again = corpus.run().unwrap();
+    assert_eq!((again.reused, again.source_bytes_read), (0, 50_000));
+}
+
+/// Records the destination's `Held` answers as they are written.
+struct HeldLog<W> {
+    output: W,
+    frame: Vec<u8>,
+    held: Arc<Mutex<Vec<(u64, bool)>>>,
+}
+impl<W: Write> Write for HeldLog<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let count = self.output.write(data)?;
+        self.frame.extend_from_slice(data.get(..count).unwrap());
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        while let Ok((frame, consumed)) = Frame::decode(&self.frame) {
+            if let Frame::Control(Control::Held { entry, held }) = frame {
+                self.held.lock().unwrap().push((entry, held));
+            }
+            self.frame.drain(..consumed);
+        }
+        self.output.flush()
+    }
+}
+
+/// #100 (R25, R-N86, R-N88): a destination group commit that fails (here
+/// its store commit, with `ENOSPC`) answers every entry of the group
+/// `Held{false}`. No ledger row and no output row commits, the session ends
+/// with the typed space refusal for each entry instead of hanging, and the
+/// next run reads each file exactly once.
+#[test]
+fn a_failed_group_commit_answers_held_false_and_records_nothing() {
+    const FILES: usize = 3;
+    const SIZE: usize = 200_000;
+    let corpus = Corpus::new();
+    for index in 0..FILES {
+        std::fs::write(
+            corpus.base.join("source").join(format!("file-{index}")),
+            noise(100 + index as u64, SIZE),
+        )
+        .unwrap();
+    }
+    let store_root = Store::open(&corpus.base.join("destination-state"))
+        .unwrap()
+        .root()
+        .to_path_buf();
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    for stream in [&sender, &receiver] {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_mins(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_mins(1)))
+            .unwrap();
+    }
+    let (source_outcome, destination_outcome) = std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            let input = sender.try_clone().unwrap();
+            let closer = sender.try_clone().unwrap();
+            let mut output = sender;
+            let served = serve(input, &mut output);
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+            served
+        });
+        let mut output = HeldLog {
+            output: receiver.try_clone().unwrap(),
+            frame: Vec::new(),
+            held: Arc::clone(&held),
+        };
+        let outcome = receive(
+            &mut receiver,
+            &mut output,
+            &corpus.base.join("source"),
+            &corpus.base.join("source-state"),
+            &corpus.base.join("destination"),
+            &corpus.base.join("destination-state"),
+        );
+        let _ = receiver.shutdown(std::net::Shutdown::Both);
+        (producer.join().unwrap(), outcome)
+    });
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    source_outcome.unwrap();
+    let stats = destination_outcome.unwrap();
+    let mut answers = held.lock().unwrap().clone();
+    answers.sort_unstable();
+    assert_eq!(answers.len(), FILES, "{answers:?}");
+    assert!(answers.iter().all(|(_, held)| !held), "{answers:?}");
+    assert_eq!(stats.completed, 0);
+    assert_eq!(stats.refusals.len(), FILES, "{:?}", stats.refusals);
+    assert!(
+        stats
+            .refusals
+            .iter()
+            .all(|(_, code)| code == "DESTINATION_SPACE_INSUFFICIENT"),
+        "{:?}",
+        stats.refusals
+    );
+    assert_eq!(rows(&corpus), (0, 0), "a failed group commits no row");
+
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.completed, FILES as u64);
+    assert_eq!(resumed.source_bytes_read, (FILES * SIZE) as u64);
+    assert_eq!(rows(&corpus), (FILES as u64, FILES as u64));
+    let warm = corpus.run().unwrap();
+    assert_eq!((warm.reused, warm.source_bytes_read), (FILES as u64, 0));
+    for index in 0..FILES {
+        let relative = format!("file-{index}");
+        assert_eq!(
+            std::fs::read(corpus.base.join("source").join(&relative)).unwrap(),
+            std::fs::read(corpus.base.join("destination").join(relative)).unwrap()
+        );
+    }
 }

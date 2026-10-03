@@ -65,6 +65,13 @@ pub enum BulkloadRefusal {
     PathMapDetached,
     /// A path left the tree it was resolved against (traversal or symlink).
     PathEscapesRoot,
+    /// A directory lies deeper beneath the walk root than the walk descends
+    /// (`walk::MAX_WALK_DEPTH`); its contents are refused as one subtree.
+    PathDepthExceeded,
+    /// A path relative to the walk root is longer than the walk carries
+    /// (`walk::MAX_REL_PATH_BYTES`); the seat, and anything beneath it, is
+    /// refused.
+    PathTooLong,
 
     // ---- git custody ------------------------------------------------------
     /// Git is not available on this host.
@@ -200,6 +207,8 @@ impl BulkloadRefusal {
             Self::PathNotPortable => "PATH_NOT_PORTABLE",
             Self::PathMapDetached => "PATH_MAP_DETACHED",
             Self::PathEscapesRoot => "PATH_ESCAPES_ROOT",
+            Self::PathDepthExceeded => "PATH_DEPTH_EXCEEDED",
+            Self::PathTooLong => "PATH_TOO_LONG",
             Self::GitUnavailable => "GIT_UNAVAILABLE",
             Self::GitAuthorityOutsideRoot => "GIT_AUTHORITY_OUTSIDE_ROOT",
             Self::GitAuthorityChanged => "GIT_AUTHORITY_CHANGED",
@@ -259,6 +268,8 @@ impl BulkloadRefusal {
         "PATH_NOT_PORTABLE",
         "PATH_MAP_DETACHED",
         "PATH_ESCAPES_ROOT",
+        "PATH_DEPTH_EXCEEDED",
+        "PATH_TOO_LONG",
         "GIT_UNAVAILABLE",
         "GIT_AUTHORITY_OUTSIDE_ROOT",
         "GIT_AUTHORITY_CHANGED",
@@ -359,6 +370,8 @@ mod tests {
             BulkloadRefusal::PathNotPortable,
             BulkloadRefusal::PathMapDetached,
             BulkloadRefusal::PathEscapesRoot,
+            BulkloadRefusal::PathDepthExceeded,
+            BulkloadRefusal::PathTooLong,
             BulkloadRefusal::GitUnavailable,
             BulkloadRefusal::GitAuthorityOutsideRoot,
             BulkloadRefusal::GitAuthorityChanged,

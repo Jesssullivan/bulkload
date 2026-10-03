@@ -1737,7 +1737,7 @@ pub const RACY_GRANULARITY_NS: i128 = 2_000_000_000;
 // identity; the next pass reads it again. A seat stamped later than this
 // pass's own clock reading comes from a clock this pass cannot order against,
 // and fails closed as racy too.
-const fn racy(row: &crate::RowSchema, started_ns: i128, now_ns: i128) -> bool {
+pub(crate) const fn racy(row: &crate::RowSchema, started_ns: i128, now_ns: i128) -> bool {
     let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
     row.mtime_ns >= window
         || row.ctime_ns >= window

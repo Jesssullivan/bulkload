@@ -211,6 +211,10 @@ fn populate(source: &Path, fixture: Fixture) {
     if fixture.refused {
         fs::write(source.join(REFUSED), b"SQLite format 3\0refused raw copy").unwrap();
     }
+    // Fresh seats are racy for one timestamp tick and their captures are
+    // never recorded (#86); settle them so the source ledger's publication
+    // points are reached and I3 counts committed captures.
+    bulkload_agent::transfer::settle_racy_window(source).unwrap();
 }
 
 /// Every regular file and directory beneath `root`, by relative path.
@@ -1252,6 +1256,9 @@ fn live_writer(mutation: Mutation) -> Scratch {
         )
         .unwrap();
     }
+    // Settle the fresh seats past the racy window (#86), so every
+    // bystander's capture is recorded.
+    bulkload_agent::transfer::settle_racy_window(&source).unwrap();
     // A coarse-grained filesystem clock could give the mutation the victim's
     // own ctime. Busy-poll a scratch file (no sleep) until its ctime is past
     // the victim's, so any later mutation carries a later ctime.
