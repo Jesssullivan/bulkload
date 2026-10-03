@@ -253,8 +253,10 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::os::unix::fs::DirBuilderExt;
     use std::process::Command;
 
@@ -299,24 +301,24 @@ mod tests {
         let head = git(&["rev-parse", "HEAD"]);
         // A header-only prior: one held tip and thousands the source lacks.
         let mut header = String::from("# v2 git bundle\n");
-        header.push_str(&format!("{head} refs/heads/main\n"));
+        writeln!(header, "{head} refs/heads/main").unwrap();
         for index in 0..TIPS {
             let missing = blake3::hash(format!("tip {index}").as_bytes()).to_hex();
-            header.push_str(&format!("{} refs/tags/t{index}\n", &missing[..40]));
+            writeln!(header, "{} refs/tags/t{index}", &missing[..40]).unwrap();
         }
         header.push('\n');
         let prior = root.join("prior.bundle");
         fs::write(&prior, header).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let (thread_source, thread_prior) = (source.clone(), prior.clone());
+        let (queried, bundle) = (source, prior);
         std::thread::spawn(move || {
-            let _ = sender.send(source_held_tips(&thread_source, &thread_prior));
+            let _ = sender.send(source_held_tips(&queried, &bundle));
         });
-        let held = receiver
-            .recv_timeout(std::time::Duration::from_secs(120))
+        let answered = receiver
+            .recv_timeout(std::time::Duration::from_mins(2))
             .expect("source_held_tips must return, not block on a full pipe")
             .unwrap();
-        assert_eq!(held, BTreeSet::from([head]));
+        assert_eq!(answered, BTreeSet::from([head]));
         let _ = fs::remove_dir_all(&root);
     }
 }

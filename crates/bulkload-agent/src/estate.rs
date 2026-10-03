@@ -4987,7 +4987,7 @@ mod wp2_chain {
     }
 
     /// Digest binding is still binding: a pulled link whose bytes are not
-    /// the recorded ones refuses DIGEST_MISMATCH and restores nothing.
+    /// the recorded ones refuses `DIGEST_MISMATCH` and restores nothing.
     #[test]
     fn a_pulled_chain_link_with_other_bytes_refuses_by_type() {
         let fixture = chain_fixture("pulled-tampered");
