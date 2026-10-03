@@ -645,24 +645,13 @@ impl<'a> Ingest<'a> {
             return Err(BulkloadRefusal::FieldDomainViolation.into());
         }
         // #82: keyed by the state dir's identity token, not its path; #120:
-        // a copied state dir has a token of its own, and knows the one it
-        // was copied with.
-        let keys = journals.keys()?;
-        let quarantine = format!("incoming-bulkload-{pack_id}-{}", keys.current);
-        let predecessor = keys
-            .predecessor
-            .map(|key| format!("incoming-bulkload-{pack_id}-{key}"));
+        // a copied state dir has a token of its own.
+        let quarantine = format!("incoming-bulkload-{pack_id}-{}", journals.key()?);
         let git_dir = target.repository.git_dir.as_path();
         let journal = match Journal::open(journals, &pack_id)? {
             Found::Existing(journal, records) => {
                 return Self::existing(
-                    target,
-                    journals,
-                    plan,
-                    journal,
-                    &records,
-                    (quarantine, predecessor),
-                    store,
+                    target, journals, plan, journal, &records, quarantine, store,
                 );
             }
             Found::Fresh(journal) => journal,
@@ -676,8 +665,8 @@ impl<'a> Ingest<'a> {
         // is discarded, never adopted. #75 r4 N1: only once its own `flock`
         // is taken: a live session holds it, so a session whose journal name
         // was replaced under it keeps its packs and this open refuses.
-        // #120: only this state dir's own name; a copied state dir's
-        // predecessor's quarantine is never touched.
+        // #120: only this state dir's own name; any other state dir's
+        // quarantine (a copy's original among them) is never touched.
         if let Err(refused) = discard_quarantine(&target.objects, &quarantine, None) {
             // #75 r5: the journal is this open's own and empty (created, or
             // emptied in place, under its lock); leave none behind. #94: the
@@ -721,16 +710,18 @@ impl<'a> Ingest<'a> {
     /// quarantine lost a journaled pack (or is gone) is abandoned, since it
     /// can never finish (#75 r2 N2), and an open then starts afresh.
     ///
-    /// #120: `quarantines` is this state dir's quarantine name and, for a
-    /// copied state dir, its predecessor's. A journal with acked segments
-    /// whose own quarantine is absent while the predecessor's exists was
-    /// copied mid-session (or its state dir moved across file systems): the
-    /// acked packs are durable in a quarantine another state dir owns. It
-    /// refuses `JOURNAL_OWNERSHIP_CONFLICT` / `state_dir_copied`, abandoning
-    /// nothing and adopting nothing, rather than re-sending what the
-    /// destination durably holds (R25) or sharing a quarantine with the
-    /// original. Once that quarantine is gone, the journal is abandoned as
-    /// lost like any other.
+    /// #120: a journal with acked segments whose own quarantine is absent
+    /// while any other quarantine for its pack id exists was copied
+    /// mid-session, or its state dir moved across file systems (or remounted
+    /// with new inode numbers), once or more: the acked packs may be durable
+    /// in a quarantine no state dir now names. It refuses
+    /// `JOURNAL_OWNERSHIP_CONFLICT` / `state_dir_copied`, abandoning nothing
+    /// and adopting nothing, rather than re-sending what the destination
+    /// durably holds (R25, OI-1002-Q33). Any quarantine counts, not only the
+    /// one this state dir was last copied from: a copy whose first open
+    /// refused was already re-keyed, so a second hop names a predecessor
+    /// that never had a quarantine. Once no other quarantine for the pack id
+    /// is left, the journal is abandoned as lost like any other.
     #[allow(clippy::too_many_arguments)]
     fn existing(
         target: &'a Target,
@@ -738,10 +729,9 @@ impl<'a> Ingest<'a> {
         plan: Option<IngestPlan>,
         journal: Journal,
         records: &[Record],
-        quarantines: (String, Option<String>),
+        quarantine: String,
         store: Option<&'a StderrStore>,
     ) -> Outcome<Self> {
-        let (quarantine, predecessor) = quarantines;
         let git_dir = target.repository.git_dir.as_path();
         let (journaled, recorded_dir, start) = IngestPlan::from_records(records)?;
         if recorded_dir != git_dir.as_os_str().as_bytes()
@@ -767,11 +757,11 @@ impl<'a> Ingest<'a> {
         if session.claim.is_none()
             && session.stage < Stage::Migrated
             && !session.acks.is_empty()
-            && predecessor
-                .as_deref()
-                .map(|name| quarantine_exists(&target.objects, name))
-                .transpose()?
-                .unwrap_or(false)
+            && other_quarantine_exists(
+                &target.objects,
+                session.plan.pack_id(),
+                &session.quarantine,
+            )?
         {
             return Err(Refused::because(
                 BulkloadRefusal::JournalOwnershipConflict,
@@ -1838,14 +1828,18 @@ fn claim_quarantine(objects: &Path, name: &str) -> Outcome<Option<File>> {
     Ok(Some(quarantine))
 }
 
-/// Whether a quarantine `name` exists under `objects` (not followed).
-fn quarantine_exists(objects: &Path, name: &str) -> crate::Result<bool> {
+/// #120: whether `objects` holds a quarantine for `pack_id` other than
+/// `own`: any `incoming-bulkload-<pack_id>-<key>` entry, whichever state dir
+/// (or no state dir any more) names it.
+fn other_quarantine_exists(objects: &Path, pack_id: &str, own: &str) -> crate::Result<bool> {
+    let prefix = format!("incoming-bulkload-{pack_id}-");
     let objects = open_dir(objects)?;
-    match open_dir_at(&objects, &cstring(name.as_bytes())?) {
-        Ok(_) => Ok(true),
-        Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(false),
-        Err(error) => Err(error),
-    }
+    Ok(entries(&objects)?.iter().any(|name| {
+        name.as_slice() != own.as_bytes()
+            && name.strip_prefix(prefix.as_bytes()).is_some_and(|key| {
+                key.len() == 16 && key.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    }))
 }
 
 /// Remove the quarantine `name` under `objects`: every file in its `pack/`,

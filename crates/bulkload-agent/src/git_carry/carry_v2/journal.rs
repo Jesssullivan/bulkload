@@ -53,10 +53,9 @@ impl JournalStore {
         self.state.is_inside(path)
     }
 
-    /// Short names for this state dir: the first 16 hex digits of BLAKE3
-    /// over its identity token. The current one keys the quarantine, so two
-    /// state dirs ingesting one plan never share (or adopt) a quarantine
-    /// (#75 r2 N4).
+    /// A short name for this state dir: the first 16 hex digits of BLAKE3
+    /// over its identity token. It keys the quarantine, so two state dirs
+    /// ingesting one plan never share (or adopt) a quarantine (#75 r2 N4).
     ///
     /// #82 (R25 / R-N58): the token is 32 random bytes created once in
     /// `git-carry-v2/quarantine-key` ([`state_binding`]), never the state
@@ -67,24 +66,22 @@ impl JournalStore {
     ///
     /// #120: the token is bound to the inode numbers of the state dir and of
     /// the token file. A copy of the state dir (token included) has other
-    /// inodes, so its first open mints a token of its own and records the
-    /// one it was copied with as its predecessor: the copy and the original
-    /// never name (or discard) each other's quarantine, however their
-    /// sessions are ordered. The predecessor's key lets a copied in-flight
-    /// journal refuse instead of re-sending what the original's quarantine
-    /// durably holds ([`StateKeys::predecessor`]).
+    /// inodes, so its first open mints a token of its own (recording the one
+    /// it was copied with as its predecessor, for provenance): the copy and
+    /// the original never name (or discard) each other's quarantine, however
+    /// their sessions are ordered. A copied in-flight journal refuses rather
+    /// than re-sending what another quarantine durably holds; that check is
+    /// the ingest's, over every quarantine for the pack id, since a copy of
+    /// a copy's predecessor may never have had a quarantine.
     ///
     /// # Errors
     /// As [`state_binding`].
-    pub(super) fn keys(&self) -> crate::Result<StateKeys> {
+    pub(super) fn key(&self) -> crate::Result<String> {
         let carry = private_subdirectory(self.state.directory(), "git-carry-v2", true)?
             .ok_or(BulkloadRefusal::Io(None))?;
         seal_dir(self.state.directory())?;
         let binding = state_binding(self.state.directory(), &carry)?;
-        Ok(StateKeys {
-            current: quarantine_key(&binding.token),
-            predecessor: binding.predecessor.as_ref().map(quarantine_key),
-        })
+        Ok(quarantine_key(&binding.token))
     }
 
     /// `git-carry-v2/ingest/`, created (0700, sealed) when `create` is set.
@@ -100,18 +97,6 @@ impl JournalStore {
         }
         Ok(ingest)
     }
-}
-
-/// The quarantine keys [`JournalStore::keys`] returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StateKeys {
-    /// This state dir's key: it names the quarantine.
-    pub(super) current: String,
-    /// #120: the key of the state dir this one was copied from (or moved
-    /// from across file systems, which is a copy), when its binding records
-    /// one. That quarantine is never this state dir's to adopt, sweep or
-    /// discard.
-    pub(super) predecessor: Option<String>,
 }
 
 /// The first 16 hex digits of BLAKE3 over a domain tag and `token`.
@@ -242,7 +227,7 @@ fn random_token() -> crate::Result<[u8; TOKEN_BYTES]> {
 ///   is bound, with the record's token as its predecessor; the original
 ///   keeps its token, so neither ever discards the other's quarantine.
 /// - Anything else (another length, or a record failing its check):
-///   `PATH_ESCAPES_ROOT`; no crash leaves it (see below).
+///   `PATH_ESCAPES_ROOT`; no crash leaves it, under the assumption below.
 ///
 /// A record is written whole with one `pwrite` at offset 0 and never
 /// truncated first, so a crash leaves the old record or the new one: it is
@@ -251,6 +236,13 @@ fn random_token() -> crate::Result<[u8; TOKEN_BYTES]> {
 /// under an exclusive `flock` on the file, and both the file and `carry`
 /// are sealed before the lock is released or the token returned, so no
 /// quarantine is ever named by a token that a power loss could take back.
+///
+/// Assumption (recorded, not checked): the file system writes one in-sector
+/// `pwrite` atomically and orders an extending write's data before its new
+/// size (ext4 `data=ordered`, XFS, APFS, btrfs, ZFS). One that can persist
+/// the new size with unwritten (zero) data leaves an 88-byte file failing
+/// its check, which refuses `PATH_ESCAPES_ROOT` until an operator removes
+/// it; re-minting it is unsafe while a journal names the key.
 ///
 /// # Errors
 /// `JOURNAL_OWNERSHIP_CONFLICT` when the lock stays held, `PATH_ESCAPES_ROOT`
@@ -790,7 +782,14 @@ mod tests {
     }
 
     fn key_of(state: &Path) -> String {
-        JournalStore::open(state).unwrap().keys().unwrap().current
+        JournalStore::open(state).unwrap().key().unwrap()
+    }
+
+    /// The predecessor key a state dir's binding record names, if any.
+    fn predecessor_of(state: &Path) -> Option<String> {
+        let held = std::fs::read(state.join("git-carry-v2/quarantine-key")).unwrap();
+        let (binding, _) = decode_binding(&held).unwrap();
+        binding.predecessor.as_ref().map(quarantine_key)
     }
 
     /// #82: the quarantine key follows the state dir's identity token, not
@@ -804,10 +803,9 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let state = scratch.path().join("state");
         private_dir(&state);
-        let keys = JournalStore::open(&state).unwrap().keys().unwrap();
-        let key = keys.current.clone();
+        let key = key_of(&state);
         assert_eq!(key.len(), 16);
-        assert_eq!(keys.predecessor, None);
+        assert_eq!(predecessor_of(&state), None);
         assert_eq!(key_of(&state), key);
         let token = state.join("git-carry-v2/quarantine-key");
         let metadata = std::fs::metadata(&token).unwrap();
@@ -816,9 +814,8 @@ mod tests {
 
         let moved = scratch.path().join("moved");
         std::fs::rename(&state, &moved).unwrap();
-        let after = JournalStore::open(&moved).unwrap().keys().unwrap();
-        assert_eq!(after.current, key, "a rename keeps the key");
-        assert_eq!(after.predecessor, None, "a rename is not a copy");
+        assert_eq!(key_of(&moved), key, "a rename keeps the key");
+        assert_eq!(predecessor_of(&moved), None, "a rename is not a copy");
 
         private_dir(&state);
         let recreated = key_of(&state);
@@ -834,7 +831,7 @@ mod tests {
         for length in [33, 87, 89] {
             std::fs::write(&torn, vec![7_u8; length]).unwrap();
             assert_eq!(
-                JournalStore::open(&state).unwrap().keys(),
+                JournalStore::open(&state).unwrap().key(),
                 Err(BulkloadRefusal::PathEscapesRoot),
                 "{length}"
             );
@@ -863,17 +860,12 @@ mod tests {
         let token = |dir: &Path| std::fs::read(dir.join("git-carry-v2/quarantine-key")).unwrap();
         assert_eq!(token(&copy), token(&state), "a byte-for-byte copy");
 
-        let copied = JournalStore::open(&copy).unwrap().keys().unwrap();
-        assert_ne!(copied.current, original, "the copy mints its own key");
-        assert_eq!(copied.predecessor.as_deref(), Some(original.as_str()));
-        assert_eq!(
-            JournalStore::open(&copy).unwrap().keys().unwrap(),
-            copied,
-            "stable once bound"
-        );
-        let kept = JournalStore::open(&state).unwrap().keys().unwrap();
-        assert_eq!(kept.current, original, "the original keeps its key");
-        assert_eq!(kept.predecessor, None);
+        let copied = key_of(&copy);
+        assert_ne!(copied, original, "the copy mints its own key");
+        assert_eq!(predecessor_of(&copy).as_deref(), Some(original.as_str()));
+        assert_eq!(key_of(&copy), copied, "stable once bound");
+        assert_eq!(key_of(&state), original, "the original keeps its key");
+        assert_eq!(predecessor_of(&state), None);
 
         // A #82 token (32 bytes, unbound) is bound in place.
         let legacy = scratch.path().join("legacy");
@@ -891,7 +883,7 @@ mod tests {
         bad[40] ^= 1;
         std::fs::write(&path, &bad).unwrap();
         assert_eq!(
-            JournalStore::open(&legacy).unwrap().keys(),
+            JournalStore::open(&legacy).unwrap().key(),
             Err(BulkloadRefusal::PathEscapesRoot)
         );
     }

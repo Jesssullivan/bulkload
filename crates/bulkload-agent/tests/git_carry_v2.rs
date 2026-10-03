@@ -3692,6 +3692,82 @@ fn issue120_a_state_dir_copied_mid_session_refuses_rather_than_resends() {
     assert_clean(&pair.destination, "issue120-mid");
 }
 
+/// #120 review (R25 / R-N58, OI-1002-Q33): a state dir moved across file
+/// systems twice (copy, then delete), with a resume in between. The first
+/// hop's resume refuses and re-keys it, so the second hop's predecessor
+/// key never had a quarantine; the original's quarantine still holds every
+/// acked pack, and no state dir names it any more. The second hop must
+/// still refuse `state_dir_copied`, not abandon the journal as lost and
+/// start again at segment 0 (a silent re-send of what the destination
+/// durably holds). Only once that quarantine is gone (an operator's sweep)
+/// is the journal abandoned as lost and the plan sent afresh.
+#[test]
+fn issue120_a_state_dir_moved_twice_refuses_rather_than_resends() {
+    let pair = pair("issue120-two-hops", 64 * 1024);
+    assert!(pair.plan.segments() >= 3);
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let state = pair.scratch.state("destination-state");
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        for index in 0..2 {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+        // Crash: the session is gone, its quarantine unlocked.
+    }
+    let original = quarantine_dir(&pair);
+    let acked = entries_of(&original);
+    assert!(!acked.is_empty());
+
+    let hop1 = copy_state(&pair, &state, "hop1-state");
+    fs::remove_dir_all(&state).unwrap();
+    let refused = Ingest::resume(
+        &target,
+        &JournalStore::open(&hop1).unwrap(),
+        pair.plan.pack_id(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+    assert_eq!(refused.reason, Some("state_dir_copied"));
+
+    let hop2 = copy_state(&pair, &hop1, "hop2-state");
+    fs::remove_dir_all(&hop1).unwrap();
+    let journals = JournalStore::open(&hop2).unwrap();
+    for _ in 0..2 {
+        let refused = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+        assert_eq!(refused.reason, Some("state_dir_copied"));
+        let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap_err();
+        assert_eq!(refused.refusal, BulkloadRefusal::JournalOwnershipConflict);
+        assert_eq!(refused.reason, Some("state_dir_copied"));
+    }
+    assert_eq!(
+        quarantines(&pair),
+        vec![original.clone()],
+        "nothing re-sent"
+    );
+    assert_eq!(entries_of(&original), acked, "the original's survives");
+    let journal = fs::read_to_string(journal_path(&pair, &hop2)).unwrap();
+    assert!(!journal.contains("abandoned"), "nothing abandoned");
+
+    // An operator's sweep of the orphan; only then does the plan restart.
+    fs::remove_dir_all(&original).unwrap();
+    let refused = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap_err();
+    assert_eq!(refused.refusal, BulkloadRefusal::SealedObjectMissing);
+    assert_eq!(refused.reason, Some("quarantine_lost"));
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    assert_eq!(session.next_segment(), 0);
+    for index in 0..pair.plan.segments() {
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    session.finish().unwrap();
+    assert!(published(&pair));
+    assert_clean(&pair.destination, "issue120-two-hops");
+}
+
 /// Point the journal's name at a copy of the journal, as reviewer probe 2
 /// of #75 r4 N1 does: the session's own file is no longer at the name.
 fn replace_journal_with_copy(pair: &Pair, state: &Path) {
