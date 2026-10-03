@@ -12,10 +12,9 @@
 
 use std::ffi::CStr;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
 
 pub use super::sys_posix::*;
-use super::sys_posix::{fsync_raw, to_off_t};
 use super::{NodeId, Qos, Stat};
 
 /// Translate a Darwin `struct stat`.
@@ -123,51 +122,10 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Background write-back kick for a large file (plan D1: every 16 MiB). On
-/// Darwin that is a plain `fsync`, which sends the data to the drive without a
-/// cache flush or a barrier. The range is advisory and ignored here.
-///
-/// # Errors
-/// Returns the `fsync` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn kick(file: impl AsFd, _offset: u64, _len: u64) -> io::Result<()> {
-    trace_serial!();
-    let fd = file.as_fd();
-    fsync_raw(fd)?;
-    trace_event!(
-        "fsync",
-        Ok(super::trace::Event::Sync {
-            node: fstat(fd)?.node,
-            kind: super::trace::SyncKind::Kick,
-        })
-    );
-    Ok(())
-}
-
-/// Rename `from` to `to` inside `directory`; an existing `to` is `EEXIST` and
-/// is left untouched. Darwin has no fallback: this is [`rename_exclusive`].
-///
-/// # Errors
-/// Returns the rename failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
-    rename_exclusive(directory, from, to)
-}
-
 /// [`rename_exclusive_at`]; Darwin has no fallback.
 ///
 /// # Errors
 /// Returns the rename failure; an occupied `to` is `EEXIST`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn rename_noreplace_at(
     from_dir: impl AsFd,
     from: &CStr,
@@ -228,97 +186,6 @@ pub fn rename_exclusive_at(
             to: to.to_bytes().to_vec(),
         })
     );
-    Ok(())
-}
-
-/// Darwin has no `O_TMPFILE`; staging always uses a named temporary.
-///
-/// # Errors
-/// Never fails on Darwin.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches the Linux O_TMPFILE call"
-)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const fn open_tmpfile(_dir: BorrowedFd<'_>, _mode: u32) -> io::Result<Option<OwnedFd>> {
-    Ok(None)
-}
-
-/// Unreachable on Darwin: [`open_tmpfile`] never yields an anonymous file.
-///
-/// # Errors
-/// Always `Unsupported`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn link_tmpfile(_file: impl AsFd, _dir: impl AsFd, _name: &CStr) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}
-
-/// Reserve `len` bytes past the file's physical end with `F_PREALLOCATE`,
-/// contiguous if possible, without changing its size. Returns `false` when
-/// the file system declines.
-///
-/// # Errors
-/// Returns an unexpected `fcntl` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
-    let fd = file.as_fd();
-    let length = to_off_t(len)?;
-    for flags in [
-        libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
-        libc::F_ALLOCATEALL,
-    ] {
-        let mut store = libc::fstore_t {
-            fst_flags: flags,
-            fst_posmode: libc::F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: length,
-            fst_bytesalloc: 0,
-        };
-        // SAFETY: the descriptor is live for the call and `store` is a live,
-        // exclusively borrowed `fstore_t`, the argument F_PREALLOCATE reads
-        // and updates.
-        let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) };
-        if ret != -1 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::ENOTSUP)) {
-            return Err(error);
-        }
-    }
-    Ok(false)
-}
-
-/// Read-ahead advice for `[offset, offset + len)` (`F_RDADVISE`). The count
-/// is clamped to `c_int`.
-///
-/// # Errors
-/// Returns the `fcntl` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
-    let fd = file.as_fd();
-    let mut advice = libc::radvisory {
-        ra_offset: to_off_t(offset)?,
-        ra_count: libc::c_int::try_from(len).unwrap_or(libc::c_int::MAX),
-    };
-    // SAFETY: the descriptor is live for the call and `advice` is a live
-    // `radvisory`, the argument F_RDADVISE reads.
-    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_RDADVISE, &raw mut advice) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
     Ok(())
 }
 

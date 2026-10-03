@@ -6,13 +6,10 @@
 //! - `sys_posix.rs`: the calls Darwin and Linux share (`openat`, `fstat`,
 //!   `pread`/`pwrite`, `fchmod`, `unlinkat`, `mkdirat`, `linkat`,
 //!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
-//!   `readdir`, `geteuid`, `flock`, `setsockopt`/`getsockopt`);
+//!   `readdir`, `geteuid`, `flock`, `setsockopt`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//!   `renameatx_np(RENAME_EXCL)`, `F_PREALLOCATE`, `F_RDADVISE` and thread
-//!   `QoS`;
-//! - `sys_linux.rs`: `fdatasync`, `fsync`, `sync_file_range`,
-//!   `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE` plus `linkat` through
-//!   `/proc/self/fd`, `fallocate(KEEP_SIZE)` and `posix_fadvise`;
+//!   `renameatx_np(RENAME_EXCL)` and thread `QoS`;
+//! - `sys_linux.rs`: `fdatasync`, `fsync` and `renameat2(RENAME_NOREPLACE)`;
 //! - `buf.rs`: the aligned slab allocation.
 //!
 //! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
@@ -29,7 +26,7 @@
 //! Group commit (W3, `durable.rs`) is built on these calls. With the
 //! `io-trace` feature each mutating call records its trace events (see
 //! `trace`), with the sync kind the crash checker models. That is one event
-//! per call, except the Linux `rename_noreplace` fallback, which records its
+//! per call, except the Linux `rename_noreplace_at` fallback, which records its
 //! `linkat` and its `unlinkat`:
 //!
 //! | call | Darwin | Linux | trace |
@@ -37,12 +34,10 @@
 //! | `sys::barrier` | `F_BARRIERFSYNC` | `fdatasync` | `Sync(Barrier)` / `Sync(DataSync)` |
 //! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Sync(Barrier)` / `Sync(Fsync)` |
 //! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `Sync(FullFlush)` / `Sync(Fsync)` |
-//! | `sys::kick` | `fsync` (no cache flush) | `sync_file_range(WRITE)` | `Sync(Kick)` |
 //! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
-//! | `sys::rename_noreplace` | as `rename_exclusive` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
+//! | `sys::rename_noreplace_at` | as `rename_exclusive_at` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
 //! | `sys::create_excl_at`, `sys::mkdirat`, `sys::symlinkat` | | | `Create`, `Mkdir`, `Symlink` |
 //! | `sys::pwrite_all`, `sys::fchmod`, `sys::unlinkat`, `sys::linkat` | | | `Write`, `SetMode`, `Unlink`, `Link` |
-//! | [`TempFile::create`] + [`TempFile::publish`] | named temp + rename | `O_TMPFILE` + `linkat` (named fallback) | `Create`, `Link`/`Rename` |
 //!
 //! The stores add an `Event::Commit` when a `SQLite` commit returns, naming
 //! the records it made durable.
@@ -56,7 +51,7 @@
 //!
 //! Directory creation and file publication use `sys::rename_exclusive`
 //! (through [`rename_exclusive`] and [`publish_noreplace`]), never the
-//! sys-internal Linux `linkat` fallback of `sys::rename_noreplace`: `linkat`
+//! sys-internal Linux `linkat` fallback of `sys::rename_noreplace_at`: `linkat`
 //! on a directory fails with `EPERM` and would hide the R-N119 path taken.
 //! [`publish_noreplace`] has its own io-level `linkat` + `unlinkat` fallback,
 //! for files only, and counts it; a directory takes the `mkdirat` fallback
@@ -98,12 +93,18 @@ macro_rules! trace_event {
 
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+    allow(
+        dead_code,
+        reason = "unwired; wire or delete on the gate (a) evidence (#88, WP10 PR 3)"
+    )
 )]
 pub mod buf;
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
+    allow(
+        dead_code,
+        reason = "unwired; wire or delete on the gate (a) evidence (#88, WP10 PR 3)"
+    )
 )]
 pub mod chunker;
 #[cfg(any(test, feature = "io-trace"))]
@@ -127,7 +128,7 @@ pub mod sys;
 compile_error!("bulkload's io layer supports Darwin and Linux only");
 
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::AsFd;
 
 /// Identity of an inode as the kernel reports it (`st_dev`, `st_ino`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -184,11 +185,8 @@ impl Stat {
         self.mode & S_IFMT == S_IFIFO
     }
 
-    /// Permission bits only.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-    )]
+    /// Permission bits only: the effective mode the R-N88 trace records.
+    #[cfg(any(test, feature = "io-trace"))]
     pub const fn permissions(&self) -> u32 {
         self.mode & 0o7777
     }
@@ -229,133 +227,10 @@ pub enum Qos {
     Background,
 }
 
-/// Hex digits in a destination store's temporary tag.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const TEMP_TAG_HEX: usize = 16;
-
-/// A destination store's temporary tag: 16 lowercase hex digits, as
-/// `materialize::temporary_tag` derives it from the store's authority. Named
-/// temporaries carry it so the store's sweep (R-N79) covers them.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub type TempTag = [u8; TEMP_TAG_HEX];
-
-/// A staged file that is not yet visible under its final name.
-///
-/// On Linux it is an `O_TMPFILE` inode with no name at all, so a crash leaves
-/// no orphan; a file system without `O_TMPFILE`, or a process without
-/// `/proc/self/fd`, gets a named temporary instead. On Darwin it is always a
-/// named temporary (`O_EXCL`, private mode) named `.bulkload-<tag>-<pid>-<n>`
-/// in the materializer's grammar, so a crash leaves nothing the store's
-/// sweep does not recognize. The staged file remembers the
-/// directory it was created in, and [`TempFile::publish`] consumes it and
-/// never replaces an existing name.
-#[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub struct TempFile {
-    fd: OwnedFd,
-    dir: OwnedFd,
-    kind: Staged,
-}
-
-#[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-enum Staged {
-    /// Linux `O_TMPFILE`: published with `linkat` through `/proc/self/fd`.
-    Anonymous,
-    /// A named temporary in the staging directory: published with
-    /// rename-no-replace.
-    Named(CString),
-}
-
-/// A failed [`TempFile::publish`]: the staged file comes back to the caller,
-/// who can retry under another name or discard it.
-#[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub struct PublishError {
-    pub temp: TempFile,
-    pub error: std::io::Error,
-}
-
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-impl TempFile {
-    /// Stage a new file in `dir` with permission bits `mode`; a named
-    /// temporary carries the destination store's `tag`. The directory
-    /// descriptor is duplicated and kept for [`TempFile::publish`].
-    ///
-    /// # Errors
-    /// `InvalidInput` for a malformed tag; otherwise the `openat` or
-    /// descriptor-duplication failure.
-    pub fn create(dir: impl AsFd, mode: u32, tag: &TempTag) -> std::io::Result<Self> {
-        let dir = dir.as_fd();
-        let (fd, kind) = if let Some(fd) = sys::open_tmpfile(dir, mode)? {
-            (fd, Staged::Anonymous)
-        } else {
-            let (fd, name) = sys::create_temp_named(dir, mode, tag)?;
-            (fd, Staged::Named(name))
-        };
-        Ok(Self {
-            fd,
-            dir: dir.try_clone_to_owned()?,
-            kind,
-        })
-    }
-
-    /// The staged file's descriptor, for `pwrite`, sync and `fchmod`.
-    pub const fn fd(&self) -> &OwnedFd {
-        &self.fd
-    }
-
-    /// Whether this is an unnamed `O_TMPFILE` inode.
-    pub const fn is_anonymous(&self) -> bool {
-        matches!(self.kind, Staged::Anonymous)
-    }
-
-    /// Give the staged file the name `name` in the directory it was staged in,
-    /// and return its descriptor. An existing `name` is `EEXIST` and is left
-    /// untouched. The caller seals the directory afterwards: the new name is
-    /// durable only after a directory sync.
-    ///
-    /// # Errors
-    /// Returns the staged file with the link or rename failure; an occupied
-    /// name is `EEXIST`.
-    pub fn publish(self, name: &std::ffi::CStr) -> Result<OwnedFd, Box<PublishError>> {
-        let result = match &self.kind {
-            Staged::Anonymous => sys::link_tmpfile(&self.fd, &self.dir, name),
-            Staged::Named(temp) => sys::rename_noreplace(&self.dir, temp, name),
-        };
-        match result {
-            Ok(()) => Ok(self.fd),
-            Err(error) => Err(Box::new(PublishError { temp: self, error })),
-        }
-    }
-}
-
 /// Convert a Rust path component to a C string for an `*at` call.
 ///
 /// # Errors
 /// `InvalidInput` when the bytes contain a NUL.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn c_name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
 }
@@ -408,9 +283,8 @@ pub use sys_posix::force_rename_unsupported;
 /// `renameatx_np(RENAME_EXCL)` / `renameat2(RENAME_NOREPLACE)`. A file system
 /// without it reports an error [`rename_unsupported`] recognizes, so a
 /// directory can take the `mkdirat` fallback and a file the link fallback
-/// (R-N119). `sys::rename_noreplace`, which falls back to `linkat` inside
-/// `sys` on Linux, is for `TempFile::publish` only: `linkat` on a directory
-/// is `EPERM`.
+/// (R-N119). `sys::rename_noreplace_at`, which falls back to `linkat` inside
+/// `sys` on Linux, is for files only: `linkat` on a directory is `EPERM`.
 ///
 /// # Errors
 /// Returns the rename failure; see [`rename_unsupported`].

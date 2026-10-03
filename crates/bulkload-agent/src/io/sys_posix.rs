@@ -13,7 +13,6 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{OpenMode, Stat};
 
@@ -39,8 +38,8 @@ pub(super) fn to_off_t(offset: u64) -> io::Result<libc::off_t> {
     libc::off_t::try_from(offset).map_err(|_| invalid_input())
 }
 
-/// `openat` with `EINTR` retried. `mode` is used only with `O_CREAT` or
-/// `O_TMPFILE`; otherwise pass 0.
+/// `openat` with `EINTR` retried. `mode` is used only with `O_CREAT`;
+/// otherwise pass 0.
 pub(super) fn openat_raw(
     dir: BorrowedFd<'_>,
     name: &CStr,
@@ -163,54 +162,6 @@ pub fn create_excl_at(dir: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result
         })
     );
     Ok(fd)
-}
-
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Create a private named temporary in `dir` (`O_EXCL`), retrying on a name
-/// collision. Returns the descriptor and the name.
-///
-/// The name is `.bulkload-<tag>-<pid>-<n>`, the materializer's file-temporary
-/// grammar (`materialize::temporary_name`), carrying the destination store's
-/// `tag`. The store's sweep therefore recognizes and removes a W4 temporary
-/// that a crash left behind, exactly as it does its own.
-///
-/// # Errors
-/// `InvalidInput` for a tag that is not 16 lowercase hex digits; otherwise
-/// the `openat` failure, or `AlreadyExists` after 64 collisions.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn create_temp_named(
-    dir: impl AsFd,
-    mode: u32,
-    tag: &super::TempTag,
-) -> io::Result<(OwnedFd, CString)> {
-    if !tag
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
-        return Err(invalid_input());
-    }
-    let dir = dir.as_fd();
-    for _ in 0..64 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut name = crate::materialize::TEMPORARY_PREFIX.to_vec();
-        name.extend_from_slice(tag);
-        name.extend_from_slice(format!("-{}-{sequence}", std::process::id()).as_bytes());
-        let name = super::c_name(&name)?;
-        match create_excl_at(dir, &name, mode) {
-            Ok(fd) => return Ok((fd, name)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::from(io::ErrorKind::AlreadyExists))
 }
 
 /// `fstat`.
@@ -618,12 +569,10 @@ pub fn flock_unlock(file: impl AsFd) -> io::Result<()> {
     check(unsafe { libc::flock(file.as_fd().as_raw_fd(), libc::LOCK_UN) }).map(|_| ())
 }
 
-/// Plain `fsync` with `EINTR` retried. Not traced here: the platform module
-/// records it with the sync kind it has on that platform.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
+/// Plain `fsync` with `EINTR` retried, for Linux's `full_flush`. Not traced
+/// here: the platform module records it with its sync kind. Darwin flushes
+/// with `fcntl` and has no caller.
+#[cfg(target_os = "linux")]
 pub(super) fn fsync_raw(fd: BorrowedFd<'_>) -> io::Result<()> {
     loop {
         // SAFETY: the descriptor is live for the call; `fsync` takes no
@@ -665,35 +614,6 @@ pub fn set_socket_buffers(fd: impl AsFd, bytes: libc::c_int) -> io::Result<bool>
         })?;
     }
     Ok(true)
-}
-
-/// Current `(SO_SNDBUF, SO_RCVBUF)` of a socket.
-///
-/// # Errors
-/// Returns the `getsockopt` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn socket_buffers(fd: impl AsFd) -> io::Result<(libc::c_int, libc::c_int)> {
-    let fd = fd.as_fd();
-    let mut values = [0 as libc::c_int; 2];
-    for (value, option) in values.iter_mut().zip([libc::SO_SNDBUF, libc::SO_RCVBUF]) {
-        let mut len = int_len()?;
-        // SAFETY: the descriptor is live for the call; `value` points at a
-        // live, exclusively borrowed `c_int` and `len` holds its exact size,
-        // which the kernel may only shrink.
-        check(unsafe {
-            libc::getsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                option,
-                std::ptr::from_mut(value).cast(),
-                &raw mut len,
-            )
-        })?;
-    }
-    Ok(values.into())
 }
 
 /// Test support: a process-wide `RLIMIT_FSIZE` soft limit with `SIGXFSZ`

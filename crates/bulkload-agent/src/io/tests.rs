@@ -1,5 +1,5 @@
-//! Tests for the `sys` wrappers. Linux-only paths (`O_TMPFILE`, `renameat2`,
-//! `fdatasync`, `sync_file_range`) are compiled and run on the Linux CI
+//! Tests for the `sys` wrappers. Linux-only paths (`renameat2`,
+//! `fdatasync`) are compiled and run on the Linux CI
 //! runner; Darwin-only paths (`F_BARRIERFSYNC`, `F_FULLFSYNC`,
 //! `renameatx_np`, `QoS`) run on Darwin.
 
@@ -13,16 +13,10 @@
 use std::ffi::CString;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::fd::AsFd as _;
 use std::os::unix::fs::MetadataExt as _;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use super::{sys, OpenMode, TempFile};
-
-/// A store tag for tests, in `materialize::temporary_tag`'s alphabet.
-pub const TAG: super::TempTag = *b"0123456789abcdef";
+use super::{sys, OpenMode};
 
 fn c(name: &str) -> CString {
     CString::new(name).unwrap()
@@ -182,10 +176,10 @@ fn namespace_calls_create_link_rename_and_remove() {
 
     // No-clobber rename: an occupied target is EEXIST and keeps its bytes.
     fs::write(dir.path().join("d/taken"), b"keep").unwrap();
-    let clobber = sys::rename_noreplace(&d, &c("one"), &c("taken"));
+    let clobber = sys::rename_noreplace_at(&d, &c("one"), &d, &c("taken"));
     assert_eq!(clobber.unwrap_err().kind(), ErrorKind::AlreadyExists);
     assert_eq!(fs::read(dir.path().join("d/taken")).unwrap(), b"keep");
-    sys::rename_noreplace(&d, &c("one"), &c("three")).unwrap();
+    sys::rename_noreplace_at(&d, &c("one"), &d, &c("three")).unwrap();
     assert_eq!(fs::read(dir.path().join("d/three")).unwrap(), b"one");
     sys::rename_noreplace_at(&d, &c("three"), &root, &c("four")).unwrap();
     assert_eq!(fs::read(dir.path().join("four")).unwrap(), b"one");
@@ -217,7 +211,7 @@ fn an_unsupported_exclusive_rename_reports_einval_and_links_nothing() {
     assert!(dir.path().join("b").exists(), "without the hook it renames");
 }
 
-/// PR #59 round 5, D2: `sys::rename_noreplace` is for files only. Under the
+/// PR #59 round 5, D2: `sys::rename_noreplace_at` is for files only. Under the
 /// hook, on a directory, its Linux `linkat` fallback fails with `EPERM`
 /// (which is why directories never take it); on Darwin it is the bare
 /// exclusive rename and reports `EINVAL`. The directory stays in place.
@@ -227,7 +221,7 @@ fn rename_noreplace_on_a_directory_never_moves_it() {
     fs::create_dir(dir.path().join("d")).unwrap();
     let root = sys::open_root(dir.path()).unwrap();
     crate::io::force_rename_unsupported(true);
-    let result = sys::rename_noreplace(&root, &c("d"), &c("e"));
+    let result = sys::rename_noreplace_at(&root, &c("d"), &root, &c("e"));
     crate::io::force_rename_unsupported(false);
     let expected = if cfg!(target_os = "linux") {
         libc::EPERM
@@ -245,168 +239,12 @@ fn every_sync_kind_succeeds_on_files_and_directories() {
     let root = sys::open_root(dir.path()).unwrap();
     let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
     sys::pwrite_all(&fd, &vec![7_u8; 65_536], 0).unwrap();
-    sys::kick(&fd, 0, 65_536).unwrap();
     sys::barrier(&fd).unwrap();
     sys::full_flush(&fd).unwrap();
     sys::barrier_dir(&root).unwrap();
     sys::full_flush(&root).unwrap();
     #[cfg(target_os = "linux")]
     sys::data_sync(&fd).unwrap();
-}
-
-#[test]
-fn preallocation_and_read_advice_keep_the_size() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o600)).unwrap();
-    let reserved = sys::preallocate(&fd, 8 * 1024 * 1024).unwrap();
-    eprintln!("preallocate reserved={reserved}");
-    assert_eq!(sys::fstat(&fd).unwrap().size, 0, "KEEP_SIZE semantics");
-    sys::pwrite_all(&fd, b"tail", 1024).unwrap();
-    sys::read_advise(&fd, 0, 1 << 40).unwrap();
-    assert_eq!(sys::fstat(&fd).unwrap().size, 1028);
-}
-
-#[test]
-fn temp_files_publish_without_clobbering() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
-    eprintln!("staged anonymous={}", temp.is_anonymous());
-    if temp.is_anonymous() {
-        assert_eq!(
-            fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "O_TMPFILE has no name"
-        );
-    }
-    sys::pwrite_all(temp.fd(), b"staged", 0).unwrap();
-    sys::barrier(temp.fd()).unwrap();
-    temp.publish(&c("final")).unwrap();
-    sys::barrier_dir(&root).unwrap();
-    assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"staged");
-
-    let second = TempFile::create(&root, 0o600, &TAG).unwrap();
-    sys::pwrite_all(second.fd(), b"other", 0).unwrap();
-    let clobber = second.publish(&c("final")).unwrap_err();
-    assert_eq!(clobber.error.kind(), ErrorKind::AlreadyExists);
-    // The staged file comes back and can still be published elsewhere.
-    clobber.temp.publish(&c("final.2")).unwrap();
-    assert_eq!(fs::read(dir.path().join("final.2")).unwrap(), b"other");
-    assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"staged");
-}
-
-#[test]
-fn named_temp_fallback_is_private_and_exclusive() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    let (fd, name) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
-    let stat = sys::fstatat_nofollow(&root, &name).unwrap();
-    assert_eq!(stat.node, sys::fstat(&fd).unwrap().node);
-    assert_eq!(stat.permissions(), 0o600);
-    let (_, other) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
-    assert_ne!(name, other);
-}
-
-/// Review #10: named temporaries use the materializer's file-temporary
-/// grammar with the store's tag, so #60's sweep recognizes them. Checked with
-/// the materializer's own parser.
-#[test]
-fn named_temporaries_follow_the_materializer_grammar() {
-    use crate::materialize::{temporary_name, TemporaryName};
-    let dir = tempfile::TempDir::new().unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    for _ in 0..3 {
-        let (_, name) = sys::create_temp_named(&root, 0o600, &TAG).unwrap();
-        assert_eq!(
-            temporary_name(name.to_bytes()),
-            Some(TemporaryName::File(TAG)),
-            "{name:?}"
-        );
-    }
-    for bad in [
-        *b"0123456789ABCDEF",
-        *b"0123456789abcde-",
-        *b"0123456789abcdeg",
-    ] {
-        let refused = sys::create_temp_named(&root, 0o600, &bad).unwrap_err();
-        assert_eq!(refused.kind(), ErrorKind::InvalidInput);
-    }
-    // A staged TempFile that falls back to a name carries the same grammar.
-    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
-    if !temp.is_anonymous() {
-        let names: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert!(names.iter().all(|leaf| {
-            temporary_name(std::os::unix::ffi::OsStrExt::as_bytes(leaf.as_os_str()))
-                == Some(TemporaryName::File(TAG))
-        }));
-    }
-}
-
-/// A scratch directory on tmpfs (`/dev/shm`), where Linux supports
-/// `O_TMPFILE`. Tests on it must run in CI, so a missing or unwritable
-/// `/dev/shm` fails the test; `BULKLOAD_ALLOW_NO_DEV_SHM=1` turns that into a
-/// printed skip for hosts that really have none.
-#[cfg(target_os = "linux")]
-pub fn shm_dir(test: &str) -> Option<tempfile::TempDir> {
-    match tempfile::TempDir::new_in("/dev/shm") {
-        Ok(dir) => {
-            println!("RAN {test}: O_TMPFILE staging under /dev/shm");
-            Some(dir)
-        }
-        Err(error) if std::env::var_os("BULKLOAD_ALLOW_NO_DEV_SHM").is_some() => {
-            println!(
-                "SKIPPED {test}: /dev/shm unusable ({error}); allowed by BULKLOAD_ALLOW_NO_DEV_SHM"
-            );
-            None
-        }
-        Err(error) => panic!("{test} must run on Linux CI but /dev/shm is unusable: {error}"),
-    }
-}
-
-/// On Linux the `O_TMPFILE` + `linkat(/proc/self/fd)` path must actually run
-/// in CI: tmpfs supports it, so the test runs under `/dev/shm`.
-#[cfg(target_os = "linux")]
-#[test]
-fn linux_o_tmpfile_publishes_through_proc_self_fd() {
-    let Some(dir) = shm_dir("linux_o_tmpfile_publishes_through_proc_self_fd") else {
-        return;
-    };
-    let root = sys::open_root(dir.path()).unwrap();
-    let temp = TempFile::create(&root, 0o600, &TAG).unwrap();
-    assert!(temp.is_anonymous(), "tmpfs supports O_TMPFILE");
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-    sys::pwrite_all(temp.fd(), b"anonymous", 0).unwrap();
-    sys::data_sync(temp.fd()).unwrap();
-    temp.publish(&c("linked")).unwrap();
-    assert_eq!(fs::read(dir.path().join("linked")).unwrap(), b"anonymous");
-    assert_eq!(
-        fs::metadata(dir.path().join("linked"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-}
-
-#[test]
-fn socket_buffers_are_raised_and_files_are_left_alone() {
-    let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
-    let before = sys::socket_buffers(&left).unwrap();
-    assert!(sys::set_socket_buffers(&left, 4 * 1024 * 1024).unwrap());
-    assert!(sys::set_socket_buffers(right.as_fd(), 4 * 1024 * 1024).unwrap());
-    let after = sys::socket_buffers(&left).unwrap();
-    eprintln!("socket buffers before={before:?} after={after:?}");
-    assert!(after.0 >= before.0 && after.1 >= before.1);
-    #[cfg(target_vendor = "apple")]
-    assert!(after.0 >= 4 * 1024 * 1024 && after.1 >= 4 * 1024 * 1024);
-    let dir = tempfile::TempDir::new().unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    assert!(!sys::set_socket_buffers(&root, 4 * 1024 * 1024).unwrap());
 }
 
 #[test]
@@ -455,7 +293,7 @@ mod traced {
         sys::fchmod(&fd, 0o640).unwrap();
         sys::full_flush(&fd).unwrap();
         sys::mkdirat(&root, &c("d"), 0o700).unwrap();
-        sys::rename_noreplace(&root, &c("f"), &c("g")).unwrap();
+        sys::rename_noreplace_at(&root, &c("f"), &root, &c("g")).unwrap();
         sys::linkat(&root, &c("g"), &root, &c("h")).unwrap();
         sys::unlinkat(&root, &c("h"), false).unwrap();
         let mut read = [0_u8; 4];
@@ -523,11 +361,9 @@ mod traced {
         let attached = recorder.attach();
         let fd = sys::openat_beneath(&root, Path::new("f"), OpenMode::CreateExcl(0o777)).unwrap();
         sys::mkdirat(&root, &c("d"), 0o777).unwrap();
-        let temp = TempFile::create(&root, 0o777, &TAG).unwrap();
         drop(attached);
         let file_mode = sys::fstat(&fd).unwrap().permissions();
         let dir_mode = sys::fstatat_nofollow(&root, &c("d")).unwrap().permissions();
-        let temp_mode = sys::fstat(temp.fd()).unwrap().permissions();
         let modes: Vec<u32> = recorder
             .take()
             .iter()
@@ -536,7 +372,7 @@ mod traced {
                 _ => None,
             })
             .collect();
-        assert_eq!(modes, vec![file_mode, dir_mode, temp_mode]);
+        assert_eq!(modes, vec![file_mode, dir_mode]);
     }
 
     /// Review r2 finding 1 (reviewer probe P3a): two threads race
