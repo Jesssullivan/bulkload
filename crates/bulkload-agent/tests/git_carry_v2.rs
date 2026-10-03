@@ -3493,11 +3493,13 @@ fn pr75_r3_m2_a_quarantine_without_a_journal_is_discarded_not_wedged() {
     assert_clean(&pair.destination, "r3-m2");
 }
 
-/// r3 M3: a state dir lost and recreated at the same path has the same key,
-/// so its orphaned quarantine has this session's name; the fresh open
-/// discards it rather than wedging every open of that plan.
+/// r3 M3, #82: a state dir lost and recreated at the same path is a new
+/// state dir: it gets a new identity token and so a new key. Its fresh open
+/// is never wedged by the lost one's quarantine, and never adopts or sweeps
+/// it (no open can prove the orphan unowned: a state dir moved elsewhere
+/// keeps its key and may still resume it).
 #[test]
-fn pr75_r3_m3_a_recreated_state_dir_discards_its_orphaned_quarantine() {
+fn pr75_r3_m3_a_recreated_state_dir_is_not_wedged_by_an_orphaned_quarantine() {
     let pair = pair("pr75-r3-m3", DEFAULT_SEGMENT_CAP);
     let state = pair.scratch.state("destination-state");
     let target = Target::probe(&pair.destination, None).unwrap();
@@ -3506,13 +3508,187 @@ fn pr75_r3_m3_a_recreated_state_dir_discards_its_orphaned_quarantine() {
         drop(received(&pair, &target, &journals));
     }
     assert!(!quarantine_entries(&pair).is_empty());
+    let orphan = quarantine_dir(&pair);
+    let orphan_packs = entries_of(&orphan);
     fs::remove_dir_all(&state).unwrap();
     let state = pair.scratch.state("destination-state");
     let journals = JournalStore::open(&state).unwrap();
     let session = received(&pair, &target, &journals);
-    assert_eq!(quarantines(&pair).len(), 1, "the same name, reused");
+    assert_eq!(quarantines(&pair).len(), 2, "a new key, a new quarantine");
+    assert_eq!(entries_of(&orphan), orphan_packs, "never adopted");
     session.finish().unwrap();
+    assert!(published(&pair));
+    assert_eq!(entries_of(&orphan), orphan_packs, "never swept");
+    fs::remove_dir_all(&orphan).unwrap();
     assert_clean(&pair.destination, "r3-m3");
+}
+
+/// #82 (R25 / R-N58): a state dir renamed mid-session (as a remount at
+/// another path would) keeps its key, so the resume finds its own
+/// quarantine, continues at `next_segment`, and no acked segment is sent
+/// again; no orphan is left.
+#[test]
+fn issue82_a_renamed_state_dir_resumes_its_own_quarantine() {
+    let pair = pair("issue82-renamed", 64 * 1024);
+    assert!(pair.plan.segments() >= 3);
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let state = pair.scratch.state("destination-state");
+    {
+        let journals = JournalStore::open(&state).unwrap();
+        let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+        for index in 0..2 {
+            let segment = pair.segment(index);
+            session.receive(index, &mut &segment[..]).unwrap();
+        }
+    }
+    let acked = quarantine_entries(&pair);
+    let moved = pair.scratch.path("moved-state");
+    fs::rename(&state, &moved).unwrap();
+    let journals = JournalStore::open(&moved).unwrap();
+    let mut session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+    assert_eq!(session.next_segment(), 2, "resumes at next_segment");
+    assert_eq!(quarantines(&pair).len(), 1, "no orphan");
+    assert_eq!(quarantine_entries(&pair), acked, "its own quarantine");
+    let mut resent = 0;
+    for index in session.next_segment()..pair.plan.segments() {
+        assert!(index >= 2, "an acked segment re-sent");
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+        resent += 1;
+    }
+    assert_eq!(resent, pair.plan.segments() - 2);
+    session.finish().unwrap();
+    assert!(published(&pair));
+    assert_clean(&pair.destination, "issue82");
+}
+
+/// Point the journal's name at a copy of the journal, as reviewer probe 2
+/// of #75 r4 N1 does: the session's own file is no longer at the name.
+fn replace_journal_with_copy(pair: &Pair, state: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let journal = journal_path(pair, state);
+    let other = state.join("git-carry-v2/ingest/replacement");
+    fs::copy(&journal, &other).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&other, &journal).unwrap();
+}
+
+/// #92: `finish` and `abandon` check that the session still owns its
+/// journal. With the name replaced after every segment is acked, `finish`
+/// refuses `journal_replaced` before connectivity, migration or publication
+/// is journaled or done, and `abandon` refuses before journaling or
+/// discarding anything; the quarantine is untouched either way. A resume
+/// from what the name holds (the copy, every ack in it) then finishes.
+#[test]
+fn issue92_finish_and_abandon_refuse_a_replaced_journal() {
+    for verb in ["finish", "abandon"] {
+        let pair = pair(&format!("issue92-{verb}"), 64 * 1024);
+        let state = pair.scratch.state("destination-state");
+        let journals = JournalStore::open(&state).unwrap();
+        let target = Target::probe(&pair.destination, None).unwrap();
+        let session = received(&pair, &target, &journals);
+        let acked = quarantine_entries(&pair);
+        replace_journal_with_copy(&pair, &state);
+        let held = fs::read_to_string(journal_path(&pair, &state)).unwrap();
+        let refused = if verb == "finish" {
+            session.finish().map(drop).unwrap_err()
+        } else {
+            session.abandon("test_abandoned").unwrap_err()
+        };
+        assert_eq!(
+            refused.refusal,
+            BulkloadRefusal::JournalOwnershipConflict,
+            "{verb}: {refused:?}"
+        );
+        assert_eq!(refused.reason, Some("journal_replaced"), "{verb}");
+        assert_eq!(quarantine_entries(&pair), acked, "{verb}: quarantine kept");
+        assert_eq!(bulkload_keeps(&pair.destination), 0, "{verb}: no migration");
+        assert!(!published(&pair), "{verb}: nothing published");
+        assert_eq!(
+            fs::read_to_string(journal_path(&pair, &state)).unwrap(),
+            held,
+            "{verb}: the name's journal unchanged"
+        );
+
+        let session = Ingest::resume(&target, &journals, pair.plan.pack_id(), None).unwrap();
+        assert_eq!(session.next_segment(), pair.plan.segments(), "{verb}");
+        assert_eq!(quarantine_entries(&pair), acked, "{verb}");
+        session.finish().unwrap();
+        assert!(published(&pair), "{verb}");
+        assert_clean(&pair.destination, "issue92");
+    }
+}
+
+/// #94: a fresh open that refuses removes its own empty journal; when that
+/// removal fails, the refusal returned is still the original one. Here
+/// session A holds the quarantine and the journal's name was replaced by an
+/// empty file, so a second open refuses `quarantine_held`; the journal
+/// directory is read-only, so removing that open's journal fails. The open
+/// still refuses `JOURNAL_OWNERSHIP_CONFLICT` / `quarantine_held` (never
+/// `IO`), with the failed removal attached as `cleanup_refused=`.
+#[test]
+fn issue94_a_failed_cleanup_never_masks_the_quarantine_held_refusal() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pair = pair("issue94", 64 * 1024);
+    let state = pair.scratch.state("destination-state");
+    let journals = JournalStore::open(&state).unwrap();
+    let target = Target::probe(&pair.destination, None).unwrap();
+    let mut a = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    let first = pair.segment(0);
+    a.receive(0, &mut &first[..]).unwrap();
+    let acked = quarantine_entries(&pair);
+    let journal = journal_path(&pair, &state);
+    let directory = state.join("git-carry-v2/ingest");
+    let other = directory.join("replacement");
+    fs::write(&other, b"").unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&other, &journal).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = directory.join("probe");
+    if fs::write(&probe, b"").is_ok() {
+        // A privileged runner ignores the mode: removal cannot be made to
+        // fail this way, so there is nothing to prove here.
+        fs::remove_file(&probe).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        println!("issue94: skipped (directory modes not enforced)");
+        return;
+    }
+    let refused = Ingest::open(&target, &journals, pair.ingest_plan(), None).map(drop);
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let refused = refused.unwrap_err();
+    assert_eq!(
+        refused.refusal,
+        BulkloadRefusal::JournalOwnershipConflict,
+        "{refused:?}"
+    );
+    assert_eq!(refused.reason, Some("quarantine_held"), "{refused:?}");
+    assert!(
+        matches!(refused.cleanup, Some(BulkloadRefusal::Io(_))),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .lines()
+            .iter()
+            .any(|line| line.starts_with("cleanup_refused=")),
+        "{:?}",
+        refused.lines()
+    );
+    assert_eq!(quarantine_entries(&pair), acked, "A's packs");
+    assert!(journal.exists(), "the removal failed");
+    drop(a);
+
+    // The empty journal left at the name holds no plan: an open starts
+    // afresh and finishes.
+    let mut session = Ingest::open(&target, &journals, pair.ingest_plan(), None).unwrap();
+    assert_eq!(session.next_segment(), 0);
+    for index in 0..pair.plan.segments() {
+        let segment = pair.segment(index);
+        session.receive(index, &mut &segment[..]).unwrap();
+    }
+    session.finish().unwrap();
+    assert!(published(&pair));
+    assert_clean(&pair.destination, "issue94");
 }
 
 /// r3 M4: re-publishing a lost ref runs the full held-tip preflight, not

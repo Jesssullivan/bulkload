@@ -54,19 +54,33 @@ impl JournalStore {
     }
 
     /// A short name for this state dir: the first 16 hex digits of BLAKE3
-    /// over its canonical spelling. It keys the quarantine, so two state dirs
+    /// over its identity token. It keys the quarantine, so two state dirs
     /// ingesting one plan never share (or adopt) a quarantine (#75 r2 N4).
-    pub(super) fn key(&self) -> String {
-        use std::os::unix::ffi::OsStrExt as _;
+    ///
+    /// #82 (R25 / R-N58): the token is 32 random bytes created once as
+    /// `git-carry-v2/quarantine-key` ([`state_token`]), never the state
+    /// dir's path, so a state dir renamed or remounted elsewhere keeps its
+    /// key and resumes its own quarantine instead of re-sending every
+    /// segment. Device and inode numbers are not used: Darwin's `st_dev`
+    /// can change across reboots. A state dir lost and recreated gets a new
+    /// token, so it never adopts the lost one's quarantine.
+    ///
+    /// # Errors
+    /// As [`state_token`].
+    pub(super) fn key(&self) -> crate::Result<String> {
+        let carry = private_subdirectory(self.state.directory(), "git-carry-v2", true)?
+            .ok_or(BulkloadRefusal::Io(None))?;
+        seal_dir(self.state.directory())?;
+        let token = state_token(&carry)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"bulkload git-carry-v2 quarantine key\0");
-        hasher.update(self.state.root().as_os_str().as_bytes());
-        hasher
+        hasher.update(&token);
+        Ok(hasher
             .finalize()
             .to_hex()
             .get(..16)
             .unwrap_or_default()
-            .to_owned()
+            .to_owned())
     }
 
     /// `git-carry-v2/ingest/`, created (0700, sealed) when `create` is set.
@@ -82,6 +96,66 @@ impl JournalStore {
         }
         Ok(ingest)
     }
+}
+
+/// Bytes in the state dir's identity token.
+const TOKEN_BYTES: usize = 32;
+
+/// The state dir's identity token (#82): `quarantine-key` in `carry`
+/// (`git-carry-v2/`), created 0600 on first use with [`TOKEN_BYTES`] random
+/// bytes and read back after the private-file checks every time after.
+///
+/// It is only ever read or written under an exclusive `flock` on the file,
+/// and both the file and `carry` are sealed before the lock is released or
+/// the token returned, so no quarantine is ever named by a token that a
+/// power loss could take back. A file shorter than a token (its creator
+/// died between the create and the sealed write) was never handed to
+/// anyone, so the holder of the lock writes a fresh token into it.
+///
+/// # Errors
+/// `JOURNAL_OWNERSHIP_CONFLICT` when the lock stays held, `PATH_ESCAPES_ROOT`
+/// for a file that fails the private-file checks or is longer than a token,
+/// and I/O failures.
+fn state_token(carry: &File) -> crate::Result<[u8; TOKEN_BYTES]> {
+    const ATTEMPTS: u32 = 50;
+    let name = cstring(b"quarantine-key")?;
+    for _ in 0..ATTEMPTS {
+        let file = match open_rw(carry, &name) {
+            Ok(file) => file,
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => match create_private(carry, &name) {
+                Ok(file) => file,
+                // Another opener created it first: open theirs.
+                Err(BulkloadRefusal::Io(Some(libc::EEXIST))) => continue,
+                Err(error) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        };
+        private_file(&file)?;
+        if !lock_exclusive(&file)? {
+            return Err(BulkloadRefusal::JournalOwnershipConflict);
+        }
+        let mut token = [0_u8; TOKEN_BYTES];
+        let mut held = Vec::with_capacity(TOKEN_BYTES + 1);
+        (&file)
+            .take(u64::try_from(TOKEN_BYTES + 1).map_err(|_| BulkloadRefusal::BudgetExceeded)?)
+            .read_to_end(&mut held)?;
+        if held.len() > TOKEN_BYTES {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        if held.len() == TOKEN_BYTES {
+            token.copy_from_slice(&held);
+        } else {
+            File::open("/dev/urandom")?.read_exact(&mut token)?;
+            file.set_len(0)?;
+            (&file).write_all(&token)?;
+        }
+        // Sealed by whoever reads it, too: a creator that died after its
+        // write and before its seal left the bytes only in the page cache.
+        seal_file(&file)?;
+        seal_dir(carry)?;
+        return Ok(token);
+    }
+    Err(BulkloadRefusal::JournalOwnershipConflict)
 }
 
 /// One journal record.
@@ -526,6 +600,56 @@ fn open_rw(directory: &File, name: &std::ffi::CString) -> crate::Result<File> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn private_dir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// #82: the quarantine key follows the state dir's identity token, not
+    /// its path. It is stable across opens, survives a rename, differs
+    /// between state dirs (and for a state dir recreated at the same path),
+    /// and a token file its creator never finished is written afresh; one
+    /// longer than a token refuses.
+    #[test]
+    fn the_quarantine_key_follows_the_state_dirs_token_not_its_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir().unwrap();
+        let state = scratch.path().join("state");
+        private_dir(&state);
+        let key = JournalStore::open(&state).unwrap().key().unwrap();
+        assert_eq!(key.len(), 16);
+        assert_eq!(JournalStore::open(&state).unwrap().key().unwrap(), key);
+        let token = state.join("git-carry-v2/quarantine-key");
+        let metadata = std::fs::metadata(&token).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.len(), 32);
+
+        let moved = scratch.path().join("moved");
+        std::fs::rename(&state, &moved).unwrap();
+        assert_eq!(JournalStore::open(&moved).unwrap().key().unwrap(), key);
+
+        private_dir(&state);
+        let recreated = JournalStore::open(&state).unwrap().key().unwrap();
+        assert_ne!(recreated, key, "a recreated state dir is a new one");
+
+        // A creator that died between the create and the write.
+        let torn = state.join("git-carry-v2/quarantine-key");
+        std::fs::write(&torn, b"short").unwrap();
+        let rewritten = JournalStore::open(&state).unwrap().key().unwrap();
+        assert_eq!(std::fs::metadata(&torn).unwrap().len(), 32);
+        assert_eq!(
+            JournalStore::open(&state).unwrap().key().unwrap(),
+            rewritten
+        );
+
+        std::fs::write(&torn, [7_u8; 33]).unwrap();
+        assert_eq!(
+            JournalStore::open(&state).unwrap().key(),
+            Err(BulkloadRefusal::PathEscapesRoot)
+        );
+    }
 
     #[test]
     fn records_round_trip_and_a_changed_byte_is_refused() {
