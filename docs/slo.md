@@ -1,6 +1,6 @@
 # Bulkload SLO and policy charter
 
-Ratified by operator interview 2026-10-03 (OI-1003-Q1–Q12), recorded under R-N13
+Ratified by operator interview 2026-10-03 (OI-1003-Q1–Q13), recorded under R-N13
 and on Linear TIN-4543. This charter defines what "bulkload is complete" means.
 It also defines the SLOs every claim must be proven against. Where it conflicts
 with an older gate, the dated ruling here wins. Change it only by a new dated
@@ -24,7 +24,13 @@ migration happens to succeed. Three bodies of work make up the bar:
 - **Migration in full.** The lab shape (neo → sting) and the migration
   relationship are defined well enough to run with confidence.
 
-The single neo→sting migration runs once, after this bar is met (OI-1002-Q24).
+**Completion means confidence in the code and the product (OI-1003-Q13).** The
+full neo→sting migration is not a major scheduled event. It is one more run of
+a tool that is already trusted, no different from any other sync. Because S3
+and S5 hold, it can be started whenever convenient and repeated as neo's work
+lanes finish, and every rerun converges without re-reading anything. OI-1002-Q24
+(no full migration before bulkload is complete) still stands. What
+OI-1003-Q13 removes is the framing of that run as a one-off milestone.
 
 ## Core SLOs
 
@@ -85,5 +91,7 @@ The single neo→sting migration runs once, after this bar is met (OI-1002-Q24).
 2. Simplification, refactoring and the adversarial architecture review, along
    with the pre-migration correctness fixes.
 3. Gates (a) and (b), measured against these SLOs.
-4. Coverage inventory (#102, #103), then the single migration run, then the
-   operator lifts R-N56.
+4. Coverage inventory (#102, #103) and the operator's lift of R-N56. From then
+   on, migrating neo to sting is a routine, repeatable sync run (OI-1003-Q13):
+   rerun as neo's work lanes complete, each run reaching closure with 0
+   unaccounted.
