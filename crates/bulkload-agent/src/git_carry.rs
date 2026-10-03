@@ -126,6 +126,59 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
+/// Run a git child that packs objects (`bundle create`, `pack-objects`),
+/// feeding it `stdin`, and reap it with `wait4` so its own resource usage is
+/// measured. Returns whether it succeeded and its storage reads in bytes
+/// (`ru_inblock` x 512; see the `counters` module notes for why this is a
+/// lower bound, and only a lower bound on Darwin). The caller sets stdout;
+/// stderr is discarded as `output` discards it.
+fn pack_child(command: &mut Command, stdin: Option<&[u8]>) -> Result<(bool, u64)> {
+    use std::io::Write;
+    use std::process::Stdio;
+    command.stderr(Stdio::null()).stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command.spawn()?;
+    // The child is reaped below whatever the write did, so a failed write
+    // never leaves an unreaped child behind; its error wins afterwards.
+    let written = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut pipe)) => pipe.write_all(bytes).map_err(BulkloadRefusal::from),
+        (Some(_), None) => Err(BulkloadRefusal::Io(None)),
+        (None, _) => Ok(()),
+    };
+    let reaped = reap(&child);
+    written?;
+    reaped
+}
+
+// wait4 on a child std has not waited for. std never reaps a child on drop,
+// so after this the `Child` handle is only dropped, never waited on.
+fn reap(child: &std::process::Child) -> Result<(bool, u64)> {
+    let pid = libc::pid_t::try_from(child.id()).map_err(|_| BulkloadRefusal::Io(None))?;
+    let mut status: libc::c_int = 0;
+    // SAFETY: `rusage` is a plain C struct of integers; all-zero is a valid
+    // value, and wait4 overwrites it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: `pid` is this process's own child, spawned by the caller and
+        // not yet reaped (std waits only when asked, and nothing asked). Both
+        // out-pointers are valid, exclusive borrows for the duration of the call.
+        let reaped = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
+        if reaped == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    let success = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let blocks = u64::try_from(usage.ru_inblock).unwrap_or(0);
+    Ok((success, blocks.saturating_mul(512)))
+}
+
 fn metadata(private: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let value = input(git(private).args(["hash-object", "-w", "--stdin"]), bytes)?;
     let value = std::str::from_utf8(&value)
@@ -1152,7 +1205,7 @@ fn export_repository_inner(
     }
     mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    shared::write_bundle(&private, &bundle, options.prerequisite)?;
+    let pack = shared::write_bundle(&private, &bundle, options.prerequisite)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
     mid_pass::fire(&repo, mid_pass::Stage::AfterPass);
@@ -1167,6 +1220,7 @@ fn export_repository_inner(
         refs_after,
         authority,
         nested_repositories,
+        pack,
     })
 }
 
@@ -1346,8 +1400,11 @@ impl StagedBundle {
     }
 }
 
-// Copy `source` to a new private file while hashing it: one read, one write.
+// Copy `source` to a new private file while hashing it: one read, one write,
+// counted as `read_bundle_stage_bytes`, `blake3_bundle_stage_bytes` and
+// `write_bundle_stage_bytes`.
 fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
+    use crate::counters::{add_len, update, Counter};
     use std::io::{Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
     let mut from = fs::OpenOptions::new()
@@ -1366,9 +1423,11 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         if count == 0 {
             break;
         }
+        add_len(Counter::BundleStageRead, count);
         let chunk = buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?;
-        hash.update(chunk);
+        update(&mut hash, Counter::HashBundleStage, chunk);
         to.write_all(chunk)?;
+        add_len(Counter::BundleStageWrite, count);
     }
     Ok(*hash.finalize().as_bytes())
 }
@@ -1482,6 +1541,11 @@ fn retained_blobs(
     use bulkload_proto::FileKind;
     use std::process::Stdio;
     let mut reuse = raw_tree::Reuse::new();
+    // The fetch reads the whole retained bundle, whatever it then keeps.
+    crate::counters::add(
+        crate::counters::Counter::SourceCaptureReuseRead,
+        fs::symlink_metadata(retained.bundle)?.len(),
+    );
     if !git(private)
         .args(["fetch", "--no-tags", "--quiet"])
         .arg(retained.bundle)
@@ -1803,6 +1867,9 @@ pub struct Export {
     pub refs_after: String,
     /// The Git authority this export read once and carried.
     pub authority: CarriedAuthority,
+    /// What packing the bundle cost (WP2): its pack's bytes and objects, and
+    /// the packing child's storage reads.
+    pub pack: shared::PackStats,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -3392,6 +3459,7 @@ fn filesystem_census(
 ) -> Result<Census> {
     use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
+    crate::counters::bump(crate::counters::Counter::CensusWalks);
     let mut pending = vec![root.to_path_buf()];
     let mut rows = Vec::new();
     let mut nested_worktrees = Vec::new();
