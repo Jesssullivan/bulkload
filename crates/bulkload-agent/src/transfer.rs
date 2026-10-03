@@ -128,6 +128,20 @@ pub struct TransferStats {
     pub directories_fallback: Vec<Vec<u8>>,
 }
 
+impl TransferStats {
+    /// Refusals that are walk caps (#129): subtrees the source walk did not
+    /// carry because they lie past its depth or path-length bound. Each is
+    /// also in [`Self::refusals`], by path and code, so a capped subtree is
+    /// never counted as carried.
+    #[must_use]
+    pub fn capped_subtrees(&self) -> u64 {
+        self.refusals
+            .iter()
+            .filter(|(_, code)| crate::walk::is_cap_refusal(code))
+            .count() as u64
+    }
+}
+
 /// Cumulative process-scope phase counters; concurrent transfers may overlap.
 #[derive(Clone, Copy, Debug)]
 pub struct TransferTiming {
