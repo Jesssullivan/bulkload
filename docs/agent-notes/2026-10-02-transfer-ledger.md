@@ -6,7 +6,9 @@ OI-1002-Q29 (operator "ultracode, full steam ahead", 2026-10-02), R-N13.
 Engine rulings honoured: R25/R-N58 strict per OI-1001-Q15, R-N76 (racy rule),
 R-N86, R-N88, R-N118 (wire v5, no dual stack), R33.
 
-Branch `feat/transfer-ledger-20261002` from `origin/main` 84242b8.
+Branch `feat/transfer-ledger-20261002` from `origin/main` 84242b8; PR
+https://github.com/Jesssullivan/bulkload/pull/117, implementation commit
+d9eca36.
 
 ## What changed
 
