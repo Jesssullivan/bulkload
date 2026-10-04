@@ -7,6 +7,12 @@ MC_*.cfg in the output directory is deleted and re-rendered, so a config
 dropped from the table leaves no stale file behind. `just tla-check` runs
 every row of configs.tsv in order (docs/formal/README.md). Sprint 2's Dhall
 catalogue replaces this script (OI-1003-Q32).
+
+Row kinds (the expect column): pass, fail (a caught mutant or a design
+finding: exactly its named property is violated), reach (a Witness_
+invariant is violated, which proves a scenario reachable), simulate and
+inconclusive (the budget self-test). A pass row also states the exact set of
+actions its coverage report must show never enabled.
 """
 
 import pathlib
@@ -29,6 +35,10 @@ DEFAULTS = {
     "MaxBackupSteps": "2",
     "Mutation": '"none"',
     "BudgetSeconds": "600",
+    # An assumption the code does not meet yet (README, "Code and design
+    # disagreements"): the source state root's entry is sealed.
+    "StoreRootSealed": "TRUE",
+    "TrackStrictHeld": "FALSE",
 }
 
 # Every safety invariant. The names are frozen (README.md, "Frozen names").
@@ -93,9 +103,27 @@ NV_CORE = {
     "EstateReads": "FALSE",
 }
 
+# The N-version core's second row: the same bound plus one third-party write
+# or delete, so that the source ledger's read paths (a ledger manifest, and
+# its chunks re-read to fill an absent output) are part of the cross-check.
+NV_LEDGER = {**NV_CORE, "MaxForeign": "1"}
+
+# WP0(g) breadth: two seats, three runs, one crash, one third-party write or
+# delete, relaxed ledger rows. The third-party write is what makes a later
+# run consult the ledger for a row a crash dropped (MC_reach_wp0g_lost_row);
+# with MC_main's bound the relaxed ledger is never read.
+WP0G = {
+    "Seats": "{a, b}",
+    "MaxRuns": "3",
+    "MaxCrashes": "1",
+    "MaxEdits": "0",
+    "MaxForeign": "1",
+    "RelaxedSourceLedger": "TRUE",
+}
+
 
 def config(name, expect, prop, comment, over, invs, props=(), spec="Spec",
-           sym=False, flags="-"):
+           sym=False, flags="-", never=None):
     return {
         "name": name,
         "expect": expect,
@@ -107,8 +135,25 @@ def config(name, expect, prop, comment, over, invs, props=(), spec="Spec",
         "spec": spec,
         "sym": sym,
         "flags": flags,
+        "never": never,
     }
 
+
+def witness(name, prop, comment, over, sym=False):
+    """A reach row: TypeOK and one Witness_ invariant, which must fail."""
+    return config(name, "reach", prop, comment, over, ["TypeOK", prop], sym=sym)
+
+
+# Coverage (README.md, "Coverage"): the actions a pass row's report must
+# show never enabled. tla-check fails a pass row on any difference, so a spec
+# edit that silently disables an action cannot pass.
+WP0D_OFF = ["CheckOwn", "Exchange", "RenameReplace", "VerifyDisp"]
+CHECK_RENAME = ["CheckOwn", "RenameReplace"]
+ESTATE_OFF = ["BackupBegin", "BackupEnd", "BackupStepLock", "BackupStepUnlock",
+              "GitRead"]
+NO_FOREIGN = ["ForeignDelete", "ForeignWrite"]
+NO_CRASH = ["CrashBoth", "CrashDst", "CrashSrc"]
+NO_EDIT = ["Edit", "SilentRewrite", "RecvRefused"]
 
 CONFIGS = [
     # ---- the budget's own proof: always the first row ----------------------
@@ -118,10 +163,10 @@ CONFIGS = [
         "WithinBudget",
         [
             "BUDGET SELF-TEST (expected INCONCLUSIVE). MC_main's constants with",
-            "a 5 s budget: the search needs far longer, so WithinBudget must",
-            "trip, which proves the budget is evaluated per state. The bound is",
-            "MC_main's, so a broken budget still ends (as a PASS, which",
-            "tla-check rejects before it runs any other config).",
+            "a 5 s budget: the search needs far longer, so WithinBudget, and",
+            "nothing else, must trip, which proves the budget is evaluated per",
+            "state. The bound is MC_main's, so a broken budget still ends (as a",
+            "PASS, which tla-check rejects before it runs any other config).",
         ],
         {**MAIN, "BudgetSeconds": "5"},
         ["TypeOK"],
@@ -134,12 +179,14 @@ CONFIGS = [
         "all",
         [
             "Main config, breadth: the code as it is today (strict source ledger,",
-            "no superseding publish). Two seats, two runs, one crash of either",
-            "host or both, one source edit per seat; destination faults off.",
+            "no superseding publish), with the state root assumed sealed. Two",
+            "seats, two runs, one crash of either host or both, one source edit",
+            "per seat; destination faults off.",
         ],
         MAIN,
         SAFETY,
         sym=True,
+        never=NO_FOREIGN + ["CommitFail"] + WP0D_OFF + ESTATE_OFF,
     ),
     config(
         "MC_main_deep",
@@ -152,6 +199,7 @@ CONFIGS = [
         ],
         {"Seats": "{a}", "MaxRuns": "3", "MaxCrashes": "2", **FAULTS},
         SAFETY,
+        never=WP0D_OFF + ESTATE_OFF,
     ),
     config(
         "MC_dest_faults",
@@ -165,6 +213,7 @@ CONFIGS = [
         {"MaxCrashes": "0", "MaxEdits": "0", **FAULTS},
         SAFETY,
         sym=True,
+        never=NO_CRASH + NO_EDIT + WP0D_OFF + ESTATE_OFF,
     ),
     config(
         "MC_nv_core",
@@ -179,6 +228,22 @@ CONFIGS = [
         ],
         NV_CORE,
         SAFETY,
+        never=NO_FOREIGN + ["CommitFail"] + WP0D_OFF + ESTATE_OFF,
+    ),
+    config(
+        "MC_nv_ledger",
+        "pass",
+        "all",
+        [
+            "N-version core, second row (OI-1003-Q32): MC_nv_core plus one",
+            "third-party write or delete, so the source ledger's read paths (a",
+            "ledger manifest; its chunks re-read for an absent output) are part",
+            "of the cross-check (MC_reach_ledger_manifest, MC_reach_ledger_chunks",
+            "prove both reachable at this bound). No SYMMETRY.",
+        ],
+        NV_LEDGER,
+        SAFETY,
+        never=["CommitFail"] + WP0D_OFF + ESTATE_OFF,
     ),
     # ---- WP0(g) / OI-1003-Q20 ----------------------------------------------
     config(
@@ -189,11 +254,16 @@ CONFIGS = [
             "WP0(g) / OI-1003-Q20, breadth: the source ledger's row commits run",
             "synchronous=NORMAL, fullfsync=OFF, so a source power loss may drop",
             "any subset of them. The store-creation commit (schema and",
-            "authority) stays durable. Every safety invariant must still hold.",
+            "authority) stays durable. Two seats, three runs, one crash, one",
+            "third-party write or delete: a later run consults the ledger for a",
+            "dropped row (MC_reach_wp0g_lost_row). Every safety invariant must",
+            "still hold.",
         ],
-        {**MAIN, "RelaxedSourceLedger": "TRUE"},
+        WP0G,
         SAFETY,
         sym=True,
+        never=["Edit", "SilentRewrite", "RecvRefused", "CommitFail"]
+        + WP0D_OFF + ESTATE_OFF,
     ),
     config(
         "MC_wp0g_deep",
@@ -211,6 +281,7 @@ CONFIGS = [
             **FAULTS,
         },
         SAFETY,
+        never=WP0D_OFF + ESTATE_OFF,
     ),
     # ---- WP0(d) candidate designs (no code yet) -----------------------------
     config(
@@ -231,6 +302,7 @@ CONFIGS = [
             "SupersedeMode": '"exchange"',
         },
         SAFETY,
+        never=["CommitFail"] + CHECK_RENAME + ESTATE_OFF,
     ),
     # ---- S2 -----------------------------------------------------------------
     config(
@@ -244,6 +316,7 @@ CONFIGS = [
         ],
         {"Seats": "{a}", "EstateReads": "TRUE"},
         SAFETY,
+        never=NO_FOREIGN + ["CommitFail"] + WP0D_OFF,
     ),
     # ---- liveness (never under SYMMETRY: unsound for liveness) --------------
     config(
@@ -260,6 +333,8 @@ CONFIGS = [
         ["TypeOK", "ClosureAccounted"],
         props=["RunsClose", "AllRunsFinish"],
         spec="LiveSpec",
+        never=NO_CRASH + NO_EDIT + NO_FOREIGN + ["CommitFail"] + WP0D_OFF
+        + ESTATE_OFF,
     ),
     # ---- the drafted constants: simulation only, never model-checked --------
     config(
@@ -275,6 +350,40 @@ CONFIGS = [
         DRAFTED,
         SAFETY,
         flags="-simulate num=3000 -depth 120 -seed 20261003",
+    ),
+    # ---- reachability witnesses: expected REACHED --------------------------
+    witness(
+        "MC_reach_ledger_manifest",
+        "Witness_LedgerManifest",
+        [
+            "REACH (expected REACHED): at MC_nv_ledger's bound the source serves",
+            "a manifest from its ledger without reading (RecvDecide's ledger",
+            "branch), so that pass row explores it.",
+        ],
+        NV_LEDGER,
+    ),
+    witness(
+        "MC_reach_ledger_chunks",
+        "Witness_LedgerChunkRead",
+        [
+            "REACH (expected REACHED): at MC_nv_ledger's bound the source re-reads",
+            "a ledger manifest's chunks to fill an absent output (RecvNeed's",
+            "pread branch), so that pass row explores it.",
+        ],
+        NV_LEDGER,
+    ),
+    witness(
+        "MC_reach_wp0g_lost_row",
+        "Witness_LostRowRead",
+        [
+            "REACH (expected REACHED): at MC_wp0g's bound a relaxed ledger loses",
+            "a committed row, and a later run consults the ledger for that seat,",
+            "misses, and reads it to build the manifest. A strict ledger never",
+            "loses a row, so this is the relaxed-only behaviour MC_wp0g must",
+            "explore for its PASS to say anything about OI-1003-Q20.",
+        ],
+        WP0G,
+        sym=True,
     ),
     # ---- design findings: expected to fail ---------------------------------
     config(
@@ -296,6 +405,36 @@ CONFIGS = [
             "RelaxedAuthority": "TRUE",
         },
         ["TypeOK", "R25_NoDurableReread"],
+    ),
+    config(
+        "MC_store_root_unsealed",
+        "fail",
+        "R25_NoDurableReread",
+        [
+            "CODE FINDING (expected to fail): the code today, strict settings,",
+            "but the source state root's directory entry is never sealed",
+            "(private_dir), so a source power loss may lose the whole store and",
+            "its authority even after synchronous=FULL commits. The next run",
+            "re-keys every row and re-reads bytes the destination holds durably:",
+            "MC_wp0g_authority's counterexample without any relaxed setting.",
+        ],
+        {**ONE, "MaxRuns": "2", "MaxCrashes": "1", "StoreRootSealed": "FALSE"},
+        ["TypeOK", "R25_NoDurableReread"],
+    ),
+    config(
+        "MC_r25_unrowed_bytes",
+        "fail",
+        "R25_StrictNoDurableReread",
+        [
+            "CODE FINDING (expected to fail): R25 under the strict reading of",
+            "\"held durably\" (OI-1002-Q33). A crash after the file and directory",
+            "seals but before commit_outputs leaves bulkload's own bytes durable",
+            "at the final path with no row; the next run reads the seat again.",
+            "R25_NoDurableReread does not see it (no row). #124 asks which",
+            "reading R25 means.",
+        ],
+        {**ONE, "MaxRuns": "2", "MaxCrashes": "1", "TrackStrictHeld": "TRUE"},
+        ["TypeOK", "R25_StrictNoDurableReread"],
     ),
     config(
         "MC_wp0d_check_rename",
@@ -361,6 +500,17 @@ MUTATIONS = [
     ("reread_changed_only", "reread_durable", "S3_ReadsOnlyChanged",
      {"MaxRuns": "2", "MaxCrashes": "1"},
      "as reread_durable, against S3's changed-seats-only inequality."),
+    ("reread_ignore_ledger", "reread_ignore_ledger",
+     "R25_NoCommittedCaptureReread", {"MaxRuns": "2"},
+     "the destination never answers Reuse AND manifest_capture ignores the\n"
+     "\\* source ledger, so a rerun re-reads a committed capture. In code shape\n"
+     "\\* (SupersedeMode \"off\") slo.md's R25 wording fails only when both\n"
+     "\\* protections are gone; reread_durable alone never violates it."),
+    ("reread_exchange", "reread_durable", "R25_NoCommittedCaptureReread",
+     {"MaxRuns": "2", "SupersedeMode": '"exchange"'},
+     "as reread_durable, under WP0(d)'s exchange design: the source serves\n"
+     "\\* its ledger manifest and re-reads its chunks for the superseding\n"
+     "\\* publish, a committed capture re-read."),
     ("skip_output_row", "skip_output_row", "S3_ClosedPassIsHeld", {},
      "the store commit records no output row, so a closed pass holds nothing."),
     ("double_read", "double_read", "ReadOnce", {},
@@ -410,10 +560,15 @@ for suffix, mutation, invariant, over, comment in MUTATIONS:
         )
     )
 
-EXPECTS = {"pass", "fail", "simulate", "inconclusive"}
+EXPECTS = {"pass", "fail", "reach", "simulate", "inconclusive"}
 names = [c["name"] for c in CONFIGS]
 assert len(names) == len(set(names)), "config names must be unique"
 assert CONFIGS[0]["expect"] == "inconclusive", "the budget self-test runs first"
+# Every safety invariant must be shown falsifiable: a property no fail row
+# violates may hold by construction (README.md, "Mutations").
+failing = {c["prop"] for c in CONFIGS if c["expect"] == "fail"}
+untested = [p for p in SAFETY if p != "TypeOK" and p not in failing]
+assert not untested, f"no fail row violates {untested}"
 
 for stale in OUT.glob("MC_*.cfg"):
     stale.unlink()
@@ -425,14 +580,19 @@ for c in CONFIGS:
     if c["props"]:
         assert not c["sym"], f"{c['name']}: SYMMETRY is unsound for liveness"
     named = [p for p in c["invs"] + c["props"] if p != "TypeOK"]
-    if c["expect"] == "fail":
+    if c["expect"] in ("fail", "reach"):
         # TypeOK rides along so a type error shows up as a wrong outcome; the
         # one other property is the one the config must violate.
         assert named == [c["prop"]], f"{c['name']} must name exactly its property"
+        assert (c["expect"] == "reach") == c["prop"].startswith("Witness_"), c["name"]
     elif c["expect"] == "inconclusive":
         assert c["prop"] == "WithinBudget" and not named, c["name"]
     else:
         assert c["prop"] == "all", c["name"]
+    # Coverage is enforced on pass rows only: a fail or reach row stops at
+    # its first violation, and a simulation samples.
+    assert (c["expect"] == "pass") == (c["never"] is not None), c["name"]
+    never = "*" if c["never"] is None else (",".join(sorted(c["never"])) or "-")
     constants = {**DEFAULTS, **c["over"]}
     width = max(len(k) for k in constants)
     lines = [f"\\* {line}" for line in c["comment"]]
@@ -449,19 +609,23 @@ for c in CONFIGS:
     for prop in c["props"]:
         lines.append(f"PROPERTY {prop}")
     (OUT / f"{c['name']}.cfg").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    rows.append("\t".join([c["name"], c["expect"], c["prop"], c["flags"]]))
+    rows.append("\t".join([c["name"], c["expect"], c["prop"], never, c["flags"]]))
 
 header = [
     "# TLC configs checked by `just tla-check`, in this order (README.md).",
     "# Rendered by gen_cfgs.py; edit its table, not this file.",
     "# Tab-separated columns:",
     "#   name            the config, MC_<name>.cfg",
-    "#   expect          pass | fail | simulate | inconclusive",
+    "#   expect          pass | fail | reach | simulate | inconclusive",
     "#   named-property  fail: the one property it must violate;",
+    "#                   reach: the Witness_ invariant it must violate;",
     "#                   inconclusive: WithinBudget; otherwise all",
+    "#   never           pass: the actions coverage must show never enabled,",
+    "#                   comma-separated and sorted (- for none);",
+    "#                   * for any other row (not checked)",
     "#   flags           extra TLC flags, one argv element per",
     "#                   space-separated word (- for none)",
-    "name\texpect\tnamed-property\tflags",
+    "name\texpect\tnamed-property\tnever\tflags",
 ]
 (OUT / "configs.tsv").write_text("\n".join(header + rows) + "\n", encoding="utf-8")
 print(len(rows), "configs")

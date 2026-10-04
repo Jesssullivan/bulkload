@@ -230,14 +230,18 @@ import? "justfile.flywheel"
 # of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
 # 3 workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. The first row is the budget self-test: it
-# must trip WithinBudget, or nothing else runs, because every other config
-# relies on that budget. Outcomes: PASS (model checking finished, no error),
-# FAIL (exactly the row's named property violated, nothing else), SIMULATION
-# (-simulate finished clean; never a model-checking result), INCONCLUSIVE (a
-# WithinBudget trip or no Finished line; never a pass or a caught mutant),
-# WRONG (anything else). Every outcome must equal the row's expect column.
-# Optional arguments name configs to run after the self-test. Scratch is
-# removed when every row matches; otherwise the logs stay for review.
+# must finish with WithinBudget, and nothing else, violated, or nothing else
+# runs, because every other config relies on that budget. Outcomes: PASS
+# (model checking finished, no error, and the never-enabled actions equal
+# the row's never column), FAIL (exactly the row's named property violated,
+# nothing else), REACHED (exactly the row's Witness_ invariant violated: the
+# scenario is reachable), SIMULATION (-simulate finished clean; never a
+# model-checking result), INCONCLUSIVE (a WithinBudget trip; never a pass or
+# a caught mutant), ABORTED (no Finished line: TLC did not end normally;
+# matches no expectation), WRONG (anything else). Every outcome must equal
+# the row's expect column. Optional arguments name configs to run after the
+# self-test. Scratch is removed when every row matches; otherwise the logs
+# stay for review.
 # Model-check docs/formal with TLC: positives pass, mutations fail.
 tla-check *configs:
     #!/usr/bin/env bash
@@ -256,9 +260,9 @@ tla-check *configs:
     proven=no
     peak=0
     begun=$SECONDS
-    format='%-30s %-12s %-12s %-22s %11s %11s %5s %6s %7s\n'
+    format='%-30s %-12s %-12s %-28s %11s %11s %5s %6s %7s\n'
     printf "$format" config expect outcome violated distinct generated depth wall rss_mib
-    while IFS=$'\t' read -r name expect prop flags; do
+    while IFS=$'\t' read -r name expect prop never_want flags; do
         if [[ -z $name || $name == \#* || $name == name ]]; then
             continue
         fi
@@ -312,7 +316,18 @@ tla-check *configs:
             violated=${violated:+$violated,}deadlock
         fi
         errors=$(grep -c '^Error:' "$log" || true)
-        if [[ ,$violated, == *,WithinBudget,* ]] || ! grep -q '^Finished in' "$log"; then
+        if ! grep -q '^Finished in' "$log"; then
+            # The JVM ended early (out of memory, ended from outside, a
+            # crash): nothing is known, and it never counts as a budget trip.
+            outcome=ABORTED
+        elif [[ $expect == inconclusive ]]; then
+            # The budget self-test proves the budget only by tripping it alone.
+            if [[ $violated == "$prop" ]]; then
+                outcome=INCONCLUSIVE
+            else
+                outcome=WRONG
+            fi
+        elif [[ ,$violated, == *,WithinBudget,* ]]; then
             outcome=INCONCLUSIVE
         elif [[ $expect == simulate ]]; then
             if [[ $status -eq 0 && $errors -eq 0 ]]; then
@@ -324,14 +339,11 @@ tla-check *configs:
             outcome=PASS
         elif [[ $expect == fail && $violated == "$prop" ]]; then
             outcome=FAIL
+        elif [[ $expect == reach && $violated == "$prop" ]]; then
+            outcome=REACHED
         else
             outcome=WRONG
         fi
-        case $expect:$outcome in
-            pass:PASS | fail:FAIL | simulate:SIMULATION | inconclusive:INCONCLUSIVE) matched=yes ;;
-            *) matched=no ;;
-        esac
-        printf "$format" "$name" "$expect" "$outcome" "${violated:--}" "${distinct:-?}" "${generated:-?}" "${depth:--}" "$wall" "$rss"
         # Coverage: the actions the last coverage report shows never enabled.
         never=$(awk '/^The coverage statistics/ { delete seen; delete order; n = 0 }
             /^<[A-Za-z_][A-Za-z0-9_]* line .*>: [0-9]+:[0-9]+$/ {
@@ -341,8 +353,25 @@ tla-check *configs:
                 seen[action] += count[1] + count[2]
             }
             END { for (i = 1; i <= n; i++) if (seen[order[i]] == 0) printf "%s ", order[i] }' "$log")
+        never_got=$(tr ' ' '\n' <<<"$never" | sed '/^$/d' | sort | paste -sd, -)
+        never_got=${never_got:--}
+        coverage=ok
+        if [[ $outcome == PASS && $never_want != '*' && $never_got != "$never_want" ]]; then
+            # A pass row's search is complete, so its never-enabled set is
+            # exact; any change means a spec edit enabled or lost an action.
+            outcome=WRONG
+            coverage=mismatch
+        fi
+        case $expect:$outcome in
+            pass:PASS | fail:FAIL | reach:REACHED | simulate:SIMULATION | inconclusive:INCONCLUSIVE) matched=yes ;;
+            *) matched=no ;;
+        esac
+        printf "$format" "$name" "$expect" "$outcome" "${violated:--}" "${distinct:-?}" "${generated:-?}" "${depth:--}" "$wall" "$rss"
         if [[ -n $never ]]; then
             printf '    never enabled: %s\n' "$never"
+        fi
+        if [[ $coverage == mismatch ]]; then
+            printf '    coverage: expected never enabled %s, got %s\n' "$never_want" "$never_got"
         fi
         if [[ $matched == no ]]; then
             mismatches=$((mismatches + 1))
@@ -350,7 +379,7 @@ tla-check *configs:
         fi
         if [[ $expect == inconclusive ]]; then
             if [[ $matched == no ]]; then
-                echo "tla-check: the budget self-test did not trip WithinBudget; no other config runs" >&2
+                echo "tla-check: the budget self-test did not finish with WithinBudget alone violated; no other config runs" >&2
                 exit 1
             fi
             proven=yes

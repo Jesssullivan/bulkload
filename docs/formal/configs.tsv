@@ -2,44 +2,56 @@
 # Rendered by gen_cfgs.py; edit its table, not this file.
 # Tab-separated columns:
 #   name            the config, MC_<name>.cfg
-#   expect          pass | fail | simulate | inconclusive
+#   expect          pass | fail | reach | simulate | inconclusive
 #   named-property  fail: the one property it must violate;
+#                   reach: the Witness_ invariant it must violate;
 #                   inconclusive: WithinBudget; otherwise all
+#   never           pass: the actions coverage must show never enabled,
+#                   comma-separated and sorted (- for none);
+#                   * for any other row (not checked)
 #   flags           extra TLC flags, one argv element per
 #                   space-separated word (- for none)
-name	expect	named-property	flags
-MC_budget_selftest	inconclusive	WithinBudget	-
-MC_main	pass	all	-
-MC_main_deep	pass	all	-
-MC_dest_faults	pass	all	-
-MC_nv_core	pass	all	-
-MC_wp0g	pass	all	-
-MC_wp0g_deep	pass	all	-
-MC_wp0d_exchange	pass	all	-
-MC_s2	pass	all	-
-MC_live	pass	all	-
-MC_main_sim	simulate	all	-simulate num=3000 -depth 120 -seed 20261003
-MC_wp0g_authority	fail	R25_NoDurableReread	-
-MC_wp0d_check_rename	fail	NoClobber	-
-MC_neg_live_unfair	fail	RunsClose	-
-MC_neg_held_before_commit	fail	HeldAfterCommit	-
-MC_neg_commit_before_fsync	fail	RecordImpliesBytes	-
-MC_neg_commit_before_dirseal	fail	RecordImpliesBytes	-
-MC_neg_adopt_without_seal	fail	RecordImpliesBytes	-
-MC_neg_ledger_before_held	fail	LedgerAfterHeld	-
-MC_neg_done_before_sync	fail	DoneAfterLedger	-
-MC_neg_reread_durable	fail	R25_NoDurableReread	-
-MC_neg_reread_unchanged	fail	S3_UnchangedReadsZero	-
-MC_neg_reread_changed_only	fail	S3_ReadsOnlyChanged	-
-MC_neg_skip_output_row	fail	S3_ClosedPassIsHeld	-
-MC_neg_double_read	fail	ReadOnce	-
-MC_neg_src_ledger_carries_r25	fail	R25_NoDurableReread	-
-MC_neg_record_racy	fail	ReuseSound	-
-MC_neg_record_racy_ledger	fail	LedgerSound	-
-MC_neg_untyped_space	fail	ClosureAccounted	-
-MC_neg_source_write	fail	S2_TypedSourceAccess	-
-MC_neg_pause_writer	fail	S2_TypedSourceAccess	-
-MC_neg_git_optional_locks	fail	S2_TypedSourceAccess	-
-MC_neg_unbounded_backup	fail	S2_BackupLockBounded	-
-MC_neg_supersede_unchecked	fail	NoClobber	-
-MC_neg_sweep_displaced	fail	NoClobber	-
+name	expect	named-property	never	flags
+MC_budget_selftest	inconclusive	WithinBudget	*	-
+MC_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_main_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_dest_faults	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_nv_core	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_nv_ledger	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_wp0g	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
+MC_s2	pass	all	CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,RenameReplace,VerifyDisp	-
+MC_live	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003
+MC_reach_ledger_manifest	reach	Witness_LedgerManifest	*	-
+MC_reach_ledger_chunks	reach	Witness_LedgerChunkRead	*	-
+MC_reach_wp0g_lost_row	reach	Witness_LostRowRead	*	-
+MC_wp0g_authority	fail	R25_NoDurableReread	*	-
+MC_store_root_unsealed	fail	R25_NoDurableReread	*	-
+MC_r25_unrowed_bytes	fail	R25_StrictNoDurableReread	*	-
+MC_wp0d_check_rename	fail	NoClobber	*	-
+MC_neg_live_unfair	fail	RunsClose	*	-
+MC_neg_held_before_commit	fail	HeldAfterCommit	*	-
+MC_neg_commit_before_fsync	fail	RecordImpliesBytes	*	-
+MC_neg_commit_before_dirseal	fail	RecordImpliesBytes	*	-
+MC_neg_adopt_without_seal	fail	RecordImpliesBytes	*	-
+MC_neg_ledger_before_held	fail	LedgerAfterHeld	*	-
+MC_neg_done_before_sync	fail	DoneAfterLedger	*	-
+MC_neg_reread_durable	fail	R25_NoDurableReread	*	-
+MC_neg_reread_unchanged	fail	S3_UnchangedReadsZero	*	-
+MC_neg_reread_changed_only	fail	S3_ReadsOnlyChanged	*	-
+MC_neg_reread_ignore_ledger	fail	R25_NoCommittedCaptureReread	*	-
+MC_neg_reread_exchange	fail	R25_NoCommittedCaptureReread	*	-
+MC_neg_skip_output_row	fail	S3_ClosedPassIsHeld	*	-
+MC_neg_double_read	fail	ReadOnce	*	-
+MC_neg_src_ledger_carries_r25	fail	R25_NoDurableReread	*	-
+MC_neg_record_racy	fail	ReuseSound	*	-
+MC_neg_record_racy_ledger	fail	LedgerSound	*	-
+MC_neg_untyped_space	fail	ClosureAccounted	*	-
+MC_neg_source_write	fail	S2_TypedSourceAccess	*	-
+MC_neg_pause_writer	fail	S2_TypedSourceAccess	*	-
+MC_neg_git_optional_locks	fail	S2_TypedSourceAccess	*	-
+MC_neg_unbounded_backup	fail	S2_BackupLockBounded	*	-
+MC_neg_supersede_unchecked	fail	NoClobber	*	-
+MC_neg_sweep_displaced	fail	NoClobber	*	-

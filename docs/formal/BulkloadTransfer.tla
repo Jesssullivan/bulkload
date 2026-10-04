@@ -27,7 +27,9 @@
 (*   - The source store's authority: a random value in the source          *)
 (*     store's settings table, created with the schema by Store::open and  *)
 (*     part of every row key on both sides. A relaxed source store can     *)
-(*     lose it (RelaxedAuthority), which re-keys every row.                *)
+(*     lose it (RelaxedAuthority), and so can a store whose state root's   *)
+(*     directory entry is not sealed (StoreRootSealed = FALSE, the code    *)
+(*     today); either loss re-keys every row.                              *)
 (*                                                                         *)
 (* ABSTRACTIONS (what is NOT modelled)                                     *)
 (*   - Content is an opaque version number per seat. Chunk boundaries,     *)
@@ -58,6 +60,24 @@
 (*     store is assumed to lose rows, never to return a wrong one: torn   *)
 (*     or reordered pages under fullfsync=OFF on Darwin are NOT modelled  *)
 (*     (README, open questions).                                          *)
+(*   - ASSUMPTION: each store's state root and database file exist        *)
+(*     durably once the store's first commit returns. The code does not   *)
+(*     establish this yet: private_dir creates the state root and never   *)
+(*     seals its parent directory (README, "Code and design               *)
+(*     disagreements"). StoreRootSealed = FALSE drops the assumption for  *)
+(*     the source store, which then behaves like a relaxed creation      *)
+(*     commit (MC_store_root_unsealed). Losing the destination store is   *)
+(*     not modelled: HeldPhys needs one of its rows, so R25 could not see *)
+(*     a re-read after such a loss.                                        *)
+(*   - A source ledger commit never fails here. In the code the first     *)
+(*     failed ledger group fails the whole session before SourceDone      *)
+(*     (LedgerSink::commit, Committer::submit); README, "Not proven".     *)
+(*   - "Held" means a committed destination row (HeldPhys). Bytes that    *)
+(*     are durable at the final path with no row (a crash before          *)
+(*     commit_outputs, a failed group whose files were renamed) are read  *)
+(*     again; R25_StrictNoDurableReread, under TrackStrictHeld, makes     *)
+(*     that gap visible (MC_r25_unrowed_bytes). Salvaged temporaries are  *)
+(*     folded away (see above) and not covered by it.                     *)
 (*   - A seal (file or directory) is durable at once. On Darwin a seal is *)
 (*     F_BARRIERFSYNC, an ordering barrier, and the group's full flush or  *)
 (*     the store commit's fullfsync is the durability point. That only     *)
@@ -124,7 +144,8 @@
 (*   code yet.                                                             *)
 (*                                                                         *)
 (* NEGATIVE CONFIGS set Mutation to break exactly one rule; each MUST      *)
-(* produce a counterexample (see README.md).                               *)
+(* produce a counterexample (see README.md). REACH CONFIGS check one       *)
+(* Witness_ invariant, whose violation proves a scenario reachable.        *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -143,11 +164,17 @@ CONSTANTS
     EstateReads,         \* model estate capture's typed reads (git, SQLite)
     MaxBackupSteps,      \* bound on SQLite backup steps under the shared lock
     Mutation,            \* "none", or one deliberate rule break
-    BudgetSeconds        \* wall-clock budget, checked by WithinBudget
+    BudgetSeconds,       \* wall-clock budget, checked by WithinBudget
+    StoreRootSealed,     \* the source state root's directory entry is sealed
+                         \* before the store's first commit returns (an
+                         \* assumption the code does not meet yet; README)
+    TrackStrictHeld      \* ghost: mark bulkload's own durable outputs from
+                         \* non-racy captures, for R25_StrictNoDurableReread
 
 Mutations == {"none", "held_before_commit", "commit_before_fsync",
               "commit_before_dirseal", "adopt_without_seal",
               "ledger_before_held", "reread_durable",
+              "reread_ignore_ledger",
               "src_ledger_carries_r25", "record_racy", "source_write",
               "git_optional_locks", "pause_writer", "unbounded_backup",
               "supersede_unchecked", "sweep_displaced", "double_read",
@@ -158,6 +185,7 @@ ASSUME /\ IsFiniteSet(Seats) /\ Seats # {}
        /\ MaxForeign \in Nat /\ MaxCommitFails \in Nat
        /\ SpaceRefusals \in BOOLEAN /\ RelaxedSourceLedger \in BOOLEAN
        /\ RelaxedAuthority \in BOOLEAN
+       /\ StoreRootSealed \in BOOLEAN /\ TrackStrictHeld \in BOOLEAN
        /\ SupersedeMode \in {"off", "check_rename", "exchange"}
        /\ EstateReads \in BOOLEAN /\ MaxBackupSteps \in Nat
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
@@ -169,7 +197,10 @@ FirstForeignId == 50 \* bulkload's own output identities are run numbers
 KeyBase == 10        \* row key = authority epoch * KeyBase + stat version
 ASSUME MaxEdits < KeyBase
 
-NoFile == [pres |-> FALSE, id |-> 0, data |-> 0, dd |-> TRUE, nd |-> TRUE]
+\* A file at a destination path. cl (ghost, only under TrackStrictHeld):
+\* bulkload published it from a non-racy capture.
+NoFile == [pres |-> FALSE, id |-> 0, data |-> 0, dd |-> TRUE, nd |-> TRUE,
+           cl |-> FALSE]
 NoTmp  == [st |-> "none", data |-> 0]
 NoCap  == [data |-> 0, racy |-> FALSE, rec |-> FALSE, led |-> FALSE]
 NoRec  == [key |-> 0, data |-> 0, racy |-> FALSE, id |-> 0, kind |-> "none"]
@@ -194,6 +225,8 @@ VARIABLES
     sPend,        \* captures Held{true} and submitted, not yet committed
     srcLedger,    \* committed source ledger rows [seat, key, data]
     srcDone,      \* SourceDone sent this session
+    ledgerLost,   \* ghost: ledger rows a source power loss dropped
+                  \* [seat, key, run]; kept beside srcLedger
     srcAuth,      \* the source store's authority epoch (0: no store yet)
     srcStore,     \* "none" | "volatile" (creation not durable) | "durable"
     \* wire: at most one in-flight control frame per entry (request/response)
@@ -226,7 +259,7 @@ VARIABLES
     clobbered     \* bulkload replaced or removed a file it does not own
 
 srcVars  == <<srcStat, edits, fresh>>
-sVars    == <<sEnt, sRow, sCap, sPend, srcLedger, srcDone>>
+sVars    == <<sEnt, sRow, sCap, sPend, srcLedger, srcDone, ledgerLost>>
 authVars == <<srcAuth, srcStore>>
 dVars    == <<dEnt, dKey, dPlan, dPub, dRec, tmp, out, outPrev, disp, dstRows>>
 runVars  == <<run, sess, crashes, foreign, cfails>>
@@ -260,6 +293,15 @@ HeldPhys(s, v) ==
     /\ out[s].pres /\ out[s].dd /\ out[s].nd /\ out[s].data # GARBAGE
     /\ \E r \in dstRows : r.seat = s /\ r.key % KeyBase = v /\ r.id = out[s].id
 
+\* The strict reading of "held durably" (OI-1002-Q33; #124 asks which
+\* reading R25 means): HeldPhys, or bulkload's own output from a non-racy
+\* capture is durable at the path with the seat's current bytes, whether
+\* or not a row records it. Equal to HeldPhys unless TrackStrictHeld.
+StrictHeld(s) ==
+    \/ HeldPhys(s, sRow[s])
+    \/ /\ out[s].pres /\ out[s].cl /\ out[s].dd /\ out[s].nd
+       /\ out[s].data = edits[s]
+
 \* Row keys (A/transfer_store.rs row_key over the authority from Start and
 \* the walked row): the key the walk offers, and the key of the walked row.
 WireKey(s) == srcAuth * KeyBase + srcStat[s]
@@ -287,14 +329,17 @@ DoRead(s, kind) ==
     /\ reads' = reads \cup {[run |-> run, seat |-> s, key |-> SKey(s),
                              kind |-> kind,
                              held |-> HeldPhys(s, sRow[s]),
+                             strict |-> StrictHeld(s),
                              committed |-> /\ LedgerRows(s, SKey(s)) # {}
                                            /\ DestHolds(s, SKey(s))]}
     /\ rc' = [rc EXCEPT ![s] = @ + 1]
     /\ runReads' = runReads \cup {s}
     /\ srcOps' = srcOps \cup {"read"} \cup MutOps
 
-\* The output a publish creates in this run.
-NewOut(d, sealed) == [pres |-> TRUE, id |-> run, data |-> d, dd |-> sealed, nd |-> FALSE]
+\* The output a publish of seat s's staged capture creates in this run.
+NewOut(s, d, sealed) ==
+    [pres |-> TRUE, id |-> run, data |-> d, dd |-> sealed, nd |-> FALSE,
+     cl |-> TrackStrictHeld /\ ~dRec[s].racy]
 
 Durable(f) == IF f.pres THEN [f EXCEPT !.dd = TRUE, !.nd = TRUE] ELSE f
 
@@ -309,6 +354,7 @@ Init ==
     /\ sPend = {}
     /\ srcLedger = {}
     /\ srcDone = FALSE
+    /\ ledgerLost = {}
     /\ srcAuth = 0
     /\ srcStore = "none"
     /\ msg = [s \in Seats |-> NoMsg]
@@ -360,14 +406,20 @@ KeptDisp(s) ==
 \* serve's Store::open creates the source store when it has none: one
 \* transaction writes the schema and a fresh random authority (INSERT OR
 \* IGNORE into settings). Under synchronous=FULL that commit is durable when
-\* it returns; relaxed (RelaxedAuthority) it is not until a later sync.
+\* it returns; relaxed (RelaxedAuthority) it is not until a later sync. Its
+\* durability also needs the state root's own directory entry, which
+\* private_dir creates without sealing the parent: StoreRootSealed = FALSE
+\* models the code as it is, where the store stays "volatile" (lost whole
+\* or kept whole by the next crash). The destination store's root is
+\* assumed durable (header, ABSTRACTIONS).
 StartRun ==
     /\ run < MaxRuns
     /\ sess \in {"idle", "done", "broken"}
     /\ Quiescent
     /\ IF srcStore = "none"
        THEN /\ srcAuth' = srcAuth + 1
-            /\ srcStore' = IF RelaxedSourceLedger /\ RelaxedAuthority
+            /\ srcStore' = IF \/ RelaxedSourceLedger /\ RelaxedAuthority
+                              \/ ~StoreRootSealed
                            THEN "volatile" ELSE "durable"
        ELSE UNCHANGED authVars
     /\ run' = run + 1
@@ -393,8 +445,8 @@ StartRun ==
     /\ rc' = [s \in Seats |-> 0]
     /\ committedRun' = [s \in Seats |-> FALSE]
     /\ outc' = [s \in Seats |-> "pending"]
-    /\ UNCHANGED <<srcVars, sRow, sPend, srcLedger, dKey, outPrev, dstRows,
-                   crashes, foreign, cfails, estVars, reads, srcOps,
+    /\ UNCHANGED <<srcVars, sRow, sPend, srcLedger, ledgerLost, dKey, outPrev,
+                   dstRows, crashes, foreign, cfails, estVars, reads, srcOps,
                    everCommitted>>
 
 -----------------------------------------------------------------------------
@@ -413,7 +465,8 @@ Walk(s) ==
     /\ msg' = [msg EXCEPT ![s] = Msg("entry", WireKey(s),
                                       LedgerRows(s, WireKey(s)) # {}, "none")]
     /\ srcOps' = srcOps \cup {"stat"}
-    /\ UNCHANGED <<srcVars, authVars, sCap, sPend, srcLedger, srcDone, dVars, runVars,
+    /\ UNCHANGED <<srcVars, authVars, sCap, sPend, srcLedger, srcDone, ledgerLost,
+                   dVars, runVars,
                    estVars, reads, rc, runReads, heldAtStart, changedRun,
                    committedRun, everCommitted, outc, clobbered>>
 
@@ -428,7 +481,7 @@ RecvEntry(s) ==
     /\ sess = "on" /\ dEnt[s] = "none" /\ msg[s].t = "entry"
     /\ LET k == msg[s].v
            reuse == /\ RowMatches(s, k)
-                    /\ Mutation # "reread_durable"
+                    /\ Mutation \notin {"reread_durable", "reread_ignore_ledger"}
                     /\ (Mutation = "src_ledger_carries_r25" => msg[s].b)
            choices == IF reuse THEN {"reuse"}
                       ELSE (IF out[s].pres THEN {"manifest"} ELSE {"send", "manifest"})
@@ -454,12 +507,16 @@ RecvEntry(s) ==
 (* (ledger manifest without reading via Store::capture, else one read     *)
 (* whose chunks are retained); capture_file (stat check before reading,   *)
 (* racy per git_carry::racy). A racy capture is sent but never recorded.  *)
+(* Mutation reread_ignore_ledger: manifest_capture ignores the ledger (and *)
+(* RecvEntry never answers Reuse).                                         *)
 RecvDecide(s) ==
     /\ sess = "on" /\ sEnt[s] = "offered" /\ msg[s].t = "decide"
     /\ LET c == msg[s].c
            racy == fresh[s]
            rec == ~racy \/ Mutation = "record_racy"
            row == [seat |-> s, key |-> SKey(s), data |-> edits[s]]
+           useLedger == /\ LedgerRows(s, SKey(s)) # {}
+                        /\ Mutation # "reread_ignore_ledger"
        IN
        CASE c \in {"reuse", "refuse"} ->
               \* Retired: nothing is read or sent.
@@ -474,7 +531,7 @@ RecvDecide(s) ==
                                               rec |-> rec, led |-> FALSE]]
               /\ sPend' = IF Mutation = "ledger_before_held" /\ rec
                           THEN sPend \cup {row} ELSE sPend
-         [] c = "manifest" /\ LedgerRows(s, SKey(s)) # {} ->
+         [] c = "manifest" /\ useLedger ->
               \* Manifest from the ledger: no source read.
               LET r == CHOOSE x \in LedgerRows(s, SKey(s)) : TRUE IN
               /\ msg' = [msg EXCEPT ![s] = Msg("manifest", r.data, FALSE, "none")]
@@ -482,7 +539,7 @@ RecvDecide(s) ==
               /\ sCap' = [sCap EXCEPT ![s] = [data |-> r.data, racy |-> FALSE,
                                               rec |-> FALSE, led |-> TRUE]]
               /\ UNCHANGED <<sPend, reads, rc, runReads, srcOps>>
-         [] c = "manifest" /\ LedgerRows(s, SKey(s)) = {} /\ CaptureOK(s) ->
+         [] c = "manifest" /\ ~useLedger /\ CaptureOK(s) ->
               /\ DoRead(s, "full")
               /\ msg' = [msg EXCEPT ![s] = Msg("manifest", edits[s], racy, "none")]
               /\ sEnt' = [sEnt EXCEPT ![s] = "manifested"]
@@ -496,9 +553,9 @@ RecvDecide(s) ==
                                                "SOURCE_CHANGED_AFTER_SNAPSHOT")]
               /\ sEnt' = [sEnt EXCEPT ![s] = "done"]
               /\ UNCHANGED <<sCap, sPend, reads, rc, runReads, srcOps>>
-    /\ UNCHANGED <<srcVars, authVars, sRow, srcLedger, srcDone, dVars, runVars, estVars,
-                   heldAtStart, changedRun, committedRun, everCommitted, outc,
-                   clobbered>>
+    /\ UNCHANGED <<srcVars, authVars, sRow, srcLedger, srcDone, ledgerLost, dVars,
+                   runVars, estVars, heldAtStart, changedRun, committedRun,
+                   everCommitted, outc, clobbered>>
 
 (* Destination: plan a manifest and ask only for what it cannot fill.     *)
 (* A/transfer.rs Inbound::manifest, plan_file: an existing output is       *)
@@ -545,8 +602,8 @@ RecvNeed(s) ==
        ELSE /\ msg' = [msg EXCEPT ![s] = Msg("end", sCap[s].data, sCap[s].racy, "none")]
             /\ sEnt' = [sEnt EXCEPT ![s] = "await_held"]
             /\ UNCHANGED <<reads, rc, runReads, srcOps>>
-    /\ UNCHANGED <<srcVars, authVars, sRow, sCap, sPend, srcLedger, srcDone, dVars,
-                   runVars, estVars, heldAtStart, changedRun, committedRun,
+    /\ UNCHANGED <<srcVars, authVars, sRow, sCap, sPend, srcLedger, srcDone, ledgerLost,
+                   dVars, runVars, estVars, heldAtStart, changedRun, committedRun,
                    everCommitted, outc, clobbered>>
 
 (* Destination: an entry's data is complete.                               *)
@@ -624,7 +681,7 @@ Publish(s) ==
     /\ IF out[s].pres
        THEN /\ dPub' = [dPub EXCEPT ![s] = "failed_occupied"]
             /\ UNCHANGED <<out, outPrev, dRec>>
-       ELSE /\ out' = [out EXCEPT ![s] = NewOut(tmp[s].data, tmp[s].st = "sealed")]
+       ELSE /\ out' = [out EXCEPT ![s] = NewOut(s, tmp[s].data, tmp[s].st = "sealed")]
             /\ outPrev' = [outPrev EXCEPT ![s] = out[s]]
             /\ dRec' = [dRec EXCEPT ![s].id = run]
             /\ dPub' = [dPub EXCEPT ![s] = "renamed"]
@@ -667,7 +724,7 @@ CheckOwn(s) ==
 RenameReplace(s) ==
     /\ dPub[s] = "checked"
     /\ clobbered' = (clobbered \/ (out[s].pres /\ out[s].id \notin OwnIds(s)))
-    /\ out' = [out EXCEPT ![s] = NewOut(tmp[s].data, TRUE)]
+    /\ out' = [out EXCEPT ![s] = NewOut(s, tmp[s].data, TRUE)]
     /\ outPrev' = [outPrev EXCEPT ![s] = out[s]]
     /\ dRec' = [dRec EXCEPT ![s].id = run]
     /\ tmp' = [tmp EXCEPT ![s] = NoTmp]
@@ -681,7 +738,7 @@ RenameReplace(s) ==
 Exchange(s) ==
     /\ SupersedeMode = "exchange" /\ dRec[s].kind = "supersede"
     /\ dPub[s] = "sealed"
-    /\ out' = [out EXCEPT ![s] = NewOut(tmp[s].data, TRUE)]
+    /\ out' = [out EXCEPT ![s] = NewOut(s, tmp[s].data, TRUE)]
     /\ outPrev' = [outPrev EXCEPT ![s] = out[s]]
     /\ disp' = [disp EXCEPT ![s] = IF out[s].pres THEN [out[s] EXCEPT !.nd = FALSE]
                                    ELSE NoFile]
@@ -793,19 +850,24 @@ RecvHeld(s) ==
                 ELSE sPend
     /\ sEnt' = [sEnt EXCEPT ![s] = "done"]
     /\ msg' = [msg EXCEPT ![s] = NoMsg]
-    /\ UNCHANGED <<srcVars, authVars, sRow, sCap, srcLedger, srcDone, dVars, runVars,
-                   estVars, ghostVars>>
+    /\ UNCHANGED <<srcVars, authVars, sRow, sCap, srcLedger, srcDone, ledgerLost,
+                   dVars, runVars, estVars, ghostVars>>
 
 (* A/transfer_store.rs LedgerSink::publish -> commit_captures: one        *)
 (* transaction per group. Also runs after the session broke (Committer     *)
 (* drop). Durable at commit unless RelaxedSourceLedger (see CrashSrc).     *)
+(* It never fails here. In the code a failed group (a full or failing     *)
+(* source state disk) is sticky: LedgerSink drops every later capture,    *)
+(* and Committer::submit / sync then fail the session before SourceDone.  *)
+(* So a lost ledger write costs the session, not one re-read (README,     *)
+(* "Not proven here" and the WP0(g) conditions).                          *)
 LedgerCommit ==
     /\ sPend # {}
     /\ srcLedger' = {r \in srcLedger : ~\E p \in sPend : p.seat = r.seat /\ p.key = r.key}
                     \cup sPend
     /\ sPend' = {}
-    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, srcDone, msg, dVars, runVars,
-                   estVars, ghostVars>>
+    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, srcDone, ledgerLost, msg, dVars,
+                   runVars, estVars, ghostVars>>
 
 (* A/transfer.rs serve: committer.sync() returns before SourceDone.        *)
 (* Mutation done_before_sync sends it with captures still pending.         *)
@@ -814,8 +876,8 @@ SendSourceDone ==
     /\ \A s \in Seats : sEnt[s] = "done"
     /\ (sPend = {} \/ Mutation = "done_before_sync")
     /\ srcDone' = TRUE
-    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, sPend, srcLedger, msg, dVars,
-                   runVars, estVars, ghostVars>>
+    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, sPend, srcLedger, ledgerLost,
+                   msg, dVars, runVars, estVars, ghostVars>>
 
 (* A/transfer.rs Inbound::run (SourceDone once nothing is incoming) and    *)
 (* finish_receive (committer.finish, remove_salvaged).                      *)
@@ -929,7 +991,8 @@ ForeignWrite(s) ==
     /\ foreign < MaxForeign
     /\ \E d \in {FOREIGN, edits[s]} :
          out' = [out EXCEPT ![s] = [pres |-> TRUE, id |-> FirstForeignId + foreign + 1,
-                                    data |-> d, dd |-> FALSE, nd |-> TRUE]]
+                                    data |-> d, dd |-> FALSE, nd |-> TRUE,
+                                    cl |-> FALSE]]
     /\ disp' = [disp EXCEPT ![s] = Durable(disp[s])]
     /\ outPrev' = [outPrev EXCEPT ![s] = NoFile]
     /\ foreign' = foreign + 1
@@ -974,18 +1037,23 @@ DstLoss(f) ==
 
 \* The source host's power loss: the process and its pending ledger items
 \* are gone; a relaxed ledger may lose any of its committed rows. A store
-\* whose creation commit (schema and authority) was never synced may be lost
-\* whole, with every row after it; the next Store::open then makes a new
-\* authority, so every row key either side holds is a different key.
+\* whose creation (its commit of schema and authority, or its state root's
+\* directory entry) was never synced may be lost whole, with every row after
+\* it; the next Store::open then makes a new authority, so every row key
+\* either side holds is a different key. ledgerLost records what was lost.
 SrcLoss ==
     /\ sPend' = {}
     /\ IF srcStore = "volatile"
        THEN \/ /\ srcStore' = "none" /\ srcLedger' = {}
-            \/ /\ srcStore' = "durable" /\ srcLedger' \in SUBSET srcLedger
+            \/ /\ srcStore' = "durable"
+               /\ srcLedger' \in IF RelaxedSourceLedger THEN SUBSET srcLedger
+                                ELSE {srcLedger}
        ELSE /\ UNCHANGED srcStore
             /\ IF RelaxedSourceLedger
                THEN srcLedger' \in SUBSET srcLedger
                ELSE UNCHANGED srcLedger
+    /\ ledgerLost' = ledgerLost \cup {[seat |-> r.seat, key |-> r.key, run |-> run] :
+                                        r \in srcLedger \ srcLedger'}
     /\ UNCHANGED srcAuth
 
 ResetSourceSession ==
@@ -1019,8 +1087,8 @@ CrashDst ==
     /\ msg' = [s \in Seats |-> NoMsg]
     /\ sess' = IF sess = "on" THEN "broken" ELSE sess
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<srcVars, authVars, sRow, sPend, srcLedger, dKey, dstRows, run, foreign,
-                   cfails, estVars, ghostVars>>
+    /\ UNCHANGED <<srcVars, authVars, sRow, sPend, srcLedger, ledgerLost, dKey, dstRows,
+                   run, foreign, cfails, estVars, ghostVars>>
 
 \* One host runs both ends (loopback copy) and loses power.
 CrashBoth ==
@@ -1082,14 +1150,26 @@ TypeOK ==
 (* the destination already holds durably: a committed output row, recorded *)
 (* from that stat identity, vouching for the durable output at the path.   *)
 (* Stated physically (HeldPhys), so losing the authority cannot hide a     *)
-(* re-read behind a new key. Both clauses of R25 are this one check: a     *)
-(* seat whose stat identity is unchanged since its recorded, non-racy      *)
-(* capture is exactly a seat whose bytes are held under that identity.     *)
+(* re-read behind a new key. This is R25 with "held" read as "a committed  *)
+(* destination row": bytes that are durable with no row are outside it     *)
+(* (R25_StrictNoDurableReread below). No ruling yet fixes that reading     *)
+(* (#124; README, "Code and design disagreements"). It is the operative R25 *)
+(* check in code shape.                                                     *)
 R25_NoDurableReread == \A r \in reads : ~r.held
 
 (* docs/slo.md wording: no committed capture is re-read (a source ledger   *)
 (* row whose destination output is still the one the destination holds).   *)
+(* Vacuous while SupersedeMode = "off" (the code today): the source reads  *)
+(* with its ledger row present only to serve chunks for an absent output.  *)
+(* MC_neg_reread_ignore_ledger and MC_neg_reread_exchange show it can fail. *)
 R25_NoCommittedCaptureReread == \A r \in reads : ~r.committed
+
+(* NOT a code-shape invariant: R25 under the strict reading of "held       *)
+(* durably" (OI-1002-Q33), where bulkload's own durable output from a      *)
+(* non-racy capture counts as held with or without a row. Meaningful only  *)
+(* under TrackStrictHeld; the code fails it (MC_r25_unrowed_bytes), which  *)
+(* is the gap between R25_NoDurableReread and the strict reading.          *)
+R25_StrictNoDurableReread == \A r \in reads : ~r.strict
 
 (* A seat is read at most once a session (P23).                            *)
 ReadOnce == \A s \in Seats : rc[s] <= 1
@@ -1171,6 +1251,24 @@ WithinBudget == run \in 0..MaxRuns => TLCGet("duration") < BudgetSeconds
 (* started run reaches closure, and every run is made.                     *)
 RunsClose == (sess = "on") ~> (sess = "done")
 AllRunsFinish == <>(run = MaxRuns /\ sess = "done")
+
+(* Reachability witnesses. Each states that a scenario never happens; a   *)
+(* reach row's REACHED outcome is its violation, which proves the scenario *)
+(* is reachable within that row's bound (README, "Coverage").              *)
+
+\* The source served a manifest from its ledger, reading nothing.
+Witness_LedgerManifest == ~\E s \in Seats : sCap[s].led
+
+\* The source re-read a ledger manifest's chunks to serve them (pread).
+Witness_LedgerChunkRead == \A r \in reads : r.kind # "chunks"
+
+\* WP0(g): a later run consulted the ledger for a row a source power loss
+\* had dropped, missed, and read the seat to build its manifest. Only a
+\* relaxed ledger (or a lost store) puts rows in ledgerLost.
+Witness_LostRowRead ==
+    ~\E s \in Seats : \E x \in ledgerLost :
+        /\ x.seat = s /\ x.key = SKey(s) /\ x.run < run
+        /\ sEnt[s] = "manifested" /\ ~sCap[s].led
 
 \* Symmetry over seats, for the safety configs only.
 SeatSymmetry == Permutations(Seats)
