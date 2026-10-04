@@ -29,15 +29,22 @@ Association, 2014, pp. 433–448. ISBN 978-1-931971-16-4.
 - Verified via: fetched the USENIX presentation page (title, authors,
   venue, ISBN, pages). The method is also named in
   `crates/bulkload-agent/src/io/crash_check.rs`.
+- The paper's description of ALICE's method comes from the paper itself,
+  downloaded from USENIX
+  (<https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf>)
+  and read as text: abstract persistence models (section 3.2); the crash
+  states it constructs (prefixes, single-call intermediate states, pairwise
+  ordering) in section 3.3; and the limitations in section 3.6.
 
 **[B3-18]** Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli, Pandian
 Raju and Vijay Chidambaram. "Finding Crash-Consistency Bugs with Bounded
 Black-Box Crash Testing." *13th USENIX Symposium on Operating Systems Design
-and Implementation (OSDI 18)*, USENIX Association, 2018. ISBN
+and Implementation (OSDI 18)*, USENIX Association, 2018, pp. 33–50. ISBN
 978-1-939133-08-3.
 <https://www.usenix.org/conference/osdi18/presentation/mohan>
-- Verified via: fetched the USENIX presentation page (title, authors,
-  venue, ISBN). Page range not recorded here.
+- Verified via: fetched the USENIX presentation page. Title, authors, venue,
+  ISBN and pages come from the BibTeX record embedded in it
+  (`pages = {33--50}`).
 
 **[CrashMonkey19]** Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli,
 Pandian Raju and Vijay Chidambaram. "CrashMonkey and ACE: Systematically
@@ -131,26 +138,49 @@ Lecture Notes in Computer Science, Springer, 1999, pp. 54–66. DOI
 **[Unison04]** Benjamin C. Pierce and Jérôme Vouillon. "What's in Unison? A
 Formal Specification and Reference Implementation of a File Synchronizer."
 Technical Report MS-CIS-03-36, Department of Computer and Information
-Science, University of Pennsylvania, 2004.
-<https://repository.upenn.edu/cis_reports/40>
-- Verified via: a web search located the UPenn repository record. Fetched
-  Pierce's Unison bibliography page,
+Science, University of Pennsylvania, 24 February 2004.
+<https://repository.upenn.edu/handle/20.500.14332/7325>
+- Verified via: the repository API record. The handle URL was fetched
+  (HTTP 200), and the item's record was read from the repository's REST API
+  (`/server/api/core/items/df9bb5bd-2f08-4333-89ee-198156a9cf1f`): title,
+  authors, report number MS-CIS-03-36, issue date 2004-02-24, and this
+  handle as its URI. Also fetched Pierce's Unison bibliography page,
   <https://www.cis.upenn.edu/~bcpierce/papers/unison_bib.html> (authors,
   title, institution, report number, 2004).
-- The repository page refused automated fetches (HTTP 403), so its URL was
-  confirmed by search only.
 
 ## Specifications and official documentation
 
 **[AppleDiskWrites]** Apple Inc. "Reducing disk writes." Apple Developer
 Documentation (Xcode). Accessed 2026-10-03.
 <https://developer.apple.com/documentation/xcode/reducing-disk-writes>
-- Verified via: fetched; the page exists under this title.
-- The body is rendered by script and could not be read by tool. The paper's
-  description of `F_FULLFSYNC` and `F_BARRIERFSYNC` follows bulkload's own
-  reading of Apple's documentation, recorded in
-  `crates/bulkload-agent/src/io/crash_check.rs`. It does not rest on a
-  tool-read of this page.
+- Verified via: fetched the page and its JSON data endpoint,
+  <https://developer.apple.com/tutorials/data/documentation/xcode/reducing-disk-writes.json>,
+  and read the body:
+  - apps that need a write barrier can use `F_BARRIERFSYNC`;
+  - `F_FULLFSYNC` is for apps that need a strong expectation of
+    persistence;
+  - `F_FULLFSYNC` is best effort, and data can still be lost on sudden
+    power loss.
+- The page says nothing about drive-wide flushing. The paper cites it only
+  for that guidance; the drain and barrier semantics come from
+  [AppleFcntl].
+
+**[AppleFcntl]** Apple Inc. "fcntl(2)" manual page, in the XNU kernel
+source as `bsd/man/man2/fcntl.2` (page date 12 August 2021). Accessed
+2026-10-03.
+<https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2>
+Older copy, which has no `F_BARRIERFSYNC` entry:
+<https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html>.
+- Verified via: fetched the raw man source from the
+  `apple-oss-distributions/xnu` repository and read both entries:
+  - `F_FULLFSYNC` asks the drive to flush all buffered data, draining the
+    device's whole queue;
+  - `F_BARRIERFSYNC` issues a barrier that orders earlier flushed I/O on
+    the same device ahead of later I/O, with no durability on return, and
+    needs hardware support that Apple SSDs are guaranteed to provide.
+- Also fetched the archive page ("Mac OS X Manual Page For fcntl(2)"),
+  whose `F_FULLFSYNC` entry matches.
+- `crates/bulkload-agent/src/io/crash_check.rs` quotes this manual page.
 
 **[BLAKE3]** Jack O'Connor, Jean-Philippe Aumasson, Samuel Neves and Zooko
 Wilcox-O'Hearn. "BLAKE3: one function, fast everywhere." Specification,
@@ -191,8 +221,10 @@ ioprio_set(2): get/set I/O scheduling class and priority." Accessed
 **[RacyGit]** The Git project. "racy-git." Git technical documentation.
 Accessed 2026-10-03.
 <https://git-scm.com/docs/racy-git>
-- Verified via: fetched (page title; the same-timestamp problem and Git's
-  content re-check of racily clean entries).
+- Verified via: fetched (page title). An entry is racily clean when its
+  cached `st_mtime` is the same as, or newer than, the index file's own
+  timestamp. Git then re-checks the entry's content against the recorded
+  object.
 
 **[SQLiteBackup]** SQLite. "SQLite Backup API." Accessed 2026-10-03.
 <https://www.sqlite.org/backup.html>
@@ -214,26 +246,37 @@ Accessed 2026-10-03.
 
 ## Software projects
 
-**[Borg]** The BorgBackup project. "Data structures and file formats."
-Borg documentation, Internals, version 1.4.5 at access. Accessed
+**[Borg]** The BorgBackup project. Borg documentation, version 1.4.5 at
+access: "Data structures and file formats" (Internals) and "borg create"
+(Usage). Source: `src/borg/cache.py` on the `1.4-maint` branch. Accessed
 2026-10-03.
-<https://borgbackup.readthedocs.io/en/stable/internals/data-structures.html>
-- Verified via: fetched (buzhash chunker; chunk ids by cryptographic hash or
-  MAC; the files cache used to skip unchanged files).
+- <https://borgbackup.readthedocs.io/en/stable/internals/data-structures.html>
+- <https://borgbackup.readthedocs.io/en/stable/usage/create.html>
+- <https://github.com/borgbackup/borg/blob/1.4-maint/src/borg/cache.py>
+- Verified via: fetched all three:
+  - data structures: the buzhash chunker; chunk ids by cryptographic hash
+    or MAC; the files cache used to skip unchanged files;
+  - `borg create`: `--files-cache` defaults to `ctime,size,inode`;
+  - `cache.py`: `LocalCache.commit` does not persist entries whose cmtime
+    is the newest seen (lines 629–647 at access).
 
-**[Bup]** The bup project. "The Crazy Hacker's Guide to Bup Craziness"
-(`DESIGN.md`). Accessed 2026-10-03.
+**[Bup]** The bup project. "The Crazy Hacker's Crazy Guide to Bup
+Craziness" (`DESIGN.md`). Accessed 2026-10-03.
 <https://github.com/bup/bup/blob/main/DESIGN.md>
-- Verified via: fetched (Git packfile storage, rolling-checksum
-  hashsplitting, the separate bupindex, midx).
+- Verified via: fetched the raw file. The title is its first line, checked
+  word for word. Also read: Git packfile storage, rolling-checksum
+  hashsplitting, the separate bupindex, and midx.
 
 **[Casync17]** Lennart Poettering. "casync — A tool for distributing file
 system images." Blog post, 20 June 2017.
 <http://0pointer.net/blog/casync-a-tool-for-distributing-file-system-images.html>
 Repository: <https://github.com/systemd/casync>.
-- Verified via: fetched the post (title, author, date; buzhash chunking,
-  SHA-256 chunk store, `.caidx`/`.caibx`/`.catar`). Fetched the repository
-  page (owner `systemd`, not archived).
+- Verified via: fetched the post (title, author, date; buzhash chunking;
+  `.caidx`/`.caibx`/`.catar`). Fetched the repository page (owner `systemd`,
+  not archived) and its README.
+- Digest: the README names SHA512/256 as the chunk digest, with SHA256 as
+  the alternative. The 2017 post names SHA256 only. The paper describes
+  casync in the present tense, so it follows the README.
 
 **[Desync]** folbricht. "desync: Alternative casync implementation."
 Software repository. Accessed 2026-10-03.
@@ -273,9 +316,14 @@ chapter). restic documentation, version 0.19.1 at access. Accessed
 **[RsyncMan]** The rsync project. "rsync(1)" manual page. Accessed
 2026-10-03. <https://download.samba.org/pub/rsync/rsync.1>
 Project home: <https://rsync.samba.org/>.
-- Verified via: fetched the manual page (the default quick check by size
-  and modification time; `--checksum`; `--partial`, `--inplace` and
-  `--append`). Fetched the project home page.
+- Verified via: fetched the manual page and read:
+  - the default quick check by size and modification time;
+  - `--checksum`: the sender checksums every file during its file-list
+    scan, and the receiver checksums every file whose size matches the
+    sender's;
+  - `--partial`, `--inplace` and `--append`.
+
+  Fetched the project home page.
 
 **[UnisonRepo]** Benjamin C. Pierce and contributors. "unison: Unison file
 synchronizer." Software repository. Accessed 2026-10-03.
