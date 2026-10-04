@@ -110,9 +110,12 @@ writing connection was still open:
     row count;
   - no -shm is written; it is a lock and index cache that the first opener
     rebuilds.
-Caveat: any WAL-aware opener, read-only included (as provider_sqlite's
-backup opens it), creates <db>-shm beside the image. A verify after such a
-read reports that path as an extra entry.
+Any WAL-aware opener, read-only included (as provider_sqlite's backup opens
+it), creates <db>-shm beside the image. A -shm beside a SQLite database is
+SQLite's wal-index: a lock and index cache that bulkload never carries. It is
+therefore set aside, never sealed. `verify` and the counts report it
+(shm_ignored, sqlite_shm_ignored), so a first measurement pass does not stop
+the next `mutate` (OI-1003-Q35), and an S2 harness still sees the write.
 
 Not modelled:
   - hardlinks, holes (sparse files), xattrs and ACLs;
@@ -143,8 +146,17 @@ It writes DEST/mutations/round-RRRR.json with:
   - stat_only: the same manifest row with a new inode, size, mtime or ctime,
     such as a rewritten index or a directory whose listing changed;
   - reads_allowed: the regular files among added, modified and stat_only. An
-    S3 rerun may read those files and nothing else.
-SEAL.json and MANIFEST.tsv then move to the new identity.
+    S3 rerun may read those files and nothing else;
+  - reads_allowed_sizes and reads_allowed_bytes: their sizes and the total,
+    the bound for source_bytes_read (S3 delta, OI-1003-Q18);
+  - changed_content_bytes: the total size of added and modified files;
+  - repos_changed: each repository touched, with its worktrees and its bare
+    mirror, plus the count of those paths inside git directories;
+  - repos_unchanged: the count of the rest. These give the expectation for
+    census_walks and pack bytes (OI-1003-Q35).
+SEAL.json and MANIFEST.tsv then move to the new identity. Rounds are
+deterministic, so one round gives the same sidecar on every build measured
+(OI-1003-Q35).
 
 Usage:
   estate_corpus.py generate DEST [--seed S] [--scale small|estate]
@@ -185,6 +197,7 @@ DEFAULT_SEED = "bulkload-estate-corpus-v1"
 HISTORY_EPOCH = 1_767_225_600  # 2026-01-01T00:00:00Z, the first git timestamp
 MUTATION_EPOCH = 1_790_985_600  # 2026-10-03T00:00:00Z; round r starts r days on
 ROOT_TOKEN = b"@CORPUS_ROOT@"
+SQLITE_MAGIC = b"SQLite format 3\0"
 KIB = 1 << 10
 MIB = 1 << 20
 BLOCK = MIB
@@ -1217,6 +1230,36 @@ def walk(corpus: Path) -> list[tuple[str, os.stat_result]]:
     return out
 
 
+def is_wal_index(corpus: Path, rel: str) -> bool:
+    """A SQLite `-shm` beside its database: a reader's lock and index cache."""
+    if not rel.endswith("-shm"):
+        return False
+    try:
+        with (corpus / rel[:-4]).open("rb") as handle:
+            return handle.read(16) == SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+def sealed_walk(
+    corpus: Path,
+) -> tuple[list[tuple[str, os.stat_result]], list[str]]:
+    """The walk minus SQLite wal-index files, and those files.
+
+    Any WAL-aware opener creates <db>-shm, read-only included (bulkload's own
+    provider_sqlite backup does), and bulkload never carries -shm bytes. So a
+    -shm is reported, never sealed: a first measurement pass must not stop the
+    next `mutate` (OI-1003-Q35).
+    """
+    kept, shm = [], []
+    for rel, info in walk(corpus):
+        if stat.S_ISREG(info.st_mode) and is_wal_index(corpus, rel):
+            shm.append(rel)
+        else:
+            kept.append((rel, info))
+    return kept, shm
+
+
 def index_logical(data: bytes) -> bytes:
     """A git index without its stat words and trailing checksum."""
     if data[:4] != b"DIRC":
@@ -1303,10 +1346,12 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
             "sqlite_wal",
             "large_files",
             "small_files",
+            "sqlite_shm_ignored",
         ),
         0,
     )
-    entries = walk(corpus)
+    entries, shm = sealed_walk(corpus)
+    counts["sqlite_shm_ignored"] = len(shm)
     children: dict[str, int] = {}
     for rel, _info in entries:
         parent = rel.rpartition("/")[0]
@@ -1368,7 +1413,7 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
             counts["packs"] += in_git and name.endswith(".pack")
             counts["jsonl"] += name.endswith(".jsonl")
             counts["jsonl_zst"] += name.endswith(".jsonl.zst")
-            counts["sqlite"] += head == b"SQLite format 3\0"
+            counts["sqlite"] += head == SQLITE_MAGIC
             counts["sqlite_wal"] += name.endswith("-wal")
             counts["large_files"] += info.st_size >= MIB
             counts["small_files"] += info.st_size <= 4 * KIB
@@ -1545,10 +1590,13 @@ def verify(dest: Path) -> int:
     if seal is None or not corpus.is_dir():
         print(f"estate-corpus verify dest={dest} missing=1 ok=False")
         return 1
-    text, problems, _counts = manifest(corpus, seal["root"])
+    text, problems, counts = manifest(corpus, seal["root"])
     identity = identity_of(text)
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
+    if counts["sqlite_shm_ignored"]:
+        for rel in sealed_walk(corpus)[1]:
+            print(f"estate-corpus note: unsealed SQLite wal-index {esc(rel)}")
     ok = not problems and identity == seal["identity"]
     if not ok and (dest / "MANIFEST.tsv").is_file():
         sealed = rows_of((dest / "MANIFEST.tsv").read_text())
@@ -1559,7 +1607,8 @@ def verify(dest: Path) -> int:
     relocated = os.path.realpath(corpus) != seal["root"]
     print(
         f"estate-corpus verify dest={dest} identity={identity} "
-        f"expected={seal['identity']} relocated={int(relocated)} ok={ok}"
+        f"expected={seal['identity']} relocated={int(relocated)} "
+        f"shm_ignored={counts['sqlite_shm_ignored']} ok={ok}"
     )
     return 0 if ok else 1
 
@@ -1587,7 +1636,7 @@ def mutate(dest: Path, count: int) -> int:
         return 2
     before = rows_of(before_text)
     # Manifest rows are keyed by escaped path; `raw` maps back to file names.
-    entries = walk(corpus)
+    entries = sealed_walk(corpus)[0]
     raw = {esc(rel): rel for rel, _info in entries}
     stats_before = {esc(rel): stat_key(info) for rel, info in entries}
     rnd = len(seal["mutations"]) + 1
@@ -1736,7 +1785,9 @@ def mutate(dest: Path, count: int) -> int:
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
     after = rows_of(after_text)
-    stats_after = {esc(rel): stat_key(info) for rel, info in walk(corpus)}
+    entries = sealed_walk(corpus)[0]
+    raw.update({esc(rel): rel for rel, _info in entries})
+    stats_after = {esc(rel): stat_key(info) for rel, info in entries}
     added, removed, modified = diff_rows(before, after)
     stat_only = sorted(
         (
@@ -1750,6 +1801,24 @@ def mutate(dest: Path, count: int) -> int:
         (p for p in {*added, *modified, *stat_only} if after[p][1] == "f"),
         key=str.encode,
     )
+    sizes = {p: stats_after[p][1] for p in reads}
+    touched = [*added, *removed, *modified, *stat_only]
+    repos_changed = []
+    for repo in seal["repos"]:
+        roots = [repo["path"], *(w["path"] for w in repo["worktrees"])]
+        roots += [repo["bare"]] if repo.get("bare") else []
+        hits = [
+            p for p in touched if any(p == r or p.startswith(r + "/") for r in roots)
+        ]
+        if hits:
+            admin = [p for p in hits if any(map(is_gitdir_name, p.split("/")))]
+            repos_changed.append(
+                {
+                    "repo": repo["path"],
+                    "paths": len(hits),
+                    "git_admin_paths": len(admin),
+                }
+            )
     identity = identity_of(after_text)
     sidecar = {
         "format": FORMAT,
@@ -1763,6 +1832,13 @@ def mutate(dest: Path, count: int) -> int:
         "changed": {"added": added, "removed": removed, "modified": modified},
         "stat_only": stat_only,
         "reads_allowed": reads,
+        "reads_allowed_sizes": sizes,
+        "reads_allowed_bytes": sum(sizes.values()),
+        "changed_content_bytes": sum(
+            sizes[p] for p in (*added, *modified) if after[p][1] == "f"
+        ),
+        "repos_changed": repos_changed,
+        "repos_unchanged": len(seal["repos"]) - len(repos_changed),
     }
     out = dest / "mutations" / f"round-{rnd:04d}.json"
     out.parent.mkdir(exist_ok=True)
@@ -1783,7 +1859,9 @@ def mutate(dest: Path, count: int) -> int:
     print(
         f"estate-corpus mutated={corpus} round={rnd} operations={count} "
         f"added={len(added)} removed={len(removed)} modified={len(modified)} "
-        f"stat_only={len(stat_only)} reads_allowed={len(reads)} identity={identity}"
+        f"stat_only={len(stat_only)} reads_allowed={len(reads)} "
+        f"reads_allowed_bytes={sum(sizes.values())} "
+        f"repos_changed={len(repos_changed)} identity={identity}"
     )
     return 1 if problems else 0
 
@@ -1821,6 +1899,19 @@ def selftest() -> int:
         else:
             print(f"estate-corpus selftest note: nothing recorded for tools {tools}")
         check(verify(a) == 0, "verify accepts the sealed corpus")
+        # A first measurement pass reads the WAL image as provider_sqlite does
+        # (read-only, WAL-aware), which leaves a -shm; mutate must still run.
+        for dest in (a, b):
+            db = dest / "corpus" / ".local/share/opencode/storage.db"
+            con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+            try:
+                con.execute("SELECT count(*) FROM items").fetchone()
+            finally:
+                con.close()
+        shm = a / "corpus" / ".local/share/opencode/storage.db-shm"
+        check(
+            shm.is_file() and verify(a) == 0, "a WAL-aware read leaves the seal intact"
+        )
         before = rows_of((a / "MANIFEST.tsv").read_text())
         check(mutate(a, len(KINDS)) == 0, "mutate applies one of each operation")
         check(mutate(b, len(KINDS)) == 0, "mutate applies to the second copy")
@@ -1848,6 +1939,20 @@ def selftest() -> int:
         check(
             all(op["path"] in changed for op in side["operations"]),
             "every operation's path is in the difference",
+        )
+        sizes = side["reads_allowed_sizes"]
+        check(
+            sorted(sizes) == sorted(side["reads_allowed"])
+            and side["reads_allowed_bytes"] == sum(sizes.values()) > 0,
+            "reads_allowed_bytes is the sum of the allowed files' sizes",
+        )
+        git_ops = [
+            op for op in side["operations"] if op["kind"] in ("commit", "head-move")
+        ]
+        repos = {r["repo"] for r in side["repos_changed"]}
+        check(
+            all(any(op["path"].startswith(r + "/") for r in repos) for op in git_ops),
+            "repos_changed names the repositories of the git operations",
         )
         content = {p for p in (*added, *modified) if after[p][1] == "f"}
         check(

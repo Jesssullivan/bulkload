@@ -1,13 +1,15 @@
 # Estate-shaped corpus v1 — 2026-10-03
 
 Rulings: OI-1003-Q19 (WP0(e): an estate-shaped S1 corpus beside R23's),
-OI-1003-Q23, R-N13. Context: [docs/slo.md](../slo.md) WP0(e), S1 and S3, and
+OI-1003-Q23, OI-1003-Q35 (Sprint 2 S3 measurement on this corpus), R-N13.
+Context: [docs/slo.md](../slo.md) WP0(e), S1 and S3, and
 [the architecture review](../plans/2026-10-03-architecture-review.md) WP0(e)
 and WP6 PR 4.
 
 This is phase 1 only: the generator, its seal and its self-test. The S3
-measurement harness comes after the WP2 counter PRs (#144, #146). No S1 or S3
-number is claimed here.
+measurement harness comes after the WP2 counter PRs #144 and #146. #144 is
+merged at 04ea9cb87; that is reported by the coordinator and was not checked
+here. No S1 or S3 number is claimed here.
 
 ## Why
 
@@ -241,7 +243,13 @@ kinds below. Targets are seed-chosen from the sorted manifest.
     or ctime moved, such as a directory whose listing changed or a rewritten
     file;
   - `reads_allowed`, the regular files among those. The S3 harness asserts
-    that a rerun reads only these.
+    that a rerun reads only these;
+  - `reads_allowed_sizes` and `reads_allowed_bytes`, their sizes and total;
+  - `changed_content_bytes`, the total size of added and modified files;
+  - `repos_changed`, each touched repository (with its worktrees and bare
+    mirror), the count of its touched paths and how many of those sit in git
+    directories;
+  - `repos_unchanged`, the count of the rest.
 - **Seal:** `SEAL.json` and `MANIFEST.tsv` move to the new identity, so
   `verify` passes after a mutation.
 - **Failure:** a failed mutate leaves the corpus unsealed. Regenerate it.
@@ -253,12 +261,56 @@ Measured results:
 | small, round 1, N=6 | 13 | 1 | 7 | 9 | 15 | `b3645454…` → `58fbcdc4…` |
 | estate, round 1, N=12 | 14 | 6 | 58 | 44 | 71 | `0bd1104e…` → `62d0385b…` |
 
-- At scale small, the second copy reached the same identity.
+- At scale small, the second copy reached the same identity. The sidecar
+  gives `reads_allowed_bytes` = 73,994, and `repos_changed` lists 2
+  repositories (1 unchanged).
 - The estate round took 395 s with a peak RSS of 685 MB. That covers two
   full manifest passes, one before and one after.
 - In the estate round, each head-move rewrote the files that differ between
   the two commits, so `removed` includes worktree files as well as the
   deleted ones.
+
+## Sprint 2 S3 measurement support (OI-1003-Q35)
+
+Under OI-1003-Q35, as relayed by the coordinator, the Q15 engine decision may
+use S3 byte counters and the rusage CPU ratio measured on sting. The admissible
+counters are `source_bytes_read`, content bytes, `census_walks` and pack
+bytes; wall time is informational only. Running estate verbs on this
+synthetic, sealed corpus under `/srv/scratch` is a test, not an R-N56 estate
+operation.
+
+Sprint 2 measures at three builds: adb9c66; the counters build (#144, merged
+to main at 04ea9cb87); and #146 once it merges from main. The corpus supports
+that in four ways:
+
+1. **Same input at every build.** Generation is deterministic, and
+   `generate` prints `recorded=True` when it reproduces the identity in
+   `RECORDED`: `b3645454…` (small) or `0bd1104e…` (estate). Regenerate in
+   place per build; the corpus is not relocatable.
+2. **Unchanged rerun.** A first pass may create `storage.db-shm` beside the
+   WAL image. That file is reported (`shm_ignored`) but never sealed, so
+   `verify` still passes and the rerun starts from the sealed identity. The
+   unchanged-estate clause expects 0 content bytes against this state.
+3. **Delta rerun.** `mutate DEST N` is deterministic per round. Round *r*
+   gives the same `identity_after` and the same sidecar on every build. The
+   sidecar gives the S3 delta bounds:
+   - `reads_allowed_bytes`, with per-file `reads_allowed_sizes`, bounds
+     `source_bytes_read` (OI-1003-Q18 inequality 1, plus racy seats, which
+     the harness adds);
+   - each `edit` records its offset and its 64-byte length, for the
+     chunk-level bound on content bytes;
+   - `repos_changed` and `repos_unchanged` give the expected spread of
+     `census_walks` and pack bytes. An unchanged repository should not be
+     re-censused or re-packed.
+4. **CPU ratio.** The corpus is large enough at scale estate that the rusage
+   CPU of the first pass and of the rerun are both measurable: 140,313
+   entries and 3.93 GB, of which 27 git directories, 53 indexes, 18,545 loose
+   objects and 20 packs.
+
+Keep bulkload's private state, ledger and destination outside `DEST/corpus`.
+Every pass's source side should then leave `verify` ok, apart from
+`shm_ignored`; any other difference that `verify` lists is a write to the
+source (S2).
 
 ## Carriability smoke (not an S1 sample)
 
@@ -303,7 +355,11 @@ Measured results:
   - `storage.db-shm` was created.
   An earlier probe with the devShell's SQLite 3.53.1, on an equivalent image,
   also created `-shm`.
-  A `verify` after such a read reports that extra path.
+  The generator therefore sets a `-shm` beside a SQLite database aside, and
+  never seals it: it is SQLite's wal-index, and bulkload never carries it.
+  `verify` reports it as `shm_ignored=N`, with one note line per file, so an
+  S2 harness still sees the write. A first measurement pass does not stop
+  the next `mutate`.
 - **APFS.** Names avoid case collisions and NFD, so the tree is legal on
   APFS. The rewritten `.git/config` says `ignorecase` is unset even on a
   case-insensitive volume. That is harmless for this corpus, which has no
@@ -314,3 +370,5 @@ Measured results:
 The small scale takes 3 to 7 s per generation, and the self-test 9 to 15 s,
 on sting. The estate figures were measured on a heavily loaded sting (load1
 above 100 from other lanes), so they are an upper bound. Generation took 30 min 55 s at load1 above 100, and 6 min 28 s once load fell to about 60. `verify` took 4 min 47 s and 3 min 17 s. Peak RSS was about 260 MB.
+One 12-operation `mutate` round took 6 min 35 s, with peak RSS 685 MB; that
+covers two full manifest passes.

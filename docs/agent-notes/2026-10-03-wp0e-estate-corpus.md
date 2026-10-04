@@ -1,7 +1,8 @@
 # 2026-10-03 WP0(e) estate-shaped corpus, phase 1
 
 Rulings: OI-1003-Q19 (WP0(e): an estate-shaped S1 corpus beside R23's),
-OI-1003-Q23, R-N13.
+OI-1003-Q23, OI-1003-Q35 (Sprint 2 measures S3 byte counters and the rusage
+CPU ratio on this corpus), R-N13.
 
 - **Branch:** `feat/wp0e-estate-corpus-20261003`, from `origin/main` 57030e1.
 - **Worktree:** `bulkload.worktrees/wp0e-estate-corpus-20261003`.
@@ -39,12 +40,38 @@ OI-1003-Q23, R-N13.
   Six of them came from three self-test runs, and one from the just recipe.
   `generate` now fails if a matching toolchain gives a different identity
   (`RECORDED`).
-- **Estate identity:** `0bd1104ecb67e160689dba4719f34dacf768420016180b38329f3064170c4baf`. Two generations into different paths gave byte-identical manifests, and both copies verify.
+- **Estate identity:** `0bd1104ecb67e160689dba4719f34dacf768420016180b38329f3064170c4baf`.
+  Two generations into different paths gave byte-identical manifests, and
+  both copies verify. One 12-operation mutate round gave 14 added, 6 removed,
+  58 modified, 44 `stat_only` and 71 `reads_allowed`, in 395 s.
 - **Toolchain** (devShell on sting): git 2.54.0 with zlib-ng 2.3.3, SQLite
   3.53.1, zstd 1.5.7 and Python 3.12.13.
 - **Walk smoke:** `bulkload-agent walk` (debug build, 57030e1) reported 0
   refusals at both scales. Its rows equal the manifest entries: 1,576 small
   and 140,313 estate. This is not an S1 sample.
+
+## Sprint 2 support (OI-1003-Q35)
+
+The coordinator relayed OI-1003-Q35. For the Q15 engine decision, it admits:
+- the S3 byte counters (`source_bytes_read`, content bytes, `census_walks`
+  and pack bytes);
+- the rusage CPU ratio, measured on sting.
+Wall time is informational only. Estate verbs run on this synthetic, sealed
+corpus under `/srv/scratch` are a test, not an R-N56 estate operation.
+
+Sprint 2 measures at adb9c66, at 04ea9cb87 (#144 merged, as reported) and at
+#146. In response, the corpus now supports three things:
+- **Seal survives a first pass.** A SQLite `-shm` wal-index, such as the one
+  the first pass creates beside the WAL image, is set aside and not sealed.
+  `verify` reports it as `shm_ignored`, so `mutate` still runs after a first
+  pass.
+- **Byte bounds in the sidecar.** The mutate sidecar now carries
+  `reads_allowed_sizes`, `reads_allowed_bytes` (the `source_bytes_read`
+  bound), `changed_content_bytes`, and `repos_changed`/`repos_unchanged`
+  (the `census_walks` and pack-bytes expectation).
+- **Self-test coverage.** The self-test checks all of this, including a real
+  read-only, WAL-aware read before `mutate`.
+Identities are unchanged: `b3645454…` and `0bd1104e…`.
 
 ## Findings for later lanes
 
