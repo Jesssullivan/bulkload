@@ -94,6 +94,19 @@ impl Completion {
     fn naming(self, nested: Vec<String>) -> Self {
         Self { nested, ..self }
     }
+
+    // WP1 PR 4 (S5): the source's object store was rewritten under the pass
+    // and a Git child failed on it. Drift custody, never a refusal: no record
+    // is written, so any retained capture stays exactly what it was, and the
+    // next pass captures the rewritten store. The receipt names no bytes: the
+    // pass's reads are in the process counters, not in a capture.
+    fn deferred(drift: &git_carry::CaptureDrift, nested: Vec<String>) -> Self {
+        Self {
+            drift: drift.lines(),
+            nested,
+            ..Self::clean("deferred-with-drift")
+        }
+    }
 }
 
 // What the next pass needs from a capture, beside its record. Same sidecar
@@ -891,6 +904,20 @@ impl Drop for Reservation<'_, '_> {
     }
 }
 
+// What must hold before an item's key reads its source: it is not a partial
+// clone (S2, WP1 PR 1), and every nest planned as its own item captured in
+// this pass (R-N114). Returns those planned nests.
+fn preflight(
+    item: &Item,
+    owners: &Owners,
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
+) -> Result<Vec<PathBuf>> {
+    git_carry::refuse_partial_clone(&item.source)?;
+    let planned = planned_nests(item, owners);
+    carriers_captured(item, &planned, refused)?;
+    Ok(planned)
+}
+
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
 fn capture_item(
     item: &Item,
@@ -904,8 +931,7 @@ fn capture_item(
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
-    let planned = planned_nests(item, owners);
-    carriers_captured(item, &planned, refused)?;
+    let planned = preflight(item, owners, refused)?;
     // The opaque key cannot say what moved. Keep its typed parts so the
     // post-capture re-read can separate tolerable drift from Git authority.
     // The parts carry the nested custody, so a reuse hit names exactly the
@@ -937,7 +963,7 @@ fn capture_item(
         .then_some(git_carry::ReuseUnavailable::FutureStamp);
     let attempt = attempt_directory(state, &identity, key)?;
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
-    let export = git_carry::export_repository_with_drift(
+    let export = match git_carry::export_repository_with_custody(
         &item.source,
         &attempt,
         &git_carry::ExportOptions {
@@ -946,7 +972,12 @@ fn capture_item(
             reuse,
             planned: &planned,
         },
-    )?;
+    )? {
+        git_carry::Exported::Captured(export) => *export,
+        git_carry::Exported::ObjectStoreRewritten(drift) => {
+            return Ok(Completion::deferred(&drift, nested))
+        }
+    };
     // The export's own census must name the nests the key did: a nest that
     // moved between the key and the export's snapshot is authority (B4).
     if export.nested_repositories != parts.nested_repositories() {
@@ -1458,6 +1489,13 @@ pub struct RepairLedger<'a> {
 // repaired (by digest) and whose repository or workspace is `repository`.
 // An unreadable capture record names no item here; it refuses on its own in
 // apply and in the closure report.
+//
+// #132: an item that plans a workspace never binds. A repair lays down no
+// working bytes, so its `refs-imported` journal would close nothing (the
+// closure report leaves it unaccounted) and would make a later estate-apply
+// replay `previous-ref-custody-not-workspace-parity` instead of restoring the
+// workspace. Such an item refuses here, before the repair writes anything,
+// and stays pending for estate-apply.
 fn repair_item(
     plan: &Plan,
     corpus: &Path,
@@ -1476,7 +1514,7 @@ fn repair_item(
         {
             continue;
         }
-        if found.is_some() {
+        if found.is_some() || item.workspace.is_some() {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
         found = Some((item.clone(), identity, captured.digest));
@@ -1488,7 +1526,9 @@ fn repair_item(
 ///
 /// Binds the bundle to the one planned item whose current capture record in
 /// CORPUS has the bundle's digest and whose repository (or workspace) is
-/// `repository`, under the state directory's estate lock, then repairs. Once
+/// `repository`, under the state directory's estate lock, then repairs. An
+/// item that plans a workspace never binds (#132): its restore belongs to
+/// estate-apply, and a repair journal would block it. Once
 /// the index is published and durable it writes the item's exact
 /// current-capture journal (`refs-imported`, unless one is already there) and
 /// then its `{item}.outcome` = `index-repaired`, so `closure-report` reads
@@ -1498,8 +1538,9 @@ fn repair_item(
 /// apply keeps its records (a second repair of a repaired index refuses).
 ///
 /// # Errors
-/// `RECEIPT_BINDING_INVALID` when the bundle names no planned item (or more
-/// than one), then everything [`git_carry::repair_missing_index`] refuses.
+/// `RECEIPT_BINDING_INVALID` when the bundle names no planned item, more
+/// than one, or an item that plans a workspace, before anything is written;
+/// then everything [`git_carry::repair_missing_index`] refuses.
 pub fn repair_missing_index(
     bundle: &Path,
     repository: &Path,
@@ -1577,6 +1618,10 @@ pub struct LedgerEntry {
     /// The apply journal for the item's current capture, at its exact path
     /// `{item}-{blake3(SOURCE)}-{capture digest}.done`.
     pub journal: JournalState,
+    /// The current capture's bundle digest (lowercase hex), when the corpus
+    /// holds a readable `{item}.capture` record. An attestation row binds to
+    /// it (#133).
+    pub capture: Option<String>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -1644,9 +1689,16 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             continue;
         }
         let record_path = corpus.join(format!("{identity}.capture"));
+        let mut capture = None;
         let journal = if !record_path.try_exists()? {
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
+            capture = Some(
+                blake3::Hash::from_bytes(captured.digest)
+                    .to_hex()
+                    .as_str()
+                    .to_owned(),
+            );
             let expected = journal_path(Path::new(""), &identity, source, &captured.digest);
             let name = expected.to_string_lossy().into_owned();
             let found = states
@@ -1668,6 +1720,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             record: record.cloned().flatten(),
             record_unreadable: matches!(record, Some(None)),
             journal,
+            capture,
             item: identity,
         });
     }
@@ -2269,6 +2322,112 @@ mod tests {
             fs::write(inside.join("appeared"), b"new seat").unwrap();
             git(&inside, &["update-ref", "refs/heads/lane-a", "HEAD"]);
         });
+    }
+
+    // WP1 PR 1 (S2): a partial-clone item refuses as its own typed receipt
+    // before its key reads anything, and no capture record is written.
+    #[test]
+    fn a_partial_clone_item_refuses_before_its_key_reads_it() {
+        let (root, origin, _, _, corpus) = drifting_plan("partial");
+        git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+        let clone = root.join("clone");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--template=",
+                "--no-checkout",
+                "--filter=blob:none",
+                &format!("file://{}", origin.display()),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let plan = root.join("partial-plan");
+        add(&plan, &clone, &root.join("partial-destination"), None).unwrap();
+        let state = root.join("state");
+        let rows = Mutex::new(Vec::new());
+        let result = capture(&plan, &state, &corpus, 1, &|row| {
+            rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err(), "a refused item fails the pass");
+        assert_eq!(
+            rows.into_inner().unwrap(),
+            vec![("refused", Some("GIT_SOURCE_PARTIAL_CLONE".to_owned()))]
+        );
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        assert!(!corpus.join(format!("{item}.capture")).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // WP1 PR 4 (S5, arch 8): a lane deletes a branch and prunes under the
+    // pass. The private repository reads the source through `alternates`, so
+    // its bundle child fails on the pruned commit; the pack listing moved, so
+    // the item is drift custody, not a refusal, and the next pass captures.
+    #[test]
+    fn an_object_store_rewrite_under_the_pass_is_drift_custody() {
+        let (root, source, _, plan, corpus) = drifting_plan("object-store");
+        git(&source, &["checkout", "-q", "-b", "doomed"]);
+        fs::write(source.join("doomed-only"), b"reachable only from doomed").unwrap();
+        git(&source, &["add", "doomed-only"]);
+        git(&source, &["commit", "-q", "-m", "doomed"]);
+        git(&source, &["checkout", "-q", "-"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm(&source, move || {
+            git(&inside, &["branch", "-D", "doomed"]);
+            git(&inside, &["reflog", "expire", "--expire=now", "--all"]);
+            git(&inside, &["repack", "-a", "-d", "-q"]);
+            git(&inside, &["prune", "--expire=now"]);
+        });
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).expect("Ok(()): custody, not a refusal");
+        assert_eq!(rows.len(), 1);
+        let (outcome, reason, drift, _) = rows.first().unwrap();
+        assert_eq!(*outcome, "deferred-with-drift");
+        assert_eq!(reason.as_deref(), Some("drift=1"));
+        assert_eq!(
+            *drift,
+            vec!["ObjectStoreRewritten \"objects/pack\"".to_owned()]
+        );
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        assert!(!corpus.join(format!("{item}.capture")).exists());
+        // The next pass sees the rewritten store and captures it clean.
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "captured");
+        assert!(corpus.join(format!("{item}.capture")).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // WP1 PR 4: the same failure with an unchanged pack listing is not a
+    // rewrite, and keeps its refusal.
+    #[test]
+    fn a_git_child_failure_without_a_rewrite_still_refuses() {
+        let (root, source, _, plan, corpus) = drifting_plan("no-rewrite");
+        git(&source, &["checkout", "-q", "-b", "doomed"]);
+        fs::write(source.join("doomed-only"), b"reachable only from doomed").unwrap();
+        git(&source, &["add", "doomed-only"]);
+        git(&source, &["commit", "-q", "-m", "doomed"]);
+        git(&source, &["checkout", "-q", "-"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm(&source, move || {
+            // Prune the loose commit without touching `objects/pack`.
+            git(&inside, &["branch", "-D", "doomed"]);
+            git(&inside, &["reflog", "expire", "--expire=now", "--all"]);
+            git(&inside, &["prune", "--expire=now"]);
+        });
+        let state = root.join("state");
+        let rows = Mutex::new(Vec::new());
+        let result = capture(&plan, &state, &corpus, 1, &|row| {
+            rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            rows.into_inner().unwrap(),
+            vec![("refused", Some("GIT_INVENTORY_MALFORMED".to_owned()))]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4244,6 +4403,71 @@ mod closure_lane_20261002 {
             matches!(classify(&refused), Disposition::Refused(_)),
             "{refused:?}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #132: a repair run on the main repository of an item that plans a
+    // linked workspace binds through `item.repository`. It must refuse
+    // before writing anything, so a later estate-apply still restores the
+    // workspace instead of replaying a refs-only journal.
+    #[test]
+    fn a_repair_never_binds_a_workspace_item_and_apply_still_restores_it() {
+        let root = fresh("repair-132");
+        let source = repository(&root, "source", b"base");
+        fs::write(source.join("file"), b"staged edit").unwrap();
+        git(&source, &["add", "file"]);
+        let repository = root.join("repository");
+        let workspace = root.join("linked");
+        let plan = root.join("plan");
+        add(&plan, &source, &repository, Some(&workspace)).unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let contents: Plan = read(&plan).unwrap();
+        let identity = id(contents.items.first().unwrap()).unwrap();
+        let captured: Capture = read(&corpus.join(format!("{identity}.capture"))).unwrap();
+        let bundle = corpus.join(&captured.bundle);
+        // The main repository holds the captured HEAD with its index gone:
+        // exactly what a repair accepts.
+        git_carry::restore_bundle(&bundle, &repository, "neo").unwrap();
+        fs::remove_file(repository.join(".git/index")).unwrap();
+        let applied = root.join("applied");
+        let led = RepairLedger {
+            plan: &plan,
+            corpus: &corpus,
+            state: &applied,
+        };
+        let receipt = root.join("r1");
+        assert_eq!(
+            repair_missing_index(&bundle, &repository, "neo", &receipt, &led),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        // Nothing was written: no receipt, no outcome, no journal, and the
+        // index is still missing.
+        assert!(!receipt.exists());
+        assert!(!repository.join(".git/index").exists());
+        let written: Vec<_> = fs::read_dir(&applied)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "estate.lock")
+            .collect();
+        assert!(written.is_empty(), "{written:?}");
+        // The workspace is still pending, and estate-apply restores it.
+        let rows = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            rows.lock().unwrap().push(row.outcome);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.into_inner().unwrap(), vec!["workspace-restored"]);
+        assert_eq!(fs::read(workspace.join("file")).unwrap(), b"staged edit");
+        let entry = ledger(&plan, &corpus, "neo", std::slice::from_ref(&applied))
+            .unwrap()
+            .entries
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(classify(&entry), Disposition::Applied);
         fs::remove_dir_all(root).unwrap();
     }
 }

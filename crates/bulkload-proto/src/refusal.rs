@@ -88,9 +88,13 @@ pub enum BulkloadRefusal {
     /// named commits as objects and retrying is the documented recovery.
     GitInventoryMissingPrerequisite,
     /// An intent-to-add (`git add -N`) index entry cannot be carried: its
-    /// seat is absent from the captured worktree, or it lies in a nested
-    /// repository, whose index is not carried (#106). Intent-to-add entries
-    /// of a captured checkout are otherwise carried as index custody.
+    /// seat is absent from the captured worktree, its seat's mode is not the
+    /// one the entry records (a restore re-marks the path from the seat, so
+    /// `git add -N f; chmod +x f` cannot be restored as captured, #131), or
+    /// it lies in a nested repository, whose index is not carried (#106).
+    /// Capture refuses it, and a restore checks it again before any worktree
+    /// byte is laid down. Intent-to-add entries of a captured checkout are
+    /// otherwise carried as index custody.
     GitInventoryIntentToAdd,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
@@ -137,6 +141,11 @@ pub enum BulkloadRefusal {
     /// and the like), where its `flock` locks cannot be trusted. Ingest
     /// destinations must be local filesystems (operator ruling OI-1001-Q17).
     GitDestinationFilesystemUnsupported,
+    /// A Git source is a partial clone (a promisor remote, a partial-clone
+    /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
+    /// store or an alternate). Reading it could fault in a lazy fetch, so v1
+    /// carry refuses it before any other read (S2, OI-1003-Q16).
+    GitSourcePartialClone,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -227,6 +236,7 @@ impl BulkloadRefusal {
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+            Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -288,6 +298,7 @@ impl BulkloadRefusal {
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+        "GIT_SOURCE_PARTIAL_CLONE",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
@@ -390,6 +401,7 @@ mod tests {
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitDestinationFilesystemUnsupported,
+            BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

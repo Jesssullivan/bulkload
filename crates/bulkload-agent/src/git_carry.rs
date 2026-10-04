@@ -25,9 +25,14 @@ pub mod registered;
 mod shallow;
 pub mod shared;
 
-fn git(repo: &Path) -> Command {
-    let mut command = Command::new("git");
-    for key in [
+/// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
+/// the v1 carry and the estimate spawn is built from it by [`git`], and the
+/// estimate's [`estimate::PROBE_SCRIPT`] preamble is tested against it, so
+/// the local builder and the remote probe cannot drift apart again.
+pub(crate) mod git_env {
+    /// Inherited variables that would redirect Git at another repository,
+    /// object store, ceiling or configuration. Each is removed.
+    pub const CLEARED: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
@@ -37,31 +42,193 @@ fn git(repo: &Path) -> Command {
         "GIT_NAMESPACE",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",
-    ] {
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+
+    /// Variables every Git child runs with: no prompt, no system or global
+    /// configuration, no replace objects, no lazy (promisor) fetch, no
+    /// optional locks, and the C locale so every parsed line is stable.
+    pub const SET: &[(&str, &str)] = &[
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("LC_ALL", "C"),
+        ("LANGUAGE", ""),
+    ];
+
+    /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
+    /// automatic gc or maintenance, and bounded pack resources.
+    pub const CONFIG: &[&str] = &[
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "gc.auto=0",
+        "maintenance.auto=false",
+        "pack.threads=2",
+        "pack.windowMemory=64m",
+    ];
+}
+
+/// A Git child for the repository at `repo`, hardened from [`git_env`]:
+/// `--no-optional-locks`, every `-c` override, every cleared and set
+/// variable, and `GIT_CEILING_DIRECTORIES` at `repo`'s parent, so discovery
+/// never climbs above the path it was given.
+fn git(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    for key in git_env::CLEARED {
         command.env_remove(key);
     }
+    command.arg("--no-optional-locks");
+    for value in git_env::CONFIG {
+        command.args(["-c", value]);
+    }
+    command.arg("-C").arg(repo);
+    for (key, value) in git_env::SET {
+        command.env(key, value);
+    }
+    // A relative or root path has no absolute parent to stop at; Git then
+    // discovers as it would have, and the explicit `-C` still names the root.
+    if let Some(ceiling) = std::path::absolute(repo)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
     command
-        .args([
-            "--no-optional-locks",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "pack.threads=2",
-            "-c",
-            "pack.windowMemory=64m",
-            "-C",
-        ])
-        .arg(repo);
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    command
+}
+
+/// Whether the repository at `repo` is a partial clone.
+///
+/// That is a promisor remote, a partial-clone filter or
+/// `extensions.partialClone` in its configuration (common, worktree and every
+/// linked worktree's), or a `.promisor` pack in its object store or any
+/// alternate (depth 5, as the estimate probe reads).
+///
+/// Reading such a repository can fault in a lazy fetch, a network write the
+/// source never asked for; v1 carry refuses it before reading anything else
+/// (`GIT_SOURCE_PARTIAL_CLONE`, WP1 PR 1, S2).
+///
+/// # Errors
+/// Refuses a repository Git cannot read.
+pub fn partial_clone(repo: &Path) -> Result<bool> {
+    let common = common_repository(repo)?;
+    let mut scopes = vec![
+        None,
+        Some(common.join("config")),
+        Some(common.join("config.worktree")),
+    ];
+    if let Ok(worktrees) = fs::read_dir(common.join("worktrees")) {
+        for admin in worktrees {
+            scopes.push(Some(admin?.path().join("config.worktree")));
+        }
+    }
+    for scope in scopes {
+        if scope.as_ref().is_some_and(|file| !file.is_file()) {
+            continue;
+        }
+        for (promisor, query) in [
+            (false, &["--get-regexp", r"^extensions\.partialclone$"][..]),
+            (
+                true,
+                &["--type=bool", "--get-regexp", r"^remote\..*\.promisor$"][..],
+            ),
+            (
+                false,
+                &["--get-regexp", r"^(remote\..*|core)\.partialclonefilter$"][..],
+            ),
+        ] {
+            let mut command = git(repo);
+            command.arg("config");
+            if let Some(file) = &scope {
+                command.args(["--includes", "--file"]).arg(file);
+            }
+            let result = command.args(query).output()?;
+            match result.status.code() {
+                Some(0) => {}
+                Some(1) => continue,
+                _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+            }
+            // `key value` lines; a promisor counts only when it is true.
+            if result.stdout.split(|byte| *byte == b'\n').any(|line| {
+                let value = line
+                    .iter()
+                    .position(|byte| *byte == b' ')
+                    .and_then(|space| line.get(space + 1..))
+                    .unwrap_or_default();
+                if promisor {
+                    value == b"true"
+                } else {
+                    !value.is_empty()
+                }
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    let objects = PathBuf::from(text(git(repo).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ]))?);
+    promisor_packs(&objects, 0)
+}
+
+// A `.promisor` pack in `store` or, through `info/alternates`, in any store it
+// borrows from, at most five levels deep (the estimate probe's bound).
+fn promisor_packs(store: &Path, depth: u8) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    match fs::read_dir(store.join("pack")) {
+        Ok(entries) => {
+            for entry in entries {
+                if Path::new(&entry?.file_name())
+                    .extension()
+                    .is_some_and(|extension| extension == "promisor")
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let alternates = match fs::read(store.join("info/alternates")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if depth >= 5 {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    for line in alternates.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        if line.starts_with(b"\"") {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let alternate = store.join(std::ffi::OsStr::from_bytes(line));
+        if alternate.is_dir() && promisor_packs(&alternate, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Refuse a partial-clone source before any other read (WP1 PR 1).
+///
+/// # Errors
+/// `GIT_SOURCE_PARTIAL_CLONE` for a partial clone; whatever
+/// [`partial_clone`] refuses.
+pub fn refuse_partial_clone(repo: &Path) -> Result<()> {
+    if partial_clone(repo)? {
+        return Err(BulkloadRefusal::GitSourcePartialClone);
+    }
+    Ok(())
 }
 
 fn output(command: &mut Command) -> Result<Vec<u8>> {
@@ -1089,23 +1256,89 @@ pub fn export_repository_with_drift(
     capture: &Path,
     options: &ExportOptions<'_>,
 ) -> Result<Export> {
+    match export_repository_inner(repo, capture, options)? {
+        Exported::Captured(export) => Ok(*export),
+        Exported::ObjectStoreRewritten(_) => Err(BulkloadRefusal::GitAuthorityChanged),
+    }
+}
+
+/// What a drift-tolerant export produced (WP1 PR 4).
+#[derive(Debug)]
+pub enum Exported {
+    /// A bundle, clean or with drift rows.
+    Captured(Box<Export>),
+    /// No bundle: a Git child failed while the source's pack listing changed
+    /// under the pass (a `gc`, `repack` or `prune` racing the capture), so the
+    /// failure is the rewrite, not the repository. Drift custody with one
+    /// [`DriftKind::ObjectStoreRewritten`] row; the next pass captures the
+    /// rewritten store. Never a refusal (S5, R-N30).
+    ObjectStoreRewritten(CaptureDrift),
+}
+
+/// The estate capture's export: [`export_repository_with_drift`], plus
+/// object-store rewrites as custody.
+///
+/// A Git child failure under an object-store rewrite is reported as
+/// [`Exported::ObjectStoreRewritten`] drift custody instead of a refusal.
+///
+/// # Errors
+/// Refuses everything [`export_repository_with_drift`] refuses, except a Git
+/// child failure while the source's pack listing changed.
+pub fn export_repository_with_custody(
+    repo: &Path,
+    capture: &Path,
+    options: &ExportOptions<'_>,
+) -> Result<Exported> {
     export_repository_inner(repo, capture, options)
 }
 
 // The pre-drift contract for callers that never asked for tolerance.
-fn refusing_drift(export: Export) -> Result<Export> {
-    if export.drift.is_empty() {
-        Ok(export)
-    } else {
-        Err(BulkloadRefusal::GitAuthorityChanged)
+fn refusing_drift(export: Exported) -> Result<Export> {
+    match export {
+        Exported::Captured(export) if export.drift.is_empty() => Ok(*export),
+        _ => Err(BulkloadRefusal::GitAuthorityChanged),
     }
+}
+
+/// The identity of the source's pack listing: every entry of
+/// `<common>/objects/pack` by name, inode and size, hashed in name order. A
+/// `gc`, `repack` or `prune --expire` writes or removes packs, so it changes
+/// this; reading through the store never does. A missing pack directory is
+/// the empty listing.
+fn pack_listing(common: &Path) -> Result<[u8; 32]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let mut entries = Vec::new();
+    match fs::read_dir(common.join("objects/pack")) {
+        Ok(listing) => {
+            for entry in listing {
+                let entry = entry?;
+                // A pack removed between the listing and its stat is the
+                // rewrite itself; record it as absent.
+                let (ino, size) = entry
+                    .metadata()
+                    .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
+                entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    entries.sort_unstable();
+    let mut hash = blake3::Hasher::new();
+    for (name, ino, size) in &entries {
+        framed(&mut hash, name)?;
+        hash.update(&ino.to_le_bytes());
+        hash.update(&size.to_le_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 fn export_repository_inner(
     repo: &Path,
     capture: &Path,
     options: &ExportOptions<'_>,
-) -> Result<Export> {
+) -> Result<Exported> {
     use std::os::unix::fs::DirBuilderExt;
     let repo = fs::canonicalize(repo)?;
     fs::DirBuilder::new().mode(0o700).create(capture)?;
@@ -1113,29 +1346,58 @@ fn export_repository_inner(
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
+    // S2 (WP1 PR 1): a partial clone could lazily fetch under any read below.
+    refuse_partial_clone(&repo)?;
     #[cfg(test)]
     mid_pass::fire(&repo, mid_pass::Stage::Snapshot);
+    // WP1 PR 4: the pack listing is read with the authority, before any Git
+    // child of the pass. The private repository reads the source's objects
+    // through `alternates`, so a `gc` or `prune` racing the pass can make one
+    // of its children fail; when the listing moved, that failure is drift
+    // custody, not a malformed repository.
+    let common = common_repository(&repo)?;
+    let packs = pack_listing(&common)?;
+    match export_pass(&repo, &capture, &common, options) {
+        Err(BulkloadRefusal::GitInventoryMalformed) if pack_listing(&common)? != packs => {
+            let mut drift = CaptureDrift::default();
+            drift.extend([DriftRow::seat(
+                DriftKind::ObjectStoreRewritten,
+                b"objects/pack",
+            )]);
+            drift.seal()?;
+            Ok(Exported::ObjectStoreRewritten(drift))
+        }
+        exported => exported.map(|export| Exported::Captured(Box::new(export))),
+    }
+}
+
+// One export pass over the canonical `repo` into the canonical `capture`.
+fn export_pass(
+    repo: &Path,
+    capture: &Path,
+    common: &Path,
+    options: &ExportOptions<'_>,
+) -> Result<Export> {
     // Before the census, so every seat the census stamps is judged against it.
     let started_ns = pass_start_ns();
-    let before_refs = refs(&repo)?;
+    let before_refs = refs(repo)?;
     // Read once and carried exactly: nothing below re-reads HEAD, the symbolic
     // HEAD, the index, exclude, the stash reflog, configuration or the frontier
     // for the bundle's content, only to compare at the end of the pass.
-    let authority = read_authority(&repo, &before_refs)?;
-    let common = common_repository(&repo)?;
-    let census = capture_census_planned(&repo, &common, options.policy, options.planned)?;
+    let authority = read_authority(repo, &before_refs)?;
+    let census = capture_census_planned(repo, common, options.policy, options.planned)?;
     let seats = &census.rows;
-    let private = carry_authority(&repo, &capture, &before_refs, &authority)?;
+    let private = carry_authority(repo, capture, &before_refs, &authority)?;
     let index = capture.join("index");
     fs::write(&index, &authority.index)?;
-    let staged = text(snapshot_command(&private, &repo, &index).arg("write-tree"))?;
+    let staged = text(snapshot_command(&private, repo, &index).arg("write-tree"))?;
     set_ref(
         &private,
         "refs/carry-export/staged",
         &commit_tree(&private, &staged, "bulkload staged tree")?,
     )?;
     #[cfg(test)]
-    mid_pass::fire(&repo, mid_pass::Stage::BytePass);
+    mid_pass::fire(repo, mid_pass::Stage::BytePass);
     // Seats a retained capture already holds at this exact identity are emitted
     // by object name. Nothing is opened for them and no source byte is re-read.
     let (reuse, reuse_unavailable) = offered_reuse(
@@ -1145,16 +1407,16 @@ fn export_repository_inner(
         seats,
         started_ns,
     )?;
-    let pass = raw_tree::capture(&private, &repo, seats, &reuse)?;
-    let after = capture_census_planned(&repo, &common, options.policy, options.planned)?;
+    let pass = raw_tree::capture(&private, repo, seats, &reuse)?;
+    let after = capture_census_planned(repo, common, options.policy, options.planned)?;
     // Git authority moving under the capture is never drift. The nested
     // worktree and nested repository censuses are compared apart from the
     // seats precisely because they carry each nested HEAD (and a foreign
     // nest's cleanliness, unpushed count and carried-ignored count), which
     // must keep its refusal (R-N73, B4); so is the omitted set, because it is
     // a key input a rebuild can move.
-    let refs_after = refs(&repo)?;
-    if !authority_held(&repo, &authority, &refs_after)?
+    let refs_after = refs(repo)?;
+    if !authority_held(repo, &authority, &refs_after)?
         || census.nested_worktrees != after.nested_worktrees
         || census.nested_repositories != after.nested_repositories
         || census.omitted != after.omitted
@@ -1189,13 +1451,13 @@ fn export_repository_inner(
     )?;
     // #106: intent-to-add entries, which the staged tree cannot hold, are
     // carried as index custody beside it, read from the carried index bytes.
-    record_intent_to_add(&private, &repo, &index, &carried)?;
+    record_intent_to_add(&private, repo, &index, &carried)?;
     let nested_repositories = custody_metadata(&private, &census, &authority)?;
     // Omission is recorded, never silent. Sizes are measured once, here, and
     // deliberately excluded from both the reusable key and the before/after
     // census comparison: they are custody evidence about bytes this capture
     // chose not to carry, not an assertion that those bytes held still.
-    let omitted = measure_omissions(&repo, &census.omitted)?;
+    let omitted = measure_omissions(repo, &census.omitted)?;
     if !omitted.is_empty() {
         metadata(
             &private,
@@ -1208,7 +1470,7 @@ fn export_repository_inner(
     let pack = shared::write_bundle(&private, &bundle, options.prerequisite)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
-    mid_pass::fire(&repo, mid_pass::Stage::AfterPass);
+    mid_pass::fire(repo, mid_pass::Stage::AfterPass);
     Ok(Export {
         bundle,
         omitted,
@@ -2027,6 +2289,11 @@ pub enum DriftKind {
     SeatChanged,
     /// A seat in the pre-pass census was removed.
     SeatRemoved,
+    /// The source's object store was rewritten under the pass (a `gc`,
+    /// `repack` or `prune` changed its pack listing) and a Git child reading
+    /// through it failed: nothing was captured, and the next pass captures
+    /// the rewritten store (WP1 PR 4, S5). Named `objects/pack`.
+    ObjectStoreRewritten,
 }
 
 impl DriftKind {
@@ -2781,21 +3048,28 @@ fn nest_ignored_seats(
 // checkout, or a split index means status may not see every change.
 fn nest_index_hides_changes(directory: &Path) -> Result<bool> {
     let debug = output(git(directory).args(["--git-dir=.git", "ls-files", "--debug"]))?;
-    let flagged: Vec<&[u8]> = debug
+    // #131: classified as the enclosing repository's entries are, so the
+    // fsmonitor validity bit is no flag here either.
+    let flagged: Vec<Result<EntryFlags>> = debug
         .split(|b| *b == b'\n')
         .filter_map(|line| {
             line.windows(8)
                 .position(|window| window == b"\tflags: ")
                 .and_then(|at| line.get(at + 8..))
         })
-        .filter(|flags| *flags != b"0")
+        .map(|flags| {
+            std::str::from_utf8(flags)
+                .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
+                .and_then(entry_flags)
+        })
+        .filter(|flags| *flags != Ok(EntryFlags::Plain))
         .collect();
     if !flagged.is_empty() {
         // #106: a nest's index is not carried, so its intent-to-add entries
         // cannot be; say so by cause rather than as a malformed inventory.
         if flagged
             .iter()
-            .all(|flags| *flags == INTENT_TO_ADD_FLAGS.as_bytes())
+            .all(|flags| *flags == Ok(EntryFlags::IntentToAdd))
         {
             return Err(BulkloadRefusal::GitInventoryIntentToAdd);
         }
@@ -3639,7 +3913,39 @@ const INTENT_TO_ADD_METADATA: &str = "intent-to-add-v1";
 
 /// `ls-files --debug` flags of an intent-to-add entry and nothing else:
 /// `CE_INTENT_TO_ADD | CE_EXTENDED`.
-const INTENT_TO_ADD_FLAGS: &str = "20004000";
+const INTENT_TO_ADD_FLAGS: u32 = 0x2000_4000;
+
+/// `CE_FSMONITOR_VALID` (#131): Git's in-memory mark that fsmonitor last
+/// reported the entry unchanged. It is cache validity, not index state: it
+/// changes nothing a capture carries, and a restore builds a fresh index
+/// with no fsmonitor extension, so it is masked before an entry is
+/// classified. The hardened `git()` pins `core.fsmonitor=false`, under
+/// which Git does not set it, so this only guards a Git that still does.
+const CE_FSMONITOR_VALID: u32 = 0x0020_0000;
+
+/// What an index entry's `ls-files --debug` flags make it (#106, #131).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryFlags {
+    /// No state flag: an ordinary entry.
+    Plain,
+    /// `git add -N`, and nothing else.
+    IntentToAdd,
+}
+
+// Classify one entry's flags, hex as `ls-files --debug` prints them, less
+// the fsmonitor validity bit. Anything else (assume-unchanged,
+// skip-worktree, a stage or a flag this code does not know) refuses
+// GIT_INVENTORY_MALFORMED: status may not see every change under it.
+fn entry_flags(flags: &str) -> Result<EntryFlags> {
+    let flags = u32::from_str_radix(flags, 16)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        & !CE_FSMONITOR_VALID;
+    match flags {
+        0 => Ok(EntryFlags::Plain),
+        INTENT_TO_ADD_FLAGS => Ok(EntryFlags::IntentToAdd),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+}
 
 /// One intent-to-add (`git add -N`) index entry, carried as custody (#106).
 ///
@@ -3668,18 +3974,13 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     let listed = |args: &[&str]| output(git(repo).env("GIT_INDEX_FILE", index).args(args));
     let debug = String::from_utf8(listed(&["ls-files", "--debug"])?)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let flags: Vec<&str> = debug
+    let flags = debug
         .lines()
         .filter_map(|line| line.split_once("\tflags: ").map(|(_, flags)| flags))
-        .collect();
-    if flags.iter().all(|flags| *flags == "0") {
+        .map(entry_flags)
+        .collect::<Result<Vec<EntryFlags>>>()?;
+    if flags.iter().all(|flags| *flags == EntryFlags::Plain) {
         return Ok(Vec::new());
-    }
-    if flags
-        .iter()
-        .any(|flags| *flags != "0" && *flags != INTENT_TO_ADD_FLAGS)
-    {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let stage = listed(&["ls-files", "--stage", "-z"])?;
     let entries: Vec<&[u8]> = stage
@@ -3691,7 +3992,7 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     }
     let mut carried = Vec::new();
     for (entry, flags) in entries.into_iter().zip(flags) {
-        if flags != INTENT_TO_ADD_FLAGS {
+        if flags != EntryFlags::IntentToAdd {
             continue;
         }
         let tab = entry
@@ -3730,10 +4031,29 @@ fn intent_to_add_entries(repo: &Path, index: &Path) -> Result<Vec<IntentToAdd>> 
     Ok(carried)
 }
 
+// The index mode `git add` gives a new entry for a seat with this row:
+// a symlink is 120000, a regular file 100755 when its owner may execute it
+// and 100644 otherwise. `None` for any other kind.
+const fn index_mode_of(row: &crate::RowSchema) -> Option<u32> {
+    match row.kind {
+        bulkload_proto::FileKind::Symlink => Some(0o120_000),
+        bulkload_proto::FileKind::Regular if row.mode & 0o100 != 0 => Some(0o100_755),
+        bulkload_proto::FileKind::Regular => Some(0o100_644),
+        _ => None,
+    }
+}
+
 // The capture's intent-to-add custody, recorded only when there is any, so
 // every other capture's bundle is unchanged. Each entry's seat must be a
 // carried file or symlink: Git can mark only an existing path intent-to-add,
 // so an entry whose seat is gone (`git add -N`, then `rm`) refuses by cause.
+//
+// #131: the seat's mode must also be the one the entry records. Restore
+// re-marks the path with `git add -N`, which takes the mode from the
+// restored seat, so an entry whose seat changed mode after it was marked
+// (`git add -N f; chmod +x f`: the index keeps 100644, the seat is 0755)
+// cannot be restored as captured. It refuses here, at capture, before any
+// destination is written, rather than after a restore laid one down.
 fn record_intent_to_add(
     private: &Path,
     repo: &Path,
@@ -3745,14 +4065,10 @@ fn record_intent_to_add(
         return Ok(());
     }
     for entry in &entries {
-        let carried = seats.iter().any(|row| {
-            row.rel_path == entry.rel_path
-                && matches!(
-                    row.kind,
-                    bulkload_proto::FileKind::Regular | bulkload_proto::FileKind::Symlink
-                )
-        });
-        if !carried {
+        let restorable = seats
+            .iter()
+            .any(|row| row.rel_path == entry.rel_path && index_mode_of(row) == Some(entry.mode));
+        if !restorable {
             return Err(BulkloadRefusal::GitInventoryIntentToAdd);
         }
     }
@@ -3781,6 +4097,46 @@ fn carried_intent_to_add(repo: &Path, heads: &str) -> Result<Vec<IntentToAdd>> {
         git(repo).args(["show", &format!("{value}:value")]),
     )?)
     .map_err(|_| BulkloadRefusal::FrameCodec)
+}
+
+// #131: every carried intent-to-add entry must name a file or symlink the
+// worktree tree (`ls-tree -r -z` output) restores at the entry's own mode,
+// since restore re-marks it with `git add -N`, which reads the mode from the
+// restored seat. Checked before a worktree byte is laid down, so a capture
+// taken before the capture-side check refuses here, by cause, not after
+// its destination is written.
+fn intent_to_add_restorable(custody: &[IntentToAdd], worktree: &[u8]) -> Result<()> {
+    if custody.is_empty() {
+        return Ok(());
+    }
+    let mut modes = std::collections::BTreeMap::new();
+    for entry in worktree
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let mode = entry
+            .get(..tab)
+            .and_then(|header| header.split(|b| *b == b' ').next())
+            .and_then(|mode| std::str::from_utf8(mode).ok())
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let path = entry
+            .get(tab + 1..)
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        modes.insert(path, mode);
+    }
+    if custody
+        .iter()
+        .all(|entry| modes.get(entry.rel_path.as_slice()) == Some(&entry.mode))
+    {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::GitInventoryIntentToAdd)
+    }
 }
 
 // Re-mark the captured intent-to-add paths in the index `index` (the
@@ -4805,6 +5161,8 @@ pub fn restore_staged(
     fs::write(destination.join(".git/info/exclude"), exclude)?;
     let worktree = find("worktree")?;
     let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
+    // #131: before any worktree byte.
+    intent_to_add_restorable(&carried_intent_to_add(&destination, &heads)?, &entries)?;
     restore_entries(&destination, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&destination, &staged, &heads)?;
@@ -4907,6 +5265,10 @@ pub fn restore_linked_staged(
     if exclude != existing_exclude {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
     }
+    // #131: before the worktree is added, so a capture whose intent-to-add
+    // custody cannot be restored refuses with nothing laid down.
+    let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
+    intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
     let attached = text(git(&repository).args(["worktree", "list", "--porcelain"]))?;
     let source_tip = text(git(&repository).args(["rev-parse", "--verify", &symbolic]));
     let reuse = symbolic.starts_with("refs/heads/")
@@ -4938,7 +5300,6 @@ pub fn restore_linked_staged(
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     restore_entries(&destination, &entries)?;
     restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
@@ -5149,6 +5510,120 @@ fn restore_entry(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ---- WP1 PR 1: one hardening table, partial-clone refusal (S2) ------
+
+    #[test]
+    fn every_git_child_carries_the_one_hardening_table() {
+        let command = git(Path::new("/estate/repo"));
+        let args: Vec<_> = command.get_args().filter_map(|arg| arg.to_str()).collect();
+        assert_eq!(args.first(), Some(&"--no-optional-locks"));
+        for config in git_env::CONFIG {
+            assert!(
+                args.windows(2).any(|pair| pair == ["-c", *config]),
+                "{config}: {args:?}"
+            );
+        }
+        assert!(args.ends_with(&["-C", "/estate/repo"]), "{args:?}");
+        let envs: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for (key, value) in git_env::SET {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsStr::new(value))),
+                "{key}"
+            );
+        }
+        for key in git_env::CLEARED {
+            let expected =
+                (*key == "GIT_CEILING_DIRECTORIES").then_some(std::ffi::OsStr::new("/estate"));
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&expected),
+                "{key}"
+            );
+        }
+    }
+
+    // A clone of `origin` with `--filter=blob:none`, never checked out, so
+    // making the fixture faults in nothing either.
+    fn partial_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-partial-{name}-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let origin = root.join("origin");
+        fs::create_dir(&origin).unwrap();
+        output(git(&origin).args(["init", "--template="])).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@localhost"),
+            ("commit.gpgsign", "false"),
+            ("uploadpack.allowFilter", "true"),
+        ] {
+            output(git(&origin).args(["config", key, value])).unwrap();
+        }
+        fs::write(origin.join("tracked"), b"blob the clone leaves behind").unwrap();
+        output(git(&origin).args(["add", "tracked"])).unwrap();
+        output(git(&origin).args(["commit", "-m", "base"])).unwrap();
+        let clone = root.join("clone");
+        output(
+            git(&root)
+                .args(["clone", "--quiet", "--template=", "--no-checkout"])
+                .args(["--filter=blob:none"])
+                .arg(format!("file://{}", origin.display()))
+                .arg(&clone),
+        )
+        .unwrap();
+        (root, clone)
+    }
+
+    #[test]
+    fn a_partial_clone_source_is_refused_before_any_read() {
+        let (root, clone) = partial_fixture("export");
+        assert!(partial_clone(&clone).unwrap());
+        let origin = root.join("origin");
+        assert!(!partial_clone(&origin).unwrap());
+        let objects_before = filesystem_rows(&clone.join(".git/objects")).unwrap();
+        let capture = root.join("capture");
+        assert_eq!(
+            export_repository(&clone, &capture).unwrap_err(),
+            BulkloadRefusal::GitSourcePartialClone
+        );
+        // Refused before the private repository exists, and the clone's object
+        // store is exactly as it was: nothing was fetched into it.
+        assert!(!capture.join("repository.git").exists());
+        assert_eq!(
+            objects_before,
+            filesystem_rows(&clone.join(".git/objects")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn promisor_configuration_alone_marks_a_partial_clone() {
+        let (root, _) = partial_fixture("config");
+        let origin = root.join("origin");
+        output(git(&origin).args(["config", "remote.lane.promisor", "false"])).unwrap();
+        assert!(!partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "remote.lane.promisor", "true"])).unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "--unset", "remote.lane.promisor"])).unwrap();
+        output(git(&origin).args(["config", "core.partialCloneFilter", "blob:none"])).unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        output(git(&origin).args(["config", "--unset", "core.partialCloneFilter"])).unwrap();
+        // A `.promisor` pack reached only through an alternate.
+        let borrowed = root.join("borrowed");
+        fs::create_dir_all(borrowed.join("pack")).unwrap();
+        fs::write(borrowed.join("pack/pack-0.promisor"), b"").unwrap();
+        fs::create_dir_all(origin.join(".git/objects/info")).unwrap();
+        fs::write(
+            origin.join(".git/objects/info/alternates"),
+            format!("{}\n", borrowed.display()),
+        )
+        .unwrap();
+        assert!(partial_clone(&origin).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn standalone_attachment_maps_origin_and_retains_tracking_without_executable_config() {
         let root = std::env::temp_dir().join(format!("bulkload-config-{}", std::process::id()));
@@ -12015,6 +12490,145 @@ mod intent_to_add_106 {
             nested_repositories(&outer),
             Err(BulkloadRefusal::GitInventoryIntentToAdd)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #131 (1): `git add -N f; chmod +x f` keeps 100644 in the index while
+    // the seat is 0755, so a restore's `git add -N` would read 100755. The
+    // capture refuses by cause, before anything is restored; restoring the
+    // executable bit lets the same checkout capture and restore.
+    #[test]
+    fn an_intent_to_add_entry_whose_seat_changed_mode_refuses_at_capture() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fresh("mode-change");
+        let source = checkout_with_intent_to_add(&root);
+        fs::set_permissions(source.join("new"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            export_repository(&source, &root.join("capture")),
+            Err(BulkloadRefusal::GitInventoryIntentToAdd)
+        );
+        assert!(!root.join("restored").exists());
+        fs::set_permissions(source.join("new"), fs::Permissions::from_mode(0o644)).unwrap();
+        let before = status(&source);
+        let bundle = export_repository(&source, &root.join("capture-clean")).unwrap();
+        restore_bundle(&bundle, &root.join("restored"), "neo").unwrap();
+        assert_eq!(status(&root.join("restored")), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #131 (1): the restore-side check, for custody recorded before the
+    // capture-side one: an entry the worktree tree restores at another mode,
+    // or not at all, refuses before any worktree byte is laid down.
+    #[test]
+    fn intent_to_add_custody_is_checked_against_the_worktree_tree() {
+        let entry = |path: &[u8], mode| IntentToAdd {
+            rel_path: path.to_vec(),
+            mode,
+            empty_blob: true,
+        };
+        let blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        let tree = format!(
+            "100755 blob {blob}\tbin/run\0100644 blob {blob}\tnew\0120000 blob {blob}\tlink\0"
+        );
+        let tree = tree.as_bytes();
+        assert_eq!(intent_to_add_restorable(&[], b"garbage"), Ok(()));
+        assert_eq!(
+            intent_to_add_restorable(
+                &[
+                    entry(b"bin/run", 0o100_755),
+                    entry(b"new", 0o100_644),
+                    entry(b"link", 0o120_000)
+                ],
+                tree
+            ),
+            Ok(())
+        );
+        for custody in [
+            entry(b"new", 0o100_755),
+            entry(b"bin/run", 0o100_644),
+            entry(b"absent", 0o100_644),
+        ] {
+            assert_eq!(
+                intent_to_add_restorable(std::slice::from_ref(&custody), tree),
+                Err(BulkloadRefusal::GitInventoryIntentToAdd),
+                "{custody:?}"
+            );
+        }
+    }
+
+    // #131 (2): fsmonitor's validity bit is masked before an entry is
+    // classified; every other flag still refuses as a malformed inventory.
+    #[test]
+    fn the_fsmonitor_valid_bit_is_masked_from_entry_flags() {
+        assert_eq!(entry_flags("0"), Ok(EntryFlags::Plain));
+        assert_eq!(entry_flags("200000"), Ok(EntryFlags::Plain));
+        assert_eq!(entry_flags("20004000"), Ok(EntryFlags::IntentToAdd));
+        assert_eq!(entry_flags("20204000"), Ok(EntryFlags::IntentToAdd));
+        for flags in [
+            "8000", "208000", "40004000", "40204000", "1000", "4000", "", "zz",
+        ] {
+            assert_eq!(
+                entry_flags(flags),
+                Err(BulkloadRefusal::GitInventoryMalformed),
+                "{flags}"
+            );
+        }
+    }
+
+    // #131 (2): a checkout whose own config enables a hook fsmonitor, and
+    // whose index carries the fsmonitor extension and validity bits, captures
+    // and restores its intent-to-add entries. The hook never runs under the
+    // capture or the restore, and the restored index carries no fsmonitor
+    // state.
+    #[test]
+    fn a_checkout_with_fsmonitor_state_carries_intent_to_add() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = fresh("fsmonitor");
+        let source = checkout_with_intent_to_add(&root);
+        let marker = root.join("fsmonitor-ran");
+        let hook = root.join("fsmonitor-hook");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n: > '{}'\nprintf 'token-1\\0'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        g(
+            &source,
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+        // Git as a person runs it, honouring the repository's fsmonitor, so
+        // the index gains the extension and the validity bits.
+        let plain = |args: &[&str]| {
+            let done = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{args:?}");
+            done.stdout
+        };
+        plain(&["status", "--porcelain=v2"]);
+        plain(&["status", "--porcelain=v2"]);
+        let debug = String::from_utf8(plain(&["ls-files", "--debug"])).unwrap();
+        assert!(debug.contains("flags: 200000"), "{debug}");
+        let index = fs::read(source.join(".git/index")).unwrap();
+        assert!(index.windows(4).any(|window| window == b"FSMN"));
+        fs::remove_file(&marker).unwrap();
+        let before = status(&source);
+        let bundle = export_repository(&source, &root.join("capture")).unwrap();
+        let restored = root.join("restored");
+        restore_bundle(&bundle, &restored, "neo").unwrap();
+        assert_eq!(status(&restored), before);
+        assert!(!marker.exists(), "the source's fsmonitor hook ran");
+        let index = fs::read(restored.join(".git/index")).unwrap();
+        assert!(!index.windows(4).any(|window| window == b"FSMN"));
         fs::remove_dir_all(root).unwrap();
     }
 

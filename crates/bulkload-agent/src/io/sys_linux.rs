@@ -16,7 +16,7 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 
 pub use super::sys_posix::*;
 use super::sys_posix::{fsync_raw, to_off_t};
-use super::{NodeId, Qos, Stat};
+use super::{NodeId, Stat};
 
 /// Translate a Linux `struct stat`.
 #[allow(
@@ -401,36 +401,55 @@ pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Linux has no `QoS` classes; nothing is applied.
+/// `ioprio_set`/`ioprio_get` `which`: one thread (or process) by id, 0 the
+/// caller (`linux/ioprio.h`).
+const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+/// The idle IO class: served only when no other class has IO pending.
+const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+/// `IOPRIO_PRIO_VALUE(class, data)`: the class sits above 13 data bits.
+const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+
+/// Enter background priority (WP0(f), OI-1003-Q17): nice 19 and the idle IO
+/// class. Called first in `main`, before any thread exists, so every thread
+/// and every child (Git, ssh) inherits both: Linux keeps nice and the IO
+/// priority per thread and copies them on `clone`.
 ///
 /// # Errors
-/// Never fails on Linux.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches Darwin's pthread_set_qos_class_self_np"
-)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
-    Ok(false)
+/// Returns the `setpriority` or `ioprio_set` failure; neither needs
+/// privilege when lowering the caller's own priority.
+pub fn enter_background() -> io::Result<()> {
+    super::sys_posix::nice_background()?;
+    // SAFETY: `ioprio_set` takes three integers and no pointers; `who` 0
+    // names the calling thread.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
+        )
+    };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-/// Linux has no `QoS` classes.
+/// Whether the calling thread runs at background priority: nice 19 and the
+/// idle IO class, exactly as [`enter_background`] leaves it.
 ///
 /// # Errors
-/// Never fails on Linux.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches Darwin's pthread_get_qos_class_np"
-)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const fn thread_qos() -> io::Result<Option<Qos>> {
-    Ok(None)
+/// Returns the `getpriority` or `ioprio_get` failure.
+pub fn in_background() -> io::Result<bool> {
+    let nice = super::sys_posix::nice()?;
+    // SAFETY: `ioprio_get` takes two integers and no pointers; `who` 0 names
+    // the calling thread.
+    let ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
+    if ioprio == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(nice == super::sys_posix::BACKGROUND_NICE
+        && ioprio >> IOPRIO_CLASS_SHIFT == libc::c_long::from(IOPRIO_CLASS_IDLE))
 }
 
 /// Raise a pipe's capacity with `F_SETPIPE_SZ`. Returns `false` without

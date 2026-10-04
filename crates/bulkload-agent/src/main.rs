@@ -18,7 +18,8 @@ const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
-    bulkload-agent [--durability=group|strict] [--min-free-percent=N] <SUBCOMMAND>
+    bulkload-agent [--durability=group|strict] [--min-free-percent=N]
+                   [--priority=background|normal] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -55,7 +56,7 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
-    closure-report PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...] [--attest LEDGER.json]
+    closure-report [--attest LEDGER.json] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's apply outcome records and journals (later
                 directories override earlier outcome records), with SOURCE
@@ -64,14 +65,17 @@ SUBCOMMANDS:
                 current-capture journal), refused (typed code; a bare IO or
                 FRAME_CODEC is not typed), or referenced-only (no workspace
                 planned, exact refs journal), else unaccounted. Stale and
-                foreign journals are listed. Exits nonzero with
-                CLOSURE_UNACCOUNTED when unaccounted > 0.
-                --attest LEDGER.json: join a bulkload.closure-ledger.v1
-                attestation ledger for items closed by audit, not by a verb.
-                Its rows are reported in a separate attested block and never
-                override a native record; the gate then passes only if every
-                item is native-accounted or attested (typed refusal, basis
-                other than native-closure-report, evidence, matching source)
+                foreign journals are listed. `verdict` is always the native
+                one. Exits nonzero with CLOSURE_UNACCOUNTED when `gate` fails.
+                --attest LEDGER.json (only first, before PLAN): join a
+                bulkload.closure-ledger.v1 attestation ledger for items closed
+                by audit, not by a verb. The ledger must name this PLAN and
+                SOURCE (plan, source_label). Its rows are reported in a
+                separate attested block and never override a native record
+                or change `verdict`; `gate` then passes only if every item is
+                native-accounted or attested (matching source and current
+                capture digest, typed refusal, basis other than
+                native-closure-report, evidence)
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -83,7 +87,9 @@ SUBCOMMANDS:
                 With PLAN CORPUS PRIVATE_STATE, bind BUNDLE to the planned item
                 whose CORPUS capture it is and record apply-style receipts in
                 PRIVATE_STATE: journal refs-imported, outcome index-repaired
-                (or refused with its code), so closure-report reads it natively
+                (or refused with its code), so closure-report reads it natively.
+                An item that plans a workspace never binds (estate-apply
+                restores it)
     git-attach-matching-payload BUNDLE REPOSITORY DESTINATION SOURCE NEW_RECEIPT
                 Attach exact matching payload using existing common Git administration
     git-attach-standalone-payload BUNDLE DESTINATION SOURCE NEW_RECEIPT ORIGIN_FROM ORIGIN_TO
@@ -113,6 +119,13 @@ BOUNDARIES:
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
     any item, planning bundle sizes (a lower bound).
+    --priority=background|normal (WP0(f)): serve, estate-capture, snapshot,
+    git-carry-estimate, git-export and copy read a live source, so they enter
+    background CPU and IO priority before anything else (Linux nice 19 and the
+    idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
+    inherited by every thread and child; other verbs run at normal priority.
+    --priority=normal is the explicit opt-out (gate (a)); every counters line
+    records priority= and priority_from=default|flag.
     copy/pull require an existing destination directory.
     copy/pull preserve divergent destinations and refuse live SQLite files.
     They enumerate the source each run; completed content is resumable.
@@ -143,6 +156,11 @@ BOUNDARIES:
     source_bytes_read). A pass reusing nothing it was offered says why:
     reuse_unavailable=shallow|retained-unreadable|pass-start-unrecorded|
     future-stamp.
+    A gc, repack or prune that rewrites the source's object store under a
+    pass, so that a Git child reading through it fails, is drift custody too:
+    outcome=deferred-with-drift with one ObjectStoreRewritten objects/pack
+    row, no capture record, and the next estate-capture captures the
+    rewritten store.
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
     with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
@@ -162,13 +180,46 @@ COUNTERS:
     every other verb prints on stderr so its stdout contract is unchanged.
 ";
 
+/// Verbs that read a live source on the host they run on. Each enters
+/// background CPU and IO priority before anything else unless
+/// `--priority=normal` opts out, and the opt-out is recorded (WP0(f),
+/// OI-1003-Q17). `copy` is here because it reads the source in-process (it is
+/// gate (a)'s verb); `pull` is not, since its source half is the remote
+/// `serve`.
+const SOURCE_SIDE_VERBS: &[&str] = &[
+    "serve",
+    "estate-capture",
+    "snapshot",
+    "git-carry-estimate",
+    "git-export",
+    "copy",
+];
+
+/// Where a verb's priority class came from, as its counters line records it.
+#[derive(Clone, Copy)]
+struct Priority {
+    class: bulkload_agent::priority::PriorityClass,
+    /// `true` when `--priority=` chose it, `false` for the verb's default.
+    explicit: bool,
+}
+
+impl Priority {
+    fn render(self) -> String {
+        format!(
+            "priority={} priority_from={}",
+            self.class.label(),
+            if self.explicit { "flag" } else { "default" }
+        )
+    }
+}
+
 fn main() -> ExitCode {
+    use bulkload_agent::priority::PriorityClass;
     let started = std::time::Instant::now();
-    // macOS starts at 256 open files; take the hard limit the host allows.
-    let _ = bulkload_agent::limits::raise_descriptor_limit();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
     bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
-    let mut args = match global_flags(std::env::args_os().skip(1).collect()) {
+    let mut requested = None;
+    let mut args = match global_flags(std::env::args_os().skip(1).collect(), &mut requested) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
@@ -181,6 +232,25 @@ fn main() -> ExitCode {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_owned();
+    // WP0(f): before any thread or child exists, so all of them inherit it.
+    let priority = Priority {
+        class: requested.unwrap_or_else(|| {
+            if SOURCE_SIDE_VERBS.contains(&verb.as_str()) {
+                PriorityClass::Background
+            } else {
+                PriorityClass::Normal
+            }
+        }),
+        explicit: requested.is_some(),
+    };
+    if priority.class == PriorityClass::Background {
+        if let Err(refusal) = bulkload_agent::priority::enter_background() {
+            eprintln!("bulkload-agent: refused: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // macOS starts at 256 open files; take the hard limit the host allows.
+    let _ = bulkload_agent::limits::raise_descriptor_limit();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
         Some("selftest") => selftest(),
         Some("handoff-verify") => handoff_command(&args.collect::<Vec<_>>()),
@@ -238,7 +308,7 @@ fn main() -> ExitCode {
         }
     };
 
-    report_counters(&verb, started);
+    report_counters(&verb, started, priority);
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
@@ -248,10 +318,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Remove `--durability=MODE` from the arguments and apply it process-wide.
-fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
+/// Remove `--durability=MODE` and `--min-free-percent=N` from the arguments
+/// and apply them process-wide, and `--priority=CLASS` into `priority`.
+fn global_flags(
+    args: Vec<std::ffi::OsString>,
+    priority: &mut Option<bulkload_agent::priority::PriorityClass>,
+) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
+        if let Some(class) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--priority="))
+        {
+            *priority = Some(class.parse()?);
+            continue;
+        }
         match arg
             .to_str()
             .and_then(|value| value.strip_prefix("--durability="))
@@ -274,25 +355,15 @@ fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
 // whether or not it passes; the verdict is the exit status.
 fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
-    // #95: `--attest LEDGER.json` may appear once, anywhere after the verb.
-    let mut attest = None;
-    let mut positional = Vec::with_capacity(args.len());
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        if arg == "--attest" {
-            if attest.is_some() {
-                return Err(BulkloadRefusal::FieldDomainViolation);
-            }
-            attest = Some(
-                rest.next()
-                    .map(PathBuf::from)
-                    .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
-            );
-        } else {
-            positional.push(arg);
-        }
-    }
-    let [plan, corpus, source, states @ ..] = positional.as_slice() else {
+    // #95, #133: `--attest LEDGER.json` is an option only as the first
+    // argument after the verb. Everywhere else every argument is positional,
+    // so a PRIVATE_STATE literally named `--attest` is still a state.
+    let (attest, positional) = match args {
+        [flag, ledger, rest @ ..] if flag == "--attest" => (Some(PathBuf::from(ledger)), rest),
+        [flag] if flag == "--attest" => return Err(BulkloadRefusal::RequiredFieldMissing),
+        rest => (None, rest),
+    };
+    let [plan, corpus, source, states @ ..] = positional else {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     };
     if states.is_empty() {
@@ -879,7 +950,7 @@ fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
 ///
 /// copy and pull print on stdout beside their transfer line; serve's stdout is
 /// the wire, so it and every other verb print on stderr.
-fn report_counters(verb: &str, started: std::time::Instant) {
+fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) {
     use bulkload_agent::counters::{elapsed_ns, Counters};
     use bulkload_agent::transfer::TransferTiming;
     use bulkload_agent::transfer_store::ChunkTiming;
@@ -889,7 +960,10 @@ fn report_counters(verb: &str, started: std::time::Instant) {
         "serve" => "source",
         _ => "local",
     };
-    let prefix = format!("verb={verb} side={side} scope=process");
+    let prefix = format!(
+        "verb={verb} side={side} scope=process {}",
+        priority.render()
+    );
     let mut lines = Vec::new();
     if matches!(verb, "copy" | "pull" | "serve") {
         lines.push(format!(
@@ -923,13 +997,14 @@ fn report_counters(verb: &str, started: std::time::Instant) {
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
-         source_engine_temporaries={}",
+         source_engine_temporaries={} capped_subtrees={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
         stats.source_bytes_read,
         stats.refusals.len(),
-        stats.source_engine_temporaries.len()
+        stats.source_engine_temporaries.len(),
+        stats.capped_subtrees()
     );
     for (path, code) in &stats.refusals {
         eprintln!("refused {}: {code}", path.escape_ascii());
@@ -1076,6 +1151,14 @@ fn walk_command(root: &Path) -> Result<()> {
     println!("rows                     {}", outcome.rows.len());
     println!("refusals                 {}", outcome.refusals.len());
     println!(
+        "capped_subtrees          {}",
+        outcome
+            .refusals
+            .iter()
+            .filter(|seat| walk::is_cap_refusal(seat.refusal.code()))
+            .count()
+    );
+    println!(
         "engine_temporaries       {}",
         outcome.engine_temporaries.len()
     );
@@ -1090,6 +1173,15 @@ fn walk_command(root: &Path) -> Result<()> {
         "files_statted_twice      {}",
         outcome.stats.files_statted_twice
     );
+    // Every declined seat by path and code, so a capped subtree (#129) is
+    // attributable, never only a count.
+    for seat in &outcome.refusals {
+        eprintln!(
+            "refused {}: {}",
+            seat.rel_path.escape_ascii(),
+            seat.refusal.code()
+        );
+    }
     Ok(())
 }
 

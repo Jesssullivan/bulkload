@@ -1366,3 +1366,184 @@ fn a_failed_group_commit_answers_held_false_and_records_nothing() {
         );
     }
 }
+
+// ---- WP1 PR 3 (S2): a run never changes the source's lstat census ---------
+
+/// Every node under `root`, itself included, by relative path, with every
+/// `lstat` field a write, create, rename, chmod or link would move. Access
+/// time is left out: reading the source is the point of a run.
+fn lstat_census(root: &Path) -> Vec<(PathBuf, [i64; 9])> {
+    use std::os::unix::fs::MetadataExt as _;
+    fn visit(root: &Path, relative: &Path, rows: &mut Vec<(PathBuf, [i64; 9])>) {
+        let meta = std::fs::symlink_metadata(root.join(relative)).unwrap();
+        rows.push((
+            relative.to_path_buf(),
+            [
+                i64::from(meta.mode()),
+                i64::try_from(meta.size()).unwrap(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+                i64::try_from(meta.ino()).unwrap(),
+                i64::try_from(meta.nlink()).unwrap(),
+                i64::from(meta.uid()),
+            ],
+        ));
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(root.join(relative)).unwrap() {
+                visit(root, &relative.join(entry.unwrap().file_name()), rows);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    visit(root, Path::new(""), &mut rows);
+    rows.sort();
+    rows
+}
+
+#[derive(Clone, Debug)]
+enum SourceNode {
+    File(u16),
+    Link(&'static str),
+    Directory,
+}
+
+fn source_node() -> impl proptest::strategy::Strategy<Value = SourceNode> {
+    use proptest::prelude::*;
+    prop_oneof![
+        4 => (0_u16..20_000).prop_map(SourceNode::File),
+        1 => prop::sample::select(vec!["n0", "../outside", "missing", "d1"])
+            .prop_map(SourceNode::Link),
+        1 => Just(SourceNode::Directory),
+    ]
+}
+
+/// Build `entries` under `source`: each lands in the root, `d1` or `d1/d2`
+/// (created on demand) under the name `n<index>`; a name already taken is
+/// skipped.
+fn build_source(source: &Path, entries: &[(u8, u8, SourceNode)]) {
+    for (depth, name, node) in entries {
+        let parent = match depth {
+            0 => source.to_path_buf(),
+            1 => source.join("d1"),
+            _ => source.join("d1/d2"),
+        };
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(format!("n{name}"));
+        if std::fs::symlink_metadata(&path).is_ok() {
+            continue;
+        }
+        match node {
+            SourceNode::File(length) => {
+                std::fs::write(&path, noise(u64::from(*length), usize::from(*length))).unwrap();
+            }
+            SourceNode::Link(target) => std::os::unix::fs::symlink(target, &path).unwrap(),
+            SourceNode::Directory => std::fs::create_dir(&path).unwrap(),
+        }
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(crate::test_support::prop_config(12))]
+
+    /// P-S2: whatever the tree, a copy, its warm rerun, and a copy refused
+    /// because a state root lies inside the source leave every source node's
+    /// lstat identity exactly as it was, and the refused run creates nothing.
+    #[test]
+    fn a_run_leaves_the_source_lstat_census_unchanged(
+        entries in proptest::collection::vec((0_u8..3, 0_u8..6, source_node()), 0..10),
+        nested_state in proptest::bool::ANY,
+        state_in_source_for_source_side in proptest::bool::ANY,
+    ) {
+        let corpus = Corpus::new();
+        let source = corpus.base.join("source");
+        build_source(&source, &entries);
+        let before = lstat_census(&source);
+        let first = corpus.run().unwrap();
+        proptest::prop_assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+        proptest::prop_assert_eq!(&before, &lstat_census(&source));
+        let warm = corpus.run().unwrap();
+        proptest::prop_assert_eq!(warm.source_bytes_read, 0);
+        proptest::prop_assert_eq!(&before, &lstat_census(&source));
+        // A state root inside the source: at the top, or under `d1` when the
+        // tree has it.
+        let inside = if nested_state && source.join("d1").is_dir() {
+            source.join("d1/state")
+        } else {
+            source.join("state")
+        };
+        let fresh = corpus.base.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        let (source_state, destination_state) = if state_in_source_for_source_side {
+            (inside.clone(), corpus.base.join("fresh-destination-state"))
+        } else {
+            (corpus.base.join("fresh-source-state"), inside.clone())
+        };
+        proptest::prop_assert_eq!(
+            copy(&source, &fresh, &source_state, &destination_state).unwrap_err(),
+            BulkloadRefusal::SnapshotRootsOverlap
+        );
+        proptest::prop_assert!(std::fs::symlink_metadata(&inside).is_err());
+        proptest::prop_assert_eq!(&before, &lstat_census(&source));
+    }
+}
+
+/// `serve` refuses a state root inside its source before `Store::open`
+/// creates it (WP1 PR 3): previously the store was created first.
+#[test]
+fn serve_refuses_a_state_inside_the_source_before_creating_it() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    std::fs::write(source.join("file"), b"bytes").unwrap();
+    let before = lstat_census(&source);
+    let state = source.join("state");
+    let mut request = Vec::new();
+    write_control(
+        &mut request,
+        &Control::Open {
+            proto: PROTO_VERSION,
+            wire_id: wire_id(),
+            root: source.as_os_str().as_bytes().to_vec(),
+            state: state.as_os_str().as_bytes().to_vec(),
+        },
+    )
+    .unwrap();
+    let mut answer = Vec::new();
+    assert_eq!(
+        serve(std::io::Cursor::new(request), &mut answer).unwrap_err(),
+        BulkloadRefusal::SnapshotRootsOverlap
+    );
+    assert!(answer.is_empty(), "nothing is sent before the refusal");
+    assert!(std::fs::symlink_metadata(&state).is_err());
+    assert_eq!(before, lstat_census(&source));
+}
+
+/// #129: a subtree past the walk's depth cap reaches the transfer's
+/// refusals by path and code, is counted as capped, and is never counted as
+/// carried; an empty directory at the cap refuses nothing.
+#[test]
+fn a_capped_subtree_is_reported_never_carried() {
+    use crate::walk::MAX_WALK_DEPTH;
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    let capped = vec!["d"; MAX_WALK_DEPTH].join("/");
+    std::fs::create_dir_all(source.join(&capped)).unwrap();
+    std::fs::write(source.join(&capped).join("hidden"), b"beyond the cap").unwrap();
+    let empty = format!("e/{}", vec!["d"; MAX_WALK_DEPTH - 1].join("/"));
+    std::fs::create_dir_all(source.join(&empty)).unwrap();
+    std::fs::write(source.join("kept"), b"carried").unwrap();
+    let stats = corpus.run().unwrap();
+    assert_eq!(
+        stats.refusals,
+        vec![(
+            capped.clone().into_bytes(),
+            "PATH_DEPTH_EXCEEDED".to_owned()
+        )]
+    );
+    assert_eq!(stats.capped_subtrees(), 1);
+    assert_eq!(stats.completed, 1, "only `kept` is a completed file");
+    let destination = corpus.base.join("destination");
+    assert!(!destination.join(&capped).join("hidden").exists());
+    assert_eq!(std::fs::read(destination.join("kept")).unwrap(), b"carried");
+}
