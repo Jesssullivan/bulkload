@@ -1,6 +1,9 @@
 {- docs/formal's typed catalogue (OI-1003-Q32): every TLC config of
    BulkloadTransfer.tla, the verdict of every mutation, and the
-   traceability row of every model property.
+   traceability row of every model property. GitCarry.dhall holds the same
+   for GitCarry.tla (OI-1003-Q43), and this file renders both modules
+   (T.Module): `files` holds each module's run order and configs, and
+   `grounding` one entry per module.
 
    Edit this file, never its outputs. `just tla-render` renders configs.tsv
    and every MC_*.cfg from it (dhall-to-json, then one file per entry of
@@ -40,77 +43,29 @@ let provenance =
           "# Rendered from catalogue/Catalogue.dhall by `just tla-render`; edit the catalogue, not this file."
       }
 
--- List and text helpers ------------------------------------------------------
+-- List and text helpers (Lib.dhall, shared with GitCarry.dhall) ---------------
 
-let map =
-      \(a : Type) ->
-      \(b : Type) ->
-      \(f : a -> b) ->
-      \(xs : List a) ->
-        List/fold a xs (List b) (\(x : a) -> \(acc : List b) -> [ f x ] # acc) ([] : List b)
+let Lib = ./Lib.dhall
 
-let concatMap =
-      \(a : Type) ->
-      \(b : Type) ->
-      \(f : a -> List b) ->
-      \(xs : List a) ->
-        List/fold a xs (List b) (\(x : a) -> \(acc : List b) -> f x # acc) ([] : List b)
+let map = Lib.map
 
-let filter =
-      \(a : Type) ->
-      \(keep : a -> Bool) ->
-      \(xs : List a) ->
-        List/fold
-          a
-          xs
-          (List a)
-          (\(x : a) -> \(acc : List a) -> if keep x then [ x ] # acc else acc)
-          ([] : List a)
+let concatMap = Lib.concatMap
 
-let any =
-      \(a : Type) ->
-      \(p : a -> Bool) ->
-      \(xs : List a) ->
-        List/fold a xs Bool (\(x : a) -> \(acc : Bool) -> p x || acc) False
+let filter = Lib.filter
 
-let all =
-      \(a : Type) ->
-      \(p : a -> Bool) ->
-      \(xs : List a) ->
-        List/fold a xs Bool (\(x : a) -> \(acc : Bool) -> p x && acc) True
+let any = Lib.any
 
-let natEq =
-      \(m : Natural) ->
-      \(n : Natural) ->
-        Natural/isZero (Natural/subtract m n) && Natural/isZero (Natural/subtract n m)
+let all = Lib.all
 
-let isEmpty = \(a : Type) -> \(xs : List a) -> Natural/isZero (List/length a xs)
+let natEq = Lib.natEq
 
-let join =
-      \(sep : Text) ->
-      \(xs : List Text) ->
-        let Acc = { empty : Bool, text : Text }
+let isEmpty = Lib.isEmpty
 
-        let joined =
-              List/fold
-                Text
-                xs
-                Acc
-                ( \(x : Text) ->
-                  \(acc : Acc) ->
-                    if    acc.empty
-                    then  { empty = False, text = x }
-                    else  { empty = False, text = "${x}${sep}${acc.text}" }
-                )
-                { empty = True, text = "" }
+let join = Lib.join
 
-        in  joined.text
+let unlines = Lib.unlines
 
-let unlines =
-      \(xs : List Text) ->
-        List/fold Text xs Text (\(x : Text) -> \(acc : Text) -> "${x}\n${acc}") ""
-
-let showBool = \(b : Bool) -> if b then "TRUE" else "FALSE"
+let showBool = Lib.showBool
 
 let showP = \(p : P) -> showConstructor p
 
@@ -134,24 +89,10 @@ let actionEq = \(a : A) -> \(b : A) -> natEq (T.actionIndex a) (T.actionIndex b)
    own label's value, and the positions are 0, 1, 2, ... with no gap or
    repeat, counted from the table itself.
 -}
-let range =
-      \(n : Natural) ->
-        Natural/fold
-          n
-          (List Natural)
-          (\(acc : List Natural) -> acc # [ List/length Natural acc ])
-          ([] : List Natural)
+let range = Lib.range
 
 -- The values of a table, in the order of their positions.
-let ordered =
-      \(a : Type) ->
-      \(index : a -> Natural) ->
-      \(xs : List a) ->
-        concatMap
-          Natural
-          a
-          (\(i : Natural) -> filter a (\(x : a) -> natEq (index x) i) xs)
-          (range (List/length a xs))
+let ordered = Lib.ordered
 
 let PropertyRow = { mapKey : Text, mapValue : T.PropertyEntry }
 
@@ -1428,33 +1369,49 @@ let constantNames =
         (\(k : { name : Text, pad : Text, value : Text }) -> k.name)
         (constantLines defaults)
 
+-- GitCarry.tla's part (OI-1003-Q43).
+let GitCarry = ./GitCarry.dhall
+
+let module = T.moduleEntry T.Module.BulkloadTransfer
+
 in  { files =
-          [ { name = "configs.tsv", text = tsv } ]
-        # map
-            T.Row
-            { name : Text, text : Text }
-            (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
-            rows
+            [ { name = module.tsv, text = tsv } ]
+          # map
+              T.Row
+              { name : Text, text : Text }
+              (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
+              rows
+        # GitCarry.files
     , grounding =
-      { operators =
-            map P Text showP allProperties
-          # map W Text showW allWitnesses
-          # map A Text showA allActions
-          # [ showConstructor T.Specification.Spec
-            , showConstructor T.Specification.LiveSpec
-            , "SeatSymmetry"
-            , "Init"
-            , "Next"
-            ]
-      , constants = constantNames
-      , mutations = map M Text showM allMutations
-      , codeSymbols =
-          concatMap
-            T.InvariantRow
-            Text
-            (\(r : T.InvariantRow) -> r.codeSymbol)
-            invariants
-      }
+      [ { module = showConstructor module.module
+        , spec = module.spec
+        , tsv = module.tsv
+        , operators =
+              map P Text showP allProperties
+            # map W Text showW allWitnesses
+            # map A Text showA allActions
+            # [ showConstructor T.Specification.Spec
+              , showConstructor T.Specification.LiveSpec
+              , "SeatSymmetry"
+              , "Init"
+              , "Next"
+              ]
+        , constants = constantNames
+        , mutations = map M Text showM allMutations
+        , codeSymbols =
+            concatMap
+              T.InvariantRow
+              Text
+              (\(r : T.InvariantRow) -> r.codeSymbol)
+              invariants
+        , pendingSymbols = [] : List Text
+        , labelSets = [] : List { name : Text, labels : List Text }
+        }
+      , GitCarry.grounding
+      ]
     , invariants
     , nversion
+    , gitCarryInvariants = GitCarry.invariants
+    , gitCarryNversion = GitCarry.nversion
+    , decide = GitCarry.decide
     }

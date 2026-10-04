@@ -1,10 +1,12 @@
-{- Types of docs/formal's typed catalogue (OI-1003-Q32).
+{- Types of docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43).
 
-   Catalogue.dhall uses these to describe every TLC config of
-   BulkloadTransfer.tla and the traceability row of every model property.
-   `just tla-render` renders configs.tsv and every MC_*.cfg from it, and
-   `just tla-check` refuses to run TLC unless the committed files equal that
-   rendering and every name below is grounded (README.md, "Hybrid roles").
+   Catalogue.dhall uses these to describe every TLC config of each module
+   (BulkloadTransfer.tla, and GitCarry.tla through GitCarry.dhall) and the
+   traceability row of every model property. `just tla-render` renders each
+   module's run order (configs.tsv, configs_gc.tsv) and every MC_*.cfg from
+   it, and `just tla-check` refuses to run TLC unless the committed files
+   equal that rendering and every name below is grounded in its module
+   (README.md, "Hybrid roles").
 
    Union labels are the TLA+ names themselves: `showConstructor` turns a
    label into the name TLC reads, so the catalogue cannot misspell one, and
@@ -431,6 +433,317 @@ let witnessTable =
 
 let witnessSelf = \(w : Witness) -> merge witnessTable w
 
+{- The modules (specs) the catalogue holds (OI-1003-Q43). Each renders its
+   own run order and configs, and tla-check runs each config against its own
+   module, with its own budget self-test first. The table is merged over the
+   union, so a module added without an entry does not type-check.
+-}
+let Module = < BulkloadTransfer | GitCarry >
+
+let ModuleEntry = { module : Module, index : Natural, spec : Text, tsv : Text }
+
+let moduleTable =
+      { BulkloadTransfer =
+        { module = Module.BulkloadTransfer
+        , index = 0
+        , spec = "BulkloadTransfer.tla"
+        , tsv = "configs.tsv"
+        }
+      , GitCarry =
+        { module = Module.GitCarry
+        , index = 1
+        , spec = "GitCarry.tla"
+        , tsv = "configs_gc.tsv"
+        }
+      }
+
+let moduleEntry = \(m : Module) -> merge moduleTable m
+
+-- GitCarry.tla (Q42 lane L4) ---------------------------------------------------
+
+-- Plan items: model values, as Seat is for BulkloadTransfer.
+let Item = < i1 | i2 >
+
+{- Every rule break GitCarry.tla's `Mutations` set knows, except "none". As
+   for Mutation, GitCarry.dhall maps each label to its verdict and to its
+   primary MC_gc_neg_ row with total `merge`s.
+-}
+let GcMutation =
+      < chain_ignores_depth
+      | gc_deletes_depended
+      | base_replaced_live
+      | sidecar_after_record
+      | skip_flatten_verify
+      | hit_ignores_chain
+      >
+
+-- GitCarry.tla's properties: its safety invariants, its budget and ChainRecovery.
+let GcProperty =
+      < TypeOK
+      | ChainDepthBounded
+      | PrereqsSatisfiedByEarlierLinks
+      | BrokenLinkNeverReuseHit
+      | BaseNotReplacedWhileDepended
+      | GCNeverDeletesDepended
+      | SidecarsBeforeRecord
+      | RestoreOrRecapture
+      | WithinBudget
+      | ChainRecovery
+      >
+
+-- The 11 actions of GitCarry.tla's Next, in the sorted order of the never column.
+let GcAction =
+      < Advance
+      | BaseRecord
+      | Capture
+      | Crash
+      | Damage
+      | GC
+      | Publish
+      | Record
+      | Rewrite
+      | Sidecars
+      | StartBase
+      >
+
+-- One value per CONSTANT of GitCarry.tla, rendered in this order.
+let GcConstants =
+      { Items : List Item
+      , DepthLimit : Natural
+      , RootWindow : Natural
+      , ChainUnderBase : Bool
+      , GCOn : Bool
+      , MaxCommits : Natural
+      , MaxRewrites : Natural
+      , MaxCrashes : Natural
+      , MaxDamage : Natural
+      , DamageBase : Bool
+      , BaseMissingTyped : Bool
+      , Mutation : Optional GcMutation
+      , BudgetSeconds : Natural
+      }
+
+let GcPass =
+      { invariants : List GcProperty
+      , properties : List GcProperty
+      , never : List GcAction
+      }
+
+-- A GitCarry row's expectation: pass, fail on one property, or the budget self-test.
+let GcExpect = < pass : GcPass | fail : GcProperty | inconclusive >
+
+let GcRow =
+      { name : Text
+      , expect : GcExpect
+      , comment : List Text
+      , constants : GcConstants
+      , spec : Specification
+      , flags : Optional Text
+      }
+
+let GcAgainst =
+      < verdict | also : { suffix : Text, property : GcProperty } >
+
+let GcNegRow =
+      { mutation : GcMutation
+      , against : GcAgainst
+      , constants : GcConstants
+      , comment : { head : Text, tail : List Text }
+      }
+
+{- Typed property-test ids, on the GitCarry rows only (the plan's Q42
+   allocation, P64-P71, and P42 REUSE-SAFETY). A P-id outside the union does
+   not type-check.
+-}
+let PId = < P42 | P64 | P65 | P66 | P67 | P68 | P69 | P70 | P71 >
+
+-- The lane that lands a symbol a GitCarry row cites before the code has it.
+let Lane = < L6a | L6b | L7 | L8 >
+
+let PendingSymbol = { symbol : Text, lands : Lane }
+
+{- A GitCarry property's traceability: as InvariantRow, plus the symbols it
+   is about that no code has yet (not grepped; tla-check prints them as
+   pending), and typed P-ids.
+-}
+let GcInvariantRow =
+      { tla : GcProperty
+      , slo : List Slo
+      , ruling : List Text
+      , codeSymbol : List Text
+      , pending : List PendingSymbol
+      , ptest : List PId
+      }
+
+let GcPropertyEntry =
+      { property : GcProperty, index : Natural, class : PropertyClass }
+
+let gcPropertyTable =
+      { TypeOK =
+        { property = GcProperty.TypeOK, index = 0, class = PropertyClass.safety }
+      , ChainDepthBounded =
+        { property = GcProperty.ChainDepthBounded
+        , index = 1
+        , class = PropertyClass.safety
+        }
+      , PrereqsSatisfiedByEarlierLinks =
+        { property = GcProperty.PrereqsSatisfiedByEarlierLinks
+        , index = 2
+        , class = PropertyClass.safety
+        }
+      , BrokenLinkNeverReuseHit =
+        { property = GcProperty.BrokenLinkNeverReuseHit
+        , index = 3
+        , class = PropertyClass.safety
+        }
+      , BaseNotReplacedWhileDepended =
+        { property = GcProperty.BaseNotReplacedWhileDepended
+        , index = 4
+        , class = PropertyClass.safety
+        }
+      , GCNeverDeletesDepended =
+        { property = GcProperty.GCNeverDeletesDepended
+        , index = 5
+        , class = PropertyClass.safety
+        }
+      , SidecarsBeforeRecord =
+        { property = GcProperty.SidecarsBeforeRecord
+        , index = 6
+        , class = PropertyClass.safety
+        }
+      , RestoreOrRecapture =
+        { property = GcProperty.RestoreOrRecapture
+        , index = 7
+        , class = PropertyClass.safety
+        }
+      , WithinBudget =
+        { property = GcProperty.WithinBudget
+        , index = 8
+        , class = PropertyClass.budget
+        }
+      , ChainRecovery =
+        { property = GcProperty.ChainRecovery
+        , index = 9
+        , class = PropertyClass.temporal
+        }
+      }
+
+let gcPropertyIndex = \(p : GcProperty) -> (merge gcPropertyTable p).index
+
+let gcPropertyClass = \(p : GcProperty) -> (merge gcPropertyTable p).class
+
+let gcIsSafety =
+      \(p : GcProperty) ->
+        merge
+          { safety = True, budget = False, finding = False, temporal = False }
+          (gcPropertyClass p)
+
+let gcIsTemporal =
+      \(p : GcProperty) ->
+        merge
+          { safety = False, budget = False, finding = False, temporal = True }
+          (gcPropertyClass p)
+
+let gcMutationIndex =
+      \(m : GcMutation) ->
+        merge
+          { chain_ignores_depth = 0
+          , gc_deletes_depended = 1
+          , base_replaced_live = 2
+          , sidecar_after_record = 3
+          , skip_flatten_verify = 4
+          , hit_ignores_chain = 5
+          }
+          m
+
+let GcActionEntry = { action : GcAction, index : Natural }
+
+let gcActionTable =
+      { Advance = { action = GcAction.Advance, index = 0 }
+      , BaseRecord = { action = GcAction.BaseRecord, index = 1 }
+      , Capture = { action = GcAction.Capture, index = 2 }
+      , Crash = { action = GcAction.Crash, index = 3 }
+      , Damage = { action = GcAction.Damage, index = 4 }
+      , GC = { action = GcAction.GC, index = 5 }
+      , Publish = { action = GcAction.Publish, index = 6 }
+      , Record = { action = GcAction.Record, index = 7 }
+      , Rewrite = { action = GcAction.Rewrite, index = 8 }
+      , Sidecars = { action = GcAction.Sidecars, index = 9 }
+      , StartBase = { action = GcAction.StartBase, index = 10 }
+      }
+
+let gcActionIndex = \(a : GcAction) -> (merge gcActionTable a).index
+
+-- The decision core's closed unions (OI-1003-Q43) ------------------------------
+
+{- What git carry's pure decision core, decide(Inputs) -> Decision, returns.
+   The labels are the constructors of hs/GitCarryCore.hs (its `schema`) and
+   the strings of GitCarry.tla's Decisions, Bases, Rebases, Reuses and
+   Refusals sets; formal-nv and tla-check require all three to be equal, and
+   decide_rows.tsv's output columns use them. The Rust decide.rs (lane L6)
+   is to use the same labels.
+   - Basis: what a capture's bundle depends on: nothing, a plan base, a
+     chain link, or (L6b's fix 2) both.
+   - Rebase: NewRoot when the depth limit (v1) or the Q46 window ends the
+     chain and the capture re-packs a fresh root; Reroot when, under Q46, it
+     chains on its chain's root instead.
+   - ReuseEligibility: the retained capture's blobs offered for reuse.
+   - Refusal: the typed refusal (R33) the core can return.
+-}
+let Basis = < SelfContained | Base | Chain | BaseAndChain >
+
+let Rebase = < NoRebase | NewRoot | Reroot >
+
+let ReuseEligibility = < NoRetained | BlobReuse | PassStartUnrecorded >
+
+let Refusal = < ReceiptBindingInvalid >
+
+let Plan =
+      { basis : Basis
+      , depth : Natural
+      , rebase : Rebase
+      , reuse : ReuseEligibility
+      }
+
+let Decision = < Hit | Export : Plan | Refuse : Refusal >
+
+{- One field per label, holding that label's value: Catalogue.dhall lists
+   each union from its table (toMap) and asserts every field holds its own
+   label, as it does for the property table.
+-}
+let basisTable =
+      { SelfContained = Basis.SelfContained
+      , Base = Basis.Base
+      , Chain = Basis.Chain
+      , BaseAndChain = Basis.BaseAndChain
+      }
+
+let rebaseTable =
+      { NoRebase = Rebase.NoRebase
+      , NewRoot = Rebase.NewRoot
+      , Reroot = Rebase.Reroot
+      }
+
+let reuseTable =
+      { NoRetained = ReuseEligibility.NoRetained
+      , BlobReuse = ReuseEligibility.BlobReuse
+      , PassStartUnrecorded = ReuseEligibility.PassStartUnrecorded
+      }
+
+let refusalTable = { ReceiptBindingInvalid = Refusal.ReceiptBindingInvalid }
+
+let decisionTable =
+      { Hit = Decision.Hit
+      , Export =
+          Decision.Export
+            { basis = Basis.SelfContained
+            , depth = 0
+            , rebase = Rebase.NoRebase
+            , reuse = ReuseEligibility.NoRetained
+            }
+      , Refuse = Decision.Refuse Refusal.ReceiptBindingInvalid
+      }
+
 in  { Seat
     , SupersedeMode
     , Mutation
@@ -459,4 +772,43 @@ in  { Seat
     , actionIndex
     , witnessTable
     , witnessSelf
+    , Module
+    , ModuleEntry
+    , moduleTable
+    , moduleEntry
+    , Item
+    , GcMutation
+    , GcProperty
+    , GcAction
+    , GcConstants
+    , GcPass
+    , GcExpect
+    , GcRow
+    , GcAgainst
+    , GcNegRow
+    , PId
+    , Lane
+    , PendingSymbol
+    , GcInvariantRow
+    , GcPropertyEntry
+    , gcPropertyTable
+    , gcPropertyIndex
+    , gcPropertyClass
+    , gcIsSafety
+    , gcIsTemporal
+    , gcMutationIndex
+    , GcActionEntry
+    , gcActionTable
+    , gcActionIndex
+    , Basis
+    , Rebase
+    , ReuseEligibility
+    , Refusal
+    , Plan
+    , Decision
+    , basisTable
+    , rebaseTable
+    , reuseTable
+    , refusalTable
+    , decisionTable
     }

@@ -242,14 +242,18 @@ ci:
 
 import? "justfile.flywheel"
 
-# docs/formal's typed catalogue (OI-1003-Q32): render configs.tsv and every
-# MC_*.cfg from docs/formal/catalogue/Catalogue.dhall into OUT (default
-# docs/formal). Every MC_*.cfg already in OUT is removed first, so a config
-# dropped from the catalogue leaves no stale file. dhall-to-json evaluates
-# the catalogue, which also checks its asserts (a mutation without a verdict
-# or a primary row does not type-check), and jq writes one file per entry.
-# Both come from the flake's pinned nixpkgs (no flake change). JSON, when
-# given, keeps the evaluated catalogue for tla-check's grounding step.
+# docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43): render each
+# module's run order (configs.tsv for BulkloadTransfer.tla, configs_gc.tsv
+# for GitCarry.tla) and every MC_*.cfg from docs/formal/catalogue/
+# Catalogue.dhall into OUT (default docs/formal). Every MC_*.cfg already in
+# OUT is removed first, so a config dropped from the catalogue leaves no
+# stale file. dhall-to-json evaluates the catalogue, which also checks its
+# asserts (a mutation without a verdict or a primary row does not
+# type-check), and jq writes one file per entry. Both come from the flake's
+# pinned nixpkgs (no flake change). JSON, when given, keeps the evaluated
+# catalogue for tla-check's grounding step. `just tla-render --check`
+# renders into scratch instead and fails unless the committed files equal
+# the rendering byte for byte, with no file missing or extra.
 # Render docs/formal's TLC configs from the Dhall catalogue.
 tla-render out="" json="":
     #!/usr/bin/env bash
@@ -258,13 +262,20 @@ tla-render out="" json="":
     out='{{ out }}'
     out=${out:-{{ root }}/docs/formal}
     json='{{ json }}'
+    check=no
+    scratch=
+    if [[ $out == --check ]]; then
+        check=yes
+        scratch=$(mktemp -d "${TMPDIR:-/tmp}/tla-render.XXXXXX")
+        out=$scratch/rendered
+    fi
     if [[ -z $json ]]; then
         json=$(mktemp "${TMPDIR:-/tmp}/tla-render.XXXXXX")
-        trap 'rm -f "$json"' EXIT
+        trap 'rm -f "$json"; if [[ -n $scratch ]]; then rm -rf "$scratch"; fi' EXIT
     fi
     read -r d2j jq < <(nix shell --inputs-from {{ root }} nixpkgs#dhall-json nixpkgs#jq --command sh -c 'printf "%s %s\n" "$(command -v dhall-to-json)" "$(command -v jq)"')
     "$d2j" --file catalogue/Catalogue.dhall --output "$json"
-    if ! "$jq" -e '[.files[].name] | (length == (unique | length)) and all(test("^(MC_[A-Za-z0-9_]+[.]cfg|configs[.]tsv)$"))' "$json" >/dev/null; then
+    if ! "$jq" -e '[.files[].name] | (length == (unique | length)) and all(test("^(MC_[A-Za-z0-9_]+[.]cfg|configs(_[a-z]+)?[.]tsv)$"))' "$json" >/dev/null; then
         echo "tla-render: the catalogue's file names are duplicated or unsafe" >&2
         exit 1
     fi
@@ -275,36 +286,64 @@ tla-render out="" json="":
         name=$("$jq" -r ".files[$i].name" "$json")
         "$jq" -j ".files[$i].text" "$json" >"$out/$name"
     done
-    echo "tla-render: $count files into $out"
+    if [[ $check == no ]]; then
+        echo "tla-render: $count files into $out"
+        exit 0
+    fi
+    committed=$(ls MC_*.cfg configs*.tsv | LC_ALL=C sort)
+    rendered=$(cd "$out" && ls | LC_ALL=C sort)
+    stale=0
+    if [[ $committed != "$rendered" ]]; then
+        echo "tla-render: the committed configs and the catalogue's differ in their file set:" >&2
+        diff <(echo "$committed") <(echo "$rendered") >&2 || true
+        stale=1
+    fi
+    for file in $rendered; do
+        if [[ -f $file ]] && ! cmp -s "$file" "$out/$file"; then
+            echo "tla-render: $file differs from the catalogue's rendering" >&2
+            stale=1
+        fi
+    done
+    if [[ $stale -ne 0 ]]; then
+        echo "tla-render: stale configs; run just tla-render and commit the result" >&2
+        exit 1
+    fi
+    echo "tla-render: all $count committed files equal the catalogue's rendering"
 
-# TLA+ model of wire v5, Held, the group commits and resume (proof package,
-# OI-1003-Q7; docs/formal/README.md). Standalone and on demand: no tier
-# depends on it, so check-fast, check-optional, check-full and CI never start
-# TLC. TLC comes from the flake's pinned nixpkgs (no flake change). Before
-# any TLC run, two catalogue checks (OI-1003-Q32) must pass. Staleness: the
-# catalogue, rendered into scratch, equals the committed configs.tsv and
-# MC_*.cfg byte for byte, with no file missing or extra. Grounding: every
-# operator the catalogue names (properties, witnesses, actions, the specs)
-# is defined in BulkloadTransfer.tla; the catalogue's constants are exactly
-# the spec's CONSTANTS, and its mutations exactly the spec's Mutations set
-# ("none" aside), each checked in both directions; and every code symbol is
-# found by `git grep -w` under crates/. A failed check removes the scratch
-# and stops.
-# The rows of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
-# 3 workers, nice 10, coverage on), with TLC state and logs in a private
-# mktemp directory under TMPDIR. The first row is the budget self-test: it
-# must finish with WithinBudget, and nothing else, violated, or nothing else
-# runs, because every other config relies on that budget. Outcomes: PASS
-# (model checking finished, no error, and the never-enabled actions equal
-# the row's never column), FAIL (exactly the row's named property violated,
-# nothing else), REACHED (exactly the row's Witness_ invariant violated: the
-# scenario is reachable), SIMULATION (-simulate finished clean; never a
-# model-checking result), INCONCLUSIVE (a WithinBudget trip; never a pass or
-# a caught mutant), ABORTED (no Finished line: TLC did not end normally;
-# matches no expectation), WRONG (anything else). Every outcome must equal
-# the row's expect column. Optional arguments name configs to run after the
-# self-test. Scratch is removed when every row matches; otherwise the logs
-# stay for review.
+# TLA+ models of the proof package (OI-1003-Q7; docs/formal/README.md):
+# BulkloadTransfer.tla (wire v5, Held, the group commits and resume) and
+# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43).
+# Standalone and on demand: no tier depends on it, so check-fast,
+# check-optional, check-full and CI never start TLC. TLC comes from the
+# flake's pinned nixpkgs (no flake change). Before any TLC run, two
+# catalogue checks (OI-1003-Q32) must pass. Staleness: the catalogue,
+# rendered into scratch, equals the committed configs*.tsv and MC_*.cfg
+# byte for byte, with no file missing or extra. Grounding, per module:
+# every operator the catalogue names (properties, witnesses, actions, the
+# specs) is defined in the module; the catalogue's constants are exactly
+# the module's CONSTANTS, and its mutations exactly the module's Mutations
+# set ("none" aside), and each closed union of the decision core exactly
+# the module's set of the same name (GitCarry: Decisions, Bases, Rebases,
+# Reuses, Refusals), each checked in both directions; and every code symbol
+# is found by `git grep -w` under crates/. Symbols the code does not have
+# yet are printed as pending, with the lane that lands them. A failed check
+# removes the scratch and stops.
+# Each module's rows run in its run order, one JVM at a time (-Xmx4g, 3
+# workers, nice 10, coverage on), with TLC state and logs in a private
+# mktemp directory under TMPDIR. A module's first row is its budget
+# self-test: it must finish with WithinBudget, and nothing else, violated,
+# or nothing else runs, because every other config relies on that budget.
+# Outcomes: PASS (model checking finished, no error, and the never-enabled
+# actions equal the row's never column), FAIL (exactly the row's named
+# property violated, nothing else), REACHED (exactly the row's Witness_
+# invariant violated: the scenario is reachable), SIMULATION (-simulate
+# finished clean; never a model-checking result), INCONCLUSIVE (a
+# WithinBudget trip; never a pass or a caught mutant), ABORTED (no Finished
+# line: TLC did not end normally; matches no expectation), WRONG (anything
+# else). Every outcome must equal the row's expect column. Optional
+# arguments name configs to run after their module's self-test; a module
+# none of them names is skipped. Scratch is removed when every row matches;
+# otherwise the logs stay for review.
 # Model-check docs/formal with TLC: positives pass, mutations fail.
 tla-check *configs:
     #!/usr/bin/env bash
@@ -315,7 +354,7 @@ tla-check *configs:
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/tla-check.XXXXXX")
     # Staleness: the committed configs are exactly the catalogue's rendering.
     (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >/dev/null
-    committed=$(ls MC_*.cfg configs.tsv | LC_ALL=C sort)
+    committed=$(ls MC_*.cfg configs*.tsv | LC_ALL=C sort)
     rendered=$(cd "$scratch/rendered" && ls | LC_ALL=C sort)
     stale=0
     if [[ $committed != "$rendered" ]]; then
@@ -334,58 +373,75 @@ tla-check *configs:
         rm -rf "$scratch"
         exit 1
     fi
-    # Grounding: every catalogue name exists in the spec, every code symbol in crates/.
+    # Grounding, per module: every catalogue name exists in its module,
+    # every code symbol in crates/.
+    catalogue=$scratch/catalogue.json
+    # The quoted strings of a module's set definition NAME == {...}.
+    set_members() {
+        awk -v name="$2" '$0 ~ "^" name " ==" { on = 1 } on { print } on && /}/ { exit }' "$1" |
+            { grep -oE '"[A-Za-z0-9_]+"' || true; } | tr -d '"' | LC_ALL=C sort -u
+    }
+    # Both directions: names in the catalogue the module lacks, and back.
+    agree() {
+        local what=$1 where=$2 spec_side=$3 catalogue_side=$4 name
+        while read -r name; do
+            echo "tla-check: $what $name is not in $where" >&2
+            ungrounded=$((ungrounded + 1))
+        done < <(LC_ALL=C comm -13 <(echo "$spec_side") <(echo "$catalogue_side") | sed '/^$/d')
+        while read -r name; do
+            echo "tla-check: $where's $what $name has no catalogue entry" >&2
+            ungrounded=$((ungrounded + 1))
+        done < <(LC_ALL=C comm -23 <(echo "$spec_side") <(echo "$catalogue_side") | sed '/^$/d')
+    }
     ungrounded=0
-    declared=$(awk '/^CONSTANTS/ { on = 1; next } on && /^$/ { on = 0 } on' BulkloadTransfer.tla)
-    mutations=$(awk '/^Mutations ==/ { on = 1 } on { print } on && /}/ { exit }' BulkloadTransfer.tla)
-    operators=$("$jq" -r '.grounding.operators[]' "$scratch/catalogue.json")
-    constants=$("$jq" -r '.grounding.constants[]' "$scratch/catalogue.json")
-    mutants=$("$jq" -r '.grounding.mutations[]' "$scratch/catalogue.json")
-    symbols=$("$jq" -r '.grounding.codeSymbols | unique | .[]' "$scratch/catalogue.json")
-    for name in $operators; do
-        if ! grep -qE "^${name}"'(\(.*\))? ==' BulkloadTransfer.tla; then
-            echo "tla-check: $name is not defined in BulkloadTransfer.tla" >&2
-            ungrounded=$((ungrounded + 1))
-        fi
-    done
-    # Constants and mutations must agree in both directions: the catalogue
-    # sets every declared constant and no other, and it has an entry (a
-    # verdict and a primary MC_neg_ row) for every rule break in the spec's
-    # Mutations set ("none" aside) and no other.
-    declared_names=$({ grep -oE '^ +[A-Za-z][A-Za-z0-9_]*' <<<"$declared" || true; } | tr -d ' ' | LC_ALL=C sort -u)
-    catalogue_constants=$(LC_ALL=C sort -u <<<"$constants")
-    while read -r name; do
-        echo "tla-check: constant $name is not declared in BulkloadTransfer.tla" >&2
-        ungrounded=$((ungrounded + 1))
-    done < <(LC_ALL=C comm -13 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
-    while read -r name; do
-        echo "tla-check: constant $name is declared in BulkloadTransfer.tla but the catalogue does not set it" >&2
-        ungrounded=$((ungrounded + 1))
-    done < <(LC_ALL=C comm -23 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
-    spec_mutations=$({ grep -oE '"[A-Za-z0-9_]+"' <<<"$mutations" || true; } | tr -d '"' | sed '/^none$/d' | LC_ALL=C sort -u)
-    catalogue_mutations=$(LC_ALL=C sort -u <<<"$mutants")
-    while read -r name; do
-        echo "tla-check: mutation $name is not in the spec's Mutations set" >&2
-        ungrounded=$((ungrounded + 1))
-    done < <(LC_ALL=C comm -13 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
-    while read -r name; do
-        echo "tla-check: the spec's mutation $name has no catalogue entry (no verdict, no MC_neg_ row)" >&2
-        ungrounded=$((ungrounded + 1))
-    done < <(LC_ALL=C comm -23 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
-    for name in $symbols; do
-        if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
-            echo "tla-check: code symbol $name is not found under crates/" >&2
-            ungrounded=$((ungrounded + 1))
-        fi
+    modules=$("$jq" '.grounding | length' "$catalogue")
+    summary=()
+    for ((m = 0; m < modules; m++)); do
+        g=".grounding[$m]"
+        spec=$("$jq" -r "$g.spec" "$catalogue")
+        operators=$("$jq" -r "$g.operators[]" "$catalogue")
+        constants=$("$jq" -r "$g.constants[]" "$catalogue")
+        mutants=$("$jq" -r "$g.mutations[]" "$catalogue")
+        symbols=$("$jq" -r "$g.codeSymbols | unique | .[]" "$catalogue")
+        for name in $operators; do
+            if ! grep -qE "^${name}"'(\(.*\))? ==' "$spec"; then
+                echo "tla-check: $name is not defined in $spec" >&2
+                ungrounded=$((ungrounded + 1))
+            fi
+        done
+        # Constants and mutations must agree in both directions: the
+        # catalogue sets every declared constant and no other, and it has an
+        # entry (a verdict and a primary MC_ neg row) for every rule break
+        # in the module's Mutations set ("none" aside) and no other.
+        declared=$(awk '/^CONSTANTS/ { on = 1; next } on && /^$/ { on = 0 } on' "$spec")
+        declared_names=$({ grep -oE '^ +[A-Za-z][A-Za-z0-9_]*' <<<"$declared" || true; } | tr -d ' ' | LC_ALL=C sort -u)
+        agree constant "$spec" "$declared_names" "$(LC_ALL=C sort -u <<<"$constants")"
+        agree mutation "$spec" "$(set_members "$spec" Mutations | sed '/^none$/d')" "$(LC_ALL=C sort -u <<<"$mutants")"
+        # The decision core's closed unions: the module's set holds exactly
+        # the catalogue's labels.
+        sets=$("$jq" -r "$g.labelSets | length" "$catalogue")
+        for ((k = 0; k < sets; k++)); do
+            set=$("$jq" -r "$g.labelSets[$k].name" "$catalogue")
+            labels=$("$jq" -r "$g.labelSets[$k].labels[]" "$catalogue" | LC_ALL=C sort -u)
+            agree "$set label" "$spec" "$(set_members "$spec" "$set")" "$labels"
+        done
+        for name in $symbols; do
+            if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
+                echo "tla-check: code symbol $name is not found under crates/" >&2
+                ungrounded=$((ungrounded + 1))
+            fi
+        done
+        "$jq" -r "$g.pendingSymbols | unique | .[]" "$catalogue" | sed "s|^|catalogue: $spec cites pending (no code yet): |"
+        summary+=("$(printf '%s: %s operators, %s constants, %s mutations, %s label sets, %s code symbols' \
+            "$spec" "$(wc -w <<<"$operators")" "$(wc -w <<<"$constants")" "$(wc -w <<<"$mutants")" \
+            "$sets" "$(wc -w <<<"$symbols")")")
     done
     if [[ $ungrounded -ne 0 ]]; then
         echo "tla-check: $ungrounded catalogue name(s) are not grounded" >&2
         rm -rf "$scratch"
         exit 1
     fi
-    printf 'catalogue: %s files current; grounded %s operators, %s constants, %s mutations, %s code symbols\n' \
-        "$(wc -w <<<"$rendered")" "$(wc -w <<<"$operators")" "$(wc -w <<<"$constants")" \
-        "$(wc -w <<<"$mutants")" "$(wc -w <<<"$symbols")"
+    printf 'catalogue: %s files current; grounded %s\n' "$(wc -w <<<"$rendered")" "$(IFS=';'; echo "${summary[*]}" | sed 's/;/; /g')"
     mkdir -p "$scratch/java"
     export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/java -Xmx4g"
     measure=()
@@ -394,134 +450,146 @@ tla-check *configs:
     fi
     wanted=" {{ configs }} "
     mismatches=0
-    proven=no
     peak=0
     begun=$SECONDS
-    format='%-30s %-12s %-12s %-28s %11s %11s %5s %6s %7s\n'
-    printf "$format" config expect outcome violated distinct generated depth wall rss_mib
-    while IFS=$'\t' read -r name expect prop never_want flags; do
-        if [[ -z $name || $name == \#* || $name == name ]]; then
-            continue
-        fi
-        if [[ $proven == no && $expect != inconclusive ]]; then
-            echo "tla-check: the first row must be the budget self-test" >&2
-            exit 1
-        fi
-        if [[ $expect != inconclusive && $wanted != "  " && $wanted != *" $name "* ]]; then
-            continue
-        fi
-        log="$scratch/$name.log"
-        args=(-workers 3 -coverage 1 -metadir "$scratch/$name.states" -config "$name.cfg")
-        if [[ $flags != - ]]; then
-            read -r -a extra <<<"$flags"
-            args+=("${extra[@]}")
-        fi
-        runner=()
-        if [[ ${#measure[@]} -gt 0 ]]; then
-            runner=("${measure[@]}" "$scratch/$name.rss")
-        fi
-        started=$SECONDS
-        status=0
-        nice -n 10 "${runner[@]}" "$tlc" "${args[@]}" BulkloadTransfer.tla >"$log" 2>&1 || status=$?
-        wall="$((SECONDS - started))s"
-        distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)
-        generated=$(grep -oE '[0-9,]+ states generated' "$log" | tail -n 1 | cut -d' ' -f1 || true)
-        if [[ -z $distinct ]]; then
-            # A simulation reports the states it checked, not distinct states.
-            distinct=$(grep -oE '[0-9,]+ states checked' "$log" | tail -n 1 | cut -d' ' -f1 || true)
-        fi
-        depth=$(grep -oE 'depth of the complete state graph search is [0-9]+' "$log" | tail -n 1 | grep -oE '[0-9]+$' || true)
-        rss=?
-        if [[ -s $scratch/$name.rss ]]; then
-            rss=$(($(tail -n 1 "$scratch/$name.rss") / 1024))
-            if [[ $rss -gt $peak ]]; then
-                peak=$rss
+    format='%-36s %-12s %-12s %-30s %11s %11s %5s %6s %7s\n'
+    # One module's rows, in its run order, against its spec.
+    run_module() {
+        local tsv=$1 spec=$2 proven=no
+        printf '%s (%s)\n' "$spec" "$tsv"
+        printf "$format" config expect outcome violated distinct generated depth wall rss_mib
+        while IFS=$'\t' read -r name expect prop never_want flags; do
+            if [[ -z $name || $name == \#* || $name == name ]]; then
+                continue
             fi
-        fi
-        # Every property the log reports violated, comma-separated.
-        violated=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | cut -d' ' -f2 | sort -u | paste -sd, - || true)
-        if grep -qF 'Temporal properties were violated' "$log"; then
-            # TLC does not name the temporal property; a fail row has one.
-            if [[ $(grep -c '^PROPERTY ' "$name.cfg") -eq 1 ]]; then
-                temporal=$(grep '^PROPERTY ' "$name.cfg" | cut -d' ' -f2)
-            else
-                temporal=temporal
-            fi
-            violated=${violated:+$violated,}$temporal
-        fi
-        if grep -qF 'Deadlock reached' "$log"; then
-            violated=${violated:+$violated,}deadlock
-        fi
-        errors=$(grep -c '^Error:' "$log" || true)
-        if ! grep -q '^Finished in' "$log"; then
-            # The JVM ended early (out of memory, ended from outside, a
-            # crash): nothing is known, and it never counts as a budget trip.
-            outcome=ABORTED
-        elif [[ $expect == inconclusive ]]; then
-            # The budget self-test proves the budget only by tripping it alone.
-            if [[ $violated == "$prop" ]]; then
-                outcome=INCONCLUSIVE
-            else
-                outcome=WRONG
-            fi
-        elif [[ ,$violated, == *,WithinBudget,* ]]; then
-            outcome=INCONCLUSIVE
-        elif [[ $expect == simulate ]]; then
-            if [[ $status -eq 0 && $errors -eq 0 ]]; then
-                outcome=SIMULATION
-            else
-                outcome=WRONG
-            fi
-        elif [[ $status -eq 0 && $errors -eq 0 ]] && grep -qF 'No error has been found' "$log"; then
-            outcome=PASS
-        elif [[ $expect == fail && $violated == "$prop" ]]; then
-            outcome=FAIL
-        elif [[ $expect == reach && $violated == "$prop" ]]; then
-            outcome=REACHED
-        else
-            outcome=WRONG
-        fi
-        # Coverage: the actions the last coverage report shows never enabled.
-        never=$(awk '/^The coverage statistics/ { delete seen; delete order; n = 0 }
-            /^<[A-Za-z_][A-Za-z0-9_]* line .*>: [0-9]+:[0-9]+$/ {
-                split($0, part, ">: "); split(part[2], count, ":")
-                action = substr($1, 2)
-                if (!(action in seen)) { seen[action] = 0; order[++n] = action }
-                seen[action] += count[1] + count[2]
-            }
-            END { for (i = 1; i <= n; i++) if (seen[order[i]] == 0) printf "%s ", order[i] }' "$log")
-        never_got=$(tr ' ' '\n' <<<"$never" | sed '/^$/d' | sort | paste -sd, -)
-        never_got=${never_got:--}
-        coverage=ok
-        if [[ $outcome == PASS && $never_want != '*' && $never_got != "$never_want" ]]; then
-            # A pass row's search is complete, so its never-enabled set is
-            # exact; any change means a spec edit enabled or lost an action.
-            outcome=WRONG
-            coverage=mismatch
-        fi
-        case $expect:$outcome in
-            pass:PASS | fail:FAIL | reach:REACHED | simulate:SIMULATION | inconclusive:INCONCLUSIVE) matched=yes ;;
-            *) matched=no ;;
-        esac
-        printf "$format" "$name" "$expect" "$outcome" "${violated:--}" "${distinct:-?}" "${generated:-?}" "${depth:--}" "$wall" "$rss"
-        if [[ -n $never ]]; then
-            printf '    never enabled: %s\n' "$never"
-        fi
-        if [[ $coverage == mismatch ]]; then
-            printf '    coverage: expected never enabled %s, got %s\n' "$never_want" "$never_got"
-        fi
-        if [[ $matched == no ]]; then
-            mismatches=$((mismatches + 1))
-            echo "tla-check: $name expected $expect, got $outcome; log kept at $log" >&2
-        fi
-        if [[ $expect == inconclusive ]]; then
-            if [[ $matched == no ]]; then
-                echo "tla-check: the budget self-test did not finish with WithinBudget alone violated; no other config runs" >&2
+            if [[ $proven == no && $expect != inconclusive ]]; then
+                echo "tla-check: the first row of $tsv must be the budget self-test" >&2
                 exit 1
             fi
-            proven=yes
+            if [[ $expect != inconclusive && $wanted != "  " && $wanted != *" $name "* ]]; then
+                continue
+            fi
+            log="$scratch/$name.log"
+            args=(-workers 3 -coverage 1 -metadir "$scratch/$name.states" -config "$name.cfg")
+            if [[ $flags != - ]]; then
+                read -r -a extra <<<"$flags"
+                args+=("${extra[@]}")
+            fi
+            runner=()
+            if [[ ${#measure[@]} -gt 0 ]]; then
+                runner=("${measure[@]}" "$scratch/$name.rss")
+            fi
+            started=$SECONDS
+            status=0
+            nice -n 10 "${runner[@]}" "$tlc" "${args[@]}" "$spec" >"$log" 2>&1 || status=$?
+            wall="$((SECONDS - started))s"
+            distinct=$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -n 1 | cut -d' ' -f1 || true)
+            generated=$(grep -oE '[0-9,]+ states generated' "$log" | tail -n 1 | cut -d' ' -f1 || true)
+            if [[ -z $distinct ]]; then
+                # A simulation reports the states it checked, not distinct states.
+                distinct=$(grep -oE '[0-9,]+ states checked' "$log" | tail -n 1 | cut -d' ' -f1 || true)
+            fi
+            depth=$(grep -oE 'depth of the complete state graph search is [0-9]+' "$log" | tail -n 1 | grep -oE '[0-9]+$' || true)
+            rss=?
+            if [[ -s $scratch/$name.rss ]]; then
+                rss=$(($(tail -n 1 "$scratch/$name.rss") / 1024))
+                if [[ $rss -gt $peak ]]; then
+                    peak=$rss
+                fi
+            fi
+            # Every property the log reports violated, comma-separated.
+            violated=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | cut -d' ' -f2 | sort -u | paste -sd, - || true)
+            if grep -qF 'Temporal properties were violated' "$log"; then
+                # TLC does not name the temporal property; a fail row has one.
+                if [[ $(grep -c '^PROPERTY ' "$name.cfg") -eq 1 ]]; then
+                    temporal=$(grep '^PROPERTY ' "$name.cfg" | cut -d' ' -f2)
+                else
+                    temporal=temporal
+                fi
+                violated=${violated:+$violated,}$temporal
+            fi
+            if grep -qF 'Deadlock reached' "$log"; then
+                violated=${violated:+$violated,}deadlock
+            fi
+            errors=$(grep -c '^Error:' "$log" || true)
+            if ! grep -q '^Finished in' "$log"; then
+                # The JVM ended early (out of memory, ended from outside, a
+                # crash): nothing is known, and it never counts as a budget trip.
+                outcome=ABORTED
+            elif [[ $expect == inconclusive ]]; then
+                # The budget self-test proves the budget only by tripping it alone.
+                if [[ $violated == "$prop" ]]; then
+                    outcome=INCONCLUSIVE
+                else
+                    outcome=WRONG
+                fi
+            elif [[ ,$violated, == *,WithinBudget,* ]]; then
+                outcome=INCONCLUSIVE
+            elif [[ $expect == simulate ]]; then
+                if [[ $status -eq 0 && $errors -eq 0 ]]; then
+                    outcome=SIMULATION
+                else
+                    outcome=WRONG
+                fi
+            elif [[ $status -eq 0 && $errors -eq 0 ]] && grep -qF 'No error has been found' "$log"; then
+                outcome=PASS
+            elif [[ $expect == fail && $violated == "$prop" ]]; then
+                outcome=FAIL
+            elif [[ $expect == reach && $violated == "$prop" ]]; then
+                outcome=REACHED
+            else
+                outcome=WRONG
+            fi
+            # Coverage: the actions the last coverage report shows never enabled.
+            never=$(awk '/^The coverage statistics/ { delete seen; delete order; n = 0 }
+                /^<[A-Za-z_][A-Za-z0-9_]* line .*>: [0-9]+:[0-9]+$/ {
+                    split($0, part, ">: "); split(part[2], count, ":")
+                    action = substr($1, 2)
+                    if (!(action in seen)) { seen[action] = 0; order[++n] = action }
+                    seen[action] += count[1] + count[2]
+                }
+                END { for (i = 1; i <= n; i++) if (seen[order[i]] == 0) printf "%s ", order[i] }' "$log")
+            never_got=$(tr ' ' '\n' <<<"$never" | sed '/^$/d' | sort | paste -sd, -)
+            never_got=${never_got:--}
+            coverage=ok
+            if [[ $outcome == PASS && $never_want != '*' && $never_got != "$never_want" ]]; then
+                # A pass row's search is complete, so its never-enabled set is
+                # exact; any change means a spec edit enabled or lost an action.
+                outcome=WRONG
+                coverage=mismatch
+            fi
+            case $expect:$outcome in
+                pass:PASS | fail:FAIL | reach:REACHED | simulate:SIMULATION | inconclusive:INCONCLUSIVE) matched=yes ;;
+                *) matched=no ;;
+            esac
+            printf "$format" "$name" "$expect" "$outcome" "${violated:--}" "${distinct:-?}" "${generated:-?}" "${depth:--}" "$wall" "$rss"
+            if [[ -n $never ]]; then
+                printf '    never enabled: %s\n' "$never"
+            fi
+            if [[ $coverage == mismatch ]]; then
+                printf '    coverage: expected never enabled %s, got %s\n' "$never_want" "$never_got"
+            fi
+            if [[ $matched == no ]]; then
+                mismatches=$((mismatches + 1))
+                echo "tla-check: $name expected $expect, got $outcome; log kept at $log" >&2
+            fi
+            if [[ $expect == inconclusive ]]; then
+                if [[ $matched == no ]]; then
+                    echo "tla-check: the budget self-test of $spec did not finish with WithinBudget alone violated; no other config runs" >&2
+                    exit 1
+                fi
+                proven=yes
+            fi
+        done < "$tsv"
+    }
+    for ((m = 0; m < modules; m++)); do
+        tsv=$("$jq" -r ".grounding[$m].tsv" "$catalogue")
+        spec=$("$jq" -r ".grounding[$m].spec" "$catalogue")
+        if [[ $wanted != "  " ]] && ! awk -F'\t' -v wanted="$wanted" '$1 !~ /^#/ && index(wanted, " " $1 " ") { found = 1 } END { exit !found }' "$tsv"; then
+            continue
         fi
-    done < configs.tsv
+        run_module "$tsv" "$spec"
+    done
     printf 'total wall %ss, peak rss %s MiB\n' "$((SECONDS - begun))" "$peak"
     if [[ $mismatches -ne 0 ]]; then
         echo "tla-check: $mismatches config(s) did not match their expectation" >&2
@@ -529,15 +597,16 @@ tla-check *configs:
     fi
     rm -rf "$scratch"
 
-# Haskell N-version explorer (OI-1003-Q32; docs/formal/README.md, "Hybrid
-# roles"). Standalone and on demand: no tier depends on it, so check-fast,
-# check-optional, check-full and CI never build it. GHC, TLC, Dhall and jq
-# come from the flake's pinned nixpkgs (no flake change).
-# docs/formal/hs/Explorer.hs uses base and containers only; it is built with
-# -O1 -Wall -Werror into a private mktemp directory under TMPDIR. Its rows:
-# - the presets nv_core and nv_ledger must reach TLC's distinct-state counts
-#   of record, MC_nv_core's 15,834 and MC_nv_ledger's 142,450, with no
-#   invariant violated and no deadlock;
+# Haskell cross-checks (OI-1003-Q32, OI-1003-Q43; docs/formal/README.md,
+# "Hybrid roles" and "GitCarry"). Standalone and on demand: no tier depends
+# on it, so check-fast, check-optional, check-full and CI never build it.
+# GHC, TLC, Dhall and jq come from the flake's pinned nixpkgs (no flake
+# change). docs/formal/hs/Explorer.hs and hs/GitCarryCore.hs use base and
+# containers only; each is built with -O1 -Wall -Werror into a private
+# mktemp directory under TMPDIR. Its rows:
+# - BulkloadTransfer: the presets nv_core and nv_ledger must reach TLC's
+#   distinct-state counts of record, MC_nv_core's 15,834 and MC_nv_ledger's
+#   142,450, with no invariant violated and no deadlock;
 # - every MC_neg_ row of the catalogue inside the explorer's domain (the
 #   evaluated catalogue's nversion list) runs at its own bound, passed as
 #   the explorer's bound flags, checking TypeOK and the row's named
@@ -545,16 +614,27 @@ tla-check *configs:
 # - each primary row among them runs again with every safety invariant
 #   checked, on the explorer and on TLC with one worker (the catalogue's
 #   scratch config for it): both must stop at the same first violated
-#   invariant after the same number of states.
+#   invariant after the same number of states;
+# - GitCarry: crates/bulkload-agent/tests/data/decide_rows.tsv must be
+#   GitCarryCore's rendering byte for byte (`rows --check`), and its
+#   closed unions (`schema`) must equal the catalogue's Basis and Decision
+#   labels;
+# - GitCarry's explorer presets gc_core, gc_q46, gc_grouped and gc_fix2
+#   must reach TLC's distinct-state counts of record for MC_gc_core
+#   (111,680), MC_gc_q46 (943,611), MC_gc_grouped (149,749) and MC_gc_fix2
+#   (770,065), with no invariant violated, and each must take the capture
+#   decisions it exists for (v1's re-base, Q46's re-root, the base refusal,
+#   fix 2's chain under a base); every MC_gc_neg_ row (gitCarryNversion) is
+#   checked as the MC_neg_ rows are, against GitCarry.tla.
 # Each explorer counterexample is written as JSON; that directory is kept
 # and printed, and so are the TLC logs.
-# Cross-check the TLA+ model with the Haskell N-version explorer.
+# Cross-check the TLA+ models with the Haskell explorers and decision core.
 formal-nv:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ root }}/docs/formal
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/formal-nv.XXXXXX")
-    mkdir -p "$scratch/build" "$scratch/counterexamples" "$scratch/tlc/java"
+    mkdir -p "$scratch/build" "$scratch/build-gc" "$scratch/counterexamples" "$scratch/tlc/java"
     if ! (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >"$scratch/render.log" 2>&1; then
         cat "$scratch/render.log" >&2
         echo "formal-nv: the catalogue did not evaluate; log kept at $scratch/render.log" >&2
@@ -562,82 +642,146 @@ formal-nv:
     fi
     tlc=$(nix shell --inputs-from {{ root }} nixpkgs#tlaplus --command sh -c 'command -v tlc')
     jq=$(nix shell --inputs-from {{ root }} nixpkgs#jq --command sh -c 'command -v jq')
-    if ! nix shell --inputs-from {{ root }} nixpkgs#ghc --command nice -n 10 ghc -O1 -Wall -Werror -outputdir "$scratch/build" -o "$scratch/explorer" hs/Explorer.hs >"$scratch/ghc.log" 2>&1; then
-        cat "$scratch/ghc.log" >&2
-        echo "formal-nv: the explorer did not build; log kept at $scratch/ghc.log" >&2
-        exit 1
-    fi
-    # TLC's distinct-state counts of record (README.md, "N-version core").
-    declare -A tlc_distinct=([nv_core]=15834 [nv_ledger]=142450)
+    for program in Explorer GitCarryCore; do
+        out=$scratch/explorer
+        dir=$scratch/build
+        if [[ $program == GitCarryCore ]]; then
+            out=$scratch/gitcarry
+            dir=$scratch/build-gc
+        fi
+        if ! nix shell --inputs-from {{ root }} nixpkgs#ghc --command nice -n 10 ghc -O1 -Wall -Werror -outputdir "$dir" -o "$out" "hs/$program.hs" >"$scratch/ghc-$program.log" 2>&1; then
+            cat "$scratch/ghc-$program.log" >&2
+            echo "formal-nv: hs/$program.hs did not build; log kept at $scratch/ghc-$program.log" >&2
+            exit 1
+        fi
+    done
     field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; }
     mismatches=0
-    format='%-34s %-42s %-42s %9s %10s %6s %s\n'
-    printf "$format" row expect explorer distinct generated depth match
-    for preset in nv_core nv_ledger; do
-        status=0
-        line=$(nice -n 10 "$scratch/explorer" --preset "$preset") || status=$?
-        want="pass (${tlc_distinct[$preset]})"
-        got="$(field outcome "$line") ($(field distinct "$line"))"
-        match=yes
-        if [[ $status -ne 0 || $got != "$want" ]]; then
-            match=no
-            mismatches=$((mismatches + 1))
-        fi
-        printf "$format" "$(field row "$line")" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
-    done
-    rows=$("$jq" '.nversion | length' "$scratch/catalogue.json")
-    if [[ $rows -eq 0 ]]; then
-        echo "formal-nv: the catalogue has no mutation row in the explorer's domain" >&2
-        exit 1
-    fi
+    format='%-36s %-42s %-42s %9s %10s %6s %s\n'
     export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/tlc/java -Xmx2g"
-    for ((i = 0; i < rows; i++)); do
-        IFS=$'\t' read -r name mutation named primary seats runs crashes edits foreign < <(
-            "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, .seats, .runs, .crashes, .edits, .foreign] | @tsv" "$scratch/catalogue.json")
-        bound=(--seats "$seats" --runs "$runs" --crashes "$crashes" --edits "$edits" --foreign "$foreign" --mutation "$mutation")
-        status=0
-        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$name" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
-        got="$(field outcome "$line") $(field violated "$line")"
-        match=yes
-        if [[ $status -ne 1 || $got != "violation $named" ]]; then
-            match=no
-            mismatches=$((mismatches + 1))
+    # One module's presets and mutation rows: EXPLORER, the module's spec,
+    # the catalogue's list of rows, then each preset as NAME=COUNT, TLC's
+    # distinct-state count of record, or NAME=COUNT=DECISION,..., the
+    # capture decisions its search must also take (GitCarryCore only).
+    cross_check() {
+        local spec=$2 rows_key=$3
+        local preset want got line status i rows name mutation named primary flags every log tlc_first tlc_states first
+        local -a explorer bound
+        read -r -a explorer <<<"$1"
+        shift 3
+        printf "$format" row expect explorer distinct generated depth match
+        local count required decision
+        for preset in "$@"; do
+            count=${preset#*=}
+            required=
+            if [[ $count == *=* ]]; then
+                required=${count#*=}
+                count=${count%%=*}
+            fi
+            status=0
+            line=$(nice -n 10 "${explorer[@]}" --preset "${preset%%=*}") || status=$?
+            want="pass ($count)"
+            got="$(field outcome "$line") ($(field distinct "$line"))"
+            match=yes
+            if [[ $status -ne 0 || $got != "$want" ]]; then
+                match=no
+                mismatches=$((mismatches + 1))
+            fi
+            printf "$format" "$(field row "$line")" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+            if [[ -n $required ]]; then
+                printf '    decisions: %s\n' "$(field decisions "$line")"
+                for decision in ${required//,/ }; do
+                    if [[ ,$(field decisions "$line"), != *,"$decision",* ]]; then
+                        echo "formal-nv: ${preset%%=*} never takes the decision $decision" >&2
+                        mismatches=$((mismatches + 1))
+                    fi
+                done
+            fi
+        done
+        rows=$("$jq" ".$rows_key | length" "$scratch/catalogue.json")
+        if [[ $rows -eq 0 ]]; then
+            echo "formal-nv: the catalogue has no $rows_key row in the explorer's domain" >&2
+            exit 1
         fi
-        printf "$format" "$name" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
-        if [[ $primary != true ]]; then
-            continue
-        fi
-        # Every safety invariant, on TLC (one worker, so its breadth-first
-        # order is fixed) and on the explorer: the first invariant violated,
-        # in the configs' order, and the counterexample's length must agree.
-        every="${name}_all"
-        log="$scratch/tlc/$every.log"
-        "$jq" -j ".nversion[$i].everyInvariant" "$scratch/catalogue.json" >"$scratch/tlc/$every.cfg"
-        nice -n 10 "$tlc" -workers 1 -metadir "$scratch/tlc/$every.states" -config "$scratch/tlc/$every.cfg" BulkloadTransfer.tla >"$log" 2>&1 || true
-        rm -rf "$scratch/tlc/$every.states"
-        tlc_first=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | head -n 1 | cut -d' ' -f2 || true)
-        if grep -qF 'Deadlock reached' "$log"; then
-            tlc_first=deadlock
-        fi
-        tlc_states=$(grep -cE '^State [0-9]+:' "$log" || true)
-        status=0
-        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$every" --check all --json "$scratch/counterexamples") || status=$?
-        first=$(field violated "$line")
-        first=${first%%,*}
-        want="TLC first ${tlc_first:-none}, $tlc_states states"
-        got="explorer first $first, $(field states "$line") states"
-        match=yes
-        if [[ $status -ne 1 || -z $tlc_first || $got != "explorer first $tlc_first, $tlc_states states" ]]; then
-            match=no
-            mismatches=$((mismatches + 1))
-            echo "formal-nv: $every disagrees with TLC; TLC log kept at $log" >&2
-        fi
-        printf "$format" "$every" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
-    done
-    rm -rf "$scratch/build" "$scratch/explorer" "$scratch/rendered" "$scratch/tlc/java"
+        for ((i = 0; i < rows; i++)); do
+            if [[ $rows_key == nversion ]]; then
+                IFS=$'\t' read -r name mutation named primary flags < <(
+                    "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, \"--seats \" + .seats + \" --runs \" + (.runs | tostring) + \" --crashes \" + (.crashes | tostring) + \" --edits \" + (.edits | tostring) + \" --foreign \" + (.foreign | tostring)] | @tsv" "$scratch/catalogue.json")
+            else
+                IFS=$'\t' read -r name mutation named primary flags < <(
+                    "$jq" -r ".$rows_key[$i] | [.name, .mutation, .property, .primary, .flags] | @tsv" "$scratch/catalogue.json")
+            fi
+            read -r -a bound <<<"$flags"
+            bound+=(--mutation "$mutation")
+            status=0
+            line=$(nice -n 10 "${explorer[@]}" "${bound[@]}" --name "$name" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
+            got="$(field outcome "$line") $(field violated "$line")"
+            match=yes
+            if [[ $status -ne 1 || $got != "violation $named" ]]; then
+                match=no
+                mismatches=$((mismatches + 1))
+            fi
+            printf "$format" "$name" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+            if [[ $primary != true ]]; then
+                continue
+            fi
+            # Every safety invariant, on TLC (one worker, so its breadth-first
+            # order is fixed) and on the explorer: the first invariant violated,
+            # in the configs' order, and the counterexample's length must agree.
+            every="${name}_all"
+            log="$scratch/tlc/$every.log"
+            "$jq" -j ".$rows_key[$i].everyInvariant" "$scratch/catalogue.json" >"$scratch/tlc/$every.cfg"
+            nice -n 10 "$tlc" -workers 1 -metadir "$scratch/tlc/$every.states" -config "$scratch/tlc/$every.cfg" "$spec" >"$log" 2>&1 || true
+            rm -rf "$scratch/tlc/$every.states"
+            tlc_first=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | head -n 1 | cut -d' ' -f2 || true)
+            if grep -qF 'Deadlock reached' "$log"; then
+                tlc_first=deadlock
+            fi
+            tlc_states=$(grep -cE '^State [0-9]+:' "$log" || true)
+            status=0
+            line=$(nice -n 10 "${explorer[@]}" "${bound[@]}" --name "$every" --check all --json "$scratch/counterexamples") || status=$?
+            first=$(field violated "$line")
+            first=${first%%,*}
+            want="TLC first ${tlc_first:-none}, $tlc_states states"
+            got="explorer first $first, $(field states "$line") states"
+            match=yes
+            if [[ $status -ne 1 || -z $tlc_first || $got != "explorer first $tlc_first, $tlc_states states" ]]; then
+                match=no
+                mismatches=$((mismatches + 1))
+                echo "formal-nv: $every disagrees with TLC; TLC log kept at $log" >&2
+            fi
+            printf "$format" "$every" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+        done
+    }
+    # BulkloadTransfer.tla: TLC's distinct-state counts of record (README.md,
+    # "N-version core").
+    cross_check "$scratch/explorer" BulkloadTransfer.tla nversion nv_core=15834 nv_ledger=142450
+    # GitCarry.tla (OI-1003-Q43): the pinned rows, the closed unions, then
+    # the custody explorer at TLC's counts of record (README.md, "GitCarry").
+    rows_file={{ root }}/crates/bulkload-agent/tests/data/decide_rows.tsv
+    if ! "$scratch/gitcarry" rows --check "$rows_file"; then
+        mismatches=$((mismatches + 1))
+    fi
+    schema_want=$("$jq" -r '.decide[] | "\(.name) \(.labels | sort | join(" "))"' "$scratch/catalogue.json" | LC_ALL=C sort)
+    schema_got=$("$scratch/gitcarry" schema | while read -r name rest; do
+        echo "$name $(tr ' ' '\n' <<<"$rest" | LC_ALL=C sort | paste -sd' ' -)"
+    done | LC_ALL=C sort)
+    if [[ $schema_got == "$schema_want" ]]; then
+        echo "schema: GitCarryCore's closed unions equal the catalogue's ($(wc -l <<<"$schema_got") unions)"
+    else
+        echo "formal-nv: GitCarryCore's closed unions differ from the catalogue's:" >&2
+        diff <(echo "$schema_want") <(echo "$schema_got") >&2 || true
+        mismatches=$((mismatches + 1))
+    fi
+    cross_check "$scratch/gitcarry explore" GitCarry.tla gitCarryNversion \
+        gc_core=111680=Hit,Export:Chain:NoRebase,Export:SelfContained:NewRoot \
+        gc_q46=943611=Export:Chain:Reroot,Export:SelfContained:NewRoot \
+        gc_grouped=149749=Export:Base:NoRebase,Refuse:ReceiptBindingInvalid \
+        gc_fix2=770065=Export:BaseAndChain:NoRebase,Export:BaseAndChain:Reroot,Refuse:ReceiptBindingInvalid
+    rm -rf "$scratch/build" "$scratch/build-gc" "$scratch/explorer" "$scratch/gitcarry" "$scratch/rendered" "$scratch/tlc/java"
     echo "counterexamples (JSON): $scratch/counterexamples; TLC logs: $scratch/tlc"
     if [[ $mismatches -ne 0 ]]; then
-        echo "formal-nv: $mismatches row(s) disagree with TLC" >&2
+        echo "formal-nv: $mismatches row(s) disagree" >&2
         exit 1
     fi
 

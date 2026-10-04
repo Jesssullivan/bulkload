@@ -1,12 +1,16 @@
-# Formal model: wire v5, Held, group commits and resume
+# Formal model: wire v5, Held, group commits and resume; git carry custody
 
 The proof package's formal model ([docs/slo.md](../slo.md), OI-1003-Q7): a
 TLA+ specification of bulkload's transfer, model-checked with TLC. TLA+ and
 TLC are the checker of record (OI-1003-Q32). Sprint 2 adds a typed Dhall
 catalogue of the configs and a Haskell N-version explorer, a second encoding
 of the spec, on [the shared core](#n-version-core-oi-1003-q32) ([Hybrid
-roles](#hybrid-roles-oi-1003-q32)).
-The model covers:
+roles](#hybrid-roles-oi-1003-q32)). The Q42 push adds a second module,
+[`GitCarry.tla`](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46):
+git carry v1's chain and base custody, beside a Haskell reference copy of
+the capture's decision core whose pinned rows the Rust code is to be checked
+against (OI-1003-Q43).
+The transfer model (`BulkloadTransfer.tla`) covers:
 
 - wire v5 per entry;
 - the destination's staging, seal, no-replace publish, directory seal and
@@ -30,23 +34,31 @@ and design disagreements](#code-and-design-disagreements)).
 | File | What it is |
 |---|---|
 | [`BulkloadTransfer.tla`](BulkloadTransfer.tla) | The specification. Its header states the scope, the abstractions and the code map. Every action cites the function it models. |
-| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg` and `configs.tsv` from it. Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
+| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv` and `configs_gc.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
 | [`catalogue/Types.dhall`](catalogue/Types.dhall) | The catalogue's types. Union labels are the TLA+ names themselves. |
 | `MC_*.cfg` | TLC configurations, rendered from the catalogue. |
 | [`configs.tsv`](configs.tsv) | The run order. Columns: `name`, `expect`, `named-property` (the one property a fail or reach row must violate), `never` (a pass row's exact never-enabled actions), `flags` (extra TLC arguments, one argv element per word). |
+| [`GitCarry.tla`](GitCarry.tla) | The git carry custody module (OI-1003-Q43): chain links, the plan base, depth, Q46's re-root and GC, crash order and restore-or-recapture ([GitCarry](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46)). |
+| [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
+| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
+| [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
 
 ## Running it
 
 ```sh
-just tla-render             # re-render configs.tsv and MC_*.cfg from the catalogue
-just tla-check              # every row of configs.tsv
-just tla-check MC_nv_core   # the budget self-test, then the named configs
-just formal-nv              # the Haskell N-version cross-check (Hybrid roles)
+just tla-render             # re-render configs.tsv, configs_gc.tsv and MC_*.cfg from the catalogue
+just tla-render --check     # fail unless the committed files are the catalogue's rendering
+just tla-check              # every row of configs.tsv, then of configs_gc.tsv
+just tla-check MC_nv_core   # that module's budget self-test, then the named configs
+just tla-check MC_gc_core   # the same for GitCarry.tla
+just formal-nv              # the Haskell cross-checks of both modules (Hybrid roles)
 ```
 
-`tla-check` is a standalone recipe at the end of the justfile. No tier
-depends on it: `check-fast`, `check-optional`, `check-full` and CI never start
-TLC, so CI stays slim (OI-1003-Q7).
+`tla-check` and `formal-nv` are standalone recipes at the end of the
+justfile. No tier depends on them: `check-fast`, `check-optional`,
+`check-full` and CI never start TLC or GHC, so CI stays slim (OI-1003-Q7).
+`tla-check` runs each module's rows against that module, after its own
+budget self-test; a module none of the named configs belongs to is skipped.
 
 How the recipe runs:
 
@@ -339,6 +351,11 @@ The model is checked by three tools, each with one job:
 | Typed catalogue | Dhall 1.42 ([`catalogue/`](catalogue/)) | Holds every config's constants and expectation, every mutation's verdict and every property's traceability row. It renders `configs.tsv` and every `MC_*.cfg`, and its staleness and grounding checks gate every TLC run. | `just tla-render` |
 | N-version cross-check | Haskell, GHC 9.10, base and containers ([`hs/Explorer.hs`](hs/Explorer.hs)) | A second encoding of the spec: independent code, shared design. An explicit-state BFS transliterated by hand from the spec's actions, on the core and every mutation row inside its domain. It must reproduce TLC's counts and mutation verdicts. It shows that TLC evaluates the spec as its text reads; it cannot catch a misreading of the code that the spec makes. | `just formal-nv` |
 
+OI-1003-Q43 widens these roles for git carry: Haskell also holds a reference
+copy of the code's decision core, a differential oracle for the Rust code,
+not only a second encoding of TLC's spec ([GitCarry
+roles](#roles-oi-1003-q43)).
+
 All three come from the flake's pinned nixpkgs through `nix shell
 --inputs-from`; there is no flake change. None of them is in `check-fast`,
 `check-optional`, `check-full` or CI.
@@ -391,11 +408,14 @@ time it is evaluated (a catalogue that breaks one renders nothing):
 
 What `tla-render` and `tla-check` add in the shell:
 
-- The rendered file names are unique and safe (`MC_<name>.cfg` or
-  `configs.tsv`).
-- **Staleness.** The committed `configs.tsv` and `MC_*.cfg` equal the
+- The rendered file names are unique and safe (`MC_<name>.cfg`,
+  `configs.tsv` or `configs_<module>.tsv`).
+- **Staleness.** The committed `configs*.tsv` and `MC_*.cfg` equal the
   catalogue's rendering byte for byte, with no file missing or extra.
-- **Grounding.** Every operator the catalogue names (21 properties, 3
+  `just tla-render --check` runs this check alone.
+- **Grounding, per module** (`T.Module`; GitCarry's numbers are in
+  [GitCarry](#results-gitcarry)). For BulkloadTransfer.tla: every operator
+  the catalogue names (21 properties, 3
   witnesses, 37 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init` and
   `Next`: 66 names) is defined in the spec. The catalogue's 16 constants
   are exactly the spec's `CONSTANTS`, and its 19 mutations exactly the
@@ -972,9 +992,12 @@ The model proves the protocol, within its bounds. It does not prove:
   the 1024-entry window, walk-ahead and the retention budget. So WP0(c)'s
   second inequality (wire bytes ≤ absent chunks) is not proven here; P18
   covers it.
-- **Git carry.** v1 bundles, carry_v2 (frozen by WP0(a)), the ingest journal,
-  the git sub-stream and estate apply's `.done` journals. Only estate
-  capture's typed reads (one git read, the SQLite backup) are modelled.
+- **Git carry, in BulkloadTransfer.tla.** Only estate capture's typed reads
+  (one git read, the SQLite backup) are modelled there. v1's chain and base
+  custody is GitCarry.tla's ([what it does not
+  prove](#what-gitcarry-does-not-prove)); carry_v2 (frozen by WP0(a), deleted
+  by Q44), the ingest journal, the git sub-stream and estate apply's `.done`
+  journals are modelled nowhere.
 - **The tree.** Directories and their records (R-N102), symlinks, `Skip`,
   engine temporaries, walk caps and devices other than the store's.
 - **Storage below the store.** The Darwin barrier model belongs to
@@ -1074,6 +1097,9 @@ renaming one is a breaking change to the proof package and needs a ruling.
 - Budget invariant: `WithinBudget`.
 - Temporal properties: `RunsClose`, `AllRunsFinish`.
 - The N-version core: `MC_nv_core`.
+
+GitCarry.tla's names (the module, its properties, mutations, constants and
+configs) are new and not frozen; freezing them needs a ruling.
 
 The names this revision adds are not frozen: `R25_StrictNoDurableReread`,
 the `Witness_` invariants, the constants `StoreRootSealed` and
