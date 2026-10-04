@@ -4,7 +4,7 @@
 - **Issue:** [#162](https://github.com/Jesssullivan/bulkload/issues/162).
 - **Worktree:** `bulkload.worktrees/fix-source-odb-20261004`.
 - **Branch:** `fix/source-odb-freshen-20261004`, cut from origin/main 4a10bb8.
-- **Pushed, no PR:** opening a PR is the coordinator's call.
+- **PR:** [#172](https://github.com/Jesssullivan/bulkload/pull/172), opened by the recheck-and-ship stage. Not merged.
 
 Rulings cited:
 
@@ -289,5 +289,39 @@ Rulings cited:
   - #168 (S2 budget instrument) merged and is in this branch at 78709af.
   - #164 (whitepaper) is still open. It does not touch this branch.
 - **Issue #162** is still open, with one comment.
-- **This lane:** branch pushed, no PR. The next action is review and PR by
-  the coordinator.
+- **This lane:** PR #172 open against main, not merged. The next action is
+  CI on #172 and the merge decision.
+
+## Recheck and ship (2026-10-04)
+
+- **Scope.** An adversarial recheck of every review-round-1 finding against
+  the diff since 915af22, then the PR. Rulings: OI-1003-Q5, OI-1003-Q16,
+  OI-1003-Q1, OI-1003-Q38, R-N13.
+- **High: a gitfile into a bare git dir.** Verified fixed. `bare_root` is
+  the one predicate for both `source_index` and `capture_census_planned`.
+  `project/.git` -> `.bare` refuses `GIT_REPOSITORY_NOT_AT_PATH` whether
+  or not `.bare/index` exists.
+- **Medium: the #151 merge.** Verified fixed. main is an ancestor, the new
+  IO sites use `.refuse_at` or `refuse::io`, and the tree compiles under
+  check-fast.
+- **Medium: a workspace from a bare capture.** Verified fixed. All five
+  verbs refuse first. Estate apply refuses before the flatten or the base
+  import. A chained bundle's header lists every private ref (`refs(private)`
+  in `shared`), so its head carries the marker. A shallow envelope lifts it.
+- **Medium: a non-bare repository with no index.** Verified fixed with
+  `GIT_INVENTORY_INDEX_ABSENT`. `authority_held` re-reads through the same
+  `source_index`.
+- **No new medium or high defect.** Also checked:
+  - A 0-byte index still refuses through the carried-copy validation.
+  - `BulkloadRefusal` has no positional encoding.
+- **Low findings.** They stay deferred, as listed under Open.
+- **`just check-fast` receipt on cffc034** (in `nix develop .#default`,
+  under the shared `.check-fast.lock`, nice 10, in the foreground):
+  - Exit 0. It queued at 2026-10-04T18:45Z and finished at 19:06:06Z.
+  - 26 cargo result lines: 710 passed, 0 failed, 9 ignored.
+  - The S4, P34 and estate bare-item tests, the fault harness, the
+    power-loss and adoption proofs and the CI contract (22 OK) passed.
+- **Main moved again.** It is now 8dc26c1 (#170, docs/formal and standalone
+  justfile recipes, no Rust). It was not merged in, so the PR head stays the
+  tree check-fast covered. `git merge-tree` against 8dc26c1 is clean.
+- **PR #172** was opened from cffc034. This note commit is note-only.
