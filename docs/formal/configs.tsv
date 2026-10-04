@@ -1,5 +1,5 @@
 # TLC configs checked by `just tla-check`, in this order (README.md).
-# Rendered by gen_cfgs.py; edit its table, not this file.
+# Rendered from catalogue/Catalogue.dhall by `just tla-render`; edit the catalogue, not this file.
 # Tab-separated columns:
 #   name            the config, MC_<name>.cfg
 #   expect          pass | fail | reach | simulate | inconclusive
