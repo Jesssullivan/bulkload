@@ -515,8 +515,8 @@ static RETAIN_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 /// At most this many salvaged temporaries outlive a session (#124,
 /// OI-1002-Q33): those whose chunks a refused entry staged.
 ///
-/// Both salvage bounds are unruled engineering defaults: OI-1002-Q33 ruled
-/// that salvage is bounded, not these values.
+/// OI-1002-Q33 ruled that salvage is bounded, and OI-1003-Q24 (2026-10-03)
+/// ratified these values: 1024 temporaries and 4 GiB per session.
 const SALVAGE_KEEP_FILES: usize = 1024;
 /// At most this many bytes of salvaged temporaries outlive a session.
 const SALVAGE_KEEP_BYTES: u64 = 4 << 30;
