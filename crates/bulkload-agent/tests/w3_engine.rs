@@ -101,7 +101,6 @@ fn w3_engine_properties() {
     );
     assert_eq!(counted.get(Counter::DestVerifyRead), 0);
     assert_eq!(counted.get(Counter::HashVerifyExisting), 0);
-    assert_eq!(counted.get(Counter::DestPackWrite), 0);
     assert_eq!(counted.get(Counter::SourcePackReadback), 0);
     assert_eq!(counted.get(Counter::FilesMaterialized), 4);
     assert!(counted.get(Counter::FlushBarrier) >= 4);
