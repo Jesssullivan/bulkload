@@ -48,7 +48,11 @@ fn validate_frontier(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Result<()> {
+pub(super) fn write_bundle(
+    private: &Path,
+    bundle: &Path,
+    boundary: &[u8],
+) -> Result<super::shared::PackStats> {
     validate_frontier(boundary)?;
     let parent = bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let pack = bundle.with_extension("objects.pack");
@@ -57,15 +61,17 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
         .create_new(true)
         .mode(0o600)
         .open(&pack)?;
-    let status = git(private)
-        .args(["pack-objects", "--stdout", "--revs", "--all"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file.try_clone()?))
-        .status()?;
-    if !status.success() {
+    let (success, storage_read) = super::pack_child(
+        git(private)
+            .args(["pack-objects", "--stdout", "--revs", "--all"])
+            .stdout(Stdio::from(file.try_clone()?)),
+        None,
+    )?;
+    if !success {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     file.sync_file_counted()?;
+    let stats = super::shared::PackStats::record(&pack, true, storage_read)?;
     let envelope = parent.join("shallow-envelope.git");
     let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
     output(
@@ -113,7 +119,7 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
         create.arg(DRIFT_MARKER);
     }
     output(&mut create)?;
-    Ok(())
+    Ok(stats)
 }
 
 fn custody_oid(heads: &str) -> Option<&str> {
