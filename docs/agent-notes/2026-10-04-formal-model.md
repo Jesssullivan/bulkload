@@ -23,10 +23,10 @@ read.
 Shas:
 
 - `8bc6672`: the model, generator, configs and runner fixes.
-- The commit on top of `8bc6672`: the README (results, coverage, the WP0(g)
-  verdict, disagreements), this note, corrections to the 2026-10-03 note,
-  and comment-only spec and config edits (#124's closure).
-- A follow-up commit records this note's check-fast result.
+- `7738b6e`: the README (results, coverage, the WP0(g) verdict,
+  disagreements), this note, corrections to the 2026-10-03 note, and
+  comment-only spec and config edits (#124's closure).
+- The follow-up commit on top of `7738b6e`: this note's check-fast result.
 
 ## What the review found, and what was done
 
@@ -78,7 +78,14 @@ clock.
   that differ only in which rows a crash dropped; its behaviour is
   unchanged. `MC_wp0g` is a new bound, 496,830 distinct, against the
   review's ghost-free 427,276 at the same bound.
-- `just check-fast` (CI toolchain, shared lock): run on this commit's tree; the result is recorded by the follow-up commit.
+- `just check-fast` (CI toolchain, shared lock, cargo target under
+  `$TMPDIR`): **pass** on the tree of `7738b6e`, 2026-10-04 01:47–01:58
+  after about 6 minutes queued for the lock. Every stage ran:
+  - the repo manifest, ruff, shellcheck and actionlint;
+  - gitleaks ("no leaks found");
+  - fmt, the three clippy runs and 20 cargo test results, all ok;
+  - the fault harness, the power-loss proofs and `resume-power-loss`;
+  - the 22 contract tests.
 
 ## Open
 
