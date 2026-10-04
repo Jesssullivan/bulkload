@@ -23,10 +23,11 @@ Shape. The corpus root models an agent's $HOME:
   git/mirrors/*.git          bare repositories, filled by a push.
   git/history-heavy/         the #48 repack shape: a long history much larger
                              than its checkout. assets/model.bin gets a new
-                             incompressible revision every 4th commit, kept
-                             out of delta search, across four packs plus
-                             loose objects (estate: 600 commits, 9 MiB
-                             revisions; small: 40 commits, 512 KiB).
+                             revision every 4th commit; each rewrites about a
+                             tenth of the previous one, so pack-objects pays
+                             a real delta search. Four packs plus loose
+                             objects (estate: 600 commits, 9 MiB revisions;
+                             small: 40 commits, 512 KiB).
   In the main checkouts: real stashes (one with untracked files), a dirty
   index (a staged edit with an unstaged edit on top, a staged new file and an
   intent-to-add entry), unstaged edits, untracked files, ignored build
@@ -72,9 +73,17 @@ sample hooks do not enter the corpus. They use --object-format=sha1 and
 --ref-format=files (git >= 2.45). Their .git/config is rewritten to the text
 Linux `git init` writes, so macOS's ignorecase and precomposeunicode lines do
 not enter the identity. The corpus repositories have only `.sample` hooks.
-Nothing sets core.hooksPath, and nothing passes --no-verify. Every
-subcommand sets umask 022 first, so the modes git and mkdir choose never
-depend on the caller.
+Nothing sets core.hooksPath, and nothing passes --no-verify.
+The caller does not change the identity:
+  - the script re-runs itself in Python's UTF-8 mode, so path names and
+    MANIFEST.tsv are UTF-8 whatever the locale (an ISO-8859-1 locale gave
+    another identity, and generate could not create the non-ASCII names);
+  - every subcommand sets umask 022; DEST and corpus/ get explicit modes,
+    which drop a setgid bit inherited from DEST's parent, and
+    `canonical_modes` clears setuid, setgid, sticky and group or other write
+    below them after the build and after each mutation round;
+  - generate refuses a DEST parent with a default POSIX ACL, which would
+    replace the umask (and add ACL entries the manifest does not cover).
 Mtimes are left as git and the filesystem set them (so no index is racily
 clean); they are not part of the identity.
 
@@ -94,20 +103,25 @@ identities measured with the devShell toolchain. When the toolchain matches,
 Three kinds of file hold bytes that are not a function of the seed, and are
 normalised explicitly:
   git-index  every `index` file of a git directory (a main checkout's and
-             each linked worktree's). Each entry's stat words (ctime, mtime,
-             dev, ino, uid, gid and size) are zeroed, and the trailing
-             checksum, which covers them, is dropped. Mode, object id, flags,
-             path and the extensions (TREE) stay. An index with a
-             stat-bearing extension (UNTR, FSMN or link) is a problem. The
-             size column is the real size, because entries are fixed width.
+             each linked worktree's). The trailing SHA-1 is checked first
+             (index.skipHash is pinned false; a corrupt one, which `git fsck`
+             refuses, is a problem). Then each entry's stat words (ctime,
+             mtime, dev, ino, uid, gid and size) are zeroed and the checksum
+             dropped. Mode, object id, flags, path and the extensions (TREE)
+             stay. An index with a stat-bearing extension (UNTR, FSMN or link)
+             is a problem. The size column is the real size.
   root       a linked worktree's `.git` file and its administration's `gitdir`
              hold absolute paths. Bulkload's carry resolves them absolutely,
              so relative worktrees are not used. The corpus root recorded in
              SEAL.json is replaced by @CORPUS_ROOT@ before hashing, and the
-             size column is the normalised size. Any other file that
-             contains the root is a problem (see Host paths).
+             size column is the normalised size. A file that already holds
+             the token, or any other file that contains the root, is a
+             problem (see Host paths).
   raw        everything else, including loose objects, packs, .idx, .rev,
              commit-graph, packed-refs, reflogs and the SQLite files.
+The identity is blind to writes that keep those rows: an index refreshed
+under index.lock, a rewrite with the same bytes, a touch. `verify` ok is not
+"no write"; `s2-snapshot` and `s2-diff` see those (S2, below).
 SQLite DELETE-mode files are stable for one SQLite version; the header
 records the writer's version.
 The WAL crash image is a main database plus its -wal, copied while the
@@ -119,45 +133,57 @@ writing connection was still open:
   - no -shm is written; it is a lock and index cache that the first opener
     rebuilds.
 Any WAL-aware opener, read-only included (as provider_sqlite's backup opens
-it), creates <db>-shm beside the image. A -shm beside a SQLite database is
-SQLite's wal-index: a lock and index cache that bulkload never carries. It is
-therefore set aside, never sealed. `verify` and the counts report it
-(shm_ignored, sqlite_shm_ignored), so a first measurement pass does not stop
-the next `mutate` (OI-1003-Q35), and an S2 harness still sees the write.
+it), creates <db>-shm beside the image. On an unsealed copy that file is set
+aside, never sealed, but only when it is exactly the wal-index of the WAL
+database beside it (`wal_index_problem`: header bytes 18-19 mark WAL, and
+size, header, salts, frame count and page and hash tables are those SQLite
+rebuilds from the -wal; only the 40-byte reader marks are free). `verify`
+and the counts report it (shm_ignored, sqlite_shm_ignored), so a first
+measurement pass does not stop the next `mutate` (OI-1003-Q35). Any other
+-shm beside a database, and every -shm in a sealed copy, is an added entry
+and a problem.
 
 Host paths. Every manifest pass (generate, verify, mutate, seal) scans every
-regular file up to 64 MiB and every symlink target for the generating host's
-absolute paths: the corpus root, DEST, $HOME (as given and resolved), the
-generator's checkout, the temp directory and the git scratch prefix. Markers
-shorter than 8 bytes (a bare /tmp) are skipped, since they would match
-generated text by chance. The only exception is the documented one: the
-`root` files above are scanned after the root is replaced by @CORPUS_ROOT@.
-A hit is a problem, so generate and verify fail. Larger files are counted
-(host_scan_skipped) but not scanned, and compressed bytes (git objects, packs,
-.zst) are scanned as stored. Generated text names a modelled home,
-/home/agent, so a host whose $HOME is /home/agent fails the scan.
+regular file up to 64 MiB and every symlink target for host paths taken from
+the running process: the corpus root, DEST, $HOME (as given and resolved),
+the generator's checkout, the temp directory and the git scratch prefix.
+Markers shorter than 8 bytes (a bare /tmp) are skipped, since they would
+match generated text by chance. The only exception is the documented one:
+the `root` files above are scanned after the root is replaced by
+@CORPUS_ROOT@. A hit is a problem, so generate and verify fail. Larger files
+are counted (host_scan_skipped) but not scanned, and compressed bytes (git
+objects, packs, .zst) are scanned as stored. Generated text names a modelled
+home, /home/agent, so a host whose $HOME is /home/agent fails the scan.
 
 Classes. SEAL.json counts["classes"] partitions the manifest's entries into
 estate classes (`entry_class`): git-admin, git-checkout, git-worktree,
 git-history, sqlite, agents, credentials, node-modules, projects, cache,
 large-data, dotfiles and edge, each with entries, dirs, files, symlinks and
-bytes.
+bytes. Report S1 and S3 per class: large-data and git-history hold most of
+the bytes in a few files.
 
 Seal (`seal DEST`). It runs only in place, on a DEST that verifies and holds
 no SQLite -shm. It sets every file to 0444 (0555 if it has an execute bit)
-and every directory to 0555, including DEST, and records:
+and every directory to 0555, including DEST and corpus/, and records:
   - readonly_identity: the identity of the read-only view of MANIFEST.tsv
     (the same rows, with the mode column mapped as above);
   - VERIFY-RECEIPT.json: the verify of the sealed tree, with both identities.
 From then on, `verify` checks the receipt. It requires the read-only view
-identity, read-only modes, the original identity in MANIFEST.tsv, and no
-mutation round after the seal. A sealed copy cannot be changed without an
-explicit chmod, and after any change, mutate included, verify fails.
+identity, read-only modes (DEST, corpus/ and every entry), the original
+identity in MANIFEST.tsv, and no mutation round after the seal, and it
+exempts no -shm. mutate refuses a sealed DEST. A sealed copy cannot be
+changed without an explicit chmod, and after any change verify fails. The
+receipt and SEAL.json are not signed: a writer who also rewrites them is not
+detected.
 
 Not modelled:
   - hardlinks, holes (sparse files), xattrs and ACLs;
   - FIFOs, sockets and devices (bulkload refuses non-regular seats);
-  - names with control or format characters (PATH_NOT_PORTABLE).
+  - names with control or format characters (PATH_NOT_PORTABLE);
+  - the git states bulkload refuses or records as custody beyond one clean
+    nest (shallow, gitlinks, merges in progress, skip-worktree, dirty nests,
+    locked or prunable worktrees, repositories outside git/); see the
+    evidence doc for each and its effect on S1, S3 and S4.
 Case-colliding and NFD names are avoided, so the tree is legal on APFS.
 
 Cross-host. The identity is stable for one toolchain: git (pack layout), its
@@ -168,32 +194,55 @@ still accepts a moved copy (it normalises with the recorded root) and reports
 relocated=1, but git must never be run in such a copy.
 
 Mutation (the S3 knob, `--mutate N`, spelled `mutate DEST N`). Round r is the
-number of mutations so far, plus one. N operations cycle through, in a
-seed-shuffled order with seed-chosen targets:
+number of mutations so far, plus one; its stream and git clock are fixed by
+(seed, scale, r). The first three operations are always, in order:
+  history    a commit on git/history-heavy's checked-out `main` (#48: the
+             large history's authority moves every round);
+  sqlite     INSERT and UPDATE in a DELETE-mode store, then a WAL-mode commit
+             appended to the WAL image (no checkpoint; storage.db untouched);
+  large-edit a 64-byte overwrite at a seed-chosen offset of a file of at
+             least 64 MiB (1 MiB at scale small): data/ or a model.bin.
+The rest cycle through the other kinds in a seed-shuffled order:
   edit       overwrite 64 bytes in place;
   append     append a JSONL line;
   new        create a file;
-  delete     remove a file;
-  commit     a new commit on a repository's unmerged `side` branch, through
+  delete     remove a file of at most 1 MiB;
+  commit     a commit on a repository's unmerged `side` branch, through
              plumbing (side is checked out nowhere);
-  head-move  `checkout --detach` in a detached worktree.
-It writes DEST/mutations/round-RRRR.json with:
-  - the operations, and the identity before and after;
-  - the exact manifest difference: added, removed and modified;
-  - stat_only: the same manifest row with a new inode, size, mtime or ctime,
-    such as a rewritten index or a directory whose listing changed;
-  - reads_allowed: the regular files among added, modified and stat_only. An
-    S3 rerun may read those files and nothing else;
-  - reads_allowed_sizes and reads_allowed_bytes: their sizes and the total,
-    the bound for source_bytes_read (S3 delta, OI-1003-Q18);
-  - changed_content_bytes: the total size of added and modified files;
-  - repos_changed: each repository touched, with its worktrees and its bare
-    mirror, plus the count of those paths inside git directories;
-  - repos_unchanged: the count of the rest. These give the expectation for
-    census_walks and pack bytes (OI-1003-Q35).
-SEAL.json and MANIFEST.tsv then move to the new identity. Rounds are
-deterministic, so one round gives the same sidecar on every build measured
-(OI-1003-Q35). mutate refuses a sealed DEST while it is read-only.
+  head-move  `checkout --detach` in a detached worktree;
+  repack     `repack -a -d`: the same objects consolidated into a new pack;
+  fetch      a new upstream commit stored as a new pack (pack-objects and
+             index-pack, as fetch does) and refs/remotes/upstream/main moved.
+So N >= 11 runs every kind. mutate refuses up front when the pools cannot
+serve N. It writes DEST/mutations/round-RRRR.before.tsv (the pre-round
+manifest) and DEST/mutations/round-RRRR.json with:
+  - the operations: per file operation its pre-size, post-size and changed
+    byte ranges; per ref move the old and new tips;
+  - the identity before and after, and the exact manifest difference;
+  - stat_only: the same manifest row with a new inode, size, mtime or ctime;
+  - reads_allowed: the regular files among added, modified and stat_only,
+    with sizes and their total (S3 inequality 1, OI-1003-Q18), and
+    reads_by_class: walk, worktree (per item), rebuildable, git-objects and
+    git-admin, each with files and bytes;
+  - changed_range_bytes, the bytes the operations changed (the input to the
+    wire bound, inequality 2, with bulkload's CDC sizes in cdc_bytes), and
+    changed_content_bytes, the whole sizes of added and modified files;
+  - items: bulkload's estate items (one per checkout, nest and mirror), the
+    ones whose capture key changed (`attribute`), and census_walks_expected
+    (4 per changed item, 1 per reuse; a bare mirror is refused, none);
+  - git_objects per repository: loose objects and packs added and removed,
+    and each ref move's new objects with their sizes;
+  - timing: mutated_at_ns and settle_ns. Wait until mutated_at_ns +
+    settle_ns before a measured pass, or seats are racy (R-N76). timing is
+    the only field that differs between two runs of a round.
+SEAL.json and MANIFEST.tsv then move to the new identity. If a problem shows
+after the operations (a host path, say), they do not move, and the corpus no
+longer verifies: regenerate it.
+
+S2. `s2-snapshot DEST OUT` records every entry's path, type, mode, inode,
+size, mtime and ctime (the corpus root and any -shm included) to OUT outside
+the corpus. `s2-diff DEST SNAPSHOT` lists every entry added, removed or
+changed since, and exits 0 only if there is none.
 
 Usage:
   estate_corpus.py generate DEST [--seed S] [--scale small|estate]
@@ -203,6 +252,8 @@ Usage:
   estate_corpus.py manifest CORPUS [--root R]
   estate_corpus.py mutate DEST N     apply N deterministic changes (S3)
   estate_corpus.py seal DEST         make DEST read-only and write its receipt
+  estate_corpus.py s2-snapshot DEST OUT    record every entry's stat
+  estate_corpus.py s2-diff DEST SNAPSHOT   list every stat change since
   estate_corpus.py selftest          optional-tier round trip at scale small
 """
 
@@ -223,7 +274,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # no __pycache__ beside the scripts
@@ -246,8 +297,44 @@ MANIFEST_HEADER = (
     "# bulkload-estate-corpus manifest v1\t"
     "path\ttype\tmode\tsize\tshake256\ttarget\tnorm\n"
 )
-KINDS = ("edit", "append", "new", "delete", "commit", "head-move")
+KINDS = (
+    "history", "sqlite", "large-edit", "edit", "append", "new", "delete",
+    "commit", "head-move", "repack", "fetch",
+)  # fmt: skip
+# Every round runs these first, in this order, so a round of N >= 3 always
+# moves history-heavy's checked-out branch, changes SQLite stores and
+# overwrites part of a large file (OI-1003-Q35 S3).
+GUARANTEED = ("history", "sqlite", "large-edit")
 UMASK = 0o022
+SPECIAL_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+MODEL_BLOCK = 4 * KIB  # each model.bin revision rewrites about 1 in 10 blocks
+UTF8_MARK = "ESTATE_CORPUS_UTF8"
+# bulkload-agent behaviour this script models, as of origin/main 46587af:
+# git_carry.rs REBUILDABLE_DIRECTORIES (default CapturePolicy custody),
+# RACY_GRANULARITY_NS (#86, R-N76), hash.rs CDC_MIN/AVG/MAX_BYTES, and the
+# census walks per item that tests/git_capture_counters.rs asserts (#144).
+REBUILDABLE = (
+    "target", "node_modules", ".venv", "venv", "__pycache__", ".direnv",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", ".next",
+    ".turbo", ".parcel-cache", ".swc", ".terraform",
+)  # fmt: skip
+RACY_SETTLE_NS = 2_000_000_000
+CDC_BYTES = (16 * KIB, 64 * KIB, 256 * KIB)
+CENSUS_WALKS_CHANGED = 4
+CENSUS_WALKS_REUSED = 1
+# SQLite's wal-index (-shm) layout, wal.c: 32 KiB regions; region 0 opens
+# with two 48-byte WalIndexHdr copies and the 40-byte WalCkptInfo.
+WALINDEX_PGSZ = 32 * KIB
+WALINDEX_HDR = 136
+HASH_NPAGE = 4096
+HASH_NPAGE_ONE = HASH_NPAGE - WALINDEX_HDR // 4
+HASH_NSLOT = 8192
+WALINDEX_VERSION = 3007000
+S2_HEADER = (
+    "# bulkload-estate-corpus s2-snapshot v1\t"
+    "path\ttype\tmode\tino\tsize\tmtime_ns\tctime_ns\n"
+)
+S2_FIELDS = ("path", "type", "mode", "ino", "size", "mtime_ns", "ctime_ns")
 HISTORY_REPO = "git/history-heavy"
 RECEIPT = "VERIFY-RECEIPT.json"
 RECEIPT_FORMAT = "bulkload-estate-corpus-verify-receipt-v1"
@@ -275,11 +362,11 @@ DEVSHELL_TOOLS = {
 }
 RECORDED: dict[tuple[str, str], tuple[str, dict[str, str]]] = {
     ("small", "bulkload-estate-corpus-v1"): (
-        "931af5b130fe601f385a06fa68f85c1f2830f32458787912134b579f01d4572b",
+        "c767aa685c670abc2d406de3c300b4e1118db8581a941de42ceee7808f98aa69",
         DEVSHELL_TOOLS,
     ),
     ("estate", "bulkload-estate-corpus-v1"): (
-        "0cb96231438c8cd721460276146c8447100951b7ebaeff0eadfe7efa8a3b60bf",
+        "586de100483a317afda3b6013ddf0a35c3e3424f57de871a328535bd3d507a93",
         DEVSHELL_TOOLS,
     ),
 }
@@ -308,6 +395,8 @@ class Scale:
     # The #48 repack shape: (commits, source files, a new model.bin revision
     # every N commits, bytes per revision).
     history: tuple[int, int, int, int]
+    # The smallest file a `large-edit` mutation overwrites.
+    large_edit_min: int
 
 
 SCALES = {
@@ -331,6 +420,7 @@ SCALES = {
         sqlite_dbs=3,
         sqlite_rows=(300, 900),
         history=(40, 60, 4, 512 * KIB),
+        large_edit_min=MIB,
     ),
     "estate": Scale(
         repos=24,
@@ -354,6 +444,7 @@ SCALES = {
         sqlite_dbs=10,
         sqlite_rows=(2_000, 60_000),
         history=(600, 1_500, 4, 9 * MIB),
+        large_edit_min=64 * MIB,
     ),
 }
 
@@ -626,6 +717,38 @@ def link(path: Path, target: str) -> None:
     os.symlink(target, path)
 
 
+def default_acl(path: Path) -> bool:
+    """Whether `path` holds a default POSIX ACL (Linux), which replaces the
+    umask for every entry created below it."""
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:  # macOS: inherited ACL entries never change mode bits
+        return False
+    try:
+        getxattr(path, "system.posix_acl_default")
+    except OSError:
+        return False
+    return True
+
+
+def canonical_modes(corpus: Path) -> int:
+    """Clear setuid, setgid, sticky and group or other write below `corpus`.
+
+    umask 022 alone does not fix modes: a setgid DEST parent passes S_ISGID to
+    every new directory. No corpus entry ever carries those bits, so this is
+    a no-op on a normal build and makes the modes a function of the seed
+    alone otherwise. Returns how many entries it changed.
+    """
+    changed = 0
+    for rel, info in walk(corpus):
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & (SPECIAL_BITS | 0o022):
+            os.chmod(corpus / rel, mode & ~(SPECIAL_BITS | 0o022))
+            changed += 1
+    return changed
+
+
 # ---- git ---------------------------------------------------------------------
 
 
@@ -641,7 +764,7 @@ class Git:
         for hook in ("pre-commit.sample", "commit-msg.sample"):
             put(self.template / "hooks" / hook, SAMPLE_HOOK, 0o755)
         config = scratch / "gitconfig"
-        config.write_text(GLOBAL_CONFIG)
+        config.write_text(GLOBAL_CONFIG, encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(
             HOME=str(home),
@@ -869,7 +992,7 @@ def build_repo(g: Git, corpus: Path, base: str, scale: Scale, i: int) -> dict:
         edit_lines(corpus / wrel / det.choice(tracked), det, f"{label}/agent")
         worktrees.append({"kind": "agent", "path": wrel, "branch": f"agent/{aid}"})
     for wt in worktrees:
-        gitfile = (corpus / wt["path"] / ".git").read_text().strip()
+        gitfile = (corpus / wt["path"] / ".git").read_text(encoding="utf-8").strip()
         wt["admin"] = f"{rel}/.git/worktrees/{gitfile.rsplit('/', 1)[-1]}"
     repo["worktrees"] = worktrees
     if feat["dirty"]:
@@ -909,23 +1032,41 @@ def build_repo(g: Git, corpus: Path, base: str, scale: Scale, i: int) -> dict:
     return repo
 
 
+def model_revision(label: str, previous: bytes | None, size: int, r: int) -> bytes:
+    """Revision `r` of a model file, as a checkpoint series changes.
+
+    Revision 0 is incompressible. Each later one rewrites about one 4 KiB
+    block in ten of the previous revision (at least one), so pack-objects
+    finds a delta against it and its CPU cost is a real delta search.
+    """
+    if previous is None:
+        return b"".join(stream(f"{label}/0", size))
+    det = Det(f"{label}/{r}")
+    out = bytearray(previous)
+    blocks = [b for b in range(0, size, MODEL_BLOCK) if det.chance(10)]
+    for start in blocks or [det.below(size // MODEL_BLOCK) * MODEL_BLOCK]:
+        end = min(start + MODEL_BLOCK, size)
+        out[start:end] = shake(f"{label}/{r}/{start}", end - start)
+    return bytes(out)
+
+
 def build_history(g: Git, corpus: Path, base: str, scale: Scale) -> dict:
     """The #48 repack shape: a long history much larger than its checkout.
 
-    model.bin gets a fresh incompressible revision every `every` commits (one
-    binary path rewritten in place, so history holds every revision), and a
-    few source files change in every commit. `*.bin -delta` keeps repack from
-    searching deltas across the revisions. Incremental `repack -d` at 1/4,
-    2/4, 3/4 and 19/20 of the history leaves four packs plus loose objects
-    for the newest commits, as on a live machine between gcs. Tags every 50
-    commits and an unmerged `side` branch go to packed-refs.
+    model.bin gets a new revision every `every` commits (one binary path
+    rewritten in place, so history holds every revision), and a few source
+    files change in every commit. Each revision rewrites about a tenth of the
+    previous one (`model_revision`) and no attribute disables delta search,
+    so repack and a bundle of this history pay a real delta search. Incremental
+    `repack -d` at 1/4, 2/4, 3/4 and 19/20 of the history leaves four packs
+    plus loose objects for the newest commits, as on a live machine between
+    gcs. Tags every 50 commits and an unmerged `side` branch go to packed-refs.
     """
     commits, nfiles, every, revision_bytes = scale.history
     det = Det(f"{base}/history")
     label = f"{base}/{HISTORY_REPO}"
     path = corpus / HISTORY_REPO
     g.init(path)
-    put(path / ".gitattributes", b"*.bin -delta\n")
     put(path / ".gitignore", GITIGNORE)
     put(path / "README.md", b"# history-heavy\n\n" + source_text(f"{label}/r", 20))
     modules = max(1, nfiles // 40)
@@ -937,9 +1078,10 @@ def build_history(g: Git, corpus: Path, base: str, scale: Scale) -> dict:
         tracked.append(rel_file)
     repack_at = {commits * q // 4 for q in (1, 2, 3)} | {commits * 19 // 20}
     revisions = 0
+    model: bytes | None = None
     for c in range(commits):
         if c % every == 0:
-            model = stream(f"{label}/model/{revisions}", revision_bytes)
+            model = model_revision(f"{label}/model", model, revision_bytes, revisions)
             put(path / "assets/model.bin", model)
             revisions += 1
         if c:
@@ -957,7 +1099,7 @@ def build_history(g: Git, corpus: Path, base: str, scale: Scale) -> dict:
         "name": "history-heavy",
         "path": HISTORY_REPO,
         "lang": "rs",
-        "features": {"pack": "multi-pack", "history": True},
+        "features": {"pack": "multi-pack", "history": True, "delta_revisions": True},
         "files": nfiles,
         "worktrees": [],
         "stashes": 0,
@@ -1347,30 +1489,142 @@ def walk(corpus: Path) -> list[tuple[str, os.stat_result]]:
     return out
 
 
-def is_wal_index(corpus: Path, rel: str) -> bool:
-    """A SQLite `-shm` beside its database: a reader's lock and index cache."""
-    if not rel.endswith("-shm"):
-        return False
+def read_head(path: Path, size: int) -> bytes:
     try:
-        with (corpus / rel[:-4]).open("rb") as handle:
-            return handle.read(16) == SQLITE_MAGIC
+        with path.open("rb") as handle:
+            return handle.read(size)
     except OSError:
-        return False
+        return b""
+
+
+def beside_sqlite(corpus: Path, rel: str) -> bool:
+    """Whether `rel` is a `<db>-shm` with a SQLite database `<db>` beside it."""
+    return rel.endswith("-shm") and read_head(corpus / rel[:-4], 16) == SQLITE_MAGIC
+
+
+def wal_frames(wal: bytes) -> tuple[list[int], dict]:
+    """The page numbers of a WAL's valid frames, and the wal-index facts.
+
+    A frame is valid while its salts are the header's and its checksum
+    continues the chain (wal.c walDecodeFrame); the first invalid frame ends
+    the log. `commit` is (mxFrame, nPage, checksum) at the last commit frame.
+    """
+    facts: dict = {"commit": (0, 0, 0, 0), "big": False, "page": 0, "salts": b""}
+    if len(wal) < 32:
+        return [], facts
+    magic, _version, page, _seq, salt1, salt2, c1, c2 = struct.unpack(">8I", wal[:32])
+    big = bool(magic & 1)
+    s0, s1 = wal_checksum(wal[:24], big, 0, 0)
+    facts.update(big=big, page=page, salts=wal[16:24], commit=(0, 0, s0, s1))
+    if magic not in (0x377F0682, 0x377F0683) or (s0, s1) != (c1, c2) or page < 512:
+        return [], facts
+    frames: list[int] = []
+    pos = 32
+    while pos + 24 + page <= len(wal):
+        pgno, truncate, f1, f2, k1, k2 = struct.unpack_from(">6I", wal, pos)
+        if pgno == 0 or (f1, f2) != (salt1, salt2):
+            break
+        s0, s1 = wal_checksum(wal[pos : pos + 8], big, s0, s1)
+        s0, s1 = wal_checksum(wal[pos + 24 : pos + 24 + page], big, s0, s1)
+        if (s0, s1) != (k1, k2):
+            break
+        frames.append(pgno)
+        if truncate:
+            facts["commit"] = (len(frames), truncate, s0, s1)
+        pos += 24 + page
+    return frames, facts
+
+
+def wal_index_tables(frames: list[int], regions: int) -> bytes:
+    """Bytes [WALINDEX_HDR, end) of the wal-index of `frames` (wal.c
+    walIndexAppend): per region, the page number of each frame, then a hash
+    table of 1-based frame slots with linear probing."""
+    out = bytearray(regions * WALINDEX_PGSZ)
+    for frame, pgno in enumerate(frames, 1):
+        region = (frame + HASH_NPAGE - HASH_NPAGE_ONE - 1) // HASH_NPAGE
+        zero = 0 if region == 0 else HASH_NPAGE_ONE + (region - 1) * HASH_NPAGE
+        slot = frame - zero
+        base = region * WALINDEX_PGSZ
+        first = base + (WALINDEX_HDR if region == 0 else 0)
+        struct.pack_into("=I", out, first + (slot - 1) * 4, pgno)
+        table = base + HASH_NPAGE * 4
+        key = (pgno * 383) & (HASH_NSLOT - 1)
+        while struct.unpack_from("=H", out, table + key * 2)[0]:
+            key = (key + 1) & (HASH_NSLOT - 1)
+        struct.pack_into("=H", out, table + key * 2, slot)
+    return bytes(out[WALINDEX_HDR:])
+
+
+def wal_index_problem(corpus: Path, rel: str) -> str | None:
+    """Why `rel` is not exactly the wal-index of the WAL database beside it.
+
+    The exemption is narrow. The database must be in WAL mode (header bytes
+    18 and 19 are 2), and the file must be the index a reader rebuilds from
+    the `-wal` beside it: its size the regions those frames need, both header
+    copies equal with a valid checksum, the WAL's salts, page size, frame
+    count and commit checksum, and page and hash tables exactly those of the
+    frames. Only WalCkptInfo, the readers' marks, is free (40 bytes).
+    """
+    head = read_head(corpus / rel[:-4], 20)
+    if head[:16] != SQLITE_MAGIC or head[18:20] != b"\x02\x02":
+        return "the database beside it is not in WAL mode"
+    path = corpus / rel
+    wal_path = corpus / (rel[:-4] + "-wal")
+    try:
+        size = os.lstat(path).st_size
+        wal_size = os.lstat(wal_path).st_size if os.path.lexists(wal_path) else 0
+        if wal_size > LEAK_SCAN_LIMIT or size > LEAK_SCAN_LIMIT:
+            return "larger than any wal-index this corpus can need"
+        frames, facts = wal_frames(wal_path.read_bytes() if wal_size else b"")
+        shm = path.read_bytes()
+    except OSError as err:
+        return f"unreadable: {err}"
+    regions = (len(frames) + HASH_NPAGE - HASH_NPAGE_ONE - 1) // HASH_NPAGE + 1
+    if len(shm) != regions * WALINDEX_PGSZ:
+        return f"size {len(shm)}, not the {regions} region(s) its WAL needs"
+    hdr = shm[:48]
+    version, _unused, _change, init, big, page = struct.unpack_from("=IIIBBH", hdr)
+    mx, npage, k0, k1 = struct.unpack_from("=IIII", hdr, 16)
+    page_code = (facts["page"] & 0xFF00) | (facts["page"] >> 16)
+    mx_want, npage_want, s0, s1 = facts["commit"]
+    # The header checksum reads native words (walChecksumBytes nativeCksum=1).
+    native = wal_checksum(hdr[:40], sys.byteorder == "big", 0, 0)
+    checks = (
+        hdr == shm[48:96],
+        version == WALINDEX_VERSION and init == 1 and big == int(facts["big"]),
+        (mx, npage) == (mx_want, npage_want),
+        not mx or (page, k0, k1) == (page_code, s0, s1),
+        not mx or hdr[32:40] == facts["salts"],
+        native == struct.unpack_from("=II", hdr, 40),
+        struct.unpack_from("=I", shm, 96)[0] <= mx,
+        shm[WALINDEX_HDR:] == wal_index_tables(frames, regions),
+    )
+    if not all(checks):
+        return "its header or tables are not those of the WAL beside it"
+    return None
 
 
 def sealed_walk(
-    corpus: Path,
+    corpus: Path, allow_shm: bool = True
 ) -> tuple[list[tuple[str, os.stat_result]], list[str]]:
-    """The walk minus SQLite wal-index files, and those files.
+    """The walk minus exempt SQLite wal-index files, and those files.
 
     Any WAL-aware opener creates <db>-shm, read-only included (bulkload's own
-    provider_sqlite backup does), and bulkload never carries -shm bytes. So a
-    -shm is reported, never sealed: a first measurement pass must not stop the
-    next `mutate` (OI-1003-Q35).
+    provider_sqlite backup does), and bulkload never carries -shm bytes. So
+    on an unsealed copy the exact wal-index of a WAL database
+    (`wal_index_problem`) is reported, never sealed: a first measurement pass
+    must not stop the next `mutate` (OI-1003-Q35). Every other file stays in
+    the walk, and so does every -shm once `allow_shm` is false (a sealed
+    copy, where no reader can create one).
     """
     kept, shm = [], []
     for rel, info in walk(corpus):
-        if stat.S_ISREG(info.st_mode) and is_wal_index(corpus, rel):
+        if (
+            allow_shm
+            and stat.S_ISREG(info.st_mode)
+            and beside_sqlite(corpus, rel)
+            and wal_index_problem(corpus, rel) is None
+        ):
             shm.append(rel)
         else:
             kept.append((rel, info))
@@ -1378,9 +1632,16 @@ def sealed_walk(
 
 
 def index_logical(data: bytes) -> bytes:
-    """A git index without its stat words and trailing checksum."""
+    """A git index without its stat words and trailing checksum.
+
+    The checksum is checked first: index.skipHash is pinned false, so the
+    trailer is the SHA-1 of everything before it, and a corrupt one (which
+    `git fsck` refuses) is a problem, not a normalised difference.
+    """
     if data[:4] != b"DIRC":
         raise CorpusError("not a DIRC index")
+    if len(data) < 32 or hashlib.sha1(data[:-20]).digest() != data[-20:]:
+        raise CorpusError("index checksum does not match its contents")
     version, count = struct.unpack(">II", data[4:12])
     if version not in (2, 3):
         raise CorpusError(f"index version {version}")
@@ -1505,14 +1766,19 @@ def digest_file(path: Path) -> tuple[int, str, bytes]:
     return size, h.hexdigest(32), head
 
 
-def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict]:
+def manifest(
+    corpus: Path, root: str, allow_shm: bool = True
+) -> tuple[str, list[str], dict]:
     """The canonical manifest of `corpus`, its problems and its counts.
 
     Every regular file up to LEAK_SCAN_LIMIT, and every symlink target, is
     scanned for host paths (`host_markers`, the corpus root first). A
     root-normalised file is scanned after the root is replaced, which is the
-    one documented exception. A hit is a problem. counts["classes"] holds
-    per-class entries, dirs, files, symlinks and bytes (`entry_class`).
+    one documented exception; one that already holds the token is a problem.
+    A hit is a problem. A `-shm` beside a SQLite database that is not exempt
+    (`sealed_walk`; never on a sealed copy, `allow_shm` false) stays in the
+    manifest and is a problem. counts["classes"] holds per-class entries,
+    dirs, files, symlinks and bytes (`entry_class`).
     """
     root_bytes = os.fsencode(root)
     markers = host_markers(root)
@@ -1555,8 +1821,12 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict]:
         ),
         0,
     )
-    entries, shm = sealed_walk(corpus)
+    entries, shm = sealed_walk(corpus, allow_shm)
     counts["sqlite_shm_ignored"] = len(shm)
+    for rel, info in entries:
+        if stat.S_ISREG(info.st_mode) and beside_sqlite(corpus, rel):
+            why = wal_index_problem(corpus, rel) if allow_shm else "a sealed copy"
+            problems.append(f"SQLite -shm {esc(rel)} is not exempt: {why}")
     children: dict[str, int] = {}
     for rel, _info in entries:
         parent = rel.rpartition("/")[0]
@@ -1599,6 +1869,10 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict]:
                 head = data[:16]
                 size = len(data)
                 if norm == "root":
+                    if ROOT_TOKEN in data:
+                        problems.append(
+                            f"{esc(rel)} already holds {ROOT_TOKEN.decode()}"
+                        )
                     data = data.replace(root_bytes, ROOT_TOKEN)
                     size = len(data)
                     counts["gitfiles"] += parts[-1] == ".git"
@@ -1711,7 +1985,9 @@ def recorded_identity(scale: str, seed: str, tools: dict) -> str | None:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def readme(seal: dict) -> str:
@@ -1748,6 +2024,12 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
             f"estate-corpus refused: DEST must be new under an existing parent: {dest}"
         )
         return 2, None
+    if default_acl(dest.parent):
+        print(
+            "estate-corpus refused: DEST's parent has a default ACL, which "
+            f"overrides umask 022 for every corpus entry: {dest.parent}"
+        )
+        return 2, None
     tools = toolchain()
     if git_version(tools["git"]) < MIN_GIT:
         print(f"estate-corpus refused: git >= 2.45 required, found {tools['git']}")
@@ -1755,9 +2037,10 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
     started = time.monotonic()
     scale = SCALES[scale_name]
     base = f"{seed}/{scale_name}"
-    dest.mkdir()
     corpus = dest / "corpus"
-    corpus.mkdir()
+    for top in (dest, corpus):
+        top.mkdir()
+        top.chmod(0o755)  # an explicit mode drops a setgid bit from the parent
     root = os.path.realpath(corpus)
     notes: list[str] = []
     repos = []
@@ -1772,6 +2055,11 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
         for i in range(scale.repos):
             repos.append(build_repo(g, Path(root), base, scale, i))
         repos.append(build_history(g, Path(root), base, scale))
+    fixed = canonical_modes(Path(root))
+    if fixed:
+        notes.append(
+            f"canonical_modes cleared special or group/other write bits on {fixed}"
+        )
     text, problems, counts = manifest(Path(root), root)
     identity = identity_of(text)
     recorded = recorded_identity(scale_name, seed, tools)
@@ -1793,9 +2081,9 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
         "generator_shake256": hashlib.shake_256(HERE.read_bytes()).hexdigest(32),
         "mutations": [],
     }
-    (dest / "MANIFEST.tsv").write_text(text)
+    (dest / "MANIFEST.tsv").write_text(text, encoding="utf-8")
     write_json(dest / "SEAL.json", seal)
-    (dest / "README.md").write_text(readme(seal))
+    (dest / "README.md").write_text(readme(seal), encoding="utf-8")
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
     print(
@@ -1810,7 +2098,7 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
 
 def load_json(path: Path) -> dict | None:
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -1849,12 +2137,13 @@ def readonly_view(text: str) -> str:
 def writable_count(dest: Path, text: str) -> int:
     """Entries of a sealed DEST that are not at their read-only mode.
 
-    Corpus entries come from the manifest `text`; DEST itself, its top-level
-    files and the mutation sidecars must have no write bit.
+    Corpus entries come from the manifest `text`; DEST itself, the corpus
+    root, DEST's top-level files and the mutation sidecars must have no write
+    bit.
     """
     view = readonly_view(text)
     count = sum(a != b for a, b in zip(text.split("\n"), view.split("\n")))
-    paths = [dest]
+    paths = [dest, dest / "corpus"]
     with os.scandir(dest) as top:
         for entry in top:
             if entry.name == "corpus":
@@ -1872,15 +2161,16 @@ def verify(dest: Path) -> int:
     if seal is None or not corpus.is_dir():
         print(f"estate-corpus verify dest={dest} missing=1 ok=False")
         return 1
-    text, problems, counts = manifest(corpus, seal["root"])
+    sealed = is_sealed(dest, seal)
+    # No reader can create a -shm in a sealed (0555) copy, so none is exempt.
+    text, problems, counts = manifest(corpus, seal["root"], allow_shm=not sealed)
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
     if counts["sqlite_shm_ignored"]:
         for rel in sealed_walk(corpus)[1]:
             print(f"estate-corpus note: unsealed SQLite wal-index {esc(rel)}")
     path = dest / "MANIFEST.tsv"
-    recorded = path.read_text() if path.is_file() else None
-    sealed = is_sealed(dest, seal)
+    recorded = path.read_text(encoding="utf-8") if path.is_file() else None
     if sealed:
         receipt = load_json(dest / RECEIPT) or {}
         expected = receipt.get("readonly_identity")
@@ -1941,7 +2231,7 @@ def seal_dest(dest: Path) -> int:
         print("estate-corpus refused: a SQLite wal-index (-shm) is present")
         return 2
     path = dest / "MANIFEST.tsv"
-    recorded = path.read_text() if path.is_file() else None
+    recorded = path.read_text(encoding="utf-8") if path.is_file() else None
     if problems or text != recorded or identity_of(text) != seal["identity"]:
         for problem in problems:
             print(f"estate-corpus problem: {problem}")
@@ -1955,7 +2245,7 @@ def seal_dest(dest: Path) -> int:
             mode = readonly_mode(kind, f"{info.st_mode & 0o7777:04o}")
             os.chmod(corpus / rel, int(mode, 8))
     corpus.chmod(0o555)
-    sealed_text, problems, counts = manifest(corpus, root)
+    sealed_text, problems, counts = manifest(corpus, root, allow_shm=False)
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
     if problems or sealed_text != view:
@@ -1997,7 +2287,7 @@ def seal_dest(dest: Path) -> int:
     }
     write_json(dest / "SEAL.json", seal)
     write_json(dest / RECEIPT, receipt)
-    (dest / "README.md").write_text(readme(seal))
+    (dest / "README.md").write_text(readme(seal), encoding="utf-8")
     for dirpath, dirnames, filenames in os.walk(dest):
         if Path(dirpath) == dest:
             dirnames[:] = [d for d in dirnames if d != "corpus"]
@@ -2013,6 +2303,81 @@ def seal_dest(dest: Path) -> int:
     return 0
 
 
+# ---- S2 stat snapshot ----------------------------------------------------------------
+
+
+def s2_rows(corpus: Path) -> dict[str, list[str]]:
+    """Every entry's stat identity: the corpus root (`.`) and any -shm included."""
+    rows = {}
+    for rel, info in [(".", os.lstat(corpus)), *walk(corpus)]:
+        mode = info.st_mode
+        kind = (
+            "d" if stat.S_ISDIR(mode)
+            else "l" if stat.S_ISLNK(mode)
+            else "f" if stat.S_ISREG(mode)
+            else "o"
+        )  # fmt: skip
+        fields = [
+            esc(rel), kind, f"{stat.S_IMODE(mode):04o}", str(info.st_ino),
+            str(info.st_size), str(info.st_mtime_ns), str(info.st_ctime_ns),
+        ]  # fmt: skip
+        rows[fields[0]] = fields
+    return rows
+
+
+def s2_snapshot(dest: Path, out: Path) -> int:
+    """Record every entry's stat identity before a measured pass (S2)."""
+    corpus = dest / "corpus"
+    real = os.path.realpath(corpus)
+    target = os.path.realpath(out)
+    if not corpus.is_dir() or out.exists() or (target + "/").startswith(real + "/"):
+        print(
+            "estate-corpus refused: s2-snapshot needs DEST/corpus and a new OUT "
+            f"outside it: {dest} {out}"
+        )
+        return 2
+    rows = s2_rows(corpus)
+    lines = "".join("\t".join(row) + "\n" for row in rows.values())
+    out.write_text(S2_HEADER + lines, encoding="utf-8")
+    print(f"estate-corpus s2-snapshot dest={dest} entries={len(rows)} out={out}")
+    return 0
+
+
+def s2_diff(dest: Path, snapshot: Path) -> int:
+    """Every stat change since `snapshot`; exit 0 only if there is none.
+
+    `verify` cannot see a write that leaves the manifest as it was: an index
+    refreshed under index.lock, a rewrite with the same bytes, a touch, or a
+    -shm. This sees each of them, and nothing a read changes (atime is not
+    recorded).
+    """
+    corpus = dest / "corpus"
+    try:
+        text = snapshot.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if not text.startswith(S2_HEADER) or not corpus.is_dir():
+        print(
+            f"estate-corpus refused: s2-diff needs DEST/corpus and a snapshot: {dest}"
+        )
+        return 2
+    before = rows_of(text)
+    after = s2_rows(corpus)
+    added, removed, modified = diff_rows(before, after)
+    for sign, paths in (("+", added), ("-", removed)):
+        for rel in paths:
+            print(f"estate-corpus s2: {sign} {rel}")
+    for rel in modified:
+        moved = [n for n, a, b in zip(S2_FIELDS, before[rel], after[rel]) if a != b]
+        print(f"estate-corpus s2: ~ {rel} {','.join(moved)}")
+    ok = not (added or removed or modified)
+    print(
+        f"estate-corpus s2-diff dest={dest} added={len(added)} removed={len(removed)} "
+        f"changed={len(modified)} ok={ok}"
+    )
+    return 0 if ok else 1
+
+
 # ---- mutation (the S3 knob) ---------------------------------------------------------
 
 
@@ -2020,22 +2385,629 @@ def stat_key(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode)
 
 
+def estate_items(seal: dict) -> list[dict]:
+    """bulkload's estate items in this corpus: one per checkout (R-N114).
+
+    The main checkout, each linked worktree (branch, detached and agent),
+    each nested repository and each bare mirror is its own item. `repo` names
+    the repository whose refs the item shares, `admin` its git directory.
+    """
+    items = []
+    for repo in seal["repos"]:
+        rel = repo["path"]
+        items.append({"item": rel, "kind": "main", "repo": rel, "admin": f"{rel}/.git"})
+        for wt in repo["worktrees"]:
+            items.append(
+                {
+                    "item": wt["path"],
+                    "kind": wt["kind"],
+                    "repo": rel,
+                    "admin": wt["admin"],
+                }
+            )
+        if repo.get("nested"):
+            nest = repo["nested"]
+            items.append(
+                {"item": nest, "kind": "nested", "repo": nest, "admin": f"{nest}/.git"}
+            )
+        if repo.get("bare"):
+            bare = repo["bare"]
+            items.append({"item": bare, "kind": "mirror", "repo": bare, "admin": bare})
+    return sorted(items, key=lambda item: item["item"].encode())
+
+
+def inside(rel: str, root: str) -> bool:
+    return rel == root or rel.startswith(root + "/")
+
+
+# Git-directory files that belong to one worktree (its HEAD, index and the
+# pseudo-refs), and those every item of the repository reads: the ref
+# inventory, configuration, exclude and the shallow boundary.
+PER_WORKTREE = ("HEAD", "index", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "logs/HEAD")
+SHARED_AUTHORITY = ("packed-refs", "config", "info/exclude", "shallow")
+SEAT_CLASSES = ("walk", "worktree", "rebuildable", "git-objects", "git-admin")
+
+
+def attribute(rel: str, kind: str, items: list[dict]) -> tuple[str, str | None, set]:
+    """The seat class of a touched path, its item, and the items it changes.
+
+    Classes: walk (outside every item), worktree (a checkout seat),
+    rebuildable (below a REBUILDABLE directory of a checkout, which the
+    default CapturePolicy records as custody instead of carrying),
+    git-objects (`objects/` of a git directory) and git-admin (the rest of a
+    git directory, and a linked worktree's `.git` file).
+    The changed items model git_carry.rs KeyParts (origin/main 46587af): a
+    checkout seat changes its item; a per-worktree file changes the item
+    whose git directory holds it; the ref inventory (refs/, logs/refs/,
+    packed-refs), config, exclude and shallow change every item of the
+    repository; `objects/` changes none, since the pack listing is drift
+    evidence, not part of the key. A nested worktree's or nested repository's
+    HEAD is also part of the census of the checkout around it.
+    """
+    owner = None
+    for item in items:
+        if inside(rel, item["item"]) and (
+            owner is None or len(item["item"]) > len(owner["item"])
+        ):
+            owner = item
+    if owner is None:
+        return "walk", None, set()
+    name = owner["item"]
+    sub = rel[len(name) + 1 :]
+
+    def around(item: dict) -> set:
+        return {
+            i["item"]
+            for i in items
+            if i["kind"] != "mirror" and item["item"].startswith(i["item"] + "/")
+        }
+
+    if owner["kind"] == "mirror":
+        git_sub = sub
+    elif owner["kind"] in ("main", "nested") and inside(sub, ".git"):
+        git_sub = sub[5:]
+    elif sub == ".git":
+        return "git-admin", name, {name}
+    else:
+        parts = sub.split("/") if sub else []
+        dirs = parts if kind == "d" else parts[:-1]
+        if any(part in REBUILDABLE for part in dirs):
+            return "rebuildable", name, set()
+        return "worktree", name, {name}
+    if inside(git_sub, "objects"):
+        return "git-objects", name, set()
+    parts = git_sub.split("/")
+    if owner["kind"] != "mirror" and parts[0] == "worktrees" and len(parts) > 1:
+        admin = f"{owner['admin']}/worktrees/{parts[1]}"
+        linked = next((i for i in items if i["admin"] == admin), None)
+        if linked is None:
+            return "git-admin", name, set()
+        changed = {linked["item"]}
+        if parts[2:] == ["HEAD"]:
+            changed |= around(linked)
+        return "git-admin", linked["item"], changed
+    if git_sub in PER_WORKTREE:
+        return (
+            "git-admin",
+            name,
+            {name} | (around(owner) if git_sub == "HEAD" else set()),
+        )
+    shared = (
+        git_sub in SHARED_AUTHORITY
+        or parts[0] == "refs"
+        or parts[:2] == ["logs", "refs"]
+    )
+    if shared:
+        return (
+            "git-admin",
+            name,
+            {i["item"] for i in items if i["repo"] == owner["repo"]},
+        )
+    return "git-admin", name, set()
+
+
+def changed_range(old: bytes, new: bytes) -> list[int]:
+    """[start, end) in `new` of the bytes that differ from `old`."""
+    limit = min(len(old), len(new))
+    start = 0
+    while start < limit and old[start] == new[start]:
+        start += 1
+    tail = 0
+    while tail < limit - start and old[-1 - tail] == new[-1 - tail]:
+        tail += 1
+    return [start, len(new) - tail]
+
+
+def page_ranges(old: bytes, new: bytes) -> list[list[int]]:
+    """The changed SQLite pages of `new`, merged into [start, end) ranges."""
+    (page,) = struct.unpack(">H", new[16:18])
+    page = 65536 if page == 1 else page
+    ranges: list[list[int]] = []
+    for start in range(0, len(new), page):
+        if old[start : start + page] != new[start : start + page]:
+            end = min(start + page, len(new))
+            if ranges and ranges[-1][1] == start:
+                ranges[-1][1] = end
+            else:
+                ranges.append([start, end])
+    return ranges
+
+
+class Round:
+    """One mutation round: its stream, target pools, scratch and git clock."""
+
+    def __init__(self, corpus: Path, seal: dict, before: dict, raw: dict, tmp: Path):
+        self.corpus = corpus
+        self.raw = raw
+        self.tmp = tmp
+        self.rnd = len(seal["mutations"]) + 1
+        self.label = f"{seal['seed']}/{seal['scale']}/mutation/{self.rnd}"
+        self.det = Det(self.label)
+        self.g = Git(tmp, corpus, MUTATION_EPOCH + self.rnd * 86_400)
+        self.used: set[str] = set()
+        self.pools = self.make_pools(seal, before)
+
+    def make_pools(self, seal: dict, before: dict) -> dict[str, list]:
+        """Targets per kind, sorted by path bytes.
+
+        File operations never touch a git directory, a detached worktree, a
+        nested repository's work tree, a `.gitignore` or `.gitattributes`, or
+        a read-only file; only the `sqlite` kind touches SQLite files.
+        """
+        detached = [
+            w for r in seal["repos"] for w in r["worktrees"] if w["kind"] == "detached"
+        ]
+        nests = [r["nested"] for r in seal["repos"] if r.get("nested")]
+        fenced = tuple(p + "/" for p in [*(w["path"] for w in detached), *nests])
+
+        def editable(rel: str, row: list[str]) -> bool:
+            parts = rel.split("/")
+            return (
+                not any(is_gitdir_name(p) for p in parts)
+                and not (rel + "/").startswith(fenced)
+                and parts[-1] not in (".gitignore", ".gitattributes")
+                and int(row[2], 8) & 0o200 != 0
+            )
+
+        def order(paths: Iterable[str]) -> list[str]:
+            return sorted(paths, key=str.encode)
+
+        files = order(p for p, r in before.items() if r[1] == "f" and editable(p, r))
+        heads = {p: read_head(self.corpus / self.raw[p], 20) for p in files}
+        sqlite_files = {p for p in files if heads[p][:16] == SQLITE_MAGIC}
+        plain = [
+            p
+            for p in files
+            if p not in sqlite_files and not p.endswith(("-wal", "-journal", ".zst"))
+        ]
+        large = SCALES[seal["scale"]].large_edit_min
+        repos = order(r["path"] for r in seal["repos"])
+        return {
+            "edit": [
+                p for p in plain if not p.endswith(".jsonl") and before[p][3] != "0"
+            ],
+            "large-edit": [p for p in plain if int(before[p][3]) >= large],
+            "append": [p for p in plain if p.endswith(".jsonl")],
+            "delete": [p for p in plain if int(before[p][3]) <= MIB],
+            "new": order(
+                p for p, r in before.items() if r[1] == "d" and editable(p, r)
+            ),
+            "sqlite": [
+                p for p in order(sqlite_files) if heads[p][18:20] == b"\x01\x01"
+            ],
+            "wal": [
+                p
+                for p in order(sqlite_files)
+                if heads[p][18:20] == b"\x02\x02" and p + "-wal" in before
+            ],
+            "commit": repos,
+            "history": [r for r in repos if r == HISTORY_REPO],
+            "repack": [r for r in repos if r != HISTORY_REPO],
+            "fetch": repos,
+            "head-move": detached,
+        }
+
+    def schedule(self, count: int) -> list[str]:
+        """GUARANTEED first, then the other kinds in a seed-shuffled cycle."""
+        rest = self.det.shuffled(k for k in KINDS if k not in GUARANTEED)
+        cycle = [*GUARANTEED, *rest]
+        return [cycle[k % len(cycle)] for k in range(count)]
+
+    def shortfall(self, plan: list[str]) -> str | None:
+        """Why the pools cannot serve `plan`, checked before anything changes."""
+        need = {kind: plan.count(kind) for kind in KINDS}
+        drawn = ("edit", "large-edit", "append", "delete")
+        for kind in drawn:
+            if need[kind] > len(self.pools[kind]):
+                return (
+                    f"{need[kind]} {kind} targets needed, {len(self.pools[kind])} exist"
+                )
+        union = set().union(*(self.pools[k] for k in drawn))
+        if sum(need[k] for k in drawn) > len(union):
+            return (
+                f"{sum(need[k] for k in drawn)} file targets needed, {len(union)} exist"
+            )
+        for kind in ("new", "commit", "history", "repack", "fetch", "head-move"):
+            if need[kind] and not self.pools[kind]:
+                return f"no target for a {kind} mutation"
+        if need["sqlite"] and not (self.pools["sqlite"] and self.pools["wal"]):
+            return "no DELETE-mode store and WAL image for a sqlite mutation"
+        if need["sqlite"] and not hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"):
+            return "a sqlite mutation needs Python 3.12's sqlite3 setconfig"
+        return None
+
+    def take(self, kind: str) -> str:
+        pool = [p for p in self.pools[kind] if p not in self.used]
+        if not pool:
+            raise CorpusError(f"no unused target left for a {kind} mutation")
+        rel = self.det.choice(pool)
+        self.used.add(rel)
+        return rel
+
+    def apply(self, kind: str, k: int) -> dict:
+        method = getattr(self, "op_" + kind.replace("-", "_"))
+        return method(k)
+
+    @staticmethod
+    def overwrite(path: Path, at: int, fresh: bytes) -> None:
+        with path.open("r+b") as handle:
+            handle.seek(at)
+            if handle.read(len(fresh)) == fresh:
+                fresh = bytes([fresh[0] ^ 1]) + fresh[1:]
+            handle.seek(at)
+            handle.write(fresh)
+
+    def op_edit(self, k: int) -> dict:
+        rel = self.take("edit")
+        path = self.corpus / self.raw[rel]
+        size = path.stat().st_size
+        width = min(64, size)
+        at = (size // 2) & ~63 if size >= 128 else 0
+        self.overwrite(path, at, prose(f"{self.label}/{k}", width).encode())
+        return {
+            "path": rel,
+            "pre_size": size,
+            "post_size": size,
+            "ranges": [[at, at + width]],
+        }
+
+    def op_large_edit(self, k: int) -> dict:
+        rel = self.take("large-edit")
+        path = self.corpus / self.raw[rel]
+        size = path.stat().st_size
+        at = self.det.below(size // 64) * 64
+        self.overwrite(path, at, shake(f"{self.label}/{k}", 64))
+        return {
+            "path": rel,
+            "pre_size": size,
+            "post_size": size,
+            "ranges": [[at, at + 64]],
+        }
+
+    def op_append(self, k: int) -> dict:
+        rel = self.take("append")
+        path = self.corpus / self.raw[rel]
+        size = path.stat().st_size
+        row = {
+            "type": "mutation",
+            "round": self.rnd,
+            "text": prose(f"{self.label}/{k}", 200),
+        }
+        data = jsonl([row])
+        with path.open("ab") as handle:
+            handle.write(data)
+        end = size + len(data)
+        return {
+            "path": rel,
+            "pre_size": size,
+            "post_size": end,
+            "ranges": [[size, end]],
+        }
+
+    def op_delete(self, k: int) -> dict:
+        rel = self.take("delete")
+        path = self.corpus / self.raw[rel]
+        size = path.stat().st_size
+        path.unlink()
+        return {"path": rel, "pre_size": size, "post_size": None, "ranges": []}
+
+    def op_new(self, k: int) -> dict:
+        parent = self.det.choice(self.pools["new"])
+        name = f"mutation-r{self.rnd:04d}-{k:02d}.md"
+        rel = f"{parent}/{name}"
+        data = prose(f"{self.label}/{k}", self.det.between(512, 8 * KIB)).encode()
+        put(self.corpus / self.raw[parent] / name, data)
+        self.used.add(rel)
+        return {
+            "path": rel,
+            "pre_size": None,
+            "post_size": len(data),
+            "ranges": [[0, len(data)]],
+        }
+
+    def tree_blobs(self, repo: Path, commit: str) -> list[str]:
+        listing = self.g.run(
+            repo, "ls-tree", "-r", "--format=%(objectmode) %(path)", commit
+        )
+        blobs = (
+            ln.split(" ", 1)[1]
+            for ln in listing.splitlines()
+            if ln.startswith("100644 ")
+        )
+        return sorted(blobs, key=str.encode)
+
+    def side_commit(
+        self, repo: Path, base: str, k: int, env: dict, message: str
+    ) -> tuple:
+        """A commit on `base` changing one blob, built through plumbing."""
+        target = self.det.choice(self.tree_blobs(repo, base))
+        content = self.g.raw(repo, "cat-file", "blob", f"{base}:{target}")
+        fresh = content + source_text(f"{self.label}/{k}", 3)
+        oid = self.g.run(repo, "hash-object", "-w", "--stdin", stdin=fresh, extra=env)
+        self.g.run(repo, "read-tree", base, extra=env)
+        cache = f"100644,{oid.strip()},{target}"
+        self.g.run(repo, "update-index", "--cacheinfo", cache, extra=env)
+        tree = self.g.run(repo, "write-tree", extra=env).strip()
+        new = self.g.run(
+            repo, "commit-tree", tree, "-p", base, "-m", message, extra=env
+        )
+        return target, new.strip()
+
+    def op_commit(self, k: int) -> dict:
+        """A commit on the unmerged `side` branch, checked out nowhere."""
+        repo_rel = self.det.choice(self.pools["commit"])
+        repo = self.corpus / repo_rel
+        old = self.g.run(repo, "rev-parse", "--verify", "refs/heads/side").strip()
+        env = {"GIT_INDEX_FILE": str(self.tmp / f"index-{k}")}
+        message = f"side: mutation round {self.rnd} op {k}"
+        target, new = self.side_commit(repo, old, k, env, message)
+        self.g.run(
+            repo, "update-ref", "-m", f"commit: {message}", "refs/heads/side", new, old
+        )
+        return {
+            "path": f"{repo_rel}/.git/refs/heads/side", "repo": repo_rel,
+            "ref": "refs/heads/side", "file": target, "old": old, "new": new,
+        }  # fmt: skip
+
+    def op_history(self, k: int) -> dict:
+        """A commit on history-heavy's checked-out `main` (#48: every round
+        moves the large history's authority, so a rerun must re-capture it)."""
+        repo = self.corpus / HISTORY_REPO
+        old = self.g.run(repo, "rev-parse", "HEAD").strip()
+        listing = self.g.raw(repo, "ls-files", "-z", "--", "src").decode()
+        target = self.det.choice(
+            sorted((p for p in listing.split("\0") if p), key=str.encode)
+        )
+        path = repo / target
+        pre = path.read_bytes()
+        edit_lines(path, self.det, f"{self.label}/{k}")
+        post = path.read_bytes()
+        self.used.add(f"{HISTORY_REPO}/{target}")
+        self.g.run(repo, "add", "--", target)
+        self.g.run(
+            repo, "commit", "-q", "-m", f"history: mutation round {self.rnd} op {k}"
+        )
+        new = self.g.run(repo, "rev-parse", "HEAD").strip()
+        return {
+            "path": f"{HISTORY_REPO}/{target}", "repo": HISTORY_REPO,
+            "ref": "refs/heads/main", "file": target, "old": old, "new": new,
+            "pre_size": len(pre), "post_size": len(post),
+            "ranges": [changed_range(pre, post)],
+        }  # fmt: skip
+
+    def op_repack(self, k: int) -> dict:
+        """`repack -a -d`: the same objects consolidated into one new pack."""
+        repo_rel = self.det.choice(self.pools["repack"])
+        pack_dir = self.corpus / repo_rel / ".git/objects/pack"
+
+        def packs() -> list[str]:
+            return (
+                sorted(p.name for p in pack_dir.glob("*.pack"))
+                if pack_dir.is_dir()
+                else []
+            )
+
+        before = packs()
+        self.g.run(self.corpus / repo_rel, "repack", "-a", "-d", "-q")
+        return {
+            "path": f"{repo_rel}/.git/objects/pack", "repo": repo_rel,
+            "packs_before": before, "packs_after": packs(),
+        }  # fmt: skip
+
+    def op_fetch(self, k: int) -> dict:
+        """A fetch: a new upstream commit arrives as a new pack and moves
+        refs/remotes/upstream/main. It is built in a private object
+        directory, packed with pack-objects and stored with index-pack, as
+        fetch does, so no URL or host path enters FETCH_HEAD or a reflog."""
+        repo_rel = self.det.choice(self.pools["fetch"])
+        repo = self.corpus / repo_rel
+        ref = "refs/remotes/upstream/main"
+        old = self.g.run(repo, "for-each-ref", "--format=%(objectname)", ref).strip()
+        base = (
+            old or self.g.run(repo, "rev-parse", "--verify", "refs/heads/main").strip()
+        )
+        work = self.tmp / f"fetch-{k}"
+        (work / "objects").mkdir(parents=True)
+        env = {
+            "GIT_OBJECT_DIRECTORY": str(work / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / ".git/objects"),
+            "GIT_INDEX_FILE": str(work / "index"),
+        }
+        message = f"upstream: mutation round {self.rnd} op {k}"
+        target, new = self.side_commit(repo, base, k, env, message)
+        revs = f"{new}\n^{base}\n".encode()
+        pack = self.g.raw(
+            repo, "pack-objects", "--revs", "--stdout", "-q", stdin=revs, extra=env
+        )
+        name = self.g.run(repo, "index-pack", "--stdin", stdin=pack).split()[-1]
+        reason = "storing head" if not old else "fast-forward"
+        self.g.run(
+            repo,
+            "update-ref",
+            "-m",
+            f"fetch upstream: {reason}",
+            ref,
+            new,
+            old or "0" * 40,
+        )
+        return {
+            "path": f"{repo_rel}/.git/objects/pack/pack-{name}.pack", "repo": repo_rel,
+            "ref": ref, "file": target, "old": old or None, "base": base, "new": new,
+            "pack": f"pack-{name}.pack", "pack_bytes": len(pack),
+        }  # fmt: skip
+
+    def op_head_move(self, k: int) -> dict:
+        detached = self.pools["head-move"]
+        wt = detached[self.det.below(len(detached))]
+        wpath = self.corpus / wt["path"]
+        head = self.g.run(wpath, "rev-parse", "HEAD").strip()
+        history = self.g.run(wpath, "rev-list", "--first-parent", "main").split()
+        target = self.det.choice([c for c in history if c != head])
+        self.g.run(wpath, "checkout", "-q", "--detach", target)
+        return {
+            "path": f"{wt['admin']}/HEAD",
+            "worktree": wt["path"],
+            "old": head,
+            "new": target,
+        }
+
+    def op_sqlite(self, k: int) -> dict:
+        """INSERT and UPDATE in a DELETE-mode store, then a WAL-mode commit."""
+        store = self.delete_mode_commit(self.det.choice(self.pools["sqlite"]), k)
+        image = self.wal_commit(self.det.choice(self.pools["wal"]), k)
+        return {"path": store["path"], "stores": [store, image]}
+
+    def rows(self, threads: list[str], k: int, tag: str, n: int) -> list[tuple]:
+        return [
+            (
+                self.det.choice(threads),
+                "assistant",
+                prose(f"{self.label}/{k}/{tag}{i}", self.det.between(40, 900)).encode(),
+            )
+            for i in range(n)
+        ]
+
+    def delete_mode_commit(self, rel: str, k: int) -> dict:
+        path = self.corpus / self.raw[rel]
+        old = path.read_bytes()
+        con = sqlite3.connect(path, isolation_level=None)
+        try:
+            if con.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+                raise CorpusError(f"{rel} is not a DELETE-mode store")
+            threads = [r[0] for r in con.execute("SELECT id FROM threads ORDER BY id")]
+            total = con.execute("SELECT count(*) FROM items").fetchone()[0]
+            con.execute("BEGIN IMMEDIATE")
+            con.executemany(
+                "INSERT INTO items(thread, role, body) VALUES (?, ?, ?)",
+                self.rows(threads, k, "i", 3),
+            )
+            victim = con.execute(
+                "SELECT id FROM items ORDER BY id LIMIT 1 OFFSET ?",
+                (self.det.below(total),),
+            ).fetchone()[0]
+            body = prose(f"{self.label}/{k}/u", 300).encode()
+            con.execute("UPDATE items SET body = ? WHERE id = ?", (body, victim))
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        new = path.read_bytes()
+        return {
+            "path": rel, "journal_mode": "delete", "inserted": 3, "updated_id": victim,
+            "pre_size": len(old), "post_size": len(new), "ranges": page_ranges(old, new),
+        }  # fmt: skip
+
+    def wal_commit(self, rel: str, k: int) -> dict:
+        """A commit appended to the WAL image as a live writer leaves it: no
+        checkpoint (wal_autocheckpoint=0, NO_CKPT_ON_CLOSE), so the main file
+        is untouched and the new frames continue the salts and checksums."""
+        db = self.corpus / self.raw[rel]
+        wal = db.with_name(db.name + "-wal")
+        shm = db.with_name(db.name + "-shm")
+        had_shm = os.path.lexists(shm)
+        main = db.read_bytes()
+        pre = wal.stat().st_size
+        con = sqlite3.connect(db, isolation_level=None)
+        try:
+            con.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            if con.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                raise CorpusError(f"{rel} is not a WAL database")
+            con.execute("BEGIN IMMEDIATE")
+            con.executemany(
+                "INSERT INTO items(thread, role, body) VALUES (?, ?, ?)",
+                self.rows(["wal"], k, "w", 5),
+            )
+            con.execute("COMMIT")
+            expected = con.execute("SELECT count(*) FROM items").fetchone()[0]
+        finally:
+            con.close()
+        if not had_shm:
+            shm.unlink(missing_ok=True)
+        if db.read_bytes() != main:
+            raise CorpusError(f"the WAL commit wrote {rel} itself")
+        probe = self.tmp / f"wal-probe-{k}"
+        probe.mkdir()
+        (probe / "x.db").write_bytes(main)
+        (probe / "x.db-wal").write_bytes(wal.read_bytes())
+        con = sqlite3.connect(probe / "x.db")
+        try:
+            check = con.execute("PRAGMA integrity_check").fetchone()[0]
+            count = con.execute("SELECT count(*) FROM items").fetchone()[0]
+        finally:
+            con.close()
+        if check != "ok" or count != expected:
+            raise CorpusError(f"WAL image does not recover: {check} {count}/{expected}")
+        post = wal.stat().st_size
+        return {
+            "path": rel + "-wal", "journal_mode": "wal", "inserted": 5, "rows": expected,
+            "pre_size": pre, "post_size": post, "ranges": [[pre, post]],
+        }  # fmt: skip
+
+    def new_objects(self, op: dict) -> dict:
+        """The objects a ref move made reachable that its old tip did not,
+        with their sizes and their sizes as stored at the end of the round."""
+        repo = self.corpus / op["repo"]
+        base = op.get("base") or op["old"]
+        listing = self.g.run(repo, "rev-list", "--objects", op["new"], f"^{base}")
+        oids = [line.split(" ", 1)[0] for line in listing.splitlines() if line]
+        query = ("\n".join(oids) + "\n").encode()
+        check = "--batch-check=%(objectsize) %(objectsize:disk)"
+        sizes = [
+            tuple(map(int, line.split()))
+            for line in self.g.run(repo, "cat-file", check, stdin=query).splitlines()
+        ]
+        return {
+            "objects": len(oids),
+            "bytes": sum(s for s, _ in sizes),
+            "disk_bytes": sum(d for _, d in sizes),
+        }
+
+
+def op_ranges(op: dict) -> list[list[int]]:
+    ranges = list(op.get("ranges", []))
+    for store in op.get("stores", []):
+        ranges += store["ranges"]
+    return ranges
+
+
 def mutate(dest: Path, count: int) -> int:
     os.umask(UMASK)
     seal = load_seal(dest)
     corpus = dest / "corpus"
     if seal is None or count < 1:
-        print(f"estate-corpus refused: mutate needs a sealed DEST and N >= 1: {dest}")
-        return 2
-    if is_sealed(dest, seal) and not os.access(corpus, os.W_OK):
         print(
-            f"estate-corpus refused: DEST is sealed read-only ({RECEIPT}); "
+            f"estate-corpus refused: mutate needs a generated DEST and N >= 1: {dest}"
+        )
+        return 2
+    if is_sealed(dest, seal):
+        print(
+            f"estate-corpus refused: DEST is sealed ({RECEIPT}); "
             "mutate a fresh generation"
         )
         return 2
     root = seal["root"]
     if os.path.realpath(corpus) != root:
-        print(f"estate-corpus refused: mutate runs in place only (sealed at {root})")
+        print(f"estate-corpus refused: mutate runs in place only (generated at {root})")
         return 2
     before_text, problems, _ = manifest(corpus, root)
     if problems or identity_of(before_text) != seal["identity"]:
@@ -2046,154 +3018,29 @@ def mutate(dest: Path, count: int) -> int:
     entries = sealed_walk(corpus)[0]
     raw = {esc(rel): rel for rel, _info in entries}
     stats_before = {esc(rel): stat_key(info) for rel, info in entries}
-    rnd = len(seal["mutations"]) + 1
-    label = f"{seal['seed']}/{seal['scale']}/mutation/{rnd}"
-    det = Det(label)
-    detached = [
-        w for r in seal["repos"] for w in r["worktrees"] if w["kind"] == "detached"
-    ]
-    fenced = tuple(w["path"] + "/" for w in detached)
-
-    def editable(rel: str, row: list[str]) -> bool:
-        parts = rel.split("/")
-        return (
-            not any(is_gitdir_name(p) for p in parts)
-            and not (rel + "/").startswith(fenced)
-            and int(row[2], 8) & 0o200 != 0
-        )
-
-    files = [p for p, r in before.items() if r[1] == "f" and editable(p, r)]
-    db_like = (".sqlite", ".db", ".vscdb", "-wal", ".zst")
-    plain = sorted((p for p in files if not p.endswith(db_like)), key=str.encode)
-    pools = {
-        "edit": [p for p in plain if not p.endswith(".jsonl") and before[p][3] != "0"],
-        "append": [p for p in plain if p.endswith(".jsonl")],
-        "delete": [p for p in plain if int(before[p][3]) <= MIB],
-        "new": sorted(
-            (p for p, r in before.items() if r[1] == "d" and editable(p, r)),
-            key=str.encode,
-        ),
-    }
-    repos = sorted(r["path"] for r in seal["repos"])
-    for kind, targets in (*pools.items(), ("commit", repos), ("head-move", detached)):
-        if not targets:
-            print(f"estate-corpus refused: no target for a {kind} mutation")
-            return 2
-    order = det.shuffled(KINDS)
-    used: set[str] = set()
     operations = []
     with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX) as tmp:
-        g = Git(Path(tmp), Path(root), MUTATION_EPOCH + rnd * 86_400)
-        for k in range(count):
-            kind = order[k % len(order)]
-            op = {"op": k, "kind": kind}
-            if kind in ("edit", "append", "delete"):
-                pool = [p for p in pools[kind] if p not in used]
-                rel = det.choice(pool)
-                used.add(rel)
-                path = corpus / raw[rel]
-                if kind == "edit":
-                    size = path.stat().st_size
-                    width = min(64, size)
-                    at = (size // 2) & ~63 if size >= 128 else 0
-                    fresh = prose(f"{label}/{k}", width).encode()
-                    with path.open("r+b") as handle:
-                        handle.seek(at)
-                        old = handle.read(width)
-                        if fresh == old:
-                            fresh = bytes([fresh[0] ^ 1]) + fresh[1:]
-                        handle.seek(at)
-                        handle.write(fresh)
-                    op.update(path=rel, offset=at, length=width)
-                elif kind == "append":
-                    row = {
-                        "type": "mutation",
-                        "round": rnd,
-                        "text": prose(f"{label}/{k}", 200),
-                    }
-                    with path.open("ab") as handle:
-                        handle.write(jsonl([row]))
-                    op.update(path=rel)
-                else:
-                    path.unlink()
-                    op.update(path=rel)
-            elif kind == "new":
-                parent = det.choice(pools["new"])
-                name = f"mutation-r{rnd:04d}-{k:02d}.md"
-                rel = f"{parent}/{name}"
-                put(
-                    corpus / raw[parent] / name,
-                    prose(f"{label}/{k}", det.between(512, 8 * KIB)).encode(),
-                )
-                used.add(rel)
-                op.update(path=rel)
-            elif kind == "commit":
-                repo_rel = det.choice(repos)
-                repo = corpus / repo_rel
-                old = g.run(repo, "rev-parse", "--verify", "refs/heads/side").strip()
-                listing = g.run(
-                    repo, "ls-tree", "-r", "--format=%(objectmode) %(path)", old
-                )
-                blobs = sorted(
-                    (
-                        line.split(" ", 1)[1]
-                        for line in listing.splitlines()
-                        if line.startswith("100644 ")
-                    ),
-                    key=str.encode,
-                )
-                target = det.choice(blobs)
-                content = g.raw(repo, "cat-file", "blob", f"{old}:{target}")
-                fresh = content + source_text(f"{label}/{k}", 3)
-                oid = g.run(repo, "hash-object", "-w", "--stdin", stdin=fresh).strip()
-                index = {"GIT_INDEX_FILE": str(Path(tmp) / f"index-{k}")}
-                g.run(repo, "read-tree", old, extra=index)
-                g.run(
-                    repo,
-                    "update-index",
-                    "--cacheinfo",
-                    f"100644,{oid},{target}",
-                    extra=index,
-                )
-                tree = g.run(repo, "write-tree", extra=index).strip()
-                message = f"side: mutation round {rnd} op {k}"
-                new = g.run(repo, "commit-tree", tree, "-p", old, "-m", message).strip()
-                g.run(
-                    repo,
-                    "update-ref",
-                    "-m",
-                    f"commit: {message}",
-                    "refs/heads/side",
-                    new,
-                    old,
-                )
-                op.update(
-                    path=f"{repo_rel}/.git/refs/heads/side",
-                    repo=repo_rel,
-                    file=target,
-                    old=old,
-                    new=new,
-                )
-            else:
-                wt = detached[det.below(len(detached))]
-                wpath = corpus / wt["path"]
-                head = g.run(wpath, "rev-parse", "HEAD").strip()
-                history = g.run(wpath, "rev-list", "--first-parent", "main").split()
-                target = det.choice([c for c in history if c != head])
-                g.run(wpath, "checkout", "-q", "--detach", target)
-                op.update(
-                    path=f"{wt['admin']}/HEAD",
-                    worktree=wt["path"],
-                    old=head,
-                    new=target,
-                )
-            operations.append(op)
+        state = Round(Path(root), seal, before, raw, Path(tmp))
+        rnd = state.rnd
+        plan = state.schedule(count)
+        short = state.shortfall(plan)
+        if short:
+            print(f"estate-corpus refused: mutate {count}: {short}")
+            return 2
+        for k, kind in enumerate(plan):
+            operations.append({"op": k, "kind": kind, **state.apply(kind, k)})
+        for op in operations:
+            if op["kind"] in ("history", "commit", "fetch"):
+                op["new_objects"] = state.new_objects(op)
+    canonical_modes(corpus)
     after_text, problems, counts = manifest(corpus, root)
-    for problem in problems:
-        print(f"estate-corpus problem: {problem}")
+    if problems:
+        for problem in problems:
+            print(f"estate-corpus problem: {problem}")
+        print("estate-corpus mutate failed: the corpus no longer matches its seal")
+        return 1
     after = rows_of(after_text)
     entries = sealed_walk(corpus)[0]
-    raw.update({esc(rel): rel for rel, _info in entries})
     stats_after = {esc(rel): stat_key(info) for rel, info in entries}
     added, removed, modified = diff_rows(before, after)
     stat_only = sorted(
@@ -2204,29 +3051,86 @@ def mutate(dest: Path, count: int) -> int:
         ),
         key=str.encode,
     )
+    items = estate_items(seal)
+    touched = [*added, *removed, *modified, *stat_only]
+    seat = {p: attribute(p, (after.get(p) or before[p])[1], items) for p in touched}
     reads = sorted(
         (p for p in {*added, *modified, *stat_only} if after[p][1] == "f"),
         key=str.encode,
     )
     sizes = {p: stats_after[p][1] for p in reads}
-    touched = [*added, *removed, *modified, *stat_only]
-    repos_changed = []
-    for repo in seal["repos"]:
-        roots = [repo["path"], *(w["path"] for w in repo["worktrees"])]
-        roots += [repo["bare"]] if repo.get("bare") else []
-        hits = [
-            p for p in touched if any(p == r or p.startswith(r + "/") for r in roots)
-        ]
-        if hits:
-            admin = [p for p in hits if any(map(is_gitdir_name, p.split("/")))]
-            repos_changed.append(
-                {
-                    "repo": repo["path"],
-                    "paths": len(hits),
-                    "git_admin_paths": len(admin),
-                }
-            )
+    by_class: dict = {c: {"files": 0, "bytes": 0} for c in SEAT_CLASSES}
+    per_item: dict = {}
+    for p in reads:
+        cls, owner, _ = seat[p]
+        by_class[cls]["files"] += 1
+        by_class[cls]["bytes"] += sizes[p]
+        if cls == "worktree":
+            slot = per_item.setdefault(owner, {"files": 0, "bytes": 0})
+            slot["files"] += 1
+            slot["bytes"] += sizes[p]
+    by_class["worktree"]["items"] = dict(sorted(per_item.items()))
+    hit: dict[str, int] = {}
+    hit_full: set[str] = set()
+    for p in touched:
+        cls, owner, changed = seat[p]
+        for item in changed:
+            hit[item] = hit.get(item, 0) + 1
+        hit_full |= changed | ({owner} if cls == "rebuildable" else set())
+    changed_items = [
+        {"item": i["item"], "kind": i["kind"], "paths": hit[i["item"]]}
+        for i in items
+        if i["item"] in hit
+    ]
+    unchanged = len(items) - len(changed_items)
+    # estate-capture refuses a bare repository (IO errno 2 at 46587af), so a
+    # mirror item records no census walk; every other item records 4 when it
+    # changed and 1 for a reuse hit (smoke-tested in the evidence doc).
+    censused = [i["item"] for i in items if i["kind"] != "mirror"]
+
+    def census_walks(changed: Iterable[str]) -> int:
+        hits = len(set(changed) & set(censused))
+        return CENSUS_WALKS_CHANGED * hits + CENSUS_WALKS_REUSED * (
+            len(censused) - hits
+        )
+
+    walks = census_walks(hit)
+    walks_full = census_walks(hit_full)
+    repo_of = {i["item"]: i["repo"] for i in items}
+    git_objects: dict = {}
+
+    def objects_of(repo: str) -> dict:
+        return git_objects.setdefault(
+            repo,
+            {
+                "loose_added": 0, "loose_added_bytes": 0, "loose_removed": 0,
+                "loose_removed_bytes": 0, "packs_added": {}, "packs_removed": {},
+                "tips": [],
+            },
+        )  # fmt: skip
+
+    for p in [*added, *removed]:
+        cls, owner, _ = seat[p]
+        if cls != "git-objects" or owner is None:
+            continue
+        row = after.get(p) or before[p]
+        name = p.rsplit("/", 1)[-1]
+        side = "added" if p not in before else "removed"
+        slot = objects_of(repo_of[owner])
+        if row[1] == "f" and len(name) == 38 and len(p.split("/")[-2]) == 2:
+            slot[f"loose_{side}"] += 1
+            slot[f"loose_{side}_bytes"] += int(row[3])
+        elif name.endswith(".pack"):
+            slot[f"packs_{side}"][name] = int(row[3])
+    for op in operations:
+        if "new_objects" in op:
+            tip = ("op", "ref", "old", "base", "new", "new_objects")
+            objects_of(op["repo"])["tips"].append({key: op.get(key) for key in tip})
     identity = identity_of(after_text)
+    mutations = dest / "mutations"
+    mutations.mkdir(exist_ok=True)
+    kept = mutations / f"round-{rnd:04d}.before.tsv"
+    kept.write_text(before_text, encoding="utf-8")
     sidecar = {
         "format": FORMAT,
         "round": rnd,
@@ -2235,20 +3139,37 @@ def mutate(dest: Path, count: int) -> int:
         "scale": seal["scale"],
         "identity_before": seal["identity"],
         "identity_after": identity,
+        "before_manifest": str(kept.relative_to(dest)),
         "operations": operations,
         "changed": {"added": added, "removed": removed, "modified": modified},
         "stat_only": stat_only,
         "reads_allowed": reads,
         "reads_allowed_sizes": sizes,
         "reads_allowed_bytes": sum(sizes.values()),
+        "reads_allowed_class": {p: seat[p][0] for p in reads},
+        "reads_by_class": by_class,
         "changed_content_bytes": sum(
             sizes[p] for p in (*added, *modified) if after[p][1] == "f"
         ),
-        "repos_changed": repos_changed,
-        "repos_unchanged": len(seal["repos"]) - len(repos_changed),
+        "changed_range_bytes": sum(
+            e - s for op in operations for s, e in op_ranges(op)
+        ),
+        "cdc_bytes": dict(zip(("min", "avg", "max"), CDC_BYTES)),
+        "items": {
+            "model": "git_carry.rs KeyParts, origin/main 46587af; one item per checkout",
+            "total": len(items),
+            "changed": changed_items,
+            "unchanged": unchanged,
+            "census_items": len(censused),
+            "not_censused": [i["item"] for i in items if i["item"] not in censused],
+            "census_walks_expected": walks,
+            "changed_include_rebuildable": sorted(hit_full, key=str.encode),
+            "census_walks_expected_include_rebuildable": walks_full,
+        },
+        "git_objects": dict(sorted(git_objects.items())),
+        "timing": {"mutated_at_ns": time.time_ns(), "settle_ns": RACY_SETTLE_NS},
     }
-    out = dest / "mutations" / f"round-{rnd:04d}.json"
-    out.parent.mkdir(exist_ok=True)
+    out = mutations / f"round-{rnd:04d}.json"
     write_json(out, sidecar)
     seal["mutations"].append(
         {
@@ -2261,16 +3182,16 @@ def mutate(dest: Path, count: int) -> int:
     )
     seal["identity"] = identity
     seal["counts"] = counts
-    (dest / "MANIFEST.tsv").write_text(after_text)
+    (dest / "MANIFEST.tsv").write_text(after_text, encoding="utf-8")
     write_json(dest / "SEAL.json", seal)
     print(
         f"estate-corpus mutated={corpus} round={rnd} operations={count} "
         f"added={len(added)} removed={len(removed)} modified={len(modified)} "
         f"stat_only={len(stat_only)} reads_allowed={len(reads)} "
-        f"reads_allowed_bytes={sum(sizes.values())} "
-        f"repos_changed={len(repos_changed)} identity={identity}"
+        f"reads_allowed_bytes={sum(sizes.values())} items_changed={len(changed_items)} "
+        f"items_unchanged={unchanged} census_walks_expected={walks} identity={identity}"
     )
-    return 1 if problems else 0
+    return 0
 
 
 # ---- self-test ---------------------------------------------------------------------------
@@ -2283,27 +3204,26 @@ def make_writable(top: Path) -> None:
             os.chmod(dirpath, 0o755)
 
 
-def restore_modes(dest: Path) -> None:
-    """Undo a seal by hand: the modes recorded in MANIFEST.tsv come back."""
-    corpus = dest / "corpus"
-    rows = rows_of((dest / "MANIFEST.tsv").read_text())
-    for rel, _info in walk(corpus):
-        row = rows.get(esc(rel))
-        if row and row[1] in ("d", "f"):
-            os.chmod(corpus / rel, int(row[2], 8))
-    corpus.chmod(0o755)
-    dest.chmod(0o755)
-    with os.scandir(dest) as top:
-        for entry in top:
-            if entry.name == "corpus":
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                os.chmod(entry.path, 0o755)
-                with os.scandir(entry.path) as inner:
-                    for item in inner:
-                        os.chmod(item.path, 0o644)
-            else:
-                os.chmod(entry.path, 0o644)
+def latin1_locale() -> str | None:
+    """A locale whose filesystem encoding is ISO-8859-1, if this host has one."""
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONUTF8", UTF8_MARK)}
+    probe = "import sys; print(sys.getfilesystemencoding())"
+    for name in ("aa_DJ.iso88591", "en_US.ISO-8859-1", "de_DE.ISO-8859-1"):
+        done = subprocess.run(
+            [sys.executable, "-c", probe],
+            env={**env, "LC_ALL": name, "LANG": name},
+            capture_output=True,
+            text=True,
+        )
+        if done.stdout.strip().replace("-", "").lower() in ("iso88591", "latin1"):
+            return name
+    return None
+
+
+def flip_byte(path: Path, at: int) -> None:
+    data = bytearray(path.read_bytes())
+    data[at] ^= 1
+    path.write_bytes(bytes(data))
 
 
 def selftest() -> int:
@@ -2322,7 +3242,7 @@ def selftest() -> int:
 
     def first_file(dest: Path, top: str) -> Path:
         """The first regular file directly in `top`, by DEST's manifest."""
-        rows = rows_of((dest / "MANIFEST.tsv").read_text())
+        rows = rows_of((dest / "MANIFEST.tsv").read_text(encoding="utf-8"))
         rel = min(
             p
             for p, r in rows.items()
@@ -2330,12 +3250,34 @@ def selftest() -> int:
         )
         return dest / "corpus" / rel
 
+    def sidecar(dest: Path) -> dict:
+        text = (dest / "mutations/round-0001.json").read_text(encoding="utf-8")
+        return json.loads(text)
+
+    def chmod_around(path: Path, write: Callable[[], None]) -> None:
+        """Run `write` with the owner's write bit on `path`'s directory."""
+        parent = path.parent
+        mode = stat.S_IMODE(parent.stat().st_mode)
+        parent.chmod(mode | 0o200)
+        try:
+            write()
+        finally:
+            parent.chmod(mode)
+
     try:
         a, b = (t / "dest" for t in temps)
+        # The second DEST's parent is setgid: canonical_modes must make the
+        # identity independent of it (finding: modes depend on the caller).
+        temps[1].chmod(0o2755)
+        setgid = bool(temps[1].stat().st_mode & stat.S_ISGID)
         rc_a, id_a = generate(a, DEFAULT_SEED, "small")
         rc_b, id_b = generate(b, DEFAULT_SEED, "small")
         check(rc_a == 0 and rc_b == 0, "both generations are clean")
-        check(id_a == id_b, f"two generations share one identity ({id_a})")
+        check(
+            id_a == id_b,
+            f"two generations share one identity ({id_a}), the second under a "
+            f"{'setgid' if setgid else 'plain (setgid not settable here)'} parent",
+        )
         check(
             (a / "MANIFEST.tsv").read_bytes() == (b / "MANIFEST.tsv").read_bytes(),
             "the two manifests are byte-identical",
@@ -2353,11 +3295,30 @@ def selftest() -> int:
             and all(c["entries"] for c in classes.values()),
             "the classes partition the manifest and none is empty",
         )
-        history = a / "corpus" / HISTORY_REPO / ".git" / "objects"
-        loose = [d for d in history.iterdir() if len(d.name) == 2 and any(d.iterdir())]
+        repo = a / "corpus" / HISTORY_REPO
+        objects = repo / ".git" / "objects"
+        loose = [d for d in objects.iterdir() if len(d.name) == 2 and any(d.iterdir())]
         check(
-            len(list((history / "pack").glob("*.pack"))) == 4 and bool(loose),
+            len(list((objects / "pack").glob("*.pack"))) == 4 and bool(loose),
             "the history repository holds four packs plus loose objects",
+        )
+        (temps[0] / "git-scratch").mkdir()
+        g = Git(temps[0] / "git-scratch", a / "corpus", HISTORY_EPOCH)
+        _commits, _files, _every, revision_bytes = SCALES["small"].history
+        stored = g.run(
+            repo,
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectsize) %(deltabase)",
+        )
+        deltas = [
+            line
+            for line in stored.splitlines()
+            if int(line.split()[0]) == revision_bytes and line.split()[1].strip("0")
+        ]
+        check(
+            not (repo / ".gitattributes").exists() and len(deltas) >= 4,
+            f"model.bin revisions are packed as deltas ({len(deltas)} of them)",
         )
         check(verify(a) == 0, "verify accepts the generated corpus")
         root_b = (load_seal(b) or {})["root"]
@@ -2373,65 +3334,163 @@ def selftest() -> int:
         planted.unlink()
         (b / "corpus" / "links" / "planted-abs").unlink()
         check(verify(b) == 0, "verify accepts the copy once they are removed")
+        locale = latin1_locale()
+        if locale:
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("PYTHONUTF8", UTF8_MARK)
+            }
+            done = subprocess.run(
+                [sys.executable, str(HERE), "verify", str(a)],
+                env={**env, "LC_ALL": locale, "LANG": locale},
+                capture_output=True,
+                text=True,
+            )
+            check(
+                done.returncode == 0 and f"identity={id_a}" in done.stdout,
+                f"verify gives the same identity under {locale} (ISO-8859-1)",
+            )
+        else:
+            print("estate-corpus selftest note: no ISO-8859-1 locale on this host")
         # A first measurement pass reads the WAL image as provider_sqlite does
         # (read-only, WAL-aware), which leaves a -shm; mutate must still run.
+        wal_db = ".local/share/opencode/storage.db"
         for dest in (a, b):
-            db = dest / "corpus" / ".local/share/opencode/storage.db"
+            db = dest / "corpus" / wal_db
             con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
             try:
                 con.execute("SELECT count(*) FROM items").fetchone()
             finally:
                 con.close()
-        shm = a / "corpus" / ".local/share/opencode/storage.db-shm"
+        shm = a / "corpus" / (wal_db + "-shm")
         check(
             shm.is_file() and verify(a) == 0, "a WAL-aware read leaves the seal intact"
         )
-        before = rows_of((a / "MANIFEST.tsv").read_text())
+        shm_b = b / "corpus" / (wal_db + "-shm")
+        good = shm_b.read_bytes()
+        shm_b.write_bytes(good + bytes(WALINDEX_PGSZ))
+        grown = verify(b)
+        shm_b.write_bytes(good)
+        junk = b / "corpus" / ".codex" / "state.sqlite-shm"
+        junk.write_bytes(shake("selftest/junk-shm", 1_050_000))
+        check(
+            grown == 1 and verify(b) == 1,
+            "verify rejects a grown wal-index and a -shm beside a DELETE-mode store",
+        )
+        junk.unlink()
+        check(verify(b) == 0, "verify accepts the copy once the wal-index is exact")
+        index = b / "corpus" / "git" / repo_name(0) / ".git" / "index"
+        flip_byte(index, index.stat().st_size - 1)
+        corrupt = verify(b)
+        flip_byte(index, index.stat().st_size - 1)
+        check(
+            corrupt == 1 and verify(b) == 0, "verify rejects a corrupt index checksum"
+        )
+        # S2: an index refresh under index.lock leaves the manifest as it was,
+        # so only the stat snapshot sees it.
+        touched = b / "corpus" / "git" / repo_name(1) / "README.md"
+        mtime = touched.stat().st_mtime_ns + 3_000_000_000
+        os.utime(touched, ns=(mtime, mtime))
+        snapshot = temps[1] / "s2-before.tsv"
+        check(s2_snapshot(b, snapshot) == 0, "s2-snapshot records the copy")
+        (temps[1] / "git-scratch").mkdir()
+        Git(temps[1] / "git-scratch", b / "corpus", HISTORY_EPOCH).run(
+            touched.parent, "status", "--porcelain"
+        )
+        moved = diff_rows(
+            rows_of(snapshot.read_text(encoding="utf-8")), s2_rows(b / "corpus")
+        )
+        index_rel = f"git/{repo_name(1)}/.git/index"
+        check(
+            verify(b) == 0 and s2_diff(b, snapshot) == 1 and index_rel in moved[2],
+            "s2-diff sees the index refresh that verify cannot",
+        )
+        before_text = (a / "MANIFEST.tsv").read_text(encoding="utf-8")
+        before = rows_of(before_text)
         check(mutate(a, len(KINDS)) == 0, "mutate applies one of each operation")
         check(mutate(b, len(KINDS)) == 0, "mutate applies to the second copy")
-        side = json.loads((a / "mutations/round-0001.json").read_text())
-        twin = json.loads((b / "mutations/round-0001.json").read_text())
-        after = rows_of((a / "MANIFEST.tsv").read_text())
+        side, twin = sidecar(a), sidecar(b)
+        after = rows_of((a / "MANIFEST.tsv").read_text(encoding="utf-8"))
         added, removed, modified = diff_rows(before, after)
         check(
             side["identity_after"] != side["identity_before"],
             "mutation changes the identity",
         )
         check(
-            side["identity_after"] == twin["identity_after"],
-            "mutation is deterministic",
+            {k: v for k, v in side.items() if k != "timing"}
+            == {k: v for k, v in twin.items() if k != "timing"},
+            "mutation is deterministic: both sidecars match apart from timing",
+        )
+        check(
+            (a / side["before_manifest"]).read_text(encoding="utf-8") == before_text,
+            "the round keeps the pre-round manifest",
         )
         check(
             side["changed"]
             == {"added": added, "removed": removed, "modified": modified},
             "the sidecar lists exactly the manifest difference",
         )
+        ops = {op["kind"]: op for op in side["operations"]}
         check(
-            {op["kind"] for op in side["operations"]} == set(KINDS), "all six kinds ran"
+            set(ops) == set(KINDS)
+            and [op["kind"] for op in side["operations"][:3]] == list(GUARANTEED),
+            "all eleven kinds ran, history, sqlite and large-edit first",
         )
-        changed = {*added, *removed, *modified}
+        touched_paths = {*added, *removed, *modified, *side["stat_only"]}
         check(
-            all(op["path"] in changed for op in side["operations"]),
+            all(op["path"] in touched_paths for op in side["operations"]),
             "every operation's path is in the difference",
         )
         sizes = side["reads_allowed_sizes"]
+        by_class = side["reads_by_class"]
         check(
             sorted(sizes) == sorted(side["reads_allowed"])
-            and side["reads_allowed_bytes"] == sum(sizes.values()) > 0,
-            "reads_allowed_bytes is the sum of the allowed files' sizes",
-        )
-        git_ops = [
-            op for op in side["operations"] if op["kind"] in ("commit", "head-move")
-        ]
-        repos = {r["repo"] for r in side["repos_changed"]}
-        check(
-            all(any(op["path"].startswith(r + "/") for r in repos) for op in git_ops),
-            "repos_changed names the repositories of the git operations",
+            and side["reads_allowed_bytes"] == sum(sizes.values()) > 0
+            and sum(c["bytes"] for c in by_class.values())
+            == side["reads_allowed_bytes"]
+            and set(side["reads_allowed_class"].values()) <= set(SEAT_CLASSES),
+            "reads_allowed_bytes is the sum of the allowed files, split by class",
         )
         content = {p for p in (*added, *modified) if after[p][1] == "f"}
         check(
             content <= set(side["reads_allowed"]),
             "reads_allowed covers every changed file",
+        )
+        items = side["items"]
+        changed_items = {i["item"] for i in items["changed"]}
+        check(
+            HISTORY_REPO in changed_items
+            and items["census_walks_expected"]
+            == CENSUS_WALKS_CHANGED * len(changed_items - set(items["not_censused"]))
+            + CENSUS_WALKS_REUSED
+            * (items["census_items"] - len(changed_items - set(items["not_censused"])))
+            and items["unchanged"] + len(changed_items) == items["total"],
+            f"items: {len(changed_items)} changed, {items['unchanged']} unchanged, "
+            f"history-heavy among the changed",
+        )
+        history = side["git_objects"][HISTORY_REPO]["tips"][0]
+        fetch = ops["fetch"]
+        repacked = ops["repack"]["repo"] == fetch["repo"]
+        check(
+            history["ref"] == "refs/heads/main"
+            and history["new_objects"]["objects"] >= 3
+            and fetch["new_objects"]["objects"] >= 3
+            and (
+                repacked
+                or fetch["pack"] in side["git_objects"][fetch["repo"]]["packs_added"]
+            ),
+            "history moves main with new objects, and fetch adds a pack",
+        )
+        stores = ops["sqlite"]["stores"]
+        check(
+            stores[0]["path"] in modified
+            and stores[1]["path"] in modified
+            and stores[1]["post_size"] > stores[1]["pre_size"]
+            and wal_db not in modified
+            and ops["large-edit"]["ranges"][0][1] - ops["large-edit"]["ranges"][0][0]
+            == 64,
+            "sqlite changes a DELETE-mode store and grows the -wal, not storage.db",
         )
         check(verify(a) == 0, "verify accepts the mutated corpus against its new seal")
         victim = b / "corpus" / "names" / "with space.txt"
@@ -2471,37 +3530,56 @@ def selftest() -> int:
             mutate(a, 1) == 2 and seal_dest(a) == 2 and verify(a) == 0,
             "mutate and a second seal refuse the sealed copy",
         )
-        parent = a / "corpus" / "names"
-        parent.chmod(0o755)
-        extra = parent / "added-after-seal.txt"
-        extra.write_bytes(b"added\n")
+        hidden = [
+            a / "corpus" / ".codex" / "state.sqlite-shm",
+            a / "corpus" / (wal_db + "-shm"),
+        ]
+        rejected = []
+        for path, data in zip(hidden, (shake("selftest/junk-shm", 1_050_000), good)):
+            chmod_around(path, lambda path=path, data=data: path.write_bytes(data))
+            path.chmod(0o444)
+            rejected.append(verify(a))
+            chmod_around(path, path.unlink)
+        check(
+            rejected == [1, 1] and verify(a) == 0,
+            "the sealed copy admits no -shm, junk or a copied wal-index",
+        )
+        extra = a / "corpus" / "names" / "added-after-seal.txt"
+        chmod_around(extra, lambda: extra.write_bytes(b"added\n"))
         extra.chmod(0o444)
-        parent.chmod(0o555)
         check(verify(a) == 1, "verify rejects one added file in the sealed copy")
-        parent.chmod(0o755)
-        extra.unlink()
-        parent.chmod(0o555)
+        chmod_around(extra, extra.unlink)
         check(verify(a) == 0, "verify accepts the sealed copy once it is removed")
         gone = first_file(a, "names")
         aside = temps[0] / "aside"
-        parent.chmod(0o755)
-        gone.rename(aside)
-        parent.chmod(0o555)
+        chmod_around(gone, lambda: gone.rename(aside))
         check(verify(a) == 1, "verify rejects one removed file in the sealed copy")
-        parent.chmod(0o755)
-        aside.rename(gone)
-        parent.chmod(0o555)
+        chmod_around(gone, lambda: aside.rename(gone))
         check(verify(a) == 0, "verify accepts the sealed copy once it is restored")
-        restore_modes(a)
-        check(mutate(a, 1) == 0, "mutate runs once the seal is undone by hand")
-        check(verify(a) == 1, "verify rejects the sealed copy after mutate 1")
+        gone.chmod(0o644)
+        flip_byte(gone, 0)
+        gone.chmod(0o444)
+        edited = verify(a)
+        gone.chmod(0o644)
+        flip_byte(gone, 0)
+        gone.chmod(0o444)
+        check(
+            edited == 1 and verify(a) == 0,
+            "verify rejects a same-size edit in the sealed copy",
+        )
+        (a / "corpus").chmod(0o755)
+        opened = verify(a)
+        (a / "corpus").chmod(0o555)
+        check(opened == 1, "verify rejects a writable corpus root in the sealed copy")
     except (
         CorpusError,
         OSError,
         KeyError,
+        IndexError,
         ValueError,
         StopIteration,
         subprocess.SubprocessError,
+        sqlite3.Error,
     ) as err:
         check(False, f"self-test raised {type(err).__name__}: {err}")
     finally:
@@ -2514,6 +3592,26 @@ def selftest() -> int:
         f"seconds={time.monotonic() - started:.1f} ok={not failures}"
     )
     return 1 if failures else 0
+
+
+def utf8_mode() -> None:
+    """Re-run this script in Python's UTF-8 mode unless it already is.
+
+    The identity must not depend on the caller's locale. Outside UTF-8 mode,
+    path names decode with the locale's filesystem encoding and text files
+    default to its encoding: under an ISO-8859-1 locale the same tree gets
+    another identity, and `generate` cannot create the non-ASCII names at
+    all. UTF-8 mode makes both UTF-8, with surrogateescape for undecodable
+    names, on every host.
+    """
+    if sys.flags.utf8_mode:
+        return
+    if os.environ.get(UTF8_MARK):
+        print("estate-corpus refused: Python UTF-8 mode is off (-X utf8=0?)")
+        raise SystemExit(2)
+    os.environ[UTF8_MARK] = "1"
+    argv = list(getattr(sys, "orig_argv", [])) or [sys.executable, *sys.argv]
+    os.execv(sys.executable, [sys.executable, "-X", "utf8", *argv[1:]])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2534,6 +3632,12 @@ def main(argv: list[str] | None = None) -> int:
     mut.add_argument("count", metavar="N", type=int)
     sea = sub.add_parser("seal", help="make DEST read-only and write its receipt")
     sea.add_argument("dest")
+    snap = sub.add_parser("s2-snapshot", help="record every entry's stat (S2)")
+    snap.add_argument("dest")
+    snap.add_argument("out")
+    s2d = sub.add_parser("s2-diff", help="list every stat change since a snapshot")
+    s2d.add_argument("dest")
+    s2d.add_argument("snapshot")
     sub.add_parser("selftest", help="optional-tier round trip at scale small")
     args = parser.parse_args(argv)
     try:
@@ -2545,6 +3649,10 @@ def main(argv: list[str] | None = None) -> int:
             return mutate(Path(args.dest).absolute(), args.count)
         if args.command == "seal":
             return seal_dest(Path(args.dest).absolute())
+        if args.command == "s2-snapshot":
+            return s2_snapshot(Path(args.dest).absolute(), Path(args.out).absolute())
+        if args.command == "s2-diff":
+            return s2_diff(Path(args.dest).absolute(), Path(args.snapshot).absolute())
         if args.command == "selftest":
             return selftest()
         corpus = Path(args.corpus).absolute()
@@ -2558,4 +3666,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    utf8_mode()
     sys.exit(main())
