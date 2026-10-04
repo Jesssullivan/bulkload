@@ -111,12 +111,12 @@ In evidence mode every ON run must report its priority class, an ON
 window that reaches the run cap is INCONCLUSIVE, and R-N81 is checked over
 the whole run, not only at the start: a window whose power_start or
 power_end is not AC, or an OFF window whose lag-corrected load1 level is
-not under 2.5, makes the run INCONCLUSIVE and not evidence. `analyze` labels a trace
-evidence only when it was run with --evidence, its schema is this one, its
-recorded configuration and gate pass the same protocol check, and no
-override differs from the recorded gate; `evidence_problems` says why not.
-So a verdict cannot be chosen after the fact and keep the label. Gated S2
-runs are separate from the S1 gate (OI-1003-Q34).
+not under 2.5, makes the run INCONCLUSIVE and not evidence. `analyze`
+labels a trace evidence only when it was run with --evidence, its schema is
+this one, its recorded configuration and gate pass the same protocol check,
+and no override differs from the recorded gate; `evidence_problems` says
+why not. So a verdict cannot be chosen after the fact and keep the label.
+Gated S2 runs are separate from the S1 gate (OI-1003-Q34).
 
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
