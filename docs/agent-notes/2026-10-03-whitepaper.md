@@ -14,8 +14,10 @@ OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
 | `d6f6432` | First draft of the paper and the bibliography. |
 | `e7b12fd` | Dropped the `docs/slo.md` pointer line; the coordinator's docs PR carries it. |
 | `ba6e487` | Lane C review fixes (25 findings); pinned to `04ea9cb`. |
-| `7e2921a` | Merge of `origin/main` at `6268175` (#152), so the branch diff lists only lane C files. |
-| finish commit | This pass: re-pin to `6268175`, formal-model section, bibliography re-resolution, this note. |
+| `7e2921a` | Merge of `origin/main` at `6268175` (#152). |
+| `6ab4ce0` | Finish pass, part 1 (pushed): re-pin to `6268175`, the formal-model section with `3dbfbdb`'s TLC results, bibliography re-resolution, this note. |
+| `cb4469b` | Merge of `origin/main` at `46587af` (#146 merged while part 1 was being committed), so the branch diff lists only lane C files. |
+| part 2 commit | Finish pass, part 2: re-pin to `46587af` and describe #146's auto-prerequisite chains. |
 
 The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 `04ea9cb`. This pass merged `main` instead and did not rewrite history.
@@ -23,7 +25,7 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 ## Done
 
 - **Paper** (`docs/whitepaper/bulkload.md`), pinned to `origin/main`
-  `6268175`. It covers the problem, the design, the invariants (R25,
+  `46587af`. It covers the problem, the design, the invariants (R25,
   durability ordering, S2), how each SLO is proven, results, related work,
   future work and limits. Section 5 quotes only `docs/evidence/`. SLO
   numbers are linked to `docs/slo.md`, not copied.
@@ -36,8 +38,9 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 
 ## Finish pass (2026-10-03, after the duplicate-agent incident)
 
-Each item was checked against `origin/main` `6268175`, `docs/evidence/`,
-the GitHub PR list and TIN-4543.
+Each item was checked against `origin/main` (`6268175`, then `46587af`
+for what #146 touched), `docs/evidence/`, the GitHub PR list and
+TIN-4543.
 
 - **S1 is stated as not met.** The 2026-09-18 R23 sample (pre-wire-v5)
   failed the initial copy at 3015.294 ms against rclone's 601.010 ms. It won
@@ -51,16 +54,28 @@ the GitHub PR list and TIN-4543.
   facts. Section 8 says WP1 made "more", not "most", of S2 structural.
 - **WP1 is on `main`** (#145, `adb9c66`). The hardening table
   (`git_carry::git_env`, eleven cleared variables) and background priority
-  for six verbs were checked in the code at `6268175`. No text says they are
-  off `main`.
+  for six verbs were checked in the code at `6268175`, and the table again
+  at `46587af`. No text says they are off `main`.
 - **#152 (WP10 PR 1) folded in.** Four crates, with `bulkload-handoff`
-  described. Five `proptest!` sites, adding `drain_bounded` in
-  `src/child.rs`. The durability row cites #152's four passing checks.
+  described. Adds `drain_bounded`'s proptests in `src/child.rs`.
+- **#146 (WP2 PR 2) folded in.** It merged as `46587af` during this pass.
+  - Section 2.7 now describes auto-prerequisite chains: source-held tips
+    only, the `.prior` sidecar, depth cap 8 with re-base, and a verified,
+    flattened restore. It notes the side doors (#148).
+  - Its evidence is fixtures only: the counters test, which writes less
+    than an eighth of the 256 KiB history, and P-CHAIN. No estate run has
+    measured it.
+  - Sections 5.4, 6 and 7 and the status table were updated. There are
+    now six `proptest!` sites. The durability row cites #146's four
+    passing checks.
+  - `estimate::hardened` still builds through `git()`, so the
+    one-hardening-table claim holds.
 - **Section 4, formal model (OI-1003-Q32).** TLA+/TLC is the checker of
   record. The Dhall catalogue and the Haskell N-version explorer are stated
   as planned for sprint 2.
   - Lane B's origin head moved during this pass, from `1da332c` (a
-    snapshot, with no results) through `3760263` to `3dbfbdb`. The first
+    snapshot, with no results) through `3760263` and `3dbfbdb` to
+    `d7589e0`. `d7589e0` changes only lane B's note. The first
     draft of this pass said "pending". After a re-check of origin before
     committing, section 4 instead reports the results committed in
     `docs/formal/README.md` at `3dbfbdb`.
@@ -83,8 +98,8 @@ the GitHub PR list and TIN-4543.
   and 8, and in the status table. The source is lane A's evidence file on
   `feat/wp0e-estate-corpus-20261003` (`7b75b26`) and TIN-4543. A ruling is
   open.
-- **Open PRs named.** #146 (WP2 PR 2), #150 and #151 (WP3), #153 (WP10
-  PR 2) and #154 (salvage) are marked open and not on `main`.
+- **Open PRs named.** #150 and #151 (WP3), #153 (WP10 PR 2) and #154
+  (salvage) are marked open and not on `main`.
 - **Bibliography re-resolution:**
   - [TLC99] gains LNCS 1703 and its editors, from Lamport's publications
     page and Crossref's book record. Crossref, OpenAlex and Springer gave
@@ -121,12 +136,17 @@ the GitHub PR list and TIN-4543.
 
 `flock bulkload.worktrees/.check-fast.lock nice -n 10 nix develop .#default
 --command just check-fast`, with
-`CARGO_TARGET_DIR=/srv/fast-local/jess/cargo-target/whitepaper`, run twice
-on the merge `7e2921a` plus this pass's doc edits. The first run came
-before the `3dbfbdb` update and the second after it, on the final tree
-(only this paragraph changed afterwards). Both exited 0. In each, the
-`cargo test` result lines total 683 passed and 0 failed, and the Python
-contract suite ran 22 tests, OK. This lane changes documentation only.
+`CARGO_TARGET_DIR=/srv/fast-local/jess/cargo-target/whitepaper`. Every run
+exited 0, and the Python contract suite ran 22 tests, OK, each time.
+
+| run | tree | `cargo test` result lines |
+|---|---|---|
+| 1 | `7e2921a` plus part 1's edits, before the `3dbfbdb` update | 683 passed, 0 failed |
+| 2 | `7e2921a` plus part 1's final edits (committed as `6ab4ce0`) | 683 passed, 0 failed |
+| 3 | `cb4469b` (with #146's code) plus part 2's edits | 690 passed, 0 failed |
+
+During run 3, only documentation lines were edited: a rewrap in section
+2.7 and this paragraph. This lane changes documentation only.
 
 - The draft's run, on `57030e1`, exited 0.
 - The review-fix pass's run was queued when its session ended. No commit
@@ -134,7 +154,8 @@ contract suite ran 22 tests, OK. This lane changes documentation only.
 
 ## Open
 
-- **Formal model.** Section 4 cites `3dbfbdb`. If lane B's branch moves
+- **Formal model.** Section 4 cites `3dbfbdb`, with the head at
+  `d7589e0`. If lane B's branch moves
   or merges, re-pin to the `main` path and its sha. Describe the Dhall
   catalogue and the Haskell explorer as done only once they land, and add
   bibliography entries for them if they are cited. Adopting WP0(g) under
@@ -148,8 +169,9 @@ contract suite ran 22 tests, OK. This lane changes documentation only.
 - **OI-1003-Q24 and Q25 are not in `docs/slo.md`.** The paper cites them
   through TIN-4543. Point at `docs/slo.md` once the coordinator's docs PR
   merges.
-- **Refresh on merge** of #146, #150, #151, #153 or #154, of the estate
-  corpus (WP0(e)), or of a gated gate (a) sample on corpus v1.
+- **Refresh on merge** of #150, #151, #153 or #154, of the estate corpus
+  (WP0(e)), or of a gated gate (a) sample on corpus v1. When WP0(a)'s S3
+  measurement of the chains lands, cite it in sections 2.7 and 5.4.
 - **S5 classes with no owner.** Configuration, shallow-frontier, nest
   custody and rebuildable-root movement, and directory-shape drift, still
   refuse. No ruling or work package names them.

@@ -1,8 +1,9 @@
 # bulkload: moving a live agent estate between machines
 
 **Whitepaper, draft of 2026-10-03.** Proof package item one (OI-1003-Q7).
-Code base: `origin/main` at `6268175`. That includes WP1 (#145, merged as
-`adb9c66`), WP2 PR 1 (#144, `04ea9cb`) and WP10 PR 1 (#152, `6268175`).
+Code base: `origin/main` at `46587af`. That includes WP1 (#145, merged as
+`adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152, `6268175`) and
+WP2 PR 2 (#146, `46587af`).
 References use keys in square brackets (for example
 [Rsync96]); each one resolves in the [bibliography](bibliography.md), with
 a note on how it was verified.
@@ -17,7 +18,7 @@ normative document disagree, the normative document wins:
 
 Statements about the code cite a file under `crates/`. Statements about
 results cite an evidence file and its date. Work that is ratified but not on
-`main` at `6268175` is marked as such. The paper quotes no SLO number; it
+`main` at `46587af` is marked as such. The paper quotes no SLO number; it
 links [`docs/slo.md`](../slo.md) for them, so a dated amendment there cannot
 leave this paper silently out of date.
 
@@ -396,11 +397,11 @@ same table. A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` in
 `git-export` and `estate-capture` before any other read. `GIT_NO_LAZY_FETCH`
 on every child is the second guard against faulting in a lazy fetch.
 
-**The cost problem, and the ruling.** Without a prerequisite base, v1 runs
-`bundle create --all` (`write_bundle` in `shared.rs`), so a changed rerun
-re-packs the repository's whole history. The cohort-1 estimate (run on
-2026-09-24 UTC) measured 9.759 MB of thin pack actually missing, against
-1,475.90 MB of history on disk
+**The cost problem, and the ruling.** Before WP2 PR 2, a v1 capture with
+no prerequisite base ran `bundle create --all` (`write_bundle` in
+`shared.rs`), so a changed rerun re-packed the repository's whole history.
+The cohort-1 estimate (run on 2026-09-24 UTC) measured 9.759 MB of thin
+pack actually missing, against 1,475.90 MB of history on disk
 ([estimate](../evidence/git-carry-estimate-2026-09-23.md)). A second engine,
 `carry_v2`, implements negotiated thin packs in the style of Git's pack
 protocol [GitPackProto] [GitPackObjects]. On fixtures, its sent object set
@@ -414,12 +415,37 @@ equalled what `upload-pack` sends for the same have list
 - measure S3 on the estate-shaped corpus;
 - then choose v1, a hybrid, or v2 on the numbers.
 
-The first step is on `main`: WP2 PR 1 (#144) counts the storage reads of
-the Git children that pack a capture, and every metadata census
-(`census_walks`; `tests/git_capture_counters.rs` pins it at 4 for a changed
-item and 1 for a reuse hit). The second step, the auto-prerequisite, is
-WP2 PR 2 (#146), which is open and not on `main`. So a changed rerun
-still re-packs the whole history; #144's own test measures that baseline.
+The first two steps are on `main`:
+
+- **Counters.** WP2 PR 1 (#144) counts the storage reads of the Git
+  children that pack a capture, and every metadata census (`census_walks`;
+  `tests/git_capture_counters.rs` pins it at 4 for a changed item and 1 for
+  a reuse hit).
+- **Auto-prerequisite chains.** WP2 PR 2 (#146, merged as `46587af`;
+  `git_carry/chain.rs`; [`docs/design.md`](../design.md), "Drift").
+  - With no plan base, a capture that follows a retained capture of the
+    same checkout declares that capture's tips as its prerequisites.
+    Only tips whose commits the source object store holds count. It then
+    packs only what is new (`write_chained` in `shared.rs`).
+  - A `.prior` sidecar, durable before the record, names each link.
+  - Depth is capped at 8 (`CHAIN_DEPTH_LIMIT`). The capture after a
+    depth-8 bundle re-bases to a self-contained bundle, which re-packs the
+    whole history again.
+  - Restore checks every link and flattens the chain into one bundle
+    before it applies. A broken chain is never a reuse hit, and the next
+    capture re-bases.
+  - Some side-door verbs still take a single bundle (#148).
+
+The evidence for the chains is from fixtures only:
+
+- #146's counters test shows that a rerun after one new commit writes
+  less than an eighth of the 256 KiB history it used to re-pack;
+- a property test (P-CHAIN, `estate::wp2_chain`) checks that random reruns
+  chain without re-packing that history, and that apply restores HEAD and
+  the bytes.
+
+No estate run has measured them yet. Measuring S3 on the estate-shaped
+corpus is the next step.
 
 Until then the ruling keeps `carry_v2` frozen behind a feature. The code
 does not have that gate yet. `carry_v2` is declared unconditionally
@@ -471,7 +497,7 @@ section 1, problem 3). That review counted, at `727493a`:
   `output()` maps any failed Git child to that one code and drops its
   stderr.
 
-On `6268175`, a failed SQLite backup step still maps to `Io(None)`
+On `46587af`, a failed SQLite backup step still maps to `Io(None)`
 (`snapshot` in `src/provider_sqlite.rs`). `closure.rs` still reads a refusal
 code back out of the receipt's Display text (`split_whitespace`), instead of
 matching a typed value. Such refusals name no cause that a disposition could
@@ -724,7 +750,7 @@ each claim. Five instruments exist or are being built.
   times the cases. There is no fuzzing (OI-1003-Q7). The method follows
   QuickCheck [QuickCheck00] through `proptest` [Proptest]. A test is retired
   only when its subsuming property catches the specific mutant the old test
-  was written for. On `main` at `6268175`, `proptest!` appears in five
+  was written for. On `main` at `46587af`, `proptest!` appears in six
   places:
   - the slab pool and chunker models (`src/io/buf/tests.rs`,
     `src/io/chunker/tests.rs`);
@@ -732,10 +758,13 @@ each claim. Five instruments exist or are being built.
   - WP1's P-S2 source-census property (`src/transfer/tests.rs`,
     section 3.3);
   - WP10 PR 1's two properties of the shared child-drain helper,
-    `drain_bounded` (`src/child.rs`, #152).
+    `drain_bounded` (`src/child.rs`, #152);
+  - WP2 PR 2's P-CHAIN property of auto-prerequisite chains
+    (`estate::wp2_chain` in `src/estate.rs`, #146).
 
   WP1 also added `test_support::prop_config`, the plan's fixed-seed helper,
-  in minimal form; P-S2 and `drain_bounded`'s properties run through it.
+  in minimal form; P-S2, `drain_bounded`'s properties and P-CHAIN run
+  through it.
   The plan counted three places before WP1
   ([plan](../plans/2026-10-03-property-test-plan.md), section 0). The
   catalogue is mostly planned work.
@@ -755,7 +784,9 @@ each claim. Five instruments exist or are being built.
     verdicts on three mutations.
 
   The TLA+ model is on the branch `docs/tla-model-20261003`, which is not
-  on `main`. At that branch's origin head, `3dbfbdb`,
+  on `main`. This section cites `3dbfbdb`, the commit with its results. The
+  branch's later origin head, `d7589e0`, changes only a lane note, and
+  nothing under `docs/formal/`. At `3dbfbdb`,
   `docs/formal/BulkloadTransfer.tla` models:
   - wire v5 per entry, from `Entry` and `Decide` through `Held` and
     `SourceDone`;
@@ -886,17 +917,17 @@ each claim. Five instruments exist or are being built.
   on it in addition to R23's 23-file corpus. It is in progress
   (`feat/wp0e-estate-corpus-20261003`).
 
-| SLO | Instrument | State at `6268175` |
+| SLO | Instrument | State at `46587af` |
 |---|---|---|
 | S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
 | S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`. The `-shm` finding awaits a ruling. |
 | S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not built. Pending gate. |
-| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
+| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
 | S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`; disposition ledger pending. |
 | S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is bare `IO` (WP5 PR 2). See section 2.10. |
-| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #152's source, build, test and fault-harness checks passed before it merged as `6268175`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
+| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #146's source, build, test and fault-harness checks passed before it merged as `46587af`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
 
 ## 5. Results
 
@@ -989,7 +1020,9 @@ No run has measured S2's p95-latency and load1 budget
 - **Scope.** All of the above measured the file mover, and every sample
   predates wire v5. The 2026-09-18 sample came from the predecessor bench,
   `tcfs-bulkload-bench`. No run has measured S3 on the Git carry path:
-  - v1 still re-packs the whole history on a changed rerun (section 2.7);
+  - since WP2 PR 2 (#146), a changed rerun packs only what is new since
+    the previous retained capture, up to a chain depth of 8. That is
+    measured on fixtures only (section 2.7);
   - WP2 PR 1 (#144) now counts the storage reads of the Git children that
     pack a capture, from their own resource usage, and the metadata
     censuses (`census_walks`). The pack-read counter is a lower bound: it
@@ -1073,8 +1106,9 @@ and bulkload never re-implements them. The estimate and `carry_v2` pin
 `pack.useSparse=false` and `pack.useBitmaps=false`, so their object counts
 are exact. `upload-pack` is the exactness oracle. *Deferred:* negotiated
 thin packs over the bulkload wire (`carry_v2`) are frozen by WP0(a). The
-cheaper fix measured first is v1 bundles whose prerequisite is the previous
-retained capture's tips.
+cheaper fix is v1 bundles whose prerequisite is the previous retained
+capture's tips. It is on `main` (#146), and it is to be measured on the
+estate corpus first.
 
 **Git's racy index** [RacyGit]. Git treats an index entry as racily clean
 when its cached `st_mtime` is the same as, or newer than, the index file's
@@ -1213,8 +1247,9 @@ ranks the work. This paper only points at it:
   on the SQLite `-shm` finding;
 - bounded salvage (#124, OI-1002-Q33): code in #154, open, not on `main`;
 - one Git engine with counted, incremental v1: WP2. PR 1 (pack-read and
-  census counters) is on `main`; PR 2 (the auto-prerequisite, #146) is
-  open;
+  census counters) and PR 2 (auto-prerequisite chains, #146) are on
+  `main`. The S3 measurement on the estate corpus, and then the choice of
+  engine, come next;
 - typed refusals and S4 closure over every item kind: WP3 (PRs 1 and 2,
   #150 and #151, open);
 - one `sync` verb in place of today's choreography of verbs: WP4;
@@ -1228,8 +1263,9 @@ ranks the work. This paper only points at it:
 - sprawl removal: WP10. PR 1 (#152) is on `main`; PR 2 (#153) is open.
 
 Two proof-package items are in progress elsewhere. The formal model is on
-`docs/tla-model-20261003`, whose origin head was `3dbfbdb` when this was
-written. Its TLC results are committed there, but it is not yet on `main`.
+`docs/tla-model-20261003`, whose origin head was `d7589e0` when this was
+written. Its TLC results are committed there (`3dbfbdb`), but it is not yet
+on `main`.
 Its Dhall catalogue and Haskell explorer are sprint 2 work (OI-1003-Q32).
 The estate-shaped corpus is on `feat/wp0e-estate-corpus-20261003`. A gated
 gate (a) run on corpus v1, and a first gate (b) run, are still owed.
