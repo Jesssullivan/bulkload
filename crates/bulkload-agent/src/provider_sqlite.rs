@@ -4,6 +4,7 @@
 //! All tables, including unknown tables and recovery orphans, are preserved.
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -283,7 +284,10 @@ fn compose(
     if integrity != "ok" {
         return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
     }
-    fs::File::open(output)?.sync_file_counted()?;
+    fs::File::open(output)
+        .refuse_at("provider_sqlite::compose")?
+        .sync_file_counted()
+        .refuse_at("provider_sqlite::compose")?;
     Ok(summary)
 }
 

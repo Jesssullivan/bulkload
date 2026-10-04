@@ -8,6 +8,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use bulkload_agent::refuse::RefuseAt as _;
 use bulkload_handoff::{self as handoff, Outcome};
 use bulkload_proto::{BulkloadRefusal, Result};
 
@@ -105,8 +106,9 @@ fn seconds(value: &std::ffi::OsString) -> Result<std::time::Duration> {
 
 /// Write the receipt and make it durable before reporting its path.
 fn write_receipt(path: &Path, payload: &[u8]) -> Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(payload)?;
-    bulkload_agent::counters::sync_full(&file)?;
+    const SITE: &str = "handoff::main::write_receipt";
+    let mut file = std::fs::File::create(path).refuse_at(SITE)?;
+    file.write_all(payload).refuse_at(SITE)?;
+    bulkload_agent::counters::sync_full(&file).refuse_at(SITE)?;
     Ok(())
 }

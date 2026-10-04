@@ -443,7 +443,7 @@ impl Control {
     /// [`BulkloadRefusal::FrameCodec`] if postcard declines the value, and
     /// [`BulkloadRefusal::BudgetExceeded`] past [`MAX_FRAME_BYTES`].
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let body = postcard::to_stdvec(self)?;
+        let body = postcard::to_stdvec(self).map_err(|_| BulkloadRefusal::FrameCodec)?;
         let header = frame_header(TAG_CONTROL, body.len())?;
         let mut out = Vec::with_capacity(FRAME_HEADER_BYTES + body.len());
         out.extend_from_slice(&header);

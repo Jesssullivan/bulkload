@@ -4,6 +4,7 @@
 //! workspace's staged, dirty, ignored and filesystem metadata capture.
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -31,9 +32,12 @@ fn stash_history(repo: &Path, inventory: &str) -> Result<Vec<u8>> {
 /// # Errors
 /// Refuses changing refs/stashes/HEAD, invalid Git state or occupied capture paths.
 pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
-    let repo = fs::canonicalize(repo)?;
-    fs::DirBuilder::new().mode(0o700).create(capture)?;
-    let capture = fs::canonicalize(capture)?;
+    let repo = fs::canonicalize(repo).refuse_at("git_carry::shared::export_base")?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(capture)
+        .refuse_at("git_carry::shared::export_base")?;
+    let capture = fs::canonicalize(capture).refuse_at("git_carry::shared::export_base")?;
     if capture.starts_with(&repo) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
@@ -106,7 +110,8 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(bundle)?;
+        .open(bundle)
+        .refuse_at("git_carry::shared::prerequisites")?;
     let mut source = BufReader::new(file);
     let mut consumed = 0usize;
     let mut prerequisite = Vec::new();
@@ -115,7 +120,8 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
         let count = source
             .by_ref()
             .take(1024 * 1024)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .refuse_at("git_carry::shared::prerequisites")?;
         if consumed == 0 && line != b"# v2 git bundle\n" && line != b"# v3 git bundle\n" {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
@@ -161,7 +167,9 @@ impl PackStats {
     pub(super) fn record(path: &Path, raw: bool, storage_read: u64) -> Result<Self> {
         use crate::counters::{add, Counter};
         let stats = Self {
-            bytes: fs::symlink_metadata(path)?.len(),
+            bytes: fs::symlink_metadata(path)
+                .refuse_at("git_carry::shared::record")?
+                .len(),
             objects: pack_object_count(path, raw)?,
             storage_read,
         };
@@ -175,10 +183,12 @@ impl PackStats {
 // The object count a pack header declares: `PACK`, version 2 or 3, count, all
 // big-endian. A bundle's pack follows its header's blank line.
 fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
+    const SITE: &str = "git_carry::shared::pack_object_count";
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .refuse_at(SITE)?;
     let mut source = BufReader::new(file);
     if !raw {
         let mut consumed = 0usize;
@@ -187,7 +197,8 @@ fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
             let count = source
                 .by_ref()
                 .take(1024 * 1024)
-                .read_until(b'\n', &mut line)?;
+                .read_until(b'\n', &mut line)
+                .refuse_at(SITE)?;
             consumed = consumed
                 .checked_add(count)
                 .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -200,7 +211,7 @@ fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
         }
     }
     let mut header = [0u8; 12];
-    source.read_exact(&mut header)?;
+    source.read_exact(&mut header).refuse_at(SITE)?;
     let (magic, rest) = header.split_at(4);
     let (version, count) = rest.split_at(4);
     if magic != b"PACK" || !matches!(version, [0, 0, 0, 2 | 3]) {
@@ -212,18 +223,11 @@ fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
     Ok(u64::from(u32::from_be_bytes(count)))
 }
 
-// `git bundle create` through the measured child path. `None` when git
-// declined to write the bundle.
-fn create_bundle(
-    command: &mut Command,
-    bundle: &Path,
-    stdin: Option<&[u8]>,
-) -> Result<Option<PackStats>> {
-    let (success, storage_read) = super::pack_child(command.stdout(Stdio::null()), stdin)?;
-    if !success {
-        return Ok(None);
-    }
-    PackStats::record(bundle, false, storage_read).map(Some)
+// `git bundle create` through the measured child path. A failed child refuses
+// GIT_CHILD_FAILED with its stderr class (WP3, R-N121).
+fn create_bundle(command: &mut Command, bundle: &Path, stdin: Option<&[u8]>) -> Result<PackStats> {
+    let storage_read = super::pack_child(command.stdout(Stdio::null()), stdin)?;
+    PackStats::record(bundle, false, storage_read)
 }
 
 // A self-contained bundle of every private ref.
@@ -235,8 +239,7 @@ fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
             .arg("--all"),
         bundle,
         None,
-    )?
-    .ok_or(BulkloadRefusal::GitInventoryMalformed)
+    )
 }
 
 /// Write a capture bundle whose prerequisites are `prior`'s source-held tips
@@ -274,6 +277,8 @@ pub(super) fn write_chained(
 // is packed by `pack-objects`, and the header (signature, prerequisites,
 // every private ref) is written here, as the shared-base path rewrites it.
 // `bundle verify` in the caller checks the result like any other bundle.
+// Both children go through the measured, classified child path: a failed
+// one refuses GIT_CHILD_FAILED with its stderr class (WP3, R-N121).
 //
 // A failed write removes its pending object list and header, so a refused
 // pass leaves no partial file beside the bundle path.
@@ -298,31 +303,33 @@ fn write_excluding_tip_trees_pending(
     bundle: &Path,
     commits: &BTreeSet<String>,
 ) -> Result<PackStats> {
+    const SITE: &str = "git_carry::shared::write_excluding_tip_trees_pending";
     let listing = bundle.with_extension("objects-pending");
     let list = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&listing)?;
+        .open(&listing)
+        .refuse_at(SITE)?;
     let exclusions = commits.iter().fold(String::new(), |mut result, value| {
         result.push('^');
         result.push_str(value);
         result.push('\n');
         result
     });
-    let (listed, list_read) = super::pack_child(
+    let list_read = super::pack_child(
         git(private)
             .args(["rev-list", "--objects-edge-aggressive", "--all", "--stdin"])
-            .stdout(Stdio::from(list.try_clone()?)),
+            .stdout(Stdio::from(list.try_clone().refuse_at(SITE)?)),
         Some(exclusions.as_bytes()),
     )?;
-    if !listed {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
     let mut objects = Vec::new();
-    fs::File::open(&listing)?.read_to_end(&mut objects)?;
-    fs::remove_file(&listing)?;
+    fs::File::open(&listing)
+        .refuse_at(SITE)?
+        .read_to_end(&mut objects)
+        .refuse_at(SITE)?;
+    fs::remove_file(&listing).refuse_at(SITE)?;
     // Edge lines (`-<oid>`) name excluded commits, not objects to pack.
     let objects: Vec<u8> = objects
         .split_inclusive(|byte| *byte == b'\n')
@@ -337,29 +344,30 @@ fn write_excluding_tip_trees_pending(
         _ => return Err(BulkloadRefusal::GitInventoryMalformed),
     };
     for value in commits {
-        writeln!(header, "-{value} shared base")?;
+        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
     }
-    writeln!(header, "{}\n", refs(private)?)?;
+    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
     let pending = bundle.with_extension("header-pending");
     let mut target = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&pending)?;
-    target.write_all(&header)?;
-    target.flush()?;
-    let (packed, pack_read) = super::pack_child(
+        .open(&pending)
+        .refuse_at(SITE)?;
+    target.write_all(&header).refuse_at(SITE)?;
+    target.flush().refuse_at(SITE)?;
+    let pack_read = super::pack_child(
         git(private)
             .args(["pack-objects", "--stdout", "--delta-base-offset"])
-            .stdout(Stdio::from(target.try_clone()?)),
+            .stdout(Stdio::from(target.try_clone().refuse_at(SITE)?)),
         Some(&objects),
     )?;
-    if !packed {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    target.sync_file_counted()?;
-    fs::rename(&pending, bundle)?;
-    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
+    target.sync_file_counted().refuse_at(SITE)?;
+    fs::rename(&pending, bundle).refuse_at(SITE)?;
+    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
     PackStats::record(bundle, false, list_read.saturating_add(pack_read))
 }
 
@@ -378,40 +386,38 @@ pub(super) fn write_bundle(
         return write_full(private, bundle);
     };
     let commits = prerequisite_commits(private, base)?;
-    write_with_prerequisites(private, bundle, &commits)?
-        .ok_or(BulkloadRefusal::GitInventoryMalformed)
+    write_with_prerequisites(private, bundle, &commits)
 }
 
 // A bundle excluding everything reachable from `commits`, which it declares
-// as its prerequisites. `None` when git declined to write it.
+// as its prerequisites. A failed `bundle create` refuses GIT_CHILD_FAILED
+// with its stderr class (WP3, R-N121).
 fn write_with_prerequisites(
     private: &Path,
     bundle: &Path,
     commits: &BTreeSet<String>,
-) -> Result<Option<PackStats>> {
+) -> Result<PackStats> {
+    const SITE: &str = "git_carry::shared::write_with_prerequisites";
     let exclusions = commits.iter().fold(String::new(), |mut result, value| {
         result.push('^');
         result.push_str(value);
         result.push('\n');
         result
     });
-    let Some(stats) = create_bundle(
+    let stats = create_bundle(
         git(private)
             .args(["bundle", "create"])
             .arg(bundle)
             .args(["--all", "--stdin"]),
         bundle,
         Some(exclusions.as_bytes()),
-    )?
-    else {
-        return Ok(None);
-    };
+    )?;
 
     // Git omits excluded ref tips from bundle headers. Our HEAD may be exactly
     // a base tip, and staged/worktree commits deliberately have no parents.
     // Retain every advertised workspace ref and explicitly declare the base
     // commits needed by their trees. The pack remains entirely Git-generated.
-    let mut source = BufReader::new(fs::File::open(bundle)?);
+    let mut source = BufReader::new(fs::File::open(bundle).refuse_at(SITE)?);
     let mut header = Vec::new();
     let mut consumed = 0usize;
     loop {
@@ -419,7 +425,8 @@ fn write_with_prerequisites(
         let count = source
             .by_ref()
             .take(1024 * 1024)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .refuse_at(SITE)?;
         consumed = consumed
             .checked_add(count)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -437,21 +444,25 @@ fn write_with_prerequisites(
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     for value in commits {
-        writeln!(header, "-{value} shared base")?;
+        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
     }
-    writeln!(header, "{}\n", refs(private)?)?;
+    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
     let pending = bundle.with_extension("header-pending");
     let mut target = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&pending)?;
-    target.write_all(&header)?;
-    std::io::copy(&mut source, &mut target)?;
-    target.sync_file_counted()?;
-    fs::rename(&pending, bundle)?;
-    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
-    Ok(Some(stats))
+        .open(&pending)
+        .refuse_at(SITE)?;
+    target.write_all(&header).refuse_at(SITE)?;
+    std::io::copy(&mut source, &mut target).refuse_at(SITE)?;
+    target.sync_file_counted().refuse_at(SITE)?;
+    fs::rename(&pending, bundle).refuse_at(SITE)?;
+    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
+    Ok(stats)
 }
 
 #[cfg(test)]

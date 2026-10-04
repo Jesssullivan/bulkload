@@ -20,6 +20,7 @@
 //! closes and commits whatever is pending, so an interrupted transfer keeps
 //! the work it finished.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::File;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -293,7 +294,8 @@ impl<S: GroupSink> Committer<S> {
         let shared = Failure::clone(&failure);
         let handle = std::thread::Builder::new()
             .name("bulkload-commit".to_owned())
-            .spawn(move || run(sink, &receiver, limits, &shared))?;
+            .spawn(move || run(sink, &receiver, limits, &shared))
+            .refuse_at("io::durable::spawn_with")?;
         Ok(Self {
             sender: Some(sender),
             handle: Some(handle),

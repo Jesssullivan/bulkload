@@ -85,6 +85,7 @@ pub mod durable {
 /// OI-1003-Q17): the class, and `io::sys::enter_background`.
 pub mod priority {
     pub use crate::io::PriorityClass;
+    use crate::refuse::RefuseAt as _;
 
     /// Enter background priority for this process and everything it creates
     /// afterwards. Call it before any thread exists.
@@ -92,7 +93,7 @@ pub mod priority {
     /// # Errors
     /// Refuses with the errno of the scheduling call that failed.
     pub fn enter_background() -> crate::Result<()> {
-        crate::io::sys::enter_background().map_err(Into::into)
+        crate::io::sys::enter_background().refuse_at("priority::enter_background")
     }
 
     /// Whether the calling thread runs at background priority.
@@ -100,7 +101,7 @@ pub mod priority {
     /// # Errors
     /// Refuses with the errno of the scheduling query that failed.
     pub fn in_background() -> crate::Result<bool> {
-        crate::io::sys::in_background().map_err(Into::into)
+        crate::io::sys::in_background().refuse_at("priority::in_background")
     }
 }
 
@@ -126,6 +127,7 @@ pub mod crash_check {
 }
 pub mod materialize;
 pub mod provider_sqlite;
+pub mod refuse;
 pub mod space;
 #[cfg(test)]
 pub(crate) mod test_support;
