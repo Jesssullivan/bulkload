@@ -5,9 +5,10 @@ Rulings:
 - OI-1003-Q7: proof package, formal model; CI stays slim.
 - OI-1003-Q32: TLA+ with TLC is the checker of record; a hybrid with a
   typed catalogue and an N-version core.
-- OI-1003-Q37 and OI-1003-Q38: cited by the lane brief. Their text is not
-  in `docs/slo.md`, nor on `docs/coordinator-20261003` at `8dd4546`, so this
-  note does not restate them (open).
+- OI-1003-Q37 and OI-1003-Q38: cited by the lane brief. Their text is in
+  the coordinator's note, `docs/agent-notes/2026-10-03-coordinator.md`
+  (on main since #167, and on this branch since the round 3 merge): Q37
+  ratifies WP0(g) with conditions, and Q38 sets the overnight scope.
 - R-N13.
 - Also followed: R-N11, R-N12, R-N92 and R-N101 (wording), R-N104, R-N98
   (no hook bypass).
@@ -15,7 +16,8 @@ Rulings:
 Branch `docs/formal-hybrid-20261004`, worktree
 `bulkload.worktrees/formal-hybrid-20261004`, created from
 `origin/docs/tla-model-20261003` at `27581be` (PR #160, stacked). This
-session was its only writer. No PR was opened, as the brief asked.
+session was its only writer. Rounds 1 and 2 opened no PR, as their briefs
+asked; round 3 opened it, to main (below).
 
 Shas:
 
@@ -34,8 +36,10 @@ Shas:
   made after `efde8ac`.
 - Round 2 (review fixes, below): `c94d2f9` (catalogue tables, grounding
   both ways), `2eb7ef3` (formal-nv over every in-domain mutation row; the
-  explorer described as a second encoding), and the commit that adds the
-  round 2 section of this note.
+  explorer described as a second encoding), and `ea78eaf` (the round 2
+  section of this note).
+- Round 3 (recheck and PR, below): `fce7ba5` (merge of `origin/main` at
+  `cd4ffad`) and the commit that adds the round 3 section of this note.
 
 ## What was done
 
@@ -150,8 +154,6 @@ Shas:
 
 ## Open
 
-- OI-1003-Q37 and OI-1003-Q38: record their text in `docs/slo.md` (or the
-  coordinator branch) so this lane's citations can be checked.
 - Freezing `MC_nv_ledger` as the second N-version row still needs a ruling;
   the explorer already matches it.
 - The explorer is not independent of the spec (round 2). An independent
@@ -161,10 +163,11 @@ Shas:
 - The low findings of the round 2 review are not fixed (listed below).
 - Carried over, unchanged by this lane: the model's re-check against PR #154
   (`Store::open`'s `racy_guard` row deletion, `SALVAGE_BOUND_EXCEEDED`); the
-  code fixes for the unsealed state root and the failing ledger commit; the
+  code fix for the failing ledger commit; the
   rulings on R25's "held durably" and slo.md's R25 wording; Linear
-  (TIN-4543 and the SSOT ledger, owned by the coordinator). #160 is open;
-  this branch has no PR yet (the brief said not to open one).
+  (TIN-4543 and the SSOT ledger, owned by the coordinator). #160 merged
+  into main on 2026-10-04 at 09:56 UTC. This branch's PR was opened by the
+  recheck stage (round 3, below) and is not merged.
 
 ## Round 2: review fixes (2026-10-04)
 
@@ -298,3 +301,115 @@ Low findings, not fixed (as the brief asked):
   is tagged S4, which slo.md does not support.
 - tla-check leaks its scratch when the catalogue fails to evaluate or
   tla-render's name check refuses (`set -e` exits before `rm -rf`).
+
+## Round 3: recheck and PR (2026-10-04)
+
+A recheck-and-ship session, the only writer in this worktree for its run.
+Rulings: OI-1003-Q7, OI-1003-Q32, OI-1003-Q37, OI-1003-Q38, R-N13. An
+earlier run of this stage stopped before committing; it left an
+uncommitted draft of this section, with placeholders and a base branch
+that no longer applies. This section replaces that draft, and records
+only what this run checked.
+
+It read the diff from the build head `65ad448` to `ea78eaf`: the
+catalogue, `Types.dhall`, `Explorer.hs`, the README, the justfile and this
+note. It then checked each medium finding of the round 2 review on
+`ea78eaf`. Verdict: CLEAN. All five medium findings are fixed, and two of
+them are the same defect. None was rejected or deferred, and the fix
+round added no medium or high defect.
+
+- **formal-nv tested 3 of 17 invariants** (fixed in `2eb7ef3`). The
+  catalogue's `nversion` output lists all 17 in-domain `MC_neg_` rows.
+  `formal-nv` runs each one on the explorer at the row's own bound. It also
+  runs each of the 14 primary rows with every safety invariant checked, on
+  TLC with one worker and on the explorer. The explorer checks its
+  invariants in the configs' order, `TypeOK` to `ClosureAccounted`. 13 of
+  the 17 invariants are some row's named property, and each fires. The
+  README names the other 4, and this run checked the spec side of that
+  claim. In the spec, `clobbered` is set only by `RenameReplace`,
+  `VerifyDisp`, and `StartRun` under `sweep_displaced` with a displaced
+  file. A displaced file comes only from `Exchange`, and all three of those
+  actions are outside the domain.
+- **The primary-row assert compared with a literal, and `allMutations`
+  was written by hand** (two findings, one defect; fixed in `c94d2f9`).
+  Five scratch copies of `catalogue/` were evaluated with dhall-to-json
+  1.7.12:
+  - a new label `new_break`, with a verdict and an index but no `primary`
+    field: `Missing handler: new_break`;
+  - the field added, but no row in `negRows`: `Assertion failed`;
+  - the row added as well: the catalogue evaluates, with 20 mutations and
+    45 files, and `new_break` is in `grounding.mutations`;
+  - that label given index 5, which another label already has:
+    `Assertion failed`;
+  - `primary.double_read` holding `skip_output_row`: `Assertion failed`.
+
+  `safety` and the traceability assert's expected list now come from
+  `propertyTable`'s classes.
+- **The explorer was called independent** (fixed in `2eb7ef3`, by
+  rewording). No text in `docs/formal`, the justfile or this note calls it
+  an independent implementation. The README and its header call it "a
+  second encoding of the spec: independent code, shared design". They say
+  it cannot catch a misreading of the code that the spec makes. The gap
+  itself stays open (see Open).
+- **Grounding checked only one direction** (fixed in `c94d2f9`). In a
+  scratch clone at `ea78eaf`, `"new_break"` was added to the spec's
+  `Mutations`. `just tla-check MC_nv_core` stopped before TLC: "the spec's
+  mutation new_break has no catalogue entry (no verdict, no MC_neg_ row)",
+  exit 1. It left no scratch.
+
+Merge: `fce7ba5` merges `origin/main` at `cd4ffad` into this branch.
+#160, the old base, merged into main at 09:56 UTC. Without the merge,
+the branch conflicted with main in the justfile. Main had appended
+`bench-s2-budget` (#168) after `tla-check`, at the same place this branch
+appends `formal-nv`. The merge keeps both recipes, `formal-nv` first, and
+changes neither. Main's merge touches nothing under `docs/formal`.
+
+Evidence (host sting, scratch under a private `$TMPDIR/formal-hybrid-ship.*`):
+
+- **Rendering** (`ea78eaf`). `just tla-render` into scratch wrote 44
+  files, and `cmp` found each identical to the committed one.
+- **formal-nv** (`ea78eaf`, started 18:38 UTC, load average 53, 56 s):
+  exit 0. Both presets matched TLC, at 15,834 and 142,450 distinct states.
+  All 17 named-property rows and all 14 every-invariant rows matched, and
+  each matched the README's parity table.
+- **tla-check MC_nv_core** (`fce7ba5`, after the merge): "44 files current;
+  grounded 66 operators, 16 constants, 19 mutations, 19 code symbols". The
+  budget self-test came out INCONCLUSIVE on `WithinBudget`, as expected,
+  and `MC_nv_core` was PASS at 15,834 distinct, 44,312 generated, depth 45.
+  Exit 0. This run did not repeat the full `tla-check`. The spec and the 44
+  configs are byte-identical to the round 2 run's.
+- **check-fast** (`fce7ba5`, plus this note's draft):
+  - The command was `flock .check-fast.lock nice -n 10 nix develop
+    .#default --command just check-fast`, with the cargo target in this
+    worktree. It ran from 18:40:50 to 18:50:55 UTC and exited 0.
+  - It outlasted the 600 s foreground limit, so the harness moved it to the
+    background. This run waited for its completion notice and started no
+    other build meanwhile.
+  - Results: ruff, shellcheck and actionlint clean; gitleaks "no leaks
+    found"; fmt and the three clippy runs clean; 699 cargo tests passed
+    and none failed; fault harness 56 passed; `power_loss` 9 passed; the
+    repo manifest PASS; `test_ci_contract.py` 22 OK.
+
+Found at recheck (low):
+
+- The README's N-version core section says that `formal-nv` runs every
+  in-domain mutation row "on both checkers". That is true only of the
+  primary rows. `formal-nv` runs the three `also` rows on the explorer
+  alone: `reread_unchanged`, `reread_changed_only` and
+  `record_racy_ledger`. Their TLC verdicts come from `tla-check`.
+
+Open, beyond round 2's list:
+
+- the low finding above and round 2's unfixed lows, which are in the PR's
+  review summary;
+- Linear (TIN-4543 and the SSOT ledger), which is the coordinator's;
+- #166 sealed the transfer store's state root and closed #161; it merged
+  into main at 11:52 UTC. The spec's `StoreRootSealed` comment and the
+  README still call the sealed root an assumption the code does not meet
+  yet. Updating the model's text to match the code is follow-up work for
+  the model's owner. This lane did not change it.
+- the PR is open and unmerged; its URL is recorded below once it exists.
+
+Scratch: only this session's private `$TMPDIR/formal-hybrid-ship.*`,
+deleted at the end. The other `formal-hybrid-recheck*` directories in
+`$TMPDIR` belong to earlier runs and were left alone.
