@@ -20,6 +20,7 @@
 //! closes and commits whatever is pending, so an interrupted transfer keeps
 //! the work it finished.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::File;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -149,6 +150,29 @@ pub fn seal_dir(directory: &File) -> std::io::Result<()> {
             super::sys::full_flush(directory)
         }),
     }
+}
+
+/// Make a private state root durable now, whatever the [`Durability`] mode.
+///
+/// #161, R25: the root's entry in `parent` and the entries it holds (a
+/// store's database and WAL). A store's authority leaves the host at Start
+/// and its records are committed inside the root, so ordering is not
+/// enough: both are on stable media when this returns.
+///
+/// `parent` is sealed with [`seal_dir`] and `root` with a full flush
+/// (counted as `flush_dir`). On Darwin that full flush also drains the
+/// drive, and with it the parent's barrier; a parent on another device (the
+/// root is a mount point) is fully flushed as well.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn seal_state_root(parent: &File, root: &File) -> std::io::Result<()> {
+    seal_dir(parent)?;
+    counters::sync_dir(root)?;
+    if super::sys::fstat(parent)?.node.dev != super::sys::fstat(root)?.node.dev {
+        counters::sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// Configure a bulkload-owned `SQLite` store for durable commits: WAL,
@@ -293,7 +317,8 @@ impl<S: GroupSink> Committer<S> {
         let shared = Failure::clone(&failure);
         let handle = std::thread::Builder::new()
             .name("bulkload-commit".to_owned())
-            .spawn(move || run(sink, &receiver, limits, &shared))?;
+            .spawn(move || run(sink, &receiver, limits, &shared))
+            .refuse_at("io::durable::spawn_with")?;
         Ok(Self {
             sender: Some(sender),
             handle: Some(handle),
@@ -343,14 +368,15 @@ impl<S: GroupSink> Committer<S> {
     /// Commit everything pending, stop the thread and return its report.
     ///
     /// # Errors
-    /// Refuses if the committer thread panicked.
+    /// Refuses [`BulkloadRefusal::WorkerLost`] if the committer thread
+    /// panicked.
     pub fn finish(mut self) -> Result<S::Report> {
         drop(self.sender.take());
         self.handle
             .take()
-            .ok_or(BulkloadRefusal::Io(None))?
+            .ok_or(BulkloadRefusal::WorkerLost)?
             .join()
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     }
 }
 

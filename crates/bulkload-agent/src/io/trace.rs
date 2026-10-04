@@ -119,6 +119,10 @@ pub enum CommitRecord {
     },
     /// A directory's final mode is durable and its record retired.
     DirectoryComplete { key: Vec<u8> },
+    /// The store's `root_sealed` setting (#161): `Store::open` sealed the
+    /// state root's entry and its database's entry before this commit, and
+    /// every later open trusts the marker without sealing again.
+    RootSealed,
 }
 
 #[cfg(feature = "io-trace")]

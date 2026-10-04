@@ -10,6 +10,7 @@
 //! `bytes_reread_on_resume` to zero; a cache consulted once per seat is what
 //! drives `files_statted_twice` to zero.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::HashMap;
 
 use bulkload_proto::{BulkloadRefusal, Result, RowSchema};
@@ -252,7 +253,8 @@ impl FreshnessCache for SqliteCache {
             identity.size,
             identity.mtime_ns,
             identity.ctime_ns,
-        ))?;
+        ))
+        .refuse_at("freshness::digest")?;
         let bytes: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -278,7 +280,8 @@ impl FreshnessCache for SqliteCache {
             identity.size,
             identity.mtime_ns,
             identity.ctime_ns,
-        ))?;
+        ))
+        .refuse_at("freshness::record_digest")?;
         self.conn
             .execute(
                 "INSERT INTO hash_completion(identity, digest) VALUES (?1, ?2)

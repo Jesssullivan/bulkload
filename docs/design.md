@@ -20,6 +20,14 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   current capture and SOURCE says `workspace-restored`.
 - `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
   cause and does not close an item.
+
+  Refusal codes stay typed at the source (WP3, 2026-10-03). Every taxonomy
+  code is raised by product code, never kept as unused vocabulary. A Git
+  child that exits non-zero refuses `GIT_CHILD_FAILED` with a
+  `stderr_class=` from a closed set; its stderr is classified, never echoed
+  or kept (R-N121). No blanket conversion turns an OS or codec error into a
+  refusal: each site names itself with `.refuse_at(site)`. The sites that
+  still raise a bare `IO` with no errno are an allowlist that only shrinks.
 - `referenced-only`: the item plans no workspace, and the exact
   current-capture journal says `refs-imported`. `git-repair-missing-index`
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
@@ -103,7 +111,10 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   the pass through the private repository's `alternates`), the item is
   `deferred-with-drift` with one `ObjectStoreRewritten` row, no capture
   record is written, and the next pass captures the rewritten store. The
-  same failure under an unchanged listing still refuses.
+  child's failure is the one a failed v1 Git child raises,
+  `GIT_CHILD_FAILED` with its stderr class (WP3), or
+  `GIT_INVENTORY_MALFORMED` for output that did not parse; the same failure
+  under an unchanged listing still refuses.
 - The pass window runs from the pre-pass key to the post-pass key, not only
   across the export's own snapshot. A capture is clean only when the
   pre-pass key parts, the export's own before and after ref inventories, and
@@ -441,6 +452,14 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+A store's state root and its database entry are sealed (the root fully
+flushed) before `Store::open` returns, so before Start and any commit, and a
+store without the `root_sealed` setting is sealed again on open (#161, R25).
+The setting commits only after the seal returns. A sealed store reopens
+without opening the root's parent; a root that still needs its seal under a
+parent the agent cannot read refuses with `IO` (`EACCES`). Other private
+state directories seal their own entry before records go in.
 
 Space preflight (OI-1001-Q2): a write that would leave its destination
 filesystem (`statvfs`; `statfs` on Darwin) with less than

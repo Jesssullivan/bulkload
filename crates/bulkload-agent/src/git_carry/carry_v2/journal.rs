@@ -14,6 +14,7 @@
 //! under an exclusive `flock` for as long as its session is open, so two
 //! sessions never interleave records.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
@@ -70,7 +71,7 @@ impl JournalStore {
     pub(super) fn key(&self) -> crate::Result<String> {
         let carry = private_subdirectory(self.state.directory(), "git-carry-v2", true)?
             .ok_or(BulkloadRefusal::Io(None))?;
-        seal_dir(self.state.directory())?;
+        seal_dir(self.state.directory()).refuse_at("git_carry::carry_v2::journal::key")?;
         let token = state_token(&carry)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"bulkload git-carry-v2 quarantine key\0");
@@ -91,8 +92,9 @@ impl JournalStore {
         };
         let ingest = private_subdirectory(&carry, "ingest", create)?;
         if create {
-            seal_dir(&carry)?;
-            seal_dir(self.state.directory())?;
+            seal_dir(&carry).refuse_at("git_carry::carry_v2::journal::directory")?;
+            seal_dir(self.state.directory())
+                .refuse_at("git_carry::carry_v2::journal::directory")?;
         }
         Ok(ingest)
     }
@@ -138,21 +140,28 @@ fn state_token(carry: &File) -> crate::Result<[u8; TOKEN_BYTES]> {
         let mut held = Vec::with_capacity(TOKEN_BYTES + 1);
         (&file)
             .take(u64::try_from(TOKEN_BYTES + 1).map_err(|_| BulkloadRefusal::BudgetExceeded)?)
-            .read_to_end(&mut held)?;
+            .read_to_end(&mut held)
+            .refuse_at("git_carry::carry_v2::journal::state_token")?;
         if held.len() > TOKEN_BYTES {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
         if held.len() == TOKEN_BYTES {
             token.copy_from_slice(&held);
         } else {
-            File::open("/dev/urandom")?.read_exact(&mut token)?;
-            file.set_len(0)?;
-            (&file).write_all(&token)?;
+            File::open("/dev/urandom")
+                .refuse_at("git_carry::carry_v2::journal::state_token")?
+                .read_exact(&mut token)
+                .refuse_at("git_carry::carry_v2::journal::state_token")?;
+            file.set_len(0)
+                .refuse_at("git_carry::carry_v2::journal::state_token")?;
+            (&file)
+                .write_all(&token)
+                .refuse_at("git_carry::carry_v2::journal::state_token")?;
         }
         // Sealed by whoever reads it, too: a creator that died after its
         // write and before its seal left the bytes only in the page cache.
-        seal_file(&file)?;
-        seal_dir(carry)?;
+        seal_file(&file).refuse_at("git_carry::carry_v2::journal::state_token")?;
+        seal_dir(carry).refuse_at("git_carry::carry_v2::journal::state_token")?;
         return Ok(token);
     }
     Err(BulkloadRefusal::JournalOwnershipConflict)
@@ -391,13 +400,21 @@ impl Journal {
         }
         // No plan was ever sealed, or the session was abandoned: nothing it
         // recorded is still in force. Empty it in place, under the lock.
-        journal.file.set_len(0)?;
-        seal_file(&journal.file)?;
+        journal
+            .file
+            .set_len(0)
+            .refuse_at("git_carry::carry_v2::journal::open")?;
+        seal_file(&journal.file).refuse_at("git_carry::carry_v2::journal::open")?;
         Ok(Found::Fresh(journal))
     }
 
     /// Open or create the file at `name` and lock it, until the locked
     /// descriptor is the file the name holds.
+    ///
+    /// The name is sealed by whoever claims it, not only by its creator
+    /// (#161): a creator that died between its create and its seal left the
+    /// entry only in the page cache, and the records this claim appends must
+    /// not outlive it.
     fn claim(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
         const ATTEMPTS: u32 = 50;
         for _ in 0..ATTEMPTS {
@@ -405,10 +422,7 @@ impl Journal {
                 Ok(file) => file,
                 Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
                     match create_private(&directory, &name) {
-                        Ok(file) => {
-                            seal_dir(&directory)?;
-                            file
-                        }
+                        Ok(file) => file,
                         // Another opener created it first: open theirs.
                         Err(BulkloadRefusal::Io(Some(libc::EEXIST))) => continue,
                         Err(error) => return Err(error),
@@ -421,6 +435,7 @@ impl Journal {
                 return Err(BulkloadRefusal::JournalOwnershipConflict);
             }
             if names(&directory, &name, &file)? {
+                seal_dir(&directory).refuse_at("git_carry::carry_v2::journal::claim")?;
                 return Ok(Self {
                     file,
                     directory,
@@ -441,7 +456,9 @@ impl Journal {
     /// reads as no records. Any other bad line refuses `SCHEMA_MISMATCH`.
     fn read(&self) -> crate::Result<Vec<Record>> {
         let mut bytes = Vec::new();
-        (&self.file).read_to_end(&mut bytes)?;
+        (&self.file)
+            .read_to_end(&mut bytes)
+            .refuse_at("git_carry::carry_v2::journal::read")?;
         let mut complete = bytes
             .iter()
             .rposition(|b| *b == b'\n')
@@ -479,8 +496,9 @@ impl Journal {
         }
         if complete < bytes.len() {
             self.file
-                .set_len(u64::try_from(complete).map_err(|_| BulkloadRefusal::BudgetExceeded)?)?;
-            seal_file(&self.file)?;
+                .set_len(u64::try_from(complete).map_err(|_| BulkloadRefusal::BudgetExceeded)?)
+                .refuse_at("git_carry::carry_v2::journal::read")?;
+            seal_file(&self.file).refuse_at("git_carry::carry_v2::journal::read")?;
         }
         Ok(records)
     }
@@ -488,8 +506,10 @@ impl Journal {
     /// Append `records` in one write and seal it.
     pub(super) fn append(&self, records: &[Record]) -> crate::Result<()> {
         let text: String = records.iter().map(Record::line).collect();
-        (&self.file).write_all(text.as_bytes())?;
-        seal_file(&self.file)?;
+        (&self.file)
+            .write_all(text.as_bytes())
+            .refuse_at("git_carry::carry_v2::journal::append")?;
+        seal_file(&self.file).refuse_at("git_carry::carry_v2::journal::append")?;
         Ok(())
     }
 
@@ -504,9 +524,12 @@ impl Journal {
         // SAFETY: the name is NUL-terminated and relative to the open
         // journal directory.
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(crate::refuse::io(
+                &std::io::Error::last_os_error(),
+                "git_carry::carry_v2::journal::remove",
+            ));
         }
-        seal_dir(&self.directory)?;
+        seal_dir(&self.directory).refuse_at("git_carry::carry_v2::journal::remove")?;
         Ok(())
     }
 
@@ -532,7 +555,12 @@ pub(super) fn lock_exclusive(file: &File) -> crate::Result<bool> {
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EWOULDBLOCK | libc::EINTR) => {}
-            _ => return Err(error.into()),
+            _ => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::carry_v2::journal::lock_exclusive",
+                ))
+            }
         }
         if attempt < ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -545,7 +573,9 @@ pub(super) fn lock_exclusive(file: &File) -> crate::Result<bool> {
 /// inode. `false` when the name is gone.
 fn names(directory: &File, name: &std::ffi::CString, file: &File) -> crate::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
-    let held = file.metadata()?;
+    let held = file
+        .metadata()
+        .refuse_at("git_carry::carry_v2::journal::names")?;
     let mut at = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `directory` is open, `name` NUL-terminated, and `at` is valid
     // writable storage for one `stat`.
@@ -562,7 +592,10 @@ fn names(directory: &File, name: &std::ffi::CString, file: &File) -> crate::Resu
         if error.raw_os_error() == Some(libc::ENOENT) {
             return Ok(false);
         }
-        return Err(error.into());
+        return Err(crate::refuse::io(
+            &error,
+            "git_carry::carry_v2::journal::names",
+        ));
     }
     // SAFETY: `fstatat` succeeded, so it filled `at`.
     let at = unsafe { at.assume_init() };
@@ -590,7 +623,10 @@ fn open_rw(directory: &File, name: &std::ffi::CString) -> crate::Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::carry_v2::journal::open_rw",
+        ));
     }
     // SAFETY: `fd` was just opened and is owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })

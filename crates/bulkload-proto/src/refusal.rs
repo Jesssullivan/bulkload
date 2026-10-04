@@ -1,8 +1,12 @@
 //! The bulkload refusal taxonomy.
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
-//! into families by prefix: `SnapshotCustody*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Rollback*` and `Budget*`.
+//! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
+//! `Sqlite*`, `Path*`, `Journal*`, `Protocol*` and `Budget*`.
+//!
+//! Every variant has at least one constructor outside test code
+//! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
+//! raises is deleted, not kept as vocabulary.
 //!
 //! Every variant is a *refusal*: the operation did not complete. Earlier durable
 //! progress or prepared state can remain; inspect its receipts before retrying.
@@ -19,16 +23,10 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BulkloadRefusal {
     // ---- custody / snapshot integrity ------------------------------------
-    /// The live snapshot custody root could not be established or opened.
-    SnapshotCustodyUnavailable,
-    /// A payload resolved outside the custody root it claims to live under.
-    SnapshotCustodyEscape,
     /// Declared snapshot roots overlap, alias, or are not unique.
     SnapshotRootsOverlap,
     /// The source tree changed after the immutable snapshot was taken.
     SourceChangedAfterSnapshot,
-    /// A capture claimed ownership of a published snapshot it cannot prove.
-    SnapshotOwnershipUnproven,
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
@@ -38,8 +36,6 @@ pub enum BulkloadRefusal {
     DigestMismatch,
     /// A sealed object required by this stage is missing.
     SealedObjectMissing,
-    /// A sealed object changed between sealing and apply.
-    SealedObjectChanged,
     /// A receipt is not bound to the plan or push it claims.
     ReceiptBindingInvalid,
 
@@ -61,8 +57,6 @@ pub enum BulkloadRefusal {
     PathNotAbsolute,
     /// A path carries control or format characters, or an interior NUL.
     PathNotPortable,
-    /// The path map is empty, detached from source authority, or unmapped.
-    PathMapDetached,
     /// A path left the tree it was resolved against (traversal or symlink).
     PathEscapesRoot,
     /// A directory lies deeper beneath the walk root than the walk descends
@@ -146,6 +140,10 @@ pub enum BulkloadRefusal {
     /// store or an alternate). Reading it could fault in a lazy fetch, so v1
     /// carry refuses it before any other read (S2, OI-1003-Q16).
     GitSourcePartialClone,
+    /// A Git child process exited non-zero (WP3). Carries its stderr's class
+    /// from the closed [`StderrClass`] set; no byte of the stderr itself is
+    /// carried or printed (R-N121).
+    GitChildFailed(StderrClass),
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -154,14 +152,11 @@ pub enum BulkloadRefusal {
     SqliteUnsupportedValue,
     /// Shared rows diverged between planning and apply.
     SqliteStateChanged,
+    /// The `SQLite` online backup (open, step or finish) failed (WP3).
+    /// Carries `SQLite`'s extended result code when `SQLite` reported one.
+    SqliteBackupFailed(Option<i32>),
 
-    // ---- rollback / journal ------------------------------------------------
-    /// The rollback snapshot required to undo this journal is missing.
-    RollbackSnapshotMissing,
-    /// Rollback did not reach the exact recorded before-state.
-    RollbackEndStateDiverged,
-    /// A journal already rolled back cannot be applied again.
-    JournalAlreadyRolledBack,
+    // ---- journal -----------------------------------------------------------
     /// An existing journal belongs to a different transaction.
     JournalOwnershipConflict,
 
@@ -177,10 +172,16 @@ pub enum BulkloadRefusal {
     /// (by count and bytes) was already reached, so it was removed and its
     /// chunks are sent again (#124, OI-1002-Q33).
     SalvageBoundExceeded,
-    /// The transport authority differs from the captured authority.
-    TransportAuthorityMismatch,
     /// The frame could not be encoded or decoded.
     FrameCodec,
+    /// A well-formed frame arrived that the session's state does not allow
+    /// (out of order, for an unknown or settled entry, or contradicting what
+    /// the peer already said), or a session's own bookkeeping disagreed with
+    /// itself (WP3). Never re-synchronised: the session ends.
+    ProtocolStateViolation,
+    /// A worker thread, or the peer of one of its channels, ended before the
+    /// work it owned was done (WP3).
+    WorkerLost,
 
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
@@ -202,15 +203,11 @@ impl BulkloadRefusal {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match *self {
-            Self::SnapshotCustodyUnavailable => "SNAPSHOT_CUSTODY_UNAVAILABLE",
-            Self::SnapshotCustodyEscape => "SNAPSHOT_CUSTODY_ESCAPE",
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
             Self::SourceChangedAfterSnapshot => "SOURCE_CHANGED_AFTER_SNAPSHOT",
-            Self::SnapshotOwnershipUnproven => "SNAPSHOT_OWNERSHIP_UNPROVEN",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::DigestMismatch => "DIGEST_MISMATCH",
             Self::SealedObjectMissing => "SEALED_OBJECT_MISSING",
-            Self::SealedObjectChanged => "SEALED_OBJECT_CHANGED",
             Self::ReceiptBindingInvalid => "RECEIPT_BINDING_INVALID",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
             Self::RequiredFieldMissing => "REQUIRED_FIELD_MISSING",
@@ -219,7 +216,6 @@ impl BulkloadRefusal {
             Self::ClosureUnaccounted => "CLOSURE_UNACCOUNTED",
             Self::PathNotAbsolute => "PATH_NOT_ABSOLUTE",
             Self::PathNotPortable => "PATH_NOT_PORTABLE",
-            Self::PathMapDetached => "PATH_MAP_DETACHED",
             Self::PathEscapesRoot => "PATH_ESCAPES_ROOT",
             Self::PathDepthExceeded => "PATH_DEPTH_EXCEEDED",
             Self::PathTooLong => "PATH_TOO_LONG",
@@ -242,18 +238,18 @@ impl BulkloadRefusal {
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
+            Self::GitChildFailed(_) => "GIT_CHILD_FAILED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
-            Self::RollbackSnapshotMissing => "ROLLBACK_SNAPSHOT_MISSING",
-            Self::RollbackEndStateDiverged => "ROLLBACK_END_STATE_DIVERGED",
-            Self::JournalAlreadyRolledBack => "JOURNAL_ALREADY_ROLLED_BACK",
+            Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
-            Self::TransportAuthorityMismatch => "TRANSPORT_AUTHORITY_MISMATCH",
             Self::FrameCodec => "FRAME_CODEC",
+            Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
+            Self::WorkerLost => "WORKER_LOST",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
@@ -265,15 +261,11 @@ impl BulkloadRefusal {
     /// to tell a typed refusal from free text; the unit tests hold it equal to
     /// the set of [`BulkloadRefusal::code`] values.
     pub const CODES: &'static [&'static str] = &[
-        "SNAPSHOT_CUSTODY_UNAVAILABLE",
-        "SNAPSHOT_CUSTODY_ESCAPE",
         "SNAPSHOT_ROOTS_OVERLAP",
         "SOURCE_CHANGED_AFTER_SNAPSHOT",
-        "SNAPSHOT_OWNERSHIP_UNPROVEN",
         "CAPTURE_DRIFTED",
         "DIGEST_MISMATCH",
         "SEALED_OBJECT_MISSING",
-        "SEALED_OBJECT_CHANGED",
         "RECEIPT_BINDING_INVALID",
         "SCHEMA_MISMATCH",
         "REQUIRED_FIELD_MISSING",
@@ -282,7 +274,6 @@ impl BulkloadRefusal {
         "CLOSURE_UNACCOUNTED",
         "PATH_NOT_ABSOLUTE",
         "PATH_NOT_PORTABLE",
-        "PATH_MAP_DETACHED",
         "PATH_ESCAPES_ROOT",
         "PATH_DEPTH_EXCEEDED",
         "PATH_TOO_LONG",
@@ -305,18 +296,18 @@ impl BulkloadRefusal {
         "GIT_HAVES_UNPROVABLE",
         "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
         "GIT_SOURCE_PARTIAL_CLONE",
+        "GIT_CHILD_FAILED",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
-        "ROLLBACK_SNAPSHOT_MISSING",
-        "ROLLBACK_END_STATE_DIVERGED",
-        "JOURNAL_ALREADY_ROLLED_BACK",
+        "SQLITE_BACKUP_FAILED",
         "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
         "SALVAGE_BOUND_EXCEEDED",
-        "TRANSPORT_AUTHORITY_MISMATCH",
         "FRAME_CODEC",
+        "PROTOCOL_STATE_VIOLATION",
+        "WORKER_LOST",
         "PROBE_FAILED",
         "IO",
     ];
@@ -332,6 +323,12 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
+            Self::SqliteBackupFailed(Some(code)) => {
+                write!(f, "{} (sqlite code {code})", self.code())
+            }
+            Self::GitChildFailed(class) => {
+                write!(f, "{} stderr_class={}", self.code(), class.code())
+            }
             // Escaped inside quotes: a path cannot forge a second line.
             Self::GitNestInnerRepository(ref path)
             | Self::GitNestConversionAttribute(ref path)
@@ -346,15 +343,113 @@ impl fmt::Display for BulkloadRefusal {
 
 impl std::error::Error for BulkloadRefusal {}
 
-impl From<std::io::Error> for BulkloadRefusal {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err.raw_os_error())
-    }
+/// What a Git child's stderr says, from a closed set (R-N121). The class is
+/// all a refusal, receipt or log line ever carries of a child's stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrClass {
+    /// The path is not a repository, or the remote repository is absent.
+    NotARepository,
+    /// ssh or HTTP authentication, or host-key verification, failed.
+    AuthFailed,
+    /// The host could not be resolved or reached.
+    HostUnreachable,
+    /// A connection or operation timed out.
+    Timeout,
+    /// Git reported a missing, bad or corrupt object.
+    BadObject,
+    /// Anything else.
+    Other,
 }
 
-impl From<postcard::Error> for BulkloadRefusal {
-    fn from(_: postcard::Error) -> Self {
-        Self::FrameCodec
+impl StderrClass {
+    /// The stable code printed as `stderr_class=`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotARepository => "not_a_repository",
+            Self::AuthFailed => "auth_failed",
+            Self::HostUnreachable => "host_unreachable",
+            Self::Timeout => "timeout",
+            Self::BadObject => "bad_object",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify raw stderr by the phrases real git and OpenSSH print in the
+    /// C locale, which every child runs under (`LC_ALL=C`). The first class
+    /// whose pattern matches wins; the order puts timeouts ahead of the
+    /// unreachable-host phrases they share a line with. Lines from a shell's
+    /// `setlocale` warning are ignored, and "No such file or directory" only
+    /// counts after git's or the shell's change-directory failure.
+    #[must_use]
+    pub fn of(raw: &[u8]) -> Self {
+        const PATTERNS: [(StderrClass, &[&str]); 5] = [
+            (
+                StderrClass::Timeout,
+                &["timed out", "timeout, server", "connection timeout"],
+            ),
+            (
+                StderrClass::HostUnreachable,
+                &[
+                    "could not resolve hostname",
+                    "could not resolve host",
+                    "name or service not known",
+                    "nodename nor servname provided",
+                    "temporary failure in name resolution",
+                    "no route to host",
+                    "network is unreachable",
+                    "connection refused",
+                    "connection closed by remote host",
+                    "connection reset by peer",
+                ],
+            ),
+            (
+                StderrClass::AuthFailed,
+                &[
+                    "permission denied (publickey",
+                    "permission denied, please try again",
+                    "authentication failed",
+                    "host key verification failed",
+                    "could not read username",
+                    "could not read password",
+                    "too many authentication failures",
+                    "no supported authentication methods",
+                ],
+            ),
+            (
+                StderrClass::NotARepository,
+                &[
+                    "not a git repository",
+                    "does not appear to be a git repository",
+                    "repository not found",
+                    "fatal: cannot change to '",
+                    ": cd: ",
+                ],
+            ),
+            (
+                StderrClass::BadObject,
+                &[
+                    "bad object",
+                    "bad revision",
+                    "missing object",
+                    "object not found",
+                    "is corrupt",
+                    "unable to read",
+                    "invalid object",
+                    "did not receive expected object",
+                ],
+            ),
+        ];
+        let text: String = String::from_utf8_lossy(raw)
+            .to_lowercase()
+            .lines()
+            .filter(|line| !line.contains("setlocale"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        PATTERNS
+            .iter()
+            .find(|(_, phrases)| phrases.iter().any(|phrase| text.contains(phrase)))
+            .map_or(Self::Other, |(class, _)| *class)
     }
 }
 
@@ -362,22 +457,18 @@ impl From<postcard::Error> for BulkloadRefusal {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use super::BulkloadRefusal;
+    use super::{BulkloadRefusal, StderrClass};
 
     /// Codes are the wire identity of a refusal: they must be unique and
     /// `SCREAMING_SNAKE_CASE`.
     #[test]
     fn codes_are_unique_and_well_formed() {
         let all = [
-            BulkloadRefusal::SnapshotCustodyUnavailable,
-            BulkloadRefusal::SnapshotCustodyEscape,
             BulkloadRefusal::SnapshotRootsOverlap,
             BulkloadRefusal::SourceChangedAfterSnapshot,
-            BulkloadRefusal::SnapshotOwnershipUnproven,
             BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::DigestMismatch,
             BulkloadRefusal::SealedObjectMissing,
-            BulkloadRefusal::SealedObjectChanged,
             BulkloadRefusal::ReceiptBindingInvalid,
             BulkloadRefusal::SchemaMismatch,
             BulkloadRefusal::RequiredFieldMissing,
@@ -386,7 +477,6 @@ mod tests {
             BulkloadRefusal::ClosureUnaccounted,
             BulkloadRefusal::PathNotAbsolute,
             BulkloadRefusal::PathNotPortable,
-            BulkloadRefusal::PathMapDetached,
             BulkloadRefusal::PathEscapesRoot,
             BulkloadRefusal::PathDepthExceeded,
             BulkloadRefusal::PathTooLong,
@@ -409,18 +499,18 @@ mod tests {
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitDestinationFilesystemUnsupported,
             BulkloadRefusal::GitSourcePartialClone,
+            BulkloadRefusal::GitChildFailed(StderrClass::Other),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
-            BulkloadRefusal::RollbackSnapshotMissing,
-            BulkloadRefusal::RollbackEndStateDiverged,
-            BulkloadRefusal::JournalAlreadyRolledBack,
+            BulkloadRefusal::SqliteBackupFailed(None),
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SalvageBoundExceeded,
-            BulkloadRefusal::TransportAuthorityMismatch,
             BulkloadRefusal::FrameCodec,
+            BulkloadRefusal::ProtocolStateViolation,
+            BulkloadRefusal::WorkerLost,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];
@@ -449,8 +539,7 @@ mod tests {
 
     #[test]
     fn io_refusal_carries_errno() {
-        let refusal = BulkloadRefusal::from(std::io::Error::from_raw_os_error(2));
-        assert_eq!(refusal, BulkloadRefusal::Io(Some(2)));
+        let refusal = BulkloadRefusal::Io(Some(2));
         assert_eq!(refusal.code(), "IO");
         assert_eq!(refusal.to_string(), "IO (errno 2)");
     }

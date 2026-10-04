@@ -1003,7 +1003,7 @@ fn credit_waiters_wake_on_grant_and_on_close() {
         assert_eq!(waiter.join().unwrap(), Ok(()));
         let waiter = scope.spawn(|| credit.acquire(1));
         credit.close();
-        assert_eq!(waiter.join().unwrap(), Err(BulkloadRefusal::Io(None)));
+        assert_eq!(waiter.join().unwrap(), Err(BulkloadRefusal::WorkerLost));
     });
 }
 
