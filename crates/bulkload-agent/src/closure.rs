@@ -32,6 +32,7 @@
 //! natively or by an accepted attestation row bound to the plan, the SOURCE
 //! label, the item's source and its current capture digest.
 
+use crate::refuse::RefuseAt as _;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -482,9 +483,12 @@ impl AttestationLedger {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
+            .open(path)
+            .refuse_at("closure::read")?;
         let mut bytes = Vec::new();
-        file.take(LEDGER_LIMIT + 1).read_to_end(&mut bytes)?;
+        file.take(LEDGER_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .refuse_at("closure::read")?;
         if bytes.len() as u64 > LEDGER_LIMIT {
             return Err(BulkloadRefusal::BudgetExceeded);
         }

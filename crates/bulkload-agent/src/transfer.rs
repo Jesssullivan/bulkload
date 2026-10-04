@@ -34,6 +34,7 @@
 //! intermediate directory swapped for a symlink is refused, never followed
 //! out of the root. Content is read with `pread`, never mapped.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsFd as _, BorrowedFd};
@@ -224,16 +225,18 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 /// touch is refused before anything is created (WP1 PR 3, S2).
 fn canonical_state(state: &Path) -> Result<PathBuf> {
     match std::fs::symlink_metadata(state) {
-        Ok(_) => Ok(std::fs::canonicalize(state)?),
+        Ok(_) => std::fs::canonicalize(state).refuse_at("transfer::canonical_state"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let name = state.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
             let parent = match state.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => parent,
                 _ => Path::new("."),
             };
-            Ok(std::fs::canonicalize(parent)?.join(name))
+            Ok(std::fs::canonicalize(parent)
+                .refuse_at("transfer::canonical_state")?
+                .join(name))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "transfer::canonical_state")),
     }
 }
 
@@ -247,8 +250,8 @@ pub fn copy(
     source_state: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
-    let source_root = std::fs::canonicalize(source)?;
-    let destination_root = std::fs::canonicalize(destination)?;
+    let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
+    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
     if overlaps(&source_root, &destination_root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
@@ -263,7 +266,8 @@ pub fn copy(
     {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair()?;
+    let (mut sender, mut receiver) =
+        std::os::unix::net::UnixStream::pair().refuse_at("transfer::copy")?;
     for stream in [&sender, &receiver] {
         tune_stream(stream);
     }
@@ -271,21 +275,27 @@ pub fn copy(
     // the suite, which on a loaded host can be many seconds.
     #[cfg(test)]
     for stream in [&sender, &receiver] {
-        stream.set_read_timeout(Some(std::time::Duration::from_mins(5)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_mins(5)))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_mins(5)))
+            .refuse_at("transfer::copy")?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_mins(5)))
+            .refuse_at("transfer::copy")?;
     }
     std::thread::scope(|scope| -> Result<TransferStats> {
-        let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let input = sender.try_clone()?;
-            let served = serve(input, &mut sender);
-            // The source's reader thread holds a clone of this end; shutting
-            // it down ends that thread and tells the destination the source
-            // is gone, whatever `serve` returned.
-            let _ = sender.shutdown(std::net::Shutdown::Both);
-            served
-        })?;
+        let producer = std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                let input = sender.try_clone().refuse_at("transfer::copy")?;
+                let served = serve(input, &mut sender);
+                // The source's reader thread holds a clone of this end; shutting
+                // it down ends that thread and tells the destination the source
+                // is gone, whatever `serve` returned.
+                let _ = sender.shutdown(std::net::Shutdown::Both);
+                served
+            })
+            .refuse_at("transfer::copy")?;
         let result = {
-            let mut output = receiver.try_clone()?;
+            let mut output = receiver.try_clone().refuse_at("transfer::copy")?;
             receive(
                 &mut receiver,
                 &mut output,
@@ -297,7 +307,7 @@ pub fn copy(
         };
         let _ = receiver.shutdown(std::net::Shutdown::Both);
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        producer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
         result
     })
 }
@@ -358,7 +368,7 @@ impl Credit {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.1 {
-                return Err(BulkloadRefusal::Io(None));
+                return Err(BulkloadRefusal::WorkerLost);
             }
             if state.0 >= bytes {
                 state.0 -= bytes;
@@ -563,9 +573,9 @@ pub const RACY_GRANULARITY_NS: i128 = crate::git_carry::RACY_GRANULARITY_NS;
 /// Refuses an unreadable tree.
 pub fn settle_racy_window(root: &Path) -> Result<std::time::Duration> {
     fn newest(directory: &Path, stamp: &mut i128) -> Result<()> {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
+        for entry in std::fs::read_dir(directory).refuse_at("transfer::newest")? {
+            let entry = entry.refuse_at("transfer::newest")?;
+            let meta = entry.metadata().refuse_at("transfer::newest")?;
             let identity = StatIdentity::from_metadata(&meta);
             *stamp = (*stamp).max(identity.mtime_ns).max(identity.ctime_ns);
             if meta.is_dir() {
@@ -575,7 +585,10 @@ pub fn settle_racy_window(root: &Path) -> Result<std::time::Duration> {
         Ok(())
     }
     let started = Instant::now();
-    let mut stamp = StatIdentity::from_metadata(&std::fs::symlink_metadata(root)?).ctime_ns;
+    let mut stamp = StatIdentity::from_metadata(
+        &std::fs::symlink_metadata(root).refuse_at("transfer::newest")?,
+    )
+    .ctime_ns;
     newest(root, &mut stamp)?;
     let settled = stamp.saturating_add(RACY_GRANULARITY_NS);
     // A seat stamped far in the future would never settle: refuse rather
@@ -758,12 +771,12 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         state,
     }) = read_frame(&mut input)?
     else {
-        return Err(BulkloadRefusal::FrameCodec);
+        return Err(BulkloadRefusal::ProtocolStateViolation);
     };
     if proto != PROTO_VERSION || id != wire_id() {
         return Err(BulkloadRefusal::FrameCodec);
     }
-    let root = std::fs::canonicalize(path(root))?;
+    let root = std::fs::canonicalize(path(root)).refuse_at("transfer::serve")?;
     let state = path(state);
     // S2 (WP1 PR 3): refuse before `Store::open` creates the state root, so
     // an overlapping state never writes a byte inside the source.
@@ -778,14 +791,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     }
     // Every source seat is walked and read beneath this one descriptor
     // (W4 PR 3); its identity is the root's in the authority.
-    let root_fd = crate::io::sys::open_root(&root)?;
-    let meta = crate::io::sys::fstat(&root_fd)?;
+    let root_fd = crate::io::sys::open_root(&root).refuse_at("transfer::serve")?;
+    let meta = crate::io::sys::fstat(&root_fd).refuse_at("transfer::serve")?;
     let authority = postcard::to_stdvec(&(
         store.authority()?,
         root.as_os_str().as_bytes(),
         meta.node.dev,
         meta.node.ino,
-    ))?;
+    ))
+    .refuse_at("transfer::serve")?;
     let committer = Committer::spawn(LedgerSink::new(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
     ))?;
@@ -817,13 +831,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
                 .name("bulkload-serve-walk".to_owned())
                 .spawn_scoped(scope, move || {
                     walk_source(walker, gate, &events);
-                })?;
+                })
+                .refuse_at("transfer::serve")?;
         }
         for _ in 0..CAPTURE_WORKERS {
             let events = events_sender.clone();
             let (work, job_queue) = (&work, &job_queue);
             std::thread::Builder::new()
-                .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))?;
+                .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))
+                .refuse_at("transfer::serve")?;
         }
         let sent = send_entries(output, &committer, &events, jobs, &gate);
         // Wake any capture thread waiting on credit, and the walk thread
@@ -875,16 +891,17 @@ fn spawn_reader<R: Read + Send + 'static>(
                     Ok(Frame::Control(Control::NeedChunks { entry, indices })) => {
                         Event::NeedChunks { entry, indices }
                     }
-                    Ok(_) => break BulkloadRefusal::FrameCodec,
+                    Ok(_) => break BulkloadRefusal::ProtocolStateViolation,
                     Err(refusal) => break refusal,
                 };
                 if events.send(event).is_err() {
-                    break BulkloadRefusal::Io(None);
+                    break BulkloadRefusal::WorkerLost;
                 }
             };
             credit.close();
             let _ = events.send(Event::PeerFailed(failure));
-        })?;
+        })
+        .refuse_at("transfer::spawn_reader")?;
     Ok(())
 }
 
@@ -943,7 +960,7 @@ fn send_entries<W: Write>(
         if outbound.finished() {
             return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
-        let event = events.recv().map_err(|_| BulkloadRefusal::Io(None))?;
+        let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
         outbound.handle(event)?;
     }
 }
@@ -983,7 +1000,9 @@ impl<W: Write> Outbound<'_, W> {
             let Some(job) = self.queue.pop_front() else {
                 break;
             };
-            self.jobs.send(job).map_err(|_| BulkloadRefusal::Io(None))?;
+            self.jobs
+                .send(job)
+                .map_err(|_| BulkloadRefusal::WorkerLost)?;
             self.active += 1;
         }
         Ok(())
@@ -998,14 +1017,14 @@ impl<W: Write> Outbound<'_, W> {
     }
 
     fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &mut Option<Arc<RowSchema>>)> {
-        let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::ProtocolStateViolation)?;
         Ok((
             self.entries
                 .get_mut(index)
-                .ok_or(BulkloadRefusal::FrameCodec)?,
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
             self.rows
                 .get_mut(index)
-                .ok_or(BulkloadRefusal::FrameCodec)?,
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
         ))
     }
 
@@ -1013,10 +1032,10 @@ impl<W: Write> Outbound<'_, W> {
     fn finish_entry(&mut self, entry: u64) -> Result<Arc<RowSchema>> {
         let (slot, row) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
-            return Err(BulkloadRefusal::Io(None));
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         *slot = SourceEntry::Done;
-        let row = row.take().ok_or(BulkloadRefusal::Io(None))?;
+        let row = row.take().ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.active -= 1;
         Ok(row)
     }
@@ -1073,7 +1092,7 @@ impl<W: Write> Outbound<'_, W> {
                 )?;
                 let (slot, _) = self.slot(entry)?;
                 if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
-                    return Err(BulkloadRefusal::Io(None));
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 *slot = SourceEntry::Offered {
                     manifest,
@@ -1086,7 +1105,7 @@ impl<W: Write> Outbound<'_, W> {
                 let record = self
                     .awaiting
                     .remove(&entry)
-                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
                 // A capture is recorded only once the destination holds its
                 // bytes durably, so a committed capture never costs a source
                 // read again (R25, OI-1001-Q15).
@@ -1145,9 +1164,11 @@ impl<W: Write> Outbound<'_, W> {
     fn decide(&mut self, entry: u64, decision: &Decision) -> Result<()> {
         let (slot, held) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Undecided) {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
-        let row = held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?;
+        let row = held
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let regular = row.kind == FileKind::Regular;
         let (next, job) = match decision {
             Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => {
@@ -1156,7 +1177,7 @@ impl<W: Write> Outbound<'_, W> {
                 (SourceEntry::Done, None)
             }
             Decision::Send | Decision::WantManifest if !regular => {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             Decision::Send => (
                 SourceEntry::Queued,
@@ -1181,7 +1202,10 @@ impl<W: Write> Outbound<'_, W> {
 
     fn need_chunks(&mut self, entry: u64, indices: Vec<u32>) -> Result<()> {
         let (slot, held) = self.slot(entry)?;
-        let row = Arc::clone(held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?);
+        let row = Arc::clone(
+            held.as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
+        );
         let SourceEntry::Offered {
             manifest,
             retained,
@@ -1189,13 +1213,13 @@ impl<W: Write> Outbound<'_, W> {
             racy,
         } = std::mem::replace(slot, SourceEntry::Working)
         else {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         };
         let count = manifest.chunks.len();
         if indices.windows(2).any(|pair| pair.first() >= pair.get(1))
             || indices.iter().any(|index| *index as usize >= count)
         {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.jobs
             .send(Job::Serve {
@@ -1207,7 +1231,7 @@ impl<W: Write> Outbound<'_, W> {
                 record,
                 racy,
             })
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     }
 }
 
@@ -1333,7 +1357,7 @@ fn send_capture(
                 },
                 data: Arc::new(data),
             })
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     })?;
     let manifest = Manifest::new(chunks);
     Ok(Event::End {
@@ -1417,7 +1441,9 @@ fn serve_chunks(
     let held = retained.filter(|held| held.chunks.len() == manifest.chunks.len());
     let opened = if held.is_none() && !indices.is_empty() {
         let file = open_source(work, row)?;
-        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+        if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
+            != StatIdentity::from_row(row)
+        {
             return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
         }
         Some(file)
@@ -1426,12 +1452,23 @@ fn serve_chunks(
     };
     for index in indices {
         let at = *index as usize;
-        let spec = manifest.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
-        let offset = *offsets.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
+        let spec = manifest
+            .chunks
+            .get(at)
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let offset = *offsets
+            .get(at)
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let data = if let Some(held) = held {
-            Arc::clone(held.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?)
+            Arc::clone(
+                held.chunks
+                    .get(at)
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
+            )
         } else {
-            let file = opened.as_ref().ok_or(BulkloadRefusal::Io(None))?;
+            let file = opened
+                .as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
             let mut data = vec![
                 0_u8;
                 usize::try_from(spec.size)
@@ -1463,10 +1500,12 @@ fn serve_chunks(
                 },
                 data,
             })
-            .map_err(|_| BulkloadRefusal::Io(None))?;
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
     }
     if let Some(file) = &opened {
-        if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
+        if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
+            != StatIdentity::from_row(row)
+        {
             return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
         }
     }
@@ -1516,7 +1555,9 @@ fn capture_file(
     let started_ns = capture_clock(work.root);
     let file = open_source(work, row)?;
     let expected = StatIdentity::from_row(row);
-    if StatIdentity::from_metadata(&file.metadata()?) != expected {
+    if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::capture_file")?)
+        != expected
+    {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut prefix = Vec::new();
@@ -1527,7 +1568,10 @@ fn capture_file(
         },
         count: bytes_read,
     };
-    (&mut reader).take(16).read_to_end(&mut prefix)?;
+    (&mut reader)
+        .take(16)
+        .read_to_end(&mut prefix)
+        .refuse_at("transfer::capture_file")?;
     if prefix.starts_with(b"SQLite format 3\0")
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
@@ -1557,7 +1601,10 @@ fn capture_file(
             .checked_add(size)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
     }
-    if offset != row.size || StatIdentity::from_metadata(&file.metadata()?) != expected {
+    if offset != row.size
+        || StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::capture_file")?)
+            != expected
+    {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let racy = crate::git_carry::racy(row, started_ns, capture_clock(work.root));
@@ -1574,7 +1621,8 @@ fn open_source(work: &SourceWork<'_>, row: &RowSchema) -> Result<std::fs::File> 
         work.root_fd,
         crate::walk::rel_path(&row.rel_path),
         crate::io::OpenMode::Read,
-    )?;
+    )
+    .refuse_at("transfer::open_source")?;
     Ok(std::fs::File::from(fd))
 }
 
@@ -1831,7 +1879,7 @@ impl Streaming {
         verified: bool,
     ) -> Result<()> {
         if header.index as usize != self.specs.len() || header.offset != self.offset {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         // More chunks than any manifest may hold ends the session: nothing
         // grows past the bound (#77 review F4).
@@ -1845,7 +1893,7 @@ impl Streaming {
         }
         if self.failure.is_none() && self.staged.is_none() {
             if *open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             match target.stage(&self.row) {
                 Ok(staged) => {
@@ -1986,15 +2034,16 @@ pub fn receive<R: Read, W: Write>(
         },
     )?;
     let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
-        return Err(BulkloadRefusal::FrameCodec);
+        return Err(BulkloadRefusal::ProtocolStateViolation);
     };
-    let target_meta = std::fs::metadata(target.path())?;
+    let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
         authority,
         target.path().as_os_str().as_bytes(),
         target_meta.dev(),
         target_meta.ino(),
-    ))?;
+    ))
+    .refuse_at("transfer::receive")?;
     write_control(
         output,
         &Control::Credit {
@@ -2053,7 +2102,7 @@ impl<W: Write> Inbound<'_, W> {
             match read_frame(input)? {
                 Frame::Control(Control::Entry { entry, row }) => {
                     if entry != offered || walk_done.is_some() {
-                        return Err(BulkloadRefusal::FrameCodec);
+                        return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
                     self.entry(entry, row)?;
@@ -2073,7 +2122,7 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 Frame::Control(Control::WalkDone { entries }) => {
                     if entries != offered || walk_done.is_some() {
-                        return Err(BulkloadRefusal::FrameCodec);
+                        return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     walk_done = Some(entries);
                     self.walk_done = true;
@@ -2098,7 +2147,7 @@ impl<W: Write> Inbound<'_, W> {
                 }) if walk_done == Some(entries) && self.incoming.is_empty() => {
                     return Ok(source_bytes_read);
                 }
-                _ => return Err(BulkloadRefusal::FrameCodec),
+                _ => return Err(BulkloadRefusal::ProtocolStateViolation),
             }
         }
     }
@@ -2219,7 +2268,7 @@ impl<W: Write> Inbound<'_, W> {
         let incoming = self
             .incoming
             .remove(&entry)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let row = match incoming {
             Incoming::Streaming(Streaming { row, staged, .. }) => {
                 if let Some(staged) = staged {
@@ -2238,7 +2287,7 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         if row.rel_path != rel_path {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.stats.refusals.push((row.rel_path, code));
         Ok(())
@@ -2250,7 +2299,7 @@ impl<W: Write> Inbound<'_, W> {
             return Err(BulkloadRefusal::FrameCodec);
         }
         let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&entry) else {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         };
         let manifest = Manifest { root, chunks };
         let mut offsets = Vec::with_capacity(manifest.chunks.len());
@@ -2264,7 +2313,7 @@ impl<W: Write> Inbound<'_, W> {
         let mut salvaged_from = Vec::new();
         let plan = if manifest.is_consistent() {
             if self.open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             plan_file(
                 &ReceiveContext {
@@ -2326,7 +2375,7 @@ impl<W: Write> Inbound<'_, W> {
         self.granted = self
             .granted
             .checked_sub(size)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
         let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
             && counters::hash(Counter::HashWireVerify, payload) == header.digest;
@@ -2347,19 +2396,19 @@ impl<W: Write> Inbound<'_, W> {
             }
             Some(Incoming::Filling(filling)) => {
                 if filling.expected.pop_front() != Some(header.index) {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let at = header.index as usize;
                 let spec = filling
                     .manifest
                     .chunks
                     .get(at)
-                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
                 if spec.digest != header.digest
                     || spec.size != size
                     || filling.offsets.get(at) != Some(&header.offset)
                 {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 if filling.failure.is_none() {
                     if verified {
@@ -2376,7 +2425,7 @@ impl<W: Write> Inbound<'_, W> {
                     }
                 }
             }
-            _ => return Err(BulkloadRefusal::FrameCodec),
+            _ => return Err(BulkloadRefusal::ProtocolStateViolation),
         }
         self.consumed = self.consumed.saturating_add(size);
         if self.consumed >= CREDIT_RETURN {
@@ -2402,12 +2451,12 @@ impl<W: Write> Inbound<'_, W> {
         let incoming = self
             .incoming
             .remove(&entry)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let (rel_path, outcome) = match incoming {
-            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::FrameCodec),
+            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::ProtocolStateViolation),
             Incoming::Streaming(streaming) => {
                 if chunks as usize != streaming.specs.len() || size != streaming.offset {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = streaming.row.rel_path.clone();
                 (rel_path, self.end_streaming(streaming, root, racy))
@@ -2418,7 +2467,7 @@ impl<W: Write> Inbound<'_, W> {
                     || root != filling.manifest.root
                     || filling.manifest.size() != Some(size)
                 {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = filling.row.rel_path.clone();
                 (rel_path, self.end_filling(filling, racy))
@@ -2472,7 +2521,7 @@ impl<W: Write> Inbound<'_, W> {
         if self.pending_held.is_empty() {
             Ok(())
         } else {
-            Err(BulkloadRefusal::Io(None))
+            Err(BulkloadRefusal::ProtocolStateViolation)
         }
     }
 
@@ -2599,7 +2648,7 @@ impl<W: Write> Inbound<'_, W> {
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
         if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
-            .map_err(BulkloadRefusal::from)
+            .refuse_at("transfer::publish")
         {
             let _ = staged.discard();
             return Err(refusal);
@@ -2843,7 +2892,7 @@ fn read_verified(
 
 fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
     for offset in offsets {
-        crate::io::sys::pwrite_all(file, data, *offset)?;
+        crate::io::sys::pwrite_all(file, data, *offset).refuse_at("transfer::place")?;
         counters::add_len(Counter::DestMaterializeWrite, data.len());
     }
     Ok(())
@@ -2860,7 +2909,9 @@ fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
 /// Refuses truncated, oversized or invalid frames.
 pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
     let mut prefix = [0_u8; FRAME_HEADER_BYTES];
-    input.read_exact(&mut prefix)?;
+    input
+        .read_exact(&mut prefix)
+        .refuse_at("transfer::read_frame")?;
     let [a, b, c, d, tag] = prefix;
     let length = u32::from_be_bytes([a, b, c, d]) as usize;
     if length > MAX_FRAME_BYTES {
@@ -2877,17 +2928,23 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
         let mut header = [0_u8; DATA_HEADER_BYTES];
-        input.read_exact(&mut header)?;
+        input
+            .read_exact(&mut header)
+            .refuse_at("transfer::read_frame")?;
         let header = DataHeader::from_bytes(&header)?;
         if header.size as usize != size {
             return Err(BulkloadRefusal::FrameCodec);
         }
         let mut payload = vec![0_u8; size];
-        input.read_exact(&mut payload)?;
+        input
+            .read_exact(&mut payload)
+            .refuse_at("transfer::read_frame")?;
         Frame::Data { header, payload }
     } else {
         let mut bytes = vec![0_u8; body];
-        input.read_exact(&mut bytes)?;
+        input
+            .read_exact(&mut bytes)
+            .refuse_at("transfer::read_frame")?;
         Frame::decode_body(tag, &bytes)?
     };
     counters::bump(Counter::WireFramesReceived);
@@ -2906,13 +2963,18 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     let mut remaining: &mut [IoSlice<'_>] = &mut slices;
     while !remaining.is_empty() {
         match output.write_vectored(remaining) {
-            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(0) => {
+                return Err(crate::refuse::io(
+                    &std::io::Error::from(std::io::ErrorKind::WriteZero),
+                    "transfer::write_data",
+                ))
+            }
             Ok(written) => IoSlice::advance_slices(&mut remaining, written),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "transfer::write_data")),
         }
     }
-    output.flush()?;
+    output.flush().refuse_at("transfer::write_data")?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, prefix.len() + payload.len());
     Ok(())
@@ -2924,8 +2986,10 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
 /// Refuses oversized messages and broken transports.
 pub fn write_control<W: Write>(output: &mut W, control: &Control) -> Result<()> {
     let encoded = control.encode()?;
-    output.write_all(&encoded)?;
-    output.flush()?;
+    output
+        .write_all(&encoded)
+        .refuse_at("transfer::write_control")?;
+    output.flush().refuse_at("transfer::write_control")?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, encoded.len());
     Ok(())
