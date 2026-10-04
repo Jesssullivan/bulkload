@@ -2,30 +2,45 @@
 N-version explorer for docs/formal (OI-1003-Q32).
 
 An explicit-state breadth-first search of bulkload's wire v5 transfer,
-destination group commit and source ledger, across crashes and reruns, on
-the N-version core: one seat, three runs, two crashes, one source edit;
-third-party writes, commit failures, the space refusal, superseding publish
-and estate reads off (TLC's MC_nv_core). The preset nv_ledger adds one
-third-party write or delete (MC_nv_ledger).
+destination group commit and source ledger, across crashes and reruns. Its
+domain: any seats, runs, crashes, source edits and third-party writes (the
+bound flags), with no failed group commit, space refusal, relaxed source
+ledger or store, superseding publish, estate reads, unsealed state root or
+strict-held ghost. The presets are the N-version core, nv_core (TLC's
+MC_nv_core: one seat, three runs, two crashes, one source edit), and
+nv_ledger, which adds one third-party write or delete (MC_nv_ledger).
 
-TLA+ with TLC is the checker of record. This program is the second
-version: an independent implementation of the same transition relation, in
-another language and another state representation (one record per seat
-instead of one function per variable). It reads no TLA+, no .cfg and no
-generated file, and shares no code with the spec. The same actions and the
-same invariants were written by hand, from the spec's action definitions,
-its abstraction map (docs/formal/README.md) and the code they cite, where
-A = crates/bulkload-agent/src; nothing here is generated from the TLA+
-text. Its distinct-state count must equal TLC's, and each core mutation
-must violate the same named invariant (docs/formal/README.md, "Hybrid
-roles").
+TLA+ with TLC is the checker of record. This program is a second encoding
+of the spec: independent code, shared design. It is a separate program in
+another language, with another state representation (one record per seat
+instead of one function per variable); it reads no TLA+, no .cfg and no
+rendered file, and nothing in it is generated from the TLA+ text. But it
+was transliterated by hand from BulkloadTransfer.tla's action definitions:
+its actions are the ones TLC's coverage shows enabled in MC_nv_ledger, its
+successor order is Next's disjunct order, and its helpers and sentinels
+follow the spec's (readSeat is DoRead, fates is CrashChoice, dstLosses is
+DstLoss; garbage, foreignBytes, firstForeignId and keyBase are GARBAGE,
+FOREIGN, FirstForeignId and KeyBase). So agreement with TLC shows that TLC
+evaluates the spec as its text reads and that neither encoding has a slip
+the other lacks. It cannot catch a misreading of the Rust code that the
+spec makes, because this encoding copies it (docs/formal/README.md,
+"Hybrid roles"). Comments cite code as A/... (crates/bulkload-agent/src)
+and P/... (crates/bulkload-proto/src).
 
-Only the core's actions are here. Out of the core, and absent: the failed
-group commit (CommitFail), the space refusal, a relaxed source ledger or
-store, an unsealed state root, the strict-held ghost, WP0(d)'s superseding
-publish (CheckOwn, RenameReplace, Exchange, VerifyDisp, the displaced
-file) and estate capture's typed reads (GitRead, Backup*). The mutations
-that need them are refused at the command line.
+`just formal-nv` requires: both presets reach TLC's distinct-state counts;
+every MC_neg_ row of the catalogue inside this domain, at its own bound,
+violates the property its row names; and every such mutation, checked
+against every invariant, stops at the same invariant after the same number
+of states as TLC with one worker.
+
+Out of the domain, and absent: the failed group commit (CommitFail), the
+space refusal, a relaxed source ledger or store, an unsealed state root,
+the strict-held ghost, WP0(d)'s superseding publish (CheckOwn,
+RenameReplace, Exchange, VerifyDisp, the displaced file) and estate
+capture's typed reads (GitRead, Backup*). The mutations that need them are
+refused at the command line. In the domain, NoClobber and
+S2_BackupLockBounded hold by construction, here and in the spec: only
+absent actions set the state they read.
 
 Base and containers only:
 
@@ -34,21 +49,32 @@ Base and containers only:
 
 Options:
 
-  --preset nv_core|nv_ledger   the bound (default nv_core)
+  --preset nv_core|nv_ledger   the base bound (default nv_core)
+  --seats LETTERS              the seats, one lowercase letter each (a, ab)
+  --runs N                     transfer sessions in one behaviour
+  --crashes N                  crash budget: either host, or both
+  --edits N                    source edits per seat
+  --foreign N                  third-party writes or deletes
   --mutation NAME              one deliberate rule break (default none)
   --check all|NAME[,NAME...]   the invariants to check (default all)
   --name NAME                  the row name reported (default from the above)
   --json DIR                   write a counterexample to DIR/NAME.json (DIR
                                must exist)
 
-Output: one line of key=value pairs. Exit 0 when the search completed with
-no violation, 1 when it stopped at a violated invariant or a deadlock, 2 on
-a usage error.
+The bound flags override the preset's values (TLC's Seats, MaxRuns,
+MaxCrashes, MaxEdits and MaxForeign).
+
+Output: one line of key=value pairs. With --check all, `violated` lists
+every invariant the failing state violates, in the spec's order, so its
+first name is the one TLC reports. Exit 0 when the search completed with no
+violation, 1 when it stopped at a violated invariant or a deadlock, 2 on a
+usage error.
 -}
 module Main (main) where
 
 import Data.Char (isAlphaNum)
 import Data.List (intercalate, subsequences)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import System.Environment (getArgs)
@@ -106,6 +132,12 @@ preset :: String -> Maybe Config
 preset "nv_core" = Just (Config "nv_core" "a" 3 2 1 0 Nothing)
 preset "nv_ledger" = Just (Config "nv_ledger" "a" 3 2 1 1 Nothing)
 preset _ = Nothing
+
+-- The bound as seats,runs,crashes,edits,foreign (TLC's Seats, MaxRuns,
+-- MaxCrashes, MaxEdits, MaxForeign).
+boundName :: Config -> String
+boundName cfg =
+  intercalate "," (cSeats cfg : map show [cRuns cfg, cCrashes cfg, cEdits cfg, cForeign cfg])
 
 mut :: Config -> Mutation -> Bool
 mut cfg m = cMutation cfg == Just m
@@ -1226,6 +1258,7 @@ counterexample cfg name checked f =
         [ ("explorer", JS "docs/formal/hs/Explorer.hs")
         , ("row", JS name)
         , ("preset", JS (cPreset cfg))
+        , ("bound", JS (boundName cfg))
         , ("mutation", JS (maybe "none" mutationName (cMutation cfg)))
         , ("checked", JA (map JS checked))
         , ("violated", JA (map JS (failWhat f)))
@@ -1244,6 +1277,11 @@ counterexample cfg name checked f =
 
 data Opts = Opts
   { oPreset :: String
+  , oSeats :: Maybe String
+  , oRuns :: Maybe Int
+  , oCrashes :: Maybe Int
+  , oEdits :: Maybe Int
+  , oForeign :: Maybe Int
   , oMutation :: Maybe String
   , oCheck :: String
   , oName :: Maybe String
@@ -1251,15 +1289,26 @@ data Opts = Opts
   }
 
 parseOpts :: [String] -> Either String Opts
-parseOpts = go (Opts "nv_core" Nothing "all" Nothing Nothing)
+parseOpts = go (Opts "nv_core" Nothing Nothing Nothing Nothing Nothing Nothing "all" Nothing Nothing)
   where
     go o [] = Right o
     go o ("--preset" : v : rest) = go o {oPreset = v} rest
+    go o ("--seats" : v : rest)
+      | not (null v) && all (`elem` ['a' .. 'z']) v && S.size (S.fromList v) == length v = go o {oSeats = Just v} rest
+      | otherwise = Left ("--seats takes distinct lowercase letters, not " ++ v)
+    go o ("--runs" : v : rest) = count v >>= \n -> go o {oRuns = Just n} rest
+    go o ("--crashes" : v : rest) = count v >>= \n -> go o {oCrashes = Just n} rest
+    go o ("--edits" : v : rest) = count v >>= \n -> go o {oEdits = Just n} rest
+    go o ("--foreign" : v : rest) = count v >>= \n -> go o {oForeign = Just n} rest
     go o ("--mutation" : v : rest) = go o {oMutation = if v == "none" then Nothing else Just v} rest
     go o ("--check" : v : rest) = go o {oCheck = v} rest
     go o ("--name" : v : rest) = go o {oName = Just v} rest
     go o ("--json" : v : rest) = go o {oJson = Just v} rest
     go _ (a : _) = Left ("unknown or incomplete option: " ++ a)
+    -- At most 9: a row key holds the stat version as one digit (keyBase).
+    count v = case reads v of
+      [(n, "")] | n >= 0 && n < keyBase -> Right n
+      _ -> Left ("a bound is a count from 0 to 9, not " ++ v)
 
 splitOn :: Char -> String -> [String]
 splitOn c s = case break (== c) s of
@@ -1269,7 +1318,7 @@ splitOn c s = case break (== c) s of
 usage :: String -> IO a
 usage err = do
   hPutStrLn stderr ("Explorer: " ++ err)
-  hPutStrLn stderr "usage: Explorer [--preset nv_core|nv_ledger] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]"
+  hPutStrLn stderr "usage: Explorer [--preset nv_core|nv_ledger] [--seats LETTERS] [--runs N] [--crashes N] [--edits N] [--foreign N] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]"
   exitWith (ExitFailure 2)
 
 main :: IO ()
@@ -1281,12 +1330,24 @@ main = do
     Just m -> case [x | x <- [minBound .. maxBound], mutationName x == m] of
       [x] -> pure (Just x)
       _ -> usage ("mutation " ++ m ++ " is not in the core (supported: " ++ unwords (map mutationName [minBound .. maxBound]) ++ ")")
-  let cfg = base {cMutation = mutation}
+  let cfg =
+        base
+          { cSeats = fromMaybe (cSeats base) (oSeats opts)
+          , cRuns = fromMaybe (cRuns base) (oRuns opts)
+          , cCrashes = fromMaybe (cCrashes base) (oCrashes opts)
+          , cEdits = fromMaybe (cEdits base) (oEdits opts)
+          , cForeign = fromMaybe (cForeign base) (oForeign opts)
+          , cMutation = mutation
+          }
       known = map fst invariants
       wanted = if oCheck opts == "all" then known else splitOn ',' (oCheck opts)
       name = case oName opts of
         Just n -> n
-        Nothing -> maybe ("MC_" ++ cPreset cfg) (("MC_neg_" ++) . mutationName) mutation
+        Nothing -> case mutation of
+          Just m -> "MC_neg_" ++ mutationName m
+          Nothing
+            | boundName cfg == boundName base -> "MC_" ++ cPreset cfg
+            | otherwise -> "MC_explorer"
   case filter (`notElem` known) wanted of
     [] -> pure ()
     bad -> usage ("unknown invariant(s): " ++ unwords bad)
@@ -1296,6 +1357,7 @@ main = do
       common =
         [ ("row", name)
         , ("preset", cPreset cfg)
+        , ("bound", boundName cfg)
         , ("mutation", maybe "none" mutationName mutation)
         , ("initial", show (repInitial rep))
         , ("distinct", show (repDistinct rep))

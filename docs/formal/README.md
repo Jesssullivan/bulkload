@@ -3,8 +3,9 @@
 The proof package's formal model ([docs/slo.md](../slo.md), OI-1003-Q7): a
 TLA+ specification of bulkload's transfer, model-checked with TLC. TLA+ and
 TLC are the checker of record (OI-1003-Q32). Sprint 2 adds a typed Dhall
-catalogue of the configs and a Haskell N-version explorer on [the shared
-core](#n-version-core-oi-1003-q32) ([Hybrid roles](#hybrid-roles-oi-1003-q32)).
+catalogue of the configs and a Haskell N-version explorer, a second encoding
+of the spec, on [the shared core](#n-version-core-oi-1003-q32) ([Hybrid
+roles](#hybrid-roles-oi-1003-q32)).
 The model covers:
 
 - wire v5 per entry;
@@ -336,7 +337,7 @@ The model is checked by three tools, each with one job:
 |---|---|---|---|
 | Checker of record | TLA+ with TLC 2.19 | `BulkloadTransfer.tla` is the model. Every verdict, count and counterexample this README cites as a result is TLC's. | `just tla-check` |
 | Typed catalogue | Dhall 1.42 ([`catalogue/`](catalogue/)) | Holds every config's constants and expectation, every mutation's verdict and every property's traceability row. It renders `configs.tsv` and every `MC_*.cfg`, and its staleness and grounding checks gate every TLC run. | `just tla-render` |
-| N-version cross-check | Haskell, GHC 9.10, base and containers ([`hs/Explorer.hs`](hs/Explorer.hs)) | An independent explicit-state BFS of the same transition relation on the core. It must reproduce TLC's counts and mutation verdicts. | `just formal-nv` |
+| N-version cross-check | Haskell, GHC 9.10, base and containers ([`hs/Explorer.hs`](hs/Explorer.hs)) | A second encoding of the spec: independent code, shared design. An explicit-state BFS transliterated by hand from the spec's actions, on the core and every mutation row inside its domain. It must reproduce TLC's counts and mutation verdicts. It shows that TLC evaluates the spec as its text reads; it cannot catch a misreading of the code that the spec makes. | `just formal-nv` |
 
 All three come from the flake's pinned nixpkgs through `nix shell
 --inputs-from`; there is no flake change. None of them is in `check-fast`,
@@ -411,55 +412,113 @@ comments and `tla-check` skips `#` lines, so no state or verdict moved.
 
 ### The explorer
 
-`hs/Explorer.hs` is an explicit-state breadth-first search of the same
-actions and invariants as the spec, on the core.
+`hs/Explorer.hs` is an explicit-state breadth-first search of the spec's
+actions and invariants inside its domain.
 
-- **Independent implementation.** It is a separate program in another
-  language, with another state representation (one record per seat instead
-  of one function per variable). It reads no TLA+, no `.cfg` and no rendered
-  file, and shares no code with the spec. It was written by hand from the
-  spec's action definitions and the code they cite; nothing in it is
-  generated from the TLA+ text. So it is an independent implementation,
-  but not independent authorship: a misreading of the protocol shared by
-  both texts would not show.
-- **The core's actions only.** It has the 27 actions that TLC's coverage
-  shows enabled in `MC_nv_ledger`: `StartRun`, the 13 per-seat protocol
-  actions, `Commit`, `LedgerCommit`, `SendSourceDone`, `Finish`, `Edit`,
+- **A second encoding, not an independent one.** The code is independent:
+  a separate program in another language, with another state
+  representation (one record per seat instead of one function per
+  variable). It reads no TLA+, no `.cfg` and no rendered file, and nothing
+  in it is generated from the TLA+ text. The design is shared: it was
+  transliterated by hand from `BulkloadTransfer.tla`'s action definitions.
+  Its actions are the ones TLC's coverage shows enabled in `MC_nv_ledger`,
+  its successor order is `Next`'s disjunct order, and its helpers and
+  sentinels follow the spec's: `readSeat` is `DoRead`, `fates` is
+  `CrashChoice`, `dstLosses` is `DstLoss`, and `GARBAGE`, `FOREIGN`,
+  `FirstForeignId` and `KeyBase` keep their values. So parity shows that
+  TLC evaluates the spec as its text reads, and that neither encoding has a
+  slip the other lacks. It does not check the spec against the code. If
+  the spec misreads a rule of the Rust code, such as how `Inbound::entry`
+  decides `Reuse` or which captures `RecvHeld` submits, the explorer
+  encodes the same misreading, and every count and counterexample still
+  matches. Getting that check needs one of two things, neither done: a
+  second author who derives each action from the cited Rust function
+  without reading the spec, or property-test or fault-harness traces
+  replayed as explorer behaviours.
+- **Its domain.** It has the 27 actions that TLC's coverage shows enabled
+  in `MC_nv_ledger`: `StartRun`, the 13 per-seat protocol actions,
+  `Commit`, `LedgerCommit`, `SendSourceDone`, `Finish`, `Edit`,
   `SilentRewrite`, `Tick`, `ForeignWrite`, `ForeignDelete`, the three
   crashes and `Terminated`. The other 10 are absent: `CommitFail`, WP0(d)'s
-  four and estate capture's five. So are the space refusal, relaxed stores,
-  an unsealed state root and the strict-held ghost. `NoClobber` and
-  `S2_BackupLockBounded` are constantly true in the explorer, because the
-  state they read does not exist in the core.
-- **Presets:** `nv_core` (`MC_nv_core`) and `nv_ledger` (`MC_nv_ledger`).
-  It supports the 14 mutations that need no absent action, and refuses the
-  other 5 at the command line.
-- **The same checks as TLC.** A state with no successor is a deadlock, as
-  in TLC, and the search stops at the first state that violates a checked
-  invariant. `formal-nv` checks every safety invariant on the presets, and
-  `TypeOK` plus the row's named property on the mutations, as the TLC
-  configs do. The recipe, not the explorer, reads that property from the
-  row's `configs.tsv` line, which is TLC's expectation, and the counts to
-  match are TLC's run of record.
-- **Counterexamples are JSON.** One file per violation: the row, the
-  mutation, the invariants checked and violated, any other invariant false
-  in the last state, and the trace. Each state uses the spec's variable
-  names and value spellings, leaving out the variables the core holds
-  constant. `formal-nv` keeps them under a private `mktemp` directory in
-  `$TMPDIR` and prints its path.
+  four and estate capture's five. So are the space refusal, relaxed
+  stores, an unsealed state root and the strict-held ghost. Inside the
+  domain, `NoClobber` and `S2_BackupLockBounded` hold by construction, in
+  the spec as well as in the explorer: only absent actions set the state
+  they read (`clobbered`, and the SQLite backup's lock and steps). The
+  explorer encodes both as constantly true, so neither is cross-checked.
+- **Presets and bound flags.** The presets are `nv_core` (`MC_nv_core`)
+  and `nv_ledger` (`MC_nv_ledger`). `--seats`, `--runs`, `--crashes`,
+  `--edits` and `--foreign` override them, as TLC's `Seats`, `MaxRuns`,
+  `MaxCrashes`, `MaxEdits` and `MaxForeign`. It supports the 14 mutations
+  that need no absent action, and refuses the other 5 at the command line.
+- **What `formal-nv` checks.** The presets must reach TLC's distinct-state
+  counts of record, with no invariant violated and no deadlock. The
+  mutation rows come from the catalogue, not from the recipe. The
+  evaluated catalogue's `nversion` list holds every `MC_neg_` row whose
+  constants are inside the explorer's domain (`explorerModels` in
+  `Catalogue.dhall`), with its bound, its mutation and its named property.
+  Today that is 17 rows: the 14 primary rows of the supported mutations,
+  plus `MC_neg_reread_unchanged`, `MC_neg_reread_changed_only` and
+  `MC_neg_record_racy_ledger`. Outside the domain are
+  `MC_neg_reread_exchange`, `untyped_space`, `git_optional_locks`,
+  `unbounded_backup`, `supersede_unchecked` and `sweep_displaced`. For
+  each row:
+  - The explorer runs at the row's bound, with `TypeOK` and the named
+    property checked as the row's TLC config does, and must violate
+    exactly that property. The property is the catalogue's, which
+    `tla-check` holds TLC to.
+  - For a primary row, the mutation runs once more with every safety
+    invariant checked, both on TLC and on the explorer. TLC runs with one
+    worker, so its breadth-first order is fixed, from a config the
+    catalogue renders into scratch. Both must report the same first
+    violated invariant, in the configs' order, after the same number of
+    states. This is what makes the other invariants count: an invariant
+    that is too weak or too strong in either encoding changes where some
+    search stops.
 
-Parity, 2026-10-04, host sting, explorer built with `ghc -O1`. TLC's
-verdicts and positive counts are the run of record above. Its
-counterexample lengths come from one-worker hand runs of the three
-mutation configs on this branch:
+  A state with no successor is a deadlock, as in TLC.
+- **Counterexamples are JSON.** One file per violation: the row, the
+  bound, the mutation, the invariants checked and violated, any other
+  invariant false in the last state, and the trace. Each state uses the
+  spec's variable names and value spellings, leaving out the variables the
+  core holds constant. `formal-nv` keeps them, and TLC's logs, under a
+  private `mktemp` directory in `$TMPDIR` and prints its path.
+
+Parity, 2026-10-04, host sting, explorer built with `ghc -O1`, from one
+`just formal-nv` run. TLC's positive counts are the run of record above.
 
 | Row | TLC | Explorer | Match |
 |---|---|---|---|
 | `MC_nv_core` | PASS: 15,834 distinct, 44,312 generated, diameter 45 | pass: 15,834 distinct, 44,312 generated, 45 levels | yes |
 | `MC_nv_ledger` | PASS: 142,450 distinct, 497,089 generated, diameter 49 | pass: 142,450 distinct, 497,089 generated, 49 levels | yes |
-| `MC_neg_held_before_commit` | FAIL `HeldAfterCommit`, 7-state counterexample | violation `HeldAfterCommit`, 7-state counterexample | yes |
-| `MC_neg_commit_before_fsync` | FAIL `RecordImpliesBytes`, 9 states | violation `RecordImpliesBytes`, 9 states | yes |
-| `MC_neg_src_ledger_carries_r25` | FAIL `R25_NoDurableReread`, 15 states | violation `R25_NoDurableReread`, 15 states | yes |
+
+The mutation rows, at each row's bound (seats, runs, crashes, edits,
+third-party writes). The named property is the catalogue's verdict, which
+the explorer violated in every row; the length is the explorer's
+counterexample. The every-invariant columns are TLC's one-worker run and
+the explorer's, each as the first violated invariant and the
+counterexample's length. All 31 mutation runs matched (17 with the named
+property, 14 with every invariant), and so did both presets.
+
+| Row | Bound | Named property (explorer) | Every invariant: TLC | Every invariant: explorer |
+|---|---|---|---|---|
+| `MC_neg_held_before_commit` | a, 3, 2, 1, 0 | `HeldAfterCommit`, 7 states | `HeldAfterCommit`, 7 | `HeldAfterCommit`, 7 |
+| `MC_neg_commit_before_fsync` | a, 3, 2, 1, 0 | `RecordImpliesBytes`, 9 | `RecordImpliesBytes`, 9 | `RecordImpliesBytes`, 9 |
+| `MC_neg_commit_before_dirseal` | a, 1, 0, 0, 0 | `RecordImpliesBytes`, 9 | `RecordImpliesBytes`, 9 | `RecordImpliesBytes`, 9 |
+| `MC_neg_adopt_without_seal` | a, 1, 0, 0, 1 | `RecordImpliesBytes`, 11 | `RecordImpliesBytes`, 11 | `RecordImpliesBytes`, 11 |
+| `MC_neg_ledger_before_held` | a, 1, 0, 0, 0 | `LedgerAfterHeld`, 5 | `LedgerAfterHeld`, 5 | `LedgerAfterHeld`, 5 |
+| `MC_neg_done_before_sync` | a, 1, 0, 0, 0 | `DoneAfterLedger`, 13 | `DoneAfterLedger`, 13 | `DoneAfterLedger`, 13 |
+| `MC_neg_reread_durable` | a, 2, 1, 0, 0 | `R25_NoDurableReread`, 15 | `R25_NoDurableReread`, 15 | `R25_NoDurableReread`, 15 |
+| `MC_neg_reread_unchanged` | a, 2, 1, 0, 0 | `S3_UnchangedReadsZero`, 15 | (an `also` row) | |
+| `MC_neg_reread_changed_only` | a, 2, 1, 0, 0 | `S3_ReadsOnlyChanged`, 15 | (an `also` row) | |
+| `MC_neg_reread_ignore_ledger` | a, 2, 0, 0, 0 | `R25_NoCommittedCaptureReread`, 19 | `R25_NoDurableReread`, 19 | `R25_NoDurableReread`, 19 |
+| `MC_neg_skip_output_row` | a, 1, 0, 0, 0 | `S3_ClosedPassIsHeld`, 15 | `LedgerAfterHeld`, 12 | `LedgerAfterHeld`, 12 |
+| `MC_neg_double_read` | a, 1, 0, 0, 0 | `ReadOnce`, 7 | `ReadOnce`, 7 | `ReadOnce`, 7 |
+| `MC_neg_src_ledger_carries_r25` | a, 3, 2, 1, 0 | `R25_NoDurableReread`, 15 | `R25_NoDurableReread`, 15 | `R25_NoDurableReread`, 15 |
+| `MC_neg_record_racy` | a, 1, 0, 1, 0 | `ReuseSound`, 11 | `ReuseSound`, 11 | `ReuseSound`, 11 |
+| `MC_neg_record_racy_ledger` | a, 1, 0, 1, 0 | `LedgerSound`, 14 | (an `also` row) | |
+| `MC_neg_source_write` | a, 1, 0, 0, 0 | `S2_TypedSourceAccess`, 5 | `S2_TypedSourceAccess`, 5 | `S2_TypedSourceAccess`, 5 |
+| `MC_neg_pause_writer` | a, 1, 0, 0, 0 | `S2_TypedSourceAccess`, 5 | `S2_TypedSourceAccess`, 5 | `S2_TypedSourceAccess`, 5 |
 
 What the parity shows:
 
@@ -470,9 +529,11 @@ What the parity shows:
   initial states plus every successor computed, `Terminated`'s stuttering
   step included. `MC_nv_ledger` reaches both ledger branches, so its
   counts cover the ledger-manifest and ledger chunk-read semantics too.
-- **The counterexamples are the same behaviours.** With one worker
-  (`-workers 1`), TLC's counterexamples have the same length and the same
-  action sequence as the explorer's:
+- **The counterexamples are the same behaviours.** In one-worker
+  (`-workers 1`) hand runs of the three core mutations, TLC's
+  counterexamples had the same length and the same action sequence as the
+  explorer's. `formal-nv` compares only the length and the first violated
+  invariant, for every primary row:
   - `held_before_commit`: run 1 sends and stages seat `a`, then answers
     `Held{true}` before any commit.
   - `commit_before_fsync`: run 1 publishes the unsealed temporary,
@@ -484,20 +545,41 @@ What the parity shows:
   the first violation depends on the order within a BFS level: 179, 549 and
   3,381 for the explorer; 196, 589 and 3,501 for TLC with one worker; and
   209, 612 and 3,541 with three workers in `tla-check`.
-- **With every invariant checked**, `src_ledger_carries_r25`'s shortest
-  counterexample also violates `S3_ReadsOnlyChanged` and
-  `S3_UnchangedReadsZero` in the same state: the seat it reads again was
-  held when the run began and is unchanged. The other two mutations violate
-  only their verdicts.
+- **With every invariant checked**, 12 of the 14 primary rows stop first
+  at their verdict, on TLC and on the explorer alike. Two stop first at
+  another invariant, on both:
+  - `reread_ignore_ledger` stops at `R25_NoDurableReread`, in the same
+    19-state counterexample that violates its verdict
+    `R25_NoCommittedCaptureReread`;
+  - `skip_output_row` stops earlier, at `LedgerAfterHeld` after 12
+    states: the source ledger records a capture whose output row the
+    mutation never commits. Its verdict `S3_ClosedPassIsHeld` needs 15.
+
+  `reread_durable`'s and `src_ledger_carries_r25`'s counterexamples also
+  violate `S3_ReadsOnlyChanged` and `S3_UnchangedReadsZero` in the same
+  state: the seat they read again was held when the run began and is
+  unchanged.
+- **What it does not show.** That the spec matches the code: the explorer
+  is a second encoding of the spec, not of the code (above). Nor does
+  every invariant fire on the explorer. 13 of the 17 safety invariants are
+  some row's named property and fire. `TypeOK` is the sanity check.
+  `NoClobber` and `S2_BackupLockBounded` hold by construction inside the
+  domain. `ClosureAccounted` is violated only by `untyped_space`, outside
+  it. The every-invariant runs still show that `ClosureAccounted` does not
+  fire early on either side.
 
 Runtime on sting at a load average near 45: the build takes about 26 s;
 `MC_nv_core` takes 0.7 s and `MC_nv_ledger` 7.6 s. Under `runghc`,
-without a build, `MC_nv_core` takes 17 s.
+without a build, `MC_nv_core` takes 17 s. A whole `just formal-nv` run,
+with its 14 TLC runs, takes about 50 s at a load average between 20 and
+30.
 
 ## N-version core (OI-1003-Q32)
 
-The model is a hybrid. A second, independent explorer, sprint 2's Haskell
-BFS, must reproduce TLC's count on a shared core. The core is `MC_nv_core`:
+The model is a hybrid. A second encoding of the spec, sprint 2's Haskell
+BFS (independent code, shared design; [Hybrid
+roles](#hybrid-roles-oi-1003-q32)), must reproduce TLC's count on a shared
+core. The core is `MC_nv_core`:
 
 - one seat, three runs, two crashes, one source edit;
 - third-party writes, commit failures, the space refusal, superseding
@@ -527,10 +609,11 @@ strict ledger. Unless `TrackStrictHeld` is set, the new field of an output
 record is always FALSE, and the new field of a read record equals `held`.
 
 The mutations `held_before_commit`, `commit_before_fsync` and
-`src_ledger_carries_r25` run on the same core as separate fail configs. Both
-explorers must find those counterexamples. A failing config's state count
-depends on where its search stops, so only the positive core's count is a
-cross-check.
+`src_ledger_carries_r25` run on the same core as separate fail configs.
+`formal-nv` runs them, and every other mutation row inside the explorer's
+domain, on both checkers at each row's own bound. A failing config's state
+count depends on where its search stops, so only the positive core's count
+is a cross-check.
 
 ## Liveness assumption (WF_vars)
 
@@ -831,7 +914,9 @@ sizes of changed or racy seats":
 Each negative config sets `Mutation` to break exactly one rule, and it must
 fail on the one property named in `configs.tsv`, with `TypeOK` checked
 alongside. Rows marked (core) run on `MC_nv_core`'s constants. The others use
-the smallest bound that reaches the break.
+the smallest bound that reaches the break. `just formal-nv` also runs every
+row inside the Haskell explorer's domain, 17 of the 23, on the explorer
+([Hybrid roles](#hybrid-roles-oi-1003-q32)).
 
 | Mutation | What it breaks (the code it would undo) | Property that must fail |
 |---|---|---|

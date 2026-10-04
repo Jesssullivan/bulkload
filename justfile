@@ -531,23 +531,37 @@ tla-check *configs:
 
 # Haskell N-version explorer (OI-1003-Q32; docs/formal/README.md, "Hybrid
 # roles"). Standalone and on demand: no tier depends on it, so check-fast,
-# check-optional, check-full and CI never build it. GHC comes from the
-# flake's pinned nixpkgs (no flake change). docs/formal/hs/Explorer.hs uses
-# base and containers only; it is built with -O1 -Wall -Werror into a
-# private mktemp directory under TMPDIR. It must reproduce TLC's run of
-# record: the distinct-state counts of MC_nv_core (15,834) and MC_nv_ledger
-# (142,450), with no invariant violated and no deadlock. On the core, each
-# of the mutations held_before_commit, commit_before_fsync and
-# src_ledger_carries_r25 must violate exactly the property configs.tsv names
-# for its MC_neg_ row, checking TypeOK and that property, as TLC does. Each
-# counterexample is written as JSON; that directory is kept and printed.
+# check-optional, check-full and CI never build it. GHC, TLC, Dhall and jq
+# come from the flake's pinned nixpkgs (no flake change).
+# docs/formal/hs/Explorer.hs uses base and containers only; it is built with
+# -O1 -Wall -Werror into a private mktemp directory under TMPDIR. Its rows:
+# - the presets nv_core and nv_ledger must reach TLC's distinct-state counts
+#   of record, MC_nv_core's 15,834 and MC_nv_ledger's 142,450, with no
+#   invariant violated and no deadlock;
+# - every MC_neg_ row of the catalogue inside the explorer's domain (the
+#   evaluated catalogue's nversion list) runs at its own bound, passed as
+#   the explorer's bound flags, checking TypeOK and the row's named
+#   property, as its TLC config does; it must violate exactly that property;
+# - each primary row among them runs again with every safety invariant
+#   checked, on the explorer and on TLC with one worker (the catalogue's
+#   scratch config for it): both must stop at the same first violated
+#   invariant after the same number of states.
+# Each explorer counterexample is written as JSON; that directory is kept
+# and printed, and so are the TLC logs.
 # Cross-check the TLA+ model with the Haskell N-version explorer.
 formal-nv:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ root }}/docs/formal
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/formal-nv.XXXXXX")
-    mkdir -p "$scratch/build" "$scratch/counterexamples"
+    mkdir -p "$scratch/build" "$scratch/counterexamples" "$scratch/tlc/java"
+    if ! (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >"$scratch/render.log" 2>&1; then
+        cat "$scratch/render.log" >&2
+        echo "formal-nv: the catalogue did not evaluate; log kept at $scratch/render.log" >&2
+        exit 1
+    fi
+    tlc=$(nix shell --inputs-from {{ root }} nixpkgs#tlaplus --command sh -c 'command -v tlc')
+    jq=$(nix shell --inputs-from {{ root }} nixpkgs#jq --command sh -c 'command -v jq')
     if ! nix shell --inputs-from {{ root }} nixpkgs#ghc --command nice -n 10 ghc -O1 -Wall -Werror -outputdir "$scratch/build" -o "$scratch/explorer" hs/Explorer.hs >"$scratch/ghc.log" 2>&1; then
         cat "$scratch/ghc.log" >&2
         echo "formal-nv: the explorer did not build; log kept at $scratch/ghc.log" >&2
@@ -557,7 +571,7 @@ formal-nv:
     declare -A tlc_distinct=([nv_core]=15834 [nv_ledger]=142450)
     field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; }
     mismatches=0
-    format='%-30s %-26s %-30s %9s %10s %6s %s\n'
+    format='%-34s %-42s %-42s %9s %10s %6s %s\n'
     printf "$format" row expect explorer distinct generated depth match
     for preset in nv_core nv_ledger; do
         status=0
@@ -571,24 +585,57 @@ formal-nv:
         fi
         printf "$format" "$(field row "$line")" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
     done
-    for mutation in held_before_commit commit_before_fsync src_ledger_carries_r25; do
-        named=$(awk -F'\t' -v row="MC_neg_$mutation" '$1 == row { print $3 }' configs.tsv)
-        if [[ -z $named ]]; then
-            echo "formal-nv: configs.tsv has no MC_neg_$mutation row" >&2
-            exit 1
-        fi
+    rows=$("$jq" '.nversion | length' "$scratch/catalogue.json")
+    if [[ $rows -eq 0 ]]; then
+        echo "formal-nv: the catalogue has no mutation row in the explorer's domain" >&2
+        exit 1
+    fi
+    export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/tlc/java -Xmx2g"
+    for ((i = 0; i < rows; i++)); do
+        IFS=$'\t' read -r name mutation named primary seats runs crashes edits foreign < <(
+            "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, .seats, .runs, .crashes, .edits, .foreign] | @tsv" "$scratch/catalogue.json")
+        bound=(--seats "$seats" --runs "$runs" --crashes "$crashes" --edits "$edits" --foreign "$foreign" --mutation "$mutation")
         status=0
-        line=$(nice -n 10 "$scratch/explorer" --mutation "$mutation" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
+        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$name" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
         got="$(field outcome "$line") $(field violated "$line")"
         match=yes
         if [[ $status -ne 1 || $got != "violation $named" ]]; then
             match=no
             mismatches=$((mismatches + 1))
         fi
-        printf "$format" "$(field row "$line")" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+        printf "$format" "$name" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+        if [[ $primary != true ]]; then
+            continue
+        fi
+        # Every safety invariant, on TLC (one worker, so its breadth-first
+        # order is fixed) and on the explorer: the first invariant violated,
+        # in the configs' order, and the counterexample's length must agree.
+        every="${name}_all"
+        log="$scratch/tlc/$every.log"
+        "$jq" -j ".nversion[$i].everyInvariant" "$scratch/catalogue.json" >"$scratch/tlc/$every.cfg"
+        nice -n 10 "$tlc" -workers 1 -metadir "$scratch/tlc/$every.states" -config "$scratch/tlc/$every.cfg" BulkloadTransfer.tla >"$log" 2>&1 || true
+        rm -rf "$scratch/tlc/$every.states"
+        tlc_first=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | head -n 1 | cut -d' ' -f2 || true)
+        if grep -qF 'Deadlock reached' "$log"; then
+            tlc_first=deadlock
+        fi
+        tlc_states=$(grep -cE '^State [0-9]+:' "$log" || true)
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$every" --check all --json "$scratch/counterexamples") || status=$?
+        first=$(field violated "$line")
+        first=${first%%,*}
+        want="TLC first ${tlc_first:-none}, $tlc_states states"
+        got="explorer first $first, $(field states "$line") states"
+        match=yes
+        if [[ $status -ne 1 || -z $tlc_first || $got != "explorer first $tlc_first, $tlc_states states" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+            echo "formal-nv: $every disagrees with TLC; TLC log kept at $log" >&2
+        fi
+        printf "$format" "$every" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
     done
-    rm -rf "$scratch/build" "$scratch/explorer"
-    echo "counterexamples (JSON): $scratch/counterexamples"
+    rm -rf "$scratch/build" "$scratch/explorer" "$scratch/rendered" "$scratch/tlc/java"
+    echo "counterexamples (JSON): $scratch/counterexamples; TLC logs: $scratch/tlc"
     if [[ $mismatches -ne 0 ]]; then
         echo "formal-nv: $mismatches row(s) disagree with TLC" >&2
         exit 1

@@ -10,6 +10,10 @@
    - every name in `grounding` exists in BulkloadTransfer.tla, and every
      code symbol is found by `git grep -w` under crates/ (grounding).
 
+   `just formal-nv` evaluates it too, and runs every row of `nversion` (the
+   mutation rows inside the Haskell explorer's domain) on the explorer and,
+   for the every-invariant check, on TLC.
+
    The `assert`s below are checked whenever the catalogue is evaluated, so a
    catalogue that breaks one of them renders nothing. No Prelude import: the
    catalogue evaluates offline.
@@ -1328,6 +1332,93 @@ let _ =
               invariants
         ===  map P Natural T.propertyIndex (filter P traced allProperties)
 
+-- The N-version explorer's rows (`just formal-nv`) ------------------------------
+
+{- The constants hs/Explorer.hs models: no failed group commit, no space
+   refusal, a strict source ledger and store, no superseding publish, no
+   estate reads, a sealed state root and no strict-held ghost. Seats, runs,
+   crashes, edits and third-party writes are its bound flags.
+-}
+let explorerModels =
+      \(c : T.Constants) ->
+            Natural/isZero c.MaxCommitFails
+        &&  c.SpaceRefusals == False
+        &&  c.RelaxedSourceLedger == False
+        &&  c.RelaxedAuthority == False
+        &&  merge { off = True, check_rename = False, exchange = False } c.SupersedeMode
+        &&  c.EstateReads == False
+        &&  c.StoreRootSealed
+        &&  c.TrackStrictHeld == False
+
+{- Every mutation row inside the explorer's domain, with its bound as the
+   explorer's flags. formal-nv runs each one on the explorer, which must
+   violate `property`, as TLC must. For a primary row it also runs the
+   mutation once with every safety invariant checked, on the explorer and
+   on TLC (`everyInvariant`, a config for scratch, never committed), and
+   the two must stop at the same invariant after the same number of states.
+-}
+let NvRow =
+      { name : Text
+      , mutation : Text
+      , property : Text
+      , primary : Bool
+      , seats : Text
+      , runs : Natural
+      , crashes : Natural
+      , edits : Natural
+      , foreign : Natural
+      , everyInvariant : Text
+      }
+
+let nversion =
+      concatMap
+        T.NegRow
+        NvRow
+        ( \(n : T.NegRow) ->
+            let c = n.constants
+
+            let r = neg n
+
+            in  if    explorerModels c
+                then  [ { name = r.name
+                        , mutation = showM n.mutation
+                        , property = showP (negProperty n)
+                        , primary =
+                            merge
+                              { verdict = True
+                              , also =
+                                  \(_ : { suffix : Text, property : P }) -> False
+                              }
+                              n.against
+                        , seats =
+                            join
+                              ""
+                              ( map
+                                  Seat
+                                  Text
+                                  (\(s : Seat) -> showConstructor s)
+                                  c.Seats
+                              )
+                        , runs = c.MaxRuns
+                        , crashes = c.MaxCrashes
+                        , edits = c.MaxEdits
+                        , foreign = c.MaxForeign
+                        , everyInvariant =
+                            cfgText
+                              (     r
+                                //  { comment =
+                                      [ "formal-nv scratch config, not a row of configs.tsv: ${r.name}"
+                                      , "with every safety invariant checked, for TLC's first violation."
+                                      ]
+                                    , expect = T.Expect.simulate safety
+                                    }
+                              )
+                        }
+                      ]
+                else  [] : List NvRow
+        )
+        negRows
+
 -- Outputs ----------------------------------------------------------------------
 
 let constantNames =
@@ -1365,4 +1456,5 @@ in  { files =
             invariants
       }
     , invariants
+    , nversion
     }
