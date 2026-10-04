@@ -25,6 +25,7 @@ use bulkload_agent::counters::Counters;
 use bulkload_agent::durable::Durability;
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::priority::PriorityClass;
+use bulkload_agent::refuse::RefuseAt as _;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
 use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
@@ -498,8 +499,12 @@ fn interrupt_after_payload(
     transfer::tune_stream(&receiver);
     std::thread::scope(|scope| -> io::Result<()> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let input = sender.try_clone()?;
-            let closer = sender.try_clone()?;
+            let input = sender
+                .try_clone()
+                .refuse_at("bench::interrupt_after_payload")?;
+            let closer = sender
+                .try_clone()
+                .refuse_at("bench::interrupt_after_payload")?;
             let served = transfer::serve(input, &mut StopBeforeDone(sender));
             // The source's reader thread holds a clone of this end; closing
             // it lets the destination see the interruption.

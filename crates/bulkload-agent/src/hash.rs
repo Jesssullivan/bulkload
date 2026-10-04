@@ -4,6 +4,7 @@
 //! classified as a regular file must still be a regular file when its bytes
 //! are read, or the read is refused rather than followed somewhere else.
 
+use crate::refuse::RefuseAt as _;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
@@ -47,7 +48,10 @@ pub fn open_nofollow(path: &Path) -> Result<File> {
         )
     };
     if fd < 0 {
-        return Err(BulkloadRefusal::from(std::io::Error::last_os_error()));
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "hash::open_nofollow",
+        ));
     }
     // SAFETY: `fd` is a fresh, open, owned descriptor that nothing else holds.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -61,7 +65,7 @@ pub fn open_nofollow(path: &Path) -> Result<File> {
 /// read fails partway through.
 pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let file = open_nofollow(path)?;
-    let identity = StatIdentity::from_metadata(&file.metadata()?);
+    let identity = StatIdentity::from_metadata(&file.metadata().refuse_at("hash::hash_file")?);
     hash_open_file(file, &identity, &mut 0, &mut 0)
 }
 
@@ -104,7 +108,7 @@ pub(crate) fn hash_beneath_observed(
     let mut bytes_read = 0;
     let mut metadata_checks = 0;
     let digest = crate::io::sys::openat_beneath(root, rel, crate::io::OpenMode::Read)
-        .map_err(BulkloadRefusal::from)
+        .refuse_at("hash::hash_beneath_observed")
         .and_then(|fd| {
             hash_open_file(
                 File::from(fd),
@@ -127,14 +131,14 @@ fn hash_open_file(
     metadata_checks: &mut u64,
 ) -> Result<[u8; 32]> {
     *metadata_checks += 1;
-    let before = file.metadata()?;
+    let before = file.metadata().refuse_at("hash::hash_open_file")?;
     if !before.is_file() || StatIdentity::from_metadata(&before) != *expected {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0_u8; READ_CHUNK_BYTES];
     loop {
-        let read = file.read(&mut buf)?;
+        let read = file.read(&mut buf).refuse_at("hash::hash_open_file")?;
         if read == 0 {
             break;
         }
@@ -144,7 +148,8 @@ fn hash_open_file(
         counters::update(&mut hasher, Counter::HashFile, filled);
     }
     *metadata_checks += 1;
-    if StatIdentity::from_metadata(&file.metadata()?) != *expected {
+    if StatIdentity::from_metadata(&file.metadata().refuse_at("hash::hash_open_file")?) != *expected
+    {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     Ok(*hasher.finalize().as_bytes())

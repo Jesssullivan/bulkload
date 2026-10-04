@@ -27,6 +27,7 @@
 //! [`PrivateState`] and the private-file helpers are shared with git carry
 //! v2's list store (`git_carry::carry_v2`).
 
+use crate::refuse::RefuseAt as _;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
@@ -67,12 +68,15 @@ impl PrivateState {
         let absolute = if state_dir.is_absolute() {
             state_dir.to_path_buf()
         } else {
-            std::env::current_dir()?.join(state_dir)
+            std::env::current_dir()
+                .refuse_at("git_carry::estimate::stderr_store::open")?
+                .join(state_dir)
         };
         let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
             return Err(BulkloadRefusal::PathNotAbsolute);
         };
-        let parent = std::fs::canonicalize(parent)?;
+        let parent =
+            std::fs::canonicalize(parent).refuse_at("git_carry::estimate::stderr_store::open")?;
         let mut directory = open_dir(None, Path::new("/"))?;
         let mut chain = vec![identity(&directory)?];
         for component in parent.components() {
@@ -131,7 +135,10 @@ pub fn private_subdirectory(parent: &File, name: &str, create: bool) -> Result<O
         if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error.into());
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::estimate::stderr_store",
+                ));
             }
         }
     }
@@ -146,7 +153,9 @@ pub fn private_subdirectory(parent: &File, name: &str, create: bool) -> Result<O
 }
 
 fn identity(directory: &File) -> Result<(u64, u64)> {
-    let metadata = directory.metadata()?;
+    let metadata = directory
+        .metadata()
+        .refuse_at("git_carry::estimate::stderr_store::identity")?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
@@ -263,7 +272,10 @@ impl StderrStore {
     }
 
     fn link(&self, opened: &Opened, capture: &Capture) -> Result<(String, PathBuf)> {
-        capture.file.sync_all()?;
+        capture
+            .file
+            .sync_all()
+            .refuse_at("git_carry::estimate::stderr_store::link")?;
         let digest = capture.hasher.finalize().to_hex().to_string();
         let leaf = format!("{digest}.log");
         let name = cstring(leaf.as_bytes())?;
@@ -281,17 +293,25 @@ impl StderrStore {
         if linked != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(error.into());
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::estimate::stderr_store",
+                ));
             }
             let existing = open_existing(&opened.directory, &name)?;
             private_file(&existing)?;
             let mut hasher = blake3::Hasher::new_keyed(&opened.key);
-            hasher.update_reader(&existing)?;
+            hasher
+                .update_reader(&existing)
+                .refuse_at("git_carry::estimate::stderr_store::link")?;
             if hasher.finalize().to_hex().as_str() != digest {
                 return Err(BulkloadRefusal::PathEscapesRoot);
             }
         }
-        opened.directory.sync_all()?;
+        opened
+            .directory
+            .sync_all()
+            .refuse_at("git_carry::estimate::stderr_store::link")?;
         Ok((digest, self.shown.join(leaf)))
     }
 
@@ -318,7 +338,9 @@ impl Capture {
     /// # Errors
     /// Any write failure.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file.write_all(bytes)?;
+        self.file
+            .write_all(bytes)
+            .refuse_at("git_carry::estimate::stderr_store::write")?;
         self.hasher.update(bytes);
         Ok(())
     }
@@ -341,7 +363,10 @@ fn open_dir(parent: Option<&File>, name: &Path) -> Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::estimate::stderr_store::open_dir",
+        ));
     }
     // SAFETY: `fd` was just opened and is owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -359,7 +384,10 @@ pub fn create_private(directory: &File, name: &CString) -> Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::estimate::stderr_store::create_private",
+        ));
     }
     // SAFETY: `fd` was just created and is owned by nothing else.
     let file = unsafe { File::from_raw_fd(fd) };
@@ -368,7 +396,10 @@ pub fn create_private(directory: &File, name: &CString) -> Result<File> {
         let error = std::io::Error::last_os_error();
         // SAFETY: as in `create_private`'s open.
         unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-        return Err(error.into());
+        return Err(crate::refuse::io(
+            &error,
+            "git_carry::estimate::stderr_store",
+        ));
     }
     if let Err(error) = private_file(&file) {
         // SAFETY: as above.
@@ -389,7 +420,10 @@ pub fn open_existing(directory: &File, name: &CString) -> Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::estimate::stderr_store::open_existing",
+        ));
     }
     // SAFETY: `fd` was just opened and is owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -402,18 +436,31 @@ fn key(directory: &File) -> Result<[u8; 32]> {
     let mut key = [0_u8; 32];
     match create_private(directory, &name) {
         Ok(mut file) => {
-            File::open("/dev/urandom")?.read_exact(&mut key)?;
-            file.write_all(&key)?;
-            file.sync_all()?;
-            directory.sync_all()?;
+            File::open("/dev/urandom")
+                .refuse_at("git_carry::estimate::stderr_store::key")?
+                .read_exact(&mut key)
+                .refuse_at("git_carry::estimate::stderr_store::key")?;
+            file.write_all(&key)
+                .refuse_at("git_carry::estimate::stderr_store::key")?;
+            file.sync_all()
+                .refuse_at("git_carry::estimate::stderr_store::key")?;
+            directory
+                .sync_all()
+                .refuse_at("git_carry::estimate::stderr_store::key")?;
         }
         Err(BulkloadRefusal::Io(Some(libc::EEXIST))) => {
             let mut file = open_existing(directory, &name)?;
             private_file(&file)?;
-            if file.metadata()?.len() != 32 {
+            if file
+                .metadata()
+                .refuse_at("git_carry::estimate::stderr_store::key")?
+                .len()
+                != 32
+            {
                 return Err(BulkloadRefusal::PathEscapesRoot);
             }
-            file.read_exact(&mut key)?;
+            file.read_exact(&mut key)
+                .refuse_at("git_carry::estimate::stderr_store::key")?;
         }
         Err(error) => return Err(error),
     }
@@ -421,7 +468,9 @@ fn key(directory: &File) -> Result<[u8; 32]> {
 }
 
 fn private_directory(directory: &File) -> Result<()> {
-    let metadata = directory.metadata()?;
+    let metadata = directory
+        .metadata()
+        .refuse_at("git_carry::estimate::stderr_store::private_directory")?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if !metadata.is_dir()
@@ -435,7 +484,9 @@ fn private_directory(directory: &File) -> Result<()> {
 }
 
 pub fn private_file(file: &File) -> Result<()> {
-    let metadata = file.metadata()?;
+    let metadata = file
+        .metadata()
+        .refuse_at("git_carry::estimate::stderr_store::private_file")?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if !metadata.is_file()
@@ -470,7 +521,10 @@ fn extended_acl(file: &File) -> Result<bool> {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(libc::ENOENT) => Ok(false),
-            _ => Err(error.into()),
+            _ => Err(crate::refuse::io(
+                &error,
+                "git_carry::estimate::stderr_store::extended_acl",
+            )),
         };
     }
     let mut entry = std::ptr::null_mut();
@@ -495,7 +549,12 @@ fn extended_acl(file: &File) -> Result<bool> {
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::ENODATA | libc::EOPNOTSUPP) => {}
-            _ => return Err(error.into()),
+            _ => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::estimate::stderr_store",
+                ))
+            }
         }
     }
     Ok(false)
