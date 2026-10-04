@@ -6,6 +6,7 @@
 //! its bytes; the destination re-reads chunks only from published outputs,
 //! through hints it re-verifies on use.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::io::Read as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -343,14 +344,18 @@ impl Store {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&db)?;
+                .open(&db)
+                .refuse_at("transfer_store::open")?;
         }
         let conn = rusqlite::Connection::open(db).map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
         crate::io::durable::configure_sqlite(&conn)?;
         let mut random = [0_u8; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        fs::File::open("/dev/urandom")
+            .refuse_at("transfer_store::open")?
+            .read_exact(&mut random)
+            .refuse_at("transfer_store::open")?;
         let before = conn.total_changes();
         let started = Instant::now();
         conn.execute_batch("BEGIN").map_err(sqlite_error)?;
@@ -399,7 +404,7 @@ impl Store {
         created?;
         counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
-            root: fs::canonicalize(root)?,
+            root: fs::canonicalize(root).refuse_at("transfer_store::open")?,
             conn,
             rows_trusted: true,
         })
@@ -407,9 +412,9 @@ impl Store {
 
     /// Open an initialized store without obtaining any write capability.
     pub(crate) fn open_reader(root: &Path) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+        let root = fs::canonicalize(root).refuse_at("transfer_store::open_reader")?;
         let db = root.join("transfer.sqlite");
-        let meta = fs::symlink_metadata(&db)?;
+        let meta = fs::symlink_metadata(&db).refuse_at("transfer_store::open_reader")?;
         if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
@@ -531,7 +536,7 @@ impl Store {
     /// # Errors
     /// Refuses serialization or database failures.
     pub fn record_capture(&self, key: &[u8], value: &Manifest) -> Result<()> {
-        let encoded = postcard::to_stdvec(value)?;
+        let encoded = postcard::to_stdvec(value).refuse_at("transfer_store::record_capture")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -635,7 +640,8 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })
+            .refuse_at("transfer_store::record_directory_created")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -750,8 +756,9 @@ impl StorePublisher {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(store.root.join("writer.lock"))?;
-        crate::io::sys::flock_exclusive(&lock)?;
+            .open(store.root.join("writer.lock"))
+            .refuse_at("transfer_store::open")?;
+        crate::io::sys::flock_exclusive(&lock).refuse_at("transfer_store::open")?;
         Ok(Self {
             store,
             side: role,
@@ -895,7 +902,11 @@ impl StorePublisher {
                     .execute(
                         "INSERT INTO captures VALUES (?1, ?2)
                          ON CONFLICT(key) DO UPDATE SET manifest=excluded.manifest",
-                        (&capture.key, postcard::to_stdvec(&capture.manifest)?),
+                        (
+                            &capture.key,
+                            postcard::to_stdvec(&capture.manifest)
+                                .refuse_at("transfer_store::commit_captures")?,
+                        ),
                     )
                     .map_err(sqlite_error)?;
             }
@@ -1030,7 +1041,7 @@ impl crate::io::durable::GroupSink for LedgerSink {
 /// # Errors
 /// Refuses serialization failure.
 pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(authority, row))?)
+    postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
 }
 
 /// Whether the store carries the [`RACY_GUARD_SETTING`] marker (#125).
@@ -1043,13 +1054,14 @@ fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
 }
 
 fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(
+    postcard::to_stdvec(&(
         identity.dev,
         identity.ino,
         identity.size,
         identity.mtime_ns,
         identity.ctime_ns,
-    ))?)
+    ))
+    .refuse_at("transfer_store::identity_bytes")
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -1058,10 +1070,13 @@ fn private_dir(path: &Path) -> Result<()> {
         Ok(_) => Err(BulkloadRefusal::PathEscapesRoot),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             use std::os::unix::fs::DirBuilderExt as _;
-            fs::DirBuilder::new().mode(0o700).create(path)?;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .refuse_at("transfer_store::private_dir")?;
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "transfer_store::private_dir")),
     }
 }
 
@@ -1091,7 +1106,7 @@ mod tests {
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path)?;
+            fs::create_dir(&path).refuse_at("transfer_store::tests::new")?;
             Ok(Self(path))
         }
     }
@@ -1318,8 +1333,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::output_records_and_chunk_hints_commit_together")?;
+        let identity =
+            StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+                "transfer_store::tests::output_records_and_chunk_hints_commit_together",
+            )?);
         let hint = ChunkHint {
             digest: [3; 32],
             offset: 5,
@@ -1356,8 +1375,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?,
+        );
         let record = |racy: bool| OutputRecord {
             key: b"key".to_vec(),
             rel_path: b"output".to_vec(),
@@ -1387,7 +1410,8 @@ mod tests {
         let store = Store::open(&state)?;
         let exact = manifest(b"exact");
         store.record_capture(b"exact", &exact)?;
-        let mut padded = postcard::to_stdvec(&exact)?;
+        let mut padded = postcard::to_stdvec(&exact)
+            .refuse_at("transfer_store::tests::a_ledger_row_with_trailing_bytes_is_a_miss")?;
         padded.push(0);
         store
             .conn
@@ -1411,8 +1435,12 @@ mod tests {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output").refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?;
+        let identity = StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?);
         let record = |key: &[u8]| OutputRecord {
             key: key.to_vec(),
             rel_path: b"output".to_vec(),
@@ -1470,8 +1498,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?,
+        );
         let record = |path: &[u8], offset: u64| OutputRecord {
             key: path.to_vec(),
             rel_path: path.to_vec(),

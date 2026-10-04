@@ -65,6 +65,7 @@
 //! After the first two the session can [`Ingest::abandon`]; a connectivity
 //! failure abandons it itself. Nothing is published by a refused session.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::File;
@@ -132,7 +133,9 @@ impl Target {
             "objects_path_failed",
             |stdout| {
                 let mut text = Vec::new();
-                stdout.read_to_end(&mut text)?;
+                stdout
+                    .read_to_end(&mut text)
+                    .refuse_at("git_carry::carry_v2::ingest::probe")?;
                 Ok(text)
             },
         )?;
@@ -140,7 +143,8 @@ impl Target {
             .strip_suffix(b"\n")
             .filter(|path| path.starts_with(b"/") && !path.iter().any(u8::is_ascii_control))
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        let objects = std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(objects)))?;
+        let objects = std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(objects)))
+            .refuse_at("git_carry::carry_v2::ingest::probe")?;
         // OI-1001-Q17, #75 r5: the quarantine and the fence are `flock`
         // locks, which a network filesystem cannot be trusted to honour (and
         // NFS refuses on a read-only descriptor). Ingest destinations must be
@@ -256,11 +260,19 @@ impl Target {
             )
         };
         if fd < 0 {
-            return Err(BulkloadRefusal::from(std::io::Error::last_os_error()).into());
+            return Err(crate::refuse::io(
+                &std::io::Error::last_os_error(),
+                "git_carry::carry_v2::ingest::fence",
+            )
+            .into());
         }
         // SAFETY: `fd` was just opened and is owned by nothing else.
         let lock = unsafe { File::from_raw_fd(fd) };
-        if !lock.metadata()?.is_file() {
+        if !lock
+            .metadata()
+            .refuse_at("git_carry::carry_v2::ingest::fence")?
+            .is_file()
+        {
             return Err(BulkloadRefusal::GitInventoryMalformed.into());
         }
         if !lock_exclusive(&lock)? {
@@ -857,7 +869,9 @@ impl<'a> Ingest<'a> {
                     "quarantine_exists",
                 ));
             }
-            return Err(BulkloadRefusal::from(error).into());
+            return Err(
+                crate::refuse::io(&error, "git_carry::carry_v2::ingest::make_quarantine").into(),
+            );
         }
         self.claim = claim_quarantine(&self.target.objects, &self.quarantine)?;
         if self.claim.is_none() {
@@ -886,8 +900,8 @@ impl<'a> Ingest<'a> {
         let pack = cstring(b"pack")?;
         if create {
             make_dir(&quarantine, &pack)?;
-            seal_dir(&quarantine)?;
-            seal_dir(&objects)?;
+            seal_dir(&quarantine).refuse_at("git_carry::carry_v2::ingest::quarantine")?;
+            seal_dir(&objects).refuse_at("git_carry::carry_v2::ingest::quarantine")?;
         }
         let pack = match open_dir_at(&quarantine, &pack) {
             Ok(pack) => pack,
@@ -926,11 +940,16 @@ impl<'a> Ingest<'a> {
         let mut held = Vec::new();
         match open_file_at(&common, &cstring(b"shallow")?) {
             Ok(file) => {
-                let metadata = file.metadata()?;
+                let metadata = file
+                    .metadata()
+                    .refuse_at("git_carry::carry_v2::ingest::frontier")?;
                 if !metadata.is_file() {
                     return Err(BulkloadRefusal::GitInventoryMalformed.into());
                 }
-                (&file).take(16 << 20).read_to_end(&mut held)?;
+                (&file)
+                    .take(16 << 20)
+                    .read_to_end(&mut held)
+                    .refuse_at("git_carry::carry_v2::ingest::frontier")?;
             }
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
             Err(error) => return Err(error.into()),
@@ -1054,7 +1073,8 @@ impl<'a> Ingest<'a> {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()?;
+                .status()
+                .refuse_at("git_carry::carry_v2::ingest::occupied")?;
             match status.code() {
                 Some(1) => {}
                 Some(0) => {
@@ -1111,7 +1131,7 @@ impl<'a> Ingest<'a> {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
         }
-        seal_dir(&pack)?;
+        seal_dir(&pack).refuse_at("git_carry::carry_v2::ingest::sweep")?;
         for ack in &self.acks {
             for extension in ["pack", "idx"] {
                 let name = cstring(format!("pack-{}.{extension}", ack.pack).as_bytes())?;
@@ -1159,12 +1179,12 @@ impl<'a> Ingest<'a> {
                 &pack_dir,
                 &cstring(format!("pack-{hash}.{extension}").as_bytes())?,
             ) {
-                Ok(file) => seal_file(&file)?,
+                Ok(file) => seal_file(&file).refuse_at("git_carry::carry_v2::ingest::receive")?,
                 Err(BulkloadRefusal::Io(Some(libc::ENOENT))) if extension == "rev" => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        seal_dir(&pack_dir)?;
+        seal_dir(&pack_dir).refuse_at("git_carry::carry_v2::ingest::receive")?;
         // #75 r1 D1(a): the ack is a record on the state dir's device; the
         // pack's device is fully flushed first, so the ack never outlives the
         // pack on power loss (device-wide on Darwin, R-N103).
@@ -1383,7 +1403,8 @@ impl<'a> Ingest<'a> {
             self.store,
             "connectivity_missing",
             |stdout| {
-                std::io::copy(stdout, &mut std::io::sink())?;
+                std::io::copy(stdout, &mut std::io::sink())
+                    .refuse_at("git_carry::carry_v2::ingest::connected")?;
                 Ok(())
             },
         )
@@ -1426,10 +1447,10 @@ impl<'a> Ingest<'a> {
                 }
             }
         }
-        seal_dir(&target)?;
+        seal_dir(&target).refuse_at("git_carry::carry_v2::ingest::migrate")?;
         drop(from);
         self.discard_quarantine()?;
-        seal_dir(&objects)?;
+        seal_dir(&objects).refuse_at("git_carry::carry_v2::ingest::migrate")?;
         flush_device(&objects)?;
         Ok(())
     }
@@ -1480,7 +1501,8 @@ impl<'a> Ingest<'a> {
                 self.store,
                 "ref_transaction_refused",
                 |stdout| {
-                    std::io::copy(stdout, &mut std::io::sink())?;
+                    std::io::copy(stdout, &mut std::io::sink())
+                        .refuse_at("git_carry::carry_v2::ingest::publish")?;
                     Ok(())
                 },
             )
@@ -1518,7 +1540,7 @@ impl<'a> Ingest<'a> {
             let parents = parts
                 .get(1..parts.len().saturating_sub(1))
                 .unwrap_or_default();
-            seal_dir(&directory)?;
+            seal_dir(&directory).refuse_at("git_carry::carry_v2::ingest::seal_refs")?;
             for part in parents {
                 directory = match open_dir_at(&directory, &cstring(part.as_bytes())?) {
                     Ok(next) => next,
@@ -1526,25 +1548,26 @@ impl<'a> Ingest<'a> {
                     Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => break,
                     Err(error) => return Err(error),
                 };
-                seal_dir(&directory)?;
+                seal_dir(&directory).refuse_at("git_carry::carry_v2::ingest::seal_refs")?;
             }
         }
         match open_file_at(&common, &cstring(b"packed-refs")?) {
-            Ok(file) => seal_file(&file)?,
+            Ok(file) => seal_file(&file).refuse_at("git_carry::carry_v2::ingest::seal_refs")?,
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
             Err(error) => return Err(error),
         }
         match open_dir_at(&common, &cstring(b"reftable")?) {
             Ok(tables) => {
                 for name in entries(&tables)? {
-                    seal_file(&open_file_at(&tables, &cstring(&name)?)?)?;
+                    seal_file(&open_file_at(&tables, &cstring(&name)?)?)
+                        .refuse_at("git_carry::carry_v2::ingest::seal_refs")?;
                 }
-                seal_dir(&tables)?;
+                seal_dir(&tables).refuse_at("git_carry::carry_v2::ingest::seal_refs")?;
             }
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {}
             Err(error) => return Err(error),
         }
-        seal_dir(&common)?;
+        seal_dir(&common).refuse_at("git_carry::carry_v2::ingest::seal_refs")?;
         flush_device(&common)?;
         Ok(())
     }
@@ -1596,7 +1619,8 @@ impl<'a> Ingest<'a> {
             self.store,
             "connectivity_missing",
             |stdout| {
-                std::io::copy(stdout, &mut std::io::sink())?;
+                std::io::copy(stdout, &mut std::io::sink())
+                    .refuse_at("git_carry::carry_v2::ingest::connected_in_store")?;
                 Ok(())
             },
         )
@@ -1714,12 +1738,15 @@ impl<'a> Ingest<'a> {
                 Err(error) => return Err(error),
             };
             let mut held = Vec::new();
-            (&mut file).take(4096).read_to_end(&mut held)?;
+            (&mut file)
+                .take(4096)
+                .read_to_end(&mut held)
+                .refuse_at("git_carry::carry_v2::ingest::drop_keeps")?;
             if held == message.as_bytes() {
                 unlink_at(&pack, &name)?;
             }
         }
-        seal_dir(&pack)?;
+        seal_dir(&pack).refuse_at("git_carry::carry_v2::ingest::drop_keeps")?;
         Ok(())
     }
 }
@@ -1750,7 +1777,9 @@ fn index_pack(
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        child.wait()?;
+        child
+            .wait()
+            .refuse_at("git_carry::carry_v2::ingest::index_pack")?;
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
@@ -1784,7 +1813,9 @@ fn index_pack(
         let read = stdout.read_to_end(&mut answer).map(|_| answer);
         (feeder.join(), reader.join(), read)
     });
-    let status = child.wait()?;
+    let status = child
+        .wait()
+        .refuse_at("git_carry::carry_v2::ingest::index_pack")?;
     let drained = drained.map_err(|_| BulkloadRefusal::Io(None))?;
     let fed = fed.map_err(|_| BulkloadRefusal::Io(None))?;
     if !status.success() {
@@ -1798,8 +1829,8 @@ fn index_pack(
     if let (Some(store), (_, _, Some(capture), _)) = (store, drained) {
         store.discard(capture);
     }
-    let (bytes, blake3, whole) = fed?;
-    let answer = answer?;
+    let (bytes, blake3, whole) = fed.refuse_at("git_carry::carry_v2::ingest::index_pack")?;
+    let answer = answer.refuse_at("git_carry::carry_v2::ingest::index_pack")?;
     let hash = answer
         .strip_suffix(b"\n")
         .and_then(|line| line.strip_prefix(b"keep\t"))
@@ -1879,7 +1910,7 @@ fn discard_quarantine(objects: &Path, name: &str, held: Option<&File>) -> Outcom
         Err(error) => return Err(error.into()),
     }
     remove_dir_at(&objects, &name)?;
-    seal_dir(&objects)?;
+    seal_dir(&objects).refuse_at("git_carry::carry_v2::ingest::discard_quarantine")?;
     Ok(())
 }
 
@@ -1891,7 +1922,10 @@ fn remote_filesystem(directory: &File) -> crate::Result<Option<&'static str>> {
     // SAFETY: `directory` is open and `stat` is valid writable storage for
     // one `statfs`.
     if unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::carry_v2::ingest::remote_filesystem",
+        ));
     }
     // SAFETY: `fstatfs` succeeded, so it filled `stat`.
     let stat = unsafe { stat.assume_init() };
@@ -1960,11 +1994,12 @@ fn darwin_remote_kind(name: &[u8]) -> Option<&'static str> {
 /// A full flush of `file`'s device, counted as one (`F_FULLFSYNC` on Darwin,
 /// which drains the whole drive cache; `fsync` elsewhere).
 fn flush_device(file: &File) -> crate::Result<()> {
-    Ok(crate::counters::timed(
+    crate::counters::timed(
         crate::counters::Counter::FlushFull,
         crate::counters::Counter::FlushFullNs,
         || crate::io::sys::full_flush(file),
-    )?)
+    )
+    .refuse_at("git_carry::carry_v2::ingest::flush_device")
 }
 
 fn open_dir(path: &Path) -> crate::Result<File> {
@@ -1987,7 +2022,10 @@ fn open_dir_raw(at: libc::c_int, name: &CString) -> crate::Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::carry_v2::ingest::open_dir_raw",
+        ));
     }
     // SAFETY: `fd` was just opened and is owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -2004,7 +2042,10 @@ fn open_file_at(parent: &File, name: &CString) -> crate::Result<File> {
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "git_carry::carry_v2::ingest::open_file_at",
+        ));
     }
     // SAFETY: `fd` was just opened and is owned by nothing else.
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -2015,7 +2056,10 @@ fn make_dir(parent: &File, name: &CString) -> crate::Result<()> {
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EEXIST) {
-            return Err(error.into());
+            return Err(crate::refuse::io(
+                &error,
+                "git_carry::carry_v2::ingest::make_dir",
+            ));
         }
     }
     Ok(())
@@ -2026,7 +2070,10 @@ fn unlink_at(parent: &File, name: &CString) -> crate::Result<()> {
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error.into());
+            return Err(crate::refuse::io(
+                &error,
+                "git_carry::carry_v2::ingest::unlink_at",
+            ));
         }
     }
     Ok(())
@@ -2037,7 +2084,10 @@ fn remove_dir_at(parent: &File, name: &CString) -> crate::Result<()> {
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error.into());
+            return Err(crate::refuse::io(
+                &error,
+                "git_carry::carry_v2::ingest::remove_dir_at",
+            ));
         }
     }
     Ok(())
@@ -2049,7 +2099,8 @@ fn rename_noreplace(
     to_dir: &File,
     to: &CString,
 ) -> crate::Result<()> {
-    crate::io::sys::rename_noreplace_at(from_dir, from, to_dir, to).map_err(Into::into)
+    crate::io::sys::rename_noreplace_at(from_dir, from, to_dir, to)
+        .refuse_at("git_carry::carry_v2::ingest::rename_noreplace")
 }
 
 /// Every entry name in `directory` except `.` and `..`, read through a fresh
@@ -2064,7 +2115,10 @@ fn entries(directory: &File) -> crate::Result<Vec<Vec<u8>>> {
         let error = std::io::Error::last_os_error();
         // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
         unsafe { libc::close(fd) };
-        return Err(error.into());
+        return Err(crate::refuse::io(
+            &error,
+            "git_carry::carry_v2::ingest::entries",
+        ));
     }
     let mut names = Vec::new();
     let outcome = loop {
@@ -2091,7 +2145,7 @@ fn entries(directory: &File) -> crate::Result<Vec<Vec<u8>>> {
     };
     // SAFETY: `stream` came from `fdopendir` and is closed exactly once.
     unsafe { libc::closedir(stream) };
-    outcome?;
+    outcome.refuse_at("git_carry::carry_v2::ingest::entries")?;
     Ok(names)
 }
 

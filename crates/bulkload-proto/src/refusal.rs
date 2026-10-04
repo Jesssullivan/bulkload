@@ -453,18 +453,6 @@ impl StderrClass {
     }
 }
 
-impl From<std::io::Error> for BulkloadRefusal {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err.raw_os_error())
-    }
-}
-
-impl From<postcard::Error> for BulkloadRefusal {
-    fn from(_: postcard::Error) -> Self {
-        Self::FrameCodec
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
@@ -551,8 +539,7 @@ mod tests {
 
     #[test]
     fn io_refusal_carries_errno() {
-        let refusal = BulkloadRefusal::from(std::io::Error::from_raw_os_error(2));
-        assert_eq!(refusal, BulkloadRefusal::Io(Some(2)));
+        let refusal = BulkloadRefusal::Io(Some(2));
         assert_eq!(refusal.code(), "IO");
         assert_eq!(refusal.to_string(), "IO (errno 2)");
     }

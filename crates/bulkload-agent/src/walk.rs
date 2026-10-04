@@ -72,6 +72,7 @@
 //! such as `.bulkload-2026-09`, so it is carried like any file. So is every
 //! other kind, and a tagged directory that holds anything else.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -321,7 +322,7 @@ impl<'root> Walker<'root> {
         cross_device: bool,
         limits: WalkLimits,
     ) -> Result<Self> {
-        let root_dev = sys::fstat(root)?.node.dev;
+        let root_dev = sys::fstat(root).refuse_at("walk::with_limits")?.node.dev;
         let mut walker = Self {
             root_dev,
             cross_device,
@@ -333,7 +334,7 @@ impl<'root> Walker<'root> {
             _root: root,
         };
         match sys::open_dir_at(root, c".")
-            .map_err(BulkloadRefusal::from)
+            .refuse_at("walk::with_limits")
             .and_then(|dir| level_of(dir, 0))
         {
             Ok(level) => {
@@ -358,7 +359,7 @@ impl<'root> Walker<'root> {
     fn visit(&self, parent: BorrowedFd<'_>, name: &CStr, rel_path: Vec<u8>) -> Visit {
         let stat = match sys::fstatat_nofollow(parent, name) {
             Ok(stat) => stat,
-            Err(error) => return refuse(rel_path, BulkloadRefusal::from(error)),
+            Err(error) => return refuse(rel_path, crate::refuse::io(&error, "walk::visit")),
         };
         if !self.cross_device && stat.node.dev != self.root_dev {
             return Visit::Skip;
@@ -424,12 +425,18 @@ impl<'root> Walker<'root> {
             // Unreadable: the directory is a seat, its contents are refused.
             Err(error) => {
                 let row = row_from_stat(rel_path.clone(), stat);
-                return contents_refused(rel_path, row, BulkloadRefusal::from(error));
+                return contents_refused(
+                    rel_path,
+                    row,
+                    crate::refuse::io(&error, "walk::visit_directory"),
+                );
             }
         };
         let opened = match sys::fstat(&dir) {
             Ok(opened) => opened,
-            Err(error) => return refuse(rel_path, BulkloadRefusal::from(error)),
+            Err(error) => {
+                return refuse(rel_path, crate::refuse::io(&error, "walk::visit_directory"))
+            }
         };
         if !self.cross_device && opened.node.dev != self.root_dev {
             return Visit::Skip;
@@ -545,7 +552,7 @@ impl Iterator for Walker<'_> {
 
 /// List the directory `dir`, names in byte order, as one walk level.
 fn level_of(dir: OwnedFd, prefix_len: usize) -> Result<Level> {
-    let mut names = sys::list_dir(&dir)?;
+    let mut names = sys::list_dir(&dir).refuse_at("walk::level_of")?;
     names.sort_unstable();
     Ok(Level {
         dir,
@@ -624,7 +631,7 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
     if !options.root.is_absolute() {
         return Err(BulkloadRefusal::PathNotAbsolute);
     }
-    let root = sys::open_root(&options.root)?;
+    let root = sys::open_root(&options.root).refuse_at("walk::walk")?;
     let mut outcome = WalkOutcome::default();
     let mut to_hash: Vec<(usize, PathBuf, StatIdentity, bool)> = Vec::new();
 
@@ -716,14 +723,16 @@ fn complete_hashes<C: FreshnessCache>(
     // owning thread commits each successful read while other workers continue.
     let (sender, receiver) = std::sync::mpsc::sync_channel(rayon::current_num_threads());
     std::thread::scope(|scope| -> Result<()> {
-        let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let _ = to_hash
-                .par_iter()
-                .try_for_each(|(index, rel, identity, reread)| {
-                    let read = hash::hash_beneath_observed(root, rel, identity);
-                    sender.send((*index, *reread, read)).map_err(|_| ())
-                });
-        })?;
+        let producer = std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                let _ = to_hash
+                    .par_iter()
+                    .try_for_each(|(index, rel, identity, reread)| {
+                        let read = hash::hash_beneath_observed(root, rel, identity);
+                        sender.send((*index, *reread, read)).map_err(|_| ())
+                    });
+            })
+            .refuse_at("walk::complete_hashes")?;
         let mut result = Ok(());
         for (index, reread, read) in &receiver {
             if let Err(refusal) = finish_read(outcome, cache, index, reread, read) {

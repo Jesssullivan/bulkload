@@ -86,7 +86,7 @@ pub fn existing_ancestor(path: &Path) -> Result<PathBuf> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 current = current.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "space::existing_ancestor")),
         }
     }
 }
@@ -98,7 +98,10 @@ fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
     // SAFETY: `name` is a valid NUL-terminated string that outlives the call,
     // and `stats` points to writable storage of the right size and alignment.
     if unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "space::counts",
+        ));
     }
     // SAFETY: a successful statvfs initialized the whole structure.
     let stats = unsafe { stats.assume_init() };
@@ -120,7 +123,10 @@ fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
     // SAFETY: `name` is a valid NUL-terminated string that outlives the call,
     // and `stats` points to writable storage of the right size and alignment.
     if unsafe { libc::statfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "space::counts",
+        ));
     }
     // SAFETY: a successful statfs initialized the whole structure.
     let stats = unsafe { stats.assume_init() };

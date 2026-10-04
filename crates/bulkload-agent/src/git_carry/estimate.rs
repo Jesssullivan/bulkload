@@ -81,6 +81,7 @@
 //! commits would name parents behind the source's frontier, and a shallow file
 //! is never written into a full destination.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
@@ -264,12 +265,6 @@ impl Refused {
 impl From<BulkloadRefusal> for Refused {
     fn from(refusal: BulkloadRefusal) -> Self {
         Self::new(refusal)
-    }
-}
-
-impl From<std::io::Error> for Refused {
-    fn from(error: std::io::Error) -> Self {
-        BulkloadRefusal::from(error).into()
     }
 }
 
@@ -611,7 +606,7 @@ impl Repository {
     /// # Errors
     /// `GIT_REPOSITORY_NOT_AT_PATH` when `root` resolves to no git dir.
     pub(super) fn local(root: &Path) -> Result<Self> {
-        let root = std::fs::canonicalize(root)?;
+        let root = std::fs::canonicalize(root).refuse_at("git_carry::estimate::local")?;
         let ceiling = root
             .parent()
             .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
@@ -852,7 +847,7 @@ pub(super) fn run_probe(
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        child.wait()?;
+        child.wait().refuse_at("git_carry::estimate::run_probe")?;
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
@@ -865,7 +860,7 @@ pub(super) fn run_probe(
         let read = stdout.read_to_end(&mut answer).map(|_| answer);
         (writer.join(), reader.join(), read)
     });
-    let status = child.wait()?;
+    let status = child.wait().refuse_at("git_carry::estimate::run_probe")?;
     let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::WorkerLost)?;
     let refusal = match status.code() {
         Some(0) => None,
@@ -878,8 +873,12 @@ pub(super) fn run_probe(
             store.discard(capture);
         }
         // A child that answered in full read its whole script.
-        written.map_err(|_| BulkloadRefusal::WorkerLost)??;
-        return Ok(parse_probe(&answer?)?);
+        written
+            .map_err(|_| BulkloadRefusal::WorkerLost)?
+            .refuse_at("git_carry::estimate::run_probe")?;
+        return Ok(parse_probe(
+            &answer.refuse_at("git_carry::estimate::run_probe")?,
+        )?);
     };
     Err(child_refusal(
         refusal,
@@ -945,9 +944,91 @@ pub(super) fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained 
         }
     });
     if let Some(error) = drained.error {
-        failure.get_or_insert_with(|| BulkloadRefusal::from(error));
+        failure.get_or_insert_with(|| crate::refuse::io(&error, "git_carry::estimate::drain"));
     }
     (drained.head, drained.total, capture, failure)
+}
+
+/// A v1 Git child's stderr, drained on its own thread into the classifier
+/// (WP3, R-N121). Only the first [`CLASSIFY_LIMIT`] bytes are held, and only
+/// until they are classified; no byte is kept, printed or carried. Draining
+/// keeps the child from ever blocking on a full stderr pipe.
+pub(in crate::git_carry) struct StderrTap(Option<std::thread::JoinHandle<Vec<u8>>>);
+
+impl StderrTap {
+    /// Start draining a child's piped stderr. If no drain thread can be
+    /// started, the pipe is closed instead, so the child still cannot block
+    /// on it; its class is then `other`.
+    pub(in crate::git_carry) fn attach(stderr: Option<std::process::ChildStderr>) -> Self {
+        Self(stderr.and_then(|stderr| {
+            std::thread::Builder::new()
+                .name("git-stderr".into())
+                .spawn(move || drain(stderr, None).0)
+                .ok()
+        }))
+    }
+
+    /// The refusal of a child that exited non-zero: `GIT_CHILD_FAILED` with
+    /// its stderr class, or `WORKER_LOST` if the drain thread did not finish.
+    pub(in crate::git_carry) fn failed(self) -> BulkloadRefusal {
+        self.0
+            .map(std::thread::JoinHandle::join)
+            .transpose()
+            .map_or(BulkloadRefusal::WorkerLost, |head| {
+                BulkloadRefusal::GitChildFailed(StderrClass::of(
+                    head.as_deref().unwrap_or_default(),
+                ))
+            })
+    }
+}
+
+/// The refusal of a finished child whose stderr was captured whole by
+/// `Command::output`: `GIT_CHILD_FAILED` with its class (R-N121). The bytes
+/// are classified, never kept.
+pub(in crate::git_carry) fn child_failed(stderr: &[u8]) -> BulkloadRefusal {
+    BulkloadRefusal::GitChildFailed(StderrClass::of(
+        stderr.get(..CLASSIFY_LIMIT).unwrap_or(stderr),
+    ))
+}
+
+/// Run a v1 Git child to completion (WP3): `input`, when given, is written
+/// on stdin from its own thread (so a large answer never deadlocks against
+/// an unread request), stdout is returned, and stderr is drained into the
+/// classifier. A non-zero exit refuses `GIT_CHILD_FAILED` with the stderr
+/// class. A child that succeeded without reading all of its input did not
+/// see the whole request, and refuses as the failed write.
+pub(in crate::git_carry) fn run_git(
+    command: &mut Command,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::run_git")?;
+    let tap = StderrTap::attach(child.stderr.take());
+    let stdin = child.stdin.take();
+    let (written, result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || match (stdin, input) {
+            (Some(mut stdin), Some(bytes)) => stdin.write_all(bytes),
+            _ => Ok(()),
+        });
+        let result = child.wait_with_output();
+        (writer.join(), result)
+    });
+    let result = result.refuse_at("git_carry::estimate::run_git")?;
+    if !result.status.success() {
+        return Err(tap.failed());
+    }
+    written
+        .map_err(|_| BulkloadRefusal::WorkerLost)?
+        .refuse_at("git_carry::estimate::run_git")?;
+    Ok(result.stdout)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<Probe> {
@@ -1001,14 +1082,7 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
 }
 
 fn run(command: &mut Command) -> Result<Vec<u8>> {
-    let result = command
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if !result.status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    Ok(result.stdout)
+    run_git(command, None)
 }
 
 /// Destination tips that exist as objects in `source`, with their types, in
@@ -1109,8 +1183,10 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         .arg("--stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::walk")?;
+    let list_stderr = StderrTap::attach(list.stderr.take());
     let check = hardened(source)
         .args([
             "cat-file",
@@ -1118,17 +1194,18 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn();
     let mut check = match check {
         Ok(check) => check,
         Err(error) => {
             drop(list.stdin.take());
             drop(list.stdout.take());
-            list.wait()?;
-            return Err(error.into());
+            list.wait().refuse_at("git_carry::estimate::walk")?;
+            return Err(crate::refuse::io(&error, "git_carry::estimate::walk"));
         }
     };
+    let check_stderr = StderrTap::attach(check.stderr.take());
     let pipes = (
         list.stdin.take(),
         list.stdout.take(),
@@ -1145,16 +1222,19 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         let written = writer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
         let tallied = reader.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
         let unavailable = unavailable?;
-        written?;
+        written.refuse_at("git_carry::estimate::walk")?;
         let mut tallied = tallied?;
         tallied.unavailable += unavailable;
         Ok(tallied)
     });
-    let list_status = list.wait()?;
-    let check_status = check.wait()?;
+    let list_status = list.wait().refuse_at("git_carry::estimate::walk")?;
+    let check_status = check.wait().refuse_at("git_carry::estimate::walk")?;
     let tallied = outcome?;
-    if !list_status.success() || !check_status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+    if !list_status.success() {
+        return Err(list_stderr.failed());
+    }
+    if !check_status.success() {
+        return Err(check_stderr.failed());
     }
     Ok(tallied)
 }
@@ -1163,7 +1243,7 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
 fn forward(list: impl BufRead, mut check: impl Write) -> Result<u64> {
     let mut unavailable = 0_u64;
     for line in list.lines() {
-        let line = line?;
+        let line = line.refuse_at("git_carry::estimate::forward")?;
         if let Some(value) = line.strip_prefix('?') {
             if !oid(value) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -1177,18 +1257,22 @@ fn forward(list: impl BufRead, mut check: impl Write) -> Result<u64> {
             if !oid(&line) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
-            check.write_all(line.as_bytes())?;
-            check.write_all(b"\n")?;
+            check
+                .write_all(line.as_bytes())
+                .refuse_at("git_carry::estimate::forward")?;
+            check
+                .write_all(b"\n")
+                .refuse_at("git_carry::estimate::forward")?;
         }
     }
-    check.flush()?;
+    check.flush().refuse_at("git_carry::estimate::forward")?;
     Ok(unavailable)
 }
 
 fn tally(reader: impl BufRead) -> Result<Tally> {
     let mut tally = Tally::default();
     for line in reader.lines() {
-        tally.add(&line?)?;
+        tally.add(&line.refuse_at("git_carry::estimate::tally")?)?;
     }
     Ok(tally)
 }
@@ -1246,8 +1330,10 @@ fn thin_pack(
     let mut pack = pack
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::thin_pack")?;
+    let stderr = StderrTap::attach(pack.stderr.take());
     let pipes = (pack.stdin.take(), pack.stdout.take());
     let counted = std::thread::scope(|scope| {
         let (Some(mut stdin), Some(stdout)) = pipes else {
@@ -1255,13 +1341,16 @@ fn thin_pack(
         };
         let writer = scope.spawn(move || stdin.write_all(input.as_bytes()));
         let counted = count_pack(stdout);
-        writer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
+        writer
+            .join()
+            .map_err(|_| BulkloadRefusal::WorkerLost)?
+            .refuse_at("git_carry::estimate::thin_pack")?;
         counted
     });
-    let status = pack.wait()?;
+    let status = pack.wait().refuse_at("git_carry::estimate::thin_pack")?;
     let counted = counted?;
     if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stderr.failed());
     }
     if counted.objects != missing.objects() {
         return Err(BulkloadRefusal::ContractSelfInconsistent);
@@ -1279,7 +1368,7 @@ fn count_pack(mut stream: impl Read) -> Result<ThinPack> {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::estimate::count_pack")),
         };
         let chunk = buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?;
         if header.len() < 12 {

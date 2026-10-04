@@ -12,6 +12,9 @@
 //! `BulkloadRefusal::<Variant>` in a value position: not a match arm, an
 //! or-pattern, a `let`/`if let` pattern, a comparison operand or a
 //! `matches!` argument.
+//!
+//! The same scan holds the count of bare `Io(None)` refusals per file to an
+//! allowlist that may only shrink (WP3 PR 2).
 
 #![allow(
     clippy::unwrap_used,
@@ -385,6 +388,90 @@ fn every_refusal_variant_has_a_non_test_constructor() {
         unconstructed.is_empty(),
         "refusal variants nothing outside test code raises -- delete them, or \
          raise them where the failure happens: {unconstructed:?}"
+    );
+}
+
+/// Non-test `BulkloadRefusal::Io(None)` constructor sites, counted per file.
+fn io_none_sites() -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    let root = workspace();
+    for path in sources() {
+        let code = without_test_items(&code_only(&fs::read_to_string(&path).unwrap()));
+        let needle = "BulkloadRefusal::Io(None)";
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let start = from + at;
+            let end = start + "BulkloadRefusal::Io".len();
+            from = start + needle.len();
+            if is_constructor(&code, start, end) {
+                let shown = path.strip_prefix(&root).unwrap().display().to_string();
+                *counts.entry(shown).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Every non-test `IO` refusal with no errno, per file (WP3). A bare
+/// `Io(None)` names no cause and no errno, so it cannot close an item
+/// (docs/design.md). This list may only shrink: a new site raises a typed
+/// refusal or goes through `.refuse_at(site)` with the OS error; a removed
+/// site lowers its count here in the same change.
+const IO_NONE_ALLOWLIST: &[(&str, usize)] = &[
+    ("crates/bulkload-agent/src/freshness.rs", 2),
+    ("crates/bulkload-agent/src/git_carry.rs", 1),
+    ("crates/bulkload-agent/src/git_carry/batch_objects.rs", 3),
+    ("crates/bulkload-agent/src/git_carry/carry_v2.rs", 3),
+    ("crates/bulkload-agent/src/git_carry/carry_v2/ingest.rs", 5),
+    ("crates/bulkload-agent/src/git_carry/carry_v2/journal.rs", 2),
+    ("crates/bulkload-agent/src/git_carry/carry_v2/lists.rs", 1),
+    ("crates/bulkload-agent/src/git_carry/carry_v2/send.rs", 2),
+    ("crates/bulkload-agent/src/git_carry/estimate.rs", 5),
+    (
+        "crates/bulkload-agent/src/git_carry/estimate/stderr_store.rs",
+        3,
+    ),
+    ("crates/bulkload-agent/src/git_carry/raw_tree.rs", 2),
+    ("crates/bulkload-agent/src/git_carry/shallow.rs", 1),
+    ("crates/bulkload-agent/src/hash.rs", 1),
+    ("crates/bulkload-agent/src/io/durable.rs", 6),
+    ("crates/bulkload-agent/src/main.rs", 3),
+    ("crates/bulkload-agent/src/materialize.rs", 1),
+    ("crates/bulkload-agent/src/provider_sqlite.rs", 5),
+    ("crates/bulkload-agent/src/provider_sqlite/hydrate.rs", 15),
+    ("crates/bulkload-agent/src/provider_sqlite/online.rs", 8),
+    ("crates/bulkload-agent/src/transfer.rs", 1),
+];
+
+#[test]
+fn bare_io_none_sites_only_shrink() {
+    let found = io_none_sites();
+    let allowed: BTreeMap<String, usize> = IO_NONE_ALLOWLIST
+        .iter()
+        .map(|(file, count)| ((*file).to_owned(), *count))
+        .collect();
+    let grown: Vec<_> = found
+        .iter()
+        .filter(|(file, count)| **count > allowed.get(*file).copied().unwrap_or(0))
+        .collect();
+    assert!(
+        grown.is_empty(),
+        "new bare Io(None) refusals -- raise a typed refusal, or use \
+         .refuse_at(site) with the OS error: {grown:?}"
+    );
+    let shrunk: Vec<_> = allowed
+        .iter()
+        .filter(|(file, count)| found.get(*file).copied().unwrap_or(0) < **count)
+        .collect();
+    assert!(
+        shrunk.is_empty(),
+        "Io(None) sites went away -- lower IO_NONE_ALLOWLIST to the new counts \
+         (found {found:?}): {shrunk:?}"
+    );
+    let total: usize = IO_NONE_ALLOWLIST.iter().map(|(_, count)| count).sum();
+    assert!(
+        total <= 70,
+        "the allowlist only shrinks (was 70 at WP3 PR 2)"
     );
 }
 
