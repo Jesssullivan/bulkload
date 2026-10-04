@@ -293,10 +293,11 @@ HeldPhys(s, v) ==
     /\ out[s].pres /\ out[s].dd /\ out[s].nd /\ out[s].data # GARBAGE
     /\ \E r \in dstRows : r.seat = s /\ r.key % KeyBase = v /\ r.id = out[s].id
 
-\* The strict reading of "held durably" (OI-1002-Q33; #124 asks which
-\* reading R25 means): HeldPhys, or bulkload's own output from a non-racy
-\* capture is durable at the path with the seat's current bytes, whether
-\* or not a row records it. Equal to HeldPhys unless TrackStrictHeld.
+\* The strict reading of "held durably" (OI-1002-Q33, which does not say
+\* whether bytes with no row count as held): HeldPhys, or bulkload's own
+\* output from a non-racy capture is durable at the path with the seat's
+\* current bytes, whether or not a row records it. Equal to HeldPhys
+\* unless TrackStrictHeld.
 StrictHeld(s) ==
     \/ HeldPhys(s, sRow[s])
     \/ /\ out[s].pres /\ out[s].cl /\ out[s].dd /\ out[s].nd
@@ -1153,7 +1154,7 @@ TypeOK ==
 (* re-read behind a new key. This is R25 with "held" read as "a committed  *)
 (* destination row": bytes that are durable with no row are outside it     *)
 (* (R25_StrictNoDurableReread below). No ruling yet fixes that reading     *)
-(* (#124; README, "Code and design disagreements"). It is the operative R25 *)
+(* (README, "Code and design disagreements"). It is the operative R25     *)
 (* check in code shape.                                                     *)
 R25_NoDurableReread == \A r \in reads : ~r.held
 

@@ -83,7 +83,10 @@ copy starts.
   time, `-Xmx4g`, `-workers 3`, `nice -n 10`, `-coverage 1`, flags as
   separate argv elements, scratch in a private `mktemp -d` under `$TMPDIR`.
   Outcomes PASS, FAIL (exactly the named property), SIMULATION, INCONCLUSIVE
-  (budget trip or no `Finished` line) and WRONG. The `check-optional` block
+  (budget trip) and WRONG. Corrected 2026-10-04: a log with no `Finished`
+  line also counted as INCONCLUSIVE, so a self-test JVM that died passed as
+  proof of the budget. It is now ABORTED
+  ([2026-10-04 note](2026-10-04-formal-model.md)). The `check-optional` block
   and its comment are byte-identical to `origin/main` (lane A owns them);
   `check-full` and CI never run TLC.
 - **`docs/formal/README.md`**: running it, the budget, results, coverage,
@@ -112,11 +115,11 @@ What the copies reported, and what this session verified:
 |---|---|
 | `MC_budget_selftest` INCONCLUSIVE at 6 s (drafted constants) | INCONCLUSIVE at 7–8 s in three runs, now on `MC_main`'s bounded constants |
 | `MC_main` 869,296 distinct, depth 51, pass | Yes, in both runs (68–69 s) |
-| `MC_wp0g` 878,950 distinct, pass | Yes, in both runs |
+| `MC_wp0g` 878,950 distinct, pass | Yes, in both runs. But at that bound (`MC_main`'s) the relaxed ledger was never read, so the pass was no WP0(g) evidence; superseded 2026-10-04 by a new bound and a reach row |
 | `MC_main_sim` clean (simulation only) | Yes: SIMULATION, 1,147,363 states checked |
 | `MC_nv_core` 15,834 distinct, 44,312 generated, depth 45, the same at 1 and 4 workers | 15,834 / 44,312 / 45 at 3 workers in both runs. The 1- and 4-worker runs were not repeated (a completed BFS count does not depend on workers). |
 | The 3 core mutations fail as required | Yes. Each fails on exactly its named property, with `TypeOK` checked alongside. |
-| Relaxed `captures` rows are safe; a relaxed authority breaks R25 in 15 states | Yes. `MC_wp0g` and `MC_wp0g_deep` pass. `MC_wp0g_authority` fails exactly `R25_NoDurableReread` with a 15-state counterexample (run 1). |
+| Relaxed `captures` rows are safe; a relaxed authority breaks R25 in 15 states | `MC_wp0g_deep` passes (`MC_wp0g` passed too, but see the row above). `MC_wp0g_authority` fails exactly `R25_NoDurableReread` with a 15-state counterexample (run 1). |
 
 Coverage: `MC_main` never enables 12 of 37 actions and `MC_main_deep` 9.
 Each one is switched off by that config's constants (faults off, no
@@ -138,7 +141,9 @@ stage ran:
 
 - **WP0(g) holds only with a condition.** Losing any subset of the source
   `captures` rows keeps every property, because R25 is carried by the
-  destination's committed rows (`MC_wp0g`, `MC_wp0g_deep` pass). Losing the
+  destination's committed rows (`MC_wp0g_deep` passes; the evidence was
+  completed on 2026-10-04, when `MC_wp0g` was re-bounded so the relaxed
+  ledger is actually read). Losing the
   store-creation commit, which holds the authority, does not: every key
   changes, and the next run re-reads durably held bytes
   (`MC_wp0g_authority` fails `R25_NoDurableReread`). So keep the creation
