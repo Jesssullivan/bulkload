@@ -17,7 +17,10 @@ OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
 | `7e2921a` | Merge of `origin/main` at `6268175` (#152). |
 | `6ab4ce0` | Finish pass, part 1 (pushed): re-pin to `6268175`, the formal-model section with `3dbfbdb`'s TLC results, bibliography re-resolution, this note. |
 | `cb4469b` | Merge of `origin/main` at `46587af` (#146 merged while part 1 was being committed), so the branch diff lists only lane C files. |
-| part 2 commit | Finish pass, part 2: re-pin to `46587af` and describe #146's auto-prerequisite chains. |
+| `1fda837` | Finish pass, part 2: re-pin to `46587af` and describe #146's auto-prerequisite chains. |
+| `7205183` | Merge of `origin/main` at `4a7b86b` (#154 merged 7 minutes after `1fda837` was pushed). |
+| `e737547` | Refuter fixes to the paper: re-pin to `4a7b86b`; bounded salvage and #125 in section 2.6; OI-1003-Q36 for the `-shm` write; the code's WantManifest condition. |
+| next commit | Refuter fixes to this note. |
 
 The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 `04ea9cb`. This pass merged `main` instead and did not rewrite history.
@@ -25,7 +28,7 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 ## Done
 
 - **Paper** (`docs/whitepaper/bulkload.md`), pinned to `origin/main`
-  `46587af`. It covers the problem, the design, the invariants (R25,
+  `4a7b86b`. It covers the problem, the design, the invariants (R25,
   durability ordering, S2), how each SLO is proven, results, related work,
   future work and limits. Section 5 quotes only `docs/evidence/`. SLO
   numbers are linked to `docs/slo.md`, not copied.
@@ -38,9 +41,10 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 
 ## Finish pass (2026-10-03, after the duplicate-agent incident)
 
-Each item was checked against `origin/main` (`6268175`, then `46587af`
-for what #146 touched), `docs/evidence/`, the GitHub PR list and
-TIN-4543.
+Each item was meant to be checked against `origin/main` (`6268175`, then
+`46587af` for what #146 touched), `docs/evidence/`, the GitHub PR list and
+TIN-4543. The `-shm` item missed TIN-4543's Q36 ruling; the refuter-fix
+pass below corrects it.
 
 - **S1 is stated as not met.** The 2026-09-18 R23 sample (pre-wire-v5)
   failed the initial copy at 3015.294 ms against rclone's 601.010 ms. It won
@@ -65,9 +69,9 @@ TIN-4543.
   - Its evidence is fixtures only: the counters test, which writes less
     than an eighth of the 256 KiB history, and P-CHAIN. No estate run has
     measured it.
-  - Sections 5.4, 6 and 7 and the status table were updated. There are
-    now six `proptest!` sites. The durability row cites #146's four
-    passing checks.
+  - Sections 5.4, 6 and 7 and the status table were updated. There were
+    then six `proptest!` sites (seven since #154). The durability row then
+    cited #146's four passing checks.
   - `estimate::hardened` still builds through `git()`, so the
     one-hardening-table claim holds.
 - **Section 4, formal model (OI-1003-Q32).** TLA+/TLC is the checker of
@@ -96,10 +100,10 @@ TIN-4543.
     the Git carry, and does not model S3's Git half.
 - **Lane A's SQLite `-shm` finding.** It is reported in sections 2.8, 3.3
   and 8, and in the status table. The source is lane A's evidence file on
-  `feat/wp0e-estate-corpus-20261003` (`7b75b26`) and TIN-4543. A ruling is
-  open.
-- **Open PRs named.** #150 and #151 (WP3), #153 (WP10 PR 2) and #154
-  (salvage) are marked open and not on `main`.
+  `feat/wp0e-estate-corpus-20261003` (`7b75b26`) and TIN-4543. The finish
+  pass wrongly called the ruling open; see the refuter-fix pass below.
+- **Open PRs named.** #150 and #151 (WP3) and #153 (WP10 PR 2) are marked
+  open and not on `main`.
 - **Bibliography re-resolution:**
   - [TLC99] gains LNCS 1703 and its editors, from Lamport's publications
     page and Crossref's book record. Crossref, OpenAlex and Springer gave
@@ -109,6 +113,52 @@ TIN-4543.
   - [AppleDiskWrites] and [RacyGit]: re-fetched, and their bodies were read
     again.
   - [Proptest]: the pin is stated as declared `1` and locked at 1.11.0.
+
+## Refuter-fix pass (2026-10-04)
+
+The refuter review of `1fda837` raised four medium or high findings, two
+of them on the same `-shm` error. All were valid. Each was checked against
+the code at `4a7b86b`, TIN-4543, GitHub and the coordinator branch before
+it was fixed. This pass ran as the lane's only writer, per its task text.
+
+- **OI-1003-Q36 was already ruled.** TIN-4543's comment of
+  2026-10-04T03:47Z (headed about 23:55 EDT on 10-03) extends the Q16
+  exception to the backup read's `<db>-shm` creation or touch. The
+  conditions: the effect is counted and recorded in S2 evidence, the main
+  file and `-wal` stay byte-identical, and a property test asserts no
+  other source write. The `docs/slo.md` text is `8dd4546` on
+  `docs/coordinator-20261003`; the implementation is #157 (open). Both came
+  before `6ab4ce0` and `1fda837`, so the finish pass's claim that every
+  item was checked against TIN-4543 was wrong for this one.
+  - Sections 2.8, 3.3, 4 (model list and status table), 7 and 8 now give
+    the ruling and its conditions, say that #157 is unbuilt, and say that
+    the model at `3dbfbdb` has no `-shm` write (its README leaves it to
+    P34). Section 3.3's statement now lists two SQLite exceptions.
+- **Re-pinned to `4a7b86b`.** #154 merged at 2026-10-04T05:18Z, 7 minutes
+  after `1fda837` was pushed. Merged as `7205183`.
+  - Section 2.6 describes bounded salvage as on `main`: only temporaries
+    staged by a byte-touching refusal are kept, capped at 1024 files and
+    4 GiB (`transfer.rs`), past which `SALVAGE_BOUND_EXCEEDED` is refused.
+  - It adds #125's legacy-row pass (`racy_guard`,
+    `transfer_legacy_rows_invalidated`; OI-1003-Q26).
+  - `proptest!` now appears in seven places (the salvage-bound property is a
+    second block in `transfer/tests.rs`).
+  - Section 3.1 cites `docs/design.md`'s new "Known limit: clocks".
+  - Section 7 and the status table were updated. The durability row cites
+    #154's four passing checks.
+- **WantManifest.** Section 2.2 now gives the code's condition
+  (`Inbound::entry`): an existing output, any output hint in the store
+  (`has_output_hints`, once per session), or any salvaged temporary. It
+  notes that `docs/design.md` states it more narrowly.
+- **For the coordinator:** `docs/design.md` on `main` still calls the
+  1024 / 4 GiB salvage values "unruled engineering defaults", while the
+  comment at the constants and TIN-4543 record OI-1003-Q24. This lane does
+  not edit `docs/design.md`.
+- **Workstreams (verified on GitHub, 2026-10-04):** open PRs are #136
+  (#120 ingest token), #150 and #151 (WP3) and #153 (WP10 PR 2). #154 is
+  merged. Lane A's branch head moved from `7b75b26` to `ec142cf`; the
+  probe record is still in its evidence file. Lane B's head is still
+  `d7589e0`.
 
 ## Duplicate-agent incident (recorded on TIN-4543)
 
@@ -144,9 +194,12 @@ exited 0, and the Python contract suite ran 22 tests, OK, each time.
 | 1 | `7e2921a` plus part 1's edits, before the `3dbfbdb` update | 683 passed, 0 failed |
 | 2 | `7e2921a` plus part 1's final edits (committed as `6ab4ce0`) | 683 passed, 0 failed |
 | 3 | `cb4469b` (with #146's code) plus part 2's edits | 690 passed, 0 failed |
+| 4 | `7205183` (with #154's code) plus the refuter-fix edits | 696 passed, 0 failed |
 
 During run 3, only documentation lines were edited: a rewrap in section
-2.7 and this paragraph. This lane changes documentation only.
+2.7 and this paragraph. During run 4, only documentation was edited: two
+paraphrases and one sentence in the paper, and this note. This lane
+changes documentation only.
 
 - The draft's run, on `57030e1`, exited 0.
 - The review-fix pass's run was queued when its session ended. No commit
@@ -160,16 +213,18 @@ During run 3, only documentation lines were edited: a rewrap in section
   catalogue and the Haskell explorer as done only once they land, and add
   bibliography entries for them if they are cited. Adopting WP0(g) under
   the model's conditions has no ruling yet.
-- **SQLite `-shm` ruling** (S2, OI-1003-Q16). Rewrite sections 2.8, 3.3
-  and 8 when it is ruled. Cite lane A's evidence file by its `main` path
-  once it merges.
+- **SQLite wal-index (OI-1003-Q36).** Ruled; implementation open as #157.
+  When #157 lands, cite its counter and property test in sections 2.8,
+  3.3, 4 and 8. Cite lane A's evidence file by its `main` path once it
+  merges, and point at `docs/slo.md` once `8dd4546` reaches `main`.
 - **Gate (a) on wire v5.** There is no evidence file for the 2026-10-03
   attempts. Cite an `r23-2026-10-03-*` file once one lands.
   OI-1003-Q33 holds the next attempt for the full post-train `main`.
-- **OI-1003-Q24 and Q25 are not in `docs/slo.md`.** The paper cites them
-  through TIN-4543. Point at `docs/slo.md` once the coordinator's docs PR
-  merges.
-- **Refresh on merge** of #150, #151, #153 or #154, of the estate corpus
+- **OI-1003-Q24, Q25, Q26 and Q36 are not in `docs/slo.md` on `main`.**
+  Their text is on `docs/coordinator-20261003` (`9784467`, `8dd4546`). The
+  paper cites them through TIN-4543. Point at `docs/slo.md` once the
+  coordinator's docs PR merges.
+- **Refresh on merge** of #136, #150, #151 or #153, of the estate corpus
   (WP0(e)), or of a gated gate (a) sample on corpus v1. When WP0(a)'s S3
   measurement of the chains lands, cite it in sections 2.7 and 5.4.
 - **S5 classes with no owner.** Configuration, shallow-frontier, nest
