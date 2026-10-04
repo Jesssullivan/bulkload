@@ -343,14 +343,15 @@ impl<S: GroupSink> Committer<S> {
     /// Commit everything pending, stop the thread and return its report.
     ///
     /// # Errors
-    /// Refuses if the committer thread panicked.
+    /// Refuses [`BulkloadRefusal::WorkerLost`] if the committer thread
+    /// panicked.
     pub fn finish(mut self) -> Result<S::Report> {
         drop(self.sender.take());
         self.handle
             .take()
-            .ok_or(BulkloadRefusal::Io(None))?
+            .ok_or(BulkloadRefusal::WorkerLost)?
             .join()
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     }
 }
 

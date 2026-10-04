@@ -733,7 +733,7 @@ fn complete_hashes<C: FreshnessCache>(
         }
         // A failed cache write must unblock senders before joining them.
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        producer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
         result
     })
 }
