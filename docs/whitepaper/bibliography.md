@@ -305,7 +305,7 @@ testing for Rust." Software repository. Accessed 2026-10-03.
 - Verified via: fetched, plus the GitHub API repository description
   (strategies, shrinking, Apache-2.0 or MIT).
 - bulkload declares `proptest` version `1` as a workspace dependency, and
-  `Cargo.lock` resolves it to 1.11.0 (checked at `6268175`;
+  `Cargo.lock` resolves it to 1.11.0 (checked at `6268175` and `dfb9604`;
   [property-test plan](../plans/2026-10-03-property-test-plan.md),
   section 0).
 

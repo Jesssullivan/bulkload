@@ -1,10 +1,12 @@
 # bulkload: moving a live agent estate between machines
 
-**Whitepaper, draft of 2026-10-03.** Proof package item one (OI-1003-Q7).
-Code base: `origin/main` at `4a10bb8`. That includes WP1 (#145, merged as
-`adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152, `6268175`),
-WP2 PR 2 (#146, `46587af`), bounded salvage with legacy-row invalidation
-(#154, `4a7b86b`) and WP10 PR 2 (#153, `4a10bb8`).
+**Whitepaper, draft of 2026-10-03, revised 2026-10-04.** Proof package item
+one (OI-1003-Q7). Code base: `origin/main` at `dfb9604`. That includes WP1
+(#145, merged as `adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152,
+`6268175`), WP2 PR 2 (#146, `46587af`), bounded salvage with legacy-row
+invalidation (#154, `4a7b86b`), WP10 PR 2 (#153, `4a10bb8`), the
+estate-shaped corpus (#159, `cb681d3`), the formal model (#160, `edf6120`)
+and WP3 PRs 1 and 2, typed refusals (#150, `8d1edd3`; #151, `dfb9604`).
 References use keys in square brackets (for example
 [Rsync96]); each one resolves in the [bibliography](bibliography.md), with
 a note on how it was verified.
@@ -19,7 +21,7 @@ normative document disagree, the normative document wins:
 
 Statements about the code cite a file under `crates/`. Statements about
 results cite an evidence file and its date. Work that is ratified but not on
-`main` at `4a10bb8` is marked as such. The paper quotes no SLO number; it
+`main` at `dfb9604` is marked as such. The paper quotes no SLO number; it
 links [`docs/slo.md`](../slo.md) for them, so a dated amendment there cannot
 leave this paper silently out of date.
 
@@ -58,7 +60,8 @@ last completed R23 sample (2026-09-18, before wire v5) failed on the initial
 copy: native median 3015.294 ms against rclone's 601.010 ms. It won the 1 %
 delta, 58.842 ms against 127.064 ms, but both comparisons are mandatory
 ([evidence](../evidence/r23-2026-09-18.md)). The samples of 2026-09-23 were
-ungated or informational. The wire v5 engine has no gated sample.
+ungated or informational. The wire v5 engine has no gated sample. A gate (a)
+run on `dfb9604` started on the morning of 2026-10-04; it has no result yet.
 
 ## 1. Problem
 
@@ -248,8 +251,9 @@ source                                   destination
   the destination holds any of that file's chunks.
   [`docs/design.md`](../design.md) ("WantManifest") states the rule more
   narrowly: an existing output, or published outputs that hold chunks. The
-  formal model's README at `3dbfbdb` already records the salvage condition
-  as a disagreement between the code and `docs/design.md`.
+  formal model's [README](../formal/README.md) ("Code and design
+  disagreements") records the salvage condition as a disagreement between
+  the code and `docs/design.md`.
 
   The source sends its manifest, from its ledger without reading when the
   stat identity is recorded. The destination fills what it can from
@@ -306,7 +310,9 @@ A row is written only when three conditions all hold:
 
 The third condition is what makes R25 safe. A committed capture means the
 destination holds the bytes durably, so a resume reuses or adopts the
-output and never reads the seat again (OI-1001-Q15).
+output and never reads the seat again (OI-1001-Q15). That rests on the
+stores themselves surviving a power loss, which #161 shows is not yet
+guaranteed for a fresh state root (section 3.2).
 
 ### 2.5 Destination: stage, seal, publish, group commit
 
@@ -407,8 +413,11 @@ Git state is carried as Git objects, not as files under `.git`
 (`crates/bulkload-agent/src/git_carry.rs`, `src/estate.rs`,
 `src/git_carry/shared.rs`). The production engine (v1) captures each
 repository into a private repository that borrows the source's objects
-through `objects/info/alternates`, and writes the history as a bundle
-[GitBundle]. A capture carries:
+through `objects/info/alternates` (`prepare_private` in `git_carry.rs`), and
+writes the history as a bundle [GitBundle]. The capture's own objects are
+written into that private repository, but on `main` the capture still
+changes the timestamps of existing objects in the source's store (#162;
+section 3.3). A capture carries:
 
 - refs, objects and real stash commits, including binaries and untracked
   files;
@@ -523,9 +532,11 @@ shared-read only, bounded and counted. The code bounds it by step count
 (`max_steps` steps of at most 128 pages, with no wait on contention), not by
 duration. No counter records backup steps or lock holds yet.
 
-A probe reported on 2026-10-03 found that this kind of open also creates a
-`<db>-shm` file, SQLite's wal-index, beside a WAL source database that has
-none (section 8). That is a source-side write. OI-1003-Q36 (recorded on
+This kind of open also creates a `<db>-shm` file, SQLite's wal-index,
+beside a WAL source database that has none. The estate-corpus evidence
+records it for bulkload's own `snapshot`
+([evidence](../evidence/estate-corpus-v1-2026-10-03.md), "Carriability
+smoke"; section 8). That is a source-side write. OI-1003-Q36 (recorded on
 Linear TIN-4543) admits it by extending the Q16 exception, on conditions:
 
 - a backup-API read of a WAL-mode source may create or touch `<db>-shm`.
@@ -550,19 +561,51 @@ Refusals are values of one taxonomy, grouped by family
 (`crates/bulkload-proto/src/refusal.rs`). A refusal crosses the wire and
 lands in receipts by its stable code.
 
-Not every refusal is typed enough to act on yet (architecture review,
-section 1, problem 3). That review counted, at `727493a`:
+The architecture review found that not every refusal was typed enough to
+act on (section 1, problem 3). At `727493a` it counted:
 
 - 104 non-test `Io(None)` sites, 35 of them in the SQLite provider code;
 - 149 occurrences of `GIT_INVENTORY_MALFORMED` in `git_carry.rs`, because
-  `output()` maps any failed Git child to that one code and drops its
+  `output()` mapped any failed Git child to that one code and dropped its
   stderr.
 
-On `4a10bb8`, a failed SQLite backup step still maps to `Io(None)`
-(`snapshot` in `src/provider_sqlite.rs`). `closure.rs` still reads a refusal
-code back out of the receipt's Display text (`split_whitespace`), instead of
-matching a typed value. Such refusals name no cause that a disposition could
-act on, so they are a known S4 gap. WP3 PRs 1–3 address them.
+WP3 PRs 1 and 2 (#150, #151) are on `main`
+([`docs/design.md`](../design.md), "Completion"):
+
+- **No dead codes.** Codes that nothing raised were deleted. A source scan
+  requires every variant to have a constructor outside test code
+  (`crates/bulkload-agent/tests/refusal_taxonomy.rs`).
+- **No blanket conversions.** The taxonomy has no `From` conversion for an
+  OS or codec error, so a bare `?` on one does not compile. Each site names
+  itself with `.refuse_at(site)` (`src/refuse.rs`). An OS error still
+  refuses `IO`, now with its errno, and a codec error `FRAME_CODEC`.
+- **Classified Git children.** A v1 Git child that exits non-zero refuses
+  `GIT_CHILD_FAILED` (`run_git` in `src/git_carry/estimate.rs`), except
+  where a site splits the failure by cause, as bundle verification does
+  (#106). The refusal carries a `stderr_class=` from a closed set of six. Its
+  stderr is classified, never echoed or kept (R-N121); a property test
+  checks this (`a_git_child_refusal_never_echoes_stderr`).
+  `GIT_INVENTORY_MALFORMED` is still raised when Git's output or state fails
+  a check, such as output that does not parse, but no longer for every
+  failed child.
+- **Typed SQLite backup failures.** A failed open, step or finish of the
+  online backup refuses `SQLITE_BACKUP_FAILED` with SQLite's extended result
+  code (`snapshot` in `src/provider_sqlite.rs`).
+- Two more codes are new: `PROTOCOL_STATE_VIOLATION` and `WORKER_LOST`.
+
+What is still untyped on `dfb9604`:
+
+- 70 non-test sites in 20 files still raise `IO` with no errno, 28 of them
+  in the SQLite provider code. A test holds each file's count to an
+  allowlist that may only shrink (`bare_io_none_sites_only_shrink`).
+- `closure.rs` still reads a refusal code back out of the receipt's Display
+  text (`split_whitespace`), instead of matching a typed value. WP3 PR 3 is
+  to persist a typed record of code, site and errno (`src/refuse.rs`).
+- In the estate-corpus smoke (built from `46587af`), `estate-capture`
+  refused a bare repository with `IO (errno 2)` on every pass (#162). An
+  `IO` refusal names no cause, so closure counts that item unaccounted.
+
+These are known S4 gaps.
 
 `closure-report` is bulkload's own completion gate
 (`crates/bulkload-agent/src/closure.rs`;
@@ -575,11 +618,12 @@ as one of:
 - `refused` with a typed code;
 - `unaccounted`.
 
-A bare `IO` or `FRAME_CODEC` names no cause, so it never closes an item. The
-native `verdict` passes only when `unaccounted` is 0. An attestation ledger
-can close natively unaccounted items in a separate block. It must be bound
-to the plan, the source label and each item's current capture digest, and it
-never overrides a native record (#133).
+An `IO`, with or without its errno, or a `FRAME_CODEC` names no cause, so it
+never closes an item (`closure.rs`). The native `verdict` passes only when
+`unaccounted` is 0. An attestation ledger can close natively unaccounted
+items in a separate block. It must be bound to the plan, the source label
+and each item's current capture digest, and it never overrides a native
+record (#133).
 
 S4 is not fully met by this. The charter also requires an operator-reviewed
 disposition (accept, re-carry or abandon) for every typed refusal before a
@@ -606,8 +650,10 @@ R-N30, R-N72):
 - The next pass extends it (`capture-extended-from-drift`).
 - **An object-store rewrite is drift too** (WP1). The export reads the
   source's pack listing with its authority. Suppose a Git child of the pass
-  fails and that listing has changed: a `gc`, `repack` or `prune` raced the
-  pass through the private repository's `alternates`. Then the item is
+  fails (`GIT_CHILD_FAILED` since WP3, or `GIT_INVENTORY_MALFORMED` for
+  output that did not parse) and that listing has changed: a `gc`, `repack`
+  or `prune` raced the pass through the private repository's `alternates`.
+  Then the item is
   `deferred-with-drift`, with one `ObjectStoreRewritten` row and no capture
   record, and the next pass captures the rewritten store. The same failure
   under an unchanged listing still refuses
@@ -638,9 +684,9 @@ does not complete S5:
 - Directory-shape drift refuses fail-closed: a directory removed, a
   directory replaced by a file, or a file replaced by a symlink. No work
   package yet names it.
-- On the file path, a seat that vanishes before it is opened surfaces as a
-  bare `IO` refusal, not as drift. WP5 PR 2 adds typed `Vanished` and
-  `ChangedDuringRead` outcomes (architecture review).
+- On the file path, a seat that vanishes before it is opened surfaces as an
+  `IO` refusal, which closes nothing, not as drift. WP5 PR 2 adds typed
+  `Vanished` and `ChangedDuringRead` outcomes (architecture review).
 
 ## 3. Invariants and why each matters
 
@@ -702,6 +748,27 @@ loss: the resume would trust the record and never fetch the bytes again.
 one draining commit per group. Barriers are modelled device-wide by default
 (R-N103), with a stricter per-object model available. How it is proven is
 in section 4.
+
+**An open defect on `main`: the store's own directory (#161).** The ordering
+above assumes that a store, once its first commit returns, survives a power
+loss. On `main` that is not guaranteed for a fresh state root:
+
+- `private_dir` (`src/transfer_store.rs`) creates the state root and never
+  seals its parent directory;
+- `Store::open` does not seal the state root after it creates
+  `transfer.sqlite`;
+- SQLite's own directory sync covers only the entries inside the state root.
+
+So a power loss can lose the whole store, records and authority with it.
+The next `Store::open` then mints a new authority, every row key changes,
+and every seat the destination holds durably is read again, which breaks
+R25. The power-loss proofs do not see this, because `crash_check` does not
+model a store's own files (`src/io/crash_check.rs`). The formal model makes
+the gap explicit: its positive configurations assume `StoreRootSealed`, and
+`MC_store_root_unsealed`, which models the code as it is, fails
+`R25_NoDurableReread` (section 4). #161 is open, and a fix lane is running.
+Until it lands, the code does not meet this condition for a fresh state
+root.
 
 ### 3.3 S2: source safety
 
@@ -788,37 +855,52 @@ amendment (OI-1003-Q25, recorded on Linear TIN-4543; its text is on
   still takes an untyped path and serves source, private and destination
   repositories alike. Typed source, private and destination repositories,
   with a closed allowlist of source read commands, are WP7.
-- **The S2 budget sampler** (WP6) is not built, so the latency and load
-  budget has never been measured (section 5.3).
+- **The S2 budget sampler** (WP6) is not on `main`, so the latency and load
+  budget has never been measured (section 5.3). #165 tracks the gated run.
 - **P34 and P35** in the property-test plan's form are pending. P34 covers
   source inertness over traced copies, carries and estimates, including lock
   events. P35 is a per-thread priority probe.
-- **The formal model** has TLC results committed on its branch
-  (`3dbfbdb`, not on `main`; section 4). It models the transfer protocol,
-  and it cannot prove S2 at the level of the code. It represents Git and
-  SQLite source access only as abstract typed reads, and it does not model
-  the Git carry itself. Its `S2_TypedSourceAccess` has no `-shm` write: the
-  README at `3dbfbdb` leaves the backup's possible touch of `-shm` to P34.
-- **The SQLite wal-index exception** (OI-1003-Q36, #157). The WP0(e)
-  estate-corpus work reported a probe on 2026-10-03: a read-only, WAL-aware
-  open, made the way `snapshot` opens a source, created `<db>-shm` beside a
-  WAL database (section 8). Q36 admits that write inside the Q16 exception
-  on its conditions (section 2.8). None of them is built yet. #157 is to
-  add the counter and record it in S2 evidence, and a P34-family property
-  test. Over generated WAL sources, with and without an existing `-shm`,
-  that test is to show that the main file and `-wal` stay byte-identical
-  and that no other source write occurs.
-- **A reported Git-carry source write** (no ruling yet). The WP0(e) lane's
-  reviewed evidence (#159 at `378b634`, not on `main`) records a smoke run
-  of `estate-capture`, built from `46587af`, over the small corpus. Each
-  pass that captured any item moved the mtime and ctime of existing loose
-  objects and a pack in source repositories. Their inode, size and bytes
-  did not change, so the corpus's own `verify` still passed; a stat diff of
-  the source showed it. The lane reads this as Git freshening objects that
-  it finds through the private repository's alternates, and leaves it to
-  S2 (WP1) for a ruling. TIN-4543 records none yet. P-S2 does not cover the
-  Git carry, and the formal model has Git only as an abstract read, so
-  nothing on `main` would catch it.
+- **The formal model** is on `main` (#160; section 4). It models the
+  transfer protocol, and it cannot prove S2 at the level of the code. It
+  represents Git and SQLite source access only as abstract typed reads, and
+  it does not model the Git carry itself. Its `S2_TypedSourceAccess` has no
+  `-shm` write: its [README](../formal/README.md) ("Not proven here") leaves
+  the backup's possible touch of `-shm` to P34.
+- **The SQLite wal-index exception** (OI-1003-Q36, #157). The estate-corpus
+  evidence records that bulkload's own `snapshot`, built from `46587af`,
+  created `storage.db-shm` in the source
+  ([evidence](../evidence/estate-corpus-v1-2026-10-03.md), "Carriability
+  smoke"; section 8). Q36 admits that write inside the Q16 exception on its
+  conditions (section 2.8). None of them is built yet. #157 is to add the
+  counter and record it in S2 evidence, and a P34-family property test.
+  Over generated WAL sources, with and without an existing `-shm`, that
+  test is to show that the main file and `-wal` stay byte-identical and
+  that no other source write occurs.
+- **A Git-carry source write** (#162, open). The same smoke ran
+  `estate-capture` over the small corpus. Each pass that captured any item
+  moved the mtime and ctime of existing loose objects and a pack in source
+  repositories: 83 loose objects and a pack on the first pass. Their inode,
+  size and bytes did not change, so the corpus's own `verify` still passed;
+  only a stat diff of the source showed it
+  ([evidence](../evidence/estate-corpus-v1-2026-10-03.md)).
+  - The cause, per #162: when a capture writes an object that already
+    exists (with commands such as `hash-object -w`, `write-tree` or
+    `commit-tree`), Git does not write a copy. It freshens the existing
+    object's timestamps instead, and here that object is in the source's
+    store. S2 says bulkload never writes to the source, so #162 counts this
+    as a source-side write.
+  - OI-1003-Q38 (Linear TIN-4543, 2026-10-04) scopes a fix lane for it:
+    build capture objects in a private object store that has the source
+    only as an alternate. #162 also asks for a P34 property that the source
+    object store's stat census is unchanged. The lane is running; on `main`
+    the write still happens.
+  - The v1 private repository already reaches the source's store through
+    `alternates` (section 2.7), and the evidence reads the write as Git
+    freshening objects it finds there. So the fix has to keep Git from
+    freshening the source's copies, not only move where new objects are
+    written. The census property is what would show it.
+  - P-S2 does not cover the Git carry, and the formal model has Git only as
+    an abstract read, so nothing on `main` would catch it.
 
 The idle I/O class only helps where the kernel's I/O scheduler honours
 priority classes [IoprioSet]. This is why S2's budget is measured, not
@@ -837,7 +919,7 @@ each claim. Five instruments exist or are being built.
   times the cases. There is no fuzzing (OI-1003-Q7). The method follows
   QuickCheck [QuickCheck00] through `proptest` [Proptest]. A test is retired
   only when its subsuming property catches the specific mutant the old test
-  was written for. On `main` at `4a10bb8`, `proptest!` appears in seven
+  was written for. On `main` at `dfb9604`, `proptest!` appears in nine
   places:
   - the slab pool and chunker models (`src/io/buf/tests.rs`,
     `src/io/chunker/tests.rs`);
@@ -850,11 +932,15 @@ each claim. Five instruments exist or are being built.
     (`estate::wp2_chain` in `src/estate.rs`, #146);
   - #154's salvage-bound property,
     `the_salvage_bound_keeps_greedily_within_both_limits`, a second block
-    in `src/transfer/tests.rs` (#124, section 2.6).
+    in `src/transfer/tests.rs` (#124, section 2.6);
+  - WP3's two properties: `.refuse_at` keeps every errno (`src/refuse.rs`),
+    and a Git child's refusal never echoes its stderr
+    (`tests/refusal_taxonomy.rs`; section 2.9).
 
   WP1 also added `test_support::prop_config`, the plan's fixed-seed helper,
   in minimal form; P-S2, `drain_bounded`'s properties, P-CHAIN and the
-  salvage-bound property run through it.
+  salvage-bound property run through it. WP3's two properties set their own
+  fixed seeds, and their comments say they are to fold into it.
   The plan counted three places before WP1
   ([plan](../plans/2026-10-03-property-test-plan.md), section 0). The
   catalogue is mostly planned work.
@@ -873,20 +959,18 @@ each claim. Five instruments exist or are being built.
     cross-check of TLC. It must match TLC's distinct-state count and TLC's
     verdicts on three mutations.
 
-  The TLA+ model is on the branch `docs/tla-model-20261003`, which is not
-  on `main`. This section describes `3dbfbdb`, the commit whose results
-  this paper was written against. After its review the branch moved on. It
-  is open as #160, at `27581be` when this paper last checked it
-  (2026-10-04). Its commits `8bc6672` and `7738b6e` change the
-  specification, the configurations and the README. This section has not
-  yet been re-checked against them; two of their changes bear on the
-  results below and are noted where they apply. At `3dbfbdb`,
-  `docs/formal/BulkloadTransfer.tla` models:
+  OI-1003-Q38 put both sprint 2 items in the overnight sprint of
+  2026-10-04. Neither is on `main`.
+
+  The TLA+ model is on `main` since #160 (`edf6120`), in
+  [`docs/formal/`](../formal/README.md). Its README is the source for what
+  follows. `docs/formal/BulkloadTransfer.tla` models:
   - wire v5 per entry, from `Entry` and `Decide` through `Held` and
     `SourceDone`;
   - destination staging, file seal, no-replace publish, directory seal and
     the store's group commit;
-  - the digest-only source ledger, committed only on `Held{true}`;
+  - the digest-only source ledger, committed only on `Held{true}`, and the
+    source store's authority, which is part of every row key;
   - crashes of either host or both, and the rerun after them;
   - racy captures, source edits, third-party writes at the destination,
     failed group commits and the space refusal;
@@ -897,65 +981,97 @@ each claim. Five instruments exist or are being built.
   - variants for WP0(g), the relaxed source ledger, and two candidate
     designs for WP0(d), superseding publish.
 
-  At `3dbfbdb` its safety invariants are `TypeOK`,
-  `R25_NoDurableReread`, `R25_NoCommittedCaptureReread`, `ReadOnce`,
-  `S3_ReadsOnlyChanged`, `S3_UnchangedReadsZero`, `S3_ClosedPassIsHeld`,
-  `RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`,
-  `DoneAfterLedger`, `ReuseSound`, `LedgerSound`, `NoClobber`,
-  `S2_TypedSourceAccess`, `S2_BackupLockBounded` and `ClosureAccounted`.
-  `RunsClose` and `AllRunsFinish` are its liveness properties.
-  `WithinBudget` is a wall-clock budget on a TLC run, not a property of the
-  protocol. The branch's README freezes these names. Each negative
-  configuration breaks exactly one rule and must produce a counterexample.
+  It models the code at `adb9c66`, and the symbols it cites were re-checked
+  at `4a7b86b`. The README lists #154's salvage bound and legacy-row
+  invalidation as not yet modelled ("Code and design disagreements").
 
-  **TLC results** (committed at `3dbfbdb`, in `docs/formal/README.md`). The
-  run of record was one full `just tla-check` on sting on 2026-10-04, with
-  TLC 2.19. It ran over the specification and configurations of
-  `3760263`; the specification is unchanged at `3dbfbdb`. All 35
-  configurations gave their expected outcome:
-  - 9 positive configurations finished with no property violated.
-    `MC_main` (two seats, two runs, one crash, one source edit, with
-    symmetry over seats) explored 869,296 distinct states. The N-version
-    core, `MC_nv_core`, has 15,834.
-  - 24 negative configurations each violated exactly the one property
-    they name, so every mutation was caught.
-  - `MC_live` satisfies `RunsClose` and `AllRunsFinish` under weak
+  Its frozen safety invariants are `TypeOK`, `R25_NoDurableReread`,
+  `R25_NoCommittedCaptureReread`, `ReadOnce`, `S3_ReadsOnlyChanged`,
+  `S3_UnchangedReadsZero`, `S3_ClosedPassIsHeld`, `RecordImpliesBytes`,
+  `HeldAfterCommit`, `LedgerAfterHeld`, `DoneAfterLedger`, `ReuseSound`,
+  `LedgerSound`, `NoClobber`, `S2_TypedSourceAccess`,
+  `S2_BackupLockBounded` and `ClosureAccounted`. `RunsClose` and
+  `AllRunsFinish` are its liveness properties. `WithinBudget` is a
+  wall-clock budget on a TLC run, not a property of the protocol. Each
+  negative configuration breaks exactly one rule and must produce a
+  counterexample on the one property it names.
+
+  **R25 in the model.** `R25_NoDurableReread` is the operative R25 check,
+  and this paper cites it as the R25 result. `docs/slo.md` words the model
+  obligation as "no committed capture is re-read", which is
+  `R25_NoCommittedCaptureReread`. The README shows that this wording is
+  vacuous in the code's shape: with no superseding publish, removing
+  `Reuse` alone never violates it. `R25_NoDurableReread` reads "held
+  durably" as "a committed destination row". Under the strict reading,
+  bytes durable at the final path with no row also count as held, and the
+  code re-reads them (`MC_r25_unrowed_bytes`, below). TIN-4543 lists which
+  reading applies, and the `docs/slo.md` wording, as still to be ruled.
+
+  **TLC results** (`docs/formal/README.md`, "Results"). The run of record
+  was one full `just tla-check` on sting on 2026-10-04 (01:30–01:38 EDT),
+  with TLC 2.19, over the specification and configurations of `8bc6672`.
+  All 43 configurations matched their expectation, with none aborted or
+  wrong:
+  - 10 PASS. Each pass row's never-enabled actions equalled the set its row
+    names, so coverage is enforced. `MC_main` (two seats, two runs, one
+    crash, one source edit per seat, with symmetry over seats) explored
+    869,296 distinct states. The N-version core, `MC_nv_core`, has 15,834.
+    A second core row with a third-party write, `MC_nv_ledger`, has
+    142,450. `MC_live` satisfies `RunsClose` and `AllRunsFinish` under weak
     fairness of the protocol, with no crash and a source that stops
-    changing. Without that fairness, `RunsClose` fails.
-  - `MC_main_sim` is a random simulation with larger constants. It is
-    evidence, not a model-checking result.
-  - The budget self-test is expected to be inconclusive. It shows that the
+    changing.
+  - 3 REACHED. Reachability witnesses show that the source-ledger branches
+    and WP0(g)'s lost-row path are explored at the bounds of the pass rows
+    that depend on them.
+  - 28 FAIL, each on exactly the one property it names:
+    - 23 mutation rows, covering 19 mutations, so every mutation was
+      caught;
+    - `MC_neg_live_unfair`, which drops fairness, so `RunsClose` fails;
+    - four finding rows on the code and the open rulings, below.
+  - 1 SIMULATION: `MC_main_sim`, a random simulation with larger constants.
+    It is evidence, not a model-checking result.
+  - 1 INCONCLUSIVE: the budget self-test, as expected. It shows that the
     wall-clock budget can end a run.
 
-  These results hold within small bounds: two seats with two runs, or one
-  seat with three runs and two crashes. TLC found no violation within
-  them. That is not a proof for every estate size.
+  This run supersedes the 35-row run over `3760263` that an earlier draft of
+  this paper reported. That run's `MC_wp0g` used `MC_main`'s bound, under
+  which the source never consulted its ledger, so its pass was no evidence.
 
-  The README at `27581be` supersedes this run of record. It reports a later
-  full run, over `8bc6672`'s specification, in which all 43 configurations
-  met their expectation. It gives the reason: the earlier `MC_wp0g`
-  configuration used `MC_main`'s bound, under which the source never
-  consulted its ledger (WP0(g) below).
+  These results hold within small bounds: two seats with two or three runs,
+  or one seat with three runs and two crashes. TLC found no violation
+  within them. That is not a proof for every estate size.
 
-  The results carry two findings on open rulings:
+  The four finding rows:
   - **WP0(g).** With relaxed ledger rows, `MC_wp0g` and `MC_wp0g_deep`
-    pass. `MC_wp0g_authority` also relaxes the commit that creates the
-    source store's authority, and it fails `R25_NoDurableReread`. The
-    README concludes that WP0(g) holds for the ledger's row commits only
-    if that creation commit stays durable, and it lists further
-    conditions. Both stores still run at full durability in the code, so
-    WP0(g) is not implemented. The review after `3dbfbdb` found that
-    `MC_wp0g`'s pass there was no evidence, because at that bound the
-    relaxed ledger was never read. At `27581be` the configuration has a
-    new bound, a reachability configuration shows that the relaxed-only
-    path is explored, and the condition is wider: the source store's whole
-    creation, its state root's directory entry included, must be durable
-    before the model's `Start`. That README also notes that the model
-    assumes a ledger commit never fails, which the code does not yet
-    honour.
-  - **WP0(d).** The exchange design satisfies `NoClobber`; the
-    check-then-rename design violates it. Superseding publish has no code
-    yet.
+    pass, and `MC_reach_wp0g_lost_row` shows that the relaxed-only path is
+    explored. `MC_wp0g_authority` also relaxes the commit that creates the
+    source store's authority, and it fails `R25_NoDurableReread` in 15
+    states. The README concludes that WP0(g) holds for the ledger's row
+    commits only if the store's whole creation, its state root's directory
+    entry included, is durable before the model's `Start`.
+    **OI-1003-Q37** (Linear TIN-4543, 2026-10-04 08:45Z) ratifies WP0(g)
+    with conditions:
+    - source-ledger row commits may use `synchronous=NORMAL` and
+      `fullfsync=OFF`;
+    - the store-creation (authority) commit stays `synchronous=FULL`;
+    - the relaxation lands only after #161 is merged.
+
+    Q37 is not yet in `docs/slo.md` on `main`, whose WP0(g) text still
+    covers the whole source ledger. Both stores still run at full
+    durability in the code, so WP0(g) is not implemented.
+  - **The store root (#161).** `MC_store_root_unsealed` models the code as
+    it is, with an unsealed state root, under strict settings. It fails
+    `R25_NoDurableReread` in 15 states: a source power loss takes the
+    store, the next run mints a new authority, and a seat the destination
+    holds durably is read again (section 3.2). The positive configurations
+    assume a sealed root (`StoreRootSealed`). The destination store has the
+    same gap, and the model cannot express losing it.
+  - **R25 under the strict reading.** `MC_r25_unrowed_bytes` fails
+    `R25_StrictNoDurableReread`: bytes made durable at the final path
+    before their row committed are read again by the next run.
+  - **WP0(d).** The exchange design satisfies `NoClobber`;
+    `MC_wp0d_check_rename` shows that the check-then-rename design violates
+    it. Superseding publish has no code yet.
 
   What the model cannot show:
   - It is a model of the protocol. It cannot prove S2 at the level of the
@@ -967,10 +1083,14 @@ each claim. Five instruments exist or are being built.
     not modelled.
   - Background priority is not a property of the model. The specification
     leaves it to P35 and the S2 budget.
-  - `docs/slo.md` makes WP0(g) conditional on the model. The model's
-    verdict is itself conditional, and the branch is not yet reviewed onto
-    `main`. TIN-4543 records no ruling yet on adopting WP0(g) under those
-    conditions.
+  - It assumes two things the code does not yet do. First, its
+    `LedgerCommit` never fails. In the code, the first failed ledger group
+    is sticky and fails the whole session before `SourceDone`
+    (`LedgerSink::commit`). So `RunsClose`, `AllRunsFinish`,
+    `ClosureAccounted` and WP0(g)'s "a lost row costs at most a re-read"
+    do not cover a failing source state disk. #163 (open) proposes counting
+    a failed ledger commit instead of failing the session. Second, its
+    positive configurations assume a sealed store root (#161).
 - **Crash and power-loss proofs.**
   - The W7 fault harness crashes a real `copy` with `_exit` at each fault
     point. After each crash it checks four invariants:
@@ -1023,21 +1143,24 @@ each claim. Five instruments exist or are being built.
   deterministic R23 corpus v1
   ([corpus evidence](../evidence/r23-corpus-v1-2026-10-02.md)).
 - **The estate-shaped corpus.** WP0(e) (OI-1003-Q19) adds a deterministic,
-  sealed generator of Git-heavy, many-small-file trees. S1 is then measured
-  on it in addition to R23's 23-file corpus. It is open as #159
-  (`feat/wp0e-estate-corpus-20261003`), not on `main`.
+  sealed generator of Git-heavy, many-small-file trees. S1 is to be measured
+  on it in addition to R23's 23-file corpus, and S3 on the Git path. It is
+  on `main` since #159 (`cb681d3`;
+  [evidence](../evidence/estate-corpus-v1-2026-10-03.md)). Its evidence
+  file covers the generator, its seal and a carriability smoke, and claims
+  no S1 or S3 number.
 
-| SLO | Instrument | State at `4a10bb8` |
+| SLO | Instrument | State at `dfb9604` |
 |---|---|---|
-| S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
+| S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. A gate (a) run on `dfb9604` started on 2026-10-04 at 10:43Z (TIN-4543); it has no result yet. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
-| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`; the model has no `-shm` write. The `-shm` wal-index write is ruled admissible on conditions (OI-1003-Q36, TIN-4543; `docs/slo.md` text on the coordinator branch, not on `main`); its counter and property test are pending (#157). A Git-carry source write (object freshening through alternates) is reported on #159's branch, with no ruling yet (section 3.3). |
-| S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not built. Pending gate. |
-| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. Since #154 a store from before the racy guard has its rows invalidated once, counted (#125). In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
+| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model on `main`, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2`, at the protocol level only; the model has no `-shm` write. The `-shm` wal-index write is ruled admissible on conditions (OI-1003-Q36, TIN-4543; `docs/slo.md` text on the coordinator branch, not on `main`); its counter and property test are pending (#157). **Not met for the Git carry:** v1 `estate-capture` freshens existing source objects (#162, open). OI-1003-Q38 scopes a fix lane; the write still happens on `main` (section 3.3). |
+| S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not on `main`; no run. Pending gate (#165). |
+| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. Since #154 a store from before the racy guard has its rows invalidated once, counted (#125). In the model, `R25_NoDurableReread` and the S3 invariants hold within its bounds, under the committed-row reading of "held durably"; the strict reading is unruled and the code fails it (section 4). Under power loss, R25 also depends on #161. |
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
-| S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`; disposition ledger pending. |
-| S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is bare `IO` (WP5 PR 2). See section 2.10. |
-| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #154's and #153's source, build, test and fault-harness checks passed before they merged as `4a7b86b` and `4a10bb8`. #153 retargeted the recorded crash-check tests at the production no-replace publish, on both its rename and its link-and-unlink path (R-N119). The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
+| S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`. WP3 PRs 1 and 2 on `main`: `GIT_CHILD_FAILED`, `SQLITE_BACKUP_FAILED` and `.refuse_at(site)`. Still open: 70 `IO` sites with no errno (an allowlist that only shrinks), closure's Display parsing, bare repositories refused as `IO` (#162) and the disposition ledger (section 2.9). |
+| S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`; object-store drift accepts `GIT_CHILD_FAILED` since #151. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is an `IO` refusal (WP5 PR 2). See section 2.10. |
+| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | **Not met for a fresh state root (#161, open).** A store's state root is never sealed, so a power loss can lose the store and break R25; the power-loss proofs do not model a store's own files, and the model's `MC_store_root_unsealed` fails `R25_NoDurableReread` (section 3.2). A fix lane is running. Otherwise in `check-fast` and PR CI. #153 retargeted the recorded crash-check tests at the production no-replace publish, on both its rename and its link-and-unlink path (R-N119). The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds, assuming a sealed root, and their mutants are caught. |
 
 ## 5. Results
 
@@ -1075,7 +1198,8 @@ wire v5 (W4 PR 2, 2026-10-01,
   and won the 1 % delta.
 - **Wire v5.** No gated sample of the wire v5 engine exists in
   `docs/evidence/`. Section 7 lists the 2026-10-03 attempts, none of which
-  produced a verdict.
+  produced a verdict. A gate (a) run on `dfb9604` started on 2026-10-04 at
+  10:43Z (Linear TIN-4543); it has no result yet.
 - **2026-09-23, W3 engine improvements (informational; native still slower
   than rclone)** ([w3-2026-09-23](../evidence/w3-2026-09-23.md)). Every
   sample was on battery at load1 3.2 to 21, so none was gated (R-N81).
@@ -1107,7 +1231,8 @@ so it must be measured beside every cross-host sample
 ### 5.3 S2 budget
 
 No run has measured S2's p95-latency and load1 budget
-([`docs/slo.md`](../slo.md), S2). **Pending gate.**
+([`docs/slo.md`](../slo.md), S2). #165 tracks the gated run. **Pending
+gate.**
 
 ### 5.4 S3 and R25
 
@@ -1353,9 +1478,14 @@ ranks the work. This paper only points at it:
 
 - S2 source safety: WP1 is on `main` (section 3.3). Still to come: WP7 for
   typed source access in the types, WP6's S2 sampler, P34 and P35 from the
-  property-test plan, review and merge of the formal model, and #157, the
-  counter and property test that OI-1003-Q36's wal-index exception
-  requires;
+  property-test plan, #157, the counter and property test that
+  OI-1003-Q36's wal-index exception requires, and #162's fix for the Git
+  carry's source write, a lane that OI-1003-Q38 scoped;
+- durability: #161, sealing each store's state root and its parent, with a
+  `crash_check` trace over `Store::open` (a fix lane is running).
+  WP0(g)'s relaxed ledger rows land only after it (OI-1003-Q37). #163
+  proposes counting a failed source-ledger commit instead of failing the
+  session;
 - bounded salvage (#124, OI-1002-Q33) and legacy-row invalidation (#125,
   OI-1003-Q26) are on `main` (#154, `4a7b86b`). The ratified bound values
   (OI-1003-Q24) still need their `docs/slo.md` text to reach `main`, and
@@ -1364,8 +1494,10 @@ ranks the work. This paper only points at it:
   census counters) and PR 2 (auto-prerequisite chains, #146) are on
   `main`. The S3 measurement on the estate corpus, and then the choice of
   engine, come next;
-- typed refusals and S4 closure over every item kind: WP3 (PRs 1 and 2,
-  #150 and #151, open);
+- typed refusals and S4 closure over every item kind: WP3. PRs 1 and 2
+  (#150, #151) are on `main`. Still to come: the typed refusal record with
+  its site (PR 3), the remaining `IO` sites with no errno, a typed outcome
+  for bare repositories (#162), and the disposition ledger (section 2.9);
 - one `sync` verb in place of today's choreography of verbs: WP4;
 - drift custody for HEAD and index (#38), and superseding publish under
   WP0(d): WP5;
@@ -1378,14 +1510,13 @@ ranks the work. This paper only points at it:
   wires or deletes the slab pool and fused chunker on the gate (a)
   evidence (section 2.1).
 
-Two proof-package items are in progress elsewhere. The formal model is on
-`docs/tla-model-20261003`, open as #160 (`27581be` when last checked). This
-paper describes its `3dbfbdb` results; the review fixes after that commit
-are not yet folded in (section 4). It is not yet on `main`.
-Its Dhall catalogue and Haskell explorer are sprint 2 work (OI-1003-Q32).
-The estate-shaped corpus is on `feat/wp0e-estate-corpus-20261003`, open as
-#159 (`633ff72` when last checked), not on `main`. A gated
-gate (a) run on corpus v1, and a first gate (b) run, are still owed.
+Two proof-package items have landed, with work still to come. The formal
+model is on `main` (#160, `edf6120`; section 4). Its Dhall catalogue and
+Haskell explorer are sprint 2 work (OI-1003-Q32, Q38), not on `main`. The
+estate-shaped corpus is on `main` (#159, `cb681d3`); its S3 measurement
+harness is not.
+
+A gated gate (a) run on corpus v1, and a first gate (b) run, are still owed.
 Linear TIN-4543 records three gate (a) attempts on 2026-10-03, none with a
 verdict:
 
@@ -1395,8 +1526,9 @@ verdict:
   over the 2.5 limit, before any timed arm ran.
 
 No evidence file for them exists in `docs/evidence/`, so section 5 does not
-count them as results. By OI-1003-Q33 (TIN-4543), the next gate (a) attempt
-waits for the full post-train `main`.
+count them as results. OI-1003-Q33 (TIN-4543) held the next attempt for the
+full post-train `main`. That attempt, on `dfb9604`, started on 2026-10-04
+at 10:43Z; it has no result yet.
 
 ## 8. Limits and threats to validity
 
@@ -1432,36 +1564,36 @@ waits for the full post-train `main`.
 - **A process crash is not a power loss.** The `_exit` fault harness cannot
   see a missing flush. That is why the R-N88 checker exists, and it models
   only the destination image plus store commit events: the databases
-  themselves are not modelled.
+  themselves are not modelled, and nor is a store's own directory. So it
+  cannot see the open durability defect #161: a fresh state root is never
+  sealed, and a power loss can lose a whole store and break R25 (section
+  3.2). A fix lane is running; on `main` the defect is open.
 - **Counters are lower bounds.** Flush counts exclude SQLite's and Git's own
   syncs (M0). The file-path byte counters miss reads by Git child processes.
   The pack-child read counter added by WP2 PR 1 misses page-cache hits, and
   on Darwin it is a lower bound even for storage reads. Reads by other Git
   children are not counted at all (section 5.4).
-- **S2 is proven only in part** (section 3.3). WP1 made more of it
-  structural, but source access is not yet typed, the budget is unmeasured,
-  the P-S2 property covers the file path only, and the model checks S2 at
-  the protocol level only. One more edge: a read-only WAL connection may
-  need to create `-shm` or `-wal` files when they are absent [SQLiteWAL].
-  The architecture review listed this as plausible, not demonstrated. The
-  WP0(e) estate-corpus work then probed it on 2026-10-03 with the open
-  flags `snapshot` uses, but outside bulkload: SQLite 3.51.2 on a copy of
-  the corpus's WAL database, and 3.53.1 on an equivalent image. Both
-  created `<db>-shm` beside the database. The 3.51.2 probe also showed the
-  main file and `-wal` staying byte-identical. The record is in
-  `docs/evidence/estate-corpus-v1-2026-10-03.md` on
-  `feat/wp0e-estate-corpus-20261003` (`7b75b26` and `ec142cf`), which is
-  not on `main`, and on Linear TIN-4543. After its review (#159,
-  `378b634`) that file no longer gives those probes. It records instead a
-  smoke run on 2026-10-04, with a release agent built from `46587af`, in
-  which bulkload's own `snapshot`, through the agent's bundled SQLite
-  3.46.0, created `storage.db-shm` beside the source's WAL image. The same
-  smoke reports a second, unruled source write by the Git carry (section
-  3.3). OI-1003-Q36 admits the `-shm` write on conditions (section 2.8), but
-  until #157 lands, no repository test on `main` runs bulkload's own open
-  in that state, and nothing counts the write or checks that the main file
-  and `-wal` stay byte-identical. The model does not represent the write
-  either (section 4).
+- **S2 is proven only in part, and not met for the Git carry** (section
+  3.3). WP1 made more of it structural, but source access is not yet typed,
+  the budget is unmeasured, the P-S2 property covers the file path only,
+  and the model checks S2 at the protocol level only. Two source writes are
+  known. Both were found by the estate-corpus smoke, run on 2026-10-04 with
+  a release agent built from `46587af`
+  ([evidence](../evidence/estate-corpus-v1-2026-10-03.md), "Carriability
+  smoke"):
+  - `snapshot`, through the agent's bundled SQLite 3.46.0, created
+    `storage.db-shm` beside the source's WAL image. A read-only WAL
+    connection may need to create `-shm` or `-wal` files when they are
+    absent [SQLiteWAL]; the architecture review had listed this as
+    plausible, not demonstrated. OI-1003-Q36 admits the `-shm` write on
+    conditions (section 2.8). Until #157 lands, no repository test on
+    `main` runs bulkload's own open in that state, and nothing counts the
+    write or checks that the main file and `-wal` stay byte-identical.
+  - `estate-capture` changed the mtime and ctime of existing objects in the
+    source's store (#162). No ruling admits it. OI-1003-Q38 scopes a fix
+    lane, and on `main` the write still happens.
+
+  The model represents neither write (section 4).
 - **The stat-identity trust model is cooperative.** Reuse trusts stat
   identity and the capturing host's clock. A writer able to forge ctime, or
   a filesystem whose clock lags by more than 2 s, defeats it. Capture
@@ -1469,7 +1601,9 @@ waits for the full post-train `main`.
   on 0700 custody ([`docs/design.md`](../design.md), "Drift").
 - **Property tests are bounded.** A fixed-seed CI corpus is a regression
   net, not a proof. A formal model proves the model, and TLC checks it
-  only within small bounds (section 4). The gap between model and code is
-  closed only by keeping both reviewed together.
+  only within small bounds (section 4). This one also assumes two things
+  the code does not yet do: a sealed store root (#161) and a source-ledger
+  commit that never fails (#163). The gap between model and code is closed
+  only by keeping both reviewed together.
 - **The sample is narrow.** Two hosts, one operator and one estate. The
   `carry_v2` results come from fixtures only.
