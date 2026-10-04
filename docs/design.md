@@ -25,26 +25,34 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
   whose current capture it is (by digest and repository) and writes the same
   journal, then the outcome `index-repaired` (or `refused` with its code), so
-  a repaired item reads as referenced-only natively (#95).
+  a repaired item reads as referenced-only natively (#95). An item that plans
+  a workspace never binds: the repair refuses `RECEIPT_BINDING_INVALID`
+  before writing anything, and estate-apply restores the workspace (#132).
 
 Anything else is `unaccounted`: a stale journal from an earlier capture, a
 record naming another source, or refs only for an item that plans a
-workspace. Stale and foreign journals are listed. The report passes only
-when `unaccounted` is 0, and otherwise exits nonzero with
-`CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
+workspace. Stale and foreign journals are listed. The native `verdict`
+passes only when `unaccounted` is 0. The report's `gate` is the exit
+status: without an attestation ledger it equals `verdict`, and a failing
+gate exits nonzero with `CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
 the daily-work bar above still applies.
 
-`--attest LEDGER.json` (#95) joins a `bulkload.closure-ledger.v1`
-attestation ledger for items closed by audit rather than by a verb. A row
+`closure-report --attest LEDGER.json PLAN ...` (#95; the option is
+recognised only before PLAN, #133) joins a `bulkload.closure-ledger.v1`
+attestation ledger for items closed by audit rather than by a verb. The
+ledger must name this plan (`plan`) and SOURCE label (`source_label`). A row
 closes a planned item only when the native ledger leaves it unaccounted, and
-only with a matching source, a known disposition (`applied`, `refused` with
+only with a matching source, the item's current capture digest (`capture`,
+as the native item row prints it; `null` only when the corpus holds no
+capture record), a known disposition (`applied`, `refused` with
 a typed code, `referenced-only`, `present`, `source-absent`), a basis other
 than `native-closure-report`, and non-empty evidence. Rows are reported in a
 separate `attested` block with their evidence; native totals are unchanged
 and a native record is never overridden (rows for natively closed items are
-counted as superseded, and disagreements listed). The gate then passes only
-when every item is native-accounted or attested. A ledger naming another
-plan or SOURCE label, or listing an item twice, refuses.
+counted as superseded, and disagreements listed). The top-level `verdict`
+stays native; `gate` passes only when every item is native-accounted or
+attested (#133). A ledger missing or naming another plan or SOURCE label,
+or listing an item twice, refuses.
 
 ## Live union
 
@@ -115,10 +123,18 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   ride in the worktree tree. `git-restore`, `git-restore-linked`, estate
   apply and `git-repair-missing-index` re-mark the paths after reading the
   staged tree and check them back, so `git status --porcelain=v2` matches.
-  An intent-to-add entry whose seat is gone, or one in a nest (whose index
-  is not carried), refuses `GIT_INVENTORY_INTENT_TO_ADD`; the `git-attach-*`
-  verbs refuse a capture carrying any. Any other entry flag
-  (assume-unchanged, skip-worktree) still refuses `GIT_INVENTORY_MALFORMED`.
+  An intent-to-add entry whose seat is gone, one whose seat's mode is not
+  the entry's (`git add -N f; chmod +x f`: restore re-marks the path from
+  the seat and would read 100755, #131), or one in a nest (whose index is
+  not carried), refuses `GIT_INVENTORY_INTENT_TO_ADD` at capture; the
+  restore verbs check the custody against the worktree tree again before
+  any worktree byte is laid down. The `git-attach-*` verbs refuse a capture
+  carrying any. Any other entry flag (assume-unchanged, skip-worktree)
+  still refuses `GIT_INVENTORY_MALFORMED`. Git's fsmonitor validity bit
+  (`CE_FSMONITOR_VALID`) is cache state, not index state: it is masked
+  before an entry is classified, a source's fsmonitor never runs (every
+  carry pins `core.fsmonitor=false`), and a restored index carries no
+  fsmonitor extension (#131).
   A bundle whose prerequisite commits the receiving repository lacks
   refuses `GIT_INVENTORY_MISSING_PREREQUISITE`; fetch them as objects and
   retry.
@@ -241,7 +257,17 @@ miss (#87).
   more than 256 components below the root, or with a relative path over 4095
   bytes, is refused as a value (`PATH_DEPTH_EXCEEDED`, `PATH_TOO_LONG`) with
   its subtree, and its siblings are carried; the walk so holds at most 256
-  directory descriptors (#110). Content is read with `pread`, never mapped.
+  directory descriptors, plus one while it lists a directory at the cap
+  (#110). Both caps are `WalkLimits`, configurable only below these
+  defaults. A directory at the depth cap is listed and refuses its contents
+  only when it holds something the walk would carry; the length cap applies
+  after the stat. Engine temporaries are matched before either cap, and a
+  seat on another device in a same-device walk is skipped before either, so
+  neither is a false refusal (#129). A capped subtree is a refusal like any
+  other, by path and code: it is never counted as carried, it keeps a
+  strict-completeness run from finishing its directories, and the transfer
+  receipt counts it as `capped_subtrees`. Content is read with `pread`,
+  never mapped.
 - **Send.** The source reads the file once, chunks it, hashes each chunk and
   streams it as a data frame (entry, chunk index, offset, size, digest), then
   sends `End` with the manifest root, chunk count, size and whether the
@@ -315,6 +341,30 @@ packs for one repository (R-N60):
 | `GitRefs{sub, updates}` | source → destination | The ref transaction to apply after every segment: name, expected old value, new value. |
 | `GitCommitted{sub, transaction_digest}` | destination → source | The ref transaction committed. |
 | `GitResume{sub, durable_segments}` | destination → source | On a resumed sub-stream, the segments already durable, so only the others are re-sent (W6 M1: a crash in segment k re-sends only segments ≥ k). |
+
+**Caller retry contract (#89, OI-1001-Q17).** Every lock an ingest takes
+(the per-repository fence `<common>/bulkload-ingest.lock`, the quarantine
+claim, the journal lock) waits about 2 s and then refuses as a value, so a
+hung git child never stalls the repository. A finish on a large repository
+routinely holds the fence far longer, so the caller retries:
+
+- Retryable: `JOURNAL_OWNERSHIP_CONFLICT` with reason `repository_fenced`,
+  `quarantine_held` or `journal_held` (another live session holds the lock).
+  Nothing else is retried; a bare `JOURNAL_OWNERSHIP_CONFLICT` (a journal
+  holding another plan) or `journal_replaced` goes to the operator at once.
+- Each retry resumes the session from its journal (`Ingest::resume`), since
+  `finish` consumes it; a resume refused by a held lock is one more attempt.
+- Backoff: before retry n, `base * 2^(n-1)` capped at `ceiling`, jittered
+  uniformly into its upper half. The default (`FenceRetry::DEFAULT`) is 12
+  attempts, 500 ms base, 30 s ceiling: about three minutes of waiting.
+- When the attempts run out the caller surfaces `JOURNAL_OWNERSHIP_CONFLICT`
+  with reason `repository_fenced_retries_exhausted`,
+  `quarantine_held_retries_exhausted` or `journal_held_retries_exhausted`;
+  the journal and quarantine stay, so a later resume carries on.
+
+`Ingest::finish_retrying` implements the contract (`FenceRetry`). The
+W4/W5 wire driver's Git sub-stream receiver, when it lands, finishes
+through it rather than through `finish`.
 
 ## Durability
 

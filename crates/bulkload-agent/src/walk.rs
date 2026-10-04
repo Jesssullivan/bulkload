@@ -16,14 +16,29 @@
 //!
 //! # Depth and path-length caps
 //!
-//! Both are bounded, and both refuse as values (#110). A seat at most
-//! [`MAX_WALK_DEPTH`] components below the root is carried, so the walk holds
-//! at most that many directory descriptors, the root's included: a directory
-//! at that depth is a row, and its contents are refused as one subtree with
-//! `PATH_DEPTH_EXCEEDED`. A seat
-//! whose relative path is longer than [`MAX_REL_PATH_BYTES`] is refused with
-//! `PATH_TOO_LONG` before it is statted, and a directory refused so is never
-//! entered. Siblings of a refused subtree are carried as usual.
+//! Both are bounded, and both refuse as values (#110). The bounds are a
+//! [`WalkLimits`]; the defaults are [`MAX_WALK_DEPTH`] and
+//! [`MAX_REL_PATH_BYTES`], which are also the most a walk may be configured
+//! to carry. A seat at most `max_depth` components below the root is carried,
+//! so the walk holds at most that many directory descriptors, the root's
+//! included, plus one while it lists a directory at the cap. A directory at
+//! the cap is a row; it is opened, listed and closed, and only when it holds
+//! something the walk would carry are its contents refused, as one subtree,
+//! with `PATH_DEPTH_EXCEEDED` (#129). An empty directory at the cap, or one
+//! holding only engine temporaries or seats a same-device walk skips, is
+//! carried whole. A seat whose relative path is longer than
+//! `max_rel_path_bytes` is refused with `PATH_TOO_LONG` once it is statted
+//! (#129: a seat on another device a same-device walk skips is skipped, and
+//! an engine temporary is recorded as one, however long its path), and a
+//! directory refused so is never entered. Siblings of a refused subtree are
+//! carried as usual.
+//!
+//! A capped subtree is never counted as carried: its refusal is a typed,
+//! attributable value (the directory's relative path and the code), it
+//! reaches the transfer's refusal list like any other, and any refusal keeps
+//! a strict-completeness run from finishing its directories. Engine
+//! temporaries are matched before either cap, so a crash leftover at the cap
+//! is recorded as one, not refused.
 //!
 //! The relative path is held once, in one buffer the levels share: each
 //! level records only the length of its prefix in it, so the walk's path
@@ -85,6 +100,62 @@ pub const MAX_WALK_DEPTH: usize = 256;
 /// seat is refused with [`BulkloadRefusal::PathTooLong`].
 pub const MAX_REL_PATH_BYTES: usize = 4095;
 
+/// The bounds one walk carries within (#110, #129). Both refuse as values
+/// past them; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkLimits {
+    max_depth: usize,
+    max_rel_path_bytes: usize,
+}
+
+impl WalkLimits {
+    /// The conservative defaults: [`MAX_WALK_DEPTH`] and
+    /// [`MAX_REL_PATH_BYTES`].
+    pub const DEFAULT: Self = Self {
+        max_depth: MAX_WALK_DEPTH,
+        max_rel_path_bytes: MAX_REL_PATH_BYTES,
+    };
+
+    /// Bounds tighter than the defaults (an operator-run census of a known
+    /// shallow tree, or a test).
+    ///
+    /// # Errors
+    /// Refuses [`BulkloadRefusal::FieldDomainViolation`] for a zero bound or
+    /// one past its default: the defaults are the most a walk holds open and
+    /// the longest path a path-based tool on either side can still name.
+    pub const fn new(max_depth: usize, max_rel_path_bytes: usize) -> Result<Self> {
+        if max_depth == 0
+            || max_depth > MAX_WALK_DEPTH
+            || max_rel_path_bytes == 0
+            || max_rel_path_bytes > MAX_REL_PATH_BYTES
+        {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+        Ok(Self {
+            max_depth,
+            max_rel_path_bytes,
+        })
+    }
+
+    /// The deepest seat carried, in components below the root.
+    #[must_use]
+    pub const fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// The longest relative path carried, in bytes.
+    #[must_use]
+    pub const fn max_rel_path_bytes(&self) -> usize {
+        self.max_rel_path_bytes
+    }
+}
+
+impl Default for WalkLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// File type bits of `st_mode`, and the symlink type.
 const S_IFMT: u32 = 0o170_000;
 const S_IFLNK: u32 = 0o120_000;
@@ -109,18 +180,32 @@ pub struct WalkOptions {
     pub hash_policy: HashPolicy,
     /// Whether to descend into other filesystems.
     pub cross_device: bool,
+    /// Depth and path-length bounds.
+    pub limits: WalkLimits,
 }
 
 impl WalkOptions {
-    /// A stat-only walk of `root`, staying on one device.
+    /// A stat-only walk of `root`, staying on one device, within the default
+    /// limits.
     #[must_use]
     pub const fn new(root: PathBuf) -> Self {
         Self {
             root,
             hash_policy: HashPolicy::Never,
             cross_device: false,
+            limits: WalkLimits::DEFAULT,
         }
     }
+}
+
+/// Whether `code` is a walk-cap refusal (#129).
+///
+/// `PATH_DEPTH_EXCEEDED` refuses a directory's contents as one subtree, and
+/// `PATH_TOO_LONG` the seat and anything beneath it. Each names a subtree
+/// the walk did not carry, so a report counts and lists them on their own.
+#[must_use]
+pub fn is_cap_refusal(code: &str) -> bool {
+    code == BulkloadRefusal::PathDepthExceeded.code() || code == BulkloadRefusal::PathTooLong.code()
 }
 
 /// A seat the walker declined, and why.
@@ -197,6 +282,7 @@ struct Level {
 pub struct Walker<'root> {
     root_dev: u64,
     cross_device: bool,
+    limits: WalkLimits,
     stack: Vec<Level>,
     /// The relative path of the seat being visited. Each level's prefix is
     /// its first `prefix_len` bytes; deeper levels only append past it.
@@ -223,10 +309,23 @@ impl<'root> Walker<'root> {
     /// listed is not an error: the walk yields one refusal with an empty
     /// relative path, so no census reads as complete after it.
     pub fn new(root: BorrowedFd<'root>, cross_device: bool) -> Result<Self> {
+        Self::with_limits(root, cross_device, WalkLimits::DEFAULT)
+    }
+
+    /// [`Walker::new`] within `limits`.
+    ///
+    /// # Errors
+    /// As [`Walker::new`].
+    pub fn with_limits(
+        root: BorrowedFd<'root>,
+        cross_device: bool,
+        limits: WalkLimits,
+    ) -> Result<Self> {
         let root_dev = sys::fstat(root)?.node.dev;
         let mut walker = Self {
             root_dev,
             cross_device,
+            limits,
             stack: Vec::new(),
             path: Vec::new(),
             ready: VecDeque::new(),
@@ -264,11 +363,18 @@ impl<'root> Walker<'root> {
         if !self.cross_device && stat.node.dev != self.root_dev {
             return Visit::Skip;
         }
-        match kind_of(&stat) {
-            FileKind::Regular if temporary_kind(name.to_bytes()) == Some(FileKind::Regular) => {
-                Visit::Items(vec![WalkItem::Engine(rel_path)])
-            }
-            FileKind::Directory => self.visit_directory(parent, name, rel_path, &stat),
+        let kind = kind_of(&stat);
+        // Engine temporaries are matched before either cap (#129): one is
+        // recorded, never carried, so its depth or length refuses nothing.
+        if kind == FileKind::Regular && temporary_kind(name.to_bytes()) == Some(FileKind::Regular) {
+            return Visit::Items(vec![WalkItem::Engine(rel_path)]);
+        }
+        let too_long = rel_path.len() > self.limits.max_rel_path_bytes;
+        match kind {
+            FileKind::Directory => self.visit_directory(parent, name, rel_path, &stat, too_long),
+            // Not carried, and never entered: everything beneath it is
+            // longer still.
+            _ if too_long => refuse(rel_path, BulkloadRefusal::PathTooLong),
             FileKind::Symlink => {
                 let mut row = row_from_stat(rel_path, &stat);
                 row.link_target = read_link(parent, name, stat.size);
@@ -280,25 +386,34 @@ impl<'root> Walker<'root> {
 
     /// Open and list a directory through the descriptor its row is taken
     /// from, so the row and the listing name one inode.
+    ///
+    /// `too_long`: the directory's relative path is past the length cap. It
+    /// is opened only when its name is a tagged directory temporary, to see
+    /// whether it is a crash leftover; otherwise it refuses unopened.
     fn visit_directory(
         &self,
         parent: BorrowedFd<'_>,
         name: &CStr,
         rel_path: Vec<u8>,
         stat: &Stat,
+        too_long: bool,
     ) -> Visit {
-        // The directory's depth below the root: its parent is the top level,
-        // at depth `stack.len() - 1`. At the cap it is a row, and its
-        // contents are one refused subtree, never opened.
-        if self.stack.len() >= MAX_WALK_DEPTH {
-            return Visit::Items(vec![
-                WalkItem::Row(row_from_stat(rel_path.clone(), stat)),
-                WalkItem::Refused(RefusedSeat {
-                    rel_path,
-                    refusal: BulkloadRefusal::PathDepthExceeded,
-                }),
-            ]);
+        let temporary = temporary_kind(name.to_bytes()) == Some(FileKind::Directory);
+        if too_long && !temporary {
+            return refuse(rel_path, BulkloadRefusal::PathTooLong);
         }
+        // A refusal that names the directory's contents: past the length
+        // cap the directory itself is refused instead, and is no row.
+        let contents_refused = |rel_path: Vec<u8>, row: RowSchema, refusal| {
+            if too_long {
+                refuse(rel_path, BulkloadRefusal::PathTooLong)
+            } else {
+                Visit::Items(vec![
+                    WalkItem::Row(row),
+                    WalkItem::Refused(RefusedSeat { rel_path, refusal }),
+                ])
+            }
+        };
         let dir = match sys::open_dir_at(parent, name) {
             Ok(dir) => dir,
             // Swapped for a symlink or a file since the stat: not followed,
@@ -308,13 +423,8 @@ impl<'root> Walker<'root> {
             }
             // Unreadable: the directory is a seat, its contents are refused.
             Err(error) => {
-                return Visit::Items(vec![
-                    WalkItem::Row(row_from_stat(rel_path.clone(), stat)),
-                    WalkItem::Refused(RefusedSeat {
-                        rel_path,
-                        refusal: BulkloadRefusal::from(error),
-                    }),
-                ]);
+                let row = row_from_stat(rel_path.clone(), stat);
+                return contents_refused(rel_path, row, BulkloadRefusal::from(error));
             }
         };
         let opened = match sys::fstat(&dir) {
@@ -327,14 +437,10 @@ impl<'root> Walker<'root> {
         let row = row_from_stat(rel_path.clone(), &opened);
         let level = match level_of(dir, rel_path.len()) {
             Ok(level) => level,
-            Err(refusal) => {
-                return Visit::Items(vec![
-                    WalkItem::Row(row),
-                    WalkItem::Refused(RefusedSeat { rel_path, refusal }),
-                ]);
-            }
+            Err(refusal) => return contents_refused(rel_path, row, refusal),
         };
-        if temporary_kind(name.to_bytes()) == Some(FileKind::Directory) {
+        // Before either cap (#129): a crash leftover is recorded whole.
+        if temporary {
             if let Some(temporaries) = self.only_file_temporaries(&level, &rel_path) {
                 let mut items: Vec<WalkItem> =
                     temporaries.into_iter().map(WalkItem::Engine).collect();
@@ -342,7 +448,40 @@ impl<'root> Walker<'root> {
                 return Visit::Items(items);
             }
         }
+        if too_long {
+            return refuse(rel_path, BulkloadRefusal::PathTooLong);
+        }
+        // The directory's depth below the root: its parent is the top level,
+        // at depth `stack.len() - 1`. At the cap it is a row, never entered.
+        if self.stack.len() >= self.limits.max_depth {
+            return self.at_depth_cap(row, &level, rel_path);
+        }
         Visit::Descend { row, level }
+    }
+
+    /// A directory at the depth cap, listed but never entered (#129). Its
+    /// contents are refused as one subtree, `PATH_DEPTH_EXCEEDED`, only when
+    /// it holds something the walk would carry: an empty directory, or one
+    /// holding nothing but tagged file temporaries (recorded, as anywhere)
+    /// and seats a same-device walk skips, is carried whole. A name that
+    /// cannot be statted counts as content. `level` closes on return.
+    fn at_depth_cap(&self, row: RowSchema, level: &Level, rel_path: Vec<u8>) -> Visit {
+        let mut temporaries = Vec::new();
+        for name in level.names.as_slice() {
+            let Ok(stat) = sys::fstatat_nofollow(&level.dir, name) else {
+                return capped(row, rel_path);
+            };
+            if !self.cross_device && stat.node.dev != self.root_dev {
+                continue;
+            }
+            if !stat.is_file() || temporary_kind(name.to_bytes()) != Some(FileKind::Regular) {
+                return capped(row, rel_path);
+            }
+            temporaries.push(join(&rel_path, name.to_bytes()));
+        }
+        let mut items = vec![WalkItem::Row(row)];
+        items.extend(temporaries.into_iter().map(WalkItem::Engine));
+        Visit::Items(items)
     }
 
     /// The relative paths of a tagged directory temporary's contents when it
@@ -388,15 +527,7 @@ impl Iterator for Walker<'_> {
                 self.path.push(b'/');
             }
             self.path.extend_from_slice(name.to_bytes());
-            if self.path.len() > MAX_REL_PATH_BYTES {
-                // Not statted and never entered: everything beneath it is
-                // longer still.
-                self.ready.push_back(WalkItem::Refused(RefusedSeat {
-                    rel_path: self.path.clone(),
-                    refusal: BulkloadRefusal::PathTooLong,
-                }));
-                continue;
-            }
+            // The length cap is applied in `visit`, after the stat (#129).
             let rel_path = self.path.clone();
             let level = self.stack.last()?;
             match self.visit(level.dir.as_fd(), &name, rel_path) {
@@ -421,6 +552,18 @@ fn level_of(dir: OwnedFd, prefix_len: usize) -> Result<Level> {
         prefix_len,
         names: names.into_iter(),
     })
+}
+
+/// A directory at the depth cap with contents: its row, then its contents
+/// refused as one subtree.
+fn capped(row: RowSchema, rel_path: Vec<u8>) -> Visit {
+    Visit::Items(vec![
+        WalkItem::Row(row),
+        WalkItem::Refused(RefusedSeat {
+            rel_path,
+            refusal: BulkloadRefusal::PathDepthExceeded,
+        }),
+    ])
 }
 
 /// A single declined seat.
@@ -485,7 +628,7 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
     let mut outcome = WalkOutcome::default();
     let mut to_hash: Vec<(usize, PathBuf, StatIdentity, bool)> = Vec::new();
 
-    for item in Walker::new(root.as_fd(), options.cross_device)? {
+    for item in Walker::with_limits(root.as_fd(), options.cross_device, options.limits)? {
         let mut row = match item {
             WalkItem::Row(row) => row,
             WalkItem::Refused(seat) => {
@@ -1113,5 +1256,159 @@ mod tests {
         assert!(rows.contains(&file), "a shorter sibling is carried");
         assert!(rows.contains(&b"nested/b.txt".to_vec()));
         assert!(!rows.iter().any(|row| row.len() > MAX_REL_PATH_BYTES));
+    }
+
+    fn limited(root: &std::path::Path, depth: usize, length: usize) -> super::WalkOutcome {
+        let options = WalkOptions {
+            limits: super::WalkLimits::new(depth, length).unwrap(),
+            ..WalkOptions::new(root.to_path_buf())
+        };
+        walk(&options, &mut MemoryCache::new()).unwrap()
+    }
+
+    /// #129: limits tighter than the defaults are accepted; a zero bound or
+    /// one past its default refuses as a value.
+    #[test]
+    fn walk_limits_are_bounded_by_the_defaults() {
+        use super::{WalkLimits, MAX_REL_PATH_BYTES, MAX_WALK_DEPTH};
+        assert_eq!(WalkLimits::default(), WalkLimits::DEFAULT);
+        assert_eq!(WalkLimits::DEFAULT.max_depth(), MAX_WALK_DEPTH);
+        assert_eq!(WalkLimits::DEFAULT.max_rel_path_bytes(), MAX_REL_PATH_BYTES);
+        assert!(WalkLimits::new(MAX_WALK_DEPTH, MAX_REL_PATH_BYTES).is_ok());
+        assert!(WalkLimits::new(1, 1).is_ok());
+        for (depth, length) in [
+            (0, MAX_REL_PATH_BYTES),
+            (MAX_WALK_DEPTH + 1, MAX_REL_PATH_BYTES),
+            (MAX_WALK_DEPTH, 0),
+            (MAX_WALK_DEPTH, MAX_REL_PATH_BYTES + 1),
+        ] {
+            assert_eq!(
+                WalkLimits::new(depth, length).unwrap_err().code(),
+                "FIELD_DOMAIN_VIOLATION",
+                "{depth} {length}"
+            );
+        }
+    }
+
+    /// #129 (1): the issue's probe. A chain of empty directories exactly as
+    /// deep as the default cap is carried whole: the empty directory at the
+    /// cap is listed, found empty, and refuses nothing.
+    #[test]
+    fn an_empty_directory_at_the_default_cap_refuses_nothing() {
+        use super::MAX_WALK_DEPTH;
+        let corpus = Corpus::new("empty-cap");
+        let chain = vec!["d"; MAX_WALK_DEPTH].join("/");
+        std::fs::create_dir_all(corpus.root.join(&chain)).unwrap();
+        let outcome = walk(
+            &WalkOptions::new(corpus.root.clone()),
+            &mut MemoryCache::new(),
+        )
+        .unwrap();
+        assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
+        assert!(rows_of(&outcome).contains(&chain.into_bytes()));
+        // The fixture's three seats and the chain.
+        assert_eq!(outcome.stats.seats_seen, 3 + MAX_WALK_DEPTH as u64);
+    }
+
+    /// #129 (1): under a configured cap, a directory at the cap with
+    /// contents refuses them as one subtree, typed and attributable; an
+    /// empty sibling at the same depth does not.
+    #[test]
+    fn a_configured_cap_refuses_only_a_non_empty_directory_at_it() {
+        let corpus = Corpus::new("configured-cap");
+        std::fs::create_dir_all(corpus.root.join("x/y/full")).unwrap();
+        std::fs::create_dir_all(corpus.root.join("x/y/empty")).unwrap();
+        std::fs::write(corpus.root.join("x/y/full/f"), b"f").unwrap();
+        let outcome = limited(&corpus.root, 3, super::MAX_REL_PATH_BYTES);
+        assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
+        assert_eq!(outcome.refusals[0].rel_path, b"x/y/full");
+        assert_eq!(outcome.refusals[0].refusal.code(), "PATH_DEPTH_EXCEEDED");
+        assert!(super::is_cap_refusal(outcome.refusals[0].refusal.code()));
+        let rows = rows_of(&outcome);
+        for row in ["x/y/full", "x/y/empty", "nested/b.txt"] {
+            assert!(rows.contains(&row.as_bytes().to_vec()), "{row}");
+        }
+        assert!(
+            !rows.contains(&b"x/y/full/f".to_vec()),
+            "never counted carried"
+        );
+    }
+
+    /// #129 (2): an engine temporary directory at the cap is recorded as
+    /// engine items, not a row plus `PATH_DEPTH_EXCEEDED`; a directory at the
+    /// cap holding only a tagged file temporary is a row with that file
+    /// recorded, and refuses nothing.
+    #[test]
+    fn engine_temporaries_at_the_cap_are_recorded_not_refused() {
+        let corpus = Corpus::new("temporary-cap");
+        let directory = ".bulkload-0123456789abcdef-d-1-2";
+        let file = ".bulkload-0123456789abcdef-1-4";
+        std::fs::create_dir_all(corpus.root.join("x").join(directory)).unwrap();
+        std::fs::write(corpus.root.join("x").join(directory).join(file), b"o").unwrap();
+        std::fs::create_dir_all(corpus.root.join("x/held")).unwrap();
+        std::fs::write(corpus.root.join("x/held").join(file), b"o").unwrap();
+        let outcome = limited(&corpus.root, 2, super::MAX_REL_PATH_BYTES);
+        assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
+        let mut recorded = outcome.engine_temporaries.clone();
+        recorded.sort();
+        let mut expected = vec![
+            format!("x/{directory}").into_bytes(),
+            format!("x/{directory}/{file}").into_bytes(),
+            format!("x/held/{file}").into_bytes(),
+        ];
+        expected.sort();
+        assert_eq!(recorded, expected);
+        let rows = rows_of(&outcome);
+        assert!(rows.contains(&b"x/held".to_vec()));
+        assert!(!rows.iter().any(|row| row.starts_with(b"x/.bulkload")));
+    }
+
+    /// #129 (3): the length cap applies after the stat, so an over-long
+    /// tagged file temporary, or a tagged directory temporary of them, is
+    /// recorded as an engine temporary; an over-long payload seat is still
+    /// refused, and an over-long directory is never entered.
+    #[test]
+    fn over_long_engine_temporaries_are_recorded_not_refused() {
+        let corpus = Corpus::new("temporary-long");
+        let directory = ".bulkload-0123456789abcdef-d-1-2";
+        let file = ".bulkload-0123456789abcdef-1-4";
+        std::fs::create_dir(corpus.root.join("long-enough")).unwrap();
+        std::fs::write(corpus.root.join("long-enough").join(file), b"o").unwrap();
+        std::fs::create_dir(corpus.root.join("long-enough").join(directory)).unwrap();
+        std::fs::write(
+            corpus.root.join("long-enough").join(directory).join(file),
+            b"o",
+        )
+        .unwrap();
+        std::fs::write(corpus.root.join("long-enough/payload-file"), b"p").unwrap();
+        std::fs::create_dir(corpus.root.join("long-enough/payload-dir")).unwrap();
+        std::fs::write(corpus.root.join("long-enough/payload-dir/x"), b"x").unwrap();
+        // "long-enough/" is 12 bytes: every name beneath it is over 16.
+        let outcome = limited(&corpus.root, super::MAX_WALK_DEPTH, 16);
+        let mut recorded = outcome.engine_temporaries.clone();
+        recorded.sort();
+        let mut expected = vec![
+            format!("long-enough/{file}").into_bytes(),
+            format!("long-enough/{directory}").into_bytes(),
+            format!("long-enough/{directory}/{file}").into_bytes(),
+        ];
+        expected.sort();
+        assert_eq!(recorded, expected);
+        let mut refused: Vec<(Vec<u8>, &str)> = outcome
+            .refusals
+            .iter()
+            .map(|seat| (seat.rel_path.clone(), seat.refusal.code()))
+            .collect();
+        refused.sort();
+        assert_eq!(
+            refused,
+            vec![
+                (b"long-enough/payload-dir".to_vec(), "PATH_TOO_LONG"),
+                (b"long-enough/payload-file".to_vec(), "PATH_TOO_LONG"),
+            ]
+        );
+        assert!(!rows_of(&outcome)
+            .iter()
+            .any(|row| row.starts_with(b"long-enough/")));
     }
 }

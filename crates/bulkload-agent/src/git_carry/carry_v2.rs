@@ -70,6 +70,7 @@ mod journal;
 mod lists;
 mod negotiate;
 mod plan;
+mod retry;
 mod send;
 
 pub use ingest::{Ingest, IngestPlan, IngestReceipt, RefUpdate, SegmentAck, Target};
@@ -77,6 +78,7 @@ pub use journal::JournalStore;
 pub use lists::ListStore;
 pub use negotiate::{first_round, FirstRound};
 pub use plan::{PackPlan, DEFAULT_SEGMENT_CAP};
+pub use retry::{retryable, FenceRetry, RETRYABLE_REASONS};
 pub use send::SegmentReceipt;
 
 /// A carry v2 result: a value, or a refusal whose child stderr is classified.

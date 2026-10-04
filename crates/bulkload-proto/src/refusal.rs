@@ -88,9 +88,13 @@ pub enum BulkloadRefusal {
     /// named commits as objects and retrying is the documented recovery.
     GitInventoryMissingPrerequisite,
     /// An intent-to-add (`git add -N`) index entry cannot be carried: its
-    /// seat is absent from the captured worktree, or it lies in a nested
-    /// repository, whose index is not carried (#106). Intent-to-add entries
-    /// of a captured checkout are otherwise carried as index custody.
+    /// seat is absent from the captured worktree, its seat's mode is not the
+    /// one the entry records (a restore re-marks the path from the seat, so
+    /// `git add -N f; chmod +x f` cannot be restored as captured, #131), or
+    /// it lies in a nested repository, whose index is not carried (#106).
+    /// Capture refuses it, and a restore checks it again before any worktree
+    /// byte is laid down. Intent-to-add entries of a captured checkout are
+    /// otherwise carried as index custody.
     GitInventoryIntentToAdd,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
