@@ -268,8 +268,8 @@ tla-render out="" json="":
 # operator the catalogue names (properties, witnesses, actions, the specs)
 # is defined in BulkloadTransfer.tla, every constant is declared, every
 # mutation is in its Mutations set, and every code symbol is found by
-# `git grep -w` under crates/. The rows
-# of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
+# `git grep -w` under crates/. A failed check removes the scratch and stops.
+# The rows of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
 # 3 workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. The first row is the budget self-test: it
 # must finish with WithinBudget, and nothing else, violated, or nothing else
@@ -310,6 +310,7 @@ tla-check *configs:
     done
     if [[ $stale -ne 0 ]]; then
         echo "tla-check: stale configs; run just tla-render and commit the result" >&2
+        rm -rf "$scratch"
         exit 1
     fi
     # Grounding: every catalogue name exists in the spec, every code symbol in crates/.
@@ -346,6 +347,7 @@ tla-check *configs:
     done
     if [[ $ungrounded -ne 0 ]]; then
         echo "tla-check: $ungrounded catalogue name(s) are not grounded" >&2
+        rm -rf "$scratch"
         exit 1
     fi
     printf 'catalogue: %s files current; grounded %s operators, %s constants, %s mutations, %s code symbols\n' \
@@ -493,3 +495,68 @@ tla-check *configs:
         exit 1
     fi
     rm -rf "$scratch"
+
+# Haskell N-version explorer (OI-1003-Q32; docs/formal/README.md, "Hybrid
+# roles"). Standalone and on demand: no tier depends on it, so check-fast,
+# check-optional, check-full and CI never build it. GHC comes from the
+# flake's pinned nixpkgs (no flake change). docs/formal/hs/Explorer.hs uses
+# base and containers only; it is built with -O1 -Wall -Werror into a
+# private mktemp directory under TMPDIR. It must reproduce TLC's run of
+# record: the distinct-state counts of MC_nv_core (15,834) and MC_nv_ledger
+# (142,450), with no invariant violated and no deadlock. On the core, each
+# of the mutations held_before_commit, commit_before_fsync and
+# src_ledger_carries_r25 must violate exactly the property configs.tsv names
+# for its MC_neg_ row, checking TypeOK and that property, as TLC does. Each
+# counterexample is written as JSON; that directory is kept and printed.
+# Cross-check the TLA+ model with the Haskell N-version explorer.
+formal-nv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}/docs/formal
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/formal-nv.XXXXXX")
+    mkdir -p "$scratch/build" "$scratch/counterexamples"
+    if ! nix shell --inputs-from {{ root }} nixpkgs#ghc --command nice -n 10 ghc -O1 -Wall -Werror -outputdir "$scratch/build" -o "$scratch/explorer" hs/Explorer.hs >"$scratch/ghc.log" 2>&1; then
+        cat "$scratch/ghc.log" >&2
+        echo "formal-nv: the explorer did not build; log kept at $scratch/ghc.log" >&2
+        exit 1
+    fi
+    # TLC's distinct-state counts of record (README.md, "N-version core").
+    declare -A tlc_distinct=([nv_core]=15834 [nv_ledger]=142450)
+    field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; }
+    mismatches=0
+    format='%-30s %-26s %-30s %9s %10s %6s %s\n'
+    printf "$format" row expect explorer distinct generated depth match
+    for preset in nv_core nv_ledger; do
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" --preset "$preset") || status=$?
+        want="pass (${tlc_distinct[$preset]})"
+        got="$(field outcome "$line") ($(field distinct "$line"))"
+        match=yes
+        if [[ $status -ne 0 || $got != "$want" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+        fi
+        printf "$format" "$(field row "$line")" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+    done
+    for mutation in held_before_commit commit_before_fsync src_ledger_carries_r25; do
+        named=$(awk -F'\t' -v row="MC_neg_$mutation" '$1 == row { print $3 }' configs.tsv)
+        if [[ -z $named ]]; then
+            echo "formal-nv: configs.tsv has no MC_neg_$mutation row" >&2
+            exit 1
+        fi
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" --mutation "$mutation" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
+        got="$(field outcome "$line") $(field violated "$line")"
+        match=yes
+        if [[ $status -ne 1 || $got != "violation $named" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+        fi
+        printf "$format" "$(field row "$line")" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+    done
+    rm -rf "$scratch/build" "$scratch/explorer"
+    echo "counterexamples (JSON): $scratch/counterexamples"
+    if [[ $mismatches -ne 0 ]]; then
+        echo "formal-nv: $mismatches row(s) disagree with TLC" >&2
+        exit 1
+    fi

@@ -31,8 +31,9 @@ let Mode = T.SupersedeMode
 -- Provenance lines written into every rendered file.
 let provenance =
       { cfg =
-          "\\* Rendered by gen_cfgs.py; expected outcome in configs.tsv."
-      , tsv = "# Rendered by gen_cfgs.py; edit its table, not this file."
+          "\\* Rendered from catalogue/Catalogue.dhall; expected outcome in configs.tsv."
+      , tsv =
+          "# Rendered from catalogue/Catalogue.dhall by `just tla-render`; edit the catalogue, not this file."
       }
 
 -- List and text helpers ------------------------------------------------------
