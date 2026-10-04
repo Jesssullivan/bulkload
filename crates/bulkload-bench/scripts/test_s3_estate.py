@@ -122,6 +122,7 @@ class BoundTests(unittest.TestCase):
                 ".bashrc": "walk",
                 "git/r00/a.rs": "worktree",
                 "git/r00/.git/index": "git-admin",
+                "git/r00/.git/objects/ab/cdef": "git-objects",
             },
             "reads_allowed_sizes": {
                 "data/big": 10_000,
@@ -129,6 +130,7 @@ class BoundTests(unittest.TestCase):
                 ".codex/state.sqlite": 8192,
                 ".bashrc": 10,
                 "git/r00/a.rs": 70,
+                "git/r00/.git/objects/ab/cdef": 40,
             },
             "operations": [
                 {
@@ -163,23 +165,79 @@ class BoundTests(unittest.TestCase):
             },
         }
         items = {
-            "git/r00": {"repo": "git/r00", "kind": "main"},
-            "git/m.git": {"repo": "git/m.git", "kind": "mirror"},
+            "git/r00": item("git/r00", "main"),
+            "git/m.git": item("git/m.git", "mirror"),
         }
         b = s3.delta_bounds(sidecar, ["data", ".codex"], {".codex/state.sqlite"}, items)
-        self.assertEqual(b["file_read_by_area"], {"data": 10_000, ".codex": 8692})
+        # The SQLite seat belongs to the SQLite half only: copy refuses it.
+        self.assertEqual(b["file_read_by_area"], {"data": 10_000, ".codex": 500})
         self.assertEqual(b["file_wire_by_area"], {"data": 832, ".codex": 356})
+        self.assertEqual(
+            b["file_wire_by_seat"], {"data/big": 832, ".codex/s.jsonl": 356}
+        )
         self.assertEqual(b["sqlite_changed"], {".codex/state.sqlite": 8192})
         self.assertEqual(b["sqlite_changed_range_bytes"], 4096)
         self.assertEqual(b["uncovered_walk_seats"], [".bashrc"])
         self.assertEqual(b["git_read_by_item"], {"git/r00": 70})
-        self.assertEqual(b["git_wire_by_item"], {"git/r00": 370})
+        self.assertEqual(b["git_worktree_chunk_bound_by_item"], {"git/r00": 70})
+        self.assertEqual(b["git_new_object_bytes_by_changed_repo"], {"git/r00": 300})
+        self.assertEqual(b["git_object_store_seat_bytes_by_item"], {"git/r00": 40})
+        repos = s3.git_wire(b, False)
+        self.assertEqual(repos["git/r00"]["bound_chunk"], 370)
+        self.assertEqual(repos["git/r00"]["bound_object"], 370)
+
+    def test_git_bound_granularity_and_repo_once(self) -> None:
+        """A large edit is bounded by its absent chunks; a repository's new
+        objects count once however many of its items changed."""
+        sidecar = {
+            "cdc_bytes": {"max": 256},
+            "reads_allowed_class": {"git/r01/model.bin": "worktree"},
+            "reads_allowed_sizes": {"git/r01/model.bin": 1_000_000},
+            "operations": [
+                {
+                    "path": "git/r01/model.bin",
+                    "pre_size": 1_000_000,
+                    "post_size": 1_000_000,
+                    "ranges": [[500_000, 500_064]],
+                }
+            ],
+            "reads_by_class": {
+                "worktree": {"items": {"git/r01": {"bytes": 1_000_000}}}
+            },
+            "git_objects": {"git/r01": {"tips": [{"new_objects": {"bytes": 300}}]}},
+            "items": {
+                "changed": [{"item": "git/r01"}, {"item": "git/r01.worktrees/tree"}]
+            },
+        }
+        items = {
+            "git/r01": item("git/r01", "main"),
+            "git/r01.worktrees/tree": item(
+                "git/r01.worktrees/tree", "branch", repo="git/r01"
+            ),
+        }
+        b = s3.delta_bounds(sidecar, [], set(), items)
+        self.assertEqual(
+            b["git_worktree_chunk_bound_by_item"],
+            {"git/r01": 832, "git/r01.worktrees/tree": 0},
+        )
+        repos = s3.git_wire(b, False)
+        self.assertEqual(
+            repos["git/r01"]["items"], ["git/r01", "git/r01.worktrees/tree"]
+        )
+        self.assertEqual(repos["git/r01"]["bound_chunk"], 1132)
+        self.assertEqual(repos["git/r01"]["bound_object"], 1_000_300)
 
     def test_sqlite_companions(self) -> None:
         dbs = {".local/s.db"}
         self.assertTrue(s3.is_sqlite_seat(".local/s.db-wal", dbs))
         self.assertTrue(s3.is_sqlite_seat(".local/s.db-shm", dbs))
         self.assertFalse(s3.is_sqlite_seat(".local/t.db-wal", dbs))
+
+
+def item(name: str, kind: str, repo: str | None = None) -> dict:
+    repo = repo or name
+    admin = name if kind == "mirror" else f"{repo}/.git"
+    return {"item": name, "kind": kind, "repo": repo, "admin": admin}
 
 
 def child(**extra: object) -> dict:
@@ -196,32 +254,51 @@ def entry(
     pack: int,
     walks: int,
     sidecar=None,
+    cpu: float = 0.5,
+    blocked: bool = True,
+    readback: int = 0,
 ) -> dict:
     return {
         "label": label,
         "mutation": {"sidecar": sidecar} if sidecar else None,
         "file": {
             "data": child(
+                cpu_s=cpu,
                 transfer={"source_bytes_read": file_read, "bytes_received": recv},
                 counters={"priority": "background", "priority_from": "default"},
-                refused=[["data/x", "GIT_DESTINATION_OCCUPIED"]] if sidecar else [],
+                refused=(
+                    [["data/x", "GIT_DESTINATION_OCCUPIED"]]
+                    if sidecar and blocked
+                    else []
+                ),
             ),
             ".codex": child(
+                cpu_s=cpu,
                 transfer={"source_bytes_read": 0, "bytes_received": 0},
                 refused=[[".codex/state.sqlite", "SQLITE_STATE_CHANGED"]],
             ),
         },
         "sqlite": {
-            ".codex/state.sqlite": child(db_bytes=8192, wal_bytes=0, output_bytes=8192)
+            ".codex/state.sqlite": child(
+                cpu_s=cpu, db_bytes=8192, wal_bytes=0, output_bytes=8192
+            )
         },
         "git": {
             "rest": child(
-                counters={"census_walks": walks, "write_source_pack_bytes": pack},
+                cpu_s=cpu,
+                counters={
+                    "census_walks": walks,
+                    "write_source_pack_bytes": pack,
+                    "read_source_pack_readback_bytes": readback,
+                },
                 outcomes={"captured": 1},
                 source_bytes_read=git_read,
             ),
             "history": child(
-                counters={"census_walks": 0}, outcomes={}, source_bytes_read=0
+                cpu_s=cpu,
+                counters={"census_walks": 0},
+                outcomes={},
+                source_bytes_read=0,
             ),
         },
         "v2": {
@@ -252,7 +329,7 @@ class EvaluateTests(unittest.TestCase):
         self.ctx = {
             "areas": ["data", ".codex"],
             "sqlite": [".codex/state.sqlite"],
-            "items": [{"item": "git/r00", "repo": "git/r00", "kind": "main"}],
+            "items": [item("git/r00", "main")],
             "plans": {"rest": {"censused": ["git/r00"]}, "history": {"censused": []}},
         }
         self.sidecar = {
@@ -277,8 +354,9 @@ class EvaluateTests(unittest.TestCase):
         record = {
             "passes": [
                 entry("first", 1000, 1000, 50, 900, 4),
-                entry("rerun-1", 0, 0, 0, 0, 1),
-                entry("mutate-1", 1000, 600, 50, 2000, 4, self.sidecar),
+                entry("rerun-1", 0, 0, 0, 0, 1, cpu=0.01),
+                entry("rerun-2", 0, 0, 0, 0, 1),
+                entry("mutate-1", 1000, 600, 50, 2000, 4, self.sidecar, readback=4096),
             ]
         }
         ev = s3.evaluate(record, self.ctx)
@@ -286,21 +364,72 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(un["file_source_bytes_read"], "pass")
         self.assertEqual(un["git_pack_bytes_written"], "pass")
         self.assertEqual(un["sqlite_whole_database_reads"], "fail")
+        self.assertEqual(un["cpu_ratio_le_10pct"], "pass")
+        # The wall ratio is informational and never stands in for the CPU one.
+        un2 = ev["rerun-2"]["subsets"]["all"]["unchanged"]
+        self.assertEqual(un2["cpu_ratio_le_10pct"], "fail")
+        self.assertEqual(un2["wall_ratio_le_10pct_informational"], "fail")
         self.assertEqual(
             ev["rerun-1"]["subsets"]["all"]["census_walks"]["verdict"], "pass"
         )
         self.assertEqual(ev["first"]["subsets"]["all"]["census_walks"]["expected"], 4)
         delta = ev["mutate-1"]["subsets"]["all"]["delta"]
         self.assertEqual(delta["file_ineq1"]["verdict"], "pass")
-        self.assertEqual(delta["file_ineq2"]["bound"], 513)
-        self.assertEqual(delta["file_ineq2"]["verdict"], "fail")
+        self.assertEqual(delta["file_ineq1"]["sqlite_header_bytes"], 16)
+        # data/x was refused GIT_DESTINATION_OCCUPIED: not carried, so it is
+        # outside the bound, and the delta did not converge.
+        self.assertEqual(delta["file_ineq2"]["bound"], 0)
+        self.assertEqual(delta["file_ineq2"]["bound_with_blocked"], 513)
+        self.assertEqual(delta["file_ineq2"]["blocked_seats"], ["data/x"])
+        self.assertEqual(delta["file_ineq2"]["verdict"], "n/a: blocked by WP0(d)")
+        self.assertEqual(delta["file_ineq2"]["carried_verdict"], "fail")
         self.assertEqual(delta["git_ineq1"]["verdict"], "pass")
+        self.assertEqual(
+            delta["git_ineq1"]["object_store"]["verdict_if_counted"], "fail"
+        )
         self.assertEqual(delta["git_ineq2"]["excess"], 1950)
+        self.assertEqual(delta["git_ineq2"]["excess_object"], 1950)
         refusals = ev["mutate-1"]["refusals"]
         self.assertEqual(refusals["blocked by WP0(d)"], ["data/x"])
         self.assertEqual(refusals["routed-to-snapshot"], [".codex/state.sqlite"])
-        without = ev["mutate-1"]["subsets"]["without-data"]["delta"]["file_ineq1"]
-        self.assertEqual((without["measured"], without["bound"]), (0, 0))
+        without = ev["mutate-1"]["subsets"]["without-data"]["delta"]
+        self.assertEqual(
+            (without["file_ineq1"]["measured"], without["file_ineq1"]["bound"]), (0, 0)
+        )
+        self.assertEqual(without["file_ineq2"]["verdict"], "pass")
+
+    def test_carried_delta_is_judged(self) -> None:
+        record = {
+            "passes": [
+                entry("first", 1000, 1000, 50, 900, 4),
+                entry("mutate-1", 1000, 500, 50, 50, 4, self.sidecar, blocked=False),
+            ]
+        }
+        delta = s3.evaluate(record, self.ctx)["mutate-1"]["subsets"]["all"]["delta"]
+        self.assertEqual(delta["file_ineq2"]["bound"], 513)
+        self.assertEqual(delta["file_ineq2"]["verdict"], "pass")
+        self.assertEqual(
+            delta["git_ineq1"]["object_store"]["verdict_if_counted"],
+            "unknown (readback is a lower bound)",
+        )
+
+    def test_reevaluate_writes_a_new_record(self) -> None:
+        record = {
+            "context": self.ctx,
+            "passes": [entry("first", 1, 1, 1, 1, 4), entry("rerun-1", 0, 0, 0, 0, 1)],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "s3-estate.json"
+            src.write_text(json.dumps(record))
+            out = Path(tmp) / "again.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(s3.reevaluate(src, out, None), 0)
+                self.assertEqual(s3.reevaluate(src, out, None), 2)
+                self.assertEqual(s3.reevaluate(src, src, None), 2)
+            again = json.loads(out.read_text())
+            self.assertEqual(json.loads(src.read_text()), record)
+        self.assertIn("rerun-1", again["evaluation"])
+        self.assertEqual(again["reevaluated"]["from"], str(src))
 
     def test_report_renders(self) -> None:
         record = {

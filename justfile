@@ -174,8 +174,9 @@ bench-estate-corpus-selftest:
 # reruns and reruns after `mutate 1` and `mutate 10` (copy, snapshot,
 # estate-capture, and git-carry-estimate as the v2 projection), evaluates the
 # OI-1003-Q18 inequalities and writes WORK/s3-estate.json. `build --out DIR`
-# release-builds bulkload-agent at origin/main; `report JSON` renders tables.
-# Informational and ungated; never deletes a target.
+# release-builds bulkload-agent at origin/main; `report JSON` renders tables;
+# `evaluate JSON --out NEW` re-runs the evaluation of a recorded run into a
+# new file. Informational and ungated; never deletes a target.
 # S3 estate measurement harness, Sprint 2 lane A (OI-1003-Q35, OI-1003-Q18)
 bench-s3-estate *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/s3_estate.py {{ args }}

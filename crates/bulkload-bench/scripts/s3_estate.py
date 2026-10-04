@@ -47,22 +47,32 @@ git engine is chosen on these numbers), R-N13.
   5. Evaluates S3 per pass, per half and per subset (all; without data/;
      without git/history-heavy; without both):
        - unchanged reruns: 0 content bytes read and received, 0 pack bytes,
-         census_walks one per censused item, and wall time <= 10 % of the
-         first pass (informational, OI-1003-Q35);
+         census_walks one per censused item, and the rusage CPU ratio
+         <= 10 % of the first pass (OI-1003-Q35); the wall ratio is reported
+         beside it, informational;
        - delta reruns, the two OI-1003-Q18 inequalities against the round's
-         sidecar: source content bytes read <= the changed or racy seats
-         (`walk` seats of the copied areas for the file half, `worktree`
-         seats for the git half), and wire content bytes <= the absent
-         chunks (per changed file: the changed ranges widened by one maximum
-         CDC chunk before and two after, capped at the file; for the git
-         half, the round's new objects of the item's repository plus its
-         changed worktree bytes, per changed item);
+         sidecar. Each changed seat counts in one half only: SQLite databases
+         and their companions belong to the SQLite half, never the file half.
+         Inequality 1: source content bytes read <= the changed or racy
+         seats (non-SQLite `walk` seats of the copied areas for the file
+         half; `worktree` seats for the git half, whose receipts count
+         worktree streaming only, so the git children's object-store reads
+         are reported beside it, pending a ruling). Inequality 2: wire
+         content bytes <= the absent chunks (per changed file: the changed
+         ranges widened by one maximum CDC chunk before and two after,
+         capped at the file). The file half bounds only the seats copy
+         carried. The git half adds each changed repository's new objects
+         once, and is reported at chunk granularity (the absent-chunk bound
+         of each changed worktree seat) and at object granularity (each
+         changed worktree seat whole);
        - a copy refusal on a seat the round changed whose destination already
          holds an older output is the typed result `blocked by WP0(d)`
-         (no-clobber; OI-1003-Q18 (d) superseding publish is not built).
-         Targets are never deleted.
+         (no-clobber; OI-1003-Q18 (d) superseding publish is not built). The
+         file half's inequality 2 is then `n/a: blocked by WP0(d)`, since
+         the delta did not converge. Targets are never deleted.
   Everything goes to WORK/s3-estate.json; each child's raw output is kept
-  under WORK/logs/. `report` renders the JSON as Markdown tables.
+  under WORK/logs/. `report` renders the JSON as Markdown tables, and
+  `evaluate` re-runs the evaluation of a recorded run into a new JSON.
 
 `build` exports REV with `git archive` into OUT/src-<sha12> and runs
 `cargo build --release --locked -p bulkload-agent` in `nix develop` of that
@@ -76,6 +86,7 @@ Usage:
   s3_estate.py run --agent BIN --work WORK [--scale small|estate] [--seed S]
                    [--jobs 2] [--min-available-gib 6] [--build-json F]
   s3_estate.py report WORK/s3-estate.json
+  s3_estate.py evaluate WORK/s3-estate.json --out NEW.json [--seal SEAL]
 
 Run `run` inside the repository's devShell (`nix develop .#default`): the
 corpus identity needs its git, SQLite and zstd. Exit: 0 complete (S3
@@ -123,6 +134,10 @@ SUBSETS = {
     "without-history": (False, True),
     "without-both": (True, True),
 }
+# The unchanged clause's <= 10 % of the first pass (S3; OI-1003-Q6, Q10).
+# OI-1003-Q35 makes the rusage CPU ratio the admissible measure; wall time is
+# informational.
+CPU_RATIO = 0.10
 WALL_RATIO = 0.10
 SETTLE_MARGIN_S = 1.0
 # Refusal codes of a no-clobber publication: the destination already holds an
@@ -368,32 +383,57 @@ def is_sqlite_seat(rel: str, sqlite: set[str]) -> bool:
 def delta_bounds(
     sidecar: dict, areas: list[str], sqlite: set[str], items_by_name: dict
 ) -> dict:
-    """The OI-1003-Q18 bounds of one round, split by half and subset key."""
+    """The OI-1003-Q18 bounds of one round, split by half and subset key.
+
+    Each changed seat is counted in exactly one half. A SQLite database and
+    its companions belong to the SQLite half only: copy refuses them
+    (SQLITE_STATE_CHANGED), so they are never in the file half's bounds.
+
+    The git half is reported at two granularities. `chunk` applies the file
+    half's absent-chunk bound (`absent_bound`) to each changed worktree seat;
+    `object` counts each changed worktree seat whole, as a new blob. Both add
+    each repository's new objects once per round, however many of its items
+    changed.
+    """
     cdc_max = sidecar.get("cdc_bytes", {}).get("max", 256 * 1024)
     classes = sidecar.get("reads_allowed_class", {})
     sizes = sidecar.get("reads_allowed_sizes", {})
     ops = file_ops(sidecar)
+    items_list = list(items_by_name.values())
     file_read: dict[str, int] = {}
     file_wire: dict[str, int] = {}
+    file_wire_by_seat: dict[str, int] = {}
     sqlite_changed: dict[str, int] = {}
     uncovered: list[str] = []
+    chunk_by_item: dict[str, int] = {}
+    object_store_by_item: dict[str, int] = {}
     for rel, cls in classes.items():
+        size = int(sizes.get(rel, 0))
+        op = ops.get(rel)
+        chunk = (
+            absent_bound(op["pre"], op["post"], op["ranges"], cdc_max) if op else size
+        )
+        if cls in ("worktree", "git-objects"):
+            _, owner, _ = ec.attribute(rel, "f", items_list)
+            if owner is None:
+                continue
+            if cls == "worktree":
+                chunk_by_item[owner] = chunk_by_item.get(owner, 0) + chunk
+            else:
+                object_store_by_item[owner] = object_store_by_item.get(owner, 0) + size
+            continue
         if cls != "walk":
             continue
         area = area_of(rel)
-        size = int(sizes.get(rel, 0))
         if area is None or area not in areas:
             uncovered.append(rel)
             continue
-        file_read[area] = file_read.get(area, 0) + size
         if is_sqlite_seat(rel, sqlite):
             sqlite_changed[rel] = size
             continue
-        op = ops.get(rel)
-        bound = (
-            absent_bound(op["pre"], op["post"], op["ranges"], cdc_max) if op else size
-        )
-        file_wire[area] = file_wire.get(area, 0) + bound
+        file_read[area] = file_read.get(area, 0) + size
+        file_wire[area] = file_wire.get(area, 0) + chunk
+        file_wire_by_seat[rel] = chunk
     sqlite_ranges = sum(
         sum(e - s for s, e in ops[rel]["ranges"]) if rel in ops else size
         for rel, size in sqlite_changed.items()
@@ -405,24 +445,32 @@ def delta_bounds(
             tip.get("new_objects", {}).get("bytes", 0) for tip in row.get("tips", [])
         )
     git_read: dict[str, int] = {}
-    git_wire: dict[str, int] = {}
+    git_chunk: dict[str, int] = {}
+    item_repo: dict[str, str] = {}
     for change in sidecar.get("items", {}).get("changed", []):
         name = change["item"]
         item = items_by_name.get(name, {"repo": name, "kind": "main"})
         if item.get("kind") == "mirror":
             continue
-        own = int(worktree.get(name, {}).get("bytes", 0))
-        git_read[name] = own
-        git_wire[name] = own + new_objects.get(item["repo"], 0)
+        git_read[name] = int(worktree.get(name, {}).get("bytes", 0))
+        git_chunk[name] = chunk_by_item.get(name, 0)
+        item_repo[name] = item["repo"]
     return {
         "cdc_max": cdc_max,
         "file_read_by_area": file_read,
         "file_wire_by_area": file_wire,
+        "file_wire_by_seat": file_wire_by_seat,
         "sqlite_changed": sqlite_changed,
         "sqlite_changed_range_bytes": sqlite_ranges,
         "uncovered_walk_seats": sorted(uncovered, key=str.encode),
         "git_read_by_item": git_read,
-        "git_wire_by_item": git_wire,
+        "git_worktree_object_bytes_by_item": dict(git_read),
+        "git_worktree_chunk_bound_by_item": git_chunk,
+        "git_item_repo": item_repo,
+        "git_new_object_bytes_by_changed_repo": {
+            repo: new_objects.get(repo, 0) for repo in sorted(set(item_repo.values()))
+        },
+        "git_object_store_seat_bytes_by_item": object_store_by_item,
         "new_object_bytes_by_repo": new_objects,
         "census_walks_expected": sidecar.get("items", {}).get("census_walks_expected"),
     }
@@ -1066,9 +1114,10 @@ class Measure:
             "repos": estimate_repos(seal),
             "items": ec.estate_items(seal),
         }
-        self.record["context"] = {
-            k: v for k, v in ctx.items() if k not in ("items",)
-        } | {"identity": seal["identity"], "counts": seal["counts"]}
+        self.record["context"] = dict(ctx) | {
+            "identity": seal["identity"],
+            "counts": seal["counts"],
+        }
         model = self.model_empty(ctx["repos"])
         time.sleep(ec.RACY_SETTLE_NS / 1e9 + SETTLE_MARGIN_S)
         mirrors = {}
@@ -1203,15 +1252,87 @@ def half_totals(entry: dict, skip_data: bool, skip_history: bool) -> dict:
     return out
 
 
-def per_item_pack(entry: dict, bounds: dict[str, int], skip_history: bool) -> dict:
-    """Bundle bytes against the bound, per item the pass wrote a bundle for."""
-    out = {}
+def git_wire(bounds: dict, skip_history: bool) -> dict:
+    """Git inequality 2 per repository: the bundle bytes of its items against
+    its changed worktree seats (chunk and object granularity) plus its new
+    objects, counted once per repository however many of its items changed."""
+    keep = [
+        name
+        for name in bounds["git_read_by_item"]
+        if not (skip_history and name == HISTORY)
+    ]
+    repos: dict[str, dict] = {}
+    for name in keep:
+        repo = bounds["git_item_repo"].get(name, name)
+        row = repos.setdefault(
+            repo,
+            {
+                "items": [],
+                "new_object_bytes": bounds["git_new_object_bytes_by_changed_repo"].get(
+                    repo, 0
+                ),
+                "worktree_chunk_bound": 0,
+                "worktree_object_bytes": 0,
+            },
+        )
+        row["items"].append(name)
+        row["worktree_chunk_bound"] += bounds["git_worktree_chunk_bound_by_item"].get(
+            name, 0
+        )
+        row["worktree_object_bytes"] += bounds["git_worktree_object_bytes_by_item"].get(
+            name, 0
+        )
+    for row in repos.values():
+        row["bound_chunk"] = row["worktree_chunk_bound"] + row["new_object_bytes"]
+        row["bound_object"] = row["worktree_object_bytes"] + row["new_object_bytes"]
+    return repos
+
+
+def per_item_pack(
+    entry: dict,
+    bounds: dict,
+    repos: dict[str, dict],
+    items_by_name: dict,
+    skip_history: bool,
+) -> tuple[dict, dict]:
+    """Bundle bytes per item the pass wrote a bundle for, and per repository
+    against that repository's bounds (`git_wire`)."""
+    out: dict[str, dict] = {}
+    per_repo: dict[str, dict] = {
+        repo: {**row, "bundle_bytes": 0} for repo, row in repos.items()
+    }
     for name, row in entry["git"].items():
         if skip_history and name == "history":
             continue
         for item, size in row.get("bundles", {}).items():
-            out[item] = {"bundle_bytes": size, "bound": bounds.get(item, 0)}
-    return out
+            repo = items_by_name.get(item, {}).get("repo", item)
+            out[item] = {
+                "bundle_bytes": size,
+                "repo": repo,
+                "worktree_chunk_bound": bounds["git_worktree_chunk_bound_by_item"].get(
+                    item, 0
+                ),
+                "worktree_object_bytes": bounds[
+                    "git_worktree_object_bytes_by_item"
+                ].get(item, 0),
+            }
+            target = per_repo.setdefault(
+                repo,
+                {
+                    "items": [],
+                    "new_object_bytes": 0,
+                    "worktree_chunk_bound": 0,
+                    "worktree_object_bytes": 0,
+                    "bound_chunk": 0,
+                    "bound_object": 0,
+                    "bundle_bytes": 0,
+                },
+            )
+            target["bundle_bytes"] += size
+    for row in per_repo.values():
+        row["excess_chunk"] = max(0, row["bundle_bytes"] - row["bound_chunk"])
+        row["excess_object"] = max(0, row["bundle_bytes"] - row["bound_object"])
+    return out, per_repo
 
 
 def verdict(ok: bool | None) -> str:
@@ -1255,6 +1376,7 @@ def evaluate(record: dict, ctx: dict) -> dict:
             for key in ("added", "modified"):
                 changed_paths |= set(sidecar.get("changed", {}).get(key, []))
             changed_paths |= set(sidecar.get("stat_only", []))
+        pass_refusals = classify_refusals(entry, changed_paths, sqlite)
         per_subset = {}
         for subset, (skip_data, skip_history) in SUBSETS.items():
             tot = half_totals(entry, skip_data, skip_history)
@@ -1304,6 +1426,9 @@ def evaluate(record: dict, ctx: dict) -> dict:
                         number(g["counters"], "write_source_pack_bytes") == 0
                     ),
                     "sqlite_whole_database_reads": verdict(s["db_bytes"] == 0),
+                    "cpu_ratio_le_10pct": verdict(
+                        cpu_ratio is not None and cpu_ratio <= CPU_RATIO
+                    ),
                     "wall_ratio_le_10pct_informational": verdict(
                         ratio is not None and ratio <= WALL_RATIO
                     ),
@@ -1314,9 +1439,27 @@ def evaluate(record: dict, ctx: dict) -> dict:
                 f_read_bound = sum(
                     v for a, v in b["file_read_by_area"].items() if a in areas
                 )
-                f_wire_bound = sum(
-                    v for a, v in b["file_wire_by_area"].items() if a in areas
+                blocked = sorted(
+                    (
+                        p
+                        for p in pass_refusals["blocked by WP0(d)"]
+                        if area_of(p) in areas
+                    ),
+                    key=str.encode,
                 )
+                f_wire_carried = sum(
+                    v
+                    for rel, v in b["file_wire_by_seat"].items()
+                    if area_of(rel) in areas and rel not in blocked
+                )
+                f_wire_blocked = sum(
+                    b["file_wire_by_seat"].get(rel, 0) for rel in blocked
+                )
+                refused_dbs = [
+                    p
+                    for p in pass_refusals["routed-to-snapshot"]
+                    if p in sqlite and area_of(p) in areas
+                ]
                 racy = entry.get("racy_seats", [])
                 racy_files = [[r, n] for r, n in racy if area_of(r) in areas]
                 racy_git = [
@@ -1332,42 +1475,73 @@ def evaluate(record: dict, ctx: dict) -> dict:
                     for k, v in b["git_read_by_item"].items()
                     if not (skip_history and k == HISTORY)
                 }
-                g_wire = {
-                    k: v
-                    for k, v in b["git_wire_by_item"].items()
+                repos = git_wire(b, skip_history)
+                per_item, per_repo = per_item_pack(
+                    entry, b, repos, items_by_name, skip_history
+                )
+                bound_chunk = sum(r["bound_chunk"] for r in repos.values())
+                bound_object = sum(r["bound_object"] for r in repos.values())
+                object_store_seats = sum(
+                    v
+                    for k, v in b["git_object_store_seat_bytes_by_item"].items()
                     if not (skip_history and k == HISTORY)
-                }
+                )
                 f, g, s = tot["file"], tot["git"], tot["sqlite"]
                 pack = number(g["counters"], "write_source_pack_bytes")
+                readback = number(g["counters"], "read_source_pack_readback_bytes")
+                f_read_measured = f["source_bytes_read"]
+                g_read_bound = sum(g_items.values()) + racy_git_bytes
+                carried_ok = f["bytes_received"] <= f_wire_carried
                 row["delta"] = {
                     "file_ineq1": {
-                        "measured": f["source_bytes_read"],
+                        "measured": f_read_measured,
                         "bound": f_read_bound + racy_bytes,
+                        "excess": max(0, f_read_measured - f_read_bound - racy_bytes),
                         "racy_seats": racy_files,
+                        "sqlite_header_bytes": len(ec.SQLITE_MAGIC) * len(refused_dbs),
                         "verdict": verdict(
-                            f["source_bytes_read"] <= f_read_bound + racy_bytes
+                            f_read_measured <= f_read_bound + racy_bytes
                         ),
                     },
                     "file_ineq2": {
                         "measured": f["bytes_received"],
-                        "bound": f_wire_bound,
-                        "verdict": verdict(f["bytes_received"] <= f_wire_bound),
+                        "bound": f_wire_carried,
+                        "bound_with_blocked": f_wire_carried + f_wire_blocked,
+                        "blocked_seats": blocked,
+                        "carried_verdict": verdict(carried_ok),
+                        "verdict": (
+                            "n/a: blocked by WP0(d)" if blocked else verdict(carried_ok)
+                        ),
                     },
                     "git_ineq1": {
                         "measured": g["source_bytes_read"],
-                        "bound": sum(g_items.values()) + racy_git_bytes,
+                        "bound": g_read_bound,
+                        "scope": "worktree seats",
                         "racy_seats": racy_git,
-                        "verdict": verdict(
-                            g["source_bytes_read"]
-                            <= sum(g_items.values()) + racy_git_bytes
-                        ),
+                        "verdict": verdict(g["source_bytes_read"] <= g_read_bound),
+                        "object_store": {
+                            "readback_lower_bound": readback,
+                            "pack_bytes_logical": pack,
+                            "changed_seat_bytes": object_store_seats,
+                            "verdict_if_counted": (
+                                "fail"
+                                if g["source_bytes_read"] + readback
+                                > g_read_bound + object_store_seats
+                                else "unknown (readback is a lower bound)"
+                            ),
+                        },
                     },
                     "git_ineq2": {
                         "measured": pack,
-                        "bound": sum(g_wire.values()),
-                        "excess": max(0, pack - sum(g_wire.values())),
-                        "per_item": per_item_pack(entry, g_wire, skip_history),
-                        "verdict": verdict(pack <= sum(g_wire.values())),
+                        "granularity": "chunk",
+                        "bound": bound_chunk,
+                        "excess": max(0, pack - bound_chunk),
+                        "verdict": verdict(pack <= bound_chunk),
+                        "bound_object": bound_object,
+                        "excess_object": max(0, pack - bound_object),
+                        "verdict_object": verdict(pack <= bound_object),
+                        "per_item": per_item,
+                        "per_repo": per_repo,
                     },
                     "sqlite_ineq1": {
                         "measured_derived": s["db_bytes"],
@@ -1387,7 +1561,7 @@ def evaluate(record: dict, ctx: dict) -> dict:
             per_subset[subset] = row
         out[label] = {
             "bounds": bounds,
-            "refusals": classify_refusals(entry, changed_paths, sqlite),
+            "refusals": pass_refusals,
             "subsets": per_subset,
             "s2_v1": entry["s2_v1"],
             "s2_v2": entry["s2_v2"],
@@ -1395,6 +1569,37 @@ def evaluate(record: dict, ctx: dict) -> dict:
             "load1": [entry["load1_before"], entry["load1_after"]],
         }
     return out
+
+
+def reevaluate(path: Path, out: Path, seal_path: Path | None) -> int:
+    """Re-run `evaluate` on a recorded run into a new JSON at OUT.
+
+    The measured record is never rewritten: OUT must be a new path. The
+    estate items come from the record's context, or for a record from before
+    they were kept there, from the corpus seal (default WORK/estate/SEAL.json
+    beside the JSON).
+    """
+    if out.exists() or out.resolve() == path.resolve():
+        say(f"refused: OUT must be new: {out}")
+        return 2
+    record = json.loads(path.read_text(encoding="utf-8"))
+    ctx = dict(record["context"])
+    if "items" not in ctx:
+        seal_file = seal_path or path.parent / "estate" / "SEAL.json"
+        ctx["items"] = ec.estate_items(
+            json.loads(seal_file.read_text(encoding="utf-8"))
+        )
+    record["evaluation"] = evaluate(record, ctx)
+    record["reevaluated"] = {
+        "at": now(),
+        "from": str(path),
+        "from_sha256": sha256(path),
+        "harness": str(Path(__file__).resolve()),
+        "harness_sha256": sha256(Path(__file__).resolve()),
+    }
+    out.write_text(json.dumps(record, indent=1, default=str) + "\n")
+    say(f"reevaluated json={out}")
+    return 0
 
 
 # ---- report ---------------------------------------------------------------------
@@ -1461,6 +1666,17 @@ def report(path: Path) -> int:
                     bound = v.get("bound", v.get("bound_changed_range_bytes"))
                     parts.append(f"{k} {fmt(measured)} <= {fmt(bound)} {v['verdict']}")
                 print(f"- {label} delta: " + "; ".join(parts))
+                git2 = row["delta"]["git_ineq2"]
+                print(
+                    f"  - git_ineq2 object granularity: {fmt(git2['measured'])} <= "
+                    f"{fmt(git2['bound_object'])} {git2['verdict_object']}"
+                )
+                for repo, r in sorted(git2.get("per_repo", {}).items()):
+                    print(
+                        f"  - {repo}: bundles {fmt(r['bundle_bytes'])}, new objects "
+                        f"{fmt(r['new_object_bytes'])}, bound chunk "
+                        f"{fmt(r['bound_chunk'])} / object {fmt(r['bound_object'])}"
+                    )
         print()
     print("## Refusals, S2 and SQLite\n")
     for entry in record["passes"]:
@@ -1567,11 +1783,21 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--build-json")
     rep = sub.add_parser("report", help="render a run's JSON as Markdown")
     rep.add_argument("json")
+    rev = sub.add_parser(
+        "evaluate", help="re-run the S3 evaluation of a recorded run into a new JSON"
+    )
+    rev.add_argument("json")
+    rev.add_argument("--out", required=True)
+    rev.add_argument("--seal", help="the corpus SEAL.json (default WORK/estate)")
     args = parser.parse_args(argv)
     if args.command == "build":
         return build(args)
     if args.command == "report":
         return report(Path(args.json))
+    if args.command == "evaluate":
+        return reevaluate(
+            Path(args.json), Path(args.out), Path(args.seal) if args.seal else None
+        )
     os.umask(0o077)
     return Measure(args).run(args)
 
