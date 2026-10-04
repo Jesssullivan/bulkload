@@ -113,6 +113,25 @@ def synth(
     }
 
 
+def kernel_load(trace, add, base=1.0, phase=2.5):
+    """Replace a synthetic trace's load1 rows with what the kernel reports
+    for a run queue of `base` in OFF windows and `base + add` in ON windows:
+    the 5 s EWMA (e = exp(-5/60)), rounded to two places as printed."""
+    windows = trace["windows"]
+    starts = [w["start"] for w in windows]
+    level, update = base, phase
+    for row in trace["load"]:
+        while update <= row["t"]:
+            index = max(
+                0, min(len(windows) - 1, sum(st <= update for st in starts) - 1)
+            )
+            n = base + (add if windows[index]["state"] == "ON" else 0.0)
+            level = level * s2.LOAD1_DECAY + n * (1.0 - s2.LOAD1_DECAY)
+            update += s2.LOAD1_UPDATE_S
+        row["load1"] = round(level, 2)
+    return trace
+
+
 def reasons(verdict) -> str:
     return " | ".join(verdict["reasons"])
 
@@ -232,6 +251,57 @@ class VerdictTests(unittest.TestCase):
         trace = synth()
         trace["cut_short"] = "ON run 3 failed"
         self.assertIn("cut short: ON run 3 failed", reasons(s2.analyze(trace)))
+
+
+class Load1LagTests(unittest.TestCase):
+    """load1 lags each switch (a 60 s EWMA updated every 5 s). The plain
+    pooled mean read a steady add X as about 0.856 X at 300 s windows and a
+    60 s settle, so a true +2.3 PASSed; the lag-corrected level does not."""
+
+    def test_a_true_add_over_the_budget_fails(self) -> None:
+        verdict = s2.analyze(kernel_load(synth(evidence=True), 2.3))
+        self.assertEqual(verdict["status"], "FAIL", reasons(verdict))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertAlmostEqual(verdict["delta_load1"], 2.3, delta=0.03)
+        self.assertAlmostEqual(verdict["delta_load1_plain"], 1.96, delta=0.03)
+        self.assertRegex(reasons(verdict), r"load1 \+2\.(29|30|31) exceeds \+2\.0")
+
+    def test_the_update_phase_moves_the_level_by_under_one_percent(self) -> None:
+        for phase in (0.01, 1.0, 2.5, 4.0, 4.99):
+            trace = kernel_load(synth(evidence=True), 2.3, phase=phase)
+            verdict = s2.analyze(trace)
+            self.assertAlmostEqual(verdict["delta_load1"], 2.3, delta=0.02, msg=phase)
+
+    def test_a_true_add_under_the_budget_passes(self) -> None:
+        verdict = s2.analyze(kernel_load(synth(evidence=True), 1.7))
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertAlmostEqual(verdict["delta_load1"], 1.7, delta=0.03)
+
+    def test_the_level_does_not_depend_on_the_settle(self) -> None:
+        trace = kernel_load(synth(evidence=True), 2.3)
+        for settle, tolerance in ((0.0, 0.06), (30.0, 0.03), (120.0, 0.03)):
+            verdict = s2.analyze(trace, {"settle_seconds": settle})
+            self.assertAlmostEqual(verdict["delta_load1"], 2.3, delta=tolerance)
+            self.assertEqual(verdict["raw_comparison"], "FAIL", settle)
+
+    def test_the_trace_records_the_plain_attenuation(self) -> None:
+        verdict = s2.analyze(kernel_load(synth(evidence=True), 1.0))
+        model = verdict["load1_model"]
+        self.assertAlmostEqual(
+            model["response_to_unit_add"]["plain"], 0.856, delta=0.01
+        )
+        self.assertAlmostEqual(
+            model["response_to_unit_add"]["corrected"], 1.0, delta=0.01
+        )
+        self.assertAlmostEqual(model["tau_s"], 59.53, delta=0.01)
+
+    def test_the_off_tail_is_not_host_noise(self) -> None:
+        verdict = s2.analyze(kernel_load(synth(evidence=True), 2.0))
+        self.assertLess(verdict["noise_load1"], 0.05)
+        levels = [w["load1_level"] for w in verdict["windows"] if w["state"] == "OFF"]
+        means = [w["load1_mean"] for w in verdict["windows"] if w["state"] == "OFF"]
+        self.assertGreater(max(means) - min(means), 0.15)
+        self.assertLess(max(levels) - min(levels), 0.05)
 
 
 class OnRunTests(unittest.TestCase):

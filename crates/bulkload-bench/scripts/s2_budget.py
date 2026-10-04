@@ -37,16 +37,22 @@ that needs shell quoting goes in a script file, because `just` re-joins
 arguments. Power is recorded at every window boundary (R-N81).
 
 Verdict. The first --settle-seconds of every window are left out of both
-metrics: load1 is a one-minute moving average and lags each switch. The
-settle trims most of that lag, not all: at 300 s windows and a 60 s settle a
-steady add X reads as about 0.86 X (0.93 X with a 120 s settle; #165). Over
-the rest, pooled per state:
+metrics (the switch transient). load1 is the kernel's one-minute EWMA,
+updated every 5 s, so it lags each switch; a plain mean of the settled rows
+read a steady add X as about 0.856 X at 300 s windows and a 60 s settle
+(#165). Each window's load1 is therefore its lag-corrected level
+(`load1_level`): the mean of its settled rows plus tau times their slope,
+which inverts the EWMA whatever the settle (within about 0.5 %). The trace's
+verdict records the model and what a unit add reads as, plain and corrected
+(`load1_model`). Over the settled rows, pooled per state:
   d_p95   = p95(ON) / p95(OFF) - 1 of the gate metric: `step` by default,
             or with --gate-metric each-op the worst of the four operations;
-  d_load1 = mean load1(ON) - mean load1(OFF).
+  d_load1 = level(ON) - level(OFF), each window weighted by its rows
+            (`delta_load1_plain` keeps the plain-mean difference).
 INCONCLUSIVE when the OFF-window noise floor exceeds half the budget (latency:
 max - min of the OFF windows' p95 over the pooled OFF p95; load1: max - min of
-the OFF windows' mean load1); when a window has fewer than
+the OFF windows' levels, so an ON window's EWMA tail is not counted as host
+noise); when a window has fewer than
 --min-window-samples or a pooled state fewer than --min-samples samples;
 when there are fewer than 2 OFF windows or no ON window; when a workload
 operation or the sampler failed; when the run was cut short; or when an ON
@@ -168,6 +174,26 @@ FIXTURE_ENV = {
     "GIT_COMMITTER_DATE": "2026-10-03T00:00:00Z",
 }
 COUNTERS_PRIORITY = re.compile(r"(?:^|\s)priority=(\S+)")
+# The kernel's load1 model (Linux and Darwin alike): every 5 s,
+# load1 <- load1 * e + n * (1 - e), with e = exp(-5/60) and n the run queue.
+# Over the K updates in (t0, t1], sum(n) = sum(load1) + e/(1-e) (load1(t1) -
+# load1(t0)), so the mean run queue over a span is the mean load1 sampled in
+# it plus tau (L(t1) - L(t0)) / (t1 - t0): `load1_level`. With 1 Hz rows,
+# each update is held for 5 rows, and the first update after t0 lands 0 to 4
+# rows into the span (the sampler's phase against the kernel's is unknown),
+# which adds that many rows of the old value. So tau = 5 e/(1-e) + c, with c
+# in 0..4; LOAD1_TAU_S takes the mean c = 2. The residual is at most
+# 2 (L(t1) - L(t0)) / span per window: about +-0.5 % of a steady add at 300 s
+# windows and a 60 s settle, against -14 % for the plain mean.
+LOAD1_UPDATE_S = 5.0
+LOAD1_DECAY = math.exp(-LOAD1_UPDATE_S / 60.0)
+LOAD1_TAU_S = (
+    LOAD1_UPDATE_S * LOAD1_DECAY / (1.0 - LOAD1_DECAY) + (LOAD1_UPDATE_S - 1.0) / 2.0
+)
+# The sample just before a settled span stands for load1(t0) when it is in
+# the same window and at most this far before the span (the sampler runs at
+# 1 Hz).
+LOAD1_PREV_GAP_S = 2.0
 
 
 def say(message: str) -> None:
@@ -480,6 +506,95 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
     return out
 
 
+def load1_level(
+    rows: list[tuple[float, float]], prev: tuple[float, float] | None
+) -> float | None:
+    """The lag-corrected mean run queue over a window's settled load1 rows
+    (time, load1), given the sample just before them (or None): the mean
+    load1 plus LOAD1_TAU_S times its slope from `prev` (or the first row) to
+    the last row. Unbiased for the kernel's 5 s EWMA whatever the settle."""
+    if not rows:
+        return None
+    mean = statistics.fmean(value for _, value in rows)
+    first_t, first_v = prev if prev is not None else rows[0]
+    last_t, last_v = rows[-1]
+    if last_t <= first_t:
+        return mean
+    return mean + LOAD1_TAU_S * (last_v - first_v) / (last_t - first_t)
+
+
+def load1_windows(
+    windows: list[dict], load: list[dict], settle: float
+) -> list[tuple[list[tuple[float, float]], float | None]]:
+    """Per window: its settled load1 rows and their lag-corrected level."""
+    times = [row["t"] for row in load]
+    out = []
+    for window in windows:
+        begin = window["start"] + settle
+        low = bisect.bisect_left(times, begin)
+        high = bisect.bisect_left(times, window["end"])
+        rows = [(load[i]["t"], load[i]["load1"]) for i in range(low, high)]
+        prev = None
+        # Only a sample inside the window: with no settle the span starts at
+        # the switch, and the first settled row stands in for load1(t0).
+        if (
+            low > 0
+            and times[low - 1] >= window["start"]
+            and begin - times[low - 1] <= LOAD1_PREV_GAP_S
+        ):
+            prev = (times[low - 1], load[low - 1]["load1"])
+        out.append((rows, load1_level(rows, prev)))
+    return out
+
+
+def weighted_level(
+    estimates: list[tuple[list, float | None]], windows: list[dict], state: str
+) -> tuple[float | None, float | None]:
+    """(lag-corrected level, plain mean) of one state, weighting each window
+    by its settled sample count."""
+    chosen = [
+        (rows, level)
+        for (rows, level), window in zip(estimates, windows, strict=True)
+        if window["state"] == state and rows
+    ]
+    total = sum(len(rows) for rows, _ in chosen)
+    if not total:
+        return None, None
+    level = sum(len(rows) * lvl for rows, lvl in chosen) / total
+    plain = sum(value for rows, _ in chosen for _, value in rows) / total
+    return level, plain
+
+
+def load1_response(windows: list[dict], times: list[float], settle: float) -> dict:
+    """What a steady +1.0 run-queue add in the ON windows reads as, on this
+    trace's windows, sample times and settle, through the kernel model: the
+    plain pooled mean difference (`plain`, the attenuation the old estimator
+    had) and the lag-corrected one (`corrected`, ~1.0)."""
+    if not windows or not times:
+        return {"plain": None, "corrected": None}
+    starts = [w["start"] for w in windows]
+    level, update = 0.0, windows[0]["start"]
+    load = []
+    for t in times:
+        while update <= t:
+            index = bisect.bisect_right(starts, update) - 1
+            on = 0 <= index < len(windows) and windows[index]["state"] == ON
+            if on and update >= windows[index]["end"]:
+                on = False
+            level = level * LOAD1_DECAY + (1.0 if on else 0.0) * (1.0 - LOAD1_DECAY)
+            update += LOAD1_UPDATE_S
+        load.append({"t": t, "load1": level})
+    estimates = load1_windows(windows, load, settle)
+    on_level, on_plain = weighted_level(estimates, windows, ON)
+    off_level, off_plain = weighted_level(estimates, windows, OFF)
+    if None in (on_level, off_level):
+        return {"plain": None, "corrected": None}
+    return {
+        "plain": rounded(on_plain - off_plain),
+        "corrected": rounded(on_level - off_level),
+    }
+
+
 def analyze(trace: dict, overrides: dict | None = None) -> dict:
     """The verdict of one trace: a pure function of its windows and samples."""
     recorded = {**DEFAULT_GATE, **trace.get("gate", {})}
@@ -507,15 +622,15 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             continue
         if index is not None and row["t"] >= windows[index]["start"] + settle:
             buckets[index]["lat"][row["op"]].append(row["ms"])
-    for row in trace.get("load", []):
-        index = locate(row["t"])
-        if index is not None and row["t"] >= windows[index]["start"] + settle:
-            buckets[index]["load"].append(row["load1"])
+    load = sorted(trace.get("load", []), key=lambda row: row["t"])
+    estimates = load1_windows(windows, load, settle)
+    for bucket, (rows, _) in zip(buckets, estimates, strict=True):
+        bucket["load"] = [value for _, value in rows]
 
     per_window = []
-    off_p95s, off_means = {m: [] for m in METRICS}, []
+    off_p95s, off_levels = {m: [] for m in METRICS}, []
     pooled = {s: {"lat": {m: [] for m in METRICS}, "load": []} for s in (OFF, ON)}
-    for window, bucket in zip(windows, buckets, strict=True):
+    for window, bucket, (_, level) in zip(windows, buckets, estimates, strict=True):
         state = window["state"]
         window_p95 = {m: p95(bucket["lat"][m]) for m in METRICS}
         window_mean = statistics.fmean(bucket["load"]) if bucket["load"] else None
@@ -525,7 +640,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                 off_p95s[metric].append(window_p95[metric])
         pooled[state]["load"].extend(bucket["load"])
         if state == OFF:
-            off_means.append(window_mean)
+            off_levels.append(level)
         per_window.append(
             {
                 "index": window["index"],
@@ -534,6 +649,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                 "p95_ms": {m: rounded(window_p95[m]) for m in METRICS},
                 "load_n": len(bucket["load"]),
                 "load1_mean": rounded(window_mean),
+                "load1_level": rounded(level),
                 "busy": rounded(busy_fraction(window)) if state == ON else None,
             }
         )
@@ -543,11 +659,15 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     for metric in METRICS:
         off, on = p95s[OFF][metric], p95s[ON][metric]
         delta[metric] = on / off - 1.0 if off and on is not None else None
-    means = {
-        s: statistics.fmean(pooled[s]["load"]) if pooled[s]["load"] else None
-        for s in (OFF, ON)
-    }
-    d_load1 = means[ON] - means[OFF] if None not in (means[ON], means[OFF]) else None
+    levels, means = {}, {}
+    for state in (OFF, ON):
+        levels[state], means[state] = weighted_level(estimates, windows, state)
+    d_load1 = (
+        levels[ON] - levels[OFF] if None not in (levels[ON], levels[OFF]) else None
+    )
+    d_load1_plain = (
+        means[ON] - means[OFF] if None not in (means[ON], means[OFF]) else None
+    )
     offs = [w for w in per_window if w["state"] == OFF]
     ons = [w for w in per_window if w["state"] == ON]
     noise = {}
@@ -560,8 +680,8 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             else None
         )
     noise_load = (
-        max(off_means) - min(off_means)
-        if len(off_means) >= 2 and None not in off_means
+        max(off_levels) - min(off_levels)
+        if len(off_levels) >= 2 and None not in off_levels
         else None
     )
 
@@ -709,12 +829,22 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         "worst_metric": worst,
         "delta_p95": rounded(d_p95),
         "delta_load1": rounded(d_load1),
+        "delta_load1_plain": rounded(d_load1_plain),
+        "load1_model": {
+            "update_s": LOAD1_UPDATE_S,
+            "decay": rounded(LOAD1_DECAY, 6),
+            "tau_s": rounded(LOAD1_TAU_S),
+            "response_to_unit_add": load1_response(
+                windows, [row["t"] for row in load], settle
+            ),
+        },
         "noise_p95": rounded(gate_noise),
         "noise_load1": rounded(noise_load),
         "delta_p95_by_metric": {m: rounded(delta[m]) for m in METRICS},
         "noise_p95_by_metric": {m: rounded(noise[m]) for m in METRICS},
         "p95_ms": {s: {m: rounded(p95s[s][m]) for m in METRICS} for s in (OFF, ON)},
         "load1_mean": {s: rounded(means[s]) for s in (OFF, ON)},
+        "load1_level": {s: rounded(levels[s]) for s in (OFF, ON)},
         "samples": {
             s: {
                 "latency": min(len(pooled[s]["lat"][m]) for m in gated),
@@ -1035,6 +1165,7 @@ def render_summary(trace: dict, verdict: dict) -> str:
     label = "" if verdict["evidence"] else f" ({NOT_EVIDENCE})"
     kind = "A/A noise run" if config["aa"] else "S2 budget run"
     gate = verdict["gate"]
+    response = verdict["load1_model"]["response_to_unit_add"]
 
     def pct(value: float | None) -> str:
         return "n/a" if value is None else f"{value:+.1%}"
@@ -1092,12 +1223,18 @@ def render_summary(trace: dict, verdict: dict) -> str:
         )
     lines += [
         "",
-        f"load1 mean: OFF {num(verdict['load1_mean'][OFF], '.2f')}, ON "
-        f"{num(verdict['load1_mean'][ON], '.2f')}.",
+        f"load1 level (lag-corrected): OFF {num(verdict['load1_level'][OFF], '.2f')}"
+        f", ON {num(verdict['load1_level'][ON], '.2f')}; plain mean: OFF "
+        f"{num(verdict['load1_mean'][OFF], '.2f')}, ON "
+        f"{num(verdict['load1_mean'][ON], '.2f')} (d_load1 plain "
+        f"{num(verdict['delta_load1_plain'], '+.2f')}). On these windows a "
+        f"steady +1.0 reads as {num(response['plain'], '.3f')} plain and "
+        f"{num(response['corrected'], '.3f')} corrected (tau "
+        f"{verdict['load1_model']['tau_s']} s).",
         "",
         "| window | state | start s | end s | overrun s | step n | step p95 ms "
-        "| load1 mean | load1 n | busy | runs | power |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| load1 mean | load1 level | load1 n | busy | runs | power |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for raw, stats in zip(trace["windows"], verdict["windows"], strict=True):
         busy = "" if stats["busy"] is None else f"{stats['busy']:.0%}"
@@ -1106,7 +1243,8 @@ def render_summary(trace: dict, verdict: dict) -> str:
             f"{raw['end']:.1f} | {raw.get('overrun_s', 0.0):.1f} | "
             f"{stats['n'][STEP]} | "
             f"{num(stats['p95_ms'][STEP])} | {num(stats['load1_mean'], '.2f')} | "
-            f"{stats['load_n']} | {busy} | {len(raw.get('runs', []))} | "
+            f"{num(stats['load1_level'], '.2f')} | {stats['load_n']} | {busy} | "
+            f"{len(raw.get('runs', []))} | "
             f"{raw.get('power_start', '?')}/{raw.get('power_end', '?')} |"
         )
     return "\n".join(lines) + "\n"
