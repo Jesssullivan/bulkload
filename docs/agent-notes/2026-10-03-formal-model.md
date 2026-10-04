@@ -25,8 +25,8 @@ Shas:
 - `1da332c`: signed snapshot (one of the duplicate copies, 22:08).
 - `3760263`: this session's reconcile commit (spec, generator, configs,
   runner).
-- The commit that adds this note, on top of `3760263`: the TLC results, the
-  README and this note.
+- `3dbfbdb`: the TLC results, the README and this note.
+- The follow-up commit on top of `3dbfbdb`: this note's check-fast result.
 
 ## The duplicate-agent incident
 
@@ -124,8 +124,15 @@ superseding publish, no estate reads) and is enabled elsewhere (README,
 Coverage).
 
 `just check-fast` (CI toolchain, under the shared lock, cargo target under
-`$TMPDIR`): queued on the shared lock when the results commit was made; its
-result is recorded in the follow-up commit.
+`$TMPDIR`): **pass** on the tree of `3dbfbdb`, 2026-10-04 00:35–00:47
+after about 30 minutes queued behind other lanes' merge-train runs. Every
+stage ran:
+- the repo manifest, ruff, shellcheck and actionlint;
+- gitleaks ("no leaks found");
+- fmt, clippy and 20 cargo test results, all ok;
+- the P5 partial-write proof and both resume power-loss proofs;
+- the fault harness;
+- the 22 contract tests.
 
 ## Findings
 
