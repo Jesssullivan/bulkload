@@ -156,6 +156,30 @@ as properties.
   - Chunk hints are kept, so the re-read costs no wire bytes for content the
     destination still holds.
 
+## Amendments 2026-10-03 (night): S2 measurement and the SQLite wal-index (OI-1003-Q34, Q36)
+
+- **S2 measured budget (OI-1003-Q34).** The budget is measured against the
+  v0 synthetic reference workload, in a sibling directory on the source's
+  device. Each operation runs at a fixed 1 Hz cadence and records its own
+  latency:
+  - JSONL append plus fsync;
+  - a SQLite WAL transaction;
+  - git status and diff;
+  - rg over a tree.
+
+  The protocol interleaves OFF and ON windows of at least 5 minutes each. A
+  result is INCONCLUSIVE when the OFF-window noise floor exceeds half the
+  budget. The budget is recorded in every gated S2 run. Those runs are separate
+  from the S1 gate, because a reference workload inside S1 would break
+  R-N81's per-arm load1 < 2.5.
+- **SQLite wal-index (OI-1003-Q36).** This extends WP0(b)'s SQLite exception
+  (OI-1003-Q16). A backup-API read of a WAL-mode source database may create
+  or touch its `<db>-shm` wal-index. That is SQLite's own coordination file,
+  holds no user data, and any live writer creates it anyway. The effect is
+  counted and recorded in S2 evidence. The main database and its `-wal` must
+  stay byte-identical, and a property test asserts that no other source
+  write occurs.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
