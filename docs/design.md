@@ -163,6 +163,33 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   guard. The next capture pass extends it (`capture-extended-from-drift`).
   R-N29 (apply proceeds on an occupied destination, recording uncaptured
   seats) is deferred to W6 git carry v2 (bulkload#48).
+- Auto-prerequisite chains (WP2, OI-1003-Q15, 2026-10-03). Without a shared
+  plan base, a capture that follows a retained capture of the same checkout
+  declares that capture's tips as its bundle prerequisites, so it packs only
+  what is new since then instead of re-packing all history. Only tips whose
+  commits the source object store holds qualify; the capture's own metadata
+  commits never do, so every link stays fetchable wherever the source is an
+  alternate, and a pruned tip only means a larger pack. The `{bundle}.prior`
+  sidecar (durable before the record) names the predecessor by name, digest,
+  stat identity and chain depth. Depth is bounded by
+  `git_carry::chain::CHAIN_DEPTH_LIMIT` (8): the capture after a depth-8
+  bundle re-bases to a self-contained one. Estate apply verifies the chain
+  (every link retained under its recorded name and digest, depths falling by
+  one to a self-contained root, every prerequisite satisfied) and restores
+  from one flattened bundle whose refs must equal the head bundle's. Apply
+  never binds a link by stat identity: a corpus pulled to the apply host
+  gives every file a new device, inode and ctime, exactly as the shared
+  `.base` import binds by digest only (R-N72). Capture-side reuse and
+  chaining do require the recorded identity, so a link replaced in place is
+  never extended. A missing link refuses `SEALED_OBJECT_MISSING`, a link
+  with other bytes `DIGEST_MISMATCH`, inconsistent depths
+  `RECEIPT_BINDING_INVALID`, and a broken chain is never a reuse hit: the
+  next capture re-bases. The tip query runs through the estimate's hardened
+  source wrapper, and every stdin-fed git child drains its answer while its
+  requests are written, so a prior with thousands of refs cannot hang a
+  capture on a full pipe. The capture counters
+  (`write_source_pack_bytes`, `write_source_pack_objects`,
+  `read_source_pack_readback_bytes`, `census_walks`) measure it.
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path

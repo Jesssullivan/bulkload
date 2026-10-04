@@ -212,13 +212,155 @@ fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
     Ok(u64::from(u32::from_be_bytes(count)))
 }
 
-// `git bundle create` through the measured child path.
-fn create_bundle(command: &mut Command, bundle: &Path, stdin: Option<&[u8]>) -> Result<PackStats> {
+// `git bundle create` through the measured child path. `None` when git
+// declined to write the bundle.
+fn create_bundle(
+    command: &mut Command,
+    bundle: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<Option<PackStats>> {
     let (success, storage_read) = super::pack_child(command.stdout(Stdio::null()), stdin)?;
     if !success {
+        return Ok(None);
+    }
+    PackStats::record(bundle, false, storage_read).map(Some)
+}
+
+// A self-contained bundle of every private ref.
+fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
+    create_bundle(
+        git(private)
+            .args(["bundle", "create"])
+            .arg(bundle)
+            .arg("--all"),
+        bundle,
+        None,
+    )?
+    .ok_or(BulkloadRefusal::GitInventoryMalformed)
+}
+
+/// Write a capture bundle whose prerequisites are `prior`'s source-held tips
+/// (see `chain`). Returns its pack cost and whether it declared any
+/// prerequisite; `false` means it is self-contained (a shallow capture, or no
+/// source-held tip).
+pub(super) fn write_chained(
+    private: &Path,
+    bundle: &Path,
+    source: &Path,
+    prior: &Path,
+) -> Result<(PackStats, bool)> {
+    let boundary = super::shallow::frontier(private)?;
+    if !boundary.is_empty() {
+        return Ok((
+            super::shallow::write_bundle(private, bundle, &boundary)?,
+            false,
+        ));
+    }
+    let commits = super::chain::source_held_tips(source, prior)?;
+    if commits.is_empty() {
+        return Ok((write_full(private, bundle)?, false));
+    }
+    Ok((write_excluding_tip_trees(private, bundle, &commits)?, true))
+}
+
+// A bundle declaring `commits` as prerequisites whose pack excludes every
+// object reachable from them, *including through their trees*.
+//
+// `git bundle create ^tip` only marks the trees of edge commits (parents of
+// packed commits) uninteresting. A capture's staged and worktree commits are
+// parentless, so their trees would re-pack every blob they share with HEAD:
+// all tracked content, every pass. `rev-list --objects-edge-aggressive`
+// marks the tree of every excluded tip uninteresting instead. The object list
+// is packed by `pack-objects`, and the header (signature, prerequisites,
+// every private ref) is written here, as the shared-base path rewrites it.
+// `bundle verify` in the caller checks the result like any other bundle.
+//
+// A failed write removes its pending object list and header, so a refused
+// pass leaves no partial file beside the bundle path.
+fn write_excluding_tip_trees(
+    private: &Path,
+    bundle: &Path,
+    commits: &BTreeSet<String>,
+) -> Result<PackStats> {
+    let written = write_excluding_tip_trees_pending(private, bundle, commits);
+    if written.is_err() {
+        for leftover in ["objects-pending", "header-pending"] {
+            // Best effort: the refusal being returned is the one that matters,
+            // and a path never created is already clean.
+            let _ = fs::remove_file(bundle.with_extension(leftover));
+        }
+    }
+    written
+}
+
+fn write_excluding_tip_trees_pending(
+    private: &Path,
+    bundle: &Path,
+    commits: &BTreeSet<String>,
+) -> Result<PackStats> {
+    let listing = bundle.with_extension("objects-pending");
+    let list = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&listing)?;
+    let exclusions = commits.iter().fold(String::new(), |mut result, value| {
+        result.push('^');
+        result.push_str(value);
+        result.push('\n');
+        result
+    });
+    let (listed, list_read) = super::pack_child(
+        git(private)
+            .args(["rev-list", "--objects-edge-aggressive", "--all", "--stdin"])
+            .stdout(Stdio::from(list.try_clone()?)),
+        Some(exclusions.as_bytes()),
+    )?;
+    if !listed {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    PackStats::record(bundle, false, storage_read)
+    let mut objects = Vec::new();
+    fs::File::open(&listing)?.read_to_end(&mut objects)?;
+    fs::remove_file(&listing)?;
+    // Edge lines (`-<oid>`) name excluded commits, not objects to pack.
+    let objects: Vec<u8> = objects
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| !line.starts_with(b"-"))
+        .flatten()
+        .copied()
+        .collect();
+    let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
+    let mut header = match format.as_str() {
+        "sha1" => b"# v2 git bundle\n".to_vec(),
+        "sha256" => b"# v3 git bundle\n@object-format=sha256\n".to_vec(),
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    };
+    for value in commits {
+        writeln!(header, "-{value} shared base")?;
+    }
+    writeln!(header, "{}\n", refs(private)?)?;
+    let pending = bundle.with_extension("header-pending");
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pending)?;
+    target.write_all(&header)?;
+    target.flush()?;
+    let (packed, pack_read) = super::pack_child(
+        git(private)
+            .args(["pack-objects", "--stdout", "--delta-base-offset"])
+            .stdout(Stdio::from(target.try_clone()?)),
+        Some(&objects),
+    )?;
+    if !packed {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    target.sync_file_counted()?;
+    fs::rename(&pending, bundle)?;
+    fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
+    PackStats::record(bundle, false, list_read.saturating_add(pack_read))
 }
 
 pub(super) fn write_bundle(
@@ -233,30 +375,37 @@ pub(super) fn write_bundle(
         return super::shallow::write_bundle(private, bundle, &boundary);
     }
     let Some(base) = base else {
-        return create_bundle(
-            git(private)
-                .args(["bundle", "create"])
-                .arg(bundle)
-                .arg("--all"),
-            bundle,
-            None,
-        );
+        return write_full(private, bundle);
     };
     let commits = prerequisite_commits(private, base)?;
+    write_with_prerequisites(private, bundle, &commits)?
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)
+}
+
+// A bundle excluding everything reachable from `commits`, which it declares
+// as its prerequisites. `None` when git declined to write it.
+fn write_with_prerequisites(
+    private: &Path,
+    bundle: &Path,
+    commits: &BTreeSet<String>,
+) -> Result<Option<PackStats>> {
     let exclusions = commits.iter().fold(String::new(), |mut result, value| {
         result.push('^');
         result.push_str(value);
         result.push('\n');
         result
     });
-    let stats = create_bundle(
+    let Some(stats) = create_bundle(
         git(private)
             .args(["bundle", "create"])
             .arg(bundle)
             .args(["--all", "--stdin"]),
         bundle,
         Some(exclusions.as_bytes()),
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
 
     // Git omits excluded ref tips from bundle headers. Our HEAD may be exactly
     // a base tip, and staged/worktree commits deliberately have no parents.
@@ -302,7 +451,7 @@ pub(super) fn write_bundle(
     target.sync_file_counted()?;
     fs::rename(&pending, bundle)?;
     fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
-    Ok(stats)
+    Ok(Some(stats))
 }
 
 #[cfg(test)]
