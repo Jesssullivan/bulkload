@@ -25,6 +25,14 @@ mod raw_tree;
 pub mod registered;
 mod shallow;
 pub mod shared;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod source_inert_tests;
 
 /// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
 /// the v1 carry and the estimate spawn is built from it by [`git`], and the
@@ -63,6 +71,12 @@ pub(crate) mod git_env {
 
     /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
     /// automatic gc or maintenance, and bounded pack resources.
+    ///
+    /// `fastimport.unpackLimit=0` keeps every `fast-import` pack whole. Below
+    /// the limit (100 objects by default) fast-import explodes its pack into
+    /// loose objects through Git's object writer, which freshens (re-stamps)
+    /// any copy an alternate already holds: the source's, for a capture's raw
+    /// tree (S2, #162). Its own pack store never freshens.
     pub const CONFIG: &[&str] = &[
         "core.hooksPath=/dev/null",
         "core.fsmonitor=false",
@@ -70,7 +84,22 @@ pub(crate) mod git_env {
         "maintenance.auto=false",
         "pack.threads=2",
         "pack.windowMemory=64m",
+        "fastimport.unpackLimit=0",
     ];
+
+    /// The object store a capture's private repository writes into, a
+    /// sibling of its `objects` (S2, #162).
+    ///
+    /// Git freshens (re-stamps with `utime`) any existing copy of an object
+    /// it is asked to write, in its own store or in any alternate. The
+    /// private repository reads the source's store through
+    /// `objects/info/alternates`, so a writer that could see it would write
+    /// to the source. Every `hash-object -w`, `mktree` and `write-tree` of a
+    /// capture therefore runs with `GIT_OBJECT_DIRECTORY` here
+    /// ([`super::git_writer`]), and this store borrows nothing. The private
+    /// repository's own store lists it as its first alternate, so every
+    /// reader (bundle, pack, fetch, fast-import, update-ref) sees both.
+    pub const WRITE_STORE: &str = "objects-written";
 }
 
 /// A Git child for the repository at `repo`, hardened from [`git_env`]:
@@ -100,6 +129,22 @@ fn git(repo: &Path) -> Command {
         command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     command
+}
+
+/// A Git child that writes objects into the capture's private repository at
+/// `private` (absolute, as [`prepare_private`] returns it) and sees no other
+/// store: [`git`], plus `GIT_OBJECT_DIRECTORY` at its
+/// [`git_env::WRITE_STORE`]. The source's object store is then strictly
+/// read-only to the capture (S2, #162).
+fn git_writer(private: &Path) -> Command {
+    let mut command = git(private);
+    writing_privately(&mut command, private);
+    command
+}
+
+// Point `command`'s object writes at `private`'s write store; see [`git_writer`].
+fn writing_privately<'a>(command: &'a mut Command, private: &Path) -> &'a mut Command {
+    command.env("GIT_OBJECT_DIRECTORY", private.join(git_env::WRITE_STORE))
 }
 
 /// Whether the repository at `repo` is a partial clone.
@@ -359,12 +404,15 @@ fn reap(child: &std::process::Child) -> Result<(bool, u64)> {
 }
 
 fn metadata(private: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let value = input(git(private).args(["hash-object", "-w", "--stdin"]), bytes)?;
+    let value = input(
+        git_writer(private).args(["hash-object", "-w", "--stdin"]),
+        bytes,
+    )?;
     let value = std::str::from_utf8(&value)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
         .trim();
     let tree = input(
-        git(private).args(["mktree", "-z"]),
+        git_writer(private).args(["mktree", "-z"]),
         format!("100644 blob {value}\tvalue\0").as_bytes(),
     )?;
     let tree = std::str::from_utf8(&tree)
@@ -403,17 +451,39 @@ fn snapshot_command(private: &Path, worktree: &Path, index: &Path) -> Command {
     command
 }
 
+/// Author and committer of every archival commit: the fixed identity and
+/// instant (2000-01-01T00:00:00Z) `commit-tree` was always run under.
+const ARCHIVAL_SIGNATURE: &str = "Bulkload archival capture <bulkload@localhost> 946684800 +0000";
+
+// A parentless archival commit of `tree` in the private repository's write
+// store (S2, #162).
 fn commit_tree(private: &Path, tree: &str, label: &str) -> Result<String> {
-    text(
-        git(private)
-            .env("GIT_AUTHOR_NAME", "Bulkload archival capture")
-            .env("GIT_AUTHOR_EMAIL", "bulkload@localhost")
-            .env("GIT_COMMITTER_NAME", "Bulkload archival capture")
-            .env("GIT_COMMITTER_EMAIL", "bulkload@localhost")
-            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
-            .args(["commit-tree", tree, "-m", label]),
-    )
+    commit_object(&mut git_writer(private), tree, label)
+}
+
+// A parentless commit of `tree` under [`ARCHIVAL_SIGNATURE`], written by
+// `writer` with `hash-object -t commit`: byte for byte what `git commit-tree
+// -m label` writes under that identity (pinned by a test), without requiring
+// `tree` in the writer's store. A capture's writer sees only its write store,
+// and a raw tree fast-import found in a source pack is not stored there.
+fn commit_object(writer: &mut Command, tree: &str, label: &str) -> Result<String> {
+    if !oid(tree) || label.contains('\n') {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let commit = format!(
+        "tree {tree}\nauthor {ARCHIVAL_SIGNATURE}\ncommitter {ARCHIVAL_SIGNATURE}\n\n{label}\n"
+    );
+    let value = input(
+        writer.args(["hash-object", "-t", "commit", "-w", "--stdin"]),
+        commit.as_bytes(),
+    )?;
+    let value = std::str::from_utf8(&value)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        .trim_end();
+    if !oid(value) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(value.to_owned())
 }
 
 // Build a raw tree without running attributes/filters or starting Git per file.
@@ -1403,8 +1473,18 @@ fn export_pass(
     let seats = &census.rows;
     let private = carry_authority(repo, capture, &before_refs, &authority)?;
     let index = capture.join("index");
-    fs::write(&index, &authority.index)?;
-    let staged = text(snapshot_command(&private, repo, &index).arg("write-tree"))?;
+    // A bare repository carries no index (S4, #162); Git reads the absent
+    // file as the empty index, so its staged tree is the empty tree.
+    if !authority.index.is_empty() {
+        fs::write(&index, &authority.index)?;
+    }
+    // Built in the write store, which cannot see the source's (S2, #162), so
+    // the index's blobs are not looked up (`--missing-ok`). Packing the bundle
+    // below reads both stores and still needs every blob it carries.
+    let staged = text(
+        writing_privately(&mut snapshot_command(&private, repo, &index), &private)
+            .args(["write-tree", "--missing-ok"]),
+    )?;
     set_ref(
         &private,
         "refs/carry-export/staged",
@@ -2260,7 +2340,23 @@ fn capture_census_planned(
     policy: CapturePolicy,
     planned: &[PathBuf],
 ) -> Result<Census> {
+    // S4 (#162): a bare repository's root is its own administration. It has
+    // no worktree, so no seat, nest or omission to census.
+    if root == common && bare(root)? {
+        return Ok(Census {
+            rows: Vec::new(),
+            nested_worktrees: Vec::new(),
+            nested_repositories: Vec::new(),
+            omitted: Vec::new(),
+        });
+    }
     filesystem_census(root, Some(common), policy, planned)
+}
+
+// Whether `repo` is a bare repository, by Git's own verdict: a non-bare
+// `.git` directory given as a root is not one.
+fn bare(repo: &Path) -> Result<bool> {
+    Ok(text(git(repo).args(["rev-parse", "--is-bare-repository"]))? == "true")
 }
 
 // A name on the fixed list is only rebuildable if Git tracks nothing beneath
@@ -4244,7 +4340,16 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
         "--git-path",
         "index",
     ]))?);
-    let before_index = fs::read(&index_path)?;
+    let before_index = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        // S4 (#162): a bare repository has no index and no worktree for one
+        // to describe. It carries none: its staged and worktree trees are
+        // empty, and its refs, HEAD and administration are its custody.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && bare(repo)? => {
+            return Ok((index_path, Vec::new(), Vec::new()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     #[cfg(test)]
     mid_pass::fire(&fs::canonicalize(repo)?, mid_pass::Stage::IndexRead);
     // Validate exactly the bytes that are carried, never the live index a
@@ -4377,6 +4482,7 @@ fn collapsed_gitlinks(repo: &Path, gitlinks: &mut Vec<NestedRepository>) -> Resu
 }
 
 fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let format = text(git(repo).args(["rev-parse", "--show-object-format"]))?;
     if !matches!(format.as_str(), "sha1" | "sha256") {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -4392,6 +4498,12 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
             ])
             .arg(&private),
     )?;
+    // S2 (#162): writers write only the write store, which borrows nothing;
+    // readers see it, then the source's store, through `alternates`. The
+    // write store's entry is relative to `objects`.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(private.join(git_env::WRITE_STORE))?;
     let objects = text(git(repo).args([
         "rev-parse",
         "--path-format=absolute",
@@ -4403,7 +4515,7 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
     }
     fs::write(
         private.join("objects/info/alternates"),
-        format!("{objects}\n"),
+        format!("../{}\n{objects}\n", git_env::WRITE_STORE),
     )?;
     let boundary = shallow::frontier(repo)?;
     if !boundary.is_empty() {

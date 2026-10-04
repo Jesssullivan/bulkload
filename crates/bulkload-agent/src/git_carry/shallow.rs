@@ -108,7 +108,12 @@ pub(super) fn write_bundle(
     let tree = std::str::from_utf8(&tree)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
         .trim();
-    let custody = super::commit_tree(&envelope, tree, "bulkload explicit shallow graph custody")?;
+    // The envelope borrows no store, so its own store is already private.
+    let custody = super::commit_object(
+        &mut git(&envelope),
+        tree,
+        "bulkload explicit shallow graph custody",
+    )?;
     super::set_ref(&envelope, CUSTODY, &custody)?;
     let mut create = git(&envelope);
     create.args(["bundle", "create"]).arg(bundle).arg(CUSTODY);

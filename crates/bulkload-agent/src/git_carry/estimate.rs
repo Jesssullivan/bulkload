@@ -783,7 +783,7 @@ const PROBE_GIT_TOO_OLD: i32 = 5;
 pub const PROBE_SCRIPT: &str = r#"set -eu
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
 export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 LC_ALL=C LANGUAGE=
-g() { git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c pack.threads=2 -c pack.windowMemory=64m "$@"; }
+g() { git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c pack.threads=2 -c pack.windowMemory=64m -c fastimport.unpackLimit=0 "$@"; }
 version=$(git version) || exit 5
 case "$version" in 'git version '*) version=${version#git version } ;; *) exit 5 ;; esac
 case "$version" in

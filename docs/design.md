@@ -68,6 +68,17 @@ Source safety (S2, WP1):
   is tested against the same table.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
+- The source's object store is read-only to a capture (#162).
+  - Git freshens (re-stamps the mtime of) any existing copy of an object it
+    writes, alternates included.
+  - So the private repository's object writers (`hash-object -w`, `mktree`,
+    `write-tree` and its archival commits) run against a write store that
+    borrows nothing (`git_env::WRITE_STORE`).
+  - `fast-import` never explodes its pack into loose objects
+    (`fastimport.unpackLimit=0`).
+  - Readers see the write store, then the source, through `alternates`.
+  - The P34 property holds every `lstat` field of the source fixed across a
+    capture and its chained reruns.
 - Source-side verbs (`serve`, `estate-capture`, `snapshot`,
   `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
   priority before anything else (WP0(f)), inherited by every thread and
@@ -78,7 +89,9 @@ Source safety (S2, WP1):
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
-paths. Import preserves divergence and leaves active HEADs, indexes and
+paths. A bare repository (a mirror) is carried as ref custody: its refs, HEAD
+and administration, with empty staged and worktree trees, since it has
+neither an index nor a worktree (S4, #162). Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.

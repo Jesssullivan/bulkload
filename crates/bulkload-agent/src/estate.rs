@@ -2568,6 +2568,74 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // S4 (#162): a bare repository item (a mirror) captures and applies as
+    // ref custody. Its key used to read the absent index and refuse with a
+    // bare IO (errno 2), which no closure report can account for.
+    #[test]
+    fn a_bare_repository_item_captures_and_applies_as_ref_custody() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare");
+        let mirror = root.join("mirror.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let plan = root.join("bare-plan");
+        add(&plan, &mirror, &repository, None).unwrap();
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (outcome, reason, drift, bytes_read) = rows.first().unwrap();
+        assert_eq!(
+            (*outcome, reason.as_deref(), drift.len(), *bytes_read),
+            ("captured", None, 0, 0)
+        );
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            outcomes.into_inner().unwrap(),
+            vec![("refs-imported", None)]
+        );
+        let main = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let imported = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["for-each-ref", "--format=%(objectname) %(refname)"])
+            .arg("refs/carry/v1/neo/")
+            .output()
+            .unwrap();
+        let main = String::from_utf8(main.stdout).unwrap();
+        let imported = String::from_utf8(imported.stdout).unwrap();
+        assert!(
+            imported
+                .lines()
+                .any(|line| line.starts_with(main.trim()) && line.ends_with("/head")),
+            "{imported}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // WP1 PR 4 (S5, arch 8): a lane deletes a branch and prunes under the
     // pass. The private repository reads the source through `alternates`, so
     // its bundle child fails on the pruned commit; the pack listing moved, so
