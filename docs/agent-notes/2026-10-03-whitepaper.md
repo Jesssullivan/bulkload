@@ -20,7 +20,11 @@ OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
 | `1fda837` | Finish pass, part 2: re-pin to `46587af` and describe #146's auto-prerequisite chains. |
 | `7205183` | Merge of `origin/main` at `4a7b86b` (#154 merged 7 minutes after `1fda837` was pushed). |
 | `e737547` | Refuter fixes to the paper: re-pin to `4a7b86b`; bounded salvage and #125 in section 2.6; OI-1003-Q36 for the `-shm` write; the code's WantManifest condition. |
-| next commit | Refuter fixes to this note. |
+| `3fdfc46` | Refuter fixes to this note (pushed with `e737547`). |
+| `11a32b8` | Merge of `origin/main` at `4a10bb8` (#153 merged at 05:41Z, after `7205183`). |
+| `1e481b1` | Re-pin to `4a10bb8`: section 2.1's dead_code reason, WP10 PR 2 on `main`, the durability row. |
+| `dd30add` | Lanes A and B under review (#159, #160): section 4 describes `3dbfbdb` only and notes that `27581be` supersedes its run of record; sections 3.3, 4, 7 and 8 add lane A's reported Git-carry source write and its `snapshot` smoke. |
+| next commit | This note: the second re-pin, the relaunch pass and check-fast run 5. |
 
 The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 `04ea9cb`. This pass merged `main` instead and did not rewrite history.
@@ -28,7 +32,7 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 ## Done
 
 - **Paper** (`docs/whitepaper/bulkload.md`), pinned to `origin/main`
-  `4a7b86b`. It covers the problem, the design, the invariants (R25,
+  `4a10bb8`. It covers the problem, the design, the invariants (R25,
   durability ordering, S2), how each SLO is proven, results, related work,
   future work and limits. Section 5 quotes only `docs/evidence/`. SLO
   numbers are linked to `docs/slo.md`, not copied.
@@ -79,7 +83,8 @@ pass below corrects it.
   as planned for sprint 2.
   - Lane B's origin head moved during this pass, from `1da332c` (a
     snapshot, with no results) through `3760263` and `3dbfbdb` to
-    `d7589e0`. `d7589e0` changes only lane B's note. The first
+    `d7589e0`. `d7589e0` changes only lane B's note (the branch has
+    moved again since; see the relaunch pass). The first
     draft of this pass said "pending". After a re-check of origin before
     committing, section 4 instead reports the results committed in
     `docs/formal/README.md` at `3dbfbdb`.
@@ -102,8 +107,8 @@ pass below corrects it.
   and 8, and in the status table. The source is lane A's evidence file on
   `feat/wp0e-estate-corpus-20261003` (`7b75b26`) and TIN-4543. The finish
   pass wrongly called the ruling open; see the refuter-fix pass below.
-- **Open PRs named.** #150 and #151 (WP3) and #153 (WP10 PR 2) are marked
-  open and not on `main`.
+- **Open PRs named.** #150 and #151 (WP3) are marked open and not on
+  `main`. #153 (WP10 PR 2) was too, until it merged (second re-pin below).
 - **Bibliography re-resolution:**
   - [TLC99] gains LNCS 1703 and its editors, from Lamport's publications
     page and Crossref's book record. Crossref, OpenAlex and Springer gave
@@ -145,7 +150,7 @@ it was fixed. This pass ran as the lane's only writer, per its task text.
     second block in `transfer/tests.rs`).
   - Section 3.1 cites `docs/design.md`'s new "Known limit: clocks".
   - Section 7 and the status table were updated. The durability row cites
-    #154's four passing checks.
+    #154's four passing checks (and, since the second re-pin, #153's).
 - **WantManifest.** Section 2.2 now gives the code's condition
   (`Inbound::entry`): an existing output, any output hint in the store
   (`has_output_hints`, once per session), or any salvaged temporary. It
@@ -154,11 +159,59 @@ it was fixed. This pass ran as the lane's only writer, per its task text.
   1024 / 4 GiB salvage values "unruled engineering defaults", while the
   comment at the constants and TIN-4543 record OI-1003-Q24. This lane does
   not edit `docs/design.md`.
-- **Workstreams (verified on GitHub, 2026-10-04):** open PRs are #136
-  (#120 ingest token), #150 and #151 (WP3) and #153 (WP10 PR 2). #154 is
-  merged. Lane A's branch head moved from `7b75b26` to `ec142cf`; the
-  probe record is still in its evidence file. Lane B's head is still
-  `d7589e0`.
+- **Second re-pin, to `4a10bb8`.** #153 (WP10 PR 2) merged at
+  2026-10-04T05:41Z, found when this pass pushed. Merged as `11a32b8`.
+  Section 2.1 now gives the io allowance's new reason (gate (a) evidence,
+  #88, WP10 PR 3) in place of the "W4 PR 2/3" quote. Section 7 has WP10
+  PR 2 on `main`. The durability row cites #153's checks and its
+  crash-check retarget at the production no-replace publish. `proptest!`
+  still appears in seven places. `transfer.rs`, `provider_sqlite.rs`,
+  `closure.rs`, `crash_check.rs` and `tests/` are unchanged from
+  `4a7b86b`.
+- That pass committed `11a32b8` and `1e481b1` but did not push them, and
+  left this note's update uncommitted. The relaunch pass below found both,
+  checked them and kept them.
+
+## Relaunch pass (2026-10-04)
+
+The coordinator relaunched this lane with the same four refuter findings,
+as the only writer; its task text says the earlier copies are gone.
+
+- **All four findings were already fixed** in `e737547` (pushed) and
+  `1e481b1`. Each was re-checked before anything was pushed:
+  - the WantManifest condition against `Inbound::entry` in `transfer.rs`
+    (`has_output_hints` once per session; any salvaged temporary);
+  - bounded salvage against `SALVAGE_KEEP_FILES`, `SALVAGE_KEEP_BYTES`,
+    `salvage_to_keep` and `bound_salvage`, and #125 against `racy_guard`
+    in `transfer_store.rs`;
+  - seven `proptest!` sites, counted with grep at `4a10bb8`;
+  - Q24, Q26 and Q36 against their TIN-4543 comments (Q36 at
+    2026-10-04T03:47Z; Q24 and Q26 at 00:46Z), and #157 open on GitHub
+    (created 03:47Z).
+- **New drift: lanes A and B moved under review.** Fixed in `dd30add`.
+  - Lane B is open as #160 at `27581be`. Its README there supersedes the
+    `3dbfbdb` run of record with a 43-row run over `8bc6672`. It says the
+    old `MC_wp0g` row used `MC_main`'s bound and never read the relaxed
+    ledger, so it was no evidence. It also widens the WP0(g) condition to
+    the store's whole creation, its state root's directory entry included,
+    and notes that the model assumes a ledger commit never fails. Section
+    4 now says it describes `3dbfbdb` only and records these points; it was
+    not re-pinned to an unmerged, still-moving branch.
+  - Lane A is open as #159 at `633ff72` (evidence at `378b634`). Its
+    evidence file no longer gives the 3.51.2 and 3.53.1 `-shm` probes. It
+    records a smoke at `46587af` instead: bulkload's own `snapshot` created
+    `storage.db-shm`, and `estate-capture` moved the mtime and ctime of
+    source loose objects and packs, which the lane reads as Git freshening
+    through alternates and leaves to S2 for a ruling. TIN-4543 has no
+    ruling on it. Sections 3.3, 4 (S2 row) and 8 report it as unruled;
+    sections 4 and 7 name #159 and #160.
+- **Workstreams (verified on GitHub and origin, 2026-10-04 about 08:40Z):**
+  `main` is `4a10bb8`. Open PRs are #136 (#120 ingest token; the refuter
+  reports it held by WP0(a), which GitHub does not show), #150 and #151
+  (WP3), #159 (lane A) and #160 (lane B). #153
+  and #154 are merged. #157 (Q36 implementation) is an open issue. The
+  coordinator's `docs/slo.md` amendments are `9784467` and `8dd4546` on
+  `docs/coordinator-20261003`, with no PR open. This branch has no PR.
 
 ## Duplicate-agent incident (recorded on TIN-4543)
 
@@ -176,9 +229,10 @@ it was fixed. This pass ran as the lane's only writer, per its task text.
 - The coordinator's rule since then: running workflow agents are never
   messaged, and a redirect relaunches the lane as a fresh workflow with one
   owner.
-- This pass is that relaunch (`lane-c-whitepaper-finish`), the only writer
-  in this worktree. Its task text, from the coordinator's workflow, says
-  the earlier copies were gone before it began.
+- The finish pass was that relaunch (`lane-c-whitepaper-finish`), the only
+  writer in this worktree. Its task text, from the coordinator's workflow,
+  said the earlier copies were gone before it began. The 2026-10-04
+  relaunch pass above was relaunched the same way.
 - Sibling agents share the session scratchpad, so this pass kept its
   scratch files in its own subdirectory.
 
@@ -195,11 +249,13 @@ exited 0, and the Python contract suite ran 22 tests, OK, each time.
 | 2 | `7e2921a` plus part 1's final edits (committed as `6ab4ce0`) | 683 passed, 0 failed |
 | 3 | `cb4469b` (with #146's code) plus part 2's edits | 690 passed, 0 failed |
 | 4 | `7205183` (with #154's code) plus the refuter-fix edits | 696 passed, 0 failed |
+| 5 | `dd30add` (with #153's code, which deleted stale io tests) | 682 passed, 0 failed |
 
 During run 3, only documentation lines were edited: a rewrap in section
 2.7 and this paragraph. During run 4, only documentation was edited: two
-paraphrases and one sentence in the paper, and this note. This lane
-changes documentation only.
+paraphrases and one sentence in the paper, and this note. Run 5 waited
+about 15 minutes for the shared lock; during it only this note was
+edited. This lane changes documentation only.
 
 - The draft's run, on `57030e1`, exited 0.
 - The review-fix pass's run was queued when its session ended. No commit
@@ -207,16 +263,24 @@ changes documentation only.
 
 ## Open
 
-- **Formal model.** Section 4 cites `3dbfbdb`, with the head at
-  `d7589e0`. If lane B's branch moves
-  or merges, re-pin to the `main` path and its sha. Describe the Dhall
-  catalogue and the Haskell explorer as done only once they land, and add
+- **Formal model (#160).** Section 4 describes `3dbfbdb` and says the
+  README at `27581be` supersedes its run of record. When #160 merges,
+  re-pin section 4 to the `main` path and sha: the 43-row run, the
+  reach rows, the widened WP0(g) condition, and the README's coverage and
+  "Code and design disagreements" sections. Describe the Dhall catalogue
+  and the Haskell explorer as done only once they land, and add
   bibliography entries for them if they are cited. Adopting WP0(g) under
   the model's conditions has no ruling yet.
 - **SQLite wal-index (OI-1003-Q36).** Ruled; implementation open as #157.
   When #157 lands, cite its counter and property test in sections 2.8,
-  3.3, 4 and 8. Cite lane A's evidence file by its `main` path once it
-  merges, and point at `docs/slo.md` once `8dd4546` reaches `main`.
+  3.3, 4 and 8. When #159 merges, rewrite section 8's probe text to cite
+  the evidence file's `main` path and its `snapshot` smoke (the 3.51.2 and
+  3.53.1 probes are no longer in it). Point at `docs/slo.md` once
+  `8dd4546` reaches `main`.
+- **Git-carry source write (reported on #159).** `estate-capture` moved
+  the mtime and ctime of source loose objects and packs in lane A's smoke.
+  No ruling yet. When TIN-4543 records one, or #159 merges, update sections
+  3.3 and 8 and the S2 row.
 - **Gate (a) on wire v5.** There is no evidence file for the 2026-10-03
   attempts. Cite an `r23-2026-10-03-*` file once one lands.
   OI-1003-Q33 holds the next attempt for the full post-train `main`.
@@ -224,8 +288,8 @@ changes documentation only.
   Their text is on `docs/coordinator-20261003` (`9784467`, `8dd4546`). The
   paper cites them through TIN-4543. Point at `docs/slo.md` once the
   coordinator's docs PR merges.
-- **Refresh on merge** of #136, #150, #151 or #153, of the estate corpus
-  (WP0(e)), or of a gated gate (a) sample on corpus v1. When WP0(a)'s S3
+- **Refresh on merge** of #136, #150, #151, #159 (estate corpus, WP0(e))
+  or #160, or of a gated gate (a) sample on corpus v1. When WP0(a)'s S3
   measurement of the chains lands, cite it in sections 2.7 and 5.4.
 - **S5 classes with no owner.** Configuration, shallow-frontier, nest
   custody and rebuildable-root movement, and directory-shape drift, still
