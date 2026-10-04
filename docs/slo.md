@@ -180,6 +180,33 @@ as properties.
   stay byte-identical, and a property test asserts that no other source
   write occurs.
 
+## Amendments 2026-10-04: WP0(g) adopted, and the R25 reading (OI-1003-Q37, Q40)
+
+- **WP0(g) adopted with conditions (OI-1003-Q37).** This ratifies (g) above on
+  the formal model's evidence in `docs/formal/README.md`:
+  - MC_wp0g and MC_wp0g_deep pass;
+  - MC_wp0g_authority fails;
+  - MC_store_root_unsealed fails.
+
+  The conditions:
+  - Source-ledger *row* commits may run with `synchronous=NORMAL` and
+    `fullfsync=OFF`.
+  - The commit that creates the source store, its authority, stays FULL.
+  - The relaxation lands only after #161, which seals the state root and its
+    parent. #166 merged that fix with power-loss proofs.
+  - A corrupt or absent source ledger is treated as empty.
+- **R25 reading (OI-1003-Q40).** "Never re-read a byte the destination already
+  holds durably" means a byte that a **committed destination row** proves
+  durable. That is `R25_NoDurableReread` in `docs/formal/`. It is the SLO's
+  proof obligation, and it holds in the model.
+  - After a crash between an output's durable publish and its row commit,
+    those durable but unrowed bytes may be read once more. Salvage (#124, #154,
+    OI-1003-Q24) bounds this.
+  - Removing that re-read is the strict reading. It is tracked as an
+    improvement in #169 and is not part of the SLO.
+  - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
+    row proves it".
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
