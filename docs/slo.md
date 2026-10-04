@@ -50,8 +50,6 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
   - casync/desync; restic/borg; bup; Unison; ZFS send/receive;
   - content-defined chunking (FastCDC); BLAKE3;
   - crash-consistency literature (ALICE, CrashMonkey).
-
-  Draft (2026-10-03): [whitepaper](whitepaper/bulkload.md), [bibliography](whitepaper/bibliography.md).
 - **Formal model.** A TLA+ (or equivalent) specification of wire v5, `Held`,
   ledger commit and resume. It is model-checked for R25 (no committed capture is
   re-read), durability ordering and S2's no-write/no-lock properties.
