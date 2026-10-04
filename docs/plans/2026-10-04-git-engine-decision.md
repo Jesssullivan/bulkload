@@ -2,10 +2,11 @@
 
 Rulings: OI-1003-Q15 (measure S3 on the estate corpus first, then choose v1,
 hybrid or v2 on the numbers; carry_v2 stays frozen until then), OI-1003-Q18
-(the S3 delta inequalities), OI-1003-Q35 (byte counters, `census_walks`, pack
-bytes and the rusage CPU ratio are admissible; wall time is informational),
-OI-1003-Q38 (cited by the Sprint 2 dispatch; its text is not in the repo),
-R-N13.
+(the S3 delta inequalities), OI-1003-Q35 (byte counters, `census_walks`,
+pack bytes and the rusage CPU ratio are admissible; wall time is
+informational), OI-1003-Q38 (the overnight scope, sprint 2 plus fix lanes
+for #161 and #162, as recorded in main's
+`docs/agent-notes/2026-10-03-coordinator.md` since #167), R-N13.
 
 This packet asks the operator for the Q15 ruling. The three OI-1003-Q18
 questions at the end are separate rulings and do not block Q15. The packet

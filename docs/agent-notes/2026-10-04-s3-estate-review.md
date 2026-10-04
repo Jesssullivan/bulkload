@@ -1,13 +1,16 @@
-# 2026-10-04 S3 estate lane: review steps (main merge, then review-round fixes)
+# 2026-10-04 S3 estate lane: review steps (main merge, review-round fixes, recheck and PR)
 
-Rulings: OI-1003-Q15, OI-1003-Q18, OI-1003-Q35, OI-1003-Q38 (cited by the
-dispatch; its text is in no repo branch, and not on main `cd4ffad`
-either), R-N13.
+Rulings: OI-1003-Q15, OI-1003-Q18, OI-1003-Q35, OI-1003-Q38 (the overnight
+scope, sprint 2 plus fix lanes for #161 and #162, as recorded in main's
+`docs/agent-notes/2026-10-03-coordinator.md` since #167; earlier steps of
+this note said no repo doc held it, which was wrong from `cd4ffad` on),
+R-N13.
 
 - **Branch:** `feat/s3-estate-20261004`.
 - **Worktree:** `bulkload.worktrees/s3-estate-20261004`. Each session below
   was its only writer.
-- **PR:** none opened (by dispatch).
+- **PR:** steps 1 and 2 opened none (by dispatch). Step 3 opened one; see
+  there. Nothing was merged.
 - **Earlier note:** [2026-10-04-s3-estate.md](2026-10-04-s3-estate.md)
   covers the harness, the runs and the Q15 packet.
 
@@ -20,7 +23,7 @@ either), R-N13.
 - check-fast exited 0 on that tree (11:00:07Z to 11:24:51Z). It ran as a
   background task, which the later review flagged; see Open.
 
-## Step 2: review-round fixes (this session)
+## Step 2: review-round fixes (earlier session)
 
 ### Starting state
 
@@ -29,7 +32,7 @@ either), R-N13.
   this review round in this lane. Its scratch is
   `$TMPDIR/s3-estate-fix-6eYBLn` (07:39 to 07:51 local), with a re-run of
   the evaluation in `$TMPDIR/s3-estate-fix2-oddLbt`. Neither committed.
-  This session reviewed those changes line by line and adopted them. It
+  That session reviewed those changes line by line and adopted them. It
   then ran the tests and ruff, and re-evaluated the recorded runs into its
   own scratch.
 
@@ -115,7 +118,7 @@ Smaller corrections from the re-evaluation:
 
 - `9581384`: the harness, its tests and the justfile line (`evaluate`
   subcommand).
-- The commit after it: the evidence doc, the packet, the earlier note's
+- `82da357`: the evidence doc, the packet, the earlier note's
   corrections, and this note.
 
 ### Validation
@@ -125,7 +128,7 @@ Smaller corrections from the re-evaluation:
   on `s3_estate.py` and `test_s3_estate.py`. check-fast's ruff does not
   cover these two files.
 - **Re-evaluation.** `s3_estate.py evaluate` re-ran the evaluation of
-  `run-estate-1` and `run-small-2` into this session's scratch, and every
+  `run-estate-1` and `run-small-2` into that session's scratch, and every
   figure above comes from it.
 - **check-fast.** `flock …/.check-fast.lock nice -n 10 nix develop
   .#default --command just check-fast` exited 0, on the tree with every
@@ -140,6 +143,126 @@ Smaller corrections from the re-evaluation:
   - Tests: 26 test-result lines, all ok and none failed. That includes the
     agent's 437 unit tests, the fault harness (56) and the power-loss
     proofs (5, and 2 for resume). The 22 contract tests passed.
+
+## Step 3: recheck and PR (this session)
+
+The recheck-and-ship stage of the review workflow. It verified the fix
+round against every medium and high review finding, found none left open,
+and opened the PR.
+
+### Starting state
+
+- HEAD and `origin/feat/s3-estate-20261004` were both `82da357`.
+- origin/main had moved to `8dc26c1` (#170, formal-model docs, after
+  `cd4ffad`). `git merge-tree` merges the branch with it cleanly, and
+  nothing in it touches this lane's files, so the branch was not merged.
+- Open PRs #171 (SLO OI-1003-Q37, Q40) and #172 (source object store
+  freshening and the bare-repository refusal) touch none of this branch's
+  files. #172 bears on evidence findings 10 and 11 and on packet
+  follow-up 5; neither changes a measured number here.
+
+### How the fix round was checked
+
+- **Diff.** `b5a583c..82da357` was read in full: the harness, its tests,
+  the justfile line, the evidence doc, the packet and both notes.
+- **Numbers.** The HEAD harness (sha256 `30200b1723c0`…) is the one that
+  wrote step 2's re-evaluated JSONs (`reevaluated.harness_sha256`). Their
+  inputs still hash as recorded (`1b0ed6f10e25`…, `ce1601940a1b`…).
+  Every verdict and figure in the evidence doc's Verdicts, Delta,
+  object-store and per-repository tables, and in the packet's table, was
+  checked against those JSONs. CPU per half and the child exit codes were
+  recomputed from the raw runs. The eight `r00`/`r12` item bundles sum to
+  546,715,099 B; `r05-bytes`'s first-pass bundle is 1,388,806 B; the
+  amortised re-base figures (179,409,341 ÷ 9 and that plus
+  1,388,806 ÷ 9) are 19.9 M and 20.1 M.
+- **Code.** Re-read at origin/main `8dc26c1`: `CHAIN_DEPTH_LIMIT = 8`;
+  `chain_offer`'s `link.filter(|_| unbased)`; `prepare_base` reusing
+  `shared-{group}.base`; `write_with_prerequisites` (plain
+  `bundle create --all --stdin`) against `write_excluding_tip_trees`
+  (`rev-list --objects-edge-aggressive`). Since `4a10bb8`, those files
+  changed only in refusal plumbing (#151, #161).
+- **Probes.** The reviewer's probe logs (scratch `s3review-rP6K9A`) were
+  re-read: chained captures 4,197,421 B, 526,413 to 526,727 B,
+  8,919,284 B at the re-base, then 526,818 B; grouped pass totals
+  12,733,976 B, 1,053,398 B, 2,102,784 B, up to 10,499,737 B at pass 10;
+  the exclusion pair 4,300,866 B against 3,507 B.
+- **Tests.** In the devShell, `python3 -m unittest test_s3_estate` ran 15
+  tests, all ok; `ruff check` and `ruff format --check` were clean on both
+  bench scripts.
+
+### Disposition of the medium and high findings
+
+All ten are fixed on the branch:
+
+| Finding | Checked |
+|---|---|
+| File inequality 1 counted SQLite seats (high) | `delta_bounds` adds a seat to `file_read` only after the SQLite check; the unit test now expects `.codex` 500. Both `mutate-10` rows read fail by the sniff (+176 B, +64 B); finding 7 and both notes agree. |
+| Git inequality 1 worktree-only (medium) | Finding 2 and the packet row say "worktree seats"; readback, logical pack bytes and changed object-store seats are reported beside it, and a ruling is asked. |
+| CPU ratio never judged (medium) | `cpu_ratio_le_10pct` is the verdict; the doc's per-subset ranges match the JSON (estate 6.9 % to 8.7 %, small 15.1 % to 16.2 %). |
+| File inequality 2 passed on refused seats (medium) | `n/a: blocked by WP0(d)` at both `mutate-10` passes, with the bound including the blocked seats beside it (263,623 B; 51,058 B). |
+| Git granularity and double count (medium) | Per-repository bound, new objects once; chunk 806,672 B against object 67,129,040 B at estate `mutate-10`; ruling asked; follow-up targets no longer use the bound. |
+| Re-base ignored (high) | Amortised row, Reasons, follow-up 3 and the "would change it" list. |
+| Grouped items never chain (high) | Stated with the probe; follow-up 2's target spans N ≥ 10 rounds. |
+| Snapshot-layer misdiagnosis (medium) | Findings 3 and 4 and packet item 5 name the group-base exclusion; old follow-ups 1 and 2 are one; the hybrid row no longer claims 932 M. |
+| Flat metadata allowance (medium) | Moved to OI-1003-Q18 question 3 as a formula or a deferral; "constant" and "the #48 case" are gone. |
+| Mirror coverage unequal (medium) | "Coverage differs", the v2-without-mirrors row (343,676,638 B) and follow-up 5. |
+
+### New in the fix round (low)
+
+- `s3_estate.py report` on a JSON evaluated by the earlier harness, which
+  is what the two recorded run files hold, stops with
+  `KeyError: 'bound_object'`. `evaluate` first, then `report`, works. Not
+  fixed here.
+- The recorded runs can no longer be re-evaluated. For records from before
+  the context kept the estate items, `evaluate` needs
+  `WORK/estate/SEAL.json`. The corpora, the exported build tree and the
+  built binary under `$TMPDIR/s3-estate-20261004` were removed at
+  18:41:45Z (directory mtimes), four minutes after step 2's
+  re-evaluation. The JSONs, logs and the build record remain. Who removed
+  them is unknown. Step 2's re-evaluated JSONs in `s3-estate-fix3-8Sbq5g`
+  are now the only evaluated copies.
+
+### Corrected in this step (R-N55)
+
+- OI-1003-Q38's text has been on main since #167 (`cd4ffad`), in the
+  coordinator's note: the overnight scope is sprint 2 plus fix lanes for
+  #161 and #162. The evidence doc, the packet and both lane notes said no
+  repo doc held it. Their ruling lines now quote it, and the earlier
+  note's open item for it is gone. No other text changed.
+
+### Validation
+
+- **check-fast.** `flock …/.check-fast.lock nice -n 10 nix develop
+  .#default --command just check-fast` ran in the foreground and exited 0
+  twice: 19:19:24Z to 19:23:29Z, then after the OI-1003-Q38 correction
+  19:24:42Z to 19:28:44Z, on the tree with every change in this commit
+  except this paragraph.
+  - Gates passed: ruff ("All checks passed!"), gitleaks ("no leaks
+    found"), cargo fmt, and the three clippy runs with `-D warnings`.
+  - Tests: 26 test-result lines, all ok and none failed, including the
+    agent's 437 unit tests, the fault harness (56) and the power-loss
+    proofs (5). The 22 contract tests passed.
+- **Bench scripts.** As above: 15 tests ok, ruff clean. check-fast's ruff
+  does not cover them.
+
+### Commits and PR
+
+- The commit after `82da357`: this note and the OI-1003-Q38 correction.
+- PR: opened right after this commit was pushed; the next commit records
+  its number.
+
+### Workstreams (restated; from `gh pr list` at this step)
+
+| Stream | Owner | Where | State | Next |
+|---|---|---|---|---|
+| S3 estate and the Q15 packet | this lane | `feat/s3-estate-20261004` | PR open, verified here | Q15 and the three Q18 rulings |
+| Source object store freshening, bare-repo refusal | fix-source-odb lane (reported) | PR #172 | open | its own review |
+| SLO OI-1003-Q37, Q40 | SLO lane (reported) | PR #171 | open | operator |
+| Whitepaper | (reported) | PR #164 | open | unknown |
+| carry_v2 ingest token | (reported) | PR #136 | open, held by OI-1003-Q15 | waits on Q15 |
+
+Only this lane's row is verified. The Linear SSOT ledger was not
+reconciled from here; no Linear write was in scope.
 
 ## Open
 
@@ -161,7 +284,7 @@ Smaller corrections from the re-evaluation:
     the three planned builds.
   - check-fast ran as a background task in earlier sessions, and its ruff
     covers only `scripts tests`, not the bench scripts. `test_s3_estate.py`
-    is optional tier. This session ran the tests and ruff on the bench
+    is optional tier. Step 2 ran the tests and ruff on the bench
     scripts directly.
   - The raw JSON and logs exist only in scratch, and the Linear ledger was
     not reconciled.
@@ -177,13 +300,18 @@ Smaller corrections from the re-evaluation:
   - "Saved on refs and history" contradicts item 2's attribution to
     capture metadata. The Reasons bullet was rewritten for the re-base
     finding.
+  - From step 3: `report` fails on a JSON evaluated by the earlier
+    harness, and the recorded runs can no longer be re-evaluated because
+    their corpus seals are gone.
 - **Re-measurement.** Nobody has requested a re-measure on `dfb9604` or
   `cd4ffad`, and none was made. A run after follow-ups 1 to 3 would test
   the derived 395 MB first pass and the targets over several rounds.
-- **Scratch.** The earlier run's scratch (`$TMPDIR/s3-estate-20261004`) and
-  the earlier attempts' scratch (`s3-estate-fix-6eYBLn`,
-  `s3-estate-fix2-oddLbt`) were left alone. This session's scratch,
-  `$TMPDIR/s3-estate-fix3-8Sbq5g`, holds the re-evaluated JSON and the
-  helper scripts. It is kept as the re-evaluation's working copy.
+- **Scratch.** Step 2 left the earlier run's scratch
+  (`$TMPDIR/s3-estate-20261004`) and the earlier attempts' scratch
+  (`s3-estate-fix-6eYBLn`, `s3-estate-fix2-oddLbt`) alone. Step 2's
+  scratch, `$TMPDIR/s3-estate-fix3-8Sbq5g`, holds the re-evaluated JSON
+  and the helper scripts, and is kept as the re-evaluation's working copy.
+  Step 3 found the run scratch thinned (see step 3, "New in the fix
+  round").
 - **Linear.** No distilled facts are on Linear, because no Linear write was
   in scope.

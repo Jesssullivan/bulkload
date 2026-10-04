@@ -1,13 +1,14 @@
 # S3 on the estate corpus, sting, 2026-10-04 (informational, ungated)
 
 Rulings: OI-1003-Q35 (the admissible S3 evidence is `source_bytes_read`,
-content bytes, `census_walks`, pack bytes and the rusage CPU ratio; wall time
-is informational; estate verbs on this synthetic corpus under scratch are a
-test, not an R-N56 estate operation), OI-1003-Q18 (the S3 delta
+content bytes, `census_walks`, pack bytes and the rusage CPU ratio; wall
+time is informational; estate verbs on this synthetic corpus under scratch
+are a test, not an R-N56 estate operation), OI-1003-Q18 (the S3 delta
 inequalities), OI-1003-Q36 (count SQLite `-shm` creation), OI-1003-Q15 (the
-git engine is chosen on these numbers; see the
-[decision packet](../plans/2026-10-04-git-engine-decision.md)), OI-1003-Q38
-(cited by the Sprint 2 dispatch; its text is not in the repo), R-N13.
+git engine is chosen on these numbers; see the [decision
+packet](../plans/2026-10-04-git-engine-decision.md)), OI-1003-Q38 (the
+overnight scope, sprint 2 plus fix lanes for #161 and #162, as recorded in
+main's `docs/agent-notes/2026-10-03-coordinator.md` since #167), R-N13.
 
 **Label: informational, ungated.** No power or load gate was applied
 (load1 16 to 47 during the passes; other lanes were busy). One run per
