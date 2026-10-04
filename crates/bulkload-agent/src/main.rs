@@ -18,14 +18,11 @@ const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
-    bulkload-agent [--durability=group|strict] [--min-free-percent=N] <SUBCOMMAND>
+    bulkload-agent [--durability=group|strict] [--min-free-percent=N]
+                   [--priority=background|normal] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
-    handoff-verify [--json PATH] [--sops-fixture PATH] [--state-root PATH]
-                   [--probe-timeout SECONDS] [--skip-ssh-host ALIAS]...
-                Prove each credential class (sops, kubeconfig, ssh, gpg, gh,
-                git, claude, codex) and emit a tcfs.bulkload.handoff.v1 receipt
     walk PATH   Stat-walk PATH and print the row and refusal counts
     copy SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores
@@ -118,6 +115,13 @@ BOUNDARIES:
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
     any item, planning bundle sizes (a lower bound).
+    --priority=background|normal (WP0(f)): serve, estate-capture, snapshot,
+    git-carry-estimate, git-export and copy read a live source, so they enter
+    background CPU and IO priority before anything else (Linux nice 19 and the
+    idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
+    inherited by every thread and child; other verbs run at normal priority.
+    --priority=normal is the explicit opt-out (gate (a)); every counters line
+    records priority= and priority_from=default|flag.
     copy/pull require an existing destination directory.
     copy/pull preserve divergent destinations and refuse live SQLite files.
     They enumerate the source each run; completed content is resumable.
@@ -148,6 +152,11 @@ BOUNDARIES:
     source_bytes_read). A pass reusing nothing it was offered says why:
     reuse_unavailable=shallow|retained-unreadable|pass-start-unrecorded|
     future-stamp.
+    A gc, repack or prune that rewrites the source's object store under a
+    pass, so that a Git child reading through it fails, is drift custody too:
+    outcome=deferred-with-drift with one ObjectStoreRewritten objects/pack
+    row, no capture record, and the next estate-capture captures the
+    rewritten store.
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
     with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
@@ -155,8 +164,6 @@ BOUNDARIES:
     nested-worktree or nested-repository changes under a pass still refuse
     GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
-    handoff-verify probes; it never signals a child process (R-N11).
-    Receipt evidence is exit statuses, counts and operator-known identifiers only.
 
 COUNTERS:
     Every verb ends with machine-readable key=value lines: `counters` (bytes
@@ -167,13 +174,46 @@ COUNTERS:
     every other verb prints on stderr so its stdout contract is unchanged.
 ";
 
+/// Verbs that read a live source on the host they run on. Each enters
+/// background CPU and IO priority before anything else unless
+/// `--priority=normal` opts out, and the opt-out is recorded (WP0(f),
+/// OI-1003-Q17). `copy` is here because it reads the source in-process (it is
+/// gate (a)'s verb); `pull` is not, since its source half is the remote
+/// `serve`.
+const SOURCE_SIDE_VERBS: &[&str] = &[
+    "serve",
+    "estate-capture",
+    "snapshot",
+    "git-carry-estimate",
+    "git-export",
+    "copy",
+];
+
+/// Where a verb's priority class came from, as its counters line records it.
+#[derive(Clone, Copy)]
+struct Priority {
+    class: bulkload_agent::priority::PriorityClass,
+    /// `true` when `--priority=` chose it, `false` for the verb's default.
+    explicit: bool,
+}
+
+impl Priority {
+    fn render(self) -> String {
+        format!(
+            "priority={} priority_from={}",
+            self.class.label(),
+            if self.explicit { "flag" } else { "default" }
+        )
+    }
+}
+
 fn main() -> ExitCode {
+    use bulkload_agent::priority::PriorityClass;
     let started = std::time::Instant::now();
-    // macOS starts at 256 open files; take the hard limit the host allows.
-    let _ = bulkload_agent::limits::raise_descriptor_limit();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
     bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
-    let mut args = match global_flags(std::env::args_os().skip(1).collect()) {
+    let mut requested = None;
+    let mut args = match global_flags(std::env::args_os().skip(1).collect(), &mut requested) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
@@ -186,9 +226,27 @@ fn main() -> ExitCode {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_owned();
+    // WP0(f): before any thread or child exists, so all of them inherit it.
+    let priority = Priority {
+        class: requested.unwrap_or_else(|| {
+            if SOURCE_SIDE_VERBS.contains(&verb.as_str()) {
+                PriorityClass::Background
+            } else {
+                PriorityClass::Normal
+            }
+        }),
+        explicit: requested.is_some(),
+    };
+    if priority.class == PriorityClass::Background {
+        if let Err(refusal) = bulkload_agent::priority::enter_background() {
+            eprintln!("bulkload-agent: refused: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // macOS starts at 256 open files; take the hard limit the host allows.
+    let _ = bulkload_agent::limits::raise_descriptor_limit();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
         Some("selftest") => selftest(),
-        Some("handoff-verify") => handoff_command(&args.collect::<Vec<_>>()),
         Some("walk") => {
             if let Some(path) = args.next() {
                 walk_command(Path::new(&path))
@@ -243,7 +301,7 @@ fn main() -> ExitCode {
         }
     };
 
-    report_counters(&verb, started);
+    report_counters(&verb, started, priority);
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
@@ -253,10 +311,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Remove `--durability=MODE` from the arguments and apply it process-wide.
-fn global_flags(args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
+/// Remove `--durability=MODE` and `--min-free-percent=N` from the arguments
+/// and apply them process-wide, and `--priority=CLASS` into `priority`.
+fn global_flags(
+    args: Vec<std::ffi::OsString>,
+    priority: &mut Option<bulkload_agent::priority::PriorityClass>,
+) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
+        if let Some(class) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--priority="))
+        {
+            *priority = Some(class.parse()?);
+            continue;
+        }
         match arg
             .to_str()
             .and_then(|value| value.strip_prefix("--durability="))
@@ -874,7 +943,7 @@ fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
 ///
 /// copy and pull print on stdout beside their transfer line; serve's stdout is
 /// the wire, so it and every other verb print on stderr.
-fn report_counters(verb: &str, started: std::time::Instant) {
+fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) {
     use bulkload_agent::counters::{elapsed_ns, Counters};
     use bulkload_agent::transfer::TransferTiming;
     use bulkload_agent::transfer_store::ChunkTiming;
@@ -884,7 +953,10 @@ fn report_counters(verb: &str, started: std::time::Instant) {
         "serve" => "source",
         _ => "local",
     };
-    let prefix = format!("verb={verb} side={side} scope=process");
+    let prefix = format!(
+        "verb={verb} side={side} scope=process {}",
+        priority.render()
+    );
     let mut lines = Vec::new();
     if matches!(verb, "copy" | "pull" | "serve") {
         lines.push(format!(
@@ -955,64 +1027,6 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
 /// Exercise the pieces M1 actually ships: hash a real file off disk, put its
 /// row in a frame, encode it with postcard, decode it back, and prove the
 /// round trip is exact.
-/// Parse `handoff-verify` flags, run the probe set, and emit the receipt.
-///
-/// The table always goes to stdout, pass or fail: an operator reading a failed
-/// handoff needs the measurements more than a clean exit. `--json PATH` writes
-/// the machine-readable receipt beside it.
-fn handoff_command(args: &[std::ffi::OsString]) -> Result<()> {
-    use bulkload_agent::handoff;
-
-    let mut options = handoff::Options::from_environment();
-    let mut state_root = std::env::temp_dir();
-    let mut receipt_path: Option<PathBuf> = None;
-    let mut index = 0_usize;
-    while let Some(flag) = args.get(index) {
-        let value = || {
-            args.get(index + 1)
-                .ok_or(BulkloadRefusal::RequiredFieldMissing)
-        };
-        match flag.to_str() {
-            Some("--json") => receipt_path = Some(PathBuf::from(value()?)),
-            Some("--sops-fixture") => options.sops_fixture = Some(PathBuf::from(value()?)),
-            Some("--state-root") => state_root = PathBuf::from(value()?),
-            Some("--skip-ssh-host") => {
-                let alias = value()?
-                    .to_str()
-                    .ok_or(BulkloadRefusal::PathNotPortable)?
-                    .to_owned();
-                options.ssh_exclude.insert(alias);
-            }
-            Some("--probe-timeout") => options.probe_timeout = seconds(value()?)?,
-            _ => return Err(BulkloadRefusal::FieldDomainViolation),
-        }
-        index += 2;
-    }
-
-    let probes = handoff::verify(&state_root, &options)?;
-    print!("{}", handoff::render_table(&probes));
-    let receipt = handoff::receipt(probes);
-    if let Some(path) = receipt_path {
-        write_scratch(&path, handoff::render_json(&receipt).as_bytes())?;
-        println!("receipt  {}", path.display());
-    }
-    if handoff::summarize(&receipt.probes).verdict == handoff::Outcome::Pass {
-        Ok(())
-    } else {
-        Err(BulkloadRefusal::ProbeFailed)
-    }
-}
-
-/// A whole-second duration flag value.
-fn seconds(value: &std::ffi::OsString) -> Result<std::time::Duration> {
-    let parsed: u64 = value
-        .to_str()
-        .ok_or(BulkloadRefusal::PathNotPortable)?
-        .parse()
-        .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
-    Ok(std::time::Duration::from_secs(parsed))
-}
-
 fn selftest() -> Result<()> {
     println!("bulkload-agent selftest");
 

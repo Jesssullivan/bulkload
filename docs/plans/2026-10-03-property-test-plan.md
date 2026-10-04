@@ -1,0 +1,309 @@
+# bulkload: property-test decomposition plan (2026-10-03)
+
+Rulings cited: OI-1003-Q7 (local property tests instead of example tests, no fuzzing, slim CI, bounded tested corpus), OI-1003-Q14 (as the task gives it; the charter text on PR #137 lists only Q1–Q13, so Q14's wording should be confirmed), OI-1003-Q11 (#38 drift extension), OI-1001-Q2 (check-fast / check-optional / check-full tiers), R-N122 (CI contract), R-N13 (receipts), R34 (dependency wall), R33 (lint wall), R-N88/R-N119 (power-loss proofs).
+Base: `origin/main` @ 727493a. Charter: `docs/slo.md` on `docs/slo-charter-20261003` (PR #137, not merged).
+Status: analysis only. Nothing was edited, committed, pushed or commented.
+
+**Why this matters (OI-1003-Q13).** Running neo→sting should feel like any other sync. That only holds if S2, S3 and S5 are stated as universal properties, not shown on a few hand-picked fixtures. The core of this plan is P21 (a rerun re-reads only changed seats), P23 (resume after any cut), P34 (no source mutation) and P39 (drift is custody). Everything else is consolidation: fewer test bodies, one oracle per claim, and a fixed-seed corpus in CI.
+
+---
+
+## 0. Inventory verification
+
+The inventory came in **truncated** partway through `git_carry_v2.rs` (the `pr75_r3_m1_concurrent_finishes…` row). It also has no rows for `estate.rs` (49 tests), `handoff.rs` (14), `closure.rs` (11), `bulkload-proto` (14), `space.rs` (7), `freshness.rs` (6), `hash.rs` (5), `counters.rs` (3), `provider_sqlite*` (7), the CLI tests (`estimate_cli` 4, `space_closure_cli` 3), `git_m1_spike` (24, optional tier), the bench crate (10) or the Python tests (68). I worked out dispositions for those areas from test names only. They are marked **[name-only]** in §2 and §4.
+
+Measured counts on `origin/main`:
+
+| Item | Count |
+|---|---|
+| `#[test]` attributes in Rust | 584 |
+| `scenarios!` table rows | 29 |
+| `git_scenarios!` table rows | 10 |
+| Rust tests after macro expansion | ≈621 (including 24 m1-spike and 5 `#[ignore]`) |
+| Python `def test_` | 68 (22 of them in the CI contract) |
+| Existing `proptest!` blocks | 3: `buf` (256 cases), `chunker` (48), `git_carry_v2::random_dags_equal_upload_pack` (12, `failure_persistence: None`) |
+
+`proptest 1.11` is already a workspace dev-dependency. `dep_graph.rs` runs `cargo tree -e normal`, so dev-dependencies are outside the R34 wall. Even so, this plan adds **no new crate** (no `proptest-state-machine`): state-machine properties use a `Vec<Op>` strategy and a hand-written model.
+
+### Sampled dispositions
+
+| Inventory row | Verdict | Evidence / correction |
+|---|---|---|
+| `live_writer_*_refuses` ×4 → retire-duplicate | **CONFIRMED** | `fault_harness.rs:1351` `assert_no_victim_ledger_row` calls the same `live_writer(mutation)` and then adds the bystander checks. Retiring them saves 4 full copy runs in the fault-harness gate. |
+| `io/mod.rs transport_tests::socketpair_…` → retire-duplicate | **CORRECTED → merge** | It tests `tune_transport`, which wraps `set_socket_buffers` and **falls back to `set_pipe_buffer`** (`io/mod.rs:379`). The `io/tests.rs` survivor tests `sys::set_socket_buffers` directly, so the wrapper and its file→false fallback path would lose direct coverage. Move the two `tune_transport` asserts into `io/tests.rs::socket_buffers_…`, then delete the module. |
+| `rust-check: cargo test --workspace (io:: re-run)` → retire-duplicate | **CORRECTED** | The proposed `--skip io::` in the workspace run would drop the io tests under the **shipped** cfg (no `io-trace`). `cfg(not(feature="fault-injection"))` code exists in `lib.rs`, `sys_posix.rs` and `transfer_store.rs`, so cfgs do diverge. Narrow the `io-trace` step to `io::tests::traced io::crash_check` instead. The non-traced io tests then run once, under the shipped cfg. This needs the pin in `tests/test_ci_contract.py:146` updated. |
+| `just rust-check` io-trace clippy → keep | **CONFIRMED** | Same `cfg(not(fault-injection))` evidence: the fault-harness clippy pass never lints those items. |
+| `git_ingest_*` ×9 → convert-to-property (enumerate every hit) | **CORRECTED → keep in CI, add a local sweep** | Enumerating every `(point, nth)` adds crash runs to the mandatory gate, which goes against Q7's "slim CI". `every_fault_point_has_a_scenario` (`fault_harness.rs:1027`) also parses the **text** of the `scenarios!` / `git_scenarios!` tables, so the tables must stay. Plan: the CI table is unchanged; a new local `just crash-sweep` enumerates every hit index for both tables. |
+| Estimate fixtures that "duplicate" `git_carry_v2` `fixture_*` | **CORRECTED → conditional** | Example: `estimate::shallow_destination_with_a_parent_have_matches_a_real_fetch` and `fixture_p1_have_order_matters` build **different** histories. The estimate test also asserts `thin_pack == upload_pack_oracle` (objects **and bytes**) and `real_fetch.objects > oracle`, while `check()` asserts only `sent.objects == estimate.objects` and `bytes ≤ 1.1×estimate`. These retire only after `check()` is strengthened to `estimate.thin_pack == oracle` exactly, and each shape lands as a pinned `Dag` row. The R-N74 real-fetch tests stay unless `check()` gains a `real_fetch` leg. |
+| Fixtures "pin as a seeded case" in `random_dags_equal_upload_pack` | **CORRECTED** | `failure_persistence: None` plus default random seeds means a seeded case is never replayed. Pinned shapes must be explicit data rows in a deterministic `#[test]` table that calls the same `check()`. A generator dimension does not reach a specific two-frontier or bitmap shape reliably at 12 cases. |
+| `rv3_fifo_in_a_nest…`, `rv5_n4_*` (`#[ignore]`) → "delete the body" | **CORRECTED → keep** | They cost nothing in CI and are the only reproductions of open defects D1, R5-1 and R5-2. Deleting them loses the repros. Keep them `#[ignore]` until the fix PR turns each into a P9/P36 cell. |
+| `head_moving_during_capture_still_refuses`, `index_rewritten_…` (P4 conflict) | **RESOLVED by charter** | Charter §Policy, #38 (OI-1003-Q11): HEAD moves and index rewrites inside a captured worktree become `captured-with-drift`. P39 takes the authority set as **data**. The #38 PR flips those rows; this plan's PRs keep current behaviour. Nest HEAD (`a_nest_head_moving_…`, `rv4_nest_head_aba…`) is not clearly "inside a captured worktree" (open decision D2). |
+| `pool_matches_its_model` exists | **CONFIRMED** | `buf/tests.rs:116`, 256 cases. |
+| `fused_and_segmented_match_the_oracle` segment range omits tiny segments | **CONFIRMED** | `chunker/tests.rs:226`: `4_096..65_536 \| 65_536..700_000 \| MIN \| MAX`. |
+| `random_dags` draws `small_cap` and `stranger` | **CONFIRMED** | `git_carry_v2.rs:4001–4036`. There is no shallow, bitmap, tag, rename, gitlink or raw-byte-path dimension yet. |
+| `check()` asserts estimate | **CONFIRMED (weaker than claimed)** | Objects equal, bytes ≤ 1.1×. See the correction above. |
+
+Rule used throughout: **a test is retired only when the subsuming property catches the specific mutant the old test was written to catch.** Every retire PR records that mutant evidence (the review IDs M3–M10, CM1/CM2, B1–B4, D1–D7, N1–N5). This is mutation evidence, not fuzzing.
+
+---
+
+## 1. Property catalogue
+
+Conventions:
+- **CI** uses a fixed RNG seed (`ProptestConfig { rng_seed: RngSeed::Fixed(..), cases: N_ci, failure_persistence: None }`) through one shared `test_support::prop_config(n_ci)` helper. Each CI run is then the same bounded corpus.
+- **Locally**, `BULKLOAD_PROPTEST_DEEP=1` switches the helper to random seeds and `cases = N_ci × 20`.
+- A **finite matrix** (a small product of enums) is **enumerated exhaustively**, not sampled.
+- Named reviewer regressions become rows in a `PINNED` table beside the property.
+
+### io and transfer core
+
+| # | Property (precise) | SLO / rule | Generator and shrinking | Replaces |
+|---|---|---|---|---|
+| P1 POOL | ∀ geometry (slab_size, count, align) and ∀ take/return sequences: `Pool::new` is Ok iff the geometry is valid, otherwise a typed error. Every lent slab is aligned, sized, zeroed when fresh, never lent twice, and isolated. | S1, R-N54, R33 | Existing `steps()`. Add a geometry strategy biased to powers of two ±1 and zero. The default geometry is a pinned row. | `default_slabs_…`, `geometry_is_validated` (kept: `take_blocks…`, `an_unrepresentable_timeout…`) |
+| P2 CDC | ∀ data, segment>0, parallel: `chunk == chunk_segmented == oracle == hash::chunk_boundaries`; `stats.chunks == \|oracle\|`; `cdc_redo_bytes ≤ len`. For Random shape with len ≥ 3·seg: `redo < seg` and `adopted+1 ≥ segments`. | S1, S3, R25 | len edge-weighted {0,1,2,3,64,MIN±1,MAX±1} ∪ 4096..1.3 MB. Segment ∈ {1,2,3 when len is small} ∪ existing ∪ {oracle cut offset ±1, 0} ∪ {k·seg±1 lengths} (dependent `prop_flat_map`). Shrinks toward short zero-filled data. | `boundaries_match_…`, `tiny_and_empty_inputs`, `segment_edges_…`, `segments_smaller_…`, `input_lengths_around_…`, `default_segment_size_…` (the large default-segment input moves to the local tier) |
+| P3 CDC-ALIGNED | ∀ n≥1, r<MAX, k≥1, on zeros of length n·MAX+r with seg = k·MAX: stitched == oracle, `redo == 0`, `adopted == segments`, `spec_discard == 0`. | S1 | Small n (1..4) and k (1..3). Shrinks to n=1, r=0. | `zeros_cut_at_max_…` |
+| P4 COMMIT | ∀ sequences of submit(bytes) / sync / finish / inject_fail(k): closed groups partition the submissions in order. A group closes iff count == GROUP_FILES ∨ bytes ≥ GROUP_BYTES ∨ sync ∨ finish. After a failure in group k, every later submit/sync returns that failure. | Durability, S1, R33 | `Vec<Op>` of length ≤ 64 with GROUP limits overridden small. The model is a pure state machine. Shrinks by dropping ops. | `groups_close_on_…`, `transfer_store::a_failed_group_is_returned_…` (kept: `an_idle_group_closes…`, a timer liveness check) |
+| P5 CLOSED-GRAMMARS | For each closed parser X ∈ {Durability, FaultSpec, group limits, space `percent_parse`, pack_id, Git version gate, refusal codes}: `parse(fmt(v)) == v` for all v. For all strings outside `fmt`'s image (near-miss mutations: case, ±1 digit, leading zero, overflow, extra field, retired v4 names): `parse == None/Err`. | R33, R-N122, S4 | Per-parser `prop_oneof![valid image, mutate(valid)]`. Mutators are shared. | `durability_parses_…`, `fault_spec_parsing_…`, `per_side_group_limits_…`, `space::percent_parse_is_closed`, `pr75_b2_a_resume_pack_id…`, `version_gate_accepts_only…` (fake-git PATH shim deleted; the predicate is extracted as a pure fn) |
+| P6 BENEATH | ∀ generated trees (dirs, files, symlinks) and relative byte paths p (with `..`, `/`, empty components): `openat_beneath(root,p)` is Ok iff p resolves component-wise through real directories to a node strictly beneath root, and it never opens a node outside root. | S2, R-N54 | Tree ≤ 12 nodes, depth ≤ 4. Path = random walk over tree names ∪ {`..`, ``, `/`}. Shrinks to the shortest escaping path. | `openat_beneath_reads_…`, `…_refuses_symlinks_at_every_component`, `…_rejects_paths_that_leave_the_root` |
+| P7 NS | ∀ op sequences over a 4-name set {create_excl, link, rename_noreplace, unlink}: errno and resulting directory == in-memory model (EEXIST on occupied names, no bytes changed). | Durability, no-clobber | `Vec<Op>` ≤ 24. | `create_excl_never_reuses_…`, `namespace_calls_…` (kept: `an_unsupported_exclusive_rename…`, `rename_noreplace_on_a_directory…` errno pins) |
+| P8 NOCLOBBER (finite matrix) | ∀ occupant ∈ {absent, file, dir, symlink, appears-after-stage} × rename_supported ∈ {T,F} × incoming ∈ {file, dir, symlink}: publish succeeds iff absent, otherwise **`GitDestinationOccupied` (never `Io`)**. The occupant is unchanged, no temporary remains, and `PublishLinkFallback` counts the F column. | Estate no-clobber, S4, R-N119 | Exhaustive (5×2×3 = 30 cells, one test). | `temp_files_publish_without_clobbering`, `materialize::publish_never_replaces_…`, `a_symlink_onto_an_occupied_leaf…`, `publish_falls_back_to_link…` |
+| P9 TEMPNAME | ∀ (tag, pid, serial): `temporary_name(format(..))` round-trips to File/Directory(tag). ∀ byte strings outside the formatter image: None. Every created temporary is mode 0600 and created with O_EXCL. | R-N79 | Valid image plus mutations. The 15 existing negatives are a PINNED table. | `named_temporaries_follow_…`, `named_temp_fallback_is_private…`, `temporary_grammar_is_exact` |
+| P10 POSIO | ∀ (offset, bytes) pwrite and (offset, len) pread sequences: file == model buffer and pread returns `min(len, size−off)`. ∀ (size, prealloc_len, advice): size and content are unchanged. | S4 | Offsets ≤ 64 KiB, ops ≤ 32. | `pwrite_and_pread_round_trip…`, `preallocation_and_read_advice…` |
+| P11 STAT-ID | ∀ node ∈ {file, dir, symlink} × mode × size: `sys::fstat` identity == `StatIdentity::from_metadata`. | S3, R25 (reuse key) | Small. | `fstat_identity_matches_std_metadata` |
+
+### crash_check (power-loss model)
+
+The checker is the instrument every power-loss proof depends on, so these properties need an **independent oracle**. That oracle must be a closed-form predicate written fresh in the test, never a call back into the checker's own code.
+
+| # | Property | SLO / rule | Generator | Replaces |
+|---|---|---|---|---|
+| P12 TRACE-REC | ∀ op sequences with attach/detach points and ∀ (mode, umask): recorded events == mutating ops issued while attached, in order, with the effective (post-umask) mode reported by fstat. | R-N88 | `Vec<Op>` ≤ 20 with attach/detach markers. | `mutating_calls_record_events_only_while_attached`, `create_and_mkdir_events_record_the_effective_mode` (kept: P3a, P3b and P5 race/rlimit probes; `a_recorder_attached_on_two_threads…` folds into P3b as a two-recorder mode) |
+| P13 CC-SYNC | ∀ publish-protocol variants over {file sync kind} × {dir sync kind} × {op order} × {omission set} × {kick insertions}: `check` passes iff a **completed** durable file sync precedes the rename and a durable dir sync follows it. | Durability, R-N88 | A finite product, enumerated exhaustively (≈ a few hundred traces, in-process and cheap). PINNED: M5 crash point 3. | `correct_publish_passes_under_every_…`, `publish_without_the_file_sync…`, `…_dir_sync…`, `kicks_are_not_durable`, `syncing_the_file_after_the_rename_is_too_late` |
+| P14 CC-SCOPE | ∀ two-drive traces: a full flush, barrier or draining commit on drive d affects exactly the mutations already *sent* on d. | R-N88 | Traces ≤ 10 ops over 2 drives. PINNED rows: CM1, CM2, M3, M4, rule-5. | 5 scope tests become 1 property + 1 pinned table |
+| P15 CC-VIEW | ∀ trees t: `materialize(scan(t), []) == t`. ∀ traces: `check_view ≡ check`; `View::walk` lists every reachable entry parents first; `StateInfo.commits == {commits completed before c}` for every crash point c. | R-N88 | Trees ≤ 10 nodes, traces ≤ 12 ops. | `a_scanned_tree_materializes_unchanged`, `the_in_memory_view_agrees…`, `the_view_walks_the_tree…`, `commits_are_reported_once…` |
+
+Kept as model-rule pins (each documents one rule of the persistence model): barrier group ×2 (R-N103), torn writes, new dir dependency, metadata ops, symlinks, foreign nodes, inode reuse, the bounded crash point, malformed input, and all four `recorded_*`.
+
+### Durability, store and walk
+
+| # | Property | SLO / rule | Generator | Replaces |
+|---|---|---|---|---|
+| P16 TOUCHED-DEVICES | ∀ multisets of (directory, device) and store device s: `seal()` full-flushes exactly the distinct devices ∖ {s} and seals each directory once. | Durability (#39) | Needs a device-id seam in `TouchedDevices`. Pure. | `a_group_fully_flushes_each_touched_device…`. This also covers the CI logic of macOS-only `cross_device.rs`, which stays `#[ignore]` local. |
+| P17 LEDGER | ∀ manifests m (with duplicate chunks): `capture(publish(m)) == m` and `size == Σ`. ∀ m with root ≠ root(chunks): publish refuses and capture never serves. ∀ non-empty suffixes s: row `encode(m)++s` is a miss. | R25, S3, S4 | Manifests ≤ 64 chunks. | `ledger_preserves_…`, `an_inconsistent_manifest…`, `a_ledger_row_with_trailing_bytes…` |
+| P18 HINTS | ∀ commit_outputs sequences: after reopen every record matches, and `output_chunks(d)` == model holders, newest first. Unknown digests are empty. **End-to-end:** ∀ subsets of holders deleted or modified, wire bytes == size − bytes available from verified survivors. | S1, S3 | Store level: ops ≤ 16. E2E: ≤ 3 holders, in-process. | `output_records_and_chunk_hints…`, `hints_keep_every_holder…`, `a_lost_output_does_not_lose_reuse…` |
+| P19 RACY | ∀ (seat stamp, capture clock) with stamp ≥ clock − 1 tick: the capture is sent but no ledger/output row commits under its key (older rows dropped), so the next run is never a Reuse. The git `reuse_at(stamp,start,now)` predicate gets the same law (one property if they share code, two if not). | R25, R-N58, S3, S5 | i128 triples around the tick boundary. | `a_racy_output_is_never_a_reuse_key`, `a_racy_capture_is_sent_…`, `a_capture_stamped_in_the_future…`, `git_carry::a_same_size_rewrite_in_the_capture_tick…`, `estate::a_same_size_rewrite_…`, `estate::a_capture_whose_seats_predate…` **[name-only]** |
+| P20 WALK-CENSUS | ∀ trees (files, dirs, symlinks, symlinked dirs, tagged temporaries, a dir of only file temporaries): every non-temporary seat appears exactly once; parents come before descendants; names are in byte order within a dir; symlinked dirs are rows, not descents; tagged temporaries are `engine_temporaries`; `HashPolicy::Always` gives `blake3(content)`, `Never` gives none. | S3, S4, R-N79 | Trees ≤ 20 nodes, depth ≤ 4. | `walks_every_seat_once`, `hashes_regular_files…`, `tagged_temporaries_…`, `parents_precede_children…`, `a_symlinked_directory_is_a_row…`, `a_directory_temporary_of_file_temporaries…` |
+| **P21 WALK-RESUME (S3 headline)** | ∀ trees and mutated subsets M between walks: a warm StaleOnly walk reads exactly Σ size(M); `bytes_reread_on_resume == 0`; rows of unchanged seats are equal. Under Always, reread == Σ size(unchanged). Stat-only walks never mark a file hashed. | **S3, R25** | (tree, M ⊆ files, policy interleaving). **New coverage:** "after N changed files a rerun reads only those". | `a_warm_stale_only_walk_rereads_nothing`, `an_always_hash_walk_…`, `stat_only_census_does_not_poison…`, `freshness::stat_observation_is_not_a_completed_content_read` **[name-only]** |
+| P22 WALK-LOCALITY | ∀ trees and bad-node sets B (unlistable dir, depth > cap, path > cap): refusals are values covering exactly the subtrees below B, and every other seat is carried. | S4, R33 | Cap overridden small (depth 3, path 64). | `an_unlistable_directory…`, `a_tree_deeper_than_the_cap…`, `a_path_longer_than_the_cap…` |
+
+### Transfer engine (in-process, end to end)
+
+| # | Property | SLO / rule | Generator | Replaces |
+|---|---|---|---|---|
+| **P23 RESUME + READ-ONCE** | ∀ small corpora and cut points k ∈ {after k End frames, at SourceDone, none} and retention budgets: the resume reads exactly Σ size of files with neither a committed capture nor an output record, converges byte-identical with only the fixture's refusals, and a further rerun reads 0 source bytes and receives 0. Every file is read at most once per session. | **S3, R25, S1** | Corpus ≤ 8 files, ≤ 256 KiB each, plus **at most one** > CREDIT_WINDOW file per CI run. Cut index drawn from 0..=files. CI cases: 8. | `interrupted_transport_resumes_completed…`, `interrupted_transport_rereads_only_the_in_flight…`, `a_large_file_round_trips…`, `parallel_entries_resume_…`, `a_file_past_the_retention_budget…`, the resume half of `round_trip_resumes_…` |
+| P24 SALVAGE | ∀ N held temporaries with committed captures (including pid/serial collisions and paths refused every run): the resume salvages all of them at 0 source reads with nothing on the wire, and none survives the session. | S3, R25, #124 | N ∈ 1..=80 (CI pins N ∈ {1, 70}). | `every_held_temporary_is_salvaged`, `a_held_temporary_is_salvaged_…`, `salvage_is_removed_even_when…` (kept: `orphans_with_this_pid…`) |
+| P25 CREDIT | ∀ grant/acquire sequences: `available ≤ CREDIT_WINDOW`; a grant past it gives BudgetExceeded and changes nothing. | S1, R33 | `Vec<Op>`. | `credit_past_the_window_is_refused` (kept: `credit_waiters_wake…`) |
+| P26 SWEEP | ∀ destination name sets (this tag, other tags, untagged grammar, prefix-sharing payload, hard links to user names): the sweep removes exactly this store's tagged temporaries, records other tagged names, and never touches untagged or payload names. | R-N79, estate | Name sets ≤ 12. | `sweep_removes_only_this_stores…`, `untagged_names_are_carried…`, `sweep_of_user_hardlink…` |
+| P27 DIR-OWN + DIR-PUBLISH (finite matrix) | ∀ occupant {foreign dir, own temp, symlink} × record {none, stale, bound-this, bound-other} × mode-change {T,F}: adopt iff the record binds this inode, otherwise refuse or clear; never modify, follow or widen a foreign node. ∀ trees × rename_supported: final modes == source, no temporary, `renamed + fallback == created`. | Estate, durability, R-N119 | Exhaustive 3×4×2 = 24 cells, plus small trees. | 4 `directory_ownership` cells, `interrupted_directory_mode_finalization…`, `directories_fall_back_to_mkdir…` |
+| P28 BACKPRESSURE | ∀ item counts n and bounds w: the session completes and the walk is never more than w items ahead. | S1 | w ∈ 1..8 (override), n ∈ w−1..=3w. | `a_walk_longer_than_the_walk_ahead…` |
+| P29 LIVE (exhaustive enum) | ∀ Mutation ∈ {InPlaceOverwrite, Truncate, RenameReplace, SameSizeMtimeRestored}: exactly one `SourceChangedAfterSnapshot` for the victim; bystanders carried with correct ledger rows; no victim row; no chunk bytes in either store. Local tier adds a mid-read offset dimension. | **S5**, R25, R-N86 | A table test, one copy per mutation. | 8 → 1 (the 4 `_refuses` are deleted outright) |
+| P30 FD | ∀ (F files, D new dirs) with F, D > soft limit: copy completes with no refusals. | S4 | One own-binary test parameterised over {(700,0),(0,300)}, since the rlimit is process-wide. | `fd_limit.rs` + `fd_limit_directories.rs`, which saves one test binary link |
+| P31 WIRE | ∀ frames f: `decode(encode(f)) == f`. ∀ (version, schema) ≠ current: refuse before reading another frame. ∀ lengths below the header, and ∀ control bodies with trailing bytes: refuse. Back-to-back frames decode in order. | R-N59, R-N118, R33 | `any::<Frame>` via an `Arbitrary` strategy in `bulkload-proto` (dev only). | `a_peer_on_another_wire…`, `a_short_data_frame…`, proto `every_control_message_round_trips`, `pack_data_frames_round_trip`, `decodes_back_to_back_frames`, `refuses_truncated_…`, `a_control_body_with_trailing_bytes…`, `decode_exact_refuses_a_remainder` **[name-only]** (kept: the layout, id and root pins) |
+| P32 ENGINE-COUNTERS | ∀ small corpora: first pass `source_bytes_read == bytes_received == payload`, `HashWireVerify == bytes_received`, `DestVerifyRead == 0`, `FlushFull ≤ groups+2`; warm rerun 0/0; adopt reads 0 source bytes and `DestVerifyRead == payload`; strict gives `FlushFull ≥ files` and `FlushBarrier == 0`; `TransportTuned ≥ 2`. | S1, S3, R25, R-N58 | It stays a single-fn binary (process counters) with a 4-case corpus loop. | `w3_engine_properties` (rewritten in place) |
+| P33 CRASH | ∀ (point, nth) with nth ≤ hits(point): after a crash, the resume satisfies I1–I4 and converges. **CI keeps the existing sampled tables (29 + 10 rows, unchanged text).** The local `just crash-sweep` enumerates every nth from a counted clean run. | Durability, R25, S3 | n/a in CI. Local: the full product. | Nothing retired. The local tier gains strength. |
+| **P34 SOURCE-INERT (S2, new)** | ∀ traced copies, carries and estimates: no mutating event (write, create, unlink, rename, chmod, link, flock/fcntl lock) targets a node beneath the source root, and no process is signalled. ∀ `Command`s built by `git_carry` helpers: they carry `--no-optional-locks`, no lazy fetch, and hooks, fsmonitor and gc off, and the source snapshot (tree + `.git` mtimes/bytes) is byte-identical before and after. ∀ hostile config keys × scope: no sentinel file appears. | **S2** (the charter requires this as a *proven* property) | Transfer: extend `power_loss.rs::the_source_writes_no_content_bytes` with a sibling over the same trace. Git: a builder registry plus snapshot diff over generated hostile configs. | `probe_and_source_git_calls_are_hardened`, `partial_clone_source_never_fetches…`, `a_state_dir_inside_a_repository…` ×2, `a_nest_with_filter_commands…`, `a_hostile_nest_config…`, `rv_nest_config_code_execution…` |
+| P35 BACKGROUND-PRIORITY (S2 gap) | Every engine worker thread runs at Background QoS (Darwin) or ionice idle / nice (Linux) once the session starts. | S2 | A counter or probe per thread. On Linux CI this checks the ioprio/nice path. | New. `thread_qos_applies…` stays. |
+
+### git_carry
+
+| # | Property | SLO / rule | Generator | Replaces |
+|---|---|---|---|---|
+| P36 NEST-CUSTODY (finite matrix + oracle) | ∀ nest state ∈ {clean, dirty, untracked, stash, stash-in-submodule, detached reachable/unreachable, tag-only commit, op-in-progress ×5, ita, populated submodule (depth 1/2), ignored inner repo, gitlink occupant ∈ {empty, FIFO, symlink, ignored dotfile, file, repo, unreadable}, outer-tracked path under nest (exact/case/NFC-NFD)} × parent kind {dir, gitfile, symlinked parent}: the verdict == oracle(state) ∈ {custody(count), refuse(name)}; never bare `Io`; restore leaves the nest absent and named; the receipt names the count and "no remote". | S4, R-N73, R-N83, R-N111, R-N115 | Exhaustive over the cells that are valid on this platform. A **template outer repo is built once and `cp -a`'d per cell**, which is the CI time win. Platform-gated cells (icase, NFD) are skipped with a logged reason. | ≈35 tests (all `a_nest_*`, `adv_outer_tracked_*`, `rv_*`/`rv3_*`/`rv4_*`/`rv5_n1_*` nest cells, `intent_to_add_in_a_nest…`, `restoring_nested_repository_custody…`) |
+| P37 CENSUS-HONESTY | ∀ hazard ∈ {assume-unchanged, skip-worktree, sparse/split index, ident/eol/text/crlf/encoding attr (each attribute source), filemode=false, trustctime=false, ignorecase=true (each config scope), lying clean filter} × scope {outer, nest, nest's submodule}: an edit hidden by the hazard is never reported clean (refuse by name); `-text` / binary never refuses. | S4, R-N73 N1/N4 | Exhaustive product with the existing hand loops promoted to the strategy. Template repo copied per cell. | ≈14 tests |
+| P38 (folded into P34) | | | | |
+| P39 DRIFT-CLASSIFICATION | ∀ mutation sets during capture over {ref create/delete, seat rewrite, seat delete (ENOENT), seat unreadable (EACCES), parent swapped for symlink, gitlink dir filled, nest-ignored seat change, HEAD move, index rewrite (stay / ABA), nest HEAD (stay / ABA)}: verdict == oracle(AUTHORITY_SET, mutations, row budget): drift rows name exactly the mutated seats, members of AUTHORITY_SET refuse, and drift beyond the budget refuses. `AUTHORITY_SET` is a const table: #38 moves HEAD and index from it to drift. | **S5**, R-N30, OI-1003-Q11 | Subsets of size ≤ 3 drawn by proptest (CI: 12 cases) plus PINNED rows for every current named test. | ≈14 tests (including `raw_tree` drift ×2 and `estate` drift/r3 rows **[name-only]**) |
+| P40 DRIFT-MARKED-NEVER-RESTORES (finite) | ∀ verb ∈ {restore, import, apply, …} × packaging ∈ {plain, shallow envelope, inner-marker-only} × swap-after-check {T,F}: refuse before any write; the restored bundle is the one checked. | S4, R-N72 | Exhaustive. | `every_restore_and_import_verb…`, `a_drift_marked_shallow_bundle…`, `a_bundle_swapped_after…`, `r4_shallow_envelope…`, estate sidecar-deletion rows **[name-only]** |
+| P41 CAPTURE-KEY | ∀ nest-free, rebuildable-free, ita-free repos: key == legacy key, bit for bit, with no sidecar; repeated clean captures are deterministic. ∀ pairs (a,b): `union(union(a,b),b) == union(a,b)` and `union(a,b)` applied A→B→A reaches a fixed point with no provenance wrapping. | **S3**, R25 | Small random repos (≤ 4 commits, ≤ 6 files). | `a_repository_without_nested…`, `…without_rebuildable_roots…`, `a_clean_capture_emits_no_drift_ref…`, `a_capture_without_intent_to_add…`, `bidirectional_union_reaches_fixed_point…`, `estate::retained_captures_from_before…` **[name-only]** |
+| P42 REUSE-SAFETY | ∀ retained captures: undecodable → no reuse and reuse refs cleared; pre/post key parts disagree → key drift; shallow → typed `reuse_unavailable=Shallow` with equal `bytes_read`; future stamp → `reuse_unavailable_future_stamp`. | S3, R-N72 | A small enum product. | 4 git_carry + ≈4 estate rows (kept: `clearing_reuse_refs_never_follows…`, a distinct destructive scope) |
+| P43 CAPTURE/RESTORE FIDELITY | ∀ generated worktrees (raw path bytes minus NUL and `/`, modes, symlink targets including escaping ones, binary blobs, staged ≠ worktree, stash, ignored secrets, linked worktree, shallow, shared-base, submodule): `restore(capture(w)) ≅ w` (HEAD, index, bytes, modes, links, stash, status), filters never run, and no secret byte appears in any receipt. | S4 | Repo strategy ≤ 6 files, ≤ 3 commits, with dimension flags. CI: 8 fixed-seed cases plus PINNED rows for each named shape. | `one_raw_pass_preserves…`, `retained_registration…`, `actual_shallow_graph…`, `shared_base…`, `standalone_attachment…`, `exact_payload_attachment…`, `union_preserves_native…`, `ignored_files_in_a_clean_nest…`, `rv_ignored_secret…`, `rv3_ignored_escaping_symlinks…`, `rv4_populated_submodule_with_ignored…`, `rv_populated_submodule_restore…` |
+| P44 TARGET-PLACEMENT | ∀ target path pairs (lexical `..`, `..` after a symlink, trailing slash, component prefix, case variant, NFD/NFC, missing parent, mount boundary): `estate::add` overlaps iff physical overlap (oracle); never bare errno; case-distinct targets on a CS volume are accepted. | S4 | Pure for the overlap fn (proptest over path pairs). FS-level cells exhaustive. R5-1/R5-2 cells are tracked exclusions until fixed. | ≈12 git_carry + ≈10 estate probe tests **[name-only]** |
+| P45 ESTATE-COMPOSITION | ∀ nest chains of depth 1..3 × refusal at level i × carrier damage {none, digest mismatch, missing bundle} × item order permutation: every level restores, or the innermost refusal propagates by name to every carrier; listing order is irrelevant. | S4 | Exhaustive over small depth. | ≈10 `rv3_estate_*` / `rv4_nest_*` / `rv5_n5_*` |
+| P46 SENDER == ORACLE == ESTIMATE | ∀ DAGs from the extended `dag()` (+ shallow frontiers 0..2, bitmap on/off, annotated tags and tag-of-tag, renames, gitlinks, raw-byte paths, held = all tips) and ∀ resume index k: sent set == upload-pack oracle; **`estimate.thin_pack == oracle` (objects and bytes, strengthened)**; haves ancestors-first, non-commit tips last; segments self-contained and disjoint; resume from k packs only k..; fsck clean. | S1, S3, S4, R-N74, R-N97, R-N113, R-N116 | CI: 12 fixed-seed cases **plus a PINNED `Dag` table**, one row per retired fixture. Local: 240 cases. | 16 `git_carry_v2` fixtures/shapes + ≈14 estimate fixtures, each retired only once its row reproduces every original assertion (kept: R-N74 `thin_pack_bytes_match_a_real_fetch*` unless `check()` gains a real-fetch leg) |
+| P47 UNPROVABLE-REFUSES-EARLY (finite) | ∀ (source kind {full, shallow, partial, missing-object}) × (dest kind {full, shallow same/different frontier, partial via worktree/alternate/promisor scrub, not-a-root}) × phase {estimate, plan, open, resume} × mask {none, grafts, commit-graph, planted shallow}: refuse iff unprovable, before list/persist/send/journal/ref, with a matching estimate verdict. | S4, R-N75, R-N131 | Exhaustive valid cells with a shared template. | ≈20 tests across estimate and v2 (kept: `a_missing_prerequisite_refuses…`, `remote_probe_reads_shallow…`, `partial_clone_source_counts_unavailable…`) |
+| P48 INGEST-CRASH | = P33 for git ingest. CI table unchanged. | Durability, S3 | | none (kept) |
+| P49 JOURNAL-SESSION | ∀ op sequences {open, append segment, reader reset, tear tail, finish, abandon, plant foreign quarantine, move state dir}: model-equivalent; one session per pack_id; ordered segments; torn tail cut; altered line refused; foreign quarantine never adopted; finish counts only journaled packs; a lost quarantine is abandoned, not wedged. | S4, durability | `Vec<Op>` ≤ 16; reviewer schedules are PINNED rows. | `the_journal_is_exclusive…`, `pr75_b1*`, `pr75_r2_n2*` ×2, `pr75_d1c…`, `a_journal_store_inside…`, `the_quarantine_key_follows…` |
+| P50 REF-PUBLICATION | ∀ ref-name sets: IngestPlan valid iff all are under `refs/carry/`, with no case/Unicode alias and no D/F clash (pure proptest). ∀ phase × occupant {none, matching, occupied, symbolic, moved alias, unrelated carry ref}: refuse or verify, never move an existing ref; a lost published ref is republished. | S4, #75 | Pure part via proptest; phase part exhaustive. | `malformed_ingest_plans…`, `pr75_b4…`, `pr75_d2…`, `pr75_d3…`, `pr75_d1b…`, `pr75_r2_n3…`, `pr75_r3_m1*` |
+| P51 CODECS | ∀ values v of {journal Record, PackPlan, cat-file header, closure JSON, handoff JSON}: `decode(encode(v)) == v`; ∀ byte positions i and flips: `decode(flip(encode(v), i))` is Err or == some valid encode(y); `pack_id == blake3(bytes)`. | S4, R33 | Arbitrary-derived strategies. | `framing_is_exact…`, `records_round_trip…`, `a_list_round_trips…`, `a_list_that_encode_could_not…`, `closure::json_parser_is_closed…`, `handoff::json_escaping_covers…` **[name-only]** |
+| P52 SECRETS-NEVER-ECHOED | ∀ stderr byte strings: classify is total into the closed set and the raw bytes are stored 0600 in a 0700 dir under a keyed digest, never echoed. ∀ store hazards {world-writable, symlink, hardlink, FIFO, ACL}: refuse. ∀ secret contents and credentialed URLs: absent from receipts, refusals and Debug. | S4, R-N121 | Arbitrary bytes plus a hazard enum. | `remote_failures_are_classified…`, `raw_stderr_is_kept…`, `a_store_that_is_not_private…`, `a_store_with_an_acl…`, `a_refused_segment_keeps…`, `rv3_no_credential…`, `handoff::every_secret_shape_redacts…`, `identifier_lines_drop_secrets…` **[name-only]** (kept: `stderr_is_classified_from_real_messages`, the real-message corpus that specifies the classifier; `estimate_cli::no_stderr_byte_reaches…`) |
+| P53 LINE-ESCAPING | ∀ `Vec<u8>`: an escaped receipt or closure line contains no LF/CR/NUL/ANSI and unescapes to the input. | S4, F8 | Arbitrary bytes. | `rv_receipt_line_escaping`, `nest_receipt_lines_escape…`, `closure::json_strings_cannot_break_out` **[name-only]** |
+| P54 NESTED-DISCOVERY | ∀ trees with repos at random depths/placements {ignored cache, linked worktree same/other repo, malformed `.git` ∈ {symlink, self, unresolvable, non-repo}}: each is recorded with the right kind, none is descended, and no census/manifest seat lies below a nest. | S4, R-N32 | Trees ≤ 3 nests, depth ≤ 3. | ≈8 tests |
+| P55 REBUILDABLE | ∀ trees with rebuildable names (`target/`, `node_modules/`) at random depths, tracked or not: untracked ones are omitted and recorded; tracked ones are carried in full; `--include-rebuildable` carries all with no sidecar. | S1, S3, S4 | Small trees. | 3 tests (+ the key-compat row → P41) |
+| P56 INPUT-PARSING | ∀ OsStr: `Destination::parse` accepted ⇒ matches grammar and `remote_command` quoting round-trips through `sh -c` word splitting; control-char paths are refused before Git runs; the network-FS classifier is Remote iff magic ∈ the documented set; estimate lines are `k=v` and `unknown = tips.saturating_sub(haves)`. | S4, R-N121, OI-1001-Q17 | Arbitrary OsStr, u32 magics, `CarryEstimate`. | `destinations_parse_conservatively`, `paths_with_control_characters…`, `network_filesystems_…`, `a_local_directory_is_not_remote`, `estimate_lines_are_key_value`, `unknown_tip_count_saturates` |
+| P57 STAGING-PRIVACY | ∀ parent states {writable, refuses}: the stage is 0700, beside the bundle or under TMPDIR, and removed on drop. | S4 | Exhaustive. | 2 tests |
+| P58 GITLINK-ITA | ∀ gitlink seat ∈ {empty, file, symlink, absent, tree-at-same-path, AD-state, absent commit} × worktree kind {main, linked} × live-index flip {none, stay, ABA}: restore status == captured status, symlink seats are not followed, and custody comes from the carried index bytes. ∀ ita entries: equal status after round trip; no seat → refuse by cause. | S4, #106 | Exhaustive. | ≈14 tests |
+| P59 CUT | ∀ (objects, cap): `cut()` is an order-preserving partition; each segment ≤ cap unless it holds one object; same-basename runs are not split. | S1, S4 | Pure. | `one_segment_keeps_list_order…` |
+
+### Other areas [name-only]
+
+| # | Property | Replaces |
+|---|---|---|
+| P60 SPACE-FLOOR | ∀ (avail, total, floor%, write): `admit(write)` iff `avail − write ≥ ceil(floor%·total)`, monotone in write, no overflow for u64::MAX. | 5 `space.rs` tests (kept: `probe_reads_a_real_filesystem…`) |
+| P61 CLOSURE | ∀ item sets × dispositions: the report passes iff every item is accounted; untyped `Io` / `FrameCodec` / unprovable items are unaccounted; attestation closes only natively unaccounted items and binds plan, label and schema. | 6 of 11 `closure.rs` tests |
+| P62 HANDOFF-VERDICT | ∀ class → result maps: the verdict is pass iff every class has ≥ 1 pass and no fail; skip never satisfies. | 3 `handoff.rs` tests |
+| P63 FRESHNESS-CACHE | ∀ op sequences: Null/Memory/SQLite caches match a model; SQLite survives reopen with full-width identity. | 4 `freshness.rs` tests |
+
+Kept as-is everywhere: the R34 dep wall (2 tests), the R33 lint wall (clippy steps), `every_fault_point_has_a_scenario`, `fault_names_round_trip…`, `crash_child_entry`, `git_ingest_child_entry`, all `power_loss.rs`, both adoption power-loss proofs, P5 partial write, `tests/test_ci_contract.py` (22), the bench scripts (optional tier), `counters.rs` (finite exhaustive), `provider_sqlite*` (SQLite estate rule pins) and `git_m1_spike` (optional tier; deletion is an open ruling from #81).
+
+---
+
+## 2. Retire list
+
+Each item has the subsuming property and why no coverage is lost. "Pre:" is the condition that must be met in the same PR before deletion.
+
+### A. Exact duplicates (delete now)
+
+| Test | Subsumed by | Zero-loss argument |
+|---|---|---|
+| `live_writer_in_place_overwrite_refuses`, `live_writer_truncate_refuses`, `live_writer_rename_replace_refuses`, `live_writer_same_size_mtime_restored_refuses` | P29 / `*_leaves_no_source_ledger_row` | Each sibling calls the identical `live_writer(m)`, which runs every assertion of the deleted test, and then adds more (`fault_harness.rs:1351`). |
+| `io::transport_tests::socketpair_buffers_…` | `io::tests::socket_buffers_…` | Pre: move `assert!(tune_transport(&left/right)?)` and `assert!(!tune_transport(&file)?)` into the survivor, which keeps the wrapper and pipe-fallback path covered. |
+| `io-trace` re-run of non-traced `io::` tests | the workspace run | Pre: narrow the filter to `io::tests::traced io::crash_check`. The non-traced tests still run once under the shipped cfg. The pin is updated in `test_ci_contract.py`. |
+
+### B. Example tests folded into an existing or strengthened property
+
+| Group | Property | Pre-condition / argument |
+|---|---|---|
+| 6 chunker examples | P2, P3 | The strategy includes every literal (len, segment) value the examples use, as `Just(..)` arms. The P2 equality set adds `hash::chunk_boundaries`. |
+| `default_slabs_…`, `geometry_is_validated` | P1 | The default geometry is a pinned row. Every invalid geometry in the old list is in the PINNED table. |
+| 3 `openat_beneath_*` | P6 | Generated paths include every literal escape from the old tests (pinned). |
+| `create_excl_…`, `namespace_calls_…` | P7 | The model checks EEXIST and byte stability. |
+| 4 publish/no-clobber tests | P8 | Exhaustive matrix ⊇ all old cells. The **Occupied-not-Io** assertion is explicit (#74 B2 mutant). |
+| 3 temp-name/privacy tests | P9 | The 15 hand negatives are a PINNED table. |
+| 2 trace recorder tests | P12 | Review #12 umask cell pinned. |
+| 5 CC-SYNC + 5 CC-SCOPE + 4 CC-VIEW tests | P13–P15 | Mutant evidence: CM1, CM2, M3, M4, M5 each fail the property when reintroduced (recorded in the PR). |
+| committer tests ×2 | P4 | |
+| ledger ×3, hints ×3, racy ×5 | P17, P18, P19 | |
+| walk ×9 | P20–P22 | |
+| transfer resume / read-once ×6, salvage ×3, sweep ×3, dir ×6, backpressure ×1, credit ×1 | P23–P28 | P23 CI corpus includes one file > CREDIT_WINDOW (bounded to 1 case). |
+| `fd_limit` + `fd_limit_directories` | P30 | Both parameter rows run. One binary is enough because each row resets the rlimit inside its own child process. Pre: confirm, otherwise keep two `#[test]`s in one binary with `--test-threads=1`. |
+| proto frame ×7 | P31 | |
+| nest ×35, census ×14, discovery ×8, gitlink/ita ×14, drift ×14, P40 ×4, P41 ×5, P42 ×4, P43 ×12, P44 ×12, P45 ×10, P47 ×20, P49 ×9, P50 ×9, P51 ×6, P52 ×6, P53 ×2, P55 ×3, P56 ×6, P57 ×2, P59 ×1 | P36–P59 | Matrix cells are **enumerated, not sampled**, so every old cell is still executed. The loss to watch is the per-test *assertions*: each old test's assertion list is diffed against the cell oracle in review (focus item in §4). |
+| `git_carry_v2` fixtures ×16, estimate fixtures ×14 | P46 | Pre: `check()` asserts `estimate.thin_pack == oracle` exactly, and each retired fixture has a PINNED `Dag` row reproducing its shape **and** its extra assertions (have order, child-first is worse, frontier unchanged after ingest). The R-N74 real-fetch tests are **not** retired. |
+| space ×5, closure ×6, handoff ×3+2, freshness ×4 | P60–P63, P52 | [name-only]. Verify before retiring. |
+
+### C. Not retired (corrections to the inventory)
+
+- The 9 `git_ingest_*` crash rows and the 29 `scenarios!` rows stay in CI (P33/P48). The full enumeration is local only.
+- The 4 `#[ignore]` defect repros (D1, R5-1, R5-2 ×2) stay until fixed.
+- `stderr_is_classified_from_real_messages`, `partial_clone_source_counts_unavailable_objects`, `remote_probe_reads_shallow…`, `a_missing_prerequisite…`, `list_store_is_private…`, `a_failing_sink_refuses…` (R-N11), and `clearing_reuse_refs_never_follows…` stay.
+
+---
+
+## 3. Slim CI design
+
+**Constraint:** do not touch `.github/workflows/ci.yml`, the composite action or the guard. Each is pinned by an exact SHA-256 in `tests/test_ci_contract.py` (`WORKFLOW_SHA256`, `ACTION_SHA256`, `*_STEP_SHA256`, `GUARD_SHA256`). All slimming happens in **justfile recipe bodies**. Those bodies are pinned as literal tuples in `test_ci_contract.py:137–215` (not digests), so every recipe edit updates its tuple in the same PR under R-N122. Dropping the `build` / `test` matrix gates is a separate, still-open operator ruling from #81 and is out of scope here.
+
+### Mandatory in CI (gate → recipe), after the change
+
+| Gate | Steps | Change |
+|---|---|---|
+| source (`ci-source` → `check-source`) | fmt; clippy workspace `-D warnings` (**R33**); clippy agent `io-trace` (keeps `cfg(not(fault-injection))` lint coverage); `cargo test -p bulkload-agent --lib --features io-trace io::tests::traced io::crash_check`; `io-partial-write-alone` (**P5 proof**); `cargo test --workspace` (incl. **R34 dep wall**, every property at its CI case count with a fixed seed); history secret scan | Only the io-trace test filter is narrowed. `PROPTEST_*` comes from the shared helper, not the env, so CI cannot be widened by accident. |
+| fault-harness | clippy `fault-injection,io-trace`; `fault_harness` (29 + 10 crash rows, 1 P29 table instead of 8 live-writer runs); `power_loss` (+ the P34 sibling); `resume-power-loss` (**R-N88 / R-N119**) | 4 copy runs fewer. Phase 2 (PR15) builds one `fault-injection,io-trace` union in `target/fault`, so the agent compiles once instead of twice. Pre: prove the recorder is inert while detached in crash children, and update the pins. |
+| build / test (Bazel) | unchanged | |
+
+### Local only (`just`, never PR gates)
+
+- `check-optional` gains `props-deep`: `BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace` (random seed, ×20 cases).
+- `crash-sweep`: every (point, nth) for `scenarios!` and `git_scenarios!`, from a counted clean run.
+- `live-writer-offsets`: P29 with a mid-read offset dimension.
+- P2's default-segment large input.
+- P23 with several > CREDIT_WINDOW files.
+- The existing `bench-io-chunker`, `cross_device` (macOS) and `git_m1_spike`.
+- A failing deep run prints the seed. The developer pastes it into the property's PINNED table, so the regression enters the bounded CI corpus deliberately rather than through a persistence file.
+
+### Contract test changes
+
+- Update the `rust-check` tuple (narrowed filter) and the `fault-harness` tuple (phase 2 only).
+- Add pins for any new recipe that check-optional calls.
+- Add a guard test: no `ProptestConfig` in the tree outside `test_support::prop_config` (grep based), so the CI corpus stays bounded and seeded.
+- No digest changes.
+
+### Expected wall time (estimate; PR0 measures it)
+
+Baseline from the 2026-10-01 note (`docs/agent-notes/2026-10-01-local-first-test-tiers.md`): source gate 385–514 s, fault-harness 350–585 s, `fault_harness` binary 116–149 s, agent lib tests 50–81 s, on a loaded host.
+
+| Saving | Estimate |
+|---|---|
+| Fault-harness, dropping 4 live-writer copy runs | ≈ −5–10 % of the `fault_harness` binary |
+| Fault-harness, feature-union build (phase 2) | One fewer agent compile, likely the largest single cut: −60–150 s of gate time |
+| Source gate, io re-run removal | Small (−5–10 s) |
+| Source gate, git matrices on a copied template repo instead of per-test `git init` + commits | −20–40 % of the git_carry lib-test share |
+| Source gate, estimate fixture dedup | ≈30 fewer real-git fixtures |
+
+**Overall: about −15–25 % CI wall**, and in CI the corpus is fixed (constant cases × fixed seed). The deep tier carries the extra strength locally.
+
+---
+
+## 4. PR breakdown
+
+Each PR's receipt cites OI-1003-Q7 (plus Q14 once confirmed), R-N122 where a pin moves, and R-N13. Each one writes a `docs/agent-notes/` entry. All are behaviour-preserving except PR7 (new coverage) and the #38 interaction in PR11.
+
+| PR | Area | Depends on | Size | Adversarial-review focus |
+|---|---|---|---|---|
+| PR0 | `test_support::prop_config` (fixed seed in CI, `DEEP` locally), shared mutators, the `props-deep` recipe + pin, the no-stray-`ProptestConfig` contract test, and a per-binary timing baseline in the agent note | — | S | Can a test escape the helper? Is the CI seed truly fixed? Does `DEEP` leak into CI env? |
+| PR1 | CI quick wins: retire 4 `live_writer_*_refuses`, merge `transport_tests`, narrow the io-trace filter + pin | PR0 | S | Is anything only asserted in a deleted body? Does the narrowed filter still match every traced and crash_check test (count guard like `resume-power-loss`)? |
+| PR2 | io properties P1, P2, P3, P5 (Durability only), P6, P7, P8, P9, P10, P11 | PR0 | M | P6 oracle independence (resolve with a pure path model, not `openat`). P8 asserts Occupied ≠ Io. Shrinking terminates on FS state (fresh tempdir per case). |
+| PR3 | crash_check P12–P15 | PR0 | M | **The oracle must not call checker code.** Reintroduce mutants CM1, CM2, M3, M4 and M5 and show red. Enumeration bounds are logged (proof honesty). |
+| PR4 | P4, P16 (device seam), P17, P18 (store half), P19 | PR2 | M | Does the device-id seam change production paths? P19 tick-boundary off-by-one. Is the committer model a faithful spec of R-N103 ordering? |
+| PR5 | Walk P20–P22 (adds the S3 N-changed clause) | PR4 | M | Is P21's "reads exactly Σ size(M)" counter-honest under Always? Can a cap override leak outside tests? |
+| PR6 | Transfer engine P18 (e2e), P23–P30, P32 | PR5 | L (split 6a: resume/salvage/read-once; 6b: sweep/dir/backpressure/live/fd/w3) | CI case count × corpus bound keeps the gate time flat. P29 stays exhaustive over `Mutation`. The fd rlimit is isolated. |
+| PR7 | **S2 closure:** P34 (trace sibling in `power_loss` + git command registry + source snapshot diff), P35 priority probe | PR6, PR8 | M | Does the registry see *every* `Command` builder (a grep test that no `Command::new("git")` exists outside the registry)? Does the snapshot include `.git` and mtimes? Are flock/fcntl lock events traced? |
+| PR8 | Git pure parsers and codecs: P5 (pack_id, version gate), P51, P53, P56, P59 | PR0 | M | Is the version-gate extraction behaviour-identical? Is the `sh -c` quoting oracle independent? Byte-flip property: "Err or a valid encode(y)" must not be vacuous. |
+| PR9 | P46: extend `dag()`, strengthen `check()` (exact estimate == oracle), add the PINNED `Dag` table, retire 16 v2 + ≈14 estimate fixtures | PR8 | L | Per-row assertion diff vs each retired fixture. R-N74 real-fetch tests kept. CI time for 12 cases with new dimensions (cap dimensions per case). |
+| PR10a | P36 nest custody + P58 gitlink/ita (template repo + `cp -a`) | PR8 | L | Oracle table vs every old verdict. Platform-gated cells logged, not silently skipped. Template copying must not share `.git` objects (use `cp -a`, not `--shared`). |
+| PR10b | P37 census honesty, P54 discovery, P55 rebuildable | PR10a | M | Hand loops promoted without losing a scope × hazard cell. "None descended" checked against the manifest, not the census. |
+| PR11 | P39 drift (AUTHORITY_SET as data), P40, P41, P42, P19-git | PR10b; coordinate with the #38 PR | M | Under the current set the property reproduces today's verdicts. The #38 PR changes only the const. The nest-HEAD row awaits D2. |
+| PR12 | P43 fidelity, P44 placement, P45 composition, P57 staging + estate.rs rows | PR11 | L | The fidelity relation (≅) covers HEAD, index, stash and status. R5 exclusions are tracked, not deleted. The case-probe tests that read the real volume stay. |
+| PR13 | P49 journal model, P50 refs, P52 secrets; the `crash-sweep` recipe (P33/P48 local) | PR8 | M | The model encodes "never adopt foreign quarantine". The `scenarios!` table text is untouched (meta-check parse). The sweep is local only. |
+| PR14 | P31 wire (proto), P60–P63 (space, closure, handoff, freshness) | PR0 | M | [name-only] areas: verify the dispositions first. The wire `Arbitrary` stays dev-only (not in the R34 normal graph). |
+| PR15 | Feature-union build for `target/fault` + fault-harness pin; final timing vs PR0 baseline | PR6, PR13 | S | Recorder inert when detached in crash children. No change in the crash-proof result counts. |
+
+Ordering: PR0 → PR1 (lands the CI saving early) → PR2/PR8/PR14 in parallel → PR3 → PR4 → PR5 → PR6 → PR7. The git track runs PR9 → PR10a/b → PR11 → PR12 → PR13. PR15 comes last.
+
+---
+
+## 5. Counts
+
+| | Before | After (est.) |
+|---|---|---|
+| Rust test functions executed in the source + fault gates | ≈597 (621 minus 24 optional m1-spike) | ≈380–400 |
+| …of which property / matrix tests | 3 | ≈63 properties in ≈75 test fns (plus PINNED tables) |
+| `#[ignore]` (local) | 5 + bench | 5 + bench (+ deep recipes) |
+| Python tests | 68 | 69 (+1 helper-guard contract test) |
+| Crash-proof rows in CI | 39 | 39 (unchanged) |
+| Live-writer copy runs in CI | 8 | 4 |
+| Agent compiles in fault gate | 2 | 1 (PR15) |
+
+Transfer and io: ≈ −55 fns. git_carry (`git_carry.rs` test module ≈ 6,900 lines, `estimate.rs`, `git_carry_v2.rs`): ≈ −165 fns. Other areas: ≈ −20 fns.
+
+Lines (estimate):
+
+| Area | Removed | Added |
+|---|---|---|
+| git_carry.rs tests | ≈5,000 (≈100 bodies × ~50) | ≈1,600 (matrices, oracles, template) |
+| estimate.rs | ≈700 | ≈100 |
+| git_carry_v2 | ≈700 | ≈450 (generator dimensions + PINNED rows) |
+| transfer and io | ≈900 | ≈1,100 (models and strategies) |
+| other | ≈300 | ≈350 |
+| CI contract and justfile | ≈10 | ≈60 |
+| **Total** | **≈7,600** | **≈3,650 (net ≈ −4,000)** |
+
+---
+
+## 6. Open decisions (recommended default in bold)
+
+- **D1.** When the #38 flip happens. Options: inside this series, or **in the #38 PR, after PR11 lands the AUTHORITY_SET seam**.
+- **D2.** Nest HEAD and nest HEAD ABA under OI-1003-Q11. **Stays an authority (refuse); the nest is not "the captured worktree"**, or becomes drift like the outer HEAD.
+- **D3.** CI proptest seed. **Fixed seed plus constant cases (bounded corpus)**, or random per run.
+- **D4.** `#[ignore]` defect repros. **Keep until fixed**, or move to issues and delete.
+- **D5.** Q14 wording. Confirm OI-1003-Q14 says what the task states. The charter on #137 lists only Q1–Q13.
+- **D6.** Dropping the `build` / `test` matrix gates (a workflow digest change). Still open from #81. **Out of scope for this series.**
