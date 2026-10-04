@@ -150,6 +150,10 @@ counters! {
     // Source captures sent but never recorded: stamped within one timestamp
     // tick of their capture (#86).
     TransferRacyCaptures => "transfer_racy_captures",
+    // Ledger and output rows of a store written before the racy guard,
+    // deleted on its first open by this engine (#125): each costs one source
+    // read of its seat.
+    TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
 }
