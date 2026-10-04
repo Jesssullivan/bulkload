@@ -90,6 +90,18 @@ pub enum BulkloadRefusal {
     /// byte is laid down. Intent-to-add entries of a captured checkout are
     /// otherwise carried as index custody.
     GitInventoryIntentToAdd,
+    /// A non-bare repository has no index file (S4, #162): a `--no-checkout`
+    /// clone or worktree. Git reads the absent file as an unborn index, which
+    /// a plain `git checkout` populates as an initial checkout; an empty index
+    /// file does not, so no carried index can restore this state. Capture
+    /// refuses rather than lay down a checkout whose every HEAD path is a
+    /// staged deletion.
+    GitInventoryIndexAbsent,
+    /// A capture of a bare repository (ref custody only, with no worktree)
+    /// was asked to lay down a workspace: a restore, a linked worktree, an
+    /// attachment or an index repair (S4, #162). Refused before anything is
+    /// written; such an item imports its refs, planned without a workspace.
+    GitBareCaptureWorkspace,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
@@ -225,6 +237,8 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitInventoryMissingPrerequisite => "GIT_INVENTORY_MISSING_PREREQUISITE",
             Self::GitInventoryIntentToAdd => "GIT_INVENTORY_INTENT_TO_ADD",
+            Self::GitInventoryIndexAbsent => "GIT_INVENTORY_INDEX_ABSENT",
+            Self::GitBareCaptureWorkspace => "GIT_BARE_CAPTURE_WORKSPACE",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
             Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
@@ -283,6 +297,8 @@ impl BulkloadRefusal {
         "GIT_INVENTORY_MALFORMED",
         "GIT_INVENTORY_MISSING_PREREQUISITE",
         "GIT_INVENTORY_INTENT_TO_ADD",
+        "GIT_INVENTORY_INDEX_ABSENT",
+        "GIT_BARE_CAPTURE_WORKSPACE",
         "GIT_DESTINATION_OCCUPIED",
         "GIT_IGNORE_POLICY_CONFLICT",
         "GIT_DESTINATION_PARENT_MISSING",
@@ -486,6 +502,8 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitInventoryMissingPrerequisite,
             BulkloadRefusal::GitInventoryIntentToAdd,
+            BulkloadRefusal::GitInventoryIndexAbsent,
+            BulkloadRefusal::GitBareCaptureWorkspace,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
             BulkloadRefusal::GitDestinationParentMissing,
