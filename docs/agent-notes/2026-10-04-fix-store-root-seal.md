@@ -218,6 +218,43 @@ OI-1003-Q37, OI-1003-Q38, R-N13.
   from head c94265d (this note's first recheck commit). It has not been
   merged. The contract tests (22 OK) were run again after the note edits.
 
+## Main merge (WP3 PR 2)
+
+Rulings: R-N58, OI-1003-Q37, R-N71, R-N13. Merge, never rebase.
+
+- origin/main dfb9604 (#151, WP3 PR 2) merged into the branch at 07d2b12
+  (parents 8fe66c4, dfb9604). #151 removed the blanket
+  `From<std::io::Error>` for `BulkloadRefusal`. The merge conflicted in
+  `transfer_store.rs`, `estate.rs` and `carry_v2/journal.rs`.
+- **Resolutions.** Each `io::Error` site in the new seal code now names
+  itself with `.refuse_at("<module>::<fn>")` or
+  `crate::refuse::io(&error, site)`. The merge adds no `From` impl and no
+  `Io(None)`.
+  - `transfer_store`: `Store::open` and `StateRoot::open` use
+    `transfer_store::open`, `StateRoot::seal` uses `transfer_store::seal`,
+    `open_parent` uses `transfer_store::open_parent`, and `resolve_leaf`
+    uses `transfer_store::resolve_leaf`. Main's `private_dir` stays
+    deleted, because `StateRoot` replaces it. The new unit tests use their
+    test names as sites, as main's tests do.
+  - `estate::private_directory` uses `estate::private_directory`.
+  - `journal::claim` keeps #166's seal after `names()`, so every claimer
+    seals. Main's creator-only seal was dropped.
+  - `stderr_store::with_opened` uses
+    `git_carry::estimate::stderr_store::with_opened`.
+- **Semantics unchanged.** `seal_state_root` still runs before the
+  `root_sealed` marker commits. The power_loss proofs and the w3 flush pins
+  merged without conflict.
+- **Evidence.** check-fast (`flock … nix develop .#default --command just
+  check-fast`, sting, merged tree): exit 0. Results:
+  - workspace lib: 442 passed, 5 ignored;
+  - io-trace lib: 61 passed;
+  - `refusal_taxonomy`: 5 passed, including the `Io(None)` allowlist;
+  - `fault_harness`: 56 passed;
+  - `power_loss`: 9 passed;
+  - `w3_engine`: 1 passed;
+  - contract tests: 22 OK.
+- Not pushed from this stage. PR #166 updates when the branch is pushed.
+
 ## Open
 
 - An operator rename or restore of a state dir is outside the engine's
@@ -250,16 +287,5 @@ OI-1003-Q37, OI-1003-Q38, R-N13.
 - A dedicated refusal code for "state root cannot be sealed" was not
   added. It would change the wire refusal taxonomy, and `IO` (`EACCES`) is
   what the open returns now.
-- origin/main moved past this branch's base 4a10bb8. A trial merge with
-  8d1edd3 (#150, #159, #160) was clean. Main then merged #151 (WP3 PR 2),
-  which removed the blanket `From<std::io::Error>` for `BulkloadRefusal`,
-  and moved to dfb9604. `git merge-tree` against dfb9604 conflicts in
-  `transfer_store.rs`, `estate.rs` and `carry_v2/journal.rs`.
-  - Before this lands, main has to be merged in (never a rebase). The
-    merge needs the `refuse_at` rewrite of the new `?` sites on
-    `io::Error`: `StateRoot`, `resolve_leaf`, and the estate, journal and
-    stderr seals. check-fast then runs again.
-  - The recheck stage did not do that merge. It is the next action for
-    whoever owns the merge train.
 - Linear: the distilled facts belong on the owning issue. Not posted from
   this lane.
