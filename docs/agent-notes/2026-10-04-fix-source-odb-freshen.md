@@ -141,8 +141,14 @@ Rulings cited:
 - c4c168e: fix, tests, design.md and this note (signed).
 - bd74e09: merge of origin/main cb681d3 (#159, estate corpus), with no
   overlap (signed).
-- The follow-up commit records this receipt (signed). It is note-only, so
-  the code tree is bd74e09's.
+- 0ca1b68: this receipt (signed). It is note-only, so the code tree is
+  bd74e09's.
+- 0708629: merge of origin/main edf6120 (#160, TLA+ model) (signed).
+  - It is docs plus a standalone `tla-check` recipe, with no Rust and no
+    change to the check-fast tier.
+  - The non-Rust check-fast gates were re-run green on it: manifest, Python,
+    shell and workflow lint, the secrets scan and the CI contract.
+- The final note commit records the line above.
 
 ## Open
 
