@@ -169,6 +169,17 @@ bench-estate-corpus dest seed="bulkload-estate-corpus-v1" scale="small":
 bench-estate-corpus-selftest:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py selftest
 
+# `run --agent BIN --work WORK [--scale small|estate]` generates the estate
+# corpus in place under a new private WORK, runs a first pass, three unchanged
+# reruns and reruns after `mutate 1` and `mutate 10` (copy, snapshot,
+# estate-capture, and git-carry-estimate as the v2 projection), evaluates the
+# OI-1003-Q18 inequalities and writes WORK/s3-estate.json. `build --out DIR`
+# release-builds bulkload-agent at origin/main; `report JSON` renders tables.
+# Informational and ungated; never deletes a target.
+# S3 estate measurement harness, Sprint 2 lane A (OI-1003-Q35, OI-1003-Q18)
+bench-s3-estate *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/s3_estate.py {{ args }}
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
@@ -204,6 +215,7 @@ check-optional:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_s3_estate.py
     cd {{ root }} && {{ just_executable() }} bench-estate-corpus-selftest
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
