@@ -247,9 +247,9 @@ import? "justfile.flywheel"
 # docs/formal). Every MC_*.cfg already in OUT is removed first, so a config
 # dropped from the catalogue leaves no stale file. dhall-to-json evaluates
 # the catalogue, which also checks its asserts (a mutation without a verdict
-# does not type-check), and jq writes one file per entry. Both come from the
-# flake's pinned nixpkgs (no flake change). JSON, when given, keeps the
-# evaluated catalogue for tla-check's grounding step.
+# or a primary row does not type-check), and jq writes one file per entry.
+# Both come from the flake's pinned nixpkgs (no flake change). JSON, when
+# given, keeps the evaluated catalogue for tla-check's grounding step.
 # Render docs/formal's TLC configs from the Dhall catalogue.
 tla-render out="" json="":
     #!/usr/bin/env bash
@@ -285,9 +285,11 @@ tla-render out="" json="":
 # catalogue, rendered into scratch, equals the committed configs.tsv and
 # MC_*.cfg byte for byte, with no file missing or extra. Grounding: every
 # operator the catalogue names (properties, witnesses, actions, the specs)
-# is defined in BulkloadTransfer.tla, every constant is declared, every
-# mutation is in its Mutations set, and every code symbol is found by
-# `git grep -w` under crates/. A failed check removes the scratch and stops.
+# is defined in BulkloadTransfer.tla; the catalogue's constants are exactly
+# the spec's CONSTANTS, and its mutations exactly the spec's Mutations set
+# ("none" aside), each checked in both directions; and every code symbol is
+# found by `git grep -w` under crates/. A failed check removes the scratch
+# and stops.
 # The rows of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
 # 3 workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. The first row is the budget self-test: it
@@ -346,18 +348,30 @@ tla-check *configs:
             ungrounded=$((ungrounded + 1))
         fi
     done
-    for name in $constants; do
-        if ! grep -qE "^ +${name}([ ,]|\$)" <<<"$declared"; then
-            echo "tla-check: constant $name is not declared in BulkloadTransfer.tla" >&2
-            ungrounded=$((ungrounded + 1))
-        fi
-    done
-    for name in $mutants; do
-        if ! grep -qF "\"$name\"" <<<"$mutations"; then
-            echo "tla-check: mutation $name is not in the spec's Mutations set" >&2
-            ungrounded=$((ungrounded + 1))
-        fi
-    done
+    # Constants and mutations must agree in both directions: the catalogue
+    # sets every declared constant and no other, and it has an entry (a
+    # verdict and a primary MC_neg_ row) for every rule break in the spec's
+    # Mutations set ("none" aside) and no other.
+    declared_names=$({ grep -oE '^ +[A-Za-z][A-Za-z0-9_]*' <<<"$declared" || true; } | tr -d ' ' | LC_ALL=C sort -u)
+    catalogue_constants=$(LC_ALL=C sort -u <<<"$constants")
+    while read -r name; do
+        echo "tla-check: constant $name is not declared in BulkloadTransfer.tla" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -13 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
+    while read -r name; do
+        echo "tla-check: constant $name is declared in BulkloadTransfer.tla but the catalogue does not set it" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -23 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
+    spec_mutations=$({ grep -oE '"[A-Za-z0-9_]+"' <<<"$mutations" || true; } | tr -d '"' | sed '/^none$/d' | LC_ALL=C sort -u)
+    catalogue_mutations=$(LC_ALL=C sort -u <<<"$mutants")
+    while read -r name; do
+        echo "tla-check: mutation $name is not in the spec's Mutations set" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -13 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
+    while read -r name; do
+        echo "tla-check: the spec's mutation $name has no catalogue entry (no verdict, no MC_neg_ row)" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -23 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
     for name in $symbols; do
         if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
             echo "tla-check: code symbol $name is not found under crates/" >&2

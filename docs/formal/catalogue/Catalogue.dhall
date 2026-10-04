@@ -121,148 +121,99 @@ let propertyEq =
 
 let actionEq = \(a : A) -> \(b : A) -> natEq (T.actionIndex a) (T.actionIndex b)
 
--- Every value of each union, in index order (asserted below) -----------------
+-- Every value of each union, from its table in Types.dhall -------------------
+
+{- Dhall cannot list a union's labels, so each list below comes from a
+   record with one field per label, which a total `merge` keeps exact (a
+   label without a field, or a field without a label, does not type-check).
+   Nothing here lists a union by hand. For each table: every field holds its
+   own label's value, and the positions are 0, 1, 2, ... with no gap or
+   repeat, counted from the table itself.
+-}
+let range =
+      \(n : Natural) ->
+        Natural/fold
+          n
+          (List Natural)
+          (\(acc : List Natural) -> acc # [ List/length Natural acc ])
+          ([] : List Natural)
+
+-- The values of a table, in the order of their positions.
+let ordered =
+      \(a : Type) ->
+      \(index : a -> Natural) ->
+      \(xs : List a) ->
+        concatMap
+          Natural
+          a
+          (\(i : Natural) -> filter a (\(x : a) -> natEq (index x) i) xs)
+          (range (List/length a xs))
+
+let PropertyRow = { mapKey : Text, mapValue : T.PropertyEntry }
+
+let propertyRows = toMap T.propertyTable
+
+let _ =
+        assert
+      :     map PropertyRow Text (\(e : PropertyRow) -> e.mapKey) propertyRows
+        ===  map
+               PropertyRow
+               Text
+               (\(e : PropertyRow) -> showP e.mapValue.property)
+               propertyRows
 
 let allProperties =
-      [ P.TypeOK
-      , P.R25_NoDurableReread
-      , P.R25_NoCommittedCaptureReread
-      , P.ReadOnce
-      , P.S3_ReadsOnlyChanged
-      , P.S3_UnchangedReadsZero
-      , P.S3_ClosedPassIsHeld
-      , P.RecordImpliesBytes
-      , P.HeldAfterCommit
-      , P.LedgerAfterHeld
-      , P.DoneAfterLedger
-      , P.ReuseSound
-      , P.LedgerSound
-      , P.NoClobber
-      , P.S2_TypedSourceAccess
-      , P.S2_BackupLockBounded
-      , P.ClosureAccounted
-      , P.WithinBudget
-      , P.R25_StrictNoDurableReread
-      , P.RunsClose
-      , P.AllRunsFinish
-      ]
+      ordered
+        P
+        T.propertyIndex
+        ( map
+            PropertyRow
+            P
+            (\(e : PropertyRow) -> e.mapValue.property)
+            propertyRows
+        )
 
 let _ =
         assert
       :     map P Natural T.propertyIndex allProperties
-        ===  [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ]
+        ===  range (List/length PropertyRow propertyRows)
 
-let allWitnesses =
-      [ W.Witness_LedgerManifest, W.Witness_LedgerChunkRead, W.Witness_LostRowRead ]
+let WitnessRow = { mapKey : Text, mapValue : W }
 
-let allMutations =
-      [ M.held_before_commit
-      , M.commit_before_fsync
-      , M.commit_before_dirseal
-      , M.adopt_without_seal
-      , M.ledger_before_held
-      , M.done_before_sync
-      , M.reread_durable
-      , M.reread_ignore_ledger
-      , M.skip_output_row
-      , M.double_read
-      , M.src_ledger_carries_r25
-      , M.record_racy
-      , M.untyped_space
-      , M.source_write
-      , M.pause_writer
-      , M.git_optional_locks
-      , M.unbounded_backup
-      , M.supersede_unchecked
-      , M.sweep_displaced
-      ]
+let witnessRows = toMap T.witnessTable
 
 let _ =
         assert
-      :     map M Natural T.mutationIndex allMutations
-        ===  [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 ]
+      :     map WitnessRow Text (\(e : WitnessRow) -> e.mapKey) witnessRows
+        ===  map WitnessRow Text (\(e : WitnessRow) -> showW e.mapValue) witnessRows
+
+let allWitnesses = map WitnessRow W (\(e : WitnessRow) -> e.mapValue) witnessRows
+
+let ActionRow = { mapKey : Text, mapValue : T.ActionEntry }
+
+let actionRows = toMap T.actionTable
+
+let _ =
+        assert
+      :     map ActionRow Text (\(e : ActionRow) -> e.mapKey) actionRows
+        ===  map
+               ActionRow
+               Text
+               (\(e : ActionRow) -> showA e.mapValue.action)
+               actionRows
 
 let allActions =
-      [ A.AnswerHeld
-      , A.BackupBegin
-      , A.BackupEnd
-      , A.BackupStepLock
-      , A.BackupStepUnlock
-      , A.CheckOwn
-      , A.Commit
-      , A.CommitFail
-      , A.CrashBoth
-      , A.CrashDst
-      , A.CrashSrc
-      , A.DirSeal
-      , A.Edit
-      , A.Exchange
-      , A.Finish
-      , A.ForeignDelete
-      , A.ForeignWrite
-      , A.GitRead
-      , A.LedgerCommit
-      , A.Publish
-      , A.RecvDecide
-      , A.RecvEnd
-      , A.RecvEntry
-      , A.RecvHeld
-      , A.RecvManifest
-      , A.RecvNeed
-      , A.RecvRefused
-      , A.RenameReplace
-      , A.SealAdopted
-      , A.SealTemp
-      , A.SendSourceDone
-      , A.SilentRewrite
-      , A.StartRun
-      , A.Terminated
-      , A.Tick
-      , A.VerifyDisp
-      , A.Walk
-      ]
+      ordered
+        A
+        T.actionIndex
+        (map ActionRow A (\(e : ActionRow) -> e.mapValue.action) actionRows)
 
 let _ =
         assert
       :     map A Natural T.actionIndex allActions
-        ===  [ 0
-             , 1
-             , 2
-             , 3
-             , 4
-             , 5
-             , 6
-             , 7
-             , 8
-             , 9
-             , 10
-             , 11
-             , 12
-             , 13
-             , 14
-             , 15
-             , 16
-             , 17
-             , 18
-             , 19
-             , 20
-             , 21
-             , 22
-             , 23
-             , 24
-             , 25
-             , 26
-             , 27
-             , 28
-             , 29
-             , 30
-             , 31
-             , 32
-             , 33
-             , 34
-             , 35
-             , 36
-             ]
+        ===  range (List/length ActionRow actionRows)
+
+-- Mutations come from the primary-row table, `primary`, below.
 
 -- Constants ------------------------------------------------------------------
 
@@ -435,26 +386,9 @@ let wp0g =
 
 -- Properties -----------------------------------------------------------------
 
--- Every safety invariant. The names are frozen (README.md, "Frozen names").
-let safety =
-      [ P.TypeOK
-      , P.R25_NoDurableReread
-      , P.R25_NoCommittedCaptureReread
-      , P.ReadOnce
-      , P.S3_ReadsOnlyChanged
-      , P.S3_UnchangedReadsZero
-      , P.S3_ClosedPassIsHeld
-      , P.RecordImpliesBytes
-      , P.HeldAfterCommit
-      , P.LedgerAfterHeld
-      , P.DoneAfterLedger
-      , P.ReuseSound
-      , P.LedgerSound
-      , P.NoClobber
-      , P.S2_TypedSourceAccess
-      , P.S2_BackupLockBounded
-      , P.ClosureAccounted
-      ]
+-- Every safety invariant, in table order. The names are frozen (README.md,
+-- "Frozen names").
+let safety = filter P T.isSafety allProperties
 
 {- The verdict of every mutation: the one property its MC_neg_<mutation>
    config must violate. A total merge: a mutation added to T.Mutation
@@ -527,15 +461,17 @@ let core = "On the N-version core (OI-1003-Q32)."
 
 let line = \(head : Text) -> { head, tail = [] : List Text }
 
-let neg =
+-- The property a mutation row must violate, and its config's name.
+let negProperty =
       \(n : T.NegRow) ->
-        let property =
-              merge
-                { verdict = verdict n.mutation
-                , also = \(a : { suffix : Text, property : P }) -> a.property
-                }
-                n.against
+        merge
+          { verdict = verdict n.mutation
+          , also = \(a : { suffix : Text, property : P }) -> a.property
+          }
+          n.against
 
+let negName =
+      \(n : T.NegRow) ->
         let suffix =
               merge
                 { verdict = showM n.mutation
@@ -543,8 +479,14 @@ let neg =
                 }
                 n.against
 
+        in  "MC_neg_${suffix}"
+
+let neg =
+      \(n : T.NegRow) ->
+        let property = negProperty n
+
         in  row
-              "MC_neg_${suffix}"
+              (negName n)
               (T.Expect.fail property)
               (   [ "NEGATIVE: ${n.comment.head}" ]
                 # n.comment.tail
@@ -812,21 +754,30 @@ let findings =
           one
       ]
 
-{- Mutations, in run order. Each must violate its verdict, or, for a row
-   with `also`, the named property; TypeOK is checked alongside.
+{- The primary row of every mutation, keyed by its label: MC_neg_<mutation>,
+   which must violate the mutation's verdict. `primaryOf` merges this record
+   over T.Mutation, so it has exactly one field per label: a label without a
+   field is a "Missing handler" error, and a field without a label an
+   "Unused handler" error. Each field holds its own label's mutation
+   (asserted below), and grounding.mutations is the list of its fields.
 -}
-let negRows
-    : List T.NegRow
-    = [ { mutation = M.held_before_commit
-        , against = T.Against.verdict
+let Primary =
+      { mutation : M
+      , constants : T.Constants
+      , comment : { head : Text, tail : List Text }
+      }
+
+let primary =
+      { held_before_commit =
+        { mutation = M.held_before_commit
         , constants = nvMutation
         , comment =
           { head = "Held{true} is answered before the output's group commit."
           , tail = [ core ]
           }
         }
-      , { mutation = M.commit_before_fsync
-        , against = T.Against.verdict
+      , commit_before_fsync =
+        { mutation = M.commit_before_fsync
         , constants = nvMutation
         , comment =
           { head =
@@ -834,37 +785,174 @@ let negRows
           , tail = [ core ]
           }
         }
-      , { mutation = M.commit_before_dirseal
-        , against = T.Against.verdict
+      , commit_before_dirseal =
+        { mutation = M.commit_before_dirseal
         , constants = one
         , comment =
             line
               "the row commits before the directory seal makes the rename durable."
         }
-      , { mutation = M.adopt_without_seal
-        , against = T.Against.verdict
+      , adopt_without_seal =
+        { mutation = M.adopt_without_seal
         , constants = one // { MaxForeign = 1 }
         , comment =
             line "an adopted existing output is recorded without sealing it."
         }
-      , { mutation = M.ledger_before_held
-        , against = T.Against.verdict
+      , ledger_before_held =
+        { mutation = M.ledger_before_held
         , constants = one
         , comment = line "the source ledger records a capture before Held{true}."
         }
-      , { mutation = M.done_before_sync
-        , against = T.Against.verdict
+      , done_before_sync =
+        { mutation = M.done_before_sync
         , constants = one
         , comment =
             line "SourceDone is sent before the ledger's last commit returned."
         }
-      , { mutation = M.reread_durable
-        , against = T.Against.verdict
+      , reread_durable =
+        { mutation = M.reread_durable
         , constants = one // { MaxRuns = 2, MaxCrashes = 1 }
         , comment =
             line
               "the destination never answers Reuse, so a rerun re-reads held bytes."
         }
+      , reread_ignore_ledger =
+        { mutation = M.reread_ignore_ledger
+        , constants = one // { MaxRuns = 2 }
+        , comment =
+          { head =
+              "the destination never answers Reuse AND manifest_capture ignores the"
+          , tail =
+            [ "source ledger, so a rerun re-reads a committed capture. In code shape"
+            , "(SupersedeMode \"off\") slo.md's R25 wording fails only when both"
+            , "protections are gone; reread_durable alone never violates it."
+            ]
+          }
+        }
+      , skip_output_row =
+        { mutation = M.skip_output_row
+        , constants = one
+        , comment =
+            line
+              "the store commit records no output row, so a closed pass holds nothing."
+        }
+      , double_read =
+        { mutation = M.double_read
+        , constants = one
+        , comment =
+            line "a fresh manifest's chunks are read again to serve them (#77 F1)."
+        }
+      , src_ledger_carries_r25 =
+        { mutation = M.src_ledger_carries_r25
+        , constants = nvMutation
+        , comment =
+          { head =
+              "WP0(g) counterfactual: Reuse also needs the SOURCE ledger's row. Fails"
+          , tail =
+            [ "even with a strict ledger: the source row always trails the"
+            , "destination commit by the Held round trip, so R25 must be carried by"
+            , "the destination."
+            , core
+            ]
+          }
+        }
+      , record_racy =
+        { mutation = M.record_racy
+        , constants = one // { MaxEdits = 1 }
+        , comment = line "a racy capture is recorded as a reuse key (#86)."
+        }
+      , untyped_space =
+        { mutation = M.untyped_space
+        , constants = one // { MaxCommitFails = 1 }
+        , comment =
+            line
+              "a full-disk group surfaces as a bare IO, which closes nothing (#100)."
+        }
+      , source_write =
+        { mutation = M.source_write
+        , constants = one
+        , comment = line "a capture also writes the source."
+        }
+      , pause_writer =
+        { mutation = M.pause_writer
+        , constants = one
+        , comment = line "a capture interrupts the source's writer to pause it."
+        }
+      , git_optional_locks =
+        { mutation = M.git_optional_locks
+        , constants = one // { EstateReads = True }
+        , comment = line "a git read runs without the optional-locks guard."
+        }
+      , unbounded_backup =
+        { mutation = M.unbounded_backup
+        , constants = one // { EstateReads = True }
+        , comment = line "the SQLite backup takes its lock past max_steps."
+        }
+      , supersede_unchecked =
+        { mutation = M.supersede_unchecked
+        , constants = one // { MaxForeign = 1, SupersedeMode = Mode.exchange }
+        , comment = line "WP0(d) exchange without the identity check."
+        }
+      , sweep_displaced =
+        { mutation = M.sweep_displaced
+        , constants =
+                one
+            //  { MaxRuns = 3
+                , MaxCrashes = 1
+                , MaxEdits = 1
+                , MaxForeign = 1
+                , SupersedeMode = Mode.exchange
+                }
+        , comment =
+          { head =
+              "WP0(d) exchange whose recovery sweeps a displaced foreign file like a"
+          , tail = [ "temporary." ]
+          }
+        }
+      }
+
+let primaryOf
+    : M -> T.NegRow
+    = \(m : M) ->
+        let p = merge primary m
+
+        in  { mutation = p.mutation
+            , against = T.Against.verdict
+            , constants = p.constants
+            , comment = p.comment
+            }
+
+let PrimaryRow = { mapKey : Text, mapValue : Primary }
+
+let primaryRowsByLabel = toMap primary
+
+let _ =
+        assert
+      :     map PrimaryRow Text (\(e : PrimaryRow) -> e.mapKey) primaryRowsByLabel
+        ===  map
+               PrimaryRow
+               Text
+               (\(e : PrimaryRow) -> showM e.mapValue.mutation)
+               primaryRowsByLabel
+
+-- Every mutation label, from the table (each field holds its own label).
+let allMutations =
+      map PrimaryRow M (\(e : PrimaryRow) -> e.mapValue.mutation) primaryRowsByLabel
+
+{- Mutation configs, in run order: every primary row, and the second rows
+   (`also`) that hold the same mutation against another property. Each must
+   violate its verdict, or, for an `also` row, the named property; TypeOK is
+   checked alongside.
+-}
+let negRows
+    : List T.NegRow
+    = [ primaryOf M.held_before_commit
+      , primaryOf M.commit_before_fsync
+      , primaryOf M.commit_before_dirseal
+      , primaryOf M.adopt_without_seal
+      , primaryOf M.ledger_before_held
+      , primaryOf M.done_before_sync
+      , primaryOf M.reread_durable
       , { mutation = M.reread_durable
         , against = also "reread_unchanged" P.S3_UnchangedReadsZero
         , constants = one // { MaxRuns = 2, MaxCrashes = 1 }
@@ -883,19 +971,7 @@ let negRows
         , comment =
             line "as reread_durable, against S3's changed-seats-only inequality."
         }
-      , { mutation = M.reread_ignore_ledger
-        , against = T.Against.verdict
-        , constants = one // { MaxRuns = 2 }
-        , comment =
-          { head =
-              "the destination never answers Reuse AND manifest_capture ignores the"
-          , tail =
-            [ "source ledger, so a rerun re-reads a committed capture. In code shape"
-            , "(SupersedeMode \"off\") slo.md's R25 wording fails only when both"
-            , "protections are gone; reread_durable alone never violates it."
-            ]
-          }
-        }
+      , primaryOf M.reread_ignore_ledger
       , { mutation = M.reread_durable
         , against = also "reread_exchange" P.R25_NoCommittedCaptureReread
         , constants = one // { MaxRuns = 2, SupersedeMode = Mode.exchange }
@@ -908,96 +984,29 @@ let negRows
             ]
           }
         }
-      , { mutation = M.skip_output_row
-        , against = T.Against.verdict
-        , constants = one
-        , comment =
-            line
-              "the store commit records no output row, so a closed pass holds nothing."
-        }
-      , { mutation = M.double_read
-        , against = T.Against.verdict
-        , constants = one
-        , comment =
-            line "a fresh manifest's chunks are read again to serve them (#77 F1)."
-        }
-      , { mutation = M.src_ledger_carries_r25
-        , against = T.Against.verdict
-        , constants = nvMutation
-        , comment =
-          { head =
-              "WP0(g) counterfactual: Reuse also needs the SOURCE ledger's row. Fails"
-          , tail =
-            [ "even with a strict ledger: the source row always trails the"
-            , "destination commit by the Held round trip, so R25 must be carried by"
-            , "the destination."
-            , core
-            ]
-          }
-        }
-      , { mutation = M.record_racy
-        , against = T.Against.verdict
-        , constants = one // { MaxEdits = 1 }
-        , comment = line "a racy capture is recorded as a reuse key (#86)."
-        }
+      , primaryOf M.skip_output_row
+      , primaryOf M.double_read
+      , primaryOf M.src_ledger_carries_r25
+      , primaryOf M.record_racy
       , { mutation = M.record_racy
         , against = also "record_racy_ledger" P.LedgerSound
         , constants = one // { MaxEdits = 1 }
         , comment = line "as record_racy, against the source ledger's manifest."
         }
-      , { mutation = M.untyped_space
-        , against = T.Against.verdict
-        , constants = one // { MaxCommitFails = 1 }
-        , comment =
-            line
-              "a full-disk group surfaces as a bare IO, which closes nothing (#100)."
-        }
-      , { mutation = M.source_write
-        , against = T.Against.verdict
-        , constants = one
-        , comment = line "a capture also writes the source."
-        }
-      , { mutation = M.pause_writer
-        , against = T.Against.verdict
-        , constants = one
-        , comment = line "a capture interrupts the source's writer to pause it."
-        }
-      , { mutation = M.git_optional_locks
-        , against = T.Against.verdict
-        , constants = one // { EstateReads = True }
-        , comment = line "a git read runs without the optional-locks guard."
-        }
-      , { mutation = M.unbounded_backup
-        , against = T.Against.verdict
-        , constants = one // { EstateReads = True }
-        , comment = line "the SQLite backup takes its lock past max_steps."
-        }
-      , { mutation = M.supersede_unchecked
-        , against = T.Against.verdict
-        , constants =
-            one // { MaxForeign = 1, SupersedeMode = Mode.exchange }
-        , comment = line "WP0(d) exchange without the identity check."
-        }
-      , { mutation = M.sweep_displaced
-        , against = T.Against.verdict
-        , constants =
-                one
-            //  { MaxRuns = 3
-                , MaxCrashes = 1
-                , MaxEdits = 1
-                , MaxForeign = 1
-                , SupersedeMode = Mode.exchange
-                }
-        , comment =
-          { head =
-              "WP0(d) exchange whose recovery sweeps a displaced foreign file like a"
-          , tail = [ "temporary." ]
-          }
-        }
+      , primaryOf M.untyped_space
+      , primaryOf M.source_write
+      , primaryOf M.pause_writer
+      , primaryOf M.git_optional_locks
+      , primaryOf M.unbounded_backup
+      , primaryOf M.supersede_unchecked
+      , primaryOf M.sweep_displaced
       ]
 
-{- Every mutation has exactly one primary row (`verdict`), and the primary
-   rows run in mutationIndex order: a mutation with no row fails here.
+{- Every mutation label has exactly one primary row in negRows, and the
+   primary rows run in mutationIndex order. The expected positions are 0, 1,
+   2, ... up to the number of fields of `primary`, which is the number of
+   labels of T.Mutation. So a label whose row is left out of negRows, or
+   listed twice, fails here, however many labels the union has.
 -}
 let primaryRows =
       List/fold
@@ -1017,7 +1026,7 @@ let primaryRows =
 let _ =
         assert
       :     primaryRows
-        ===  [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 ]
+        ===  range (List/length PrimaryRow primaryRowsByLabel)
 
 let rows =
         [ budgetSelftest ]
@@ -1302,12 +1311,22 @@ let invariants
         }
       ]
 
--- One row per frozen safety invariant (TypeOK is a sanity check) and temporal
--- property, in that order.
+{- One row per frozen safety invariant (TypeOK is a sanity check) and per
+   temporal property, in table order. Both lists come from the property
+   table, so a property added with either class needs a row here.
+-}
+let traced =
+      \(p : P) ->
+        (T.isSafety p && propertyEq p P.TypeOK == False) || T.isTemporal p
+
 let _ =
         assert
-      :     map T.InvariantRow Natural (\(r : T.InvariantRow) -> T.propertyIndex r.tla) invariants
-        ===  [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20 ]
+      :     map
+              T.InvariantRow
+              Natural
+              (\(r : T.InvariantRow) -> T.propertyIndex r.tla)
+              invariants
+        ===  map P Natural T.propertyIndex (filter P traced allProperties)
 
 -- Outputs ----------------------------------------------------------------------
 

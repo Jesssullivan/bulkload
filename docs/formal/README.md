@@ -58,9 +58,11 @@ How the recipe runs:
     missing or extra;
   - **grounding**: every operator the catalogue names (properties,
     witnesses, the 37 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init`,
-    `Next`) is defined in `BulkloadTransfer.tla`, every constant is
-    declared, every mutation is in its `Mutations` set, and every code
-    symbol is found by `git grep -w` under `crates/`.
+    `Next`) is defined in `BulkloadTransfer.tla`; the catalogue's
+    constants are exactly the spec's `CONSTANTS`, and its mutations exactly
+    the spec's `Mutations` set (`"none"` aside), each checked in both
+    directions; and every code symbol is found by `git grep -w` under
+    `crates/`.
 - The rows of `configs.tsv` run in order, one JVM at a time, with `-Xmx4g`,
   `-workers 3`, `nice -n 10` and `-coverage 1`.
 - TLC state and logs go under a private `mktemp -d` in `$TMPDIR`. It is
@@ -354,19 +356,34 @@ time it is evaluated (a catalogue that breaks one renders nothing):
   carries exactly one property, and a reach row exactly one witness, which
   is a separate type. The rendering adds `TypeOK` to fail and reach rows and
   `WithinBudget` to every row, so neither can be forgotten.
-- **Every mutation has a verdict.** A total `merge` maps each `Mutation` to
-  the property its `MC_neg_` row must violate. A mutation added to the union
-  without a verdict is a type error. An assert also requires exactly one
-  such primary row per mutation. A second row for the same mutation names
-  its other property explicitly (`also`), as `MC_neg_reread_unchanged` and
-  `MC_neg_record_racy_ledger` do.
+- **Every mutation has a verdict and a primary row.** A total `merge` maps
+  each `Mutation` to the property its `MC_neg_` row must violate. The
+  primary rows are a record with one field per mutation label (`primary`),
+  also merged over the union. So a label added without a verdict, or
+  without a primary row, is a type error (`Missing handler`), and a field
+  without a label is one too (`Unused handler`). An assert requires every
+  field to hold its own label's row. Another requires the rendered rows to
+  contain exactly one primary row per field, at positions 0, 1, 2, ...
+  counted from the record, not from a literal list. A second row for the
+  same mutation names its other property explicitly (`also`), as
+  `MC_neg_reread_unchanged` and `MC_neg_record_racy_ledger` do.
+- **No union is listed by hand.** Dhall cannot list a union's labels, so
+  every list of all properties, actions, witnesses or mutations comes from
+  a record with one field per label (`Types.dhall`'s `propertyTable`,
+  `actionTable` and `witnessTable`, and `primary`), kept exact by a total
+  `merge`. The safety invariants are the properties whose class in
+  `propertyTable` is `safety`, not a separate list. `grounding.mutations`
+  is `primary`'s fields.
 - **`gen_cfgs.py`'s checks, kept.** Every safety invariant except `TypeOK`
   has a fail row, and no row with a temporal property uses `SYMMETRY`.
+  Because the safety invariants come from the property table, a property
+  added with class `safety` and no fail row fails the first check.
 - **Names are the TLA+ names.** Union labels are rendered with
   `showConstructor`, so the catalogue cannot misspell a property, action or
   mutation. The frozen names are unchanged.
 - **Traceability rows.** One `{tla, slo, ruling, codeSymbol, ptest}` row
-  per frozen safety invariant except `TypeOK`, and per temporal property:
+  per frozen safety invariant except `TypeOK`, and per temporal property,
+  in table order; the expected list comes from the property table. It is
   the table under [Properties, SLOs, rulings and
   tests](#properties-slos-rulings-and-tests), with the code symbols each
   property is about.
@@ -379,9 +396,11 @@ What `tla-render` and `tla-check` add in the shell:
   catalogue's rendering byte for byte, with no file missing or extra.
 - **Grounding.** Every operator the catalogue names (21 properties, 3
   witnesses, 37 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init` and
-  `Next`: 66 names) is defined in the spec. All 16 constants are declared,
-  all 19 mutations are in its `Mutations` set, and all 19 distinct code
-  symbols are found by `git grep -w` under `crates/`.
+  `Next`: 66 names) is defined in the spec. The catalogue's 16 constants
+  are exactly the spec's `CONSTANTS`, and its 19 mutations exactly the
+  spec's `Mutations` set without `"none"`: a rule break added to the spec
+  with no catalogue entry fails, as does a catalogue entry the spec lacks.
+  All 19 distinct code symbols are found by `git grep -w` under `crates/`.
 
 **It replaced `gen_cfgs.py` byte for byte.** At `0781bd6` the catalogue's
 rendering, `gen_cfgs.py`'s output and the committed files were identical:
