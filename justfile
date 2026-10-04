@@ -152,6 +152,21 @@ bench-r23-ab *args:
 bench-r23-corpus *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/r23_corpus.py {{ args }}
 
+# Git-heavy, many-small-file trees for S1 and S3, deterministic from (seed,
+# scale) and sealed by the SHAKE-256 of their manifest. DEST must be new and
+# absolute (for example under $TMPDIR). Check a copy with `estate_corpus.py
+# verify DEST`; the S3 knob is `estate_corpus.py mutate DEST N`.
+# Estate-shaped corpus generator, WP0(e) (OI-1003-Q19)
+bench-estate-corpus dest seed="bulkload-estate-corpus-v1" scale="small":
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py generate "{{ dest }}" --seed "{{ seed }}" --scale "{{ scale }}"
+
+# Generates scale=small twice under $TMPDIR, checks that both share one
+# identity, then checks verify, a one-of-each mutate and tamper detection, and
+# removes both copies. Optional tier only (OI-1003-Q7: CI stays slim).
+# Estate corpus round-trip self-test (OI-1003-Q19)
+bench-estate-corpus-selftest:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py selftest
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
@@ -167,7 +182,8 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 #                   R33 lint wall, CI contract). PR CI runs this tier through
 #                   its source, fault-harness and test gates.
 #   check-optional  optional tier: spike evidence, bench-script stubs, the
-#                   history secret scan and the Nix/Bazel graph. On demand.
+#                   estate corpus self-test (OI-1003-Q19), the history secret
+#                   scan and the Nix/Bazel graph. On demand.
 #   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
 
 # The repository and CI contract tests, run directly instead of through
@@ -186,6 +202,7 @@ check-optional:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
+    cd {{ root }} && {{ just_executable() }} bench-estate-corpus-selftest
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
     cd {{ root }} && {{ just_executable() }} test-local
