@@ -13,12 +13,27 @@ git engine is chosen on these numbers; see the
 (load1 16 to 47 during the passes; other lanes were busy). One run per
 scale. Nothing here is an S1 sample.
 
+**Measured on main `4a10bb8`, before #151.** Every number below comes from
+a release build of main `4a10bb8`. That build has neither #150 nor #151
+(WP3 typed refusals): both merged after the 08:49Z build. The branch that
+carries this doc was later merged with main `dfb9604` (#159, #160, #150,
+#151). The numbers were **not re-measured** on `dfb9604`.
+
+- **What may differ on `dfb9604`.** #151 removed the blanket I/O refusal
+  conversions. It also routes v1 git children through the estimate
+  classifier (`GIT_CHILD_FAILED`), so refusal text may read differently
+  there, such as finding 11's `IO (errno 2)`. Its commit message says
+  errno values and transfer refusal codes are unchanged.
+- **What was checked.** The `ExportOptions::chain` doc comment that
+  finding 3 cites ("Ignored when `prerequisite` is set") is the same at
+  `dfb9604`.
+
 ## Setup
 
 - **Build:** release `bulkload-agent` of main
   `4a10bb8278b189064ce0b32ae0a43ed6127cf218` (it carries #144 counters, #145
-  WP1 and #146 auto-prerequisite chains; PR #151 was still open, so it is not
-  in). Exported with `git archive` into scratch and built with
+  WP1 and #146 auto-prerequisite chains; PRs #150 and #151 were still open,
+  so neither is in). Exported with `git archive` into scratch and built with
   `cargo build --release --locked -p bulkload-agent` in that tree's
   `nix develop`, at nice 19, `CARGO_BUILD_JOBS=4`, under the lanes' shared
   flock, with its own `CARGO_TARGET_DIR`. Default features: carry_v2 is

@@ -12,7 +12,9 @@ allowance in item 4 of the recommendation. It decides nothing itself.
 
 - **Evidence:** [S3 on the estate corpus, sting, 2026-10-04](../evidence/s3-estate-sting-2026-10-04.md),
   measured with `crates/bulkload-bench/scripts/s3_estate.py` and a release
-  build of main `4a10bb8` (PR #151 was still open).
+  build of main `4a10bb8` (PRs #150 and #151 were still open). The branch
+  later merged main `dfb9604`. Nothing was re-measured on it, and the line
+  counts below stay those at `4a10bb8`.
 - **Label:** informational, ungated. No gated sample, no power or load gate
   (load1 was 16 to 47 during the passes).
 
