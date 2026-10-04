@@ -409,22 +409,45 @@ fn socket_buffers_are_raised_and_files_are_left_alone() {
     assert!(!sys::set_socket_buffers(&root, 4 * 1024 * 1024).unwrap());
 }
 
+// WP0(f): background priority is entered on one thread and inherited by
+// every thread and child it creates afterwards. Run on a fresh thread, so the
+// test harness's own threads keep their class (Linux keeps nice and the IO
+// class per thread).
 #[test]
-fn thread_qos_applies_on_darwin_and_is_a_no_op_on_linux() {
+fn background_priority_is_inherited_by_threads_and_children() {
     std::thread::spawn(|| {
-        let applied = sys::set_thread_qos(super::Qos::UserInitiated).unwrap();
-        let now = sys::thread_qos().unwrap();
-        if cfg!(target_vendor = "apple") {
-            assert!(applied);
-            assert_eq!(now, Some(super::Qos::UserInitiated));
-            assert!(sys::set_thread_qos(super::Qos::Background).unwrap());
-            assert_eq!(sys::thread_qos().unwrap(), Some(super::Qos::Background));
-            assert!(sys::set_thread_qos(super::Qos::Utility).unwrap());
-            assert_eq!(sys::thread_qos().unwrap(), Some(super::Qos::Utility));
-        } else {
-            assert!(!applied);
-            assert_eq!(now, None);
-        }
+        sys::enter_background().unwrap();
+        assert!(sys::in_background().unwrap());
+        assert!(std::thread::spawn(|| sys::in_background().unwrap())
+            .join()
+            .unwrap());
+        // A child process inherits the lowered nice value: Linux reports a
+        // process's own nice as field 19 of `/proc/self/stat`, Darwin's `ps`
+        // reports the shell's.
+        #[cfg(target_os = "linux")]
+        let child = std::process::Command::new("cat")
+            .arg("/proc/self/stat")
+            .output()
+            .unwrap();
+        #[cfg(target_vendor = "apple")]
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec ps -o nice= -p $$"])
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let report = String::from_utf8(child.stdout).unwrap();
+        #[cfg(target_os = "linux")]
+        let nice = report
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split(' ')
+            .nth(16)
+            .unwrap()
+            .to_owned();
+        #[cfg(target_vendor = "apple")]
+        let nice = report.trim().to_owned();
+        assert_eq!(nice, sys::BACKGROUND_NICE.to_string());
     })
     .join()
     .unwrap();
