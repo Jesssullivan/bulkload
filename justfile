@@ -155,14 +155,16 @@ bench-r23-corpus *args:
 # Git-heavy, many-small-file trees for S1 and S3, deterministic from (seed,
 # scale) and sealed by the SHAKE-256 of their manifest. DEST must be new and
 # absolute (for example under $TMPDIR). Check a copy with `estate_corpus.py
-# verify DEST`; the S3 knob is `estate_corpus.py mutate DEST N`.
+# verify DEST`; the S3 knob is `estate_corpus.py mutate DEST N`; `seal DEST`
+# makes a kept copy read-only (0444/0555) and writes VERIFY-RECEIPT.json.
 # Estate-shaped corpus generator, WP0(e) (OI-1003-Q19)
 bench-estate-corpus dest seed="bulkload-estate-corpus-v1" scale="small":
     cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py generate "{{ dest }}" --seed "{{ seed }}" --scale "{{ scale }}"
 
 # Generates scale=small twice under $TMPDIR, checks that both share one
-# identity, then checks verify, a one-of-each mutate and tamper detection, and
-# removes both copies. Optional tier only (OI-1003-Q7: CI stays slim).
+# identity, then checks verify, the host-path scan, a one-of-each mutate,
+# seal and tamper detection, and removes both copies. Optional tier only
+# (OI-1003-Q7: CI stays slim).
 # Estate corpus round-trip self-test (OI-1003-Q19)
 bench-estate-corpus-selftest:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py selftest

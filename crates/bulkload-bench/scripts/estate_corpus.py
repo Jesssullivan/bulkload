@@ -21,6 +21,12 @@ Shape. The corpus root models an agent's $HOME:
                              its HEAD.
   git/rNN-*/.claude/worktrees/agent-*   an ignored in-repository worktree.
   git/mirrors/*.git          bare repositories, filled by a push.
+  git/history-heavy/         the #48 repack shape: a long history much larger
+                             than its checkout. assets/model.bin gets a new
+                             incompressible revision every 4th commit, kept
+                             out of delta search, across four packs plus
+                             loose objects (estate: 600 commits, 9 MiB
+                             revisions; small: 40 commits, 512 KiB).
   In the main checkouts: real stashes (one with untracked files), a dirty
   index (a staged edit with an unstaged edit on top, a staged new file and an
   intent-to-add entry), unstaged edits, untracked files, ignored build
@@ -66,7 +72,9 @@ sample hooks do not enter the corpus. They use --object-format=sha1 and
 --ref-format=files (git >= 2.45). Their .git/config is rewritten to the text
 Linux `git init` writes, so macOS's ignorecase and precomposeunicode lines do
 not enter the identity. The corpus repositories have only `.sample` hooks.
-Nothing sets core.hooksPath, and nothing passes --no-verify. umask is 022.
+Nothing sets core.hooksPath, and nothing passes --no-verify. Every
+subcommand sets umask 022 first, so the modes git and mkdir choose never
+depend on the caller.
 Mtimes are left as git and the filesystem set them (so no index is racily
 clean); they are not part of the identity.
 
@@ -96,8 +104,8 @@ normalised explicitly:
              hold absolute paths. Bulkload's carry resolves them absolutely,
              so relative worktrees are not used. The corpus root recorded in
              SEAL.json is replaced by @CORPUS_ROOT@ before hashing, and the
-             size column is the normalised size. Any other file under a git
-             directory that contains the root is a problem.
+             size column is the normalised size. Any other file that
+             contains the root is a problem (see Host paths).
   raw        everything else, including loose objects, packs, .idx, .rev,
              commit-graph, packed-refs, reflogs and the SQLite files.
 SQLite DELETE-mode files are stable for one SQLite version; the header
@@ -116,6 +124,35 @@ SQLite's wal-index: a lock and index cache that bulkload never carries. It is
 therefore set aside, never sealed. `verify` and the counts report it
 (shm_ignored, sqlite_shm_ignored), so a first measurement pass does not stop
 the next `mutate` (OI-1003-Q35), and an S2 harness still sees the write.
+
+Host paths. Every manifest pass (generate, verify, mutate, seal) scans every
+regular file up to 64 MiB and every symlink target for the generating host's
+absolute paths: the corpus root, DEST, $HOME (as given and resolved), the
+generator's checkout, the temp directory and the git scratch prefix. Markers
+shorter than 8 bytes (a bare /tmp) are skipped, since they would match
+generated text by chance. The only exception is the documented one: the
+`root` files above are scanned after the root is replaced by @CORPUS_ROOT@.
+A hit is a problem, so generate and verify fail. Larger files are counted
+(host_scan_skipped) but not scanned, and compressed bytes (git objects, packs,
+.zst) are scanned as stored. Generated text names a modelled home,
+/home/agent, so a host whose $HOME is /home/agent fails the scan.
+
+Classes. SEAL.json counts["classes"] partitions the manifest's entries into
+estate classes (`entry_class`): git-admin, git-checkout, git-worktree,
+git-history, sqlite, agents, credentials, node-modules, projects, cache,
+large-data, dotfiles and edge, each with entries, dirs, files, symlinks and
+bytes.
+
+Seal (`seal DEST`). It runs only in place, on a DEST that verifies and holds
+no SQLite -shm. It sets every file to 0444 (0555 if it has an execute bit)
+and every directory to 0555, including DEST, and records:
+  - readonly_identity: the identity of the read-only view of MANIFEST.tsv
+    (the same rows, with the mode column mapped as above);
+  - VERIFY-RECEIPT.json: the verify of the sealed tree, with both identities.
+From then on, `verify` checks the receipt. It requires the read-only view
+identity, read-only modes, the original identity in MANIFEST.tsv, and no
+mutation round after the seal. A sealed copy cannot be changed without an
+explicit chmod, and after any change, mutate included, verify fails.
 
 Not modelled:
   - hardlinks, holes (sparse files), xattrs and ACLs;
@@ -156,7 +193,7 @@ It writes DEST/mutations/round-RRRR.json with:
     census_walks and pack bytes (OI-1003-Q35).
 SEAL.json and MANIFEST.tsv then move to the new identity. Rounds are
 deterministic, so one round gives the same sidecar on every build measured
-(OI-1003-Q35).
+(OI-1003-Q35). mutate refuses a sealed DEST while it is read-only.
 
 Usage:
   estate_corpus.py generate DEST [--seed S] [--scale small|estate]
@@ -165,6 +202,7 @@ Usage:
   estate_corpus.py verify DEST       exit 0 only if DEST/corpus matches its seal
   estate_corpus.py manifest CORPUS [--root R]
   estate_corpus.py mutate DEST N     apply N deterministic changes (S3)
+  estate_corpus.py seal DEST         make DEST read-only and write its receipt
   estate_corpus.py selftest          optional-tier round trip at scale small
 """
 
@@ -209,6 +247,22 @@ MANIFEST_HEADER = (
     "path\ttype\tmode\tsize\tshake256\ttarget\tnorm\n"
 )
 KINDS = ("edit", "append", "new", "delete", "commit", "head-move")
+UMASK = 0o022
+HISTORY_REPO = "git/history-heavy"
+RECEIPT = "VERIFY-RECEIPT.json"
+RECEIPT_FORMAT = "bulkload-estate-corpus-verify-receipt-v1"
+RULINGS = "OI-1003-Q19, OI-1003-Q23, OI-1003-Q35, R-N13"
+READONLY_MODES = "files 0444, files with an execute bit 0555, directories 0555"
+# Git's private HOME and config live under a temporary directory with this
+# prefix; the host-path scan treats the prefix itself as a host path.
+SCRATCH_PREFIX = "estate-corpus-git-"
+HOST_MARKER_MIN = 8  # shorter host paths would match generated text by chance
+# Estate classes, a partition of the manifest's entries (see `entry_class`).
+CLASSES = (
+    "git-admin", "git-checkout", "git-worktree", "git-history", "sqlite",
+    "agents", "credentials", "node-modules", "projects", "cache", "large-data",
+    "dotfiles", "edge",
+)  # fmt: skip
 # Identities measured with the devShell toolchain on sting (x86_64-linux), see
 # docs/evidence/estate-corpus-v1-2026-10-03.md. The self-test compares against
 # them only when the toolchain matches; a generator change that moves an
@@ -221,11 +275,11 @@ DEVSHELL_TOOLS = {
 }
 RECORDED: dict[tuple[str, str], tuple[str, dict[str, str]]] = {
     ("small", "bulkload-estate-corpus-v1"): (
-        "b36454548957e9bac0b4aefce6e54cf90335df0323d152ececad139aa09a29be",
+        "931af5b130fe601f385a06fa68f85c1f2830f32458787912134b579f01d4572b",
         DEVSHELL_TOOLS,
     ),
     ("estate", "bulkload-estate-corpus-v1"): (
-        "0bd1104ecb67e160689dba4719f34dacf768420016180b38329f3064170c4baf",
+        "0cb96231438c8cd721460276146c8447100951b7ebaeff0eadfe7efa8a3b60bf",
         DEVSHELL_TOOLS,
     ),
 }
@@ -251,6 +305,9 @@ class Scale:
     zst_sessions: int
     sqlite_dbs: int
     sqlite_rows: tuple[int, int]
+    # The #48 repack shape: (commits, source files, a new model.bin revision
+    # every N commits, bytes per revision).
+    history: tuple[int, int, int, int]
 
 
 SCALES = {
@@ -273,6 +330,7 @@ SCALES = {
         zst_sessions=1,
         sqlite_dbs=3,
         sqlite_rows=(300, 900),
+        history=(40, 60, 4, 512 * KIB),
     ),
     "estate": Scale(
         repos=24,
@@ -295,6 +353,7 @@ SCALES = {
         zst_sessions=24,
         sqlite_dbs=10,
         sqlite_rows=(2_000, 60_000),
+        history=(600, 1_500, 4, 9 * MIB),
     ),
 }
 
@@ -850,6 +909,64 @@ def build_repo(g: Git, corpus: Path, base: str, scale: Scale, i: int) -> dict:
     return repo
 
 
+def build_history(g: Git, corpus: Path, base: str, scale: Scale) -> dict:
+    """The #48 repack shape: a long history much larger than its checkout.
+
+    model.bin gets a fresh incompressible revision every `every` commits (one
+    binary path rewritten in place, so history holds every revision), and a
+    few source files change in every commit. `*.bin -delta` keeps repack from
+    searching deltas across the revisions. Incremental `repack -d` at 1/4,
+    2/4, 3/4 and 19/20 of the history leaves four packs plus loose objects
+    for the newest commits, as on a live machine between gcs. Tags every 50
+    commits and an unmerged `side` branch go to packed-refs.
+    """
+    commits, nfiles, every, revision_bytes = scale.history
+    det = Det(f"{base}/history")
+    label = f"{base}/{HISTORY_REPO}"
+    path = corpus / HISTORY_REPO
+    g.init(path)
+    put(path / ".gitattributes", b"*.bin -delta\n")
+    put(path / ".gitignore", GITIGNORE)
+    put(path / "README.md", b"# history-heavy\n\n" + source_text(f"{label}/r", 20))
+    modules = max(1, nfiles // 40)
+    tracked: list[str] = []
+    for k in range(nfiles):
+        module = f"src/{WORDS[k % modules % len(WORDS)]}_{k % modules:02d}"
+        rel_file = f"{module}/{det.word()}_{k:05d}.rs"
+        put(path / rel_file, source_text(f"{label}/{rel_file}", 10 + det.below(120)))
+        tracked.append(rel_file)
+    repack_at = {commits * q // 4 for q in (1, 2, 3)} | {commits * 19 // 20}
+    revisions = 0
+    for c in range(commits):
+        if c % every == 0:
+            model = stream(f"{label}/model/{revisions}", revision_bytes)
+            put(path / "assets/model.bin", model)
+            revisions += 1
+        if c:
+            for e in range(1 + det.below(4)):
+                edit_lines(path / det.choice(tracked), det, f"{label}/c{c}/e{e}")
+        g.run(path, "add", "-A")
+        g.run(path, "commit", "-q", "-m", commit_message(det, c))
+        if c % 50 == 0:
+            g.run(path, "tag", f"v1.{c // 50}.0")
+        if c + 1 in repack_at:
+            g.run(path, "repack", "-d", "-q")
+    g.run(path, "branch", "side", f"HEAD~{min(3, commits - 1)}")
+    g.run(path, "pack-refs", "--all")
+    return {
+        "name": "history-heavy",
+        "path": HISTORY_REPO,
+        "lang": "rs",
+        "features": {"pack": "multi-pack", "history": True},
+        "files": nfiles,
+        "worktrees": [],
+        "stashes": 0,
+        "commits": int(g.run(path, "rev-list", "--count", "--branches", "--tags")),
+        "revisions": revisions,
+        "revision_bytes": revision_bytes,
+    }
+
+
 # ---- non-git estate state ------------------------------------------------------
 
 
@@ -1294,6 +1411,73 @@ def is_gitdir_name(name: str) -> bool:
     return name == ".git" or name.endswith(".git")
 
 
+def entry_class(parts: list[str], kind: str, head: bytes) -> str:
+    """The estate class of one manifest entry; the first matching rule wins.
+
+    git-history is all of the #48 repository. git-admin is everything inside
+    a git directory (`.git`, a bare `*.git`, `git/mirrors`) plus each linked
+    worktree's `.git` file. git-worktree is a linked worktree's checkout, and
+    git-checkout is the rest of `git/`. Outside `git/`, a SQLite database or
+    `-wal` is sqlite wherever it lives; then the top-level area decides.
+    """
+    top = parts[0]
+    if top == "git" and len(parts) > 1:
+        if f"git/{parts[1]}" == HISTORY_REPO:
+            return "git-history"
+        if parts[1] == "mirrors" or any(is_gitdir_name(p) for p in parts):
+            return "git-admin"
+        agent = any(
+            parts[k] == ".claude" and parts[k + 1] == "worktrees"
+            for k in range(1, len(parts) - 2)
+        )
+        if parts[1].endswith(".worktrees") or agent:
+            return "git-worktree"
+        return "git-checkout"
+    if top == "git":
+        return "git-checkout"
+    if kind == "f" and (head == SQLITE_MAGIC or parts[-1].endswith("-wal")):
+        return "sqlite"
+    if top in (".codex", ".claude", ".claude.json"):
+        return "agents"
+    if top == ".ssh" or parts[:2] == [".config", "agent"]:
+        return "credentials"
+    if "node_modules" in parts:
+        return "node-modules"
+    if top == "projects":
+        return "projects"
+    if top == ".cache":
+        return "cache"
+    if top == "data":
+        return "large-data"
+    if top.startswith(".") or top == "dotfiles":
+        return "dotfiles"
+    return "edge"
+
+
+def host_markers(root: str) -> tuple[bytes, ...]:
+    """Host paths that must never appear in the corpus, longest first.
+
+    The corpus root and DEST, $HOME as given and resolved, the generator's
+    checkout, the temp directory and the git scratch prefix. Root-normalised
+    files are scanned after the root is replaced, so a marker that prefixes
+    the root (a DEST under $HOME or $TMPDIR) only matches a real leak.
+    """
+    home = os.path.expanduser("~")
+    temp = tempfile.gettempdir()
+    found = {
+        root,
+        os.path.dirname(root),
+        home,
+        os.path.realpath(home),
+        str(HERE.parents[3]),
+        temp,
+        os.path.realpath(temp),
+        SCRATCH_PREFIX,
+    }
+    markers = {os.fsencode(m) for m in found if len(m) >= HOST_MARKER_MIN}
+    return tuple(sorted(markers, key=lambda m: (-len(m), m)))
+
+
 def norm_kind(parts: list[str]) -> str:
     """Which normalisation a regular file gets (see the module docstring)."""
     if parts[-1] == ".git":
@@ -1321,11 +1505,31 @@ def digest_file(path: Path) -> tuple[int, str, bytes]:
     return size, h.hexdigest(32), head
 
 
-def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
-    """The canonical manifest of `corpus`, its problems and its counts."""
+def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict]:
+    """The canonical manifest of `corpus`, its problems and its counts.
+
+    Every regular file up to LEAK_SCAN_LIMIT, and every symlink target, is
+    scanned for host paths (`host_markers`, the corpus root first). A
+    root-normalised file is scanned after the root is replaced, which is the
+    one documented exception. A hit is a problem. counts["classes"] holds
+    per-class entries, dirs, files, symlinks and bytes (`entry_class`).
+    """
     root_bytes = os.fsencode(root)
+    markers = host_markers(root)
     problems: list[str] = []
-    counts = dict.fromkeys(
+    classes = {
+        name: dict.fromkeys(("entries", "dirs", "files", "symlinks", "bytes"), 0)
+        for name in CLASSES
+    }
+
+    def scan(rel: str, data: bytes) -> None:
+        for marker in markers:
+            if marker in data:
+                where = esc(os.fsdecode(marker))
+                problems.append(f"host path {where} inside {esc(rel)}")
+                return
+
+    counts: dict = dict.fromkeys(
         (
             "entries",
             "dirs",
@@ -1347,6 +1551,7 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
             "large_files",
             "small_files",
             "sqlite_shm_ignored",
+            "host_scan_skipped",
         ),
         0,
     )
@@ -1361,8 +1566,10 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
         parts = rel.split("/")
         in_git = any(is_gitdir_name(p) for p in parts[:-1])
         mode = info.st_mode
-        counts["entries"] += 1
+        head = b""
+        size = 0
         if stat.S_ISDIR(mode):
+            kind = "d"
             counts["dirs"] += 1
             counts["empty_dirs"] += children.get(rel, 0) == 0
             counts["git_dirs"] += parts[-1] == ".git"
@@ -1374,32 +1581,34 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
             )
             row = (rel, "d", f"{mode & 0o7777:04o}", "-", "-", "-", "-")
         elif stat.S_ISLNK(mode):
+            kind = "l"
             counts["symlinks"] += 1
             target = os.readlink(corpus / rel)
-            size = str(len(os.fsencode(target)))
-            row = (rel, "l", "-", size, "-", esc(target), "-")
+            scan(rel, os.fsencode(target))
+            row = (rel, "l", "-", str(len(os.fsencode(target))), "-", esc(target), "-")
         elif stat.S_ISREG(mode):
+            kind = "f"
             counts["files"] += 1
             norm = norm_kind(parts)
             path = corpus / rel
-            if norm == "raw" and not (in_git and info.st_size <= LEAK_SCAN_LIMIT):
+            if norm == "raw" and info.st_size > LEAK_SCAN_LIMIT:
                 size, digest, head = digest_file(path)
+                counts["host_scan_skipped"] += 1
             else:
                 data = path.read_bytes()
                 head = data[:16]
                 size = len(data)
-                if norm == "raw" and root_bytes in data:
-                    problems.append(f"absolute corpus root inside {rel}")
-                elif norm == "root":
+                if norm == "root":
                     data = data.replace(root_bytes, ROOT_TOKEN)
                     size = len(data)
                     counts["gitfiles"] += parts[-1] == ".git"
-                elif norm == "git-index":
+                scan(rel, data)
+                if norm == "git-index":
                     counts["git_indexes"] += 1
                     try:
                         data = index_logical(data)
                     except (CorpusError, ValueError, struct.error) as err:
-                        problems.append(f"index {rel}: {err}")
+                        problems.append(f"index {esc(rel)}: {err}")
                 digest = hashlib.shake_256(data).hexdigest(32)
             name = parts[-1]
             counts["bytes"] += size
@@ -1419,9 +1628,15 @@ def manifest(corpus: Path, root: str) -> tuple[str, list[str], dict[str, int]]:
             counts["small_files"] += info.st_size <= 4 * KIB
             row = (rel, "f", f"{mode & 0o7777:04o}", str(size), digest, "-", norm)
         else:
-            problems.append(f"not a file, directory or symlink: {rel}")
+            problems.append(f"not a file, directory or symlink: {esc(rel)}")
             continue
+        counts["entries"] += 1
+        bucket = classes[entry_class(parts, kind, head)]
+        bucket["entries"] += 1
+        bucket[{"d": "dirs", "f": "files", "l": "symlinks"}[kind]] += 1
+        bucket["bytes"] += size
         lines.append("\t".join((esc(row[0]), *row[1:])) + "\n")
+    counts["classes"] = classes
     return "".join(lines), problems, counts
 
 
@@ -1430,10 +1645,13 @@ def identity_of(text: str) -> str:
 
 
 def rows_of(text: str) -> dict[str, list[str]]:
+    # Split on newline only: str.splitlines also splits on U+2028 and the
+    # like, which esc() leaves in a path.
     rows = {}
-    for line in text.splitlines()[1:]:
-        fields = line.split("\t")
-        rows[fields[0]] = fields
+    for line in text.split("\n")[1:]:
+        if line:
+            fields = line.split("\t")
+            rows[fields[0]] = fields
     return rows
 
 
@@ -1449,7 +1667,7 @@ def diff_rows(
     return added, removed, modified
 
 
-# ---- seal ------------------------------------------------------------------------------
+# ---- generate, verify and seal -----------------------------------------------------
 
 
 def toolchain() -> dict[str, str | None]:
@@ -1497,21 +1715,34 @@ def write_json(path: Path, value: object) -> None:
 
 
 def readme(seal: dict) -> str:
-    return (
+    counts = seal["counts"]
+    text = (
         f"# Estate-shaped corpus v1 ({seal['identity'][:16]})\n\n"
         "Generated by bulkload `crates/bulkload-bench/scripts/estate_corpus.py`\n"
         f"(WP0(e), OI-1003-Q19) with seed `{seal['seed']}` and scale "
         f"`{seal['scale']}`.\n\n"
         f"- Identity (SHAKE-256/256 of MANIFEST.tsv): `{seal['identity']}`\n"
-        f"- {seal['counts']['entries']:,} entries, {seal['counts']['files']:,} files, "
-        f"{seal['counts']['bytes']:,} bytes under `corpus/`.\n"
+        f"- {counts['entries']:,} entries, {counts['files']:,} files, "
+        f"{counts['bytes']:,} bytes under `corpus/`.\n"
         "- Check before use: `estate_corpus.py verify <this dir>`.\n"
         "- Not relocatable: linked worktrees point at the absolute generation path,\n"
         "  so never run git in a moved copy.\n"
     )
+    sealed = seal.get("readonly")
+    if sealed:
+        text += (
+            "\n## PROTECTED: sealed read-only\n\n"
+            "Do not modify, move, prune or delete this directory. It was sealed in\n"
+            f"place on {sealed['sealed_at']} ({READONLY_MODES}).\n"
+            f"`verify` checks it against `{RECEIPT}`, so any change fails,\n"
+            "a `mutate` round included.\n\n"
+            f"- Read-only view identity: `{sealed['identity']}`\n"
+        )
+    return text
 
 
 def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
+    os.umask(UMASK)
     if dest.exists() or not dest.parent.is_dir():
         print(
             f"estate-corpus refused: DEST must be new under an existing parent: {dest}"
@@ -1521,7 +1752,6 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
     if git_version(tools["git"]) < MIN_GIT:
         print(f"estate-corpus refused: git >= 2.45 required, found {tools['git']}")
         return 2, None
-    os.umask(0o022)
     started = time.monotonic()
     scale = SCALES[scale_name]
     base = f"{seed}/{scale_name}"
@@ -1531,7 +1761,7 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
     root = os.path.realpath(corpus)
     notes: list[str] = []
     repos = []
-    with tempfile.TemporaryDirectory(prefix="estate-corpus-git-") as raw:
+    with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX) as raw:
         scratch = Path(raw)
         build_home(Path(root), base)
         build_large(Path(root), base, scale)
@@ -1541,6 +1771,7 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
         g = Git(scratch, Path(root), HISTORY_EPOCH)
         for i in range(scale.repos):
             repos.append(build_repo(g, Path(root), base, scale, i))
+        repos.append(build_history(g, Path(root), base, scale))
     text, problems, counts = manifest(Path(root), root)
     identity = identity_of(text)
     recorded = recorded_identity(scale_name, seed, tools)
@@ -1577,11 +1808,62 @@ def generate(dest: Path, seed: str, scale_name: str) -> tuple[int, str | None]:
     return (1 if problems else 0), identity
 
 
-def load_seal(dest: Path) -> dict | None:
+def load_json(path: Path) -> dict | None:
     try:
-        return json.loads((dest / "SEAL.json").read_text())
+        value = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+    return value if isinstance(value, dict) else None
+
+
+def load_seal(dest: Path) -> dict | None:
+    return load_json(dest / "SEAL.json")
+
+
+def is_sealed(dest: Path, seal: dict) -> bool:
+    """Whether `seal` sealed DEST; its receipt then pins DEST for good."""
+    return bool(seal.get("readonly")) or os.path.lexists(dest / RECEIPT)
+
+
+def readonly_mode(kind: str, mode: str) -> str:
+    """The mode column of an entry once sealed (READONLY_MODES)."""
+    if kind == "d":
+        return "0555"
+    if kind == "f":
+        return "0555" if int(mode, 8) & 0o111 else "0444"
+    return mode
+
+
+def readonly_view(text: str) -> str:
+    """A manifest with every mode mapped to its sealed, read-only mode."""
+    head, _, body = text.partition("\n")
+    out = [head + "\n"]
+    for line in body.split("\n"):
+        if line:
+            fields = line.split("\t")
+            fields[2] = readonly_mode(fields[1], fields[2])
+            out.append("\t".join(fields) + "\n")
+    return "".join(out)
+
+
+def writable_count(dest: Path, text: str) -> int:
+    """Entries of a sealed DEST that are not at their read-only mode.
+
+    Corpus entries come from the manifest `text`; DEST itself, its top-level
+    files and the mutation sidecars must have no write bit.
+    """
+    view = readonly_view(text)
+    count = sum(a != b for a, b in zip(text.split("\n"), view.split("\n")))
+    paths = [dest]
+    with os.scandir(dest) as top:
+        for entry in top:
+            if entry.name == "corpus":
+                continue
+            paths.append(Path(entry.path))
+            if entry.is_dir(follow_symlinks=False):
+                with os.scandir(entry.path) as inner:
+                    paths += [Path(e.path) for e in inner]
+    return count + sum(bool(os.lstat(p).st_mode & 0o222) for p in paths)
 
 
 def verify(dest: Path) -> int:
@@ -1591,26 +1873,144 @@ def verify(dest: Path) -> int:
         print(f"estate-corpus verify dest={dest} missing=1 ok=False")
         return 1
     text, problems, counts = manifest(corpus, seal["root"])
-    identity = identity_of(text)
     for problem in problems:
         print(f"estate-corpus problem: {problem}")
     if counts["sqlite_shm_ignored"]:
         for rel in sealed_walk(corpus)[1]:
             print(f"estate-corpus note: unsealed SQLite wal-index {esc(rel)}")
-    ok = not problems and identity == seal["identity"]
-    if not ok and (dest / "MANIFEST.tsv").is_file():
-        sealed = rows_of((dest / "MANIFEST.tsv").read_text())
-        added, removed, modified = diff_rows(sealed, rows_of(text))
+    path = dest / "MANIFEST.tsv"
+    recorded = path.read_text() if path.is_file() else None
+    sealed = is_sealed(dest, seal)
+    if sealed:
+        receipt = load_json(dest / RECEIPT) or {}
+        expected = receipt.get("readonly_identity")
+        current = readonly_view(text)
+        identity = identity_of(current)
+        baseline = readonly_view(recorded) if recorded is not None else None
+        checks = {
+            "receipt": expected is not None
+            and expected == (seal.get("readonly") or {}).get("identity"),
+            "manifest": recorded is not None
+            and identity_of(recorded) == receipt.get("identity") == seal["identity"],
+            "no-round-since-seal": len(seal["mutations"]) == receipt.get("mutations"),
+            "identity": identity == expected,
+            "read-only": writable_count(dest, text) == 0,
+        }
+        for name, passed in checks.items():
+            if not passed:
+                print(f"estate-corpus sealed check failed: {name}")
+        ok = not problems and all(checks.values())
+    else:
+        expected = seal["identity"]
+        current = text
+        identity = identity_of(text)
+        baseline = recorded
+        ok = not problems and identity == expected
+    if not ok and baseline is not None:
+        added, removed, modified = diff_rows(rows_of(baseline), rows_of(current))
         for sign, paths in (("+", added), ("-", removed), ("~", modified)):
-            for path in paths[:20]:
-                print(f"estate-corpus differs: {sign} {path}")
+            for rel in paths[:20]:
+                print(f"estate-corpus differs: {sign} {rel}")
     relocated = os.path.realpath(corpus) != seal["root"]
     print(
         f"estate-corpus verify dest={dest} identity={identity} "
-        f"expected={seal['identity']} relocated={int(relocated)} "
+        f"expected={expected} sealed={int(sealed)} relocated={int(relocated)} "
         f"shm_ignored={counts['sqlite_shm_ignored']} ok={ok}"
     )
     return 0 if ok else 1
+
+
+def seal_dest(dest: Path) -> int:
+    """Make DEST read-only in place and write its verify receipt (see Seal)."""
+    os.umask(UMASK)
+    started = time.monotonic()
+    seal = load_seal(dest)
+    corpus = dest / "corpus"
+    if seal is None or not corpus.is_dir():
+        print(f"estate-corpus refused: seal needs a generated DEST: {dest}")
+        return 2
+    if is_sealed(dest, seal):
+        print(f"estate-corpus refused: DEST is already sealed: {dest}")
+        return 2
+    root = seal["root"]
+    if os.path.realpath(corpus) != root:
+        print(f"estate-corpus refused: seal runs in place only (generated at {root})")
+        return 2
+    text, problems, counts = manifest(corpus, root)
+    if counts["sqlite_shm_ignored"]:
+        print("estate-corpus refused: a SQLite wal-index (-shm) is present")
+        return 2
+    path = dest / "MANIFEST.tsv"
+    recorded = path.read_text() if path.is_file() else None
+    if problems or text != recorded or identity_of(text) != seal["identity"]:
+        for problem in problems:
+            print(f"estate-corpus problem: {problem}")
+        print("estate-corpus refused: the corpus does not match its seal")
+        return 1
+    view = readonly_view(text)
+    readonly_identity = identity_of(view)
+    for rel, info in walk(corpus):
+        if not stat.S_ISLNK(info.st_mode):
+            kind = "d" if stat.S_ISDIR(info.st_mode) else "f"
+            mode = readonly_mode(kind, f"{info.st_mode & 0o7777:04o}")
+            os.chmod(corpus / rel, int(mode, 8))
+    corpus.chmod(0o555)
+    sealed_text, problems, counts = manifest(corpus, root)
+    for problem in problems:
+        print(f"estate-corpus problem: {problem}")
+    if problems or sealed_text != view:
+        print("estate-corpus seal failed: the sealed tree is not the read-only view")
+        return 1
+    sealed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    receipt = {
+        "format": RECEIPT_FORMAT,
+        "rulings": RULINGS,
+        "dest": str(dest),
+        "root": root,
+        "seed": seal["seed"],
+        "scale": seal["scale"],
+        "identity": seal["identity"],
+        "base_identity": seal["base_identity"],
+        "readonly_identity": readonly_identity,
+        "readonly_modes": READONLY_MODES,
+        "mutations": len(seal["mutations"]),
+        "verified": {
+            "ok": True,
+            "check": "sealed tree == read-only view of MANIFEST.tsv",
+            "problems": 0,
+            "shm_ignored": 0,
+            "host_scan_skipped": counts["host_scan_skipped"],
+            "seconds": round(time.monotonic() - started, 1),
+        },
+        "counts": counts,
+        "tools": toolchain(),
+        "generator_shake256": seal["generator_shake256"],
+        "sealer_shake256": hashlib.shake_256(HERE.read_bytes()).hexdigest(32),
+        "host": platform.node(),
+        "sealed_at": sealed_at,
+    }
+    seal["readonly"] = {
+        "identity": readonly_identity,
+        "modes": READONLY_MODES,
+        "receipt": RECEIPT,
+        "sealed_at": sealed_at,
+    }
+    write_json(dest / "SEAL.json", seal)
+    write_json(dest / RECEIPT, receipt)
+    (dest / "README.md").write_text(readme(seal))
+    for dirpath, dirnames, filenames in os.walk(dest):
+        if Path(dirpath) == dest:
+            dirnames[:] = [d for d in dirnames if d != "corpus"]
+        for name in filenames:
+            if not os.path.islink(Path(dirpath) / name):
+                os.chmod(Path(dirpath) / name, 0o444)
+        os.chmod(dirpath, 0o555)
+    print(
+        f"estate-corpus sealed={dest} identity={seal['identity']} "
+        f"readonly_identity={readonly_identity} receipt={dest / RECEIPT} "
+        f"seconds={time.monotonic() - started:.1f}"
+    )
+    return 0
 
 
 # ---- mutation (the S3 knob) ---------------------------------------------------------
@@ -1621,10 +2021,17 @@ def stat_key(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def mutate(dest: Path, count: int) -> int:
+    os.umask(UMASK)
     seal = load_seal(dest)
     corpus = dest / "corpus"
     if seal is None or count < 1:
         print(f"estate-corpus refused: mutate needs a sealed DEST and N >= 1: {dest}")
+        return 2
+    if is_sealed(dest, seal) and not os.access(corpus, os.W_OK):
+        print(
+            f"estate-corpus refused: DEST is sealed read-only ({RECEIPT}); "
+            "mutate a fresh generation"
+        )
         return 2
     root = seal["root"]
     if os.path.realpath(corpus) != root:
@@ -1675,7 +2082,7 @@ def mutate(dest: Path, count: int) -> int:
     order = det.shuffled(KINDS)
     used: set[str] = set()
     operations = []
-    with tempfile.TemporaryDirectory(prefix="estate-corpus-git-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=SCRATCH_PREFIX) as tmp:
         g = Git(Path(tmp), Path(root), MUTATION_EPOCH + rnd * 86_400)
         for k in range(count):
             kind = order[k % len(order)]
@@ -1869,8 +2276,39 @@ def mutate(dest: Path, count: int) -> int:
 # ---- self-test ---------------------------------------------------------------------------
 
 
+def make_writable(top: Path) -> None:
+    """Give the owner write access to every directory under `top` again."""
+    if top.is_dir():
+        for dirpath, _dirs, _files in os.walk(top):
+            os.chmod(dirpath, 0o755)
+
+
+def restore_modes(dest: Path) -> None:
+    """Undo a seal by hand: the modes recorded in MANIFEST.tsv come back."""
+    corpus = dest / "corpus"
+    rows = rows_of((dest / "MANIFEST.tsv").read_text())
+    for rel, _info in walk(corpus):
+        row = rows.get(esc(rel))
+        if row and row[1] in ("d", "f"):
+            os.chmod(corpus / rel, int(row[2], 8))
+    corpus.chmod(0o755)
+    dest.chmod(0o755)
+    with os.scandir(dest) as top:
+        for entry in top:
+            if entry.name == "corpus":
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                os.chmod(entry.path, 0o755)
+                with os.scandir(entry.path) as inner:
+                    for item in inner:
+                        os.chmod(item.path, 0o644)
+            else:
+                os.chmod(entry.path, 0o644)
+
+
 def selftest() -> int:
-    """Generate scale=small twice, verify, mutate and tamper (optional tier)."""
+    """Generate scale=small twice; verify, scan, mutate, seal and tamper."""
+    os.umask(UMASK)
     started = time.monotonic()
     temps = [
         Path(tempfile.mkdtemp(prefix=f"estate-corpus-selftest-{n}-")) for n in "ab"
@@ -1882,6 +2320,16 @@ def selftest() -> int:
         if not ok:
             failures.append(what)
 
+    def first_file(dest: Path, top: str) -> Path:
+        """The first regular file directly in `top`, by DEST's manifest."""
+        rows = rows_of((dest / "MANIFEST.tsv").read_text())
+        rel = min(
+            p
+            for p, r in rows.items()
+            if r[1] == "f" and p.rpartition("/")[0] == top and "\\" not in p
+        )
+        return dest / "corpus" / rel
+
     try:
         a, b = (t / "dest" for t in temps)
         rc_a, id_a = generate(a, DEFAULT_SEED, "small")
@@ -1892,13 +2340,39 @@ def selftest() -> int:
             (a / "MANIFEST.tsv").read_bytes() == (b / "MANIFEST.tsv").read_bytes(),
             "the two manifests are byte-identical",
         )
-        tools = load_seal(a)["tools"]
+        seal_a = load_seal(a) or {}
+        tools = seal_a["tools"]
         recorded = recorded_identity("small", DEFAULT_SEED, tools)
         if recorded:
             check(id_a == recorded, f"identity equals the recorded {recorded[:16]}")
         else:
             print(f"estate-corpus selftest note: nothing recorded for tools {tools}")
-        check(verify(a) == 0, "verify accepts the sealed corpus")
+        classes = seal_a["counts"]["classes"]
+        check(
+            sum(c["entries"] for c in classes.values()) == seal_a["counts"]["entries"]
+            and all(c["entries"] for c in classes.values()),
+            "the classes partition the manifest and none is empty",
+        )
+        history = a / "corpus" / HISTORY_REPO / ".git" / "objects"
+        loose = [d for d in history.iterdir() if len(d.name) == 2 and any(d.iterdir())]
+        check(
+            len(list((history / "pack").glob("*.pack"))) == 4 and bool(loose),
+            "the history repository holds four packs plus loose objects",
+        )
+        check(verify(a) == 0, "verify accepts the generated corpus")
+        root_b = (load_seal(b) or {})["root"]
+        planted = b / "corpus" / "names" / "planted-host-path.txt"
+        planted.write_bytes(b"cwd=" + os.fsencode(str(HERE.parent)) + b"\n")
+        link(b / "corpus" / "links" / "planted-abs", os.path.join(root_b, "names"))
+        problems = manifest(b / "corpus", root_b)[1]
+        check(
+            any("planted-host-path.txt" in p for p in problems)
+            and any("planted-abs" in p for p in problems),
+            "the host-path scan flags a planted path and an absolute symlink",
+        )
+        planted.unlink()
+        (b / "corpus" / "links" / "planted-abs").unlink()
+        check(verify(b) == 0, "verify accepts the copy once they are removed")
         # A first measurement pass reads the WAL image as provider_sqlite does
         # (read-only, WAL-aware), which leaves a -shm; mutate must still run.
         for dest in (a, b):
@@ -1964,16 +2438,75 @@ def selftest() -> int:
         with victim.open("ab") as handle:
             handle.write(b"!")
         check(verify(b) == 1, "verify rejects a tampered byte")
+        # Seal: read-only modes and a receipt that pins the copy for good.
+        check(seal_dest(a) == 2, "seal refuses a copy with a SQLite -shm")
+        shm.unlink()
+        check(seal_dest(a) == 0, "seal makes the copy read-only")
+        sealed = load_seal(a) or {}
+        receipt = load_json(a / RECEIPT) or {}
+        check(
+            receipt.get("readonly_identity") == sealed["readonly"]["identity"]
+            and receipt.get("identity") == sealed["identity"]
+            and receipt.get("rulings") == RULINGS,
+            "the receipt pins both identities",
+        )
+        probes = (
+            a,
+            a / "SEAL.json",
+            a / RECEIPT,
+            a / "mutations",
+            a / "corpus",
+            a / "corpus" / ".ssh",
+            a / "corpus" / ".ssh" / "config",
+            a / "corpus" / ".local" / "bin" / "corpus-tool",
+            a / "corpus" / "Documents" / "shared.txt",
+        )
+        modes = [stat.S_IMODE(os.lstat(p).st_mode) for p in probes]
+        check(
+            modes == [0o555, 0o444, 0o444, 0o555, 0o555, 0o555, 0o444, 0o555, 0o444],
+            "sealed modes are 0444, or 0555 for directories and executables",
+        )
+        check(verify(a) == 0, "verify accepts the sealed copy")
+        check(
+            mutate(a, 1) == 2 and seal_dest(a) == 2 and verify(a) == 0,
+            "mutate and a second seal refuse the sealed copy",
+        )
+        parent = a / "corpus" / "names"
+        parent.chmod(0o755)
+        extra = parent / "added-after-seal.txt"
+        extra.write_bytes(b"added\n")
+        extra.chmod(0o444)
+        parent.chmod(0o555)
+        check(verify(a) == 1, "verify rejects one added file in the sealed copy")
+        parent.chmod(0o755)
+        extra.unlink()
+        parent.chmod(0o555)
+        check(verify(a) == 0, "verify accepts the sealed copy once it is removed")
+        gone = first_file(a, "names")
+        aside = temps[0] / "aside"
+        parent.chmod(0o755)
+        gone.rename(aside)
+        parent.chmod(0o555)
+        check(verify(a) == 1, "verify rejects one removed file in the sealed copy")
+        parent.chmod(0o755)
+        aside.rename(gone)
+        parent.chmod(0o555)
+        check(verify(a) == 0, "verify accepts the sealed copy once it is restored")
+        restore_modes(a)
+        check(mutate(a, 1) == 0, "mutate runs once the seal is undone by hand")
+        check(verify(a) == 1, "verify rejects the sealed copy after mutate 1")
     except (
         CorpusError,
         OSError,
         KeyError,
         ValueError,
+        StopIteration,
         subprocess.SubprocessError,
     ) as err:
         check(False, f"self-test raised {type(err).__name__}: {err}")
     finally:
         for temp in temps:
+            make_writable(temp)
             shutil.rmtree(temp, ignore_errors=True)
         check(not any(t.exists() for t in temps), "temporary corpora removed")
     print(
@@ -1984,6 +2517,7 @@ def selftest() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    os.umask(UMASK)  # every subcommand, so git's and mkdir's modes are fixed
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser("generate", help="build a new corpus under DEST")
@@ -1998,6 +2532,8 @@ def main(argv: list[str] | None = None) -> int:
     mut = sub.add_parser("mutate", help="the S3 knob: apply N changes in place")
     mut.add_argument("dest")
     mut.add_argument("count", metavar="N", type=int)
+    sea = sub.add_parser("seal", help="make DEST read-only and write its receipt")
+    sea.add_argument("dest")
     sub.add_parser("selftest", help="optional-tier round trip at scale small")
     args = parser.parse_args(argv)
     try:
@@ -2007,6 +2543,8 @@ def main(argv: list[str] | None = None) -> int:
             return verify(Path(args.dest).absolute())
         if args.command == "mutate":
             return mutate(Path(args.dest).absolute(), args.count)
+        if args.command == "seal":
+            return seal_dest(Path(args.dest).absolute())
         if args.command == "selftest":
             return selftest()
         corpus = Path(args.corpus).absolute()
