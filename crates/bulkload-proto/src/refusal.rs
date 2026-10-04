@@ -135,6 +135,11 @@ pub enum BulkloadRefusal {
     /// and the like), where its `flock` locks cannot be trusted. Ingest
     /// destinations must be local filesystems (operator ruling OI-1001-Q17).
     GitDestinationFilesystemUnsupported,
+    /// A Git source is a partial clone (a promisor remote, a partial-clone
+    /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
+    /// store or an alternate). Reading it could fault in a lazy fetch, so v1
+    /// carry refuses it before any other read (S2, OI-1003-Q16).
+    GitSourcePartialClone,
     /// A Git child process exited non-zero (WP3). Carries its stderr's class
     /// from the closed [`StderrClass`] set; no byte of the stderr itself is
     /// carried or printed (R-N121).
@@ -227,6 +232,7 @@ impl BulkloadRefusal {
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+            Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::GitChildFailed(_) => "GIT_CHILD_FAILED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
@@ -283,6 +289,7 @@ impl BulkloadRefusal {
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+        "GIT_SOURCE_PARTIAL_CLONE",
         "GIT_CHILD_FAILED",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
@@ -496,6 +503,7 @@ mod tests {
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitDestinationFilesystemUnsupported,
+            BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::GitChildFailed(StderrClass::Other),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
