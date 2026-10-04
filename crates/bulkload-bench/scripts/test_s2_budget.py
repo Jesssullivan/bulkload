@@ -381,6 +381,66 @@ class ArgumentTests(unittest.TestCase):
             self.assertIn("evidence=false", out.getvalue())
 
 
+class GitIsolationTests(unittest.TestCase):
+    def test_git_env_drops_every_inherited_git_variable(self) -> None:
+        inherited = {
+            "PATH": "/bin",
+            "GIT_DIR": "/elsewhere/.git",
+            "GIT_INDEX_FILE": "/elsewhere/.git/index",
+            "GIT_WORK_TREE": "/elsewhere",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": "/elsewhere",
+            "GIT_TEMPLATE_DIR": "/elsewhere/templates",
+        }
+        env = s2.git_env(Path("/work"), inherited)
+        self.assertEqual(env["PATH"], "/bin")
+        self.assertEqual(
+            {k: v for k, v in env.items() if k.startswith("GIT_")},
+            {**s2.GIT_SET, "GIT_CEILING_DIRECTORIES": "/work"},
+        )
+
+    def test_fixtures_and_workload_never_touch_an_inherited_repository(self) -> None:
+        git = s2.shutil.which("git")
+        if git is None:
+            self.skipTest("git is not on PATH")
+        with tempfile.TemporaryDirectory() as tmp:
+            decoy = Path(tmp) / "decoy"
+            decoy.mkdir()
+            s2.build_fixtures(decoy, git)
+            dot = decoy / "repo" / ".git"
+            before = {
+                "head": (dot / "HEAD").read_bytes(),
+                "main": (dot / "refs" / "heads" / "main").read_bytes(),
+                "index": (dot / "index").read_bytes(),
+            }
+            hostile = {
+                "GIT_DIR": str(dot),
+                "GIT_INDEX_FILE": str(dot / "index"),
+                "GIT_WORK_TREE": str(decoy / "repo"),
+            }
+            root = Path(tmp) / "work"
+            root.mkdir()
+            with mock.patch.dict(s2.os.environ, hostile):
+                s2.build_fixtures(root, git)
+                tool, search = s2.search_command(root / "tree")
+                workload = s2.Workload(root, git, search)
+                try:
+                    results = workload.step()
+                finally:
+                    workload.close()
+            after = {
+                "head": (dot / "HEAD").read_bytes(),
+                "main": (dot / "refs" / "heads" / "main").read_bytes(),
+                "index": (dot / "index").read_bytes(),
+            }
+            own = root / "repo" / ".git"
+            self.assertTrue((own / "refs" / "heads" / "main").is_file())
+            self.assertTrue((own / "index").is_file())
+        self.assertEqual(after, before)
+        self.assertTrue(all(error is None for _, _, error in results), results)
+
+
 class LiveRunTests(unittest.TestCase):
     def test_a_short_run_samples_waits_and_ends(self) -> None:
         before = threading.active_count()

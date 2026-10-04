@@ -16,6 +16,10 @@ another device, inside the source, or already existing. One step runs at a fixed
             (the tool used is recorded).
 `step` is the sum of the four: the latency of one agent step. A step that
 overruns its second skips the ticks it missed (counted), never runs late.
+Every git child runs without any inherited GIT_* variable and without the
+global or system configuration (`git_env`), so a GIT_DIR or GIT_INDEX_FILE
+exported by a hook, `rebase -x` or `bisect run` cannot point the fixture
+build or the workload at a repository outside the work directory.
 
 Sampler: load1 at 1 Hz, from /proc/loadavg on Linux and `sysctl -n
 vm.loadavg` on Darwin (os.getloadavg elsewhere; the source is recorded).
@@ -228,11 +232,38 @@ def git_base(git: str) -> list[str]:
     return [git, "-c", "core.fsmonitor=false", "-c", "gc.auto=0"]
 
 
+# Every git child runs in an environment of its own, matching the agent's
+# `git_carry::git_env`. An inherited GIT_DIR, GIT_INDEX_FILE or GIT_WORK_TREE
+# (git exports them to hooks, `rebase -x` and `bisect run`) would point the
+# fixture build and the 1 Hz workload at a repository outside the workdir, so
+# every inherited GIT_* variable is dropped (a superset of git_env::CLEARED,
+# which also covers GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> and
+# GIT_TEMPLATE_DIR). The global and system configuration are not read, git
+# never prompts, and discovery never climbs above the work directory.
+GIT_SET = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def git_env(ceiling: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment of every git child: `base` (the process environment
+    by default) without any GIT_* variable, plus GIT_SET, plus
+    GIT_CEILING_DIRECTORIES at `ceiling`."""
+    source = os.environ if base is None else base
+    env = {key: value for key, value in source.items() if not key.startswith("GIT_")}
+    env.update(GIT_SET)
+    env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
+    return env
+
+
 def build_fixtures(root: Path, git: str) -> None:
     """A 64-file fixture repository with one modified file, so `git diff`
     has output, and a 256-file tree for the search. Deterministic. The
     commit is made with plumbing (write-tree, commit-tree, update-ref), which
-    runs no commit hooks, so none are invoked or bypassed."""
+    runs no commit hooks, so none are invoked or bypassed. Every git child
+    runs with `git_env`, so nothing outside `root` is read or written."""
     rng = random.Random(34)
     repo = root / "repo"
     for d in range(8):
@@ -245,7 +276,7 @@ def build_fixtures(root: Path, git: str) -> None:
             path = root / "tree" / f"t{t:02}" / f"f{f:02}.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(fixture_text(rng, 64, needle=(t * 16 + f) % 7 == 0))
-    env = {**os.environ, **FIXTURE_ENV}
+    env = {**git_env(root.resolve()), **FIXTURE_ENV}
     base = git_base(git)
 
     def plumb(*args: str) -> str:
@@ -289,6 +320,7 @@ class Workload:
     def __init__(self, root: Path, git: str, search: list[str]) -> None:
         self.root = root
         self.git = git_base(git)
+        self.git_env = git_env(root.resolve())
         self.search = search
         self.repo = root / "repo"
         self.steps = 0
@@ -339,6 +371,7 @@ class Workload:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=True,
+                env=self.git_env,
             )
 
     def search_tree(self) -> None:
@@ -757,7 +790,7 @@ def run_once(command, priority, run, runs_dir, origin) -> dict:
     return record
 
 
-def host_record(git: str, search: list[str], source: str) -> dict:
+def host_record(git: str, search: list[str], source: str, env: dict) -> dict:
     def version(argv: list[str]) -> str:
         try:
             out = subprocess.run(
@@ -766,6 +799,7 @@ def host_record(git: str, search: list[str], source: str) -> dict:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=env,
             ).stdout
         except OSError:
             return "unknown"
@@ -828,7 +862,7 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
             "min_window_samples": args.min_window_samples,
             "min_on_busy": args.min_on_busy,
         },
-        "host": host_record(git, search, source_name),
+        "host": host_record(git, search, source_name, workload.git_env),
         "start_utc": utc_now(),
         "windows": [],
         "latency": [],
