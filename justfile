@@ -223,10 +223,52 @@ ci:
 
 import? "justfile.flywheel"
 
+# docs/formal's typed catalogue (OI-1003-Q32): render configs.tsv and every
+# MC_*.cfg from docs/formal/catalogue/Catalogue.dhall into OUT (default
+# docs/formal). Every MC_*.cfg already in OUT is removed first, so a config
+# dropped from the catalogue leaves no stale file. dhall-to-json evaluates
+# the catalogue, which also checks its asserts (a mutation without a verdict
+# does not type-check), and jq writes one file per entry. Both come from the
+# flake's pinned nixpkgs (no flake change). JSON, when given, keeps the
+# evaluated catalogue for tla-check's grounding step.
+# Render docs/formal's TLC configs from the Dhall catalogue.
+tla-render out="" json="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}/docs/formal
+    out='{{ out }}'
+    out=${out:-{{ root }}/docs/formal}
+    json='{{ json }}'
+    if [[ -z $json ]]; then
+        json=$(mktemp "${TMPDIR:-/tmp}/tla-render.XXXXXX")
+        trap 'rm -f "$json"' EXIT
+    fi
+    read -r d2j jq < <(nix shell --inputs-from {{ root }} nixpkgs#dhall-json nixpkgs#jq --command sh -c 'printf "%s %s\n" "$(command -v dhall-to-json)" "$(command -v jq)"')
+    "$d2j" --file catalogue/Catalogue.dhall --output "$json"
+    if ! "$jq" -e '[.files[].name] | (length == (unique | length)) and all(test("^(MC_[A-Za-z0-9_]+[.]cfg|configs[.]tsv)$"))' "$json" >/dev/null; then
+        echo "tla-render: the catalogue's file names are duplicated or unsafe" >&2
+        exit 1
+    fi
+    mkdir -p "$out"
+    rm -f "$out"/MC_*.cfg
+    count=$("$jq" '.files | length' "$json")
+    for ((i = 0; i < count; i++)); do
+        name=$("$jq" -r ".files[$i].name" "$json")
+        "$jq" -j ".files[$i].text" "$json" >"$out/$name"
+    done
+    echo "tla-render: $count files into $out"
+
 # TLA+ model of wire v5, Held, the group commits and resume (proof package,
 # OI-1003-Q7; docs/formal/README.md). Standalone and on demand: no tier
 # depends on it, so check-fast, check-optional, check-full and CI never start
-# TLC. TLC comes from the flake's pinned nixpkgs (no flake change). The rows
+# TLC. TLC comes from the flake's pinned nixpkgs (no flake change). Before
+# any TLC run, two catalogue checks (OI-1003-Q32) must pass. Staleness: the
+# catalogue, rendered into scratch, equals the committed configs.tsv and
+# MC_*.cfg byte for byte, with no file missing or extra. Grounding: every
+# operator the catalogue names (properties, witnesses, actions, the specs)
+# is defined in BulkloadTransfer.tla, every constant is declared, every
+# mutation is in its Mutations set, and every code symbol is found by
+# `git grep -w` under crates/. The rows
 # of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
 # 3 workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. The first row is the budget self-test: it
@@ -248,7 +290,67 @@ tla-check *configs:
     set -euo pipefail
     cd {{ root }}/docs/formal
     tlc=$(nix shell --inputs-from {{ root }} nixpkgs#tlaplus --command sh -c 'command -v tlc')
+    jq=$(nix shell --inputs-from {{ root }} nixpkgs#jq --command sh -c 'command -v jq')
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/tla-check.XXXXXX")
+    # Staleness: the committed configs are exactly the catalogue's rendering.
+    (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >/dev/null
+    committed=$(ls MC_*.cfg configs.tsv | LC_ALL=C sort)
+    rendered=$(cd "$scratch/rendered" && ls | LC_ALL=C sort)
+    stale=0
+    if [[ $committed != "$rendered" ]]; then
+        echo "tla-check: the committed configs and the catalogue's differ in their file set:" >&2
+        diff <(echo "$committed") <(echo "$rendered") >&2 || true
+        stale=1
+    fi
+    for file in $rendered; do
+        if [[ -f $file ]] && ! cmp -s "$file" "$scratch/rendered/$file"; then
+            echo "tla-check: $file differs from the catalogue's rendering" >&2
+            stale=1
+        fi
+    done
+    if [[ $stale -ne 0 ]]; then
+        echo "tla-check: stale configs; run just tla-render and commit the result" >&2
+        exit 1
+    fi
+    # Grounding: every catalogue name exists in the spec, every code symbol in crates/.
+    ungrounded=0
+    declared=$(awk '/^CONSTANTS/ { on = 1; next } on && /^$/ { on = 0 } on' BulkloadTransfer.tla)
+    mutations=$(awk '/^Mutations ==/ { on = 1 } on { print } on && /}/ { exit }' BulkloadTransfer.tla)
+    operators=$("$jq" -r '.grounding.operators[]' "$scratch/catalogue.json")
+    constants=$("$jq" -r '.grounding.constants[]' "$scratch/catalogue.json")
+    mutants=$("$jq" -r '.grounding.mutations[]' "$scratch/catalogue.json")
+    symbols=$("$jq" -r '.grounding.codeSymbols | unique | .[]' "$scratch/catalogue.json")
+    for name in $operators; do
+        if ! grep -qE "^${name}"'(\(.*\))? ==' BulkloadTransfer.tla; then
+            echo "tla-check: $name is not defined in BulkloadTransfer.tla" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    for name in $constants; do
+        if ! grep -qE "^ +${name}([ ,]|\$)" <<<"$declared"; then
+            echo "tla-check: constant $name is not declared in BulkloadTransfer.tla" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    for name in $mutants; do
+        if ! grep -qF "\"$name\"" <<<"$mutations"; then
+            echo "tla-check: mutation $name is not in the spec's Mutations set" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    for name in $symbols; do
+        if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
+            echo "tla-check: code symbol $name is not found under crates/" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    if [[ $ungrounded -ne 0 ]]; then
+        echo "tla-check: $ungrounded catalogue name(s) are not grounded" >&2
+        exit 1
+    fi
+    printf 'catalogue: %s files current; grounded %s operators, %s constants, %s mutations, %s code symbols\n' \
+        "$(wc -w <<<"$rendered")" "$(wc -w <<<"$operators")" "$(wc -w <<<"$constants")" \
+        "$(wc -w <<<"$mutants")" "$(wc -w <<<"$symbols")"
     mkdir -p "$scratch/java"
     export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/java -Xmx4g"
     measure=()
