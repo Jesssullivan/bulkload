@@ -1,5 +1,6 @@
 //! Packing one segment into a sink.
 
+use crate::refuse::RefuseAt as _;
 use std::io::{Read, Write};
 
 use super::{pinned, run_child, Outcome, PackPlan, Source};
@@ -103,7 +104,12 @@ fn stream(stdout: &mut dyn Read, sink: &mut dyn Write) -> crate::Result<(u64, [u
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::carry_v2::send::stream",
+                ))
+            }
         };
         let chunk = buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?;
         if seen < header.len() {
@@ -116,9 +122,11 @@ fn stream(stdout: &mut dyn Read, sink: &mut dyn Write) -> crate::Result<(u64, [u
             seen += take;
         }
         hasher.update(chunk);
-        sink.write_all(chunk)?;
+        sink.write_all(chunk)
+            .refuse_at("git_carry::carry_v2::send::stream")?;
         bytes += u64::try_from(read).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
     }
-    sink.flush()?;
+    sink.flush()
+        .refuse_at("git_carry::carry_v2::send::stream")?;
     Ok((bytes, header, hasher.finalize().to_hex().to_string()))
 }

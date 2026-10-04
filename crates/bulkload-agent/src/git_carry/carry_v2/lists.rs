@@ -1,6 +1,7 @@
 //! `<state>/git-carry-v2/lists/<pack_id>.list`: the persisted plans resume
 //! reads back.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::unix::io::AsRawFd as _;
@@ -82,8 +83,10 @@ impl ListStore {
         )?;
         let mut file = create_private(&lists, &temporary)?;
         let written = (|| -> crate::Result<()> {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+            file.write_all(&bytes)
+                .refuse_at("git_carry::carry_v2::lists::persist")?;
+            file.sync_all()
+                .refuse_at("git_carry::carry_v2::lists::persist")?;
             // SAFETY: both names are NUL-terminated and relative to the open
             // `lists` directory; `linkat` never replaces an existing name.
             let linked = unsafe {
@@ -98,7 +101,10 @@ impl ListStore {
             if linked != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(error.into());
+                    return Err(crate::refuse::io(
+                        &error,
+                        "git_carry::carry_v2::lists::persist",
+                    ));
                 }
                 let existing = read_private(&lists, &name)?;
                 if blake3::hash(&existing).to_hex().as_str() != plan.pack_id() {
@@ -112,9 +118,16 @@ impl ListStore {
         // open `lists` directory, where this call just created it.
         unsafe { libc::unlinkat(lists.as_raw_fd(), temporary.as_ptr(), 0) };
         written?;
-        lists.sync_all()?;
-        carry.sync_all()?;
-        self.state.directory().sync_all()?;
+        lists
+            .sync_all()
+            .refuse_at("git_carry::carry_v2::lists::persist")?;
+        carry
+            .sync_all()
+            .refuse_at("git_carry::carry_v2::lists::persist")?;
+        self.state
+            .directory()
+            .sync_all()
+            .refuse_at("git_carry::carry_v2::lists::persist")?;
         Ok(self.state.root().join("git-carry-v2/lists").join(leaf))
     }
 
@@ -156,6 +169,7 @@ fn read_private(directory: &File, name: &std::ffi::CString) -> crate::Result<Vec
     let mut file = open_existing(directory, name)?;
     private_file(&file)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.read_to_end(&mut bytes)
+        .refuse_at("git_carry::carry_v2::lists::read_private")?;
     Ok(bytes)
 }

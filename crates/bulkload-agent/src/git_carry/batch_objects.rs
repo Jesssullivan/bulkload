@@ -1,14 +1,17 @@
 //! One bounded raw-object reader per restore; no filters or per-file subprocesses.
 
+use crate::refuse::RefuseAt as _;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
+use super::estimate::StderrTap;
 use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
 pub(super) struct BatchObjects {
     child: Option<Child>,
+    stderr: Option<StderrTap>,
     input: Option<ChildStdin>,
     output: Option<BufReader<ChildStdout>>,
 }
@@ -19,12 +22,15 @@ impl BatchObjects {
             .args(["cat-file", "--batch"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::piped())
+            .spawn()
+            .refuse_at("git_carry::batch_objects::new")?;
+        let stderr = Some(StderrTap::attach(child.stderr.take()));
         let input = child.stdin.take();
         let output = child.stdout.take().map(BufReader::new);
         let reader = Self {
             child: Some(child),
+            stderr,
             input,
             output,
         };
@@ -44,9 +50,15 @@ impl BatchObjects {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         let input = self.input.as_mut().ok_or(BulkloadRefusal::Io(None))?;
-        input.write_all(value.as_bytes())?;
-        input.write_all(b"\n")?;
-        input.flush()?;
+        input
+            .write_all(value.as_bytes())
+            .refuse_at("git_carry::batch_objects::copy_into")?;
+        input
+            .write_all(b"\n")
+            .refuse_at("git_carry::batch_objects::copy_into")?;
+        input
+            .flush()
+            .refuse_at("git_carry::batch_objects::copy_into")?;
         let output = self.output.as_mut().ok_or(BulkloadRefusal::Io(None))?;
         let length = read_header(output, value)?;
         if limit.is_some_and(|limit| length > limit) {
@@ -70,8 +82,16 @@ impl BatchObjects {
             .map(|mut output| std::io::copy(&mut output, &mut std::io::sink()))
             .transpose();
         let status = self.child.take().map(|mut child| child.wait()).transpose();
-        if drained?.is_some_and(|bytes| bytes != 0)
-            || status?.is_some_and(|status| !status.success())
+        let stderr = self.stderr.take();
+        if status
+            .refuse_at("git_carry::batch_objects::close")?
+            .is_some_and(|status| !status.success())
+        {
+            return Err(stderr.map_or(BulkloadRefusal::WorkerLost, StderrTap::failed));
+        }
+        if drained
+            .refuse_at("git_carry::batch_objects::close")?
+            .is_some_and(|bytes| bytes != 0)
         {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
@@ -91,7 +111,9 @@ fn read_header(reader: &mut impl Read, expected: &str) -> Result<u64> {
     let mut header = Vec::with_capacity(128);
     loop {
         let mut byte = [0];
-        reader.read_exact(&mut byte)?;
+        reader
+            .read_exact(&mut byte)
+            .refuse_at("git_carry::batch_objects::read_header")?;
         if byte == [b'\n'] {
             break;
         }
@@ -118,11 +140,16 @@ fn read_header(reader: &mut impl Read, expected: &str) -> Result<u64> {
 }
 
 fn read_body(reader: &mut impl Read, writer: &mut impl Write, length: u64) -> Result<()> {
-    if std::io::copy(&mut (&mut *reader).take(length), writer)? != length {
+    if std::io::copy(&mut (&mut *reader).take(length), writer)
+        .refuse_at("git_carry::batch_objects::read_body")?
+        != length
+    {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let mut terminator = [0];
-    reader.read_exact(&mut terminator)?;
+    reader
+        .read_exact(&mut terminator)
+        .refuse_at("git_carry::batch_objects::read_body")?;
     if terminator != [b'\n'] {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }

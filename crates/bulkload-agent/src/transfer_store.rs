@@ -6,6 +6,7 @@
 //! its bytes; the destination re-reads chunks only from published outputs,
 //! through hints it re-verifies on use.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::io::Read as _;
 use std::os::fd::AsFd as _;
@@ -358,12 +359,13 @@ impl Store {
         match crate::io::sys::create_excl_at(state.root.as_fd(), name, 0o600) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let found = crate::io::sys::fstatat_nofollow(&state.root, name)?;
+                let found = crate::io::sys::fstatat_nofollow(&state.root, name)
+                    .refuse_at("transfer_store::open")?;
                 if !found.is_file() || found.mode & 0o077 != 0 {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "transfer_store::open")),
         }
         let conn =
             rusqlite::Connection::open(root.join("transfer.sqlite")).map_err(sqlite_error)?;
@@ -379,7 +381,10 @@ impl Store {
             state.seal()?;
         }
         let mut random = [0_u8; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        fs::File::open("/dev/urandom")
+            .refuse_at("transfer_store::open")?
+            .read_exact(&mut random)
+            .refuse_at("transfer_store::open")?;
         let before = conn.total_changes();
         let started = Instant::now();
         // The trace's serial lock before SQLite's write lock (D5): the
@@ -455,7 +460,7 @@ impl Store {
         created?;
         counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
-            root: fs::canonicalize(root)?,
+            root: fs::canonicalize(root).refuse_at("transfer_store::open")?,
             conn,
             rows_trusted: true,
         })
@@ -463,9 +468,9 @@ impl Store {
 
     /// Open an initialized store without obtaining any write capability.
     pub(crate) fn open_reader(root: &Path) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+        let root = fs::canonicalize(root).refuse_at("transfer_store::open_reader")?;
         let db = root.join("transfer.sqlite");
-        let meta = fs::symlink_metadata(&db)?;
+        let meta = fs::symlink_metadata(&db).refuse_at("transfer_store::open_reader")?;
         if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
@@ -587,7 +592,7 @@ impl Store {
     /// # Errors
     /// Refuses serialization or database failures.
     pub fn record_capture(&self, key: &[u8], value: &Manifest) -> Result<()> {
-        let encoded = postcard::to_stdvec(value)?;
+        let encoded = postcard::to_stdvec(value).refuse_at("transfer_store::record_capture")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -691,7 +696,8 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })
+            .refuse_at("transfer_store::record_directory_created")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -806,8 +812,9 @@ impl StorePublisher {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(store.root.join("writer.lock"))?;
-        crate::io::sys::flock_exclusive(&lock)?;
+            .open(store.root.join("writer.lock"))
+            .refuse_at("transfer_store::open")?;
+        crate::io::sys::flock_exclusive(&lock).refuse_at("transfer_store::open")?;
         Ok(Self {
             store,
             side: role,
@@ -951,7 +958,11 @@ impl StorePublisher {
                     .execute(
                         "INSERT INTO captures VALUES (?1, ?2)
                          ON CONFLICT(key) DO UPDATE SET manifest=excluded.manifest",
-                        (&capture.key, postcard::to_stdvec(&capture.manifest)?),
+                        (
+                            &capture.key,
+                            postcard::to_stdvec(&capture.manifest)
+                                .refuse_at("transfer_store::commit_captures")?,
+                        ),
                     )
                     .map_err(sqlite_error)?;
             }
@@ -1086,7 +1097,7 @@ impl crate::io::durable::GroupSink for LedgerSink {
 /// # Errors
 /// Refuses serialization failure.
 pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(authority, row))?)
+    postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
 }
 
 /// Whether the store carries the [`RACY_GUARD_SETTING`] marker (#125).
@@ -1099,13 +1110,14 @@ fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
 }
 
 fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(
+    postcard::to_stdvec(&(
         identity.dev,
         identity.ino,
         identity.size,
         identity.mtime_ns,
         identity.ctime_ns,
-    ))?)
+    ))
+    .refuse_at("transfer_store::identity_bytes")
 }
 
 /// Whether the store has a `settings` table holding `key`. A database
@@ -1171,23 +1183,23 @@ impl StateRoot {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
-        let name = crate::io::c_name(leaf.as_bytes())?;
+        let name = crate::io::c_name(leaf.as_bytes()).refuse_at("transfer_store::open")?;
         let escapes = |error: std::io::Error| {
             if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
                 BulkloadRefusal::PathEscapesRoot
             } else {
-                error.into()
+                crate::refuse::io(&error, "transfer_store::open")
             }
         };
         // An existing root needs only search permission on its parent.
         let (root, parent) = match crate::io::sys::open_dir_path_nofollow(&parent_path.join(leaf)) {
             Ok(root) => (root, None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let parent = fs::File::open(parent_path)?;
+                let parent = fs::File::open(parent_path).refuse_at("transfer_store::open")?;
                 match crate::io::sys::mkdirat(&parent, &name, 0o700) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(crate::refuse::io(&error, "transfer_store::open")),
                 }
                 let root = crate::io::sys::open_dir_at(&parent, &name).map_err(escapes)?;
                 (root, Some(parent))
@@ -1195,7 +1207,7 @@ impl StateRoot {
             Err(error) => return Err(escapes(error)),
         };
         let root = fs::File::from(root);
-        let found = crate::io::sys::fstat(&root)?;
+        let found = crate::io::sys::fstat(&root).refuse_at("transfer_store::open")?;
         if !found.is_dir() || found.mode & 0o077 != 0 {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
@@ -1219,7 +1231,7 @@ impl StateRoot {
         };
         let sealed = crate::io::durable::seal_state_root(&parent, &self.root);
         self.parent = Some(parent);
-        Ok(sealed?)
+        sealed.refuse_at("transfer_store::seal")
     }
 
     /// The directory holding the root's entry, opened for its seal. It must
@@ -1231,9 +1243,11 @@ impl StateRoot {
     /// root's entry there cannot be sealed. `PATH_ESCAPES_ROOT` when the
     /// parent's entry is no longer this root.
     fn open_parent(&self) -> Result<fs::File> {
-        let parent = fs::File::open(&self.parent_path)?;
-        let entry = crate::io::sys::fstatat_nofollow(&parent, &self.name)?;
-        if entry.node != crate::io::sys::fstat(&self.root)?.node {
+        let parent = fs::File::open(&self.parent_path).refuse_at("transfer_store::open_parent")?;
+        let entry = crate::io::sys::fstatat_nofollow(&parent, &self.name)
+            .refuse_at("transfer_store::open_parent")?;
+        let root = crate::io::sys::fstat(&self.root).refuse_at("transfer_store::open_parent")?;
+        if entry.node != root.node {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
         Ok(parent)
@@ -1261,7 +1275,7 @@ fn resolve_leaf(path: &Path) -> Result<std::borrow::Cow<'_, Path>> {
         {
             Ok(std::borrow::Cow::Borrowed(path))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "transfer_store::resolve_leaf")),
     }
 }
 
@@ -1291,7 +1305,7 @@ mod tests {
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path)?;
+            fs::create_dir(&path).refuse_at("transfer_store::tests::new")?;
             Ok(Self(path))
         }
     }
@@ -1396,13 +1410,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = TestRoot::new()?;
         let private = root.0.join("private");
-        fs::create_dir(&private)?;
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
-        std::os::unix::fs::symlink(&private, root.0.join("link"))?;
-        fs::write(root.0.join("file"), b"")?;
+        fs::create_dir(&private)
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
+        std::os::unix::fs::symlink(&private, root.0.join("link"))
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
+        fs::write(root.0.join("file"), b"")
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
         let shared = root.0.join("shared");
-        fs::create_dir(&shared)?;
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750))?;
+        fs::create_dir(&shared)
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750))
+            .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
         for refused in ["link", "file", "shared"] {
             assert!(
                 matches!(
@@ -1417,7 +1437,8 @@ mod tests {
         fs::set_permissions(
             state.join("transfer.sqlite"),
             fs::Permissions::from_mode(0o644),
-        )?;
+        )
+        .refuse_at("transfer_store::tests::a_state_root_must_be_a_private_directory")?;
         assert!(matches!(
             Store::open(&state),
             Err(BulkloadRefusal::PathEscapesRoot)
@@ -1479,7 +1500,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = TestRoot::new()?;
         let parent = root.0.join("parent");
-        fs::create_dir(&parent)?;
+        fs::create_dir(&parent).refuse_at(
+            "transfer_store::tests::a_sealed_store_opens_under_a_parent_it_cannot_list",
+        )?;
         let sealed = parent.join("sealed");
         drop(Store::open(&sealed)?);
         let unsealed = parent.join("unsealed");
@@ -1490,11 +1513,15 @@ mod tests {
             })
             .map_err(sqlite_error)?;
         let fresh = parent.join("fresh");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o311))?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).refuse_at(
+            "transfer_store::tests::a_sealed_store_opens_under_a_parent_it_cannot_list",
+        )?;
         let reopened = Store::open(&sealed).map(drop);
         let needs_seal = Store::open(&unsealed).map(drop);
         let created = Store::open(&fresh).map(drop);
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).refuse_at(
+            "transfer_store::tests::a_sealed_store_opens_under_a_parent_it_cannot_list",
+        )?;
         assert_eq!(reopened, Ok(()));
         // Permission bits do not bind the superuser.
         if crate::io::sys::effective_uid() != 0 {
@@ -1517,10 +1544,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = TestRoot::new()?;
         let private = root.0.join("private");
-        fs::create_dir(&private)?;
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
-        std::os::unix::fs::symlink(&private, root.0.join("link"))?;
-        let canonical = fs::canonicalize(&private)?;
+        fs::create_dir(&private).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
+        std::os::unix::fs::symlink(&private, root.0.join("link")).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
+        let canonical = fs::canonicalize(&private).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
         for spelling in ["link/", "link/.", "link//", "link/./"] {
             let store = Store::open(&root.0.join(spelling))?;
             assert_eq!(store.root(), canonical.as_path(), "{spelling}");
@@ -1529,18 +1564,32 @@ mod tests {
                 "{spelling}"
             );
         }
-        assert!(fs::symlink_metadata(private.join("transfer.sqlite"))?.is_file());
-        assert!(fs::symlink_metadata(root.0.join("link"))?.is_symlink());
+        assert!(fs::symlink_metadata(private.join("transfer.sqlite"))
+            .refuse_at(
+                "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf"
+            )?
+            .is_file());
+        assert!(fs::symlink_metadata(root.0.join("link"))
+            .refuse_at(
+                "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf"
+            )?
+            .is_symlink());
         // A fresh name with a trailing slash is made under that name.
         let fresh = Store::open(&root.0.join("fresh/"))?;
         assert_eq!(
             fresh.root(),
-            fs::canonicalize(root.0.join("fresh"))?.as_path()
+            fs::canonicalize(root.0.join("fresh")).refuse_at("transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf")?.as_path()
         );
         let shared = root.0.join("shared");
-        fs::create_dir(&shared)?;
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750))?;
-        std::os::unix::fs::symlink(&shared, root.0.join("shared-link"))?;
+        fs::create_dir(&shared).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
+        std::os::unix::fs::symlink(&shared, root.0.join("shared-link")).refuse_at(
+            "transfer_store::tests::a_state_root_named_with_a_trailing_slash_follows_its_leaf",
+        )?;
         for refused in ["shared-link/", "shared-link/."] {
             assert!(
                 matches!(
@@ -1682,8 +1731,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::output_records_and_chunk_hints_commit_together")?;
+        let identity =
+            StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+                "transfer_store::tests::output_records_and_chunk_hints_commit_together",
+            )?);
         let hint = ChunkHint {
             digest: [3; 32],
             offset: 5,
@@ -1720,8 +1773,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?,
+        );
         let record = |racy: bool| OutputRecord {
             key: b"key".to_vec(),
             rel_path: b"output".to_vec(),
@@ -1751,7 +1808,8 @@ mod tests {
         let store = Store::open(&state)?;
         let exact = manifest(b"exact");
         store.record_capture(b"exact", &exact)?;
-        let mut padded = postcard::to_stdvec(&exact)?;
+        let mut padded = postcard::to_stdvec(&exact)
+            .refuse_at("transfer_store::tests::a_ledger_row_with_trailing_bytes_is_a_miss")?;
         padded.push(0);
         store
             .conn
@@ -1775,8 +1833,12 @@ mod tests {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output").refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?;
+        let identity = StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?);
         let record = |key: &[u8]| OutputRecord {
             key: key.to_vec(),
             rel_path: b"output".to_vec(),
@@ -1834,8 +1896,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?,
+        );
         let record = |path: &[u8], offset: u64| OutputRecord {
             key: path.to_vec(),
             rel_path: path.to_vec(),

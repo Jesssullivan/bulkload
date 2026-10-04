@@ -12,3 +12,7 @@ __pycache__/
 .DS_Store
 ._*
 /target/
+# TLC model-checker scratch (docs/formal; `just tla-check` writes under TMPDIR)
+/docs/formal/states/
+/docs/formal/*.states/
+/docs/formal/*_TTrace_*

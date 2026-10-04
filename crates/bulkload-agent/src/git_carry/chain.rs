@@ -31,6 +31,7 @@
 //! writes one self-contained bundle whose advertised refs must equal the head
 //! bundle's exactly. The restore and import verbs read only that bundle.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -57,7 +58,8 @@ fn advertised(bundle: &Path) -> Result<Vec<(String, String)>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(bundle)?;
+        .open(bundle)
+        .refuse_at("git_carry::chain::advertised")?;
     let mut source = BufReader::new(file);
     let mut consumed = 0usize;
     let mut refs = Vec::new();
@@ -66,7 +68,8 @@ fn advertised(bundle: &Path) -> Result<Vec<(String, String)>> {
         let count = source
             .by_ref()
             .take(1024 * 1024)
-            .read_until(b'\n', &mut line)?;
+            .read_until(b'\n', &mut line)
+            .refuse_at("git_carry::chain::advertised")?;
         if consumed == 0 && line != b"# v2 git bundle\n" && line != b"# v3 git bundle\n" {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
@@ -231,7 +234,9 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
     )?;
     crate::counters::add(
         crate::counters::Counter::BundleStageWrite,
-        fs::symlink_metadata(&flat)?.len(),
+        fs::symlink_metadata(&flat)
+            .refuse_at("git_carry::chain::flatten")?
+            .len(),
     );
     let sorted = |listing: &str| {
         let mut entries: Vec<String> = listing.lines().map(str::to_owned).collect();
