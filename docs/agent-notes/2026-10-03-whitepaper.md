@@ -1,7 +1,7 @@
 # 2026-10-03 — whitepaper and bibliography (proof package item one)
 
 **Lane:** `whitepaper` (Lane C). Branch `docs/whitepaper-20261003`, worktree
-`bulkload.worktrees/whitepaper-20261003`. No PR yet.
+`bulkload.worktrees/whitepaper-20261003`. PR #164 (open, not merged).
 **Rulings:** OI-1003-Q7 (proof package: whitepaper and bibliography),
 OI-1003-Q23 (lane fan-out; C is the whitepaper and bibliography),
 OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
@@ -24,7 +24,8 @@ OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
 | `11a32b8` | Merge of `origin/main` at `4a10bb8` (#153 merged at 05:41Z, after `7205183`). |
 | `1e481b1` | Re-pin to `4a10bb8`: section 2.1's dead_code reason, WP10 PR 2 on `main`, the durability row. |
 | `dd30add` | Lanes A and B under review (#159, #160): section 4 describes `3dbfbdb` only and notes that `27581be` supersedes its run of record; sections 3.3, 4, 7 and 8 add lane A's reported Git-carry source write and its `snapshot` smoke. |
-| next commit | This note: the second re-pin, the relaunch pass and check-fast run 5. |
+| `3e41784` | This note: the second re-pin, the relaunch pass and check-fast run 5. |
+| next commit | This note: the ship pass (PR #164) and check-fast run 6. |
 
 The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 `04ea9cb`. This pass merged `main` instead and did not rewrite history.
@@ -213,6 +214,22 @@ as the only writer; its task text says the earlier copies are gone.
   coordinator's `docs/slo.md` amendments are `9784467` and `8dd4546` on
   `docs/coordinator-20261003`, with no PR open. This branch has no PR.
 
+## Ship pass (2026-10-04)
+
+Relaunched by the coordinator as the only writer, to open the PR.
+
+- Before opening, the worktree was clean. `HEAD` was `3e41784`, equal to
+  `origin`, and 0 commits behind `main` (`4a10bb8`). All 14 branch commits
+  are GPG-signed. The diff against `main` touches only the paper, the
+  bibliography and this note.
+- The cite and definition check was re-run at `3e41784`: 34 of 34.
+- Opened #164 at 2026-10-04T09:05Z, not merged. Its body covers scope and
+  structure, pending gate evidence, how the references were verified, and
+  the review summary, and it lists the open low findings below.
+- The refuter's low findings on the probe script, the `proptest!` seeds,
+  `StreamCDC`, `KeyParts::carries` and S4's #40 were re-checked at
+  `4a10bb8` and still hold. This pass did not change the paper.
+
 ## Duplicate-agent incident (recorded on TIN-4543)
 
 - About 22:05 EDT on 2026-10-03, the coordinator used SendMessage to send
@@ -250,12 +267,15 @@ exited 0, and the Python contract suite ran 22 tests, OK, each time.
 | 3 | `cb4469b` (with #146's code) plus part 2's edits | 690 passed, 0 failed |
 | 4 | `7205183` (with #154's code) plus the refuter-fix edits | 696 passed, 0 failed |
 | 5 | `dd30add` (with #153's code, which deleted stale io tests) | 682 passed, 0 failed |
+| 6 | `3e41784` plus the ship pass's edit to this note | 682 passed, 0 failed |
 
 During run 3, only documentation lines were edited: a rewrap in section
 2.7 and this paragraph. During run 4, only documentation was edited: two
 paraphrases and one sentence in the paper, and this note. Run 5 waited
 about 15 minutes for the shared lock; during it only this note was
-edited. This lane changes documentation only.
+edited. Run 6 waited about 20 minutes for the lock; the tree was
+`3e41784` plus this note's ship-pass edit, and only that edit's result
+row was filled in afterwards. This lane changes documentation only.
 
 - The draft's run, on `57030e1`, exited 0.
 - The review-fix pass's run was queued when its session ended. No commit
@@ -296,5 +316,17 @@ edited. This lane changes documentation only.
   refuse. No ruling or work package names them.
 - **Next sprint (OI-1003-Q34).** This lane's sprint 2 is the S2 budget
   instrument, using the v0 synthetic workload; then refresh section 5.3.
-- **PR.** None is open for this branch. Under OI-1003-Q29 it merges once
-  its R-N71 review is clean and CI is green.
+- **PR #164.** Under OI-1003-Q29 it merges once its R-N71 review is clean
+  and CI is green.
+- **Nine low refuter findings on `1fda837` are not yet fixed.** #164's body
+  lists them:
+  - §2.7: the estimate's probe script does not build its children through
+    `git()`;
+  - "last completed" R23 sample;
+  - three `proptest!` sites draw a random seed;
+  - verbatim runs from `docs/design.md`, and copied live PR state;
+  - §6 FastCDC rate (the engine uses `StreamCDC`);
+  - S4's #40 is omitted;
+  - §2.10 omits the exclude file, the stash reflog and the symbolic HEAD;
+  - the §4 mutation count includes three non-mutation rows;
+  - `MC_main`'s edit bound is per seat.
