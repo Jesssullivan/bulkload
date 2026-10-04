@@ -28,6 +28,25 @@ carries this doc was later merged with main `dfb9604` (#159, #160, #150,
   finding 3 cites ("Ignored when `prerequisite` is set") is the same at
   `dfb9604`.
 
+**Re-evaluated after review (same day).** The verdicts below come from
+`s3_estate.py evaluate`, which re-runs the evaluation of the recorded JSON
+(the same two files, sha256 below) with the revised harness. No pass was
+re-run, and no counter changed. What changed:
+
+- Each changed seat counts in one half. File inequality 1 no longer counts
+  SQLite seats, so it fails by the sniff bytes at every delta pass.
+- File inequality 2 is `n/a: blocked by WP0(d)` when a changed seat was
+  refused and not carried.
+- Git inequality 1 covers worktree seats only. Object-store reads are
+  reported beside it.
+- Git inequality 2 counts each repository's new objects once and is
+  reported at chunk and object granularity.
+- The unchanged clause is judged on the CPU ratio. It fails at small
+  scale.
+- Findings 3 and 4 are re-attributed to the group-base exclusion, using
+  the code at `4a10bb8` and scratch probes of the measured binary (see
+  "Probes after the run").
+
 ## Setup
 
 - **Build:** release `bulkload-agent` of main
@@ -44,8 +63,10 @@ carries this doc was later merged with main `dfb9604` (#159, #160, #150,
   `76239763ae7e`…, the committed file), run as
   `nice -n 10 nix develop .#default --command python3 s3_estate.py run
   --agent BIN --work WORK --scale small|estate`. Its tests are
-  `test_s3_estate.py` (12 tests, optional tier). `just bench-s3-estate`
-  wraps it.
+  `test_s3_estate.py` (12 tests then, optional tier). `just bench-s3-estate`
+  wraps it. The verdicts were then re-evaluated with the revised harness of
+  commit `9581384` (`s3_estate.py evaluate RUN.json --out NEW.json`, 15
+  tests).
 - **Host:** sting, x86_64 Linux, 32 CPUs, 54.7 GiB RAM. MemAvailable was
   15.3 GiB before the estate run (the 6 GiB precondition held) and 13.3 to
   25.2 GiB at the starts of its passes.
@@ -113,22 +134,49 @@ exact sum of process-scope counters.
 
 **Bounds (OI-1003-Q18), from each round's sidecar.**
 
-- **Inequality 1, file half.** Source bytes read ≤ the `walk` seats of the
-  copied areas in `reads_allowed`, plus racy seats.
+Each changed seat counts in one half only. SQLite databases and their
+`-wal`, `-shm` and `-journal` companions belong to the SQLite half: copy
+refuses them (`SQLITE_STATE_CHANGED`), so they are in no file-half bound.
+
+- **Inequality 1, file half.** Source bytes read ≤ the non-SQLite `walk`
+  seats of the copied areas in `reads_allowed`, plus racy seats.
 - **Inequality 1, git half.** Receipt `source_bytes_read` ≤ the round's
-  `worktree` seats, plus racy seats.
-- **Inequality 2, file half.** `bytes_received` ≤ the absent chunks. Per
-  changed file, each changed range is widened by one maximum CDC chunk
-  (256 KiB) before it and two after it, then capped at the file. A new file
-  counts whole, and a deleted one counts 0. This widening is the harness's
-  resynchronisation allowance, not a ruling.
+  `worktree` seats, plus racy seats. At `4a10bb8` that counter covers
+  worktree streaming only (`raw_tree.rs`: "Metadata censuses, symlink reads
+  and Git repacking are separate"), so both sides count worktree seats.
+  The git children's reads of the source object store are outside it, though
+  `counters.rs` says every object in a capture pack "was read from an object
+  store to be written". They are reported beside the inequality:
+  - `write_source_pack_bytes`, the logical measure (it includes objects the
+    capture wrote into its private repository);
+  - `read_source_pack_readback_bytes`, a lower bound;
+  - the round's changed `git-objects` seats.
+
+  Whether object-store reads count as "source content bytes" under
+  OI-1003-Q18 needs a ruling.
+- **Inequality 2, file half.** `bytes_received` ≤ the absent chunks of the
+  seats copy carried. Per changed file, each changed range is widened by one
+  maximum CDC chunk (256 KiB) before it and two after it, then capped at the
+  file. A new file counts whole, and a deleted one counts 0. This widening
+  is the harness's resynchronisation allowance, not a ruling. A changed seat
+  refused `GIT_DESTINATION_OCCUPIED` was not carried, so the delta did not
+  converge. The verdict is then `n/a: blocked by WP0(d)`, and the bound with
+  the blocked seats is shown beside it.
 - **Inequality 2, git half.** `write_source_pack_bytes` ≤ the sum over
-  changed items of the round's new objects in the item's repository
-  (uncompressed) plus the item's changed worktree bytes. The bound has no
-  allowance for capture metadata, so any excess is reported per item.
-- **The unchanged clause.** 0 content bytes read and received, 0 pack bytes,
-  one census walk per censused item, and wall time ≤ 10 % of the first pass.
-  The wall-time part is informational.
+  changed repositories of the round's new objects (uncompressed, counted
+  once per repository however many of its items changed) plus its changed
+  worktree seats. The seats are counted at two granularities:
+  - **chunk:** the file half's absent-chunk bound on each changed seat;
+  - **object:** each changed seat whole, as a new blob. Git packs whole
+    blobs, so this is the finest bound a Git pack can meet.
+
+  Which granularity OI-1003-Q18 means for the git half needs a ruling. The
+  bound has no allowance for capture metadata, so any excess is reported per
+  repository.
+- **The unchanged clause.** 0 content bytes read and received, 0 pack
+  bytes, one census walk per censused item, and the rusage CPU ratio ≤ 10 %
+  of the first pass (OI-1003-Q35). The wall ratio is reported beside it and
+  is informational.
 
 ## Results, scale estate (142,321 entries, 4.19 GB)
 
@@ -198,45 +246,88 @@ then writes no pack, and `mutate-10` writes a 2,232,456-byte pack.
 | File: 0 content bytes received | **pass** | 0 |
 | File: 0 content bytes read | **fail** | 176 B (estate) or 64 B (small): 16 B per refused SQLite database, every pass |
 | SQLite: 0 content bytes read | **fail** | snapshot re-reads every database: 180,581,128 B (estate), 1,667,776 B (small) |
-| Wall time ≤ 10 % of `first` (informational) | **pass** | 0.6 % to 1.7 % (estate), 3.7 % to 6.5 % (small) |
+| CPU ratio ≤ 10 % of `first` (OI-1003-Q35) | estate **pass**, small **fail** | see below |
+
+The CPU ratio, rusage user plus system of v1's three halves, per scale and
+subset (range over `rerun-1` to `rerun-3`), with the wall ratio beside it
+(informational):
+
+| Scale | Subset | CPU ratio | Verdict | Wall ratio (informational) |
+|---|---|---:|---|---:|
+| estate | all | 6.9 % to 7.9 % | pass | 0.6 % to 1.7 % |
+| estate | without `data/` | 7.2 % to 8.2 % | pass | 0.6 % to 1.7 % |
+| estate | without history-heavy | 7.2 % to 8.2 % | pass | 0.6 % to 1.7 % |
+| estate | without both | 7.6 % to 8.7 % | pass | 0.6 % to 1.7 % |
+| small | all | 15.2 % to 15.9 % | fail | 3.7 % to 6.5 % |
+| small | without `data/` | 15.1 % to 15.8 % | fail | 3.8 % to 6.5 % |
+| small | without history-heavy | 15.5 % to 16.2 % | fail | 3.5 % to 5.4 % |
+| small | without both | 15.4 % to 16.1 % | fail | 3.5 % to 5.4 % |
+
+The small-scale failure comes from a small denominator. The first pass
+there is 6.75 s of CPU, 5.88 s of it the git capture of 9 censused items.
+A rerun's
+census costs about 0.09 s per item at both scales: 0.78 s to 0.81 s for 9
+items at small, and 4.65 s to 5.19 s for 54 items at estate. Against a
+first-pass capture of 118.96 s at estate, that is under 10 %. Against
+5.88 s at small, it is not. The file half adds 0.22 s to 0.23 s per small
+rerun over 14 copy processes.
 
 ### Delta reruns (OI-1003-Q18)
 
+"Sniff only" means the excess equals the 16-byte magic copy reads from each
+refused SQLite database (finding 6). Git inequality 2 gives the chunk bound
+first, then the object bound.
+
 | Pass | Half | Inequality | Measured | Bound | Verdict |
 |---|---|---|---:|---:|---|
-| estate mutate-1 | file | 1 | 176 | 0 | fail (sniff bytes only) |
+| estate mutate-1 | file | 1 | 176 | 0 | fail (sniff only, +176) |
 | estate mutate-1 | file | 2 | 0 | 0 | pass |
-| estate mutate-1 | git | 1 | 3,209 | 3,209 | pass |
-| estate mutate-1 | git | 2 | 39,352 | 9,782 | fail (+29,570) |
-| estate mutate-10 | file | 1 | 674,467 | 4,095,275 | pass |
-| estate mutate-10 | file | 2 | 1,217 | 263,623 | pass |
-| estate mutate-10 | git | 1 | 67,115,992 | 67,115,992 | pass |
-| estate mutate-10 | git | 2 | 70,619,800 | 67,129,040 | fail (+3,490,760) |
-| small mutate-1 | file | 1 / 2 | 64 / 0 | 0 / 0 | fail (sniff) / pass |
-| small mutate-1 | git | 1 / 2 | 865 / 5,753 | 865 / 4,666 | pass / fail (+1,087) |
-| small mutate-10 | file | 1 / 2 | 51,122 / 1,879 | 735,842 / 51,058 | pass / pass |
-| small mutate-10 | git | 1 / 2 | 1,059,187 / 2,239,880 | 1,059,187 / 1,069,932 | pass / fail (+1,169,948) |
+| estate mutate-1 | git | 1, worktree seats | 3,209 | 3,209 | pass |
+| estate mutate-1 | git | 2, chunk / object | 39,352 | 9,782 / 9,782 | fail (+29,570 / +29,570) |
+| estate mutate-10 | file | 1 | 674,467 | 674,291 | fail (sniff only, +176) |
+| estate mutate-10 | file | 2 | 1,217 | 1,217 carried (263,623 with the 2 blocked seats) | n/a: blocked by WP0(d) |
+| estate mutate-10 | git | 1, worktree seats | 67,115,992 | 67,115,992 | pass |
+| estate mutate-10 | git | 2, chunk / object | 70,619,800 | 806,672 / 67,129,040 | fail (+69,813,128 / +3,490,760) |
+| small mutate-1 | file | 1 / 2 | 64 / 0 | 0 / 0 | fail (sniff only, +64) / pass |
+| small mutate-1 | git | 1 / 2 (chunk = object) | 865 / 5,753 | 865 / 4,666 | pass / fail (+1,087) |
+| small mutate-10 | file | 1 | 51,122 | 51,058 | fail (sniff only, +64) |
+| small mutate-10 | file | 2 | 1,879 | 1,879 carried (51,058 with the blocked seat) | n/a: blocked by WP0(d) |
+| small mutate-10 | git | 1, worktree seats | 1,059,187 | 1,059,187 | pass |
+| small mutate-10 | git | 2, chunk / object | 2,239,880 | 291,969 / 1,066,625 | fail (+1,947,911 / +1,173,255) |
+
+Object-store reads beside git inequality 1 are not judged; their status
+needs a ruling (see Bounds):
+
+| Pass | Readback (lower bound) | Pack bytes (logical) | Changed object-store seats | If they counted |
+|---|---:|---:|---:|---|
+| estate mutate-1 | 32,768 | 39,352 | 4,386 | fail |
+| estate mutate-10 | 16,859,136 | 70,619,800 | 447,490 | fail |
+| small mutate-1 | 0 | 5,753 | 2,753 | unknown (page cache) |
+| small mutate-10 | 0 | 2,239,880 | 1,118,125 | unknown (page cache) |
 
 The SQLite half fails both inequalities at every delta pass, because snapshot
 reads and writes whole databases. At estate `mutate-10` it read 180,589,368 B
 against 3,420,984 B of changed SQLite seats, and wrote 180,518,912 B against
-32,816 B of changed pages. Without `data/`, the verdicts are the same. Without
-history-heavy, estate `mutate-1` passes both git inequalities trivially (0,
-0), and `mutate-10` git inequality 2 is 70,580,320 against 67,118,480.
+32,816 B of changed pages. Those 3,420,984 B (`kv.sqlite` 3,284,992 B and
+`storage.db-wal` 135,992 B) are in the SQLite half's bound only. Without
+`data/`, the verdicts are the same. Without history-heavy, estate `mutate-1`
+passes both git inequalities trivially (0, 0). Without history-heavy, estate
+`mutate-10` git inequality 2 is 70,580,320 against 796,112 (chunk) or
+67,118,480 (object), and its readback is 16,384 B.
 
-Git inequality 2, per item, from the bundles each capture added:
+Git inequality 2, per repository, from the bundles its items' captures
+added. New objects count once per repository:
 
-| Pass | Item | Bundle bytes | Bound | Why the bound is what it is |
-|---|---|---:|---:|---|
-| estate mutate-1 | `git/history-heavy` | 39,352 | 9,782 | a 5-object commit (6,573 B) and a 3,209 B file |
-| estate mutate-10 | `git/history-heavy` | 39,480 | 10,560 | a 5-object commit and an edited file |
-| estate mutate-10 | `git/r00-delta` | 68,702,196 | 67,108,864 | `large-edit` of the 64 MiB tracked `assets/model.bin`, uncommitted |
-| estate mutate-10 | `git/r20-resume.worktrees/detached` | 1,834,076 | 3,545 | `head-move`: `checkout --detach` rewrote a few files |
-| estate mutate-10 | `git/r05-bytes` | 46,395 | 6,071 | a 5-object commit on the unmerged `side` |
-| small mutate-10 | `git/r00-delta.worktrees/detached` | 1,105,407 | 5,337 | `head-move` |
-| small mutate-10 | `git/r00-delta` | 1,113,336 | 1,048,576 | `large-edit` of the 1 MiB `model.bin` |
-| small mutate-10 | `git/r01-row`, `git/r01-row.worktrees/tree` | 10,563, 6,674 | 3,307 each | a commit on `side` |
-| small mutate-10 | `git/history-heavy` | 7,424 | 9,405 | **within the bound** |
+| Pass | Repository (items recaptured) | Bundle bytes | New objects | Bound chunk / object | Why the bound is what it is |
+|---|---|---:|---:|---:|---|
+| estate mutate-1 | `git/history-heavy` | 39,352 | 6,573 | 9,782 / 9,782 | a 5-object commit and a 3,209 B file |
+| estate mutate-10 | `git/history-heavy` | 39,480 | 6,977 | 10,560 / 10,560 | a 5-object commit and an edited file |
+| estate mutate-10 | `git/r00-delta` (main) | 68,702,196 | 0 | 786,496 / 67,108,864 | `large-edit` of 64 B in the 64 MiB tracked `assets/model.bin`, uncommitted |
+| estate mutate-10 | `git/r20-resume` (`worktrees/detached`) | 1,834,076 | 0 | 3,545 / 3,545 | `head-move`: `checkout --detach` rewrote a few files |
+| estate mutate-10 | `git/r05-bytes` (main; a group of one, chained) | 46,395 | 6,071 | 6,071 / 6,071 | a 5-object commit on the unmerged `side` |
+| small mutate-10 | `git/r00-delta` (main, `worktrees/detached`) | 1,113,336 + 1,105,407 | 0 | 279,257 / 1,053,913 | `large-edit` of the 1 MiB `model.bin`, and a `head-move` |
+| small mutate-10 | `git/r01-row` (main, `worktrees/tree`) | 10,563 + 6,674 | 3,307 | 3,307 / 3,307 | a commit on `side` |
+| small mutate-10 | `git/history-heavy` | 7,424 | 4,131 | 9,405 / 9,405 | **within the bound** |
 
 ## Findings
 
@@ -245,33 +336,71 @@ Git inequality 2, per item, from the bundles each capture added:
    bytes, 0 pack bytes, and one census walk per item. `census_walks` matched
    the sidecar's `census_walks_expected` at every pass: 216, 54, 57 and 66
    at estate. The census model in the corpus doc holds at estate scale.
-2. **Git inequality 1 holds with equality.** The receipts'
-   `source_bytes_read` equals the changed worktree seats to the byte (3,209
-   B; 67,115,992 B). Nothing unchanged was re-read.
-3. **Git inequality 2 fails in v1's snapshot layer, not in history.** Three
-   shapes:
-   - **A grouped item re-packs its checkout.** The examples are a linked
-     worktree after a `head-move` (estate 1.83 MB against 3.5 KB; small
-     1.1 MB against 5.3 KB) and a main checkout after an unrelated `side`
-     commit. At small scale, the detached bundle held 70 objects (50 blobs,
+2. **Git inequality 1, worktree seats: no unchanged worktree seat was
+   re-read.** The receipts' `source_bytes_read` equals the changed worktree
+   seats to the byte (3,209 B; 67,115,992 B). That equality holds by
+   construction, since both sides count worktree seats only (see Bounds).
+   Unchanged objects *were* re-read from object stores, outside the
+   counter:
+   - At estate `mutate-10`, readback was 16,859,136 B, a lower bound. Of
+     that, 16,842,752 B was history-heavy's packing child, for a 39,480 B
+     bundle with a 5-object change. At `mutate-1` it was 32,768 B.
+   - At small `mutate-10`, the detached worktree's bundle re-packed the
+     unchanged committed 1 MiB `model.bin` (finding 3). Packing it means
+     reading it from an object store, yet readback shows 0 there because of
+     page-cache hits.
+
+   If object-store reads count as source content bytes, git inequality 1
+   fails at both estate delta passes. That needs a ruling.
+3. **Git inequality 2 fails on v1 mechanisms, not on the round's
+   history.** Three shapes:
+   - **A grouped item re-packs the blobs its group base holds.** The
+     examples are a linked worktree after a `head-move` (estate 1.83 MB
+     against 3.5 KB; small 1.1 MB against 5.3 KB) and a main checkout after
+     an unrelated `side` commit (small `r01-row`, 17,237 B against 3,307 B).
+     At small scale, the detached bundle held 70 objects (50 blobs,
      1,100,983 B). They include the unchanged committed 1 MiB `model.bin`
      (`c2574974`) and a tag. The worktree and staged snapshot commits in it
      are parentless.
-   - **The cause is a hypothesis, not root-caused here.** An item in a
-     multi-item group takes the plan's shared group base as its prerequisite.
-     `ExportOptions::chain` is "ignored when `prerequisite` is set"
-     (`git_carry.rs`, main 4a10bb8). The base's trees are then never edges of
-     the parentless snapshot commits. history-heavy, a group of one, takes
-     the chain and packed 19 objects.
-   - **A constant per-capture overhead.** A changed capture adds its own
-     metadata: snapshot commits and trees, carry refs and the bundle header.
-     history-heavy carries 29,570 B of it at estate and 1,087 B at small.
-     The estate figure scales with its ref and tree count.
-4. **First-pass duplication across linked worktrees.** Every item bundle of
-   `r00` and `r12` (4 items each) carries the 64 MiB blob, at 67.99 to
-   68.70 MB per bundle. That is 546 MB of the first pass's 932 MB of v1
-   bundles. The shared group bases total 155.9 MB, and history-heavy's
-   bundle is 179.4 MB.
+   - **The cause is the group-base exclusion.** It was root-caused from
+     the code at `4a10bb8` and a scratch probe, and not re-measured on the
+     corpus. An item in a multi-item group takes the plan's shared group
+     base as its prerequisite. `write_with_prerequisites` (`shared.rs`)
+     writes the bundle with plain `git bundle create --all --stdin` and
+     `^tip` lines. That marks only the trees of edge commits uninteresting,
+     so the parentless snapshot commits' trees re-pack every tracked blob
+     they share with HEAD, including blobs the base already holds. The
+     chained path, `write_excluding_tip_trees`, already avoids this with
+     `rev-list --objects-edge-aggressive`, and its own comment describes
+     the effect. In the probe, a parentless snapshot over a 4 MiB tracked
+     blob with a one-line change gave a 4,300,866 B bundle through
+     `bundle create ^base --all`, and 3,507 B through the tip-tree
+     exclusion. history-heavy, a group of one, takes the chained path and
+     packed 19 objects.
+   - **Capture metadata, which grows with refs and trees.** A changed
+     capture adds its own snapshot commits and trees, carry refs and a
+     bundle header. The header lists the whole private ref inventory
+     (`refs(private)` in `write_excluding_tip_trees_pending`). The residuals
+     on chained items are:
+     - history-heavy: 29,570 B (estate `mutate-1`), 28,920 B (estate
+       `mutate-10`) and 1,087 B (small `mutate-1`);
+     - `r05-bytes`: 40,324 B (estate `mutate-10`).
+
+     The cost is per ref and per changed tree, not constant.
+4. **First-pass duplication across linked worktrees, from the same
+   exclusion.** Every item bundle of `r00` and `r12` (4 items each) carries
+   the committed 64 MiB blob, at 67.99 to 68.70 MB per bundle. That is
+   546.7 MB of the first pass's 932 MB of v1 bundles.
+   - The two 68 MB shared group bases already hold those blobs:
+     `f34c244b…` in one and `c8fbd764…` in the other, checked by scanning
+     the packs. Each of the eight item bundles carries one of them again,
+     with 876 to 1,530 other blobs.
+   - These are history bytes that the missing tip-tree exclusion leaves in.
+     They are not snapshot layer.
+   - With the exclusion, the eight copies, about 537 MB, would go (derived,
+     not measured). That would leave v1's first pass near 395 MB.
+   - The shared group bases total 155.9 MB, and history-heavy's bundle is
+     179.4 MB.
 5. **A changed capture fetches its whole retained bundle for reuse.** At
    estate `mutate-1`, history-heavy's capture read 179,409,341 B of its own
    retained bundle (`read_source_capture_reuse_bytes`). That is private
@@ -281,18 +410,38 @@ Git inequality 2, per item, from the bundles each capture added:
 6. **File half: a 16-byte sniff per refused SQLite seat, every pass.** copy
    reads the magic of each database it then refuses (`SQLITE_STATE_CHANGED`):
    4 × 16 B at small and 11 × 16 B at estate. The `-wal` and `-shm` are
-   refused by name, unread. This is the only thing that fails the file half's
-   "0 content bytes" clause. It is the review's WP6 PR 2 item: memoise
-   refused seats by stat identity, and count sniff bytes separately.
-7. **File half deltas pass both inequalities.** At estate `mutate-10`, copy
-   read 674,467 B against a bound of 4,095,275 B and received 1,217 B (the
-   new file) against 263,623 B.
+   refused by name, unread. This sniff alone fails the file half's
+   "0 content bytes" clause. It also fails file inequality 1 at every delta
+   pass at both scales, by exactly 176 B or 64 B. It is the review's WP6
+   PR 2 item: memoise refused seats by stat identity, and count sniff bytes
+   separately.
+7. **File half deltas: inequality 1 fails by the sniff bytes only, and
+   inequality 2 is n/a at `mutate-10`.**
+   - **Inequality 1, estate `mutate-10`.** copy read 674,467 B against
+     674,291 B of changed non-SQLite seats: 673,054 B in `.codex` (the
+     rollout, read whole) and 1,237 B in `projects`, plus the 176 B sniff.
+     The first evaluation's bound, 4,095,275 B, also counted `kv.sqlite`
+     (3,284,992 B) and `storage.db-wal` (135,992 B). copy refuses those
+     seats and only sniffs them (`.local` read 144 B), and the SQLite half
+     owns them. So that "pass" was an artifact of the bound.
+   - **Inequality 1, small `mutate-10`.** 51,122 B against 51,058 B, over
+     by 64 B.
+   - **Inequality 2.** At estate `mutate-10`, copy received 1,217 B, all of
+     it the new file. The two other changed non-SQLite files were refused
+     `GIT_DESTINATION_OCCUPIED` and never received (finding 8): the 673,054 B
+     rollout append and the edited `cli.js`. At small `mutate-10`, the
+     modified rollout was refused and only the new file was carried. Over
+     the carried seats the inequality holds (1,217 ≤ 1,217; 1,879 ≤ 1,879).
+     The delta did not converge, though, so that is not S3 evidence.
 8. **No-clobber: `blocked by WP0(d)`.** A changed seat whose destination
    already holds an older output is read and then refused
    `GIT_DESTINATION_OCCUPIED`, and the destination keeps the stale bytes:
    - estate `mutate-10`: the appended 673,054 B rollout JSONL and the edited
      `cli.js`;
    - small `mutate-10`: the appended 49,179 B rollout.
+
+   This is why file inequality 2 is `n/a: blocked by WP0(d)` at both
+   `mutate-10` passes.
 
    Until OI-1003-Q18 (d) superseding publish lands, a live estate's edited
    files never converge. Each such seat is probably re-read on every rerun,
@@ -324,8 +473,9 @@ Git inequality 2, per item, from the bundles each capture added:
       195 s in 16,606 directory barriers, and 231 s in 9,414 SQLite commits.
 
     That is WP9's serial per-entry chain on a loaded volume at idle IO
-    priority. It is why the unchanged reruns sit at 0.6 % to 1.7 % of the
-    first pass.
+    priority. It is why the unchanged reruns' wall time (informational) sits
+    at 0.6 % to 1.7 % of the first pass, while their CPU sits at 6.9 % to
+    8.7 %.
 
 ## v2 projection (for the decision packet)
 
@@ -340,22 +490,85 @@ Git inequality 2, per item, from the bundles each capture added:
 
 At estate `first`, the v2 thin pack splits into 170,742,243 B for the
 repositories without history-heavy and 179,361,524 B for history-heavy.
+v1 and v2 do not cover the same repositories. v1 refused all 4 bare mirrors
+on every pass (finding 11), and the projection includes them:
+
+| Pass | v2 thin pack, all (estate) | of which bare mirrors | v2 without mirrors (estate) | v2 without mirrors (small) |
+|---|---:|---:|---:|---:|
+| first | 350,103,767 | 6,427,129 | 343,676,638 | 2,407,663 |
+| rerun-1 to rerun-3 | 0 | 0 | 0 | 0 |
+| mutate-1 | 499 | 0 | 499 | 422 |
+| mutate-10 | 1,065 | 0 | 1,065 | 947 |
+
+The mirrors at estate `first` are `r02` 1,558,041 B, `r08` 565,541 B, `r14`
+2,420,149 B and `r20` 1,883,398 B. At small, the one mirror is 41,250 B.
+
 v1's first-pass bundle files (932,163,797 B; the counter says 932,119,799 B)
 split into:
 - the shared group bases, 155,889,062 B;
 - history-heavy's bundle, 179,409,341 B;
-- the eight `r00` and `r12` item bundles, 546,715,099 B;
+- the eight `r00` and `r12` item bundles, 546,715,099 B. About 537 MB of
+  that is the 64 MiB base blob, re-packed eight times (finding 4);
 - the other 45 item bundles, 50,150,295 B. A repository without linked
   worktrees has no group base, so its history rides in these.
 
-So for refs and history, v1 (335 MB, plus at most 50 MB inside the other
-item bundles) and v2 (350 MB) are comparable. v2 carries no worktree,
-index, untracked or ignored state, so the rest of v1's bytes have no v2
-counterpart. The uncommitted 64 MiB edit at `mutate-10` alone is 67 MB that
-v2 cannot carry.
+So v1's first pass holds 335 MB of bases and history-heavy, and at most
+50 MB more history inside the other item bundles. On top of that come
+about 537 MB of base blobs re-packed by the group-base exclusion, which are
+history bytes, not snapshot layer. Over the same repositories, v2's thin
+packs come to 343.7 MB. v2 carries no worktree, index, untracked or ignored
+state, so the snapshot share of v1's item bundles has no v2 counterpart. In
+unfixed v1 that share cannot be separated from the re-packed base blobs.
+The uncommitted 64 MiB edit at `mutate-10` alone is 67 MB that v2 cannot
+carry.
 
 Building the destination models took 26.8 s (m0) and 64.8 s (m1) at estate,
 with 24 stash entries fetched each time.
+
+## Probes after the run (review round)
+
+The review ran three scratch probes with the measured binary (sha256
+`2da7ec11…`) under an empty git config. Their outputs were re-read for this
+section; the scratch is not durable. Each probe is small, and none is an
+estate-corpus measurement. They show two v1 behaviours that the six passes
+could not reach, because the runs made at most 2 changed captures per item:
+
+- **Exclusion.** A parentless snapshot commit over a 4 MiB tracked blob
+  with a one-line change, excluding a base that holds the blob:
+  - `git bundle create ^base --all`, the group-base path: 4,300,866 B;
+  - `rev-list --objects-edge-aggressive | pack-objects`, the chained path:
+    3,507 B.
+- **Chained item re-base** (`CHAIN_DEPTH_LIMIT` = 8, `chain.rs`). One
+  ungrouped repository with a 4 MiB tracked blob takes ten 512 KiB commits,
+  with one `estate-capture` after each:
+
+  | Capture | 0 | 1 to 8 | 9 | 10 |
+  |---|---:|---:|---:|---:|
+  | Bundle bytes | 4,197,421 | 526,413 to 526,727 | 8,919,284 | 526,818 |
+  | Depth | self-contained | chained | self-contained (re-base) | chained |
+
+  Every ninth changed capture re-packs the item's whole history, by design.
+- **Grouped items never chain.** `chain_offer` drops the link whenever a
+  plan base exists (`link.filter(|_| unbased)`), and `prepare_base` reuses
+  `shared-{group}.base` for good. The probe used one repository plus one
+  linked worktree (a 2-item group, so a shared base), with the same ten
+  commits. Each commit changes the ref inventory in both items' keys, so
+  both recapture every pass. Each pass's bundle grows by about one
+  commit:
+
+  | Pass | 0 | 1 | 2 | 3 | … | 10 |
+  |---|---:|---:|---:|---:|---|---:|
+  | Item bundle bytes (each of the 2) | 4.25 M | 526,696 to 526,926 | 1,051,382 to 1,051,626 | 1,576,092 to 1,576,350 | … | 5,249,800 to 5,250,161 |
+
+  At pass 0, the two item bundles (4,245,323 B and 4,245,531 B) sit beside
+  a 4,243,658 B shared base. The base's 4 MiB blob is re-packed into both,
+  which is finding 4's shape.
+
+  By pass 10, a 512 KiB commit costs about 10.5 MB across the two items. A
+  grouped item re-packs all history added since the first pass on every
+  changed capture, once per item in the group. In the corpus, `r00` and
+  `r12` are 4-item groups. history-heavy, the only history-delta case the
+  runs measured, is a group of one.
 
 ## Caveats
 
@@ -368,8 +581,12 @@ with 24 stash entries fetched each time.
   and 61,440 B.
 - **The SQLite bytes are derived.** They are the database plus `-wal` sizes
   the backup API reads, not a counter.
-- **The bounds are the harness's.** The file half's absent-chunk widening is
-  an allowance, not a ruling. The git bound includes no capture metadata.
+- **The bounds are the harness's.**
+  - The file half's absent-chunk widening is an allowance, not a ruling.
+  - The git bound includes no capture metadata. It is reported at chunk
+    and object granularity, pending a ruling on which applies.
+  - Git inequality 1 covers worktree seats only, pending a ruling on
+    object-store reads.
 - **The v2 column is a projection.** It is history and refs only, against a
   mirror model of the destination. A real v2 sender also needs the snapshot
   layer.
