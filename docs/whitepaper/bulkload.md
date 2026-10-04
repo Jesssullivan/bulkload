@@ -1,8 +1,9 @@
 # bulkload: moving a live agent estate between machines
 
 **Whitepaper, draft of 2026-10-03.** Proof package item one (OI-1003-Q7).
-Code base: `origin/main` at `04ea9cb` (WP1, PR #145, and WP2 PR 1, PR #144,
-both merged). References use keys in square brackets (for example
+Code base: `origin/main` at `6268175`. That includes WP1 (#145, merged as
+`adb9c66`), WP2 PR 1 (#144, `04ea9cb`) and WP10 PR 1 (#152, `6268175`).
+References use keys in square brackets (for example
 [Rsync96]); each one resolves in the [bibliography](bibliography.md), with
 a note on how it was verified.
 
@@ -16,7 +17,7 @@ normative document disagree, the normative document wins:
 
 Statements about the code cite a file under `crates/`. Statements about
 results cite an evidence file and its date. Work that is ratified but not on
-`main` at `04ea9cb` is marked as such. The paper quotes no SLO number; it
+`main` at `6268175` is marked as such. The paper quotes no SLO number; it
 links [`docs/slo.md`](../slo.md) for them, so a dated amendment there cannot
 leave this paper silently out of date.
 
@@ -28,9 +29,10 @@ linked worktrees, stashes, staged and unstaged work; agent transcripts and
 SQLite stores; dotfiles and credentials. The target user runs coding agents
 that keep committing, writing transcripts and updating databases during the
 move. bulkload's goal is that the move is not an event: it is a sync that
-can be rerun at any time. Each rerun reads only what changed, never reads a
-byte the destination already holds durably, and ends with every planned item
-accounted for.
+can be rerun at any time. The aim is that each rerun reads only what
+changed, never reads a byte the destination already holds durably, and ends
+with every planned item accounted for. Sections 4 and 5 say how much of
+that is proven today.
 
 The design has four parts:
 
@@ -51,10 +53,10 @@ invariant (R25) has held in every recorded bench run. Every such run
 measured the file mover, before wire v5; the Git carry path has not been
 measured for it. **S1 is not met.** Gate (a) has no passing verdict. The
 last completed R23 sample (2026-09-18, before wire v5) failed on the initial
-copy, with a native median of 3,015 ms against rclone's 601 ms, and won on
-the 1 % delta ([evidence](../evidence/r23-2026-09-18.md)). The samples of
-2026-09-23 were ungated or informational. The wire v5 engine has no gated
-sample.
+copy: native median 3015.294 ms against rclone's 601.010 ms. It won the 1 %
+delta, 58.842 ms against 127.064 ms, but both comparisons are mandatory
+([evidence](../evidence/r23-2026-09-18.md)). The samples of 2026-09-23 were
+ungated or informational. The wire v5 engine has no gated sample.
 
 ## 1. Problem
 
@@ -142,10 +144,11 @@ run starts again from the first byte.
 ### 1.4 The goal: a routine rerun, not an event
 
 OI-1003-Q13 sets the completion bar as confidence in the code and the
-product. The full neo → sting migration is one more run of a trusted tool.
-It can start whenever convenient and be repeated as neo's work lanes finish.
-Each rerun converges without re-reading anything it has already carried.
-That requires three properties together:
+product. The full neo → sting migration is then meant to be one more run of
+a trusted tool. It can start whenever convenient and be repeated as neo's
+work lanes finish. Once S3 and S5 hold, each rerun converges without
+re-reading anything it has already carried. That requires three properties
+together:
 
 - **S3:** an unchanged estate costs a metadata walk and no content reads;
 - **S5:** a moving source produces custody, not failure;
@@ -158,14 +161,18 @@ correct and boring.
 
 ### 2.1 Shape
 
-bulkload is a Rust workspace of three crates (`AGENTS.md`, "Repository"):
+bulkload is a Rust workspace of four crates (`AGENTS.md`, "Repository"):
 
 - `crates/bulkload-proto`: the wire codec and schema text
   (`src/frame.rs`), the row schema (`src/row.rs`) and the refusal taxonomy
   (`src/refusal.rs`);
 - `crates/bulkload-agent`: the walk, the transfer engine, the destination
   store, Git estate carry, SQLite capture, closure and the crash tooling;
-- `crates/bulkload-bench`: the R23 benchmark against rclone.
+- `crates/bulkload-bench`: the R23 benchmark against rclone;
+- `crates/bulkload-handoff`: the credential-class handoff probes. WP10 PR 1
+  (#152) moved them out of the agent binary. A source scan now checks that
+  no agent source names a credential or agent tool as a program to run
+  (`crates/bulkload-agent/tests/no_credential_tools.rs`).
 
 The agent may not depend on tokio, opendal, reqwest, ring or tonic. A test
 enforces this (`crates/bulkload-agent/tests/dep_graph.rs`). R-N54 makes raw
@@ -411,8 +418,8 @@ The first step is on `main`: WP2 PR 1 (#144) counts the storage reads of
 the Git children that pack a capture, and every metadata census
 (`census_walks`; `tests/git_capture_counters.rs` pins it at 4 for a changed
 item and 1 for a reuse hit). The second step, the auto-prerequisite, is
-WP2 PR 2 and is not on `main`. So a changed rerun still re-packs the whole
-history; #144's own test measures that baseline.
+WP2 PR 2 (#146), which is open and not on `main`. So a changed rerun
+still re-packs the whole history; #144's own test measures that baseline.
 
 Until then the ruling keeps `carry_v2` frozen behind a feature. The code
 does not have that gate yet. `carry_v2` is declared unconditionally
@@ -443,7 +450,10 @@ budget turns an endlessly restarting backup into a typed refusal
 S2's "no locks" (WP0(b), OI-1003-Q16). The ruling requires it to be
 shared-read only, bounded and counted. The code bounds it by step count
 (`max_steps` steps of at most 128 pages, with no wait on contention), not by
-duration. No counter records backup steps or lock holds yet. Composition
+duration. No counter records backup steps or lock holds yet. A probe
+reported on 2026-10-03 indicates that this kind of open also creates a
+`-shm` file beside a source database that has none, which is a source-side
+write (section 8). Composition
 preserves unique rows on both sides and keeps conflicting snapshots for
 explicit resolution. A snapshot is never installed over a live database.
 
@@ -461,7 +471,7 @@ section 1, problem 3). That review counted, at `727493a`:
   `output()` maps any failed Git child to that one code and drops its
   stderr.
 
-On `04ea9cb`, a failed SQLite backup step still maps to `Io(None)`
+On `6268175`, a failed SQLite backup step still maps to `Io(None)`
 (`snapshot` in `src/provider_sqlite.rs`). `closure.rs` still reads a refusal
 code back out of the receipt's Display text (`split_whitespace`), instead of
 matching a typed value. Such refusals name no cause that a disposition could
@@ -604,10 +614,11 @@ in section 4.
 ### 3.3 S2: source safety
 
 **Statement** (paraphrased; the normative text and the budget are S2 and
-WP0(b) in [`docs/slo.md`](../slo.md)). bulkload takes no lock on a source
-repository, writes nothing to the source, signals no process, and runs at
-background priority. The one exception is SQLite's shared read lock
-(OI-1003-Q5, Q9, Q16).
+WP0(b) in [`docs/slo.md`](../slo.md)). S2 requires that bulkload take no
+lock on a source repository, write nothing to the source, signal no
+process, and run at background priority. The one stated exception is
+SQLite's shared read lock (OI-1003-Q5, Q9, Q16). This section says how much
+of that holds today.
 
 **Why it matters.** The source is a live workstation. A mover that takes
 `index.lock`, triggers `gc`, runs a hook, fetches from a promisor remote, or
@@ -633,7 +644,7 @@ leave alone. Any of these makes the migration an event again.
   only another session's commit
   ([estimate](../evidence/git-carry-estimate-2026-09-23.md)).
 
-**What WP1 delivered** (PR #145, merged as `adb9c66`;
+**What WP1 delivered, on `main` since `adb9c66`** (PR #145;
 [`docs/design.md`](../design.md), "Live union", "Source safety (S2, WP1)";
 [agent note](../agent-notes/2026-10-03-wp1-s2-source-safety.md)). The
 architecture review had found S2 held partly by convention
@@ -685,9 +696,16 @@ amendment (OI-1003-Q25, recorded on Linear TIN-4543), not yet in
 - **P34 and P35** in the property-test plan's form are pending. P34 covers
   source inertness over traced copies, carries and estimates, including lock
   events. P35 is a per-thread priority probe.
-- **The formal model** is in progress (section 4). It models the transfer
-  protocol. It will not prove S2 at the level of the code, and it does not
-  cover the Git carry or the SQLite capture.
+- **The formal model** has TLC results committed on its branch
+  (`3dbfbdb`, not on `main`; section 4). It models the transfer protocol,
+  and it cannot prove S2 at the level of the code. It represents Git and
+  SQLite source access only as abstract typed reads, and it does not model
+  the Git carry itself.
+- **SQLite `-shm` creation.** The WP0(e) estate-corpus work reported a
+  probe on 2026-10-03: a read-only, WAL-aware open, made the way `snapshot`
+  opens a source, created `<db>-shm` beside a WAL database (section 8).
+  That is a write to the source. Whether it falls inside OI-1003-Q16's
+  SQLite exception is an open operator ruling (Linear TIN-4543).
 
 The idle I/O class only helps where the kernel's I/O scheduler honours
 priority classes [IoprioSet]. This is why S2's budget is measured, not
@@ -706,43 +724,112 @@ each claim. Five instruments exist or are being built.
   times the cases. There is no fuzzing (OI-1003-Q7). The method follows
   QuickCheck [QuickCheck00] through `proptest` [Proptest]. A test is retired
   only when its subsuming property catches the specific mutant the old test
-  was written for. On `main` today, `proptest!` appears in four places:
+  was written for. On `main` at `6268175`, `proptest!` appears in five
+  places:
   - the slab pool and chunker models (`src/io/buf/tests.rs`,
     `src/io/chunker/tests.rs`);
   - the `carry_v2` random-DAG test (`tests/git_carry_v2.rs`);
   - WP1's P-S2 source-census property (`src/transfer/tests.rs`,
-    section 3.3).
+    section 3.3);
+  - WP10 PR 1's two properties of the shared child-drain helper,
+    `drain_bounded` (`src/child.rs`, #152).
 
   WP1 also added `test_support::prop_config`, the plan's fixed-seed helper,
-  in minimal form. The plan counted three places before WP1
+  in minimal form; P-S2 and `drain_bounded`'s properties run through it.
+  The plan counted three places before WP1
   ([plan](../plans/2026-10-03-property-test-plan.md), section 0). The
   catalogue is mostly planned work.
-- **Formal model.** `docs/slo.md` ("Proof package") asks for a
-  specification of the transfer protocol, model-checked by a tool.
-  OI-1003-Q32 (Linear TIN-4543) makes the model a hybrid:
+- **Formal model.** `docs/slo.md` ("Proof package") asks for a TLA+ (or
+  equivalent) specification of wire v5, `Held`, ledger commit and resume. It
+  is to be model-checked for R25, durability ordering, and S2's no-write
+  and no-lock properties. OI-1003-Q32 (Linear TIN-4543) makes the model a
+  hybrid:
   - TLA+ with the TLC model checker [TLA94] [Specifying02] [TLC99] is the
     checker of record;
-  - planned: a Dhall typed catalogue will render the model-checking
-    configurations;
-  - planned: an independent explorer written in Haskell will re-check one
-    core configuration, as an N-version cross-check of TLC.
+  - planned for sprint 2: a Dhall typed catalogue will render the TLC
+    configurations (`configs.tsv` and the `MC_*.cfg` files), replacing
+    today's generator script;
+  - planned for sprint 2: an independent breadth-first explorer written in
+    Haskell will re-check one core configuration, as an N-version
+    cross-check of TLC. It must match TLC's distinct-state count and TLC's
+    verdicts on three mutations.
 
-  The TLA+ model is in progress on the branch `docs/tla-model-20261003`.
-  Its scope, described generically until its invariant names are fixed:
-  - wire v5;
-  - `Held` sent only after the output's group commit;
-  - durability ordering;
-  - R25 across crash and resume;
-  - variants for WP0(g), the relaxed source ledger, and WP0(d),
-    superseding publish.
+  The TLA+ model is on the branch `docs/tla-model-20261003`, which is not
+  on `main`. At that branch's origin head, `3dbfbdb`,
+  `docs/formal/BulkloadTransfer.tla` models:
+  - wire v5 per entry, from `Entry` and `Decide` through `Held` and
+    `SourceDone`;
+  - destination staging, file seal, no-replace publish, directory seal and
+    the store's group commit;
+  - the digest-only source ledger, committed only on `Held{true}`;
+  - crashes of either host or both, and the rerun after them;
+  - racy captures, source edits, third-party writes at the destination,
+    failed group commits and the space refusal;
+  - source access as typed reads, with the SQLite backup's shared read lock
+    as the one bounded exception;
+  - variants for WP0(g), the relaxed source ledger, and two candidate
+    designs for WP0(d), superseding publish.
 
-  This paper reports no model results; only TLC results committed on that
-  branch would count. The model is a model of the protocol. It cannot
-  prove S2 at the level of the code, it does not cover the Git carry, and
-  S3's Git half is not modelled. `docs/slo.md` also asks
-  the model to check S2's no-write and no-lock properties; a result there
-  would hold for the model's abstraction of the source, not for the code.
-  WP0(g) holds only if the model proves it.
+  At `3dbfbdb` its safety invariants are `TypeOK`,
+  `R25_NoDurableReread`, `R25_NoCommittedCaptureReread`, `ReadOnce`,
+  `S3_ReadsOnlyChanged`, `S3_UnchangedReadsZero`, `S3_ClosedPassIsHeld`,
+  `RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`,
+  `DoneAfterLedger`, `ReuseSound`, `LedgerSound`, `NoClobber`,
+  `S2_TypedSourceAccess`, `S2_BackupLockBounded` and `ClosureAccounted`.
+  `RunsClose` and `AllRunsFinish` are its liveness properties.
+  `WithinBudget` is a wall-clock budget on a TLC run, not a property of the
+  protocol. The branch's README freezes these names. Each negative
+  configuration breaks exactly one rule and must produce a counterexample.
+
+  **TLC results** (committed at `3dbfbdb`, in `docs/formal/README.md`). The
+  run of record was one full `just tla-check` on sting on 2026-10-04, with
+  TLC 2.19. It ran over the specification and configurations of
+  `3760263`; the specification is unchanged at `3dbfbdb`. All 35
+  configurations gave their expected outcome:
+  - 9 positive configurations finished with no property violated.
+    `MC_main` (two seats, two runs, one crash, one source edit, with
+    symmetry over seats) explored 869,296 distinct states. The N-version
+    core, `MC_nv_core`, has 15,834.
+  - 24 negative configurations each violated exactly the one property
+    they name, so every mutation was caught.
+  - `MC_live` satisfies `RunsClose` and `AllRunsFinish` under weak
+    fairness of the protocol, with no crash and a source that stops
+    changing. Without that fairness, `RunsClose` fails.
+  - `MC_main_sim` is a random simulation with larger constants. It is
+    evidence, not a model-checking result.
+  - The budget self-test is expected to be inconclusive. It shows that the
+    wall-clock budget can end a run.
+
+  These results hold within small bounds: two seats with two runs, or one
+  seat with three runs and two crashes. TLC found no violation within
+  them. That is not a proof for every estate size.
+
+  The results carry two findings on open rulings:
+  - **WP0(g).** With relaxed ledger rows, `MC_wp0g` and `MC_wp0g_deep`
+    pass. `MC_wp0g_authority` also relaxes the commit that creates the
+    source store's authority, and it fails `R25_NoDurableReread`. The
+    README concludes that WP0(g) holds for the ledger's row commits only
+    if that creation commit stays durable, and it lists further
+    conditions. Both stores still run at full durability in the code, so
+    WP0(g) is not implemented.
+  - **WP0(d).** The exchange design satisfies `NoClobber`; the
+    check-then-rename design violates it. Superseding publish has no code
+    yet.
+
+  What the model cannot show:
+  - It is a model of the protocol. It cannot prove S2 at the level of the
+    code. `S2_TypedSourceAccess` holds for the model's abstraction of
+    source access, not for the binary.
+  - It does not cover the Git carry. Git carry v1 and v2, the ingest
+    journal and estate apply are outside it (the specification's header
+    says so). Git appears only as one abstract typed read. S3's Git half is
+    not modelled.
+  - Background priority is not a property of the model. The specification
+    leaves it to P35 and the S2 budget.
+  - `docs/slo.md` makes WP0(g) conditional on the model. The model's
+    verdict is itself conditional, and the branch is not yet reviewed onto
+    `main`. TIN-4543 records no ruling yet on adopting WP0(g) under those
+    conditions.
 - **Crash and power-loss proofs.**
   - The W7 fault harness crashes a real `copy` with `_exit` at each fault
     point. After each crash it checks four invariants:
@@ -799,17 +886,17 @@ each claim. Five instruments exist or are being built.
   on it in addition to R23's 23-file corpus. It is in progress
   (`feat/wp0e-estate-corpus-20261003`).
 
-| SLO | Instrument | State at `04ea9cb` |
+| SLO | Instrument | State at `6268175` |
 |---|---|---|
 | S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
-| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main`, with P-S2 for the file path (section 3.3). Typed source access (WP7), P34, P35 and the model pending. |
+| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`. The `-shm` finding awaits a ruling. |
 | S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not built. Pending gate. |
-| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). |
+| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
 | S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`; disposition ledger pending. |
 | S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is bare `IO` (WP5 PR 2). See section 2.10. |
-| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs | In `check-fast` and PR CI; #144 passed CI before merging as `04ea9cb` (Linear TIN-4543). The real-copy and adoption power-loss proofs accept bounded crash points. |
+| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #152's source, build, test and fault-harness checks passed before it merged as `6268175`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
 
 ## 5. Results
 
@@ -1120,13 +1207,16 @@ The architecture review
 ([`docs/plans/2026-10-03-architecture-review.md`](../plans/2026-10-03-architecture-review.md))
 ranks the work. This paper only points at it:
 
-- S2 source safety: WP1 has landed (section 3.3). Still to come: WP7 for
+- S2 source safety: WP1 is on `main` (section 3.3). Still to come: WP7 for
   typed source access in the types, WP6's S2 sampler, P34 and P35 from the
-  property-test plan, and the formal model;
-- bounded salvage (#124, OI-1002-Q33): code in #154, not on `main`;
+  property-test plan, review and merge of the formal model, and a ruling
+  on the SQLite `-shm` finding;
+- bounded salvage (#124, OI-1002-Q33): code in #154, open, not on `main`;
 - one Git engine with counted, incremental v1: WP2. PR 1 (pack-read and
-  census counters) is on `main`; PR 2 (the auto-prerequisite) is not;
-- typed refusals and S4 closure over every item kind: WP3;
+  census counters) is on `main`; PR 2 (the auto-prerequisite, #146) is
+  open;
+- typed refusals and S4 closure over every item kind: WP3 (PRs 1 and 2,
+  #150 and #151, open);
 - one `sync` verb in place of today's choreography of verbs: WP4;
 - drift custody for HEAD and index (#38), and superseding publish under
   WP0(d): WP5;
@@ -1135,13 +1225,16 @@ ranks the work. This paper only points at it:
   a v0 synthetic reference workload (OI-1003-Q34, Linear TIN-4543);
 - one durability façade: WP8;
 - destination throughput for estate-shaped trees: WP9;
-- sprawl removal: WP10.
+- sprawl removal: WP10. PR 1 (#152) is on `main`; PR 2 (#153) is open.
 
-Two proof-package items are in progress elsewhere: the formal model
-(`docs/tla-model-20261003`) and the estate-shaped corpus
-(`feat/wp0e-estate-corpus-20261003`). A gated gate (a) run on corpus v1, and
-a first gate (b) run, are still owed. Linear TIN-4543 records three gate (a)
-attempts on 2026-10-03, none with a verdict:
+Two proof-package items are in progress elsewhere. The formal model is on
+`docs/tla-model-20261003`, whose origin head was `3dbfbdb` when this was
+written. Its TLC results are committed there, but it is not yet on `main`.
+Its Dhall catalogue and Haskell explorer are sprint 2 work (OI-1003-Q32).
+The estate-shaped corpus is on `feat/wp0e-estate-corpus-20261003`. A gated
+gate (a) run on corpus v1, and a first gate (b) run, are still owed.
+Linear TIN-4543 records three gate (a) attempts on 2026-10-03, none with a
+verdict:
 
 - 01:32Z failed to build, because local builds were disabled on neo;
 - 02:01Z was refused at load1 37;
@@ -1192,20 +1285,30 @@ waits for the full post-train `main`.
   The pack-child read counter added by WP2 PR 1 misses page-cache hits, and
   on Darwin it is a lower bound even for storage reads. Reads by other Git
   children are not counted at all (section 5.4).
-- **S2 is proven only in part** (section 3.3). WP1 made most of it
+- **S2 is proven only in part** (section 3.3). WP1 made more of it
   structural, but source access is not yet typed, the budget is unmeasured,
-  and the P-S2 property covers the file path only. One more unverified edge:
-  a read-only WAL connection may need to create `-shm` or `-wal` files when
-  they are absent [SQLiteWAL]. No repository test shows what bulkload's
-  SQLite open does on a source directory in that state. The architecture
-  review lists this as plausible, not demonstrated.
+  the P-S2 property covers the file path only, and the model checks S2 at
+  the protocol level only. One more edge: a read-only WAL connection may
+  need to create `-shm` or `-wal` files when they are absent [SQLiteWAL].
+  The architecture review listed this as plausible, not demonstrated. The
+  WP0(e) estate-corpus work then probed it on 2026-10-03 with the open
+  flags `snapshot` uses, but outside bulkload: SQLite 3.51.2 on a copy of
+  the corpus's WAL database, and 3.53.1 on an equivalent image. Both
+  created `<db>-shm` beside the database. The 3.51.2 probe also showed the
+  main file and `-wal` staying byte-identical. The record is in
+  `docs/evidence/estate-corpus-v1-2026-10-03.md` on
+  `feat/wp0e-estate-corpus-20261003` (`7b75b26`), which is not on `main`,
+  and on Linear TIN-4543. No repository test on `main` runs bulkload's own
+  open in that state. Whether S2 and OI-1003-Q16 admit this write is an
+  open operator ruling.
 - **The stat-identity trust model is cooperative.** Reuse trusts stat
   identity and the capturing host's clock. A writer able to forge ctime, or
   a filesystem whose clock lags by more than 2 s, defeats it. Capture
   records and their sidecars are not authenticated; corpus integrity rests
   on 0700 custody ([`docs/design.md`](../design.md), "Drift").
 - **Property tests are bounded.** A fixed-seed CI corpus is a regression
-  net, not a proof. A formal model proves the model; the gap between model
-  and code is closed only by keeping both reviewed together.
+  net, not a proof. A formal model proves the model, and TLC checks it
+  only within small bounds (section 4). The gap between model and code is
+  closed only by keeping both reviewed together.
 - **The sample is narrow.** Two hosts, one operator and one estate. The
   `carry_v2` results come from fixtures only.

@@ -69,10 +69,15 @@ Content-Defined Chunking for Data Deduplication Based Storage Systems."
 *IEEE Transactions on Parallel and Distributed Systems* 31(9), 2020,
 pp. 2017–2031. DOI
 [10.1109/TPDS.2020.2984632](https://doi.org/10.1109/TPDS.2020.2984632).
-- Verified via: Crossref, DOI 10.1109/TPDS.2020.2984632.
+- Verified via: Crossref, DOI 10.1109/TPDS.2020.2984632 (title, volume 31,
+  issue 9, pages 2017–2031). Its Crossref primary resource is IEEE Xplore
+  document 9055082.
 - Note: bulkload uses the `fastcdc` crate's `v2020` module
-  (`crates/bulkload-agent/src/hash.rs`). That the module implements this
-  paper is the crate's naming, not checked by a tool here.
+  (`crates/bulkload-agent/src/hash.rs`), at version 3.2.1 in `Cargo.lock`.
+  Re-resolved on 2026-10-03: that version's `src/v2020/mod.rs`, read from
+  the crates.io package, names this paper as IEEE Xplore document 9055082,
+  the same record as the DOI. Whether the code matches the paper is the
+  crate's claim; it was not checked here.
 
 **[FileSync98]** S. Balasubramaniam and Benjamin C. Pierce. "What is a file
 synchronizer?" *Proceedings of the 4th Annual ACM/IEEE International
@@ -128,12 +133,19 @@ pp. 872–923. DOI
 - Verified via: Crossref, DOI 10.1145/177492.177726.
 
 **[TLC99]** Yuan Yu, Panagiotis Manolios and Leslie Lamport. "Model Checking
-TLA+ Specifications." In *Correct Hardware Design and Verification Methods*,
-Lecture Notes in Computer Science, Springer, 1999, pp. 54–66. DOI
+TLA+ Specifications." In Laurence Pierre and Thomas Kropf (eds.), *Correct
+Hardware Design and Verification Methods (CHARME '99)*, Lecture Notes in
+Computer Science 1703, Springer, 1999, pp. 54–66. DOI
 [10.1007/3-540-48153-2_6](https://doi.org/10.1007/3-540-48153-2_6).
 - Verified via: Crossref API, DOI 10.1007/3-540-48153-2_6 (authors, title,
-  container titles, year, pages, ISBN 9783540665595).
-- LNCS volume number: unverified, so omitted.
+  container titles, year, pages, ISBN 9783540665595). The editors come
+  from Crossref's record for the book, DOI 10.1007/3-540-48153-2.
+- LNCS volume number: re-resolved on 2026-10-03. Crossref, OpenAlex and the
+  Springer chapter page gave no volume number. Springer's page served a bot
+  check, and DBLP returned an error. Lamport's publications page,
+  <https://lamport.azurewebsites.net/pubs/pubs.html> (fetched), lists the
+  paper in CHARME '99 as LNCS number 1703, edited by Pierre and Kropf,
+  pp. 54–66.
 
 **[Unison04]** Benjamin C. Pierce and Jérôme Vouillon. "What's in Unison? A
 Formal Specification and Reference Implementation of a File Synchronizer."
@@ -155,7 +167,9 @@ Documentation (Xcode). Accessed 2026-10-03.
 <https://developer.apple.com/documentation/xcode/reducing-disk-writes>
 - Verified via: fetched the page and its JSON data endpoint,
   <https://developer.apple.com/tutorials/data/documentation/xcode/reducing-disk-writes.json>,
-  and read the body:
+  and read the body. Re-resolved on 2026-10-03: the JSON endpoint was
+  fetched again (HTTP 200, title "Reducing disk writes"), and its body
+  still says:
   - apps that need a write barrier can use `F_BARRIERFSYNC`;
   - `F_FULLFSYNC` is for apps that need a strong expectation of
     persistence;
@@ -221,10 +235,11 @@ ioprio_set(2): get/set I/O scheduling class and priority." Accessed
 **[RacyGit]** The Git project. "racy-git." Git technical documentation.
 Accessed 2026-10-03.
 <https://git-scm.com/docs/racy-git>
-- Verified via: fetched (page title). An entry is racily clean when its
-  cached `st_mtime` is the same as, or newer than, the index file's own
-  timestamp. Git then re-checks the entry's content against the recorded
-  object.
+- Verified via: fetched, title "Git - racy-git Documentation". Re-resolved
+  on 2026-10-03 by fetching it again and reading the body: an entry is
+  racily clean when its cached `st_mtime` is the same as, or newer than,
+  the index file's own timestamp. Git then re-checks the entry's content
+  against the recorded object.
 
 **[SQLiteBackup]** SQLite. "SQLite Backup API." Accessed 2026-10-03.
 <https://www.sqlite.org/backup.html>
@@ -289,8 +304,9 @@ testing for Rust." Software repository. Accessed 2026-10-03.
 <https://github.com/proptest-rs/proptest>
 - Verified via: fetched, plus the GitHub API repository description
   (strategies, shrinking, Apache-2.0 or MIT).
-- bulkload pins `proptest` 1.11 as a workspace dev-dependency
-  ([property-test plan](../plans/2026-10-03-property-test-plan.md),
+- bulkload declares `proptest` version `1` as a workspace dependency, and
+  `Cargo.lock` resolves it to 1.11.0 (checked at `6268175`;
+  [property-test plan](../plans/2026-10-03-property-test-plan.md),
   section 0).
 
 **[Rclone]** The rclone project. rclone documentation: "rclone copy", "Local

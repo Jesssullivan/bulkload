@@ -1,129 +1,159 @@
 # 2026-10-03 — whitepaper and bibliography (proof package item one)
 
-**Lane:** `whitepaper` (Lane C), a workflow subagent on sting. Branch
-`docs/whitepaper-20261003`. It was first cut from `origin/main` `57030e1`,
-then rebased onto `04ea9cb` in the review-fix pass below. That base holds
-WP1 (#145) and WP2 PR 1 (#144). Worktree
+**Lane:** `whitepaper` (Lane C). Branch `docs/whitepaper-20261003`, worktree
 `bulkload.worktrees/whitepaper-20261003`. No PR yet.
 **Rulings:** OI-1003-Q7 (proof package: whitepaper and bibliography),
-OI-1003-Q23 (lane fan-out; C is the whitepaper and bibliography, per
-Linear TIN-4543), R-N13 (receipts and this note).
+OI-1003-Q23 (lane fan-out; C is the whitepaper and bibliography),
+OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
+(receipts and this note). All are recorded on Linear TIN-4543.
+
+## Commits on the branch
+
+| sha | what |
+|---|---|
+| `d6f6432` | First draft of the paper and the bibliography. |
+| `e7b12fd` | Dropped the `docs/slo.md` pointer line; the coordinator's docs PR carries it. |
+| `ba6e487` | Lane C review fixes (25 findings); pinned to `04ea9cb`. |
+| `7e2921a` | Merge of `origin/main` at `6268175` (#152), so the branch diff lists only lane C files. |
+| finish commit | This pass: re-pin to `6268175`, formal-model section, bibliography re-resolution, this note. |
+
+The branch was first cut from `57030e1`. The review-fix pass rebased it onto
+`04ea9cb`. This pass merged `main` instead and did not rewrite history.
 
 ## Done
 
-- `docs/whitepaper/bulkload.md` covers the problem, the design, the
-  invariants (R25, durability ordering, S2), how each SLO is proven, results,
-  related work, future work, and limits. It cites code paths under
-  `crates/` and evidence files with their dates. It is pinned to `04ea9cb`.
-  - Section 5 quotes only `docs/evidence/`.
-  - S1 is stated as not met. Gate (a) has no passing verdict, and the wire
-    v5 engine has no gated sample.
-  - S1 gate (b), the S2 budget and the S3 ratio are marked "pending gate".
-  - SLO numbers are linked to `docs/slo.md`, not copied.
-  - The formal model is described generically. Following OI-1003-Q32
-    (TIN-4543), TLA+/TLC is the checker of record, and the Dhall catalogue
-    and the Haskell N-version explorer are stated as planned work. It names
-    no model invariant or mutation. It says the model cannot
-    prove S2 at the level of the code and does not cover the Git carry, and
-    that S3's Git half is not modelled. No model results are reported.
-- `docs/whitepaper/bibliography.md` has 34 entries, each with a "verified
-  via" note. The sources are Crossref DOI records, USENIX pages with ISBNs
-  or BibTeX, the ANU and UPenn handles, official documentation pages and
-  repositories. Every key cited in the paper is defined, and every defined
+- **Paper** (`docs/whitepaper/bulkload.md`), pinned to `origin/main`
+  `6268175`. It covers the problem, the design, the invariants (R25,
+  durability ordering, S2), how each SLO is proven, results, related work,
+  future work and limits. Section 5 quotes only `docs/evidence/`. SLO
+  numbers are linked to `docs/slo.md`, not copied.
+- **Bibliography** (`docs/whitepaper/bibliography.md`): 34 entries, each
+  with a "verified via" note. Every cited key is defined, and every defined
   key is cited (checked by script).
-- `docs/slo.md` and `AGENTS.md` are **not** changed. The first draft's
-  `docs/slo.md` pointer line was dropped by coordinator direction: the
-  coordinator's docs PR carries that pointer, with rulings Q24 onward. The
-  whitepaper is not a source of truth, so it is not listed in `AGENTS.md`.
+- `docs/slo.md`, `docs/design.md` and `AGENTS.md` are not changed by this
+  lane. `AGENTS.md` differs from `ba6e487` only through the merge of
+  `main`.
 
-## Review-fix pass (2026-10-03, 25 findings)
+## Finish pass (2026-10-03, after the duplicate-agent incident)
 
-Two agents wrote this worktree during the pass: the workflow's fix agent
-and a copy resumed by the coordinator's first redirect. By coordinator
-ruling, lane C has one owner, the fix agent. Its edits were reviewed and
-kept where correct; one example is Borg's `LocalCache.commit`.
+Each item was checked against `origin/main` `6268175`, `docs/evidence/`,
+the GitHub PR list and TIN-4543.
 
-- **S2 and WP1 (sections 2.7, 3.3, 4, 7).** The paper now describes what WP1
-  delivered:
-  - the `git_env` table, which removes eleven named variables (not every
-    `GIT_*` variable);
-  - `GIT_SOURCE_PARTIAL_CLONE`;
-  - background priority for six verbs;
-  - the overlap-first check;
-  - the P-S2 proptest, which makes four `proptest!` sites;
-  - `ObjectStoreRewritten` drift.
+- **S1 is stated as not met.** The 2026-09-18 R23 sample (pre-wire-v5)
+  failed the initial copy at 3015.294 ms against rclone's 601.010 ms. It won
+  the 1 % delta, 58.842 ms against 127.064 ms. The abstract now gives these
+  exact numbers, matching `docs/evidence/r23-2026-09-18.md`.
+- **Wire v5 has no gated sample.** The three 2026-10-03 gate (a) attempts
+  (01:32Z, 02:01Z, 19:30Z) are cited only through TIN-4543, in section 7,
+  because `docs/evidence/` has no file for them.
+- **Nothing stronger than `docs/slo.md`.** The abstract, section 1.4 and
+  section 3.3 now state the S3 and S2 goals as requirements or aims, not as
+  facts. Section 8 says WP1 made "more", not "most", of S2 structural.
+- **WP1 is on `main`** (#145, `adb9c66`). The hardening table
+  (`git_carry::git_env`, eleven cleared variables) and background priority
+  for six verbs were checked in the code at `6268175`. No text says they are
+  off `main`.
+- **#152 (WP10 PR 1) folded in.** Four crates, with `bulkload-handoff`
+  described. Five `proptest!` sites, adding `drain_bounded` in
+  `src/child.rs`. The durability row cites #152's four passing checks.
+- **Section 4, formal model (OI-1003-Q32).** TLA+/TLC is the checker of
+  record. The Dhall catalogue and the Haskell N-version explorer are stated
+  as planned for sprint 2.
+  - Lane B's origin head moved during this pass, from `1da332c` (a
+    snapshot, with no results) through `3760263` to `3dbfbdb`. The first
+    draft of this pass said "pending". After a re-check of origin before
+    committing, section 4 instead reports the results committed in
+    `docs/formal/README.md` at `3dbfbdb`.
+  - Those results: the run of record over `3760263`'s spec, which is
+    unchanged at `3dbfbdb`. All 35 rows matched their expectation:
+    - 9 PASS, 24 FAIL each on its named property, 1 SIMULATION and the
+      INCONCLUSIVE budget self-test;
+    - `MC_main` has 869,296 distinct states and `MC_nv_core` 15,834;
+    - the WP0(g) verdict is conditional, and WP0(d)'s exchange passes
+      while check-then-rename fails.
 
-  Only these stay open: WP7, the S2 sampler, P34 and P35, and the model.
-  `the_source_writes_no_content_bytes` is described as the R-N58
-  no-source-pack check.
-- **WP2 PR 1 (#144).** It merged while this pass ran, so the paper was
-  re-pinned. Pack-child reads are counted as a lower bound and
-  `census_walks` exists. The auto-prerequisite (PR 2) is not on `main`, so
-  v1 still re-packs the whole history. The Git carry remains unmeasured in
-  any run.
-- **Code-state corrections:**
-  - the source-ledger path is `LedgerSink::publish`, then
-    `StorePublisher::commit_captures`;
-  - R-N54 buffer reuse is not wired;
-  - `carry_v2` has no feature gate yet;
-  - the salvage bound is in #154, not on `main`;
-  - the SQLite lock is bounded by step count, with no counter;
-  - untyped refusal sites are an S4 gap;
-  - S5 lists every class that still refuses.
-- **Results:**
-  - the W3 bullet gives native against rclone for each run, and the
-    baseline's `status=fail`;
-  - S3 is scoped to the pre-wire-v5 file path;
-  - the three 2026-10-03 gate (a) attempts are in section 7 only, cited to
-    Linear TIN-4543;
-  - the link rate applies to that session only;
-  - the R36 and rsync claims are softened.
-- **Related work and bibliography:**
-  - ALICE is described as constructing selected states. This was read from
-    the paper's PDF, sections 3.3 and 3.6.
-  - The power-loss bound (`exhaustive_limit` 12, `accept_bounded`) is
-    stated, and added to section 8.
-  - Borg's default `ctime,size,inode` and its newest-cmtime guard are
-    stated.
-  - The casync digest is SHA-512/256, per the README.
-  - The Bup title is corrected.
-  - rsync `--checksum` and Git's racy rule are stated precisely.
-  - [B3-18] gains pp. 33–50, from the USENIX BibTeX.
-  - [Unison04] cites its handle, verified through the repository API.
-  - [AppleDiskWrites] was read through its JSON endpoint, and is cited only
-    for its guidance.
-  - A new [AppleFcntl] entry (XNU `fcntl(2)`, dated 2021-08-12) carries
-    the drain and barrier semantics.
+    The paper states the small bounds, and that the branch is not on
+    `main`.
+  - The paper names only invariants defined in `BulkloadTransfer.tla` at
+    `3dbfbdb`. All 20 names were checked, and they match the README's
+    frozen list.
+  - The paper says the model cannot prove code-level S2, does not cover
+    the Git carry, and does not model S3's Git half.
+- **Lane A's SQLite `-shm` finding.** It is reported in sections 2.8, 3.3
+  and 8, and in the status table. The source is lane A's evidence file on
+  `feat/wp0e-estate-corpus-20261003` (`7b75b26`) and TIN-4543. A ruling is
+  open.
+- **Open PRs named.** #146 (WP2 PR 2), #150 and #151 (WP3), #153 (WP10
+  PR 2) and #154 (salvage) are marked open and not on `main`.
+- **Bibliography re-resolution:**
+  - [TLC99] gains LNCS 1703 and its editors, from Lamport's publications
+    page and Crossref's book record. Crossref, OpenAlex and Springer gave
+    no volume number.
+  - [FastCDC20]: `fastcdc` 3.2.1's `v2020` module names IEEE Xplore
+    document 9055082, the DOI's primary resource.
+  - [AppleDiskWrites] and [RacyGit]: re-fetched, and their bodies were read
+    again.
+  - [Proptest]: the pin is stated as declared `1` and locked at 1.11.0.
+
+## Duplicate-agent incident (recorded on TIN-4543)
+
+- About 22:05 EDT on 2026-10-03, the coordinator used SendMessage to send
+  redirects to the running lane workflow agents.
+- The first send to each agent started a resumed copy of it, instead of
+  reaching the live agent. Lanes A, B and C then each had two agents
+  writing one worktree.
+- In this lane, the workflow's fix agent and the resumed copy both edited
+  this worktree during the review-fix pass. By coordinator ruling, the fix
+  agent owned the lane. The earlier version of this note records that the
+  edits were reviewed and kept where correct, for example Borg's
+  `LocalCache.commit`.
+- At 22:23 the session reached its rate limit and every lane agent ended.
+- The coordinator's rule since then: running workflow agents are never
+  messaged, and a redirect relaunches the lane as a fresh workflow with one
+  owner.
+- This pass is that relaunch (`lane-c-whitepaper-finish`), the only writer
+  in this worktree. Its task text, from the coordinator's workflow, says
+  the earlier copies were gone before it began.
+- Sibling agents share the session scratchpad, so this pass kept its
+  scratch files in its own subdirectory.
 
 ## Validation
 
 `flock bulkload.worktrees/.check-fast.lock nice -n 10 nix develop .#default
 --command just check-fast`, with
-`CARGO_TARGET_DIR=/srv/fast-local/jess/cargo-target/whitepaper`. When the
-fix commit was made, the run was queued behind other lanes on the shared
-lock; its result is recorded in a follow-up commit to this note. The first
-draft's run, on `57030e1`, exited 0. This lane changed documentation only.
+`CARGO_TARGET_DIR=/srv/fast-local/jess/cargo-target/whitepaper`, run twice
+on the merge `7e2921a` plus this pass's doc edits. The first run came
+before the `3dbfbdb` update and the second after it, on the final tree
+(only this paragraph changed afterwards). Both exited 0. In each, the
+`cargo test` result lines total 683 passed and 0 failed, and the Python
+contract suite ran 22 tests, OK. This lane changes documentation only.
+
+- The draft's run, on `57030e1`, exited 0.
+- The review-fix pass's run was queued when its session ended. No commit
+  recorded that run's result.
 
 ## Open
 
-- **No evidence file for the 2026-10-03 gate (a) attempts.** The paper cites
-  them through Linear TIN-4543 in section 7 only. Once an
-  `r23-2026-10-03-*` file lands in `docs/evidence/`, cite that instead.
+- **Formal model.** Section 4 cites `3dbfbdb`. If lane B's branch moves
+  or merges, re-pin to the `main` path and its sha. Describe the Dhall
+  catalogue and the Haskell explorer as done only once they land, and add
+  bibliography entries for them if they are cited. Adopting WP0(g) under
+  the model's conditions has no ruling yet.
+- **SQLite `-shm` ruling** (S2, OI-1003-Q16). Rewrite sections 2.8, 3.3
+  and 8 when it is ruled. Cite lane A's evidence file by its `main` path
+  once it merges.
+- **Gate (a) on wire v5.** There is no evidence file for the 2026-10-03
+  attempts. Cite an `r23-2026-10-03-*` file once one lands.
+  OI-1003-Q33 holds the next attempt for the full post-train `main`.
 - **OI-1003-Q24 and Q25 are not in `docs/slo.md`.** The paper cites them
-  through TIN-4543 as pending amendments. Point at `docs/slo.md` once the
-  coordinator's docs PR merges.
-- **Formal model.** Name the model's invariants only after Lane B fixes them
-  in `docs/formal/README.md` and they are on `origin`. Report only TLC
-  results committed on `docs/tla-model-20261003`. Describe the Dhall and
-  Haskell parts as done only once they land; add bibliography entries for
-  them then, if cited.
-- **Next sprint (OI-1003-Q34):** this lane's sprint 2 is the S2 budget
-  instrument, using the v0 synthetic workload. Then refresh section 5.3.
+  through TIN-4543. Point at `docs/slo.md` once the coordinator's docs PR
+  merges.
+- **Refresh on merge** of #146, #150, #151, #153 or #154, of the estate
+  corpus (WP0(e)), or of a gated gate (a) sample on corpus v1.
 - **S5 classes with no owner.** Configuration, shallow-frontier, nest
   custody and rebuildable-root movement, and directory-shape drift, still
   refuse. No ruling or work package names them.
-- **Bibliography field not verified by tool:** the LNCS volume number for
-  [TLC99], which is omitted.
-- Refresh sections 2.7 and 5 when any of these lands: WP2 PR 2, #154, a
-  gated gate (a) sample on corpus v1, the estate corpus (WP0(e)), or the
-  model.
+- **Next sprint (OI-1003-Q34).** This lane's sprint 2 is the S2 budget
+  instrument, using the v0 synthetic workload; then refresh section 5.3.
+- **PR.** None is open for this branch. Under OI-1003-Q29 it merges once
+  its R-N71 review is clean and CI is green.
