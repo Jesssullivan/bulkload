@@ -73,12 +73,21 @@ bound no ON command is started again, the run ends as cut short, and the
 verdict is INCONCLUSIVE.
 
 Evidence (R-N81, R-N91, OI-1003-Q34). A run is NOT EVIDENCE unless
---evidence is given, and --evidence refuses unless the windows are at least
-300 s, there are at least five of them, the budgets and the gate metric are
-the SLO's, it is not an A/A run, --coordinator-quiet is given (recorded, not
-checked), and the host is on AC power with load1 < 2.5 at the start. In
-evidence mode every ON run must report its priority class. Gated S2 runs
-are separate from the S1 gate (OI-1003-Q34).
+--evidence is given, and --evidence refuses unless the whole measurement
+protocol is the SLO's (`protocol_problems`): windows of at least 300 s, at
+least five of them, the ON command repeated for the whole window (no
+--no-repeat) with --max-runs at its default or more, not an A/A run,
+--coordinator-quiet given (recorded, not checked), the budgets, the gate
+metric and --settle-seconds exactly at their pinned values, and
+--min-samples, --min-window-samples and --min-on-busy at their defaults or
+stricter; and the host must be on AC power with load1 < 2.5 at the start.
+In evidence mode every ON run must report its priority class, and an ON
+window that reaches the run cap is INCONCLUSIVE. `analyze` labels a trace
+evidence only when it was run with --evidence, its schema is this one, its
+recorded configuration and gate pass the same protocol check, and no
+override differs from the recorded gate; `evidence_problems` says why not.
+So a verdict cannot be chosen after the fact and keep the label. Gated S2
+runs are separate from the S1 gate (OI-1003-Q34).
 
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
@@ -143,6 +152,12 @@ DEFAULT_GATE = {
     "min_window_samples": 20,
     "min_on_busy": 0.8,
 }
+DEFAULT_MAX_RUNS = 1000
+# The evidence protocol (OI-1003-Q34, S2): these gate values are pinned
+# exactly, so a verdict cannot be chosen after the fact, ...
+EVIDENCE_PINNED = ("budget_p95", "budget_load1", "gate_metric", "settle_seconds")
+# ... and these floors may only be raised, which can only add INCONCLUSIVE.
+EVIDENCE_FLOORS = ("min_samples", "min_window_samples", "min_on_busy")
 # Fixed identity for the fixture commit, so it needs no user configuration.
 FIXTURE_ENV = {
     "GIT_AUTHOR_NAME": "s2-budget fixture",
@@ -431,9 +446,44 @@ def busy_fraction(window: dict) -> float:
     return busy / length
 
 
+def protocol_problems(config: dict, gate: dict) -> list[str]:
+    """Why a run with this configuration and gate is not the S2 evidence
+    protocol, or [] when it is. `run --evidence` refuses on any of them and
+    `analyze` labels a trace evidence only when there are none."""
+    out = []
+    if config.get("aa"):
+        out.append("an A/A run is a noise measurement, not evidence")
+    if (config.get("window_seconds") or 0) < EVIDENCE_MIN_WINDOW:
+        out.append(f"evidence needs windows of at least {EVIDENCE_MIN_WINDOW:.0f} s")
+    if len(config.get("pattern") or []) < EVIDENCE_MIN_WINDOWS:
+        out.append(f"evidence needs at least {EVIDENCE_MIN_WINDOWS} windows")
+    if not config.get("repeat"):
+        out.append(
+            "evidence repeats the ON command for the whole window (no --no-repeat)"
+        )
+    if (config.get("max_runs") or 0) < DEFAULT_MAX_RUNS:
+        out.append(f"evidence keeps --max-runs at {DEFAULT_MAX_RUNS} or more")
+    if not config.get("coordinator_quiet"):
+        out.append("evidence needs --coordinator-quiet (R-N91)")
+    for key in EVIDENCE_PINNED:
+        if gate.get(key) != DEFAULT_GATE[key]:
+            out.append(
+                f"evidence uses the SLO protocol unchanged: {key} is pinned at "
+                f"{DEFAULT_GATE[key]} (got {gate.get(key)})"
+            )
+    for key in EVIDENCE_FLOORS:
+        value = gate.get(key)
+        if value is None or value < DEFAULT_GATE[key]:
+            out.append(
+                f"evidence needs {key} of at least {DEFAULT_GATE[key]} (got {value})"
+            )
+    return out
+
+
 def analyze(trace: dict, overrides: dict | None = None) -> dict:
     """The verdict of one trace: a pure function of its windows and samples."""
-    gate = {**DEFAULT_GATE, **trace.get("gate", {}), **(overrides or {})}
+    recorded = {**DEFAULT_GATE, **trace.get("gate", {})}
+    gate = {**recorded, **(overrides or {})}
     config = trace.get("config", {})
     aa = bool(config.get("aa"))
     windows = trace["windows"]
@@ -578,6 +628,10 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     structural.append(
                         f"ON run {run['run']} did not report its priority class"
                     )
+            if w.get("run_cap_reached") and evidence:
+                structural.append(
+                    f"ON window {w['index']} reached the run cap (--max-runs)"
+                )
             busy = busy_fraction(w)
             if runs and busy < gate["min_on_busy"]:
                 structural.append(
@@ -629,15 +683,25 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             )
         else:
             status, reasons = raw, over
-    slo_gate = (
-        budget == BUDGET_P95
-        and budget_load == BUDGET_LOAD1
-        and gate["gate_metric"] == GATE_METRIC
-    )
+    if not config.get("evidence"):
+        evidence_problems = ["the run was made without --evidence"]
+    else:
+        evidence_problems = protocol_problems(config, trace.get("gate", {}))
+        if trace.get("schema") != SCHEMA:
+            evidence_problems.append(
+                f"trace schema {trace.get('schema')} is not {SCHEMA}"
+            )
+        for key in sorted(overrides or {}):
+            if overrides[key] != recorded.get(key):
+                evidence_problems.append(
+                    f"analyze override {key}={overrides[key]} differs from the "
+                    f"recorded {recorded.get(key)}"
+                )
     return {
         "status": status,
         "mode": mode,
-        "evidence": bool(config.get("evidence")) and slo_gate and not aa,
+        "evidence": not evidence_problems,
+        "evidence_problems": evidence_problems,
         "reasons": reasons,
         "raw_comparison": raw,
         "gate": gate,
@@ -718,22 +782,16 @@ def run_refusals(args: argparse.Namespace, states: list[str] | None) -> list[str
     if args.max_runs < 1:
         out.append("--max-runs must be at least 1")
     if args.evidence:
-        if args.window_seconds < EVIDENCE_MIN_WINDOW:
-            out.append(
-                f"evidence needs windows of at least {EVIDENCE_MIN_WINDOW:.0f} s"
-            )
-        if states is not None and len(states) < EVIDENCE_MIN_WINDOWS:
-            out.append(f"evidence needs at least {EVIDENCE_MIN_WINDOWS} windows")
-        if (
-            args.budget_p95 != BUDGET_P95
-            or args.budget_load1 != BUDGET_LOAD1
-            or args.gate_metric != GATE_METRIC
-        ):
-            out.append("evidence uses the SLO budgets and gate metric unchanged")
-        if args.aa:
-            out.append("an A/A run is a noise measurement, not evidence")
-        if not args.coordinator_quiet:
-            out.append("evidence needs --coordinator-quiet (R-N91)")
+        config = {
+            "aa": args.aa,
+            "window_seconds": args.window_seconds,
+            # A refused pattern is reported on its own; do not double it here.
+            "pattern": states if states is not None else [OFF] * EVIDENCE_MIN_WINDOWS,
+            "repeat": args.repeat,
+            "max_runs": args.max_runs,
+            "coordinator_quiet": args.coordinator_quiet,
+        }
+        out.extend(protocol_problems(config, gate_of(args)))
     source = args.source.resolve()
     if not source.is_dir():
         out.append(f"source {source} is not a directory")
@@ -745,6 +803,10 @@ def run_refusals(args: argparse.Namespace, states: list[str] | None) -> list[str
     if source.is_dir() and is_within(out_dir, source):
         out.append(f"out {out_dir} is inside the source")
     return out
+
+
+def gate_of(args: argparse.Namespace) -> dict:
+    return {key: getattr(args, key) for key in DEFAULT_GATE}
 
 
 def priorities_in(log: Path) -> list[str]:
@@ -853,15 +915,7 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
             "workload": "v0: jsonl+fsync, sqlite WAL synchronous=FULL, "
             "git status+diff, search",
         },
-        "gate": {
-            "budget_p95": args.budget_p95,
-            "budget_load1": args.budget_load1,
-            "gate_metric": args.gate_metric,
-            "settle_seconds": args.settle_seconds,
-            "min_samples": args.min_samples,
-            "min_window_samples": args.min_window_samples,
-            "min_on_busy": args.min_on_busy,
-        },
+        "gate": gate_of(args),
         "host": host_record(git, search, source_name, workload.git_env),
         "start_utc": utc_now(),
         "windows": [],
@@ -993,7 +1047,12 @@ def render_summary(trace: dict, verdict: dict) -> str:
         "",
     ]
     if not verdict["evidence"]:
-        lines += [f"**{NOT_EVIDENCE}.** Not a gated S2 sample.", ""]
+        lines += [
+            f"**{NOT_EVIDENCE}.** Not a gated S2 sample: "
+            + "; ".join(verdict["evidence_problems"])
+            + ".",
+            "",
+        ]
     lines += [
         f"- Label: {trace.get('label') or '(none)'}",
         f"- Verdict: **{verdict['status']}** (mode {verdict['mode']}; raw "
@@ -1064,6 +1123,8 @@ def emit(verdict: dict) -> None:
     for reason in verdict["reasons"]:
         say(f"reason {reason}")
     if not verdict["evidence"]:
+        for problem in verdict["evidence_problems"]:
+            say(f"not_evidence {problem}")
         say(NOT_EVIDENCE)
 
 
@@ -1180,7 +1241,7 @@ def parser() -> argparse.ArgumentParser:
         "--priority", choices=("background", "normal"), default="background"
     )
     run.add_argument("--no-repeat", dest="repeat", action="store_false")
-    run.add_argument("--max-runs", type=int, default=1000)
+    run.add_argument("--max-runs", type=int, default=DEFAULT_MAX_RUNS)
     run.add_argument("--max-overrun-seconds", type=float, default=1800.0)
     run.add_argument("--aa", action="store_true")
     run.add_argument("--evidence", action="store_true")

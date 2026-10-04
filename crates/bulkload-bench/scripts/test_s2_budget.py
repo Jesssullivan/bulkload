@@ -35,8 +35,8 @@ def per_window(value, index):
 
 def synth(
     pattern=FIVE,
-    window=200.0,
-    n=200,
+    window=300.0,
+    n=300,
     off_ms=10.0,
     on_factor=1.0,
     op_factor=None,
@@ -50,7 +50,8 @@ def synth(
 ):
     """A deterministic trace: n evenly spaced samples per window. Latency
     cycles through 20 levels (1.00 to 1.95 x base), so every window of one
-    base has the same p95 (1.9 x base at n=200) and zero noise."""
+    base has the same p95 (1.9 x base at n=300) and zero noise. An evidence
+    trace follows the evidence protocol (settle 60 s, every window on AC)."""
     op_factor = op_factor or {}
     windows, latency, load = [], [], []
     t = 0.0
@@ -64,6 +65,8 @@ def synth(
             "end": t + window,
             "planned_end": t + window,
             "overrun_s": 0.0,
+            "power_start": "ac" if evidence else "unknown-no-supply-class",
+            "power_end": "ac" if evidence else "unknown-no-supply-class",
         }
         if on and not aa:
             record["runs"] = [
@@ -91,8 +94,17 @@ def synth(
         t += window
     return {
         "schema": s2.SCHEMA,
-        "config": {"aa": aa, "priority": "background", "evidence": evidence},
-        "gate": {**s2.DEFAULT_GATE, "settle_seconds": 0.0},
+        "config": {
+            "aa": aa,
+            "priority": "background",
+            "evidence": evidence,
+            "window_seconds": window,
+            "pattern": list(pattern),
+            "repeat": True,
+            "max_runs": s2.DEFAULT_MAX_RUNS,
+            "coordinator_quiet": evidence,
+        },
+        "gate": {**s2.DEFAULT_GATE, **({} if evidence else {"settle_seconds": 0.0})},
         "windows": windows,
         "latency": latency,
         "load": load,
@@ -245,9 +257,93 @@ class OnRunTests(unittest.TestCase):
         self.assertIn("ON window 1 was busy 50% of the time", reasons(verdict))
 
     def test_evidence_only_with_the_slo_gate(self) -> None:
-        self.assertTrue(s2.analyze(synth(evidence=True))["evidence"])
+        verdict = s2.analyze(synth(evidence=True))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(verdict["evidence_problems"], [])
         loose = s2.analyze(synth(evidence=True), {"budget_p95": 0.5})
         self.assertFalse(loose["evidence"])
+
+    def test_a_run_cap_under_evidence_is_inconclusive(self) -> None:
+        trace = synth(evidence=True)
+        trace["windows"][1]["run_cap_reached"] = True
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("ON window 1 reached the run cap", reasons(verdict))
+
+
+class EvidenceProtocolTests(unittest.TestCase):
+    """The evidence label is tied to the whole measurement protocol, not
+    just the budgets: no analyze override and no relaxed recorded gate."""
+
+    def test_every_analyze_override_that_differs_drops_the_label(self) -> None:
+        trace = synth(evidence=True, on_factor=1.1)
+        for key, value in (
+            ("settle_seconds", 99.0),
+            ("settle_seconds", 0.0),
+            ("min_on_busy", 0.0),
+            ("min_samples", 1),
+            ("min_window_samples", 1),
+            ("min_samples", 500),
+            ("budget_load1", 3.0),
+        ):
+            verdict = s2.analyze(trace, {key: value})
+            self.assertFalse(verdict["evidence"], (key, value))
+            self.assertIn(
+                f"analyze override {key}=", " | ".join(verdict["evidence_problems"])
+            )
+        same = s2.analyze(trace, {"settle_seconds": 60.0, "min_on_busy": 0.8})
+        self.assertTrue(same["evidence"], same["evidence_problems"])
+
+    def test_an_idle_evidence_trace_stays_inconclusive_or_loses_the_label(
+        self,
+    ) -> None:
+        trace = synth(evidence=True, busy=0.05)
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertTrue(verdict["evidence"])
+        relaxed = s2.analyze(trace, {"min_on_busy": 0.0, "settle_seconds": 99.0})
+        self.assertEqual(relaxed["status"], "PASS")
+        self.assertFalse(relaxed["evidence"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.json"
+            path.write_text(json.dumps(trace))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                s2.main(
+                    ["analyze", str(path), "--min-on-busy", "0"]
+                    + ["--settle-seconds", "99"]
+                )
+        self.assertIn("evidence=false", out.getvalue())
+        self.assertIn("NOT EVIDENCE", out.getvalue())
+
+    def test_a_relaxed_recorded_protocol_is_not_evidence(self) -> None:
+        for change in (
+            {"gate": {"settle_seconds": 0.0}},
+            {"gate": {"settle_seconds": 120.0}},
+            {"gate": {"min_on_busy": 0.0}},
+            {"gate": {"min_samples": 1}},
+            {"gate": {"min_window_samples": 1}},
+            {"config": {"repeat": False}},
+            {"config": {"max_runs": 1}},
+            {"config": {"coordinator_quiet": False}},
+            {"config": {"window_seconds": 60.0}},
+            {"schema": "bulkload.s2-budget.v-old"},
+        ):
+            trace = synth(evidence=True)
+            for part, values in change.items():
+                if isinstance(values, dict):
+                    trace[part].update(values)
+                else:
+                    trace[part] = values
+            verdict = s2.analyze(trace)
+            self.assertFalse(verdict["evidence"], change)
+            self.assertTrue(verdict["evidence_problems"], change)
+
+    def test_stricter_floors_keep_the_label(self) -> None:
+        trace = synth(evidence=True)
+        trace["gate"].update({"min_samples": 200, "min_on_busy": 0.9})
+        verdict = s2.analyze(trace)
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
 
 
 class AaTests(unittest.TestCase):
@@ -336,8 +432,54 @@ class ArgumentTests(unittest.TestCase):
                 "--evidence", "--window-seconds", "60", "--budget-p95", "0.5", "--", "x"
             )
             self.assertIn("at least 300 s", gated)
-            self.assertIn("SLO budgets", gated)
+            self.assertIn("budget_p95 is pinned", gated)
             self.assertIn("--coordinator-quiet", gated)
+            self.assertEqual(refused("--evidence", "--coordinator-quiet", "x"), "")
+            self.assertEqual(
+                refused(
+                    "--evidence",
+                    "--coordinator-quiet",
+                    "--min-samples",
+                    "200",
+                    "--min-on-busy",
+                    "0.9",
+                    "--",
+                    "x",
+                ),
+                "",
+            )
+            relaxed = refused(
+                "--evidence",
+                "--coordinator-quiet",
+                "--settle-seconds",
+                "0",
+                "--min-on-busy",
+                "0",
+                "--min-samples",
+                "1",
+                "--min-window-samples",
+                "1",
+                "--no-repeat",
+                "--max-runs",
+                "1",
+                "--",
+                "true",
+            )
+            for needle in (
+                "settle_seconds is pinned",
+                "min_on_busy of at least",
+                "min_samples of at least",
+                "min_window_samples of at least",
+                "no --no-repeat",
+                "--max-runs at 1000",
+            ):
+                self.assertIn(needle, relaxed)
+            self.assertIn(
+                "settle_seconds is pinned",
+                refused(
+                    "--evidence", "--coordinator-quiet", "--settle-seconds", "120", "x"
+                ),
+            )
             self.assertIn(
                 "under half a window", refused("--settle-seconds", "150", "x")
             )
