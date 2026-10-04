@@ -297,14 +297,37 @@ pub struct PendingDirectory {
     pub mode: u32,
 }
 
+/// The `settings` row that marks a store whose ledger and output rows were
+/// all written by the racy-capture guard (#86, #125). A store created by this
+/// engine carries it from its first commit. A store without it predates the
+/// guard: any of its rows may vouch for bytes captured inside the timestamp
+/// tick of a same-size rewrite, so none of them is trusted (see
+/// [`Store::open`]).
+const RACY_GUARD_SETTING: &str = "racy_guard";
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
     conn: rusqlite::Connection,
+    /// The store's `captures` and `outputs` rows were all written under the
+    /// racy-capture guard (#125). A read-only handle on a store nobody has
+    /// upgraded yet reads its rows as misses.
+    rows_trusted: bool,
 }
 
 impl Store {
     /// Open or create a private transfer store outside the carried roots.
+    ///
+    /// A store written before the racy-capture guard (#86) has no
+    /// [`RACY_GUARD_SETTING`] row, and none of its ledger or output rows is
+    /// proven non-racy (#125). Opening it for writing invalidates them all
+    /// in the transaction that adds the marker: every `captures` and
+    /// `outputs` row is deleted, and the count is added to
+    /// `transfer_legacy_rows_invalidated`. Each such seat is then read from
+    /// the source once more, a re-read R25 allows because its row could not
+    /// prove the seat was not racy when it was recorded. Chunk hints are
+    /// kept: they are re-verified on use, so the re-read costs no wire bytes
+    /// for content the destination still holds.
     ///
     /// # Errors
     /// Refuses symlinks, non-private directories and database failures.
@@ -335,6 +358,7 @@ impl Store {
         // rowid, so losing one output does not lose reuse of its chunks. A
         // pre-v5 store's `output_chunks`, `chunks` and `chunk_locations` are
         // left untouched and unread.
+        let mut invalidated = 0_usize;
         let created = conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS captures (key BLOB PRIMARY KEY, manifest BLOB NOT NULL);
@@ -349,7 +373,23 @@ impl Store {
                     [random.as_slice()],
                 )
             })
-            .and_then(|_| conn.execute_batch("COMMIT"))
+            .and_then(|_| {
+                // #125: a store without the marker predates the racy guard.
+                // Its rows are deleted with the marker's insert, in one
+                // transaction, so no crash can leave the marker beside an
+                // unproven row. A fresh store has no rows to delete.
+                if racy_guarded(&conn)? {
+                    return Ok(());
+                }
+                invalidated = conn.execute("DELETE FROM captures", [])?;
+                invalidated = invalidated.saturating_add(conn.execute("DELETE FROM outputs", [])?);
+                conn.execute(
+                    "INSERT INTO settings VALUES (?1, ?2)",
+                    (RACY_GUARD_SETTING, b"#86".as_slice()),
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| conn.execute_batch("COMMIT"))
             .map_err(sqlite_error);
         if created.is_err() {
             let _ = conn.execute_batch("ROLLBACK");
@@ -357,9 +397,11 @@ impl Store {
             counters::sqlite_commit(Counter::SqliteSchema, started, &created);
         }
         created?;
+        counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
             root: fs::canonicalize(root)?,
             conn,
+            rows_trusted: true,
         })
     }
 
@@ -378,7 +420,14 @@ impl Store {
         .map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
-        Ok(Self { root, conn })
+        // A reader never upgrades a store: one without the racy-guard
+        // marker serves no capture and matches no output (#125).
+        let rows_trusted = racy_guarded(&conn).map_err(sqlite_error)?;
+        Ok(Self {
+            root,
+            conn,
+            rows_trusted,
+        })
     }
 
     /// Acquire the nonblocking single-writer guard for `side`.
@@ -418,6 +467,9 @@ impl Store {
     /// # Errors
     /// Refuses database errors.
     pub fn capture(&self, key: &[u8]) -> Result<Option<Manifest>> {
+        if !self.rows_trusted {
+            return Ok(None);
+        }
         let bytes: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -465,6 +517,15 @@ impl Store {
         Ok((count("captures")?, count("outputs")?))
     }
 
+    /// Drop the racy-guard marker, as a store written before #86 lacks it.
+    #[cfg(test)]
+    pub(crate) fn forget_racy_guard(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", [RACY_GUARD_SETTING])
+            .map_err(sqlite_error)?;
+        Ok(())
+    }
+
     /// Commit one identity-checked capture on its own.
     ///
     /// # Errors
@@ -494,6 +555,9 @@ impl Store {
     /// # Errors
     /// Refuses database failures.
     pub fn output_matches(&self, key: &[u8], identity: &StatIdentity) -> Result<bool> {
+        if !self.rows_trusted {
+            return Ok(false);
+        }
         let found: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -969,6 +1033,15 @@ pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
     Ok(postcard::to_stdvec(&(authority, row))?)
 }
 
+/// Whether the store carries the [`RACY_GUARD_SETTING`] marker (#125).
+fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+        [RACY_GUARD_SETTING],
+        |row| row.get(0),
+    )
+}
+
 fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
     Ok(postcard::to_stdvec(&(
         identity.dev,
@@ -1325,6 +1398,67 @@ mod tests {
             .map_err(sqlite_error)?;
         assert_eq!(store.capture(b"exact")?, Some(exact));
         assert_eq!(store.capture(b"padded")?, None);
+        Ok(())
+    }
+
+    /// #125: a store written before the racy guard (#86) has no marker, so
+    /// none of its ledger or output rows is proven non-racy. A reader serves
+    /// none of them; the first writable open deletes them all with the
+    /// marker's insert and counts them, and keeps the chunk hints. Rows
+    /// written after the upgrade are trusted and survive later opens.
+    #[test]
+    fn a_store_from_before_the_racy_guard_trusts_none_of_its_rows() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let file = root.0.join("output");
+        fs::write(&file, b"output")?;
+        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        let record = |key: &[u8]| OutputRecord {
+            key: key.to_vec(),
+            rel_path: b"output".to_vec(),
+            identity,
+            racy: false,
+            hints: vec![ChunkHint {
+                digest: [7; 32],
+                offset: 0,
+                size: 6,
+            }],
+        };
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(&[record(b"old")])?;
+        publisher
+            .store()
+            .record_capture(b"old", &manifest(b"old"))?;
+        publisher.store().forget_racy_guard()?;
+        drop(publisher);
+
+        let reader = Store::open_reader(&state)?;
+        assert_eq!(reader.capture(b"old")?, None);
+        assert!(!reader.output_matches(b"old", &identity)?);
+        drop(reader);
+
+        let counted =
+            || crate::counters::Counters::snapshot().get(Counter::TransferLegacyRowsInvalidated);
+        let before = counted();
+        let upgraded = Store::open(&state)?;
+        assert!(counted() >= before + 2, "both rows are counted");
+        assert_eq!(upgraded.row_counts()?, (0, 0));
+        assert!(!upgraded.output_matches(b"old", &identity)?);
+        assert_eq!(upgraded.capture(b"old")?, None);
+        assert_eq!(upgraded.output_chunks(&[7; 32])?.len(), 1, "hints are kept");
+        drop(upgraded);
+
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(&[record(b"new")])?;
+        publisher
+            .store()
+            .record_capture(b"new", &manifest(b"new"))?;
+        drop(publisher);
+        let reopened = Store::open(&state)?;
+        assert_eq!(reopened.row_counts()?, (1, 1));
+        assert!(reopened.output_matches(b"new", &identity)?);
+        assert_eq!(reopened.capture(b"new")?, Some(manifest(b"new")));
+        assert!(Store::open_reader(&state)?.output_matches(b"new", &identity)?);
         Ok(())
     }
 

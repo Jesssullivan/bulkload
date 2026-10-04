@@ -19,6 +19,7 @@ use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
 pub mod carry_v2;
+pub mod chain;
 pub mod estimate;
 mod raw_tree;
 pub mod registered;
@@ -273,6 +274,13 @@ fn text(command: &mut Command) -> Result<String> {
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
 }
 
+/// Run `command` with `bytes` on stdin and return its stdout.
+///
+/// `bytes` are written from a scoped thread while this thread drains stdout:
+/// a child that answers per request (`cat-file --batch-check`, `hash-object
+/// --stdin`) stops reading once its stdout pipe fills, so writing every
+/// request before reading any answer would block both processes forever
+/// (64 KiB pipes on Linux, 16 KiB on Darwin; a few thousand refs).
 fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::process::Stdio;
@@ -281,16 +289,73 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or(BulkloadRefusal::Io(None))?
-        .write_all(bytes)?;
-    let result = child.wait_with_output()?;
+    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
+    let (written, result) = std::thread::scope(|scope| {
+        // `stdin` moves into the writer and closes when it returns, so the
+        // child sees end of input exactly once every request is written.
+        let writer = scope.spawn(move || stdin.write_all(bytes));
+        let result = child.wait_with_output();
+        (writer.join(), result)
+    });
+    let result = result?;
+    written.map_err(|_| BulkloadRefusal::Io(None))??;
     if !result.status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     Ok(result.stdout)
+}
+
+/// Run a git child that packs objects (`bundle create`, `pack-objects`),
+/// feeding it `stdin`, and reap it with `wait4` so its own resource usage is
+/// measured. Returns whether it succeeded and its storage reads in bytes
+/// (`ru_inblock` x 512; see the `counters` module notes for why this is a
+/// lower bound, and only a lower bound on Darwin). The caller sets stdout;
+/// stderr is discarded as `output` discards it.
+fn pack_child(command: &mut Command, stdin: Option<&[u8]>) -> Result<(bool, u64)> {
+    use std::io::Write;
+    use std::process::Stdio;
+    command.stderr(Stdio::null()).stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command.spawn()?;
+    // The child is reaped below whatever the write did, so a failed write
+    // never leaves an unreaped child behind; its error wins afterwards.
+    let written = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut pipe)) => pipe.write_all(bytes).map_err(BulkloadRefusal::from),
+        (Some(_), None) => Err(BulkloadRefusal::Io(None)),
+        (None, _) => Ok(()),
+    };
+    let reaped = reap(&child);
+    written?;
+    reaped
+}
+
+// wait4 on a child std has not waited for. std never reaps a child on drop,
+// so after this the `Child` handle is only dropped, never waited on.
+fn reap(child: &std::process::Child) -> Result<(bool, u64)> {
+    let pid = libc::pid_t::try_from(child.id()).map_err(|_| BulkloadRefusal::Io(None))?;
+    let mut status: libc::c_int = 0;
+    // SAFETY: `rusage` is a plain C struct of integers; all-zero is a valid
+    // value, and wait4 overwrites it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: `pid` is this process's own child, spawned by the caller and
+        // not yet reaped (std waits only when asked, and nothing asked). Both
+        // out-pointers are valid, exclusive borrows for the duration of the call.
+        let reaped = unsafe { libc::wait4(pid, &raw mut status, 0, &raw mut usage) };
+        if reaped == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    let success = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let blocks = u64::try_from(usage.ru_inblock).unwrap_or(0);
+    Ok((success, blocks.saturating_mul(512)))
 }
 
 fn metadata(private: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -1154,6 +1219,7 @@ pub fn export_repository_with_policy(
             policy,
             reuse: None,
             planned: &[],
+            chain: None,
         },
     )?)
 }
@@ -1178,6 +1244,7 @@ pub fn export_repository_with_prerequisite(
             policy: CapturePolicy::default(),
             reuse: None,
             planned: &[],
+            chain: None,
         },
     )?)?
     .bundle)
@@ -1414,7 +1481,12 @@ fn export_pass(
     }
     mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    shared::write_bundle(&private, &bundle, options.prerequisite)?;
+    // A plan base wins; otherwise a retained capture's source-held tips are
+    // the prerequisites (WP2); otherwise the bundle is self-contained.
+    let (pack, chained) = match (options.prerequisite, options.chain) {
+        (None, Some(prior)) => shared::write_chained(&private, &bundle, repo, prior)?,
+        (base, _) => (shared::write_bundle(&private, &bundle, base)?, false),
+    };
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
     mid_pass::fire(repo, mid_pass::Stage::AfterPass);
@@ -1429,6 +1501,8 @@ fn export_pass(
         refs_after,
         authority,
         nested_repositories,
+        pack,
+        chained,
     })
 }
 
@@ -1608,8 +1682,11 @@ impl StagedBundle {
     }
 }
 
-// Copy `source` to a new private file while hashing it: one read, one write.
+// Copy `source` to a new private file while hashing it: one read, one write,
+// counted as `read_bundle_stage_bytes`, `blake3_bundle_stage_bytes` and
+// `write_bundle_stage_bytes`.
 fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
+    use crate::counters::{add_len, update, Counter};
     use std::io::{Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
     let mut from = fs::OpenOptions::new()
@@ -1628,9 +1705,11 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         if count == 0 {
             break;
         }
+        add_len(Counter::BundleStageRead, count);
         let chunk = buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?;
-        hash.update(chunk);
+        update(&mut hash, Counter::HashBundleStage, chunk);
         to.write_all(chunk)?;
+        add_len(Counter::BundleStageWrite, count);
     }
     Ok(*hash.finalize().as_bytes())
 }
@@ -1744,6 +1823,11 @@ fn retained_blobs(
     use bulkload_proto::FileKind;
     use std::process::Stdio;
     let mut reuse = raw_tree::Reuse::new();
+    // The fetch reads the whole retained bundle, whatever it then keeps.
+    crate::counters::add(
+        crate::counters::Counter::SourceCaptureReuseRead,
+        fs::symlink_metadata(retained.bundle)?.len(),
+    );
     if !git(private)
         .args(["fetch", "--no-tags", "--quiet"])
         .arg(retained.bundle)
@@ -1973,6 +2057,11 @@ pub struct ExportOptions<'a> {
     /// items (R-N114). Such a nest keeps its custody row and every refusal,
     /// but its seats belong to its own item, never to this capture.
     pub planned: &'a [PathBuf],
+    /// A retained capture bundle of this checkout whose source-held tips
+    /// become this bundle's prerequisites, so only what is new since it is
+    /// packed (WP2, see [`chain`]). Ignored when `prerequisite` is set. The
+    /// caller owns the chain's custody and depth bound.
+    pub chain: Option<&'a Path>,
 }
 
 /// A retained capture offered for blob reuse, with the instant its pass began.
@@ -2065,6 +2154,13 @@ pub struct Export {
     pub refs_after: String,
     /// The Git authority this export read once and carried.
     pub authority: CarriedAuthority,
+    /// What packing the bundle cost (WP2): its pack's bytes and objects, and
+    /// the packing child's storage reads.
+    pub pack: shared::PackStats,
+    /// Whether the bundle declares a retained capture's source-held tips as
+    /// prerequisites ([`ExportOptions::chain`]). A restore must then supply
+    /// that capture's chain ([`chain::flatten`]).
+    pub chained: bool,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -3666,6 +3762,7 @@ fn filesystem_census(
 ) -> Result<Census> {
     use bulkload_proto::FileKind;
     use std::os::unix::ffi::OsStrExt;
+    crate::counters::bump(crate::counters::Counter::CensusWalks);
     let mut pending = vec![root.to_path_buf()];
     let mut rows = Vec::new();
     let mut nested_worktrees = Vec::new();
@@ -12111,6 +12208,7 @@ mod review_pr53e {
                 policy: CapturePolicy::default(),
                 reuse: None,
                 planned: &[],
+                chain: None,
             },
         );
         let outcome = match &export {

@@ -710,6 +710,37 @@ pub(super) struct Repository {
     pub(super) ceiling: PathBuf,
 }
 
+impl Repository {
+    /// A local repository whose root is `root`, resolved as [`PROBE_SCRIPT`]
+    /// resolves one: discovery is fenced at the root's parent, and the git
+    /// dir is `rev-parse --absolute-git-dir` (WP0(b): a source read names the
+    /// resolved git dir, never the given path).
+    ///
+    /// # Errors
+    /// `GIT_REPOSITORY_NOT_AT_PATH` when `root` resolves to no git dir.
+    pub(super) fn local(root: &Path) -> Result<Self> {
+        let root = std::fs::canonicalize(root)?;
+        let ceiling = root
+            .parent()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        let git_dir = super::text(
+            git(&root)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .env("GIT_CEILING_DIRECTORIES", &ceiling)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|_| BulkloadRefusal::GitRepositoryNotAtPath)?;
+        if git_dir.is_empty() || has_control(OsStr::new(&git_dir)) {
+            return Err(BulkloadRefusal::GitRepositoryNotAtPath);
+        }
+        Ok(Self {
+            git_dir: PathBuf::from(git_dir),
+            ceiling,
+        })
+    }
+}
+
 /// [`git`] on the probed git dir. Every hardening variable and `-c` override
 /// comes from the one [`super::git_env`] table through [`git`]; this adds only
 /// `--git-dir` and the probe's own `GIT_CEILING_DIRECTORIES` (F1).
@@ -1010,25 +1041,9 @@ pub(super) type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal
 /// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
 /// them all, and stream them all into `capture`. A capture write failure is
 /// recorded, and the stream is still drained so the child never blocks.
-pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
-    let mut head = Vec::new();
-    let mut total = 0_u64;
+pub(super) fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained {
     let mut failure = None;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = match stderr.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                failure.get_or_insert_with(|| BulkloadRefusal::from(error));
-                break;
-            }
-        };
-        let chunk = buffer.get(..read).unwrap_or_default();
-        let room = CLASSIFY_LIMIT.saturating_sub(head.len()).min(chunk.len());
-        head.extend_from_slice(chunk.get(..room).unwrap_or_default());
-        total += u64::try_from(read).unwrap_or(u64::MAX);
+    let drained = crate::child::drain_bounded(stderr, CLASSIFY_LIMIT, |chunk| {
         if failure.is_none() {
             if let Some(capture) = capture.as_mut() {
                 if let Err(error) = capture.write(chunk) {
@@ -1036,8 +1051,11 @@ pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drai
                 }
             }
         }
+    });
+    if let Some(error) = drained.error {
+        failure.get_or_insert_with(|| BulkloadRefusal::from(error));
     }
-    (head, total, capture, failure)
+    (drained.head, drained.total, capture, failure)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<Probe> {
@@ -1090,28 +1108,6 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
     Ok(probe)
 }
 
-/// Run `command`, feeding `bytes` on stdin from a separate thread so a large
-/// answer can never deadlock against an unread request.
-fn feed(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
-    let (writer, result) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || stdin.write_all(bytes));
-        let result = child.wait_with_output();
-        (writer.join(), result)
-    });
-    writer.map_err(|_| BulkloadRefusal::Io(None))??;
-    let result = result?;
-    if !result.status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    Ok(result.stdout)
-}
-
 fn run(command: &mut Command) -> Result<Vec<u8>> {
     let result = command
         .stdin(Stdio::null())
@@ -1138,7 +1134,7 @@ pub(super) fn present(
         request.push_str(tip);
         request.push('\n');
     }
-    let answer = feed(
+    let answer = super::input(
         hardened(source).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
     )?;

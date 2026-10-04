@@ -149,6 +149,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bulkload-handoff"
+version = "0.2.0"
+dependencies = [
+ "bulkload-agent",
+ "bulkload-proto",
+ "libc",
+]
+
+[[package]]
 name = "bulkload-proto"
 version = "0.2.0"
 dependencies = [

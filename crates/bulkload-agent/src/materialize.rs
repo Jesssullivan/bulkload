@@ -188,12 +188,14 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
-    /// This store's orphaned file temporaries, kept for their chunks and
-    /// removed when the session finishes, whatever it refused (#97): bytes
+    /// This store's orphaned file temporaries, kept for their chunks: bytes
     /// the destination already holds are not sent again within the session.
-    /// Every one is kept, however many: a session can leave up to a whole
+    /// Every one is indexed, however many: a session can leave up to a whole
     /// committer group and queue of sealed temporaries unrenamed (#77 round
-    /// 2, N2). No descriptor is held; each is opened by name when read.
+    /// 2, N2). When the session finishes, only those whose chunks a refused
+    /// entry staged outlive it, up to a bound; the rest are removed (#97,
+    /// #124, see [`Destination::retire_salvaged`]). No descriptor is held;
+    /// each is opened by name when read.
     salvage: Vec<Salvaged>,
 }
 
@@ -258,15 +260,38 @@ impl Destination {
         open_regular(&salvaged.parent, &salvaged.name).ok()
     }
 
-    /// Remove every salvaged temporary by name, as the sweep would have, and
-    /// seal each directory that lost one. Call once the session's outputs
-    /// are queued: their bytes no longer depend on the temporaries.
+    /// The size of the salvaged temporary at `index`, by name; `None` once it
+    /// is gone or is not a regular file.
+    pub(crate) fn salvaged_size(&self, index: usize) -> Option<u64> {
+        self.salvaged_file(index)
+            .and_then(|file| file.metadata().ok())
+            .map(|metadata| metadata.len())
+    }
+
+    /// The destination-relative path the salvaged temporary at `index` has
+    /// now (the session name the sweep gave it).
+    pub(crate) fn salvaged_path(&self, index: usize) -> Option<&[u8]> {
+        self.salvage
+            .get(index)
+            .map(|salvaged| salvaged.rel_path.as_slice())
+    }
+
+    /// Retire the session's salvage: keep the temporaries at `keep` (indices
+    /// as [`Destination::salvaged_file`] takes them) for a later session,
+    /// reported in [`Sweep::left`] under their current names, and remove
+    /// every other one by name, as the sweep would have, sealing each
+    /// directory that lost one. Call once the session's outputs are queued:
+    /// their bytes no longer depend on the temporaries.
     ///
     /// # Errors
     /// Refuses a failed directory seal.
-    pub fn remove_salvaged(&mut self) -> Result<()> {
+    pub(crate) fn retire_salvaged(&mut self, keep: &[usize]) -> Result<()> {
         let mut touched: Vec<Arc<File>> = Vec::new();
-        for salvaged in std::mem::take(&mut self.salvage) {
+        for (index, salvaged) in std::mem::take(&mut self.salvage).into_iter().enumerate() {
+            if keep.contains(&index) {
+                self.swept.left.push(salvaged.rel_path);
+                continue;
+            }
             match crate::io::sys::unlinkat(&salvaged.parent, &salvaged.name, false) {
                 Ok(()) => {
                     self.swept.removed += 1;
@@ -582,8 +607,8 @@ impl Destination {
                 store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
             } else if stat.nlink == 1 {
                 // An orphan with no other name may hold a whole staged
-                // output: keep it for its chunks and remove it when the
-                // session finishes. It takes a name of this session first,
+                // output: keep it for its chunks and retire it when the
+                // session finishes (`retire_salvaged`). It takes a name of this session first,
                 // so no temporary this session stages can collide with it.
                 // A second link to a published output is removed at once;
                 // the output keeps the bytes.
