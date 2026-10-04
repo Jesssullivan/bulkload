@@ -152,8 +152,12 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PackStats {
     /// Bytes git wrote for the capture's pack (the bundle as git created it,
-    /// or the raw pack of a shallow envelope): the logical measure of what it
-    /// read from the object stores to write them.
+    /// or the raw pack of a shallow envelope). For a self-contained pack this
+    /// is the logical measure of what git read from the object stores to
+    /// write it. A thin pack (a grouped item or a chained link, OI-1003-Q42)
+    /// also read every preferred delta base it deltaed against, which it does
+    /// not hold, so this bounds what was written, not what was read;
+    /// `storage_read` sees those reads, as a lower bound.
     pub bytes: u64,
     /// Objects in that pack, from its header.
     pub objects: u64,
@@ -180,35 +184,60 @@ impl PackStats {
     }
 }
 
+// Read a bundle's header through the blank line that ends it, leaving
+// `source` at its pack. Returns the header's length.
+fn skip_header(source: &mut BufReader<fs::File>, site: &'static str) -> Result<u64> {
+    let mut consumed = 0usize;
+    loop {
+        let mut line = Vec::new();
+        let count = source
+            .by_ref()
+            .take(1024 * 1024)
+            .read_until(b'\n', &mut line)
+            .refuse_at(site)?;
+        consumed = consumed
+            .checked_add(count)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        if line == b"\n" {
+            return u64::try_from(consumed).map_err(|_| BulkloadRefusal::BudgetExceeded);
+        }
+    }
+}
+
+fn open_nofollow(path: &Path, site: &'static str) -> Result<BufReader<fs::File>> {
+    Ok(BufReader::new(
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .refuse_at(site)?,
+    ))
+}
+
+/// The length of `bundle`'s pack: the file less its header.
+///
+/// # Errors
+/// Refuses malformed or oversized bundle headers and unavailable files.
+pub(super) fn bundle_pack_len(bundle: &Path) -> Result<u64> {
+    const SITE: &str = "git_carry::shared::bundle_pack_len";
+    let mut source = open_nofollow(bundle, SITE)?;
+    let header = skip_header(&mut source, SITE)?;
+    let length = source.get_ref().metadata().refuse_at(SITE)?.len();
+    length
+        .checked_sub(header)
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)
+}
+
 // The object count a pack header declares: `PACK`, version 2 or 3, count, all
 // big-endian. A bundle's pack follows its header's blank line.
 fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
     const SITE: &str = "git_carry::shared::pack_object_count";
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .refuse_at(SITE)?;
-    let mut source = BufReader::new(file);
+    let mut source = open_nofollow(path, SITE)?;
     if !raw {
-        let mut consumed = 0usize;
-        loop {
-            let mut line = Vec::new();
-            let count = source
-                .by_ref()
-                .take(1024 * 1024)
-                .read_until(b'\n', &mut line)
-                .refuse_at(SITE)?;
-            consumed = consumed
-                .checked_add(count)
-                .ok_or(BulkloadRefusal::BudgetExceeded)?;
-            if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            if line == b"\n" {
-                break;
-            }
-        }
+        skip_header(&mut source, SITE)?;
     }
     let mut header = [0u8; 12];
     source.read_exact(&mut header).refuse_at(SITE)?;
@@ -262,10 +291,19 @@ pub(super) fn write_chained(
     Ok((write_excluding_tip_trees(private, bundle, &commits)?, true))
 }
 
-// A thin bundle declaring `commits` as prerequisites whose pack excludes every
-// object reachable from them, *including through their trees*, and deltas
-// against them. Both prerequisite kinds come here: a shared plan base's tips
+// A thin bundle declaring `commits` as prerequisites, which deltas against
+// them. Both prerequisite kinds come here: a shared plan base's tips
 // (`write_bundle`) and a prior capture's source-held tips (`write_chained`).
+//
+// What its pack omits is what the walk marks uninteresting, P64 in
+// `tests/git_group_minimality.rs`: every commit `commits` reach, and every
+// tree and blob under the tree of an excluded tip, of a ref tip they reach
+// (HEAD among them, through `--all`), or of an edge (an excluded parent of a
+// packed commit). That is not the full object closure of `commits`. A blob
+// they hold only deeper in history (a `checkout <old> -- path`, a revert, a
+// stash of old content) is packed again, and so is the capture's own
+// snapshot payload (untracked and ignored files), which no prerequisite
+// holds. OI-1003-Q42 reading (a); the P64 rows pin both costs.
 //
 // `git bundle create ^tip` only marks the trees of edge commits (parents of
 // packed commits) uninteresting. A capture's staged and worktree commits are
@@ -273,20 +311,23 @@ pub(super) fn write_chained(
 // all tracked content, every pass (Q42: 1.83 MB for a 3.5 KB head move, and
 // a 64 MiB base blob in every item of a group). `rev-list
 // --objects-edge-aggressive` marks the tree of every excluded tip, and of
-// every ref tip they reach (HEAD among them, through `--all`), uninteresting
-// instead. The header (signature, prerequisites, every private ref) is
-// written here. `bundle verify` in the caller checks the result like any
-// other bundle. Both children go through the measured, classified child
-// path: a failed one refuses GIT_CHILD_FAILED with its stderr class (WP3,
-// R-N121).
+// every ref tip they reach, uninteresting instead. The header (signature,
+// prerequisites, every private ref) is written here. `bundle verify` in the
+// caller checks the result like any other bundle. Both children go through
+// the measured, classified child path: a failed one refuses GIT_CHILD_FAILED
+// with its stderr class (WP3, R-N121).
 //
 // The walk's `-<oid>` edge lines stay on pack-objects' stdin: it reads each
 // edge's tree as a preferred base, so an edited blob packs as a delta against
 // the copy its path holds there, a REF_DELTA to an object the pack omits
 // (OI-1003-Q42). That pack is thin by construction; a restore's fetch, or
 // `chain::flatten`'s, completes it with `index-pack --fix-thin` from the
-// prerequisites it already holds. `--thin` itself is not passed: it implies
+// prerequisites it already holds. So does the next pass's blob-reuse fetch
+// (`retained_blobs`), which reads those bases from the source object store
+// and counts them. `--thin` itself is not passed: it implies
 // pack-objects' internal rev-list, which refuses edge lines (`not a rev`).
+// Each preferred base is read from the object stores to delta against and
+// never written, so `PackStats::bytes` bounds this pack, not its reads.
 // pack-objects keeps only the first `pack.window` (10) edges as bases. The
 // walk prints the edge parents of new commits first, then the uninteresting
 // ref tips in ref order, where `refs/carry-export/head` sorts before every
@@ -380,8 +421,12 @@ fn write_excluding_tip_trees_pending(
 
 /// Write a capture bundle: a shallow envelope, a self-contained bundle, or,
 /// with a shared plan `base`, a thin bundle whose prerequisites are the
-/// base's commit tips and whose pack holds nothing the base already does
-/// (OI-1003-Q42; see `write_excluding_tip_trees`).
+/// base's commit tips. Its pack holds no commit the base reaches and no
+/// object under the tree of a base tip, of a capture ref the base reaches
+/// (HEAD's) or of an edge parent. It can still hold an object the base
+/// holds only deeper in its history, and it holds the capture's untracked
+/// and ignored payload on every pass (OI-1003-Q42, P64; see
+/// `write_excluding_tip_trees`).
 pub(super) fn write_bundle(
     private: &Path,
     bundle: &Path,
