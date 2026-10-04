@@ -82,20 +82,12 @@ reports that all of them have ended. Verified from git and the file system:
 
 ## Identities and archive copies
 
-Toolchain: the devShell on sting, git 2.54.0 with zlib-ng 2.3.3, SQLite
-3.53.1, zstd 1.5.7 and Python 3.12.13.
-
-- **small:** `931af5b130fe601f385a06fa68f85c1f2830f32458787912134b579f01d4572b`.
-  Generated twice into fresh directories, with byte-identical manifests;
-  the self-test and the archive copy reproduced it.
-- **estate:** `0cb96231438c8cd721460276146c8447100951b7ebaeff0eadfe7efa8a3b60bf`.
-  Generated twice into fresh directories, with byte-identical manifests;
-  the archive copy reproduced it.
-- **Archive copies,** generated in place, sealed, with a passing `verify`:
-  - `/srv/data/jess/archive/bulkload-evidence/estate-corpus-931af5b130fe/`
-  - `/srv/data/jess/archive/bulkload-evidence/estate-corpus-0cb96231438c/`
-
-  Each holds its `VERIFY-RECEIPT.json`.
+Superseded on 2026-10-04. This session recorded `931af5b1…` (small) and
+`0cb96231…` (estate) and sealed archive copies of them. A review fix changed
+the history repository, so both identities moved; the current ones, and
+their archive copies, are in
+[2026-10-04-wp0e-estate-corpus.md](2026-10-04-wp0e-estate-corpus.md) and
+the evidence doc. The 2026-10-03 archive copies stay in place, sealed.
 
 ## Findings for later lanes
 
