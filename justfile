@@ -222,3 +222,16 @@ ci:
     cd {{ root }} && just flywheel-test //:tests
 
 import? "justfile.flywheel"
+
+# `run --source SRC --out OUT -- <bulkload command>` runs the v0 reference
+# workload (JSONL+fsync, SQLite WAL, git status+diff, rg) at 1 Hz in a sibling
+# directory on the source's device, samples load1 at 1 Hz, and alternates
+# OFF/ON/OFF/ON/OFF windows of 300 s; the verdict is PASS (d_p95 <= +25 % and
+# d_load1 <= +2.0), FAIL or INCONCLUSIVE (noise floor over half the budget, or
+# too few samples). `--aa` is the A/A noise mode, `analyze TRACE` re-derives a
+# verdict and `selftest` runs the synthetic-trace tests. NOT EVIDENCE unless
+# --evidence; gated runs are separate from the S1 gate. Put an ON command that
+# needs shell quoting in a script file: just re-joins arguments.
+# S2 measured budget instrument (OI-1003-Q34)
+bench-s2-budget *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/s2_budget.py {{ args }}
