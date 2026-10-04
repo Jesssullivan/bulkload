@@ -1078,15 +1078,18 @@ fn the_view_walks_the_tree_and_finds_named_inodes() {
 }
 
 /// The same protocols through the real syscall wrappers, checked from the
-/// recorded trace.
+/// recorded trace. A file is published with `io::publish_noreplace`, the
+/// path the stores use: an exclusive rename, or with the rename-unsupported
+/// hook its counted `linkat` + `unlinkat` fallback (R-N119).
 #[cfg(feature = "io-trace")]
 mod recorded {
     use std::ffi::CString;
     use std::fs;
+    use std::os::fd::AsFd as _;
 
     use super::*;
     use crate::io::trace::recorder::Recorder;
-    use crate::io::{sys, TempFile};
+    use crate::io::{publish_noreplace, sys, Published};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Seal {
@@ -1105,48 +1108,40 @@ mod recorded {
     }
 
     /// Run the publish protocol in a fresh directory and return the pre-trace
-    /// image and the recorded events.
+    /// image, the recorded events and how the publish was carried out.
+    /// `fallback` forces the link fallback.
     fn record(
-        base: Option<&Path>,
         file: Seal,
         dir: Seal,
         drain: bool,
-        named: bool,
-    ) -> (Image, Vec<Event>, bool) {
-        let scratch = base
-            .map_or_else(tempfile::TempDir::new, tempfile::TempDir::new_in)
-            .unwrap();
+        fallback: bool,
+    ) -> (Image, Vec<Event>, Published) {
+        let scratch = tempfile::TempDir::new().unwrap();
         fs::write(scratch.path().join("keep"), KEEP).unwrap();
         fs::write(scratch.path().join("ledger"), b"").unwrap();
-        let root = sys::open_root(scratch.path()).unwrap();
+        let root = fs::File::from(sys::open_root(scratch.path()).unwrap());
         let ledger =
             sys::openat_beneath(&root, Path::new("ledger"), crate::io::OpenMode::Read).unwrap();
         let image = Image::scan(scratch.path()).unwrap();
         let recorder = Recorder::new();
-        let anonymous;
+        let published;
         {
             let _attached = recorder.attach();
+            let temp = CString::new("tmp").unwrap();
             let data = CString::new("data").unwrap();
-            if named {
-                let (fd, name) =
-                    sys::create_temp_named(&root, 0o600, &crate::io::tests::TAG).unwrap();
-                sys::pwrite_all(&fd, NEW, 0).unwrap();
-                seal(&fd, file, false);
-                sys::rename_noreplace(&root, &name, &data).unwrap();
-                anonymous = false;
-            } else {
-                let temp = TempFile::create(&root, 0o600, &crate::io::tests::TAG).unwrap();
-                anonymous = temp.is_anonymous();
-                sys::pwrite_all(temp.fd(), NEW, 0).unwrap();
-                seal(temp.fd(), file, false);
-                temp.publish(&data).unwrap();
-            }
+            let fd = sys::create_excl_at(root.as_fd(), &temp, 0o600).unwrap();
+            sys::pwrite_all(&fd, NEW, 0).unwrap();
+            seal(&fd, file, false);
+            crate::io::force_rename_unsupported(fallback);
+            let outcome = publish_noreplace(&root, &temp, &data);
+            crate::io::force_rename_unsupported(false);
+            published = outcome.unwrap();
             seal(&root, dir, true);
             if drain {
                 sys::full_flush(&ledger).unwrap();
             }
         }
-        (image, recorder.take(), anonymous)
+        (image, recorder.take(), published)
     }
 
     fn verdict(image: &Image, events: &[Event], scope: BarrierScope) -> Report {
@@ -1163,35 +1158,30 @@ mod recorded {
     const SCOPES: [BarrierScope; 2] = [BarrierScope::Device, BarrierScope::Object];
 
     #[test]
-    fn recorded_named_publish_passes_and_its_broken_variants_fail() {
-        for scope in SCOPES {
-            let (image, events, _) = record(None, Seal::Full, Seal::Full, false, true);
-            assert!(verdict(&image, &events, scope).passed());
+    fn recorded_publish_passes_and_its_broken_variants_fail() {
+        for fallback in [false, true] {
+            let expected = if fallback {
+                Published::Linked
+            } else {
+                Published::Renamed
+            };
+            for scope in SCOPES {
+                let (image, events, published) = record(Seal::Full, Seal::Full, false, fallback);
+                assert_eq!(published, expected);
+                assert!(verdict(&image, &events, scope).passed());
 
-            let (image, events, _) = record(None, Seal::None, Seal::Full, false, true);
-            assert!(
-                !verdict(&image, &events, scope).passed(),
-                "no file sync must fail"
-            );
+                let (image, events, _) = record(Seal::None, Seal::Full, false, fallback);
+                assert!(
+                    !verdict(&image, &events, scope).passed(),
+                    "no file sync must fail (fallback={fallback})"
+                );
 
-            let (image, events, _) = record(None, Seal::Full, Seal::None, false, true);
-            assert!(
-                !verdict(&image, &events, scope).passed(),
-                "no dir sync must fail"
-            );
-        }
-    }
-
-    #[test]
-    fn recorded_temp_file_publish_passes_and_its_broken_variants_fail() {
-        for scope in SCOPES {
-            let (image, events, anonymous) = record(None, Seal::Full, Seal::Full, false, false);
-            eprintln!("temp file anonymous={anonymous}");
-            assert!(verdict(&image, &events, scope).passed());
-            let (image, events, _) = record(None, Seal::None, Seal::Full, false, false);
-            assert!(!verdict(&image, &events, scope).passed());
-            let (image, events, _) = record(None, Seal::Full, Seal::None, false, false);
-            assert!(!verdict(&image, &events, scope).passed());
+                let (image, events, _) = record(Seal::Full, Seal::None, false, fallback);
+                assert!(
+                    !verdict(&image, &events, scope).passed(),
+                    "no dir sync must fail (fallback={fallback})"
+                );
+            }
         }
     }
 
@@ -1202,33 +1192,9 @@ mod recorded {
     /// (durable).
     #[test]
     fn recorded_group_protocol() {
-        let (image, events, _) = record(None, Seal::Barrier, Seal::Barrier, true, true);
+        let (image, events, _) = record(Seal::Barrier, Seal::Barrier, true, false);
         assert!(verdict(&image, &events, Options::default().barrier_scope).passed());
         let strict = verdict(&image, &events, BarrierScope::Object);
         assert_eq!(strict.passed(), !cfg!(target_vendor = "apple"));
-    }
-
-    /// Linux `O_TMPFILE` + `linkat(/proc/self/fd)` on tmpfs, where the kernel
-    /// supports it: the correct protocol passes and the unsynced one fails.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn recorded_o_tmpfile_publish_on_tmpfs() {
-        let base = Path::new("/dev/shm");
-        if crate::io::tests::shm_dir("recorded_o_tmpfile_publish_on_tmpfs").is_none() {
-            return;
-        }
-        let (image, events, anonymous) =
-            record(Some(base), Seal::Barrier, Seal::Full, false, false);
-        assert!(anonymous);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::Create { name: None, .. })));
-        for scope in SCOPES {
-            assert!(verdict(&image, &events, scope).passed());
-        }
-        let (image, events, _) = record(Some(base), Seal::None, Seal::Full, false, false);
-        for scope in SCOPES {
-            assert!(!verdict(&image, &events, scope).passed());
-        }
     }
 }
