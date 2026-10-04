@@ -6,6 +6,7 @@
 //! its bytes; the destination re-reads chunks only from published outputs,
 //! through hints it re-verifies on use.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::io::Read as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -297,14 +298,37 @@ pub struct PendingDirectory {
     pub mode: u32,
 }
 
+/// The `settings` row that marks a store whose ledger and output rows were
+/// all written by the racy-capture guard (#86, #125). A store created by this
+/// engine carries it from its first commit. A store without it predates the
+/// guard: any of its rows may vouch for bytes captured inside the timestamp
+/// tick of a same-size rewrite, so none of them is trusted (see
+/// [`Store::open`]).
+const RACY_GUARD_SETTING: &str = "racy_guard";
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
     conn: rusqlite::Connection,
+    /// The store's `captures` and `outputs` rows were all written under the
+    /// racy-capture guard (#125). A read-only handle on a store nobody has
+    /// upgraded yet reads its rows as misses.
+    rows_trusted: bool,
 }
 
 impl Store {
     /// Open or create a private transfer store outside the carried roots.
+    ///
+    /// A store written before the racy-capture guard (#86) has no
+    /// [`RACY_GUARD_SETTING`] row, and none of its ledger or output rows is
+    /// proven non-racy (#125). Opening it for writing invalidates them all
+    /// in the transaction that adds the marker: every `captures` and
+    /// `outputs` row is deleted, and the count is added to
+    /// `transfer_legacy_rows_invalidated`. Each such seat is then read from
+    /// the source once more, a re-read R25 allows because its row could not
+    /// prove the seat was not racy when it was recorded. Chunk hints are
+    /// kept: they are re-verified on use, so the re-read costs no wire bytes
+    /// for content the destination still holds.
     ///
     /// # Errors
     /// Refuses symlinks, non-private directories and database failures.
@@ -320,14 +344,18 @@ impl Store {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&db)?;
+                .open(&db)
+                .refuse_at("transfer_store::open")?;
         }
         let conn = rusqlite::Connection::open(db).map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
         crate::io::durable::configure_sqlite(&conn)?;
         let mut random = [0_u8; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        fs::File::open("/dev/urandom")
+            .refuse_at("transfer_store::open")?
+            .read_exact(&mut random)
+            .refuse_at("transfer_store::open")?;
         let before = conn.total_changes();
         let started = Instant::now();
         conn.execute_batch("BEGIN").map_err(sqlite_error)?;
@@ -335,6 +363,7 @@ impl Store {
         // rowid, so losing one output does not lose reuse of its chunks. A
         // pre-v5 store's `output_chunks`, `chunks` and `chunk_locations` are
         // left untouched and unread.
+        let mut invalidated = 0_usize;
         let created = conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS captures (key BLOB PRIMARY KEY, manifest BLOB NOT NULL);
@@ -349,7 +378,23 @@ impl Store {
                     [random.as_slice()],
                 )
             })
-            .and_then(|_| conn.execute_batch("COMMIT"))
+            .and_then(|_| {
+                // #125: a store without the marker predates the racy guard.
+                // Its rows are deleted with the marker's insert, in one
+                // transaction, so no crash can leave the marker beside an
+                // unproven row. A fresh store has no rows to delete.
+                if racy_guarded(&conn)? {
+                    return Ok(());
+                }
+                invalidated = conn.execute("DELETE FROM captures", [])?;
+                invalidated = invalidated.saturating_add(conn.execute("DELETE FROM outputs", [])?);
+                conn.execute(
+                    "INSERT INTO settings VALUES (?1, ?2)",
+                    (RACY_GUARD_SETTING, b"#86".as_slice()),
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| conn.execute_batch("COMMIT"))
             .map_err(sqlite_error);
         if created.is_err() {
             let _ = conn.execute_batch("ROLLBACK");
@@ -357,17 +402,19 @@ impl Store {
             counters::sqlite_commit(Counter::SqliteSchema, started, &created);
         }
         created?;
+        counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
-            root: fs::canonicalize(root)?,
+            root: fs::canonicalize(root).refuse_at("transfer_store::open")?,
             conn,
+            rows_trusted: true,
         })
     }
 
     /// Open an initialized store without obtaining any write capability.
     pub(crate) fn open_reader(root: &Path) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+        let root = fs::canonicalize(root).refuse_at("transfer_store::open_reader")?;
         let db = root.join("transfer.sqlite");
-        let meta = fs::symlink_metadata(&db)?;
+        let meta = fs::symlink_metadata(&db).refuse_at("transfer_store::open_reader")?;
         if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
@@ -378,7 +425,14 @@ impl Store {
         .map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
-        Ok(Self { root, conn })
+        // A reader never upgrades a store: one without the racy-guard
+        // marker serves no capture and matches no output (#125).
+        let rows_trusted = racy_guarded(&conn).map_err(sqlite_error)?;
+        Ok(Self {
+            root,
+            conn,
+            rows_trusted,
+        })
     }
 
     /// Acquire the nonblocking single-writer guard for `side`.
@@ -418,6 +472,9 @@ impl Store {
     /// # Errors
     /// Refuses database errors.
     pub fn capture(&self, key: &[u8]) -> Result<Option<Manifest>> {
+        if !self.rows_trusted {
+            return Ok(None);
+        }
         let bytes: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -465,12 +522,21 @@ impl Store {
         Ok((count("captures")?, count("outputs")?))
     }
 
+    /// Drop the racy-guard marker, as a store written before #86 lacks it.
+    #[cfg(test)]
+    pub(crate) fn forget_racy_guard(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", [RACY_GUARD_SETTING])
+            .map_err(sqlite_error)?;
+        Ok(())
+    }
+
     /// Commit one identity-checked capture on its own.
     ///
     /// # Errors
     /// Refuses serialization or database failures.
     pub fn record_capture(&self, key: &[u8], value: &Manifest) -> Result<()> {
-        let encoded = postcard::to_stdvec(value)?;
+        let encoded = postcard::to_stdvec(value).refuse_at("transfer_store::record_capture")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -494,6 +560,9 @@ impl Store {
     /// # Errors
     /// Refuses database failures.
     pub fn output_matches(&self, key: &[u8], identity: &StatIdentity) -> Result<bool> {
+        if !self.rows_trusted {
+            return Ok(false);
+        }
         let found: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -571,7 +640,8 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })?;
+        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })
+            .refuse_at("transfer_store::record_directory_created")?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
@@ -686,8 +756,9 @@ impl StorePublisher {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(store.root.join("writer.lock"))?;
-        crate::io::sys::flock_exclusive(&lock)?;
+            .open(store.root.join("writer.lock"))
+            .refuse_at("transfer_store::open")?;
+        crate::io::sys::flock_exclusive(&lock).refuse_at("transfer_store::open")?;
         Ok(Self {
             store,
             side: role,
@@ -831,7 +902,11 @@ impl StorePublisher {
                     .execute(
                         "INSERT INTO captures VALUES (?1, ?2)
                          ON CONFLICT(key) DO UPDATE SET manifest=excluded.manifest",
-                        (&capture.key, postcard::to_stdvec(&capture.manifest)?),
+                        (
+                            &capture.key,
+                            postcard::to_stdvec(&capture.manifest)
+                                .refuse_at("transfer_store::commit_captures")?,
+                        ),
                     )
                     .map_err(sqlite_error)?;
             }
@@ -966,17 +1041,27 @@ impl crate::io::durable::GroupSink for LedgerSink {
 /// # Errors
 /// Refuses serialization failure.
 pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(authority, row))?)
+    postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
+}
+
+/// Whether the store carries the [`RACY_GUARD_SETTING`] marker (#125).
+fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+        [RACY_GUARD_SETTING],
+        |row| row.get(0),
+    )
 }
 
 fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
-    Ok(postcard::to_stdvec(&(
+    postcard::to_stdvec(&(
         identity.dev,
         identity.ino,
         identity.size,
         identity.mtime_ns,
         identity.ctime_ns,
-    ))?)
+    ))
+    .refuse_at("transfer_store::identity_bytes")
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -985,10 +1070,13 @@ fn private_dir(path: &Path) -> Result<()> {
         Ok(_) => Err(BulkloadRefusal::PathEscapesRoot),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             use std::os::unix::fs::DirBuilderExt as _;
-            fs::DirBuilder::new().mode(0o700).create(path)?;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .refuse_at("transfer_store::private_dir")?;
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "transfer_store::private_dir")),
     }
 }
 
@@ -1018,7 +1106,7 @@ mod tests {
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path)?;
+            fs::create_dir(&path).refuse_at("transfer_store::tests::new")?;
             Ok(Self(path))
         }
     }
@@ -1245,8 +1333,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::output_records_and_chunk_hints_commit_together")?;
+        let identity =
+            StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+                "transfer_store::tests::output_records_and_chunk_hints_commit_together",
+            )?);
         let hint = ChunkHint {
             digest: [3; 32],
             offset: 5,
@@ -1283,8 +1375,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::a_racy_output_is_never_a_reuse_key")?,
+        );
         let record = |racy: bool| OutputRecord {
             key: b"key".to_vec(),
             rel_path: b"output".to_vec(),
@@ -1314,7 +1410,8 @@ mod tests {
         let store = Store::open(&state)?;
         let exact = manifest(b"exact");
         store.record_capture(b"exact", &exact)?;
-        let mut padded = postcard::to_stdvec(&exact)?;
+        let mut padded = postcard::to_stdvec(&exact)
+            .refuse_at("transfer_store::tests::a_ledger_row_with_trailing_bytes_is_a_miss")?;
         padded.push(0);
         store
             .conn
@@ -1328,6 +1425,71 @@ mod tests {
         Ok(())
     }
 
+    /// #125: a store written before the racy guard (#86) has no marker, so
+    /// none of its ledger or output rows is proven non-racy. A reader serves
+    /// none of them; the first writable open deletes them all with the
+    /// marker's insert and counts them, and keeps the chunk hints. Rows
+    /// written after the upgrade are trusted and survive later opens.
+    #[test]
+    fn a_store_from_before_the_racy_guard_trusts_none_of_its_rows() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let file = root.0.join("output");
+        fs::write(&file, b"output").refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?;
+        let identity = StatIdentity::from_metadata(&fs::metadata(&file).refuse_at(
+            "transfer_store::tests::a_store_from_before_the_racy_guard_trusts_none_of_its_rows",
+        )?);
+        let record = |key: &[u8]| OutputRecord {
+            key: key.to_vec(),
+            rel_path: b"output".to_vec(),
+            identity,
+            racy: false,
+            hints: vec![ChunkHint {
+                digest: [7; 32],
+                offset: 0,
+                size: 6,
+            }],
+        };
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(&[record(b"old")])?;
+        publisher
+            .store()
+            .record_capture(b"old", &manifest(b"old"))?;
+        publisher.store().forget_racy_guard()?;
+        drop(publisher);
+
+        let reader = Store::open_reader(&state)?;
+        assert_eq!(reader.capture(b"old")?, None);
+        assert!(!reader.output_matches(b"old", &identity)?);
+        drop(reader);
+
+        let counted =
+            || crate::counters::Counters::snapshot().get(Counter::TransferLegacyRowsInvalidated);
+        let before = counted();
+        let upgraded = Store::open(&state)?;
+        assert!(counted() >= before + 2, "both rows are counted");
+        assert_eq!(upgraded.row_counts()?, (0, 0));
+        assert!(!upgraded.output_matches(b"old", &identity)?);
+        assert_eq!(upgraded.capture(b"old")?, None);
+        assert_eq!(upgraded.output_chunks(&[7; 32])?.len(), 1, "hints are kept");
+        drop(upgraded);
+
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(&[record(b"new")])?;
+        publisher
+            .store()
+            .record_capture(b"new", &manifest(b"new"))?;
+        drop(publisher);
+        let reopened = Store::open(&state)?;
+        assert_eq!(reopened.row_counts()?, (1, 1));
+        assert!(reopened.output_matches(b"new", &identity)?);
+        assert_eq!(reopened.capture(b"new")?, Some(manifest(b"new")));
+        assert!(Store::open_reader(&state)?.output_matches(b"new", &identity)?);
+        Ok(())
+    }
+
     /// Hint ordering (#59 review): several outputs holding one digest are all
     /// kept, newest first, and re-recording an output moves it to the front.
     #[test]
@@ -1336,8 +1498,12 @@ mod tests {
         let state = root.0.join("state");
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
         let file = root.0.join("output");
-        fs::write(&file, b"output")?;
-        let identity = StatIdentity::from_metadata(&fs::metadata(&file)?);
+        fs::write(&file, b"output")
+            .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?;
+        let identity = StatIdentity::from_metadata(
+            &fs::metadata(&file)
+                .refuse_at("transfer_store::tests::hints_keep_every_holder_newest_first")?,
+        );
         let record = |path: &[u8], offset: u64| OutputRecord {
             key: path.to_vec(),
             rel_path: path.to_vec(),

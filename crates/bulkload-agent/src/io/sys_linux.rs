@@ -12,11 +12,11 @@
 
 use std::ffi::CStr;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
 
+use super::sys_posix::fsync_raw;
 pub use super::sys_posix::*;
-use super::sys_posix::{fsync_raw, to_off_t};
-use super::{NodeId, Qos, Stat};
+use super::{NodeId, Stat};
 
 /// Translate a Linux `struct stat`.
 #[allow(
@@ -126,61 +126,12 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
     full_flush(directory)
 }
 
-/// Start write-back of `[offset, offset + len)` with
-/// `sync_file_range(SYNC_FILE_RANGE_WRITE)`. Not durable and not ordered; a
-/// later [`data_sync`] is what makes the range durable.
-///
-/// # Errors
-/// Returns the `sync_file_range` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn kick(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
-    trace_serial!();
-    let fd = file.as_fd();
-    let (offset, len) = (to_off_t(offset)?, to_off_t(len)?);
-    // SAFETY: the descriptor is live for every call of the closure;
-    // `sync_file_range` takes no pointers.
-    retry_eintr(|| unsafe {
-        libc::sync_file_range(fd.as_raw_fd(), offset, len, libc::SYNC_FILE_RANGE_WRITE)
-    })?;
-    trace_event!(
-        "sync_file_range",
-        Ok(super::trace::Event::Sync {
-            node: fstat(fd)?.node,
-            kind: super::trace::SyncKind::Kick,
-        })
-    );
-    Ok(())
-}
-
-/// Rename `from` to `to` inside `directory`; an existing `to` is `EEXIST` and
-/// is left untouched. Falls back to `linkat` then `unlinkat` where
-/// `renameat2(RENAME_NOREPLACE)` is not offered, so it suits files only; see
-/// [`rename_exclusive`] for a rename with no fallback.
-///
-/// # Errors
-/// Returns the rename failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn rename_noreplace(directory: impl AsFd, from: &CStr, to: &CStr) -> io::Result<()> {
-    let directory = directory.as_fd();
-    rename_noreplace_at(directory, from, directory, to)
-}
-
 /// [`rename_exclusive_at`], then on `EINVAL`/`ENOSYS` `linkat` and `unlinkat`
 /// (no-clobber, two directory operations). For files only: `linkat` on a
 /// directory is `EPERM`.
 ///
 /// # Errors
 /// Returns the rename, link or unlink failure; an occupied `to` is `EEXIST`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
 pub fn rename_noreplace_at(
     from_dir: impl AsFd,
     from: &CStr,
@@ -250,187 +201,55 @@ pub fn rename_exclusive_at(
     Ok(())
 }
 
-/// Whether `/proc/self/fd` is reachable, probed once per process. Without it
-/// an `O_TMPFILE` inode could not be given a name, so staging uses a named
-/// temporary instead.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-fn proc_fd_reachable() -> bool {
-    static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REACHABLE.get_or_init(|| std::fs::metadata("/proc/self/fd").is_ok_and(|meta| meta.is_dir()))
-}
+/// `ioprio_set`/`ioprio_get` `which`: one thread (or process) by id, 0 the
+/// caller (`linux/ioprio.h`).
+const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+/// The idle IO class: served only when no other class has IO pending.
+const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+/// `IOPRIO_PRIO_VALUE(class, data)`: the class sits above 13 data bits.
+const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 
-/// Stage an unnamed file in `dir` with `O_TMPFILE`. Returns `None` when
-/// `/proc/self/fd` is unreachable, or when the kernel or file system does not
-/// support `O_TMPFILE` (`EOPNOTSUPP`, `EISDIR`, `EINVAL`); the caller then
-/// falls back to a named temporary.
+/// Enter background priority (WP0(f), OI-1003-Q17): nice 19 and the idle IO
+/// class. Called first in `main`, before any thread exists, so every thread
+/// and every child (Git, ssh) inherits both: Linux keeps nice and the IO
+/// priority per thread and copies them on `clone`.
 ///
 /// # Errors
-/// Returns any other `openat` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn open_tmpfile(dir: BorrowedFd<'_>, mode: u32) -> io::Result<Option<OwnedFd>> {
-    if !proc_fd_reachable() {
-        return Ok(None);
-    }
-    trace_serial!();
-    let here = c".";
-    match openat_raw(
-        dir,
-        here,
-        libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
-        mode,
-    ) {
-        Ok(fd) => {
-            trace_event!(
-                "openat(O_TMPFILE)",
-                Ok(super::trace::Event::Create {
-                    dir: Some(fstat(dir)?.node),
-                    name: None,
-                    node: fstat(&fd)?.node,
-                    // The effective mode, after the umask.
-                    mode: fstat(&fd)?.permissions(),
-                })
-            );
-            Ok(Some(fd))
-        }
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Give an `O_TMPFILE` inode the name `name` in `dir`:
-/// `linkat(AT_FDCWD, "/proc/self/fd/N", dir, name, AT_SYMLINK_FOLLOW)`, which
-/// needs no capability. [`open_tmpfile`] only stages anonymously when
-/// `/proc/self/fd` is reachable. An occupied `name` is `EEXIST`.
-///
-/// # Errors
-/// Returns the `linkat` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn link_tmpfile(file: impl AsFd, dir: impl AsFd, name: &CStr) -> io::Result<()> {
-    trace_serial!();
-    let (fd, dir) = (file.as_fd(), dir.as_fd());
-    let proc_path = super::c_name(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
-    // SAFETY: `dir` is live for the call, both paths are NUL-terminated and
-    // outlive it, and AT_FDCWD with an absolute path reads no descriptor.
-    let linked = unsafe {
-        libc::linkat(
-            libc::AT_FDCWD,
-            proc_path.as_ptr(),
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::AT_SYMLINK_FOLLOW,
+/// Returns the `setpriority` or `ioprio_set` failure; neither needs
+/// privilege when lowering the caller's own priority.
+pub fn enter_background() -> io::Result<()> {
+    super::sys_posix::nice_background()?;
+    // SAFETY: `ioprio_set` takes three integers and no pointers; `who` 0
+    // names the calling thread.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
         )
     };
-    if linked != 0 {
+    if ret == -1 {
         return Err(io::Error::last_os_error());
     }
-    trace_event!(
-        "linkat(/proc/self/fd)",
-        Ok(super::trace::Event::Link {
-            node: fstat(fd)?.node,
-            dir: fstat(dir)?.node,
-            name: name.to_bytes().to_vec(),
-        })
-    );
     Ok(())
 }
 
-/// Reserve `[0, len)` without changing the file size
-/// (`fallocate(FALLOC_FL_KEEP_SIZE)`). Returns `false` when the file system
-/// declines (`EOPNOTSUPP`).
+/// Whether the calling thread runs at background priority: nice 19 and the
+/// idle IO class, exactly as [`enter_background`] leaves it.
 ///
 /// # Errors
-/// Returns any other `fallocate` failure.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn preallocate(file: impl AsFd, len: u64) -> io::Result<bool> {
-    let fd = file.as_fd();
-    let len = to_off_t(len)?;
-    // SAFETY: the descriptor is live for every call of the closure;
-    // `fallocate` takes no pointers.
-    match retry_eintr(|| unsafe {
-        libc::fallocate(fd.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len)
-    }) {
-        Ok(()) => Ok(true),
-        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(false),
-        Err(error) => Err(error),
+/// Returns the `getpriority` or `ioprio_get` failure.
+pub fn in_background() -> io::Result<bool> {
+    let nice = super::sys_posix::nice()?;
+    // SAFETY: `ioprio_get` takes two integers and no pointers; `who` 0 names
+    // the calling thread.
+    let ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
+    if ioprio == -1 {
+        return Err(io::Error::last_os_error());
     }
-}
-
-/// Read-ahead advice for `[offset, offset + len)`
-/// (`posix_fadvise(POSIX_FADV_WILLNEED)`).
-///
-/// # Errors
-/// Returns the error number `posix_fadvise` reports.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn read_advise(file: impl AsFd, offset: u64, len: u64) -> io::Result<()> {
-    let fd = file.as_fd();
-    // SAFETY: the descriptor is live for the call; `posix_fadvise` takes no
-    // pointers and returns an error number instead of setting errno.
-    let ret = unsafe {
-        libc::posix_fadvise(
-            fd.as_raw_fd(),
-            to_off_t(offset)?,
-            to_off_t(len)?,
-            libc::POSIX_FADV_WILLNEED,
-        )
-    };
-    if ret != 0 {
-        return Err(io::Error::from_raw_os_error(ret));
-    }
-    Ok(())
-}
-
-/// Linux has no `QoS` classes; nothing is applied.
-///
-/// # Errors
-/// Never fails on Linux.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches Darwin's pthread_set_qos_class_self_np"
-)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const fn set_thread_qos(_class: Qos) -> io::Result<bool> {
-    Ok(false)
-}
-
-/// Linux has no `QoS` classes.
-///
-/// # Errors
-/// Never fails on Linux.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the signature matches Darwin's pthread_get_qos_class_np"
-)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub const fn thread_qos() -> io::Result<Option<Qos>> {
-    Ok(None)
+    Ok(nice == super::sys_posix::BACKGROUND_NICE
+        && ioprio >> IOPRIO_CLASS_SHIFT == libc::c_long::from(IOPRIO_CLASS_IDLE))
 }
 
 /// Raise a pipe's capacity with `F_SETPIPE_SZ`. Returns `false` without

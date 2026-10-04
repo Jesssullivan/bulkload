@@ -4,6 +4,7 @@
 //! restores are never replayed over subsequent operator edits.
 
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -42,6 +43,134 @@ struct Base {
     bundle: String,
     digest: [u8; 32],
     identity: crate::freshness::StatIdentity,
+}
+
+// WP2 (OI-1003-Q15): the `{bundle}.prior` sidecar of a capture whose bundle
+// declares its predecessor's source-held tips as prerequisites. It names that
+// predecessor exactly as `Base` names a shared base, plus the predecessor's
+// own chain depth: 0 for a self-contained bundle, else one more than the
+// depth its own `.prior` records. A sidecar, so the Capture postcard gains no
+// field and every retained record still decodes.
+#[derive(Clone, Serialize, Deserialize)]
+struct Prior {
+    bundle: String,
+    digest: [u8; 32],
+    identity: crate::freshness::StatIdentity,
+    depth: u32,
+}
+
+fn prior_sidecar(corpus: &Path, bundle: &str) -> PathBuf {
+    corpus.join(format!("{bundle}.prior"))
+}
+
+/// How [`chain_links`] binds each link it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkBinding {
+    /// Capture side (reuse, chaining, sidecar publication) on the capture
+    /// host: every link must also sit at the `StatIdentity` its `.prior`
+    /// recorded, so a link replaced in place is never extended or reused.
+    Custody,
+    /// Apply side (restore, space preflight): a link is bound by its corpus
+    /// name and recorded digest only. A corpus pulled to another host gives
+    /// every file a new device, inode and ctime, so identity cannot bind
+    /// there; [`git_carry::chain::flatten`] digest-checks every staged link,
+    /// as `import_base` digest-checks a shared base (R-N72).
+    Digest,
+}
+
+/// The bundles a chained capture's bundle depends on, oldest first, each with
+/// its recorded digest. Empty for a bundle without a `.prior` sidecar.
+///
+/// Every link must be retained (and, under [`LinkBinding::Custody`], at its
+/// recorded identity), and depths must fall by exactly one per link to a
+/// depth-0 root within [`git_carry::chain::CHAIN_DEPTH_LIMIT`]; the walk is
+/// therefore bounded. Digests and prerequisites are checked when the chain is
+/// flattened.
+///
+/// # Errors
+/// `SEALED_OBJECT_MISSING` for a link the corpus no longer holds,
+/// `RECEIPT_BINDING_INVALID` for inconsistent depths or (under `Custody`) a
+/// replaced link, and `PATH_ESCAPES_ROOT` for a link name that is not a
+/// corpus file name.
+fn chain_links(
+    corpus: &Path,
+    bundle: &str,
+    binding: LinkBinding,
+) -> Result<Vec<(PathBuf, [u8; 32])>> {
+    let mut links = Vec::new();
+    let mut current = bundle.to_owned();
+    let mut expected: Option<u32> = None;
+    loop {
+        let sidecar = prior_sidecar(corpus, &current);
+        if !sidecar.try_exists().refuse_at("estate::chain_links")? {
+            // `expected` is the depth `current`'s own link must record: a
+            // chained bundle that lost its link breaks the chain. Only an
+            // unchained head ends the walk here; a root ends it below.
+            return match expected {
+                None => Ok(links),
+                Some(_) => Err(BulkloadRefusal::ReceiptBindingInvalid),
+            };
+        }
+        let prior: Prior = read(&sidecar)?;
+        if prior.depth >= git_carry::chain::CHAIN_DEPTH_LIMIT
+            || expected.is_some_and(|depth| depth != prior.depth)
+        {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        let path = link_path(corpus, &prior)?;
+        if !path.try_exists().refuse_at("estate::chain_links")? {
+            return Err(BulkloadRefusal::SealedObjectMissing);
+        }
+        if binding == LinkBinding::Custody
+            && prior.identity
+                != crate::freshness::StatIdentity::from_metadata(
+                    &fs::symlink_metadata(&path).refuse_at("estate::chain_links")?,
+                )
+        {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        links.push((path, prior.digest));
+        if prior.depth == 0 {
+            if prior_sidecar(corpus, &prior.bundle)
+                .try_exists()
+                .refuse_at("estate::chain_links")?
+            {
+                return Err(BulkloadRefusal::ReceiptBindingInvalid);
+            }
+            links.reverse();
+            return Ok(links);
+        }
+        expected = Some(prior.depth - 1);
+        current = prior.bundle;
+    }
+}
+
+/// The link a new capture may chain onto `previous`, if any: `None` when
+/// `previous` depends on a shared plan base, its own chain is not intact, or
+/// it already sits at the depth limit (the next capture re-bases).
+fn chainable(corpus: &Path, previous: &Capture, bundle: &Path) -> Result<Option<Prior>> {
+    let depth = if prior_sidecar(corpus, &previous.bundle)
+        .try_exists()
+        .refuse_at("estate::chainable")?
+    {
+        match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
+            Ok(links) => u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+            // A broken chain is never extended; the next bundle re-bases.
+            Err(_) => return Ok(None),
+        }
+    } else if git_carry::shared::requires_base(bundle)? {
+        return Ok(None);
+    } else {
+        0
+    };
+    Ok(
+        (depth < git_carry::chain::CHAIN_DEPTH_LIMIT).then(|| Prior {
+            bundle: previous.bundle.clone(),
+            digest: previous.digest,
+            identity: previous.identity,
+            depth,
+        }),
+    )
 }
 
 #[derive(Debug)]
@@ -94,6 +223,19 @@ impl Completion {
     fn naming(self, nested: Vec<String>) -> Self {
         Self { nested, ..self }
     }
+
+    // WP1 PR 4 (S5): the source's object store was rewritten under the pass
+    // and a Git child failed on it. Drift custody, never a refusal: no record
+    // is written, so any retained capture stays exactly what it was, and the
+    // next pass captures the rewritten store. The receipt names no bytes: the
+    // pass's reads are in the process counters, not in a capture.
+    fn deferred(drift: &git_carry::CaptureDrift, nested: Vec<String>) -> Self {
+        Self {
+            drift: drift.lines(),
+            nested,
+            ..Self::clean("deferred-with-drift")
+        }
+    }
 }
 
 // What the next pass needs from a capture, beside its record. Same sidecar
@@ -113,7 +255,7 @@ struct Parts {
 // is the record of what it does not hold. Absent means the pass raced nothing.
 fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift> {
     let path = corpus.join(format!("{bundle}.drift"));
-    if path.try_exists()? {
+    if path.try_exists().refuse_at("estate::retained_drift")? {
         read(&path)
     } else {
         Ok(git_carry::CaptureDrift::default())
@@ -126,7 +268,7 @@ fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift
 // next pass re-reads every seat, says so, and records its own start (R-N76).
 fn retained_parts(corpus: &Path, bundle: &str) -> Result<Option<Parts>> {
     let path = corpus.join(format!("{bundle}.parts"));
-    if path.try_exists()? {
+    if path.try_exists().refuse_at("estate::retained_parts")? {
         Ok(Some(read::<Parts>(&path)?))
     } else {
         Ok(None)
@@ -137,7 +279,7 @@ fn retained_parts(corpus: &Path, bundle: &str) -> Result<Option<Parts>> {
 // sidecar is written whenever the capture's custody is non-empty.
 fn retained_nested(corpus: &Path, bundle: &str) -> Result<Vec<git_carry::NestedRepository>> {
     let path = corpus.join(format!("{bundle}.nested"));
-    if path.try_exists()? {
+    if path.try_exists().refuse_at("estate::retained_nested")? {
         read(&path)
     } else {
         Ok(Vec::new())
@@ -228,9 +370,12 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .refuse_at("estate::read")?;
     let mut bytes = Vec::new();
-    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    file.take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .refuse_at("estate::read")?;
     if bytes.len() > 16 * 1024 * 1024 {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
@@ -256,13 +401,16 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
                     .checked_add(1)
                     .ok_or(BulkloadRefusal::FieldDomainViolation)?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "estate::write")),
         }
     };
-    file.write_all(&bytes)?;
-    file.sync_file_counted()?;
-    fs::rename(&temporary, path)?;
-    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
+    file.write_all(&bytes).refuse_at("estate::write")?;
+    file.sync_file_counted().refuse_at("estate::write")?;
+    fs::rename(&temporary, path).refuse_at("estate::write")?;
+    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at("estate::write")?
+        .sync_dir_counted()
+        .refuse_at("estate::write")?;
     Ok(())
 }
 
@@ -270,7 +418,7 @@ fn private_directory(path: &Path) -> Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path)?;
+            let metadata = fs::symlink_metadata(path).refuse_at("estate::private_directory")?;
             // SAFETY: geteuid has no preconditions or side effects.
             if metadata.is_dir()
                 && metadata.mode().trailing_zeros() >= 6
@@ -281,7 +429,7 @@ fn private_directory(path: &Path) -> Result<()> {
                 Err(BulkloadRefusal::PathEscapesRoot)
             }
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "estate::private_directory")),
     }
 }
 
@@ -319,7 +467,7 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
         return Err(BulkloadRefusal::PathNotAbsolute);
     }
     let _lock = exclusive(&plan.with_extension("lock"))?;
-    let mut contents: Plan = if plan.try_exists()? {
+    let mut contents: Plan = if plan.try_exists().refuse_at("estate::add_batch")? {
         read(plan)?
     } else {
         Plan::default()
@@ -337,7 +485,7 @@ pub fn add_batch(plan: &Path, items: &[Item]) -> Result<()> {
     }
     for incoming in items {
         let mut item = incoming.clone();
-        item.source = fs::canonicalize(&item.source)?;
+        item.source = fs::canonicalize(&item.source).refuse_at("estate::add_batch")?;
         if !item.repository.is_absolute()
             || item.workspace.as_ref().is_some_and(|p| !p.is_absolute())
         {
@@ -608,10 +756,14 @@ fn exclusive(path: &Path) -> Result<Exclusive> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .refuse_at("estate::exclusive")?;
     // SAFETY: the owned file descriptor remains open for the lock lifetime.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(crate::refuse::io(
+            &std::io::Error::last_os_error(),
+            "estate::exclusive",
+        ));
     }
     Ok(Exclusive(file))
 }
@@ -620,11 +772,12 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .refuse_at("estate::hash_file")?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0; 65536];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = file.read(&mut buffer).refuse_at("estate::hash_file")?;
         if count == 0 {
             break;
         }
@@ -647,14 +800,16 @@ fn base_path(corpus: &Path, base: &Base) -> Result<PathBuf> {
 
 fn retained_base(corpus: &Path, base: &Base) -> Result<bool> {
     let path = base_path(corpus, base)?;
-    Ok(path.try_exists()?
+    Ok(path.try_exists().refuse_at("estate::retained_base")?
         && base.identity
-            == crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(path)?))
+            == crate::freshness::StatIdentity::from_metadata(
+                &fs::symlink_metadata(path).refuse_at("estate::retained_base")?,
+            ))
 }
 
 fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result<Base> {
     let record = corpus.join(format!("shared-{group}.base"));
-    if record.try_exists()? {
+    if record.try_exists().refuse_at("estate::prepare_base")? {
         let base: Base = read(&record)?;
         if retained_base(corpus, &base)? {
             return Ok(base);
@@ -666,7 +821,7 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
     let mut generation = 0u64;
     let attempt = loop {
         let attempt = state.join(format!("shared-{group}-{generation}"));
-        if !attempt.try_exists()? {
+        if !attempt.try_exists().refuse_at("estate::prepare_base")? {
             break attempt;
         }
         generation = generation
@@ -680,20 +835,25 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
         blake3::Hash::from_bytes(digest).to_hex()
     );
     let published = corpus.join(&name);
-    if published.try_exists()? {
+    if published.try_exists().refuse_at("estate::prepare_base")? {
         if hash_file(&published)? != digest {
             return Err(BulkloadRefusal::DigestMismatch);
         }
     } else {
-        fs::hard_link(&bundle, &published)?;
+        fs::hard_link(&bundle, &published).refuse_at("estate::prepare_base")?;
     }
     // Git's successful pack write is not a durability guarantee. Flush the
     // payload before write() publishes and directory-syncs its dependency.
-    fs::File::open(&published)?.sync_file_counted()?;
+    fs::File::open(&published)
+        .refuse_at("estate::prepare_base")?
+        .sync_file_counted()
+        .refuse_at("estate::prepare_base")?;
     let base = Base {
         bundle: name,
         digest,
-        identity: crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(published)?),
+        identity: crate::freshness::StatIdentity::from_metadata(
+            &fs::symlink_metadata(published).refuse_at("estate::prepare_base")?,
+        ),
     };
     write(&record, &base)?;
     Ok(base)
@@ -713,6 +873,9 @@ enum Retained {
         bundle: PathBuf,
         started_ns: Option<i128>,
         extends: bool,
+        /// The link this pass may chain onto (WP2), if the retained bundle
+        /// is chainable.
+        chain: Option<Prior>,
     },
     /// Nothing retained.
     None,
@@ -725,7 +888,7 @@ fn retained_capture(
     key: [u8; 32],
     authority: [u8; 32],
 ) -> Result<Retained> {
-    if !record.try_exists()? {
+    if !record.try_exists().refuse_at("estate::retained_capture")? {
         return Ok(Retained::None);
     }
     let previous: Capture = read(record)?;
@@ -733,9 +896,11 @@ fn retained_capture(
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
     let bundle = corpus.join(&previous.bundle);
-    if !bundle.try_exists()?
+    if !bundle.try_exists().refuse_at("estate::retained_capture")?
         || previous.identity
-            != crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(&bundle)?)
+            != crate::freshness::StatIdentity::from_metadata(
+                &fs::symlink_metadata(&bundle).refuse_at("estate::retained_capture")?,
+            )
     {
         return Ok(Retained::None);
     }
@@ -750,8 +915,16 @@ fn retained_capture(
     let settled = recorded
         .as_ref()
         .is_some_and(|recorded| !parts.racy_since(recorded.started_ns, git_carry::pass_start_ns()));
-    if previous.key == key && drift.is_empty() && settled {
-        if git_carry::shared::requires_base(&bundle)? {
+    let chained = prior_sidecar(corpus, &previous.bundle)
+        .try_exists()
+        .refuse_at("estate::retained_capture")?;
+    // A chained bundle is a hit only while its whole chain is retained: a
+    // broken chain recaptures (self-contained) instead of standing as custody
+    // no restore can satisfy.
+    let restorable =
+        !chained || chain_links(corpus, &previous.bundle, LinkBinding::Custody).is_ok();
+    if previous.key == key && drift.is_empty() && settled && restorable {
+        if !chained && git_carry::shared::requires_base(&bundle)? {
             let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
             if !retained_base(corpus, &bound)? {
                 return Err(BulkloadRefusal::ReceiptBindingInvalid);
@@ -763,10 +936,12 @@ fn retained_capture(
         && recorded
             .as_ref()
             .is_some_and(|recorded| recorded.authority == authority);
+    let chain = chainable(corpus, &previous, &bundle)?;
     Ok(Retained::Extend {
         bundle,
         started_ns: recorded.map(|recorded| recorded.started_ns),
         extends,
+        chain,
     })
 }
 
@@ -806,7 +981,10 @@ fn attempt_directory(state: &Path, identity: &str, key: [u8; 32]) -> Result<Path
             "{identity}-{}-{generation}",
             blake3::Hash::from_bytes(key).to_hex()
         ));
-        if !candidate.try_exists()? {
+        if !candidate
+            .try_exists()
+            .refuse_at("estate::attempt_directory")?
+        {
             return Ok(candidate);
         }
         generation = generation
@@ -822,7 +1000,9 @@ fn attempt_directory(state: &Path, identity: &str, key: [u8; 32]) -> Result<Path
 /// history the retained bundle does not hold can make it larger.
 fn estimated_bundle(parts: &git_carry::KeyParts, retained: Option<&Path>) -> Result<u64> {
     let retained = match retained {
-        Some(bundle) => fs::metadata(bundle)?.len(),
+        Some(bundle) => fs::metadata(bundle)
+            .refuse_at("estate::estimated_bundle")?
+            .len(),
         None => 0,
     };
     Ok(parts.census_bytes().max(retained))
@@ -891,6 +1071,20 @@ impl Drop for Reservation<'_, '_> {
     }
 }
 
+// What must hold before an item's key reads its source: it is not a partial
+// clone (S2, WP1 PR 1), and every nest planned as its own item captured in
+// this pass (R-N114). Returns those planned nests.
+fn preflight(
+    item: &Item,
+    owners: &Owners,
+    refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
+) -> Result<Vec<PathBuf>> {
+    git_carry::refuse_partial_clone(&item.source)?;
+    let planned = planned_nests(item, owners);
+    carriers_captured(item, &planned, refused)?;
+    Ok(planned)
+}
+
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
 fn capture_item(
     item: &Item,
@@ -902,10 +1096,10 @@ fn capture_item(
     refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
     space: &CorpusSpace<'_>,
 ) -> Result<Completion> {
+    const SITE: &str = "estate::capture_item";
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
-    let planned = planned_nests(item, owners);
-    carriers_captured(item, &planned, refused)?;
+    let planned = preflight(item, owners, refused)?;
     // The opaque key cannot say what moved. Keep its typed parts so the
     // post-capture re-read can separate tolerable drift from Git authority.
     // The parts carry the nested custody, so a reuse hit names exactly the
@@ -914,7 +1108,7 @@ fn capture_item(
     let nested = nest_lines(item, owners, parts.nested_repositories());
     let key = parts.digest()?;
     let authority = parts.authority()?;
-    let (retained, started_ns, extends) =
+    let (retained, started_ns, extends, link) =
         match retained_capture(&record, corpus, &parts, key, authority)? {
             Retained::Hit => {
                 return Ok(Completion::clean("capture-reused-after-census").naming(nested));
@@ -923,9 +1117,13 @@ fn capture_item(
                 bundle,
                 started_ns,
                 extends,
-            } => (Some(bundle), started_ns, extends),
-            Retained::None => (None, None, false),
+                chain,
+            } => (Some(bundle), started_ns, extends, chain),
+            Retained::None => (None, None, false, None),
         };
+    // WP2: without a plan base, pack only what is new since the retained
+    // capture, by declaring its source-held tips as prerequisites.
+    let (link, chain) = chain_offer(corpus, link, base.is_none())?;
     // #101 (OI-1002-Q11): before this item's export writes a byte, charge its
     // estimated bundle to CORPUS. An item that does not fit refuses
     // DESTINATION_SPACE_INSUFFICIENT as its own receipt; the pass goes on.
@@ -937,7 +1135,7 @@ fn capture_item(
         .then_some(git_carry::ReuseUnavailable::FutureStamp);
     let attempt = attempt_directory(state, &identity, key)?;
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
-    let export = git_carry::export_repository_with_drift(
+    let export = match git_carry::export_repository_with_custody(
         &item.source,
         &attempt,
         &git_carry::ExportOptions {
@@ -945,8 +1143,14 @@ fn capture_item(
             policy,
             reuse,
             planned: &planned,
+            chain: chain.as_deref(),
         },
-    )?;
+    )? {
+        git_carry::Exported::Captured(export) => *export,
+        git_carry::Exported::ObjectStoreRewritten(drift) => {
+            return Ok(Completion::deferred(&drift, nested))
+        }
+    };
     // The export's own census must name the nests the key did: a nest that
     // moved between the key and the export's snapshot is authority (B4).
     if export.nested_repositories != parts.nested_repositories() {
@@ -977,6 +1181,7 @@ fn capture_item(
         // Publish dependency custody before the unchanged completion codec.
         write(&corpus.join(format!("{name}.base")), base)?;
     }
+    publish_prior(corpus, &name, link.as_ref(), export.chained)?;
     // Separate sidecars, exactly as the shared-base dependency is: the Capture
     // postcard is positional and gains no field, so every retained record and
     // every live restore journal still decodes. This sidecar can be a superset
@@ -1007,27 +1212,23 @@ fn capture_item(
     )?;
     #[cfg(test)]
     git_carry::mid_pass::fire(
-        &fs::canonicalize(&item.source)?,
+        &fs::canonicalize(&item.source).refuse_at(SITE)?,
         git_carry::mid_pass::Stage::RecordWritten,
     );
-    if drift.is_empty() && drift_sidecar.try_exists()? {
+    if drift.is_empty() && drift_sidecar.try_exists().refuse_at(SITE)? {
         // A clean pass can reproduce a drifted pass's bundle byte for byte
         // when the drift lay only before the export's snapshot. Retire the
         // stale record only after the clean completion is durable: a crash in
         // between leaves the capture drifted, which costs one more pass and
         // never a stale reuse.
-        fs::remove_file(&drift_sidecar)?;
-        fs::File::open(corpus)?.sync_dir_counted()?;
+        fs::remove_file(&drift_sidecar).refuse_at(SITE)?;
+        fs::File::open(corpus)
+            .refuse_at(SITE)?
+            .sync_dir_counted()
+            .refuse_at(SITE)?;
     }
-    let outcome = if !drift.is_empty() {
-        "captured-with-drift"
-    } else if extends {
-        "capture-extended-from-drift"
-    } else {
-        "captured"
-    };
     Ok(Completion {
-        outcome,
+        outcome: captured_outcome(&drift, extends),
         drift: drift.lines(),
         bytes_read: export.bytes_read,
         reuse_unavailable: unrecorded
@@ -1036,6 +1237,67 @@ fn capture_item(
             .map(git_carry::ReuseUnavailable::code),
         nested,
     })
+}
+
+// The receipt outcome of a capture that exported: any drift wins, then a
+// clean pass that extended a drifted capture, then a plain capture.
+const fn captured_outcome(drift: &git_carry::CaptureDrift, extends: bool) -> &'static str {
+    if !drift.is_empty() {
+        "captured-with-drift"
+    } else if extends {
+        "capture-extended-from-drift"
+    } else {
+        "captured"
+    }
+}
+
+// Where a chain link's bundle lives in the corpus.
+fn link_path(corpus: &Path, link: &Prior) -> Result<PathBuf> {
+    base_path(
+        corpus,
+        &Base {
+            bundle: link.bundle.clone(),
+            digest: link.digest,
+            identity: link.identity,
+        },
+    )
+}
+
+// The link a capture chains onto and its corpus path: none under a plan base.
+fn chain_offer(
+    corpus: &Path,
+    link: Option<Prior>,
+    unbased: bool,
+) -> Result<(Option<Prior>, Option<PathBuf>)> {
+    let link = link.filter(|_| unbased);
+    let path = link
+        .as_ref()
+        .map(|link| link_path(corpus, link))
+        .transpose()?;
+    Ok((link, path))
+}
+
+// The chain link of a capture's bundle, durable before its record names it
+// (WP2), as `.base` is for a shared plan base.
+fn publish_prior(corpus: &Path, name: &str, link: Option<&Prior>, chained: bool) -> Result<()> {
+    match (link, chained) {
+        (Some(link), true) => {
+            // Identical bundle bytes declare identical prerequisites, so an
+            // intact chain already recorded for this name stands as it is.
+            let sidecar = prior_sidecar(corpus, name);
+            if !(sidecar.try_exists().refuse_at("estate::publish_prior")?
+                && chain_links(corpus, name, LinkBinding::Custody).is_ok())
+            {
+                if link.bundle == name {
+                    return Err(BulkloadRefusal::ContractSelfInconsistent);
+                }
+                write(&sidecar, link)?;
+            }
+            Ok(())
+        }
+        (None, true) => Err(BulkloadRefusal::ContractSelfInconsistent),
+        (_, false) => Ok(()),
+    }
 }
 
 // Publish an exported bundle into the corpus under its content name, durable
@@ -1051,17 +1313,20 @@ fn publish_bundle(
         blake3::Hash::from_bytes(digest).to_hex()
     );
     let published = corpus.join(&name);
-    if published.try_exists()? {
+    if published.try_exists().refuse_at("estate::publish_bundle")? {
         if hash_file(&published)? != digest {
             return Err(BulkloadRefusal::DigestMismatch);
         }
     } else {
-        fs::hard_link(bundle, &published)?;
+        fs::hard_link(bundle, &published).refuse_at("estate::publish_bundle")?;
     }
     // Completion may survive a crash only after its bundle bytes are durable.
     // Counted, as main counts every sync (#57).
-    fs::File::open(&published)?.sync_file_counted()?;
-    let metadata = fs::symlink_metadata(&published)?;
+    fs::File::open(&published)
+        .refuse_at("estate::publish_bundle")?
+        .sync_file_counted()
+        .refuse_at("estate::publish_bundle")?;
+    let metadata = fs::symlink_metadata(&published).refuse_at("estate::publish_bundle")?;
     Ok((name, digest, metadata))
 }
 
@@ -1332,7 +1597,10 @@ fn import_base(
     let path = base_path(corpus, &base)?;
     // Existing shared repositories are the supported optimization. Creating a
     // standalone destination needs a separate private preseed implementation.
-    if !item.repository.try_exists()?
+    if !item
+        .repository
+        .try_exists()
+        .refuse_at("estate::import_base")?
         || item
             .workspace
             .as_ref()
@@ -1372,7 +1640,7 @@ fn apply_item(
     let record = corpus.join(format!("{identity}.capture"));
     // Round 4 N5: an item whose capture refused has no record. That is a
     // typed refusal, never a bare IO errno.
-    if !record.try_exists()? {
+    if !record.try_exists().refuse_at("estate::apply_item")? {
         return Err(BulkloadRefusal::SealedObjectMissing);
     }
     let captured: Capture = read(&record)?;
@@ -1391,7 +1659,7 @@ fn apply_item(
     // applies. R-N29 (apply proceeds on an occupied destination, recording
     // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
     let journal = journal_path(state, &identity, source, &captured.digest);
-    if journal.try_exists()? {
+    if journal.try_exists().refuse_at("estate::apply_item")? {
         let done: String = read(&journal)?;
         let outcome = match done.as_str() {
             "workspace-restored" => "previous-workspace-restoration-not-revalidated",
@@ -1408,7 +1676,7 @@ fn apply_item(
     // R5-4: a carrier bundle the record names but the corpus no longer holds
     // is a typed refusal, never a bare IO errno.
     let published = corpus.join(&captured.bundle);
-    if !published.try_exists()? {
+    if !published.try_exists().refuse_at("estate::apply_item")? {
         return Err(BulkloadRefusal::SealedObjectMissing);
     }
     let staged = git_carry::stage_bundle(&published).map_err(|error| {
@@ -1421,7 +1689,20 @@ fn apply_item(
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
-    import_base(item, &captured, staged.path(), corpus, source, imported)?;
+    // WP2: a chained capture restores from its verified, flattened chain; a
+    // capture on a shared plan base imports that base first.
+    let staged = if prior_sidecar(corpus, &captured.bundle)
+        .try_exists()
+        .refuse_at("estate::apply_item")?
+    {
+        git_carry::chain::flatten(
+            staged,
+            &chain_links(corpus, &captured.bundle, LinkBinding::Digest)?,
+        )?
+    } else {
+        import_base(item, &captured, staged.path(), corpus, source, imported)?;
+        staged
+    };
     let outcome = if let Some(workspace) = &item.workspace {
         if item.repository == *workspace {
             git_carry::restore_staged(&staged, workspace, source, None)?;
@@ -1520,7 +1801,7 @@ pub fn repair_missing_index(
     private_directory(ledger.state)?;
     let _lock = exclusive(&ledger.state.join("estate.lock"))?;
     let contents: Plan = read(ledger.plan)?;
-    let canonical = fs::canonicalize(repository)?;
+    let canonical = fs::canonicalize(repository).refuse_at("estate::repair_missing_index")?;
     let mut bound = None;
     let result =
         git_carry::repair_missing_index_bound(bundle, repository, source, receipt, |digest| {
@@ -1536,14 +1817,20 @@ pub fn repair_missing_index(
         Ok(()) => {
             // Durability order: the index is published and synced, then the
             // journal, then the outcome record that names it.
-            if !journal.try_exists()? {
+            if !journal
+                .try_exists()
+                .refuse_at("estate::repair_missing_index")?
+            {
                 write(&journal, &"refs-imported".to_owned())?;
             }
             write(&outcome, &(&item.source, INDEX_REPAIRED, &None::<String>))?;
             Ok(())
         }
         Err(refusal) => {
-            if !journal.try_exists()? {
+            if !journal
+                .try_exists()
+                .refuse_at("estate::repair_missing_index")?
+            {
                 write(
                     &outcome,
                     &(&item.source, "refused", &Some(refusal.to_string())),
@@ -1627,9 +1914,9 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
     let mut records = std::collections::BTreeMap::<String, Record>::new();
     let mut journals = std::collections::BTreeSet::<String>::new();
     for state in states {
-        for entry in fs::read_dir(state)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+        for entry in fs::read_dir(state).refuse_at("estate::ledger")? {
+            let entry = entry.refuse_at("estate::ledger")?;
+            if !entry.file_type().refuse_at("estate::ledger")?.is_file() {
                 continue;
             }
             let name = entry.file_name();
@@ -1659,7 +1946,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         }
         let record_path = corpus.join(format!("{identity}.capture"));
         let mut capture = None;
-        let journal = if !record_path.try_exists()? {
+        let journal = if !record_path.try_exists().refuse_at("estate::ledger")? {
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
             capture = Some(
@@ -1722,16 +2009,30 @@ type ItemSpace = (Vec<(PathBuf, u64)>, u64);
 fn item_space(item: &Item, corpus: &Path, state: &Path, source: &str) -> Result<Option<ItemSpace>> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
-    if !record.try_exists()? {
+    if !record.try_exists().refuse_at("estate::item_space")? {
         return Ok(None);
     }
     let captured: Capture = read(&record)?;
     if !filename(&captured.bundle)
-        || journal_path(state, &identity, source, &captured.digest).try_exists()?
+        || journal_path(state, &identity, source, &captured.digest)
+            .try_exists()
+            .refuse_at("estate::item_space")?
     {
         return Ok(None);
     }
-    let bundle = fs::metadata(corpus.join(&captured.bundle))?.len();
+    // A chained capture lands its whole chain's objects (WP2).
+    let bundle = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?
+        .iter()
+        .try_fold(
+            fs::metadata(corpus.join(&captured.bundle))
+                .refuse_at("estate::item_space")?
+                .len(),
+            |total, (link, _)| {
+                Ok::<_, BulkloadRefusal>(
+                    total.saturating_add(fs::metadata(link).refuse_at("estate::item_space")?.len()),
+                )
+            },
+        )?;
     // Objects land in the repository; a checkout lands in the workspace.
     // For a linked worktree those are two places, possibly two filesystems.
     let mut writes = vec![(item.repository.clone(), bundle)];
@@ -1762,7 +2063,10 @@ fn space_plan(
     let mut by_device = std::collections::BTreeMap::<u64, (PathBuf, u64)>::new();
     let locate = |path: &Path| -> Result<(u64, PathBuf)> {
         let probe = crate::space::existing_ancestor(path)?;
-        Ok((fs::metadata(&probe)?.dev(), probe))
+        Ok((
+            fs::metadata(&probe).refuse_at("estate::space_plan")?.dev(),
+            probe,
+        ))
     };
     let mut staged = Vec::new();
     for item in &plan.items {
@@ -1826,7 +2130,7 @@ pub fn apply(
         // already there, that is a collision the restore refuses by type
         // (R-N114), not Git administration to serialise on.
         let standalone = item.workspace.as_ref() == Some(&item.repository);
-        let common = if !standalone && item.repository.try_exists()? {
+        let common = if !standalone && item.repository.try_exists().refuse_at("estate::apply")? {
             git_carry::common_repository(&item.repository)?
         } else {
             item.repository.clone()
@@ -2291,6 +2595,118 @@ mod tests {
             fs::write(inside.join("appeared"), b"new seat").unwrap();
             git(&inside, &["update-ref", "refs/heads/lane-a", "HEAD"]);
         });
+    }
+
+    // WP1 PR 1 (S2): a partial-clone item refuses as its own typed receipt
+    // before its key reads anything, and no capture record is written.
+    #[test]
+    fn a_partial_clone_item_refuses_before_its_key_reads_it() {
+        let (root, origin, _, _, corpus) = drifting_plan("partial");
+        git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+        let clone = root.join("clone");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--template=",
+                "--no-checkout",
+                "--filter=blob:none",
+                &format!("file://{}", origin.display()),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let plan = root.join("partial-plan");
+        add(&plan, &clone, &root.join("partial-destination"), None).unwrap();
+        let state = root.join("state");
+        let rows = Mutex::new(Vec::new());
+        let result = capture(&plan, &state, &corpus, 1, &|row| {
+            rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err(), "a refused item fails the pass");
+        assert_eq!(
+            rows.into_inner().unwrap(),
+            vec![("refused", Some("GIT_SOURCE_PARTIAL_CLONE".to_owned()))]
+        );
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        assert!(!corpus.join(format!("{item}.capture")).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // WP1 PR 4 (S5, arch 8): a lane deletes a branch and prunes under the
+    // pass. The private repository reads the source through `alternates`, so
+    // its bundle child fails on the pruned commit; the pack listing moved, so
+    // the item is drift custody, not a refusal, and the next pass captures.
+    #[test]
+    fn an_object_store_rewrite_under_the_pass_is_drift_custody() {
+        let (root, source, _, plan, corpus) = drifting_plan("object-store");
+        git(&source, &["checkout", "-q", "-b", "doomed"]);
+        fs::write(source.join("doomed-only"), b"reachable only from doomed").unwrap();
+        git(&source, &["add", "doomed-only"]);
+        git(&source, &["commit", "-q", "-m", "doomed"]);
+        git(&source, &["checkout", "-q", "-"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm(&source, move || {
+            git(&inside, &["branch", "-D", "doomed"]);
+            git(&inside, &["reflog", "expire", "--expire=now", "--all"]);
+            git(&inside, &["repack", "-a", "-d", "-q"]);
+            git(&inside, &["prune", "--expire=now"]);
+        });
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).expect("Ok(()): custody, not a refusal");
+        assert_eq!(rows.len(), 1);
+        let (outcome, reason, drift, _) = rows.first().unwrap();
+        assert_eq!(*outcome, "deferred-with-drift");
+        assert_eq!(reason.as_deref(), Some("drift=1"));
+        assert_eq!(
+            *drift,
+            vec!["ObjectStoreRewritten \"objects/pack\"".to_owned()]
+        );
+        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
+        assert!(!corpus.join(format!("{item}.capture")).exists());
+        // The next pass sees the rewritten store and captures it clean.
+        let second = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(second.first().unwrap().0, "captured");
+        assert!(corpus.join(format!("{item}.capture")).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // WP1 PR 4: the same failure with an unchanged pack listing is not a
+    // rewrite, and keeps its refusal. Since WP3 PR 2 that refusal is the
+    // bundle child's own GIT_CHILD_FAILED with its stderr class (the pruned
+    // commit is a bad object), the refusal custody absorbs only under a moved
+    // listing.
+    #[test]
+    fn a_git_child_failure_without_a_rewrite_still_refuses() {
+        let (root, source, _, plan, corpus) = drifting_plan("no-rewrite");
+        git(&source, &["checkout", "-q", "-b", "doomed"]);
+        fs::write(source.join("doomed-only"), b"reachable only from doomed").unwrap();
+        git(&source, &["add", "doomed-only"]);
+        git(&source, &["commit", "-q", "-m", "doomed"]);
+        git(&source, &["checkout", "-q", "-"]);
+        let inside = fs::canonicalize(&source).unwrap();
+        git_carry::mid_pass::arm(&source, move || {
+            // Prune the loose commit without touching `objects/pack`.
+            git(&inside, &["branch", "-D", "doomed"]);
+            git(&inside, &["reflog", "expire", "--expire=now", "--all"]);
+            git(&inside, &["prune", "--expire=now"]);
+        });
+        let state = root.join("state");
+        let rows = Mutex::new(Vec::new());
+        let result = capture(&plan, &state, &corpus, 1, &|row| {
+            rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            rows.into_inner().unwrap(),
+            vec![(
+                "refused",
+                Some("GIT_CHILD_FAILED stderr_class=bad_object".to_owned())
+            )]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4332,5 +4748,486 @@ mod closure_lane_20261002 {
             .unwrap();
         assert_eq!(classify(&entry), Disposition::Applied);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// WP2 PR 2: auto-prerequisite chains (OI-1003-Q15, R-N13).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod wp2_chain {
+    use super::*;
+    use std::process::Command;
+
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Bulkload test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_nanos(
+            u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
+        ));
+    }
+
+    const CHAIN_HISTORY: usize = 64 * 1024;
+
+    // Incompressible, so a re-packed history is visible in a bundle's size.
+    fn chain_noise(len: usize, mut state: u32) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    struct ChainFixture {
+        root: PathBuf,
+        source: PathBuf,
+        target: PathBuf,
+        plan: PathBuf,
+        state: PathBuf,
+        corpus: PathBuf,
+    }
+
+    impl Drop for ChainFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn chain_fixture(name: &str) -> ChainFixture {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tcfs-estate-chain-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template=", "-b", "main"]);
+        fs::write(source.join("history"), chain_noise(CHAIN_HISTORY, 11)).unwrap();
+        fs::write(source.join("file-0"), b"base").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "base"]);
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        ChainFixture {
+            state: root.join("state"),
+            corpus: root.join("corpus"),
+            source,
+            target,
+            plan,
+            root,
+        }
+    }
+
+    fn chain_record(fixture: &ChainFixture) -> Capture {
+        let item = inspect(&fixture.plan).unwrap().remove(0);
+        read(
+            &fixture
+                .corpus
+                .join(format!("{}.capture", id(&item).unwrap())),
+        )
+        .unwrap()
+    }
+
+    // 0 for a self-contained bundle, else one more than its prior's depth.
+    fn chain_depth(corpus: &Path, bundle: &str) -> u32 {
+        let sidecar = prior_sidecar(corpus, bundle);
+        if sidecar.exists() {
+            read::<Prior>(&sidecar).unwrap().depth + 1
+        } else {
+            0
+        }
+    }
+
+    fn heads(bundle: &Path) -> Vec<String> {
+        let listed = Command::new("git")
+            .args(["bundle", "list-heads"])
+            .arg(bundle)
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let mut lines: Vec<String> = String::from_utf8(listed.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    fn head_of(repo: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[derive(Debug, Clone)]
+    enum ChainStep {
+        Commit(u8, u32),
+        Branch(u8),
+        Untracked(u32),
+        Stage(u8, u32),
+    }
+
+    fn chain_step() -> impl proptest::strategy::Strategy<Value = ChainStep> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0u8..3, any::<u32>()).prop_map(|(file, seed)| ChainStep::Commit(file, seed)),
+            (0u8..2).prop_map(ChainStep::Branch),
+            any::<u32>().prop_map(ChainStep::Untracked),
+            (0u8..3, any::<u32>()).prop_map(|(file, seed)| ChainStep::Stage(file, seed)),
+        ]
+    }
+
+    fn apply_step(source: &Path, step: &ChainStep) {
+        match step {
+            ChainStep::Commit(file, seed) => {
+                let name = format!("file-{file}");
+                fs::write(source.join(&name), format!("commit {seed}")).unwrap();
+                git(source, &["add", &name]);
+                git(source, &["commit", "--allow-empty", "-m", "step"]);
+            }
+            ChainStep::Branch(lane) => {
+                git(source, &["branch", "-f", &format!("lane-{lane}"), "HEAD"]);
+            }
+            ChainStep::Untracked(seed) => {
+                fs::write(source.join("notes"), format!("untracked {seed}")).unwrap();
+            }
+            ChainStep::Stage(file, seed) => {
+                let name = format!("file-{file}");
+                fs::write(source.join(&name), format!("staged {seed}")).unwrap();
+                git(source, &["add", &name]);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(crate::test_support::prop_config(6))]
+
+        /// P-CHAIN (WP2, S3 + S4): ∀ sequences of commits, branch moves,
+        /// staged and untracked edits, each followed by a capture:
+        /// - every rerun chains on the retained capture and never re-packs
+        ///   the incompressible history blob (its bundle stays far smaller);
+        /// - the chain only grows by one per changed pass (bounded depth);
+        /// - the flattened chain advertises exactly the refs a standalone
+        ///   capture of the same state advertises;
+        /// - apply restores the source's HEAD and bytes from the chain.
+        #[test]
+        fn a_capture_chain_packs_only_what_is_new_and_restores_exactly(
+            steps in proptest::collection::vec(chain_step(), 1..=4)
+        ) {
+            let fixture = chain_fixture("prop");
+            capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| Ok(())).unwrap();
+            let first = chain_record(&fixture);
+            proptest::prop_assert_eq!(chain_depth(&fixture.corpus, &first.bundle), 0);
+            let full = fs::metadata(fixture.corpus.join(&first.bundle)).unwrap().len();
+            proptest::prop_assert!(full >= CHAIN_HISTORY as u64);
+            let mut previous = (first.bundle, 0u32);
+            for step in &steps {
+                apply_step(&fixture.source, step);
+                capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| Ok(())).unwrap();
+                let record = chain_record(&fixture);
+                let depth = chain_depth(&fixture.corpus, &record.bundle);
+                if record.bundle == previous.0 {
+                    // Byte-identical to the retained bundle: same custody.
+                    proptest::prop_assert_eq!(depth, previous.1);
+                } else {
+                    proptest::prop_assert_eq!(depth, previous.1 + 1, "{:?}", step);
+                }
+                let size = fs::metadata(fixture.corpus.join(&record.bundle)).unwrap().len();
+                proptest::prop_assert!(
+                    size < (CHAIN_HISTORY / 4) as u64,
+                    "a chained bundle re-packed history: {} bytes after {:?}", size, step
+                );
+                previous = (record.bundle, depth);
+            }
+            let head = fixture.corpus.join(&previous.0);
+            let flat = git_carry::chain::flatten(
+                git_carry::stage_bundle(&head).unwrap(),
+                &chain_links(&fixture.corpus, &previous.0, LinkBinding::Digest).unwrap(),
+            )
+            .unwrap();
+            let standalone = git_carry::export_repository_with_policy(
+                &fixture.source,
+                &fixture.root.join("standalone"),
+                None,
+                git_carry::CapturePolicy::default(),
+            )
+            .unwrap();
+            proptest::prop_assert_eq!(heads(flat.path()), heads(&standalone.bundle));
+            proptest::prop_assert_eq!(heads(flat.path()), heads(&head));
+            apply(&fixture.plan, &fixture.corpus, &fixture.root.join("applied"), "neo", 1, &|_| Ok(())).unwrap();
+            proptest::prop_assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+            for name in ["history", "file-0", "file-1", "file-2", "notes"] {
+                let expected = fs::read(fixture.source.join(name)).ok();
+                proptest::prop_assert_eq!(fs::read(fixture.target.join(name)).ok(), expected, "{}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_chain_re_bases_at_the_depth_limit() {
+        let fixture = chain_fixture("limit");
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let mut depths = vec![chain_depth(&fixture.corpus, &chain_record(&fixture).bundle)];
+        for pass in 0..=git_carry::chain::CHAIN_DEPTH_LIMIT {
+            apply_step(&fixture.source, &ChainStep::Commit(0, pass));
+            capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+                Ok(())
+            })
+            .unwrap();
+            depths.push(chain_depth(&fixture.corpus, &chain_record(&fixture).bundle));
+        }
+        // 0 (first), 1..=LIMIT chained, then a self-contained re-base.
+        let mut expected: Vec<u32> = (0..=git_carry::chain::CHAIN_DEPTH_LIMIT).collect();
+        expected.push(0);
+        assert_eq!(depths, expected);
+        let record = chain_record(&fixture);
+        assert!(!git_carry::shared::requires_base(&fixture.corpus.join(&record.bundle)).unwrap());
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+    }
+
+    #[test]
+    fn a_broken_chain_refuses_apply_by_type_and_the_next_capture_re_bases() {
+        let fixture = chain_fixture("broken");
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let root = chain_record(&fixture).bundle;
+        apply_step(&fixture.source, &ChainStep::Commit(1, 7));
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let chained = chain_record(&fixture).bundle;
+        assert_eq!(chain_depth(&fixture.corpus, &chained), 1);
+        let held = fixture.root.join("held-root");
+        fs::rename(fixture.corpus.join(&root), &held).unwrap();
+        let reasons = Mutex::new(Vec::new());
+        assert!(apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|row| {
+                reasons.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            *reasons.lock().unwrap(),
+            vec![Some(BulkloadRefusal::SealedObjectMissing.to_string())]
+        );
+        assert!(
+            !fixture.target.exists(),
+            "nothing is restored from a broken chain"
+        );
+        // The chained record is no longer a hit: the next pass writes a
+        // self-contained bundle, which applies.
+        settle();
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let rebased = chain_record(&fixture).bundle;
+        assert_ne!(rebased, chained);
+        assert_eq!(chain_depth(&fixture.corpus, &rebased), 0);
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied-2"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+    }
+
+    #[test]
+    fn a_replaced_chain_link_refuses_by_type() {
+        let fixture = chain_fixture("replaced");
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let root = chain_record(&fixture).bundle;
+        apply_step(&fixture.source, &ChainStep::Commit(2, 9));
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let chained = chain_record(&fixture).bundle;
+        // Same bytes, new inode: the recorded identity no longer matches.
+        let path = fixture.corpus.join(&root);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            chain_links(&fixture.corpus, &chained, LinkBinding::Custody).err(),
+            Some(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        // Capture never extends or reuses it, but the bytes are the recorded
+        // ones, so restore (bound by name and digest) still applies.
+        assert!(chain_links(&fixture.corpus, &chained, LinkBinding::Digest).is_ok());
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+    }
+
+    // A chained capture of `fixture` (depth 1), with its corpus copied as
+    // `pull` copies one to the apply host: every file a new inode, and a new
+    // ctime, so no link sits at its recorded `StatIdentity`.
+    fn chained_and_pulled(fixture: &ChainFixture) -> (String, String, PathBuf) {
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let root = chain_record(fixture).bundle;
+        apply_step(&fixture.source, &ChainStep::Commit(1, 5));
+        capture(&fixture.plan, &fixture.state, &fixture.corpus, 1, &|_| {
+            Ok(())
+        })
+        .unwrap();
+        let chained = chain_record(fixture).bundle;
+        assert_eq!(chain_depth(&fixture.corpus, &chained), 1);
+        let pulled = fixture.root.join("pulled");
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(&fixture.corpus)
+            .arg(&pulled)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        (root, chained, pulled)
+    }
+
+    /// R-N72 restore custody: a chain captured on one host applies from a
+    /// pulled copy of its corpus on another. Links bind by name and digest
+    /// at apply; the capture-side identity check refuses only the reuse.
+    #[test]
+    fn a_chained_capture_applies_from_a_pulled_corpus() {
+        let fixture = chain_fixture("pulled");
+        let (_, chained, pulled) = chained_and_pulled(&fixture);
+        assert_eq!(
+            chain_links(&pulled, &chained, LinkBinding::Custody).err(),
+            Some(BulkloadRefusal::ReceiptBindingInvalid),
+            "the copy must move every link off its recorded identity"
+        );
+        // The space preflight charges the whole chain from the copy, too.
+        let item = inspect(&fixture.plan).unwrap().remove(0);
+        let (_, charged) = item_space(&item, &pulled, &fixture.root.join("applied"), "neo")
+            .unwrap()
+            .expect("the pulled chained capture is pending");
+        assert!(charged > fs::metadata(pulled.join(&chained)).unwrap().len());
+        let reasons = Mutex::new(Vec::new());
+        apply(
+            &fixture.plan,
+            &pulled,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|row| {
+                reasons.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*reasons.lock().unwrap(), vec![None]);
+        assert_eq!(head_of(&fixture.target), head_of(&fixture.source));
+        for name in ["history", "file-0", "file-1"] {
+            assert_eq!(
+                fs::read(fixture.target.join(name)).unwrap(),
+                fs::read(fixture.source.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Digest binding is still binding: a pulled link whose bytes are not
+    /// the recorded ones refuses `DIGEST_MISMATCH` and restores nothing.
+    #[test]
+    fn a_pulled_chain_link_with_other_bytes_refuses_by_type() {
+        let fixture = chain_fixture("pulled-tampered");
+        let (root, _, pulled) = chained_and_pulled(&fixture);
+        let link = pulled.join(&root);
+        let mut bytes = fs::read(&link).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&link, bytes).unwrap();
+        let reasons = Mutex::new(Vec::new());
+        assert!(apply(
+            &fixture.plan,
+            &pulled,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|row| {
+                reasons.lock().unwrap().push(row.reason.clone());
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            *reasons.lock().unwrap(),
+            vec![Some(BulkloadRefusal::DigestMismatch.to_string())]
+        );
+        assert!(!fixture.target.exists(), "nothing is restored");
     }
 }

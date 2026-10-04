@@ -4,6 +4,7 @@ members = [
     "crates/bulkload-proto",
     "crates/bulkload-agent",
     "crates/bulkload-bench",
+    "crates/bulkload-handoff",
 ]
 
 [workspace.package]

@@ -20,6 +20,7 @@
 //! closes and commits whatever is pending, so an interrupted transfer keeps
 //! the work it finished.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::File;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -293,7 +294,8 @@ impl<S: GroupSink> Committer<S> {
         let shared = Failure::clone(&failure);
         let handle = std::thread::Builder::new()
             .name("bulkload-commit".to_owned())
-            .spawn(move || run(sink, &receiver, limits, &shared))?;
+            .spawn(move || run(sink, &receiver, limits, &shared))
+            .refuse_at("io::durable::spawn_with")?;
         Ok(Self {
             sender: Some(sender),
             handle: Some(handle),
@@ -343,14 +345,15 @@ impl<S: GroupSink> Committer<S> {
     /// Commit everything pending, stop the thread and return its report.
     ///
     /// # Errors
-    /// Refuses if the committer thread panicked.
+    /// Refuses [`BulkloadRefusal::WorkerLost`] if the committer thread
+    /// panicked.
     pub fn finish(mut self) -> Result<S::Report> {
         drop(self.sender.take());
         self.handle
             .take()
-            .ok_or(BulkloadRefusal::Io(None))?
+            .ok_or(BulkloadRefusal::WorkerLost)?
             .join()
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     }
 }
 

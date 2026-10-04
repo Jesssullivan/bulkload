@@ -20,6 +20,14 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   current capture and SOURCE says `workspace-restored`.
 - `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
   cause and does not close an item.
+
+  Refusal codes stay typed at the source (WP3, 2026-10-03). Every taxonomy
+  code is raised by product code, never kept as unused vocabulary. A Git
+  child that exits non-zero refuses `GIT_CHILD_FAILED` with a
+  `stderr_class=` from a closed set; its stderr is classified, never echoed
+  or kept (R-N121). No blanket conversion turns an OS or codec error into a
+  refusal: each site names itself with `.refuse_at(site)`. The sites that
+  still raise a bare `IO` with no errno are an allowlist that only shrinks.
 - `referenced-only`: the item plans no workspace, and the exact
   current-capture journal says `refs-imported`. `git-repair-missing-index`
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
@@ -59,6 +67,23 @@ or listing an item twice, refuses.
 Both hosts stay usable. Bulkload never signals sessions, never requires a
 stillness pair and never requires writers to pause.
 
+Source safety (S2, WP1):
+
+- Every Git child is built from one hardening table (`git_carry::git_env`):
+  no hooks, fsmonitor, automatic gc or maintenance, optional locks, lazy
+  fetch, system or global config, or replace objects; the C locale; and a
+  discovery ceiling at the given path's parent. The estimate's remote probe
+  is tested against the same table.
+- A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
+  read, in `git-export` and `estate-capture`.
+- Source-side verbs (`serve`, `estate-capture`, `snapshot`,
+  `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
+  priority before anything else (WP0(f)), inherited by every thread and
+  child. `--priority=normal` is the explicit, recorded opt-out; every
+  counters line and the bench header record the class.
+- `serve` and `copy` refuse a private state root that overlaps the source
+  (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
 paths. Import preserves divergence and leaves active HEADs, indexes and
@@ -80,6 +105,16 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
+- An object-store rewrite is drift too (WP1, S5). The export reads the
+  source's pack listing with its authority; when a Git child of the pass
+  fails and that listing has changed (a `gc`, `repack` or `prune` racing
+  the pass through the private repository's `alternates`), the item is
+  `deferred-with-drift` with one `ObjectStoreRewritten` row, no capture
+  record is written, and the next pass captures the rewritten store. The
+  child's failure is the one a failed v1 Git child raises,
+  `GIT_CHILD_FAILED` with its stderr class (WP3), or
+  `GIT_INVENTORY_MALFORMED` for output that did not parse; the same failure
+  under an unchanged listing still refuses.
 - The pass window runs from the pre-pass key to the post-pass key, not only
   across the export's own snapshot. A capture is clean only when the
   pre-pass key parts, the export's own before and after ref inventories, and
@@ -139,6 +174,33 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   guard. The next capture pass extends it (`capture-extended-from-drift`).
   R-N29 (apply proceeds on an occupied destination, recording uncaptured
   seats) is deferred to W6 git carry v2 (bulkload#48).
+- Auto-prerequisite chains (WP2, OI-1003-Q15, 2026-10-03). Without a shared
+  plan base, a capture that follows a retained capture of the same checkout
+  declares that capture's tips as its bundle prerequisites, so it packs only
+  what is new since then instead of re-packing all history. Only tips whose
+  commits the source object store holds qualify; the capture's own metadata
+  commits never do, so every link stays fetchable wherever the source is an
+  alternate, and a pruned tip only means a larger pack. The `{bundle}.prior`
+  sidecar (durable before the record) names the predecessor by name, digest,
+  stat identity and chain depth. Depth is bounded by
+  `git_carry::chain::CHAIN_DEPTH_LIMIT` (8): the capture after a depth-8
+  bundle re-bases to a self-contained one. Estate apply verifies the chain
+  (every link retained under its recorded name and digest, depths falling by
+  one to a self-contained root, every prerequisite satisfied) and restores
+  from one flattened bundle whose refs must equal the head bundle's. Apply
+  never binds a link by stat identity: a corpus pulled to the apply host
+  gives every file a new device, inode and ctime, exactly as the shared
+  `.base` import binds by digest only (R-N72). Capture-side reuse and
+  chaining do require the recorded identity, so a link replaced in place is
+  never extended. A missing link refuses `SEALED_OBJECT_MISSING`, a link
+  with other bytes `DIGEST_MISMATCH`, inconsistent depths
+  `RECEIPT_BINDING_INVALID`, and a broken chain is never a reuse hit: the
+  next capture re-bases. The tip query runs through the estimate's hardened
+  source wrapper, and every stdin-fed git child drains its answer while its
+  requests are written, so a prior with thousands of refs cannot hang a
+  capture on a full pipe. The capture counters
+  (`write_source_pack_bytes`, `write_source_pack_objects`,
+  `read_source_pack_readback_bytes`, `census_walks`) measure it.
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
@@ -277,6 +339,28 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
+- **Rows from before the racy guard.** A store created by this engine
+  carries a `racy_guard` marker from its first commit. A store without it was
+  written before #86, so none of its ledger or output rows is proven
+  non-racy. The first writable open deletes every `captures` and `outputs`
+  row in the transaction that adds the marker, and counts them in
+  `transfer_legacy_rows_invalidated`; a read-only handle on an unmarked store
+  serves none of them. Each such seat is read from the source once more,
+  which R25 allows (its row cannot show it was not racy), and recorded under
+  the guard; chunk hints are kept, so content the destination still holds is
+  adopted after verification and never crosses the wire again (#125). The
+  single migration run (OI-1002-Q24) may therefore start from existing
+  pre-migration state.
+- **Known limit: clocks.** The racy predicate compares the source
+  filesystem's mtime and ctime with the capturing host's wall clock, as in
+  the Git carry. Destinations are local filesystems (OI-1001-Q17), but a
+  source may not be: a source on NFS or SMB whose server clock runs behind
+  the capturing host by more than the 2 s allowance can stamp a rewrite made
+  during a capture earlier than the window, and the guard cannot see it; a
+  server clock running ahead only makes more captures racy (fail-closed).
+  Bulkload never writes into a source to read its filesystem's clock. Keep
+  network-mounted sources NTP-synchronised with the capturing host, or carry
+  them from a host where they are local.
 - **Held.** The destination answers every `End` with `Held`. A capture is
   committed to the ledger only when the destination holds its bytes
   durably: `Held{true}` is sent once the output's group commit has
@@ -289,9 +373,18 @@ miss (#87).
   `Held{false}`: neither store records them, the session finishes with the
   refusals, and the next run reads them once (#100). The sweep keeps every
   one of this store's orphaned file temporaries as a chunk source, under a
-  name of the new session, and removes them when the session finishes,
-  whatever it refused (#97). They only save wire bytes: no recorded capture's
-  bytes live only in a temporary.
+  name of the new session. They only save wire bytes: no recorded capture's
+  bytes live only in a temporary. When the session finishes it removes them,
+  except those an entry refused in that session had staged chunks from (a
+  byte-touching refusal: verification, publication or the group commit
+  failed after the entry was filled), which are kept for the retry and
+  reported as left (#124, OI-1002-Q33). An entry refused before it staged
+  anything keeps nothing, so a path refused on every run never keeps
+  temporaries (#97). What is kept is bounded, 1024 temporaries and 4 GiB per
+  session (unruled engineering defaults: OI-1002-Q33 ruled that salvage is
+  bounded, not these numbers; a ruling may change them); a temporary past the bound is removed and refused as a value,
+  `SALVAGE_BOUND_EXCEEDED` under its current name, and its chunks are sent
+  again.
 - **Hints.** The destination records, per digest, every published output
   holding it, newest first; a hint is re-read and re-verified on use, and a
   miss falls through to the next.
