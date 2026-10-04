@@ -214,7 +214,9 @@ OI-1003-Q37, OI-1003-Q38, R-N13.
   - `w3_engine`: 1 passed;
   - contract tests: 22 OK.
   The three new unit tests passed.
-- The PR, ready for review and not merged, is recorded below once it opens.
+- PR [#166](https://github.com/Jesssullivan/bulkload/pull/166) is open
+  from head c94265d (this note's first recheck commit). It has not been
+  merged. The contract tests (22 OK) were run again after the note edits.
 
 ## Open
 
@@ -248,8 +250,16 @@ OI-1003-Q37, OI-1003-Q38, R-N13.
 - A dedicated refusal code for "state root cannot be sealed" was not
   added. It would change the wire refusal taxonomy, and `IO` (`EACCES`) is
   what the open returns now.
-- origin/main moved past this branch's base (#159, #160, #150; 8d1edd3 at
-  recheck). A trial merge with `git merge-tree` has no conflicts. The
-  branch was not merged.
+- origin/main moved past this branch's base 4a10bb8. A trial merge with
+  8d1edd3 (#150, #159, #160) was clean. Main then merged #151 (WP3 PR 2),
+  which removed the blanket `From<std::io::Error>` for `BulkloadRefusal`,
+  and moved to dfb9604. `git merge-tree` against dfb9604 conflicts in
+  `transfer_store.rs`, `estate.rs` and `carry_v2/journal.rs`.
+  - Before this lands, main has to be merged in (never a rebase). The
+    merge needs the `refuse_at` rewrite of the new `?` sites on
+    `io::Error`: `StateRoot`, `resolve_leaf`, and the estate, journal and
+    stderr seals. check-fast then runs again.
+  - The recheck stage did not do that merge. It is the next action for
+    whoever owns the merge train.
 - Linear: the distilled facts belong on the owning issue. Not posted from
   this lane.
