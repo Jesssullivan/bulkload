@@ -79,6 +79,36 @@ Validation: `nix develop .#default --command just check-fast` green (rustc
 Validation passed: `just check-fast` and `just resume-power-loss`, both run with
 `nix develop .#default`.
 
+### PR 2 merge of PR 1 (28ec2d7) and main (2026-10-04, R-N71, OI-1003-Q23)
+
+PR 1's head 28ec2d7 already carries main through 4a7b86b (#145 WP1 S2,
+#144 v1 counters, #152 handoff crate, #146 chains, #154 salvage). Merged
+here, with main's new code brought under PR 2's rules:
+
+- WP1 custody (`git_carry::export_repository_inner`): a failed child under
+  a moved pack listing now arrives as `GIT_CHILD_FAILED(_)`, so the custody
+  match takes `GitInventoryMalformed | GitChildFailed(_)`. Without that a
+  `gc`/`prune` racing the pass would refuse instead of deferring (S5).
+  `estate::tests::a_git_child_failure_without_a_rewrite_still_refuses` now
+  expects `GIT_CHILD_FAILED stderr_class=bad_object`.
+- #144's `pack_child` drains stderr through `estimate::StderrTap` (it was
+  `Stdio::null`) and returns only the storage reads: a failed packing child
+  refuses `GIT_CHILD_FAILED` with its class, ahead of the write it cut short.
+  Its two `Io(None)` sites are gone: a missing stdin pipe is `WORKER_LOST`,
+  and a pid that does not fit `pid_t` is `IO(ECHILD)` via `refuse::io`. The
+  `Io(None)` allowlist is unchanged (git_carry.rs stays at 1).
+- #146's chained export (`shared::write_chained`, the `rev-list --stdin`
+  and `pack-objects` pair) and `create_bundle`/`write_full`/
+  `write_with_prerequisites` go through `pack_child`, so the old
+  `Option`/`!success` catch-alls to `GIT_INVENTORY_MALFORMED` are gone.
+  `chain.rs` reuses `input`/`output`/`text`, so it is classified already.
+- #145's `partial_clone` classifies a `git config` failure other than exit 1
+  with `estimate::child_failed`; `promisor_packs` and `pack_listing` name
+  their sites.
+- Every other bare `?` the merge brought in (estate chain links, chain.rs,
+  `estimate::Repository::local`, `priority::*`, the handoff binary's
+  receipt) now goes through `.refuse_at(site)`.
+
 ## Open
 
 - Deferred: `verify_bundle`'s residual `GIT_INVENTORY_MALFORMED` (the
@@ -88,8 +118,12 @@ Validation passed: `just check-fast` and `just resume-power-loss`, both run with
   They belong to WP7's `SourceRepo::git(ReadCmd)`.
 - The `refuse_at` site is carried only at the call site today. WP3 PR 3
   persists it in `Refusal{code, site, errno}`.
-- PR #145 (WP1) rewrites `git_carry::git()` and `estimate::hardened`. Expect
-  textual conflicts in `git_carry.rs` and `estimate.rs` against this lane.
-  After the merge, the compiler lists every new bare `?` the merge brings in.
-- PR #145 (WP1) adds `GitSourcePartialClone` next to the same lines in
-  `refusal.rs`: a trivial textual merge for whichever lands second.
+- Merged main 4a7b86b (#146 v1 auto-prerequisite chains, #154 bounded
+  salvage) on 2026-10-04 (R-N71, OI-1003-Q23). `refusal.rs` keeps main's
+  live `SalvageBoundExceeded` before `FrameCodec` in the enum, `code()`,
+  `CODES` and the test list, and still drops the dead
+  `TransportAuthorityMismatch` (no constructor on main either). #146 folded
+  estimate's `feed` into `git_carry::input`; the writer-thread join there
+  now refuses `WORKER_LOST`, as `feed`'s did on this branch.
+- `refusal_taxonomy.rs` keeps its local `prop_config`; folding it into
+  `test_support::prop_config` (now on main) is a follow-up.

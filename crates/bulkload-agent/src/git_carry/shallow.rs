@@ -49,7 +49,11 @@ fn validate_frontier(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Result<()> {
+pub(super) fn write_bundle(
+    private: &Path,
+    bundle: &Path,
+    boundary: &[u8],
+) -> Result<super::shared::PackStats> {
     validate_frontier(boundary)?;
     let parent = bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let pack = bundle.with_extension("objects.pack");
@@ -59,23 +63,20 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
         .mode(0o600)
         .open(&pack)
         .refuse_at("git_carry::shallow::write_bundle")?;
-    // stdout goes to the pack file; stderr is captured for the classifier
-    // only (R-N121), never inherited.
-    let packed = git(private)
-        .args(["pack-objects", "--stdout", "--revs", "--all"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            file.try_clone()
-                .refuse_at("git_carry::shallow::write_bundle")?,
-        ))
-        .stderr(Stdio::piped())
-        .output()
-        .refuse_at("git_carry::shallow::write_bundle")?;
-    if !packed.status.success() {
-        return Err(super::estimate::child_failed(&packed.stderr));
-    }
+    // stdout goes to the pack file; stderr is drained into the classifier
+    // only (R-N121), never inherited. A failed child refuses GIT_CHILD_FAILED.
+    let storage_read = super::pack_child(
+        git(private)
+            .args(["pack-objects", "--stdout", "--revs", "--all"])
+            .stdout(Stdio::from(
+                file.try_clone()
+                    .refuse_at("git_carry::shallow::write_bundle")?,
+            )),
+        None,
+    )?;
     file.sync_file_counted()
         .refuse_at("git_carry::shallow::write_bundle")?;
+    let stats = super::shared::PackStats::record(&pack, true, storage_read)?;
     let envelope = parent.join("shallow-envelope.git");
     let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
     output(
@@ -123,7 +124,7 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, boundary: &[u8]) -> Re
         create.arg(DRIFT_MARKER);
     }
     output(&mut create)?;
-    Ok(())
+    Ok(stats)
 }
 
 fn custody_oid(heads: &str) -> Option<&str> {

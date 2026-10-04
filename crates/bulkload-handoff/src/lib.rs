@@ -1,4 +1,9 @@
-//! `handoff-verify`: typed credential-class proof with structural evidence (R-N3).
+//! `bulkload-handoff verify`: typed credential-class proof with structural
+//! evidence (R-N3).
+//!
+//! This is an operator tool, not part of the engine. It lives in its own crate
+//! and binary (WP10, OI-1003-Q14) so the source-side `bulkload-agent` never
+//! spawns sops, kubectl, gpg, gh, claude or codex.
 //!
 //! # What this is
 //!
@@ -32,8 +37,8 @@
 //! child onto a reaper thread that only waits on it. There is no `kill`, no // agent-process-safety: allow (prose asserting absence of process control)
 //! `libc::kill`, and no signal of any kind in this file. // agent-process-safety: allow (prose asserting absence of process control)
 
-use crate::counters::CountedSync as _;
-use crate::refuse::RefuseAt as _;
+use bulkload_agent::counters::CountedSync as _;
+use bulkload_agent::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -552,29 +557,18 @@ impl Capture {
     }
 }
 
-/// Drain a child stream to end, retaining at most [`CAPTURE_CAP`] bytes.
+/// Drain a child stream to end, retaining at most [`CAPTURE_CAP`] bytes. The
+/// loop is the agent's shared [`bulkload_agent::child::drain_bounded`]; the
+/// bytes past the head are counted and dropped.
 fn drain<R: std::io::Read>(pipe: Option<R>) -> (Vec<u8>, usize) {
-    let Some(mut pipe) = pipe else {
+    let Some(pipe) = pipe else {
         return (Vec::new(), 0);
     };
-    let mut kept: Vec<u8> = Vec::new();
-    let mut total = 0_usize;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match pipe.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                total = total.saturating_add(count);
-                let room = CAPTURE_CAP.saturating_sub(kept.len());
-                if room > 0 {
-                    if let Some(slice) = buffer.get(..count.min(room)) {
-                        kept.extend_from_slice(slice);
-                    }
-                }
-            }
-        }
-    }
-    (kept, total)
+    let drained = bulkload_agent::child::drain_bounded(pipe, CAPTURE_CAP, |_| {});
+    (
+        drained.head,
+        usize::try_from(drained.total).unwrap_or(usize::MAX),
+    )
 }
 
 /// Run one child to completion under a wall-clock cap.
