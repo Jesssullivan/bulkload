@@ -9,8 +9,9 @@ R-N13.
 - **Branch:** `feat/s3-estate-20261004`.
 - **Worktree:** `bulkload.worktrees/s3-estate-20261004`. Each session below
   was its only writer.
-- **PR:** steps 1 and 2 opened none (by dispatch). Step 3 opened one; see
-  there. Nothing was merged.
+- **PR:** [#173](https://github.com/Jesssullivan/bulkload/pull/173),
+  opened in step 3. Steps 1 and 2 opened none (by dispatch). Nothing was
+  merged.
 - **Earlier note:** [2026-10-04-s3-estate.md](2026-10-04-s3-estate.md)
   covers the harness, the runs and the Q15 packet.
 
@@ -247,15 +248,16 @@ All ten are fixed on the branch:
 
 ### Commits and PR
 
-- The commit after `82da357`: this note and the OI-1003-Q38 correction.
-- PR: opened right after this commit was pushed; the next commit records
-  its number.
+- `fa2f1d7`: this note and the OI-1003-Q38 correction.
+- PR [#173](https://github.com/Jesssullivan/bulkload/pull/173), opened
+  after `fa2f1d7` was pushed; not merged. The commit after `fa2f1d7`
+  records its number here.
 
 ### Workstreams (restated; from `gh pr list` at this step)
 
 | Stream | Owner | Where | State | Next |
 |---|---|---|---|---|
-| S3 estate and the Q15 packet | this lane | `feat/s3-estate-20261004` | PR open, verified here | Q15 and the three Q18 rulings |
+| S3 estate and the Q15 packet | this lane | `feat/s3-estate-20261004`, PR #173 | open, verified here | Q15 and the three Q18 rulings |
 | Source object store freshening, bare-repo refusal | fix-source-odb lane (reported) | PR #172 | open | its own review |
 | SLO OI-1003-Q37, Q40 | SLO lane (reported) | PR #171 | open | operator |
 | Whitepaper | (reported) | PR #164 | open | unknown |
