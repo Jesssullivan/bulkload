@@ -171,6 +171,51 @@ Same lane, same day. Rulings: R-N58, OI-1003-Q37, OI-1003-Q38, R-N13.
   - marker-first mutation: `events=5 … violations=3`;
   - pre-#161 model: `events=3 … violations=4`.
 
+## Recheck and ship
+
+Same lane, same day, recheck-and-ship stage. Rulings: R-N58,
+OI-1003-Q37, OI-1003-Q38, R-N13.
+
+- **What was checked.** The diff from d649f7c to e5216be, read against the
+  three medium findings, plus the rest of the branch for any new defect.
+  Verdict: CLEAN. No medium or high finding remains.
+  - Seal before marker: fixed. The marker's `Event::Commit` is recorded
+    once `COMMIT` returns, under the reentrant trace serial lock taken
+    before `BEGIN`; `record` takes no lock of its own. `store_kept` reads
+    the marker's commit from the trace indices in `StateInfo::commits`. The
+    positive proof asserts both syncs fall in `opening[..marker]`, so a seal
+    moved after `COMMIT` fails that proof deterministically. The trace-level
+    teeth proof is independent of the code. `fail_dir_seals` is
+    thread-local, so the unit test cannot disturb parallel tests.
+  - Parent read-open: fixed. An existing root is opened by path, which
+    needs only search permission on the parent. The parent is opened only
+    in the create branch or in `StateRoot::seal`, and `open_parent` checks
+    the parent's entry against the root's inode.
+  - Trailing `/` or `/.`: fixed. `resolve_leaf` canonicalizes such paths.
+    A name that does not exist yet keeps its leaf (Rust's
+    `Path::file_name` drops the trailing `/` or `/.`). `link/..` and `.`
+    resolve as they did before.
+  - No new medium or high defect. `CommitRecord::RootSealed` is ignored by
+    the other commit consumers: the copy invariant, which handles it
+    explicitly, and `adoption_power_loss`, which has a `_` arm.
+- **Small differences from main, rated below low, not filed:**
+  - an existing root without its owner's read bit (a private 0300 root)
+    now refuses `IO` (`EACCES`);
+  - a non-directory earlier component now refuses `PATH_ESCAPES_ROOT`
+    instead of `IO` (`ENOTDIR`).
+- **Evidence.** check-fast (`flock … nix develop .#default --command just
+  check-fast`, sting, head e5216be): exit 0. It outlasted the 600 s
+  foreground limit, so the harness moved it to the background, where it was
+  waited on. Results:
+  - workspace lib: 439 passed, 5 ignored;
+  - io-trace lib: 61 passed;
+  - `fault_harness`: 56 passed;
+  - `power_loss`: 9 passed, including all four store proofs;
+  - `w3_engine`: 1 passed;
+  - contract tests: 22 OK.
+  The three new unit tests passed.
+- The PR, ready for review and not merged, is recorded below once it opens.
+
 ## Open
 
 - An operator rename or restore of a state dir is outside the engine's
@@ -203,7 +248,8 @@ Same lane, same day. Rulings: R-N58, OI-1003-Q37, OI-1003-Q38, R-N13.
 - A dedicated refusal code for "state root cannot be sealed" was not
   added. It would change the wire refusal taxonomy, and `IO` (`EACCES`) is
   what the open returns now.
-- origin/main moved past this branch's base (#159, #160). A trial merge
-  with `git merge-tree` has no conflicts. The branch was not merged.
+- origin/main moved past this branch's base (#159, #160, #150; 8d1edd3 at
+  recheck). A trial merge with `git merge-tree` has no conflicts. The
+  branch was not merged.
 - Linear: the distilled facts belong on the owning issue. Not posted from
   this lane.
