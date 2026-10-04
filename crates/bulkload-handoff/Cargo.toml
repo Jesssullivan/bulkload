@@ -1,0 +1,29 @@
+[package]
+name = "bulkload-handoff"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bulkload credential-class handoff proof (R-N3), outside the engine binary"
+publish = false
+
+# WP10 (OI-1003-Q14): the handoff probes spawn sops, kubectl, gpg, gh, claude
+# and codex. They live here, not in bulkload-agent, so the source-side engine
+# binary never runs any of them.
+[[bin]]
+name = "bulkload-handoff"
+path = "src/main.rs"
+
+[dependencies]
+bulkload-agent = { path = "../bulkload-agent" }
+bulkload-proto = { path = "../bulkload-proto" }
+libc.workspace = true
+
+[lints.clippy]
+# R33 deny-panics wall. Refusals are Results, never panics.
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
