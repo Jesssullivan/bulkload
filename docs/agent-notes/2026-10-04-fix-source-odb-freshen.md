@@ -148,7 +148,18 @@ Rulings cited:
     change to the check-fast tier.
   - The non-Rust check-fast gates were re-run green on it: manifest, Python,
     shell and workflow lint, the secrets scan and the CI contract.
-- The final note commit records the line above.
+- 8d7c9e5: note (signed).
+- c7c2849: merge of origin/main 8d1edd3 (#150, WP3 PR 1, typed refusals),
+  clean (signed).
+  - `just check-fast` was re-run on it and exited 0 at 2026-10-04T10:38Z.
+  - 26 cargo result lines: 691 passed, 0 failed, 8 ignored, with
+    `refusal_taxonomy` included.
+  - The fault harness, the power-loss and adoption proofs and the CI
+    contract (22 OK) passed.
+  - **This is the code tree that was pushed.**
+- The last commit is note-only: it records the lines above.
+- **PR #151 (WP3 PR 2)** was still open when this lane pushed. The
+  `refuse_at` follow-ups listed under Open apply when it lands.
 
 ## Open
 
