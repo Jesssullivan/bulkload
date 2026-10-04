@@ -229,12 +229,14 @@ fn assert_no_echo(state: &Path, payloads: &[(Vec<u8>, String)], stdout: &str, st
         }
     }
     // The verb's stderr is its refusal line and the M2 W2 counters line
-    // (`counters verb=... side=... scope=process <name>=<number> ...`), which
-    // carries only the verb's own measurements.
+    // (`counters verb=... side=... scope=process priority=... priority_from=...
+    // <name>=<number> ...`), which carries only the verb's own measurements.
+    // The estimate is a source-side verb: background by default (WP0(f)).
     for line in stderr.lines() {
-        if let Some(fields) =
-            line.strip_prefix("counters verb=git-carry-estimate side=local scope=process ")
-        {
+        if let Some(fields) = line.strip_prefix(
+            "counters verb=git-carry-estimate side=local scope=process \
+             priority=background priority_from=default ",
+        ) {
             for field in fields.split(' ') {
                 let (name, value) = field.split_once('=').unwrap();
                 assert!(

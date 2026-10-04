@@ -141,6 +141,11 @@ pub enum BulkloadRefusal {
     /// and the like), where its `flock` locks cannot be trusted. Ingest
     /// destinations must be local filesystems (operator ruling OI-1001-Q17).
     GitDestinationFilesystemUnsupported,
+    /// A Git source is a partial clone (a promisor remote, a partial-clone
+    /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
+    /// store or an alternate). Reading it could fault in a lazy fetch, so v1
+    /// carry refuses it before any other read (S2, OI-1003-Q16).
+    GitSourcePartialClone,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -167,6 +172,11 @@ pub enum BulkloadRefusal {
     /// less free space than the configured floor (`--min-free-percent`,
     /// default 25%), or with no room at all (OI-1001-Q2).
     DestinationSpaceInsufficient,
+    /// A salvaged destination temporary that a refused entry staged chunks
+    /// from could not be kept for the next run: the session's salvage bound
+    /// (by count and bytes) was already reached, so it was removed and its
+    /// chunks are sent again (#124, OI-1002-Q33).
+    SalvageBoundExceeded,
     /// The transport authority differs from the captured authority.
     TransportAuthorityMismatch,
     /// The frame could not be encoded or decoded.
@@ -231,6 +241,7 @@ impl BulkloadRefusal {
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+            Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -240,6 +251,7 @@ impl BulkloadRefusal {
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
+            Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
             Self::TransportAuthorityMismatch => "TRANSPORT_AUTHORITY_MISMATCH",
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProbeFailed => "PROBE_FAILED",
@@ -292,6 +304,7 @@ impl BulkloadRefusal {
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+        "GIT_SOURCE_PARTIAL_CLONE",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
@@ -301,6 +314,7 @@ impl BulkloadRefusal {
         "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
+        "SALVAGE_BOUND_EXCEEDED",
         "TRANSPORT_AUTHORITY_MISMATCH",
         "FRAME_CODEC",
         "PROBE_FAILED",
@@ -394,6 +408,7 @@ mod tests {
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitDestinationFilesystemUnsupported,
+            BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
@@ -403,6 +418,7 @@ mod tests {
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
+            BulkloadRefusal::SalvageBoundExceeded,
             BulkloadRefusal::TransportAuthorityMismatch,
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProbeFailed,

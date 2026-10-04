@@ -60,6 +60,7 @@ macro_rules! fault_mid_read {
     ($first:expr, $path:expr) => {{}};
 }
 
+pub mod child;
 pub mod closure;
 pub mod counters;
 pub mod estate;
@@ -67,7 +68,6 @@ pub mod estate;
 pub mod fault;
 pub mod freshness;
 pub mod git_carry;
-pub mod handoff;
 pub mod hash;
 // The engine's io layer (R-N90, R-N54, R-N88). W3's group commit
 // (`io::durable`), the destination's materializer and the counted syncs run on
@@ -79,6 +79,29 @@ pub(crate) mod io;
 /// per-file and per-directory seals. See `io::durable`.
 pub mod durable {
     pub use crate::io::durable::*;
+}
+
+/// Background CPU and IO priority for source-side verbs (WP0(f),
+/// OI-1003-Q17): the class, and `io::sys::enter_background`.
+pub mod priority {
+    pub use crate::io::PriorityClass;
+
+    /// Enter background priority for this process and everything it creates
+    /// afterwards. Call it before any thread exists.
+    ///
+    /// # Errors
+    /// Refuses with the errno of the scheduling call that failed.
+    pub fn enter_background() -> crate::Result<()> {
+        crate::io::sys::enter_background().map_err(Into::into)
+    }
+
+    /// Whether the calling thread runs at background priority.
+    ///
+    /// # Errors
+    /// Refuses with the errno of the scheduling query that failed.
+    pub fn in_background() -> crate::Result<bool> {
+        crate::io::sys::in_background().map_err(Into::into)
+    }
 }
 
 /// Open-file limits and the destination's descriptor budget (M2 W3).
@@ -104,6 +127,8 @@ pub mod crash_check {
 pub mod materialize;
 pub mod provider_sqlite;
 pub mod space;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transfer;
 pub mod transfer_store;
 pub mod walk;
