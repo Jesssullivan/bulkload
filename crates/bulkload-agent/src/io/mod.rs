@@ -6,10 +6,12 @@
 //! - `sys_posix.rs`: the calls Darwin and Linux share (`openat`, `fstat`,
 //!   `pread`/`pwrite`, `fchmod`, `unlinkat`, `mkdirat`, `linkat`,
 //!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
-//!   `readdir`, `geteuid`, `flock`, `setsockopt`);
+//!   `readdir`, `geteuid`, `flock`, `setsockopt`, `setpriority`/`getpriority`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//!   `renameatx_np(RENAME_EXCL)` and thread `QoS`;
-//! - `sys_linux.rs`: `fdatasync`, `fsync` and `renameat2(RENAME_NOREPLACE)`;
+//!   `renameatx_np(RENAME_EXCL)`, and the background `IOPOL_THROTTLE` policy
+//!   and `QoS` class;
+//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)` and
+//!   the idle `ioprio_set` class;
 //! - `buf.rs`: the aligned slab allocation.
 //!
 //! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
@@ -211,20 +213,41 @@ pub enum OpenMode {
     CreateExcl(u32),
 }
 
-/// A thread quality-of-service class (Darwin `QoS`; a no-op on Linux).
+/// The CPU and IO class a verb's process runs at (WP0(f), OI-1003-Q17).
+///
+/// Source-side verbs enter [`PriorityClass::Background`] through
+/// `sys::enter_background` as the first act of `main`; every verb records its
+/// class on its counters line, and the bench records it in its header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub enum Qos {
-    /// `QOS_CLASS_USER_INITIATED`: the plan's class for the largest file, so
-    /// it lands on a P-core.
-    UserInitiated,
-    /// `QOS_CLASS_UTILITY`.
-    Utility,
-    /// `QOS_CLASS_BACKGROUND`: E-cores only.
+pub enum PriorityClass {
+    /// The class the process was started with; nothing was lowered.
+    Normal,
+    /// Background CPU and IO: Linux nice 19 and `IOPRIO_CLASS_IDLE`; Darwin
+    /// `IOPOL_THROTTLE`, `QOS_CLASS_BACKGROUND` and nice 19.
     Background,
+}
+
+impl PriorityClass {
+    /// The stable word printed for this class.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Background => "background",
+        }
+    }
+}
+
+impl std::str::FromStr for PriorityClass {
+    type Err = bulkload_proto::BulkloadRefusal;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "background" => Ok(Self::Background),
+            _ => Err(bulkload_proto::BulkloadRefusal::FieldDomainViolation),
+        }
+    }
 }
 
 /// Convert a Rust path component to a C string for an `*at` call.

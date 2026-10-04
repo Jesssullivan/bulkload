@@ -15,7 +15,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
 
 pub use super::sys_posix::*;
-use super::{NodeId, Qos, Stat};
+use super::{NodeId, Stat};
 
 /// Translate a Darwin `struct stat`.
 pub(super) fn stat_from_raw(raw: &libc::stat) -> Stat {
@@ -189,44 +189,54 @@ pub fn rename_exclusive_at(
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-const fn qos_class(class: Qos) -> libc::qos_class_t {
-    match class {
-        Qos::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
-        Qos::Utility => libc::qos_class_t::QOS_CLASS_UTILITY,
-        Qos::Background => libc::qos_class_t::QOS_CLASS_BACKGROUND,
-    }
+// <sys/resource.h>: the disk IO policy calls libc does not bind.
+extern "C" {
+    fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;
+    fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
 }
 
-/// Set the calling thread's `QoS` class. Returns `true` when applied.
+/// `IOPOL_TYPE_DISK`: the disk IO policy.
+const IOPOL_TYPE_DISK: libc::c_int = 0;
+/// `IOPOL_SCOPE_PROCESS`: every thread of the process, inherited by children.
+const IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+/// `IOPOL_THROTTLE`: the process's IO yields to every unthrottled IO.
+const IOPOL_THROTTLE: libc::c_int = 3;
+
+/// Enter background priority (WP0(f), OI-1003-Q17): the process-wide
+/// `IOPOL_THROTTLE` disk policy, `QOS_CLASS_BACKGROUND` on the calling
+/// thread, and nice 19. Called first in `main`, before any thread exists:
+/// threads inherit their creator's `QoS` class, and children (Git, ssh)
+/// inherit the process IO policy and the nice value.
 ///
 /// # Errors
-/// Returns the error number `pthread_set_qos_class_self_np` reports.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn set_thread_qos(class: Qos) -> io::Result<bool> {
+/// Returns the `setiopolicy_np`, `pthread_set_qos_class_self_np` or
+/// `setpriority` failure.
+pub fn enter_background() -> io::Result<()> {
+    // SAFETY: `setiopolicy_np` takes three integers and no pointers.
+    if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
     // SAFETY: the call acts on the calling thread only and takes no pointers.
-    let ret = unsafe { libc::pthread_set_qos_class_self_np(qos_class(class), 0) };
+    let ret =
+        unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) };
     if ret != 0 {
         return Err(io::Error::from_raw_os_error(ret));
     }
-    Ok(true)
+    super::sys_posix::nice_background()
 }
 
-/// The calling thread's current `QoS` class, if it is one of [`Qos`].
+/// Whether the process runs at background priority: the `IOPOL_THROTTLE`
+/// disk policy, the calling thread at `QOS_CLASS_BACKGROUND`, and nice 19.
 ///
 /// # Errors
-/// Returns the error number `pthread_get_qos_class_np` reports.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired in by W4 PR 2/3 (R-N127); tests use it now")
-)]
-pub fn thread_qos() -> io::Result<Option<Qos>> {
+/// Returns the `getiopolicy_np`, `pthread_get_qos_class_np` or
+/// `getpriority` failure.
+pub fn in_background() -> io::Result<bool> {
+    // SAFETY: `getiopolicy_np` takes two integers and no pointers.
+    let policy = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS) };
+    if policy == -1 {
+        return Err(io::Error::last_os_error());
+    }
     let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
     let mut priority: libc::c_int = 0;
     // SAFETY: `pthread_self` takes no arguments and only names the calling
@@ -238,10 +248,9 @@ pub fn thread_qos() -> io::Result<Option<Qos>> {
     if ret != 0 {
         return Err(io::Error::from_raw_os_error(ret));
     }
-    let class = class as u32;
-    Ok([Qos::UserInitiated, Qos::Utility, Qos::Background]
-        .into_iter()
-        .find(|candidate| qos_class(*candidate) as u32 == class))
+    Ok(policy == IOPOL_THROTTLE
+        && class as u32 == libc::qos_class_t::QOS_CLASS_BACKGROUND as u32
+        && super::sys_posix::nice()? == super::sys_posix::BACKGROUND_NICE)
 }
 
 /// Darwin pipes size themselves; there is nothing to raise.

@@ -550,6 +550,47 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// The nice value a background verb runs at (WP0(f), OI-1003-Q17).
+pub const BACKGROUND_NICE: libc::c_int = 19;
+
+/// Lower the calling thread's CPU priority to [`BACKGROUND_NICE`]. Threads
+/// and children created after this call inherit it; lowering needs no
+/// privilege, and nothing in bulkload ever raises it back.
+///
+/// # Errors
+/// Returns the `setpriority` failure.
+pub(super) fn nice_background() -> io::Result<()> {
+    // SAFETY: `setpriority` takes no pointers; `who` 0 names the caller.
+    check(unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, BACKGROUND_NICE) }).map(|_| ())
+}
+
+/// The calling thread's nice value.
+///
+/// # Errors
+/// Returns the `getpriority` failure.
+pub(super) fn nice() -> io::Result<libc::c_int> {
+    // `getpriority` may return -1 as a value, so success is judged by errno.
+    // SAFETY: `__error`/`__errno_location` take no arguments and return the
+    // calling thread's own errno slot.
+    #[cfg(target_vendor = "apple")]
+    let errno = unsafe { libc::__error() };
+    // SAFETY: as above.
+    #[cfg(not(target_vendor = "apple"))]
+    let errno = unsafe { libc::__errno_location() };
+    // SAFETY: the slot is the calling thread's, aligned and valid for writes
+    // for the thread's lifetime.
+    unsafe { *errno = 0 };
+    // SAFETY: `getpriority` takes no pointers; `who` 0 names the caller.
+    let value = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    if value == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(0) {
+            return Err(error);
+        }
+    }
+    Ok(value)
+}
+
 /// Take an exclusive `flock` on `file` without blocking.
 ///
 /// # Errors

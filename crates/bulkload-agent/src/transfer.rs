@@ -213,6 +213,30 @@ fn elapsed_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Whether either canonical path contains the other.
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// The canonical path a private state root has, or will have once a store
+/// creates it: the root itself when it exists, else its canonical parent
+/// joined with its name. Read-only, so an overlap with a root it must not
+/// touch is refused before anything is created (WP1 PR 3, S2).
+fn canonical_state(state: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(state) {
+        Ok(_) => Ok(std::fs::canonicalize(state)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = state.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+            let parent = match state.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Run the same framed protocol locally over a bounded Unix stream pair.
 ///
 /// # Errors
@@ -225,7 +249,18 @@ pub fn copy(
 ) -> Result<TransferStats> {
     let source_root = std::fs::canonicalize(source)?;
     let destination_root = std::fs::canonicalize(destination)?;
-    if source_root.starts_with(&destination_root) || destination_root.starts_with(&source_root) {
+    if overlaps(&source_root, &destination_root) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    // S2 (WP1 PR 3): both halves run at once, so neither state root may be
+    // created inside the source, and each must stay apart from its own root,
+    // all decided before either store exists.
+    let source_state_root = canonical_state(source_state)?;
+    let destination_state_root = canonical_state(destination_state)?;
+    if overlaps(&source_state_root, &source_root)
+        || overlaps(&destination_state_root, &source_root)
+        || overlaps(&destination_state_root, &destination_root)
+    {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
     let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair()?;
@@ -697,8 +732,15 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
     }
     let root = std::fs::canonicalize(path(root))?;
     let state = path(state);
+    // S2 (WP1 PR 3): refuse before `Store::open` creates the state root, so
+    // an overlapping state never writes a byte inside the source.
+    if overlaps(&canonical_state(&state)?, &root) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
     let store = Store::open(&state)?;
-    if store.root().starts_with(&root) || root.starts_with(store.root()) {
+    // Again on the store's own canonical root: a state swapped for a symlink
+    // after the check above still refuses before any source read.
+    if overlaps(store.root(), &root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
     // Every source seat is walked and read beneath this one descriptor
