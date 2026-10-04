@@ -18,10 +18,11 @@ Rulings cited:
 ## What changed
 
 - **`Store::open` (source ledger store and destination store).**
-  - `private_dir` now opens the parent, creates the root with
-    `io::sys::mkdirat`, and opens the root `O_DIRECTORY|O_NOFOLLOW`. The same
-    refusals as before apply: a symlink, a non-directory, or group/other bits
-    give `PATH_ESCAPES_ROOT`.
+  - The state root is opened `O_DIRECTORY|O_NOFOLLOW` and, when absent,
+    created with `io::sys::mkdirat`. A symlink, a non-directory, or
+    group/other bits give `PATH_ESCAPES_ROOT`. The first version of this
+    claimed the refusals were unchanged; that was wrong, and review round 1
+    below corrects it and lists the remaining differences from origin/main.
   - `transfer.sqlite` is created with `io::sys::create_excl_at`. Both
     creations are now traced, so the R-N88 checker sees them.
   - New `io::durable::seal_state_root(parent, root)`: `seal_dir(parent)`,
@@ -87,10 +88,88 @@ Rulings cited:
   flush_dir_ns=42691006 full_flushes_total=9 durable_groups=5`. That is one
   state-root full flush per fresh store, about 21 ms each on sting.
 
+## Review round 1 (three medium findings, all fixed)
+
+Same lane, same day. Rulings: R-N58, OI-1003-Q37, OI-1003-Q38, R-N13.
+
+- **The seal-before-marker order had no proof.** The schema transaction
+  that commits `root_sealed` traced no `Event::Commit`, so a refactor that
+  sealed after `COMMIT` kept every store proof green.
+  - New `CommitRecord::RootSealed`. `Store::open` traces the marker's
+    commit inside the `COMMIT` step, as it returns, under the trace's serial
+    lock (taken before `BEGIN`, D5 order).
+  - `store_kept` requires the state root and its database once the marker
+    commit has returned, with its own message.
+  - The positive proofs assert that both seals come before the marker. The
+    pre-#161 model (`before_the_seal`) drops the marker as well as the
+    seals.
+  - New teeth proof `a_store_marker_committed_before_its_seal_can_lose_the_store`
+    moves the seals after the marker in the trace. It reports violations
+    at ops 3 and 4.
+  - New unit test `a_store_whose_seal_fails_records_no_seal` uses
+    `fail_dir_seals`: the open refuses `IO(EIO)` and leaves no marker, and
+    the next open seals and records it.
+  - Mutation run: seal moved after `COMMIT` in `Store::open`. Both positive
+    store proofs and the unit test FAILED (`the state root is None after the
+    root_sealed marker committed`). Restored afterwards.
+- **Every open read-opened the parent (regression).** `StateRoot::open`
+  first opens the root by path, `O_NOFOLLOW|O_DIRECTORY`, which needs only
+  search permission on the parent. The parent is opened only to create the
+  root (for `mkdirat`) or for a seal that is needed (`StateRoot::seal`). A
+  parent opened late must still hold this root's inode under the root's
+  name, or the open refuses `PATH_ESCAPES_ROOT`. A seal the agent cannot do
+  because it cannot read the parent refuses `IO` (`EACCES`). That happens
+  only when a seal is needed, not on every open, and no marker is recorded.
+  Unit test
+  `a_sealed_store_opens_under_a_parent_it_cannot_list` covers a 0311 parent
+  with a sealed root, an unsealed root and a fresh name. The asserts that
+  depend on permission bits are skipped for euid 0. A mutation that opens
+  the parent eagerly fails it.
+- **Trailing `/` or `/.` on a symlinked root (changed acceptance).** Option 1
+  was taken: the acceptance origin/main had is kept. `resolve_leaf`
+  canonicalizes a path ending in `/` or `/.` the same way it already
+  canonicalizes `.` and `..` leaves. The store then lives in, and seals,
+  the directory the link names. A trailing-slash name that does not exist
+  yet is created as written. Unit test
+  `a_state_root_named_with_a_trailing_slash_follows_its_leaf` covers
+  `link/`, `link/.`, `link//`, `link/./`, a fresh `fresh/`, and a link to a
+  0750 directory, which is still refused. A mutation without the
+  trailing-slash case fails it. The bare `link` is still refused, as on
+  main.
+- Differences from origin/main that remain, all deliberate:
+  - creating a root under a parent the agent can write and search but not
+    read now refuses `IO` (`EACCES`), because the new root could never be
+    sealed;
+  - an existing root without its marker under such a parent refuses the
+    same way until the parent is readable;
+  - a dangling symlink named with a trailing slash refuses
+    `PATH_ESCAPES_ROOT` instead of `IO` (`EEXIST`).
+- `docs/design.md` Durability: added that the marker commits only after the
+  seal, and the parent-access rule.
+- Evidence: see the review round 1 entries under Shas.
+
 ## Shas
 
 - Fix commit: f3d0449 (`fix(store): seal the state root and its parent before
-  Store::open returns (#161)`). This note is in the commit after it.
+  Store::open returns (#161)`). The first version of this note is in d649f7c.
+- Review round 1: 217deca (`fix(store): prove the seal precedes root_sealed;
+  open the parent only to seal (#161 review)`). This note's update is in the
+  commit after it.
+- Review round 1 check-fast (`flock … nix develop .#default --command just
+  check-fast`, sting): exit 0. The run outlasted the harness's 600 s
+  foreground limit, so the harness moved it to the background. It was waited
+  on to completion, and nothing ran in parallel. Results:
+  - workspace lib: 439 passed, 5 ignored;
+  - `power_loss`: 9 passed (the 5 copy proofs and 4 store proofs, including
+    the new marker-order teeth);
+  - `fault_harness`: 56 passed;
+  - `adoption_power_loss`: 2 passed;
+  - contract tests: 22 OK.
+- Store proofs after the fix:
+  - fresh open plus commit: `crash_check events=6 ops=6 crash_points=7
+    states=11 exhaustive=true violations=0`;
+  - marker-first mutation: `events=5 … violations=3`;
+  - pre-#161 model: `events=3 … violations=4`.
 
 ## Open
 
@@ -99,9 +178,32 @@ Rulings cited:
   re-sealed.
 - The stderr store's `key` file has a separate gap: a creator that died
   between create and write leaves a short key, which refuses later opens.
-  This is a different gap from #161 and was not fixed.
+  Review round 1 points out that it is also a power-loss gap of the #161
+  kind: a process that did not create the key never syncs the key file.
+  This was not fixed (rated low).
 - The estate shared-base hard link into the corpus was not audited for its
   corpus-directory seal.
 - The state dir's own ancestors (operator paths) are not sealed.
+- Review round 1 low findings, not fixed (by instruction), each still
+  open:
+  - On Darwin the parent's barrier must come before the root's full flush
+    in `seal_state_root`, and nothing guards that order.
+  - SQLite opens `transfer.sqlite` again by path, so a root swapped between
+    `StateRoot::open` and `Connection::open` defeats the descriptor seal.
+  - A foreign read-write connection (the sqlite3 CLI, a backup tool) deletes
+    the WAL on close. The next WAL is then never sealed, because the marker
+    is trusted.
+  - The estate, journal and stderr seals have no proofs or `fail_dir_seals`
+    pins.
+  - The Darwin trace shape (Barrier, then FullFlush) is never exercised.
+  - The four sealing sites use three different primitives. Estate
+    full-flushes its parent on every call.
+  - The low finding about the parent `O_RDONLY` open repeats medium finding
+    2, and is fixed with it.
+- A dedicated refusal code for "state root cannot be sealed" was not
+  added. It would change the wire refusal taxonomy, and `IO` (`EACCES`) is
+  what the open returns now.
+- origin/main moved past this branch's base (#159, #160). A trial merge
+  with `git merge-tree` has no conflicts. The branch was not merged.
 - Linear: the distilled facts belong on the owning issue. Not posted from
   this lane.
