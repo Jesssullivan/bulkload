@@ -9,8 +9,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use super::{capture_refs, git, input, oid, output, prepare_private, refs, set_ref, text};
+use super::{capture_refs, git, oid, output, prepare_private, refs, set_ref, text};
 use crate::{BulkloadRefusal, Result};
 
 fn stash_history(repo: &Path, inventory: &str) -> Result<Vec<u8>> {
@@ -139,7 +140,92 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
     }
 }
 
-pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -> Result<()> {
+/// What packing one capture cost (WP2, OI-1003-Q15). Also added to the
+/// process counters `write_source_pack_bytes`, `write_source_pack_objects`
+/// and `read_source_pack_readback_bytes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackStats {
+    /// Bytes git wrote for the capture's pack (the bundle as git created it,
+    /// or the raw pack of a shallow envelope): the logical measure of what it
+    /// read from the object stores to write them.
+    pub bytes: u64,
+    /// Objects in that pack, from its header.
+    pub objects: u64,
+    /// The packing child's own storage reads: a lower bound (counters notes).
+    pub storage_read: u64,
+}
+
+impl PackStats {
+    /// Measure a pack git just wrote at `path` (a bundle, or a raw pack when
+    /// `raw`), add it to the process counters and return it.
+    pub(super) fn record(path: &Path, raw: bool, storage_read: u64) -> Result<Self> {
+        use crate::counters::{add, Counter};
+        let stats = Self {
+            bytes: fs::symlink_metadata(path)?.len(),
+            objects: pack_object_count(path, raw)?,
+            storage_read,
+        };
+        add(Counter::SourcePackWrite, stats.bytes);
+        add(Counter::SourcePackObjects, stats.objects);
+        add(Counter::SourcePackReadback, stats.storage_read);
+        Ok(stats)
+    }
+}
+
+// The object count a pack header declares: `PACK`, version 2 or 3, count, all
+// big-endian. A bundle's pack follows its header's blank line.
+fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut source = BufReader::new(file);
+    if !raw {
+        let mut consumed = 0usize;
+        loop {
+            let mut line = Vec::new();
+            let count = source
+                .by_ref()
+                .take(1024 * 1024)
+                .read_until(b'\n', &mut line)?;
+            consumed = consumed
+                .checked_add(count)
+                .ok_or(BulkloadRefusal::BudgetExceeded)?;
+            if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
+                return Err(BulkloadRefusal::GitInventoryMalformed);
+            }
+            if line == b"\n" {
+                break;
+            }
+        }
+    }
+    let mut header = [0u8; 12];
+    source.read_exact(&mut header)?;
+    let (magic, rest) = header.split_at(4);
+    let (version, count) = rest.split_at(4);
+    if magic != b"PACK" || !matches!(version, [0, 0, 0, 2 | 3]) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let count: [u8; 4] = count
+        .try_into()
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(u64::from(u32::from_be_bytes(count)))
+}
+
+// `git bundle create` through the measured child path.
+fn create_bundle(command: &mut Command, bundle: &Path, stdin: Option<&[u8]>) -> Result<PackStats> {
+    let (success, storage_read) = super::pack_child(command.stdout(Stdio::null()), stdin)?;
+    if !success {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    PackStats::record(bundle, false, storage_read)
+}
+
+pub(super) fn write_bundle(
+    private: &Path,
+    bundle: &Path,
+    base: Option<&Path>,
+) -> Result<PackStats> {
     let boundary = super::shallow::frontier(private)?;
     if !boundary.is_empty() {
         // A shallow frontier is not a bundle prerequisite. Preserve the entire
@@ -147,13 +233,14 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
         return super::shallow::write_bundle(private, bundle, &boundary);
     }
     let Some(base) = base else {
-        output(
+        return create_bundle(
             git(private)
                 .args(["bundle", "create"])
                 .arg(bundle)
                 .arg("--all"),
-        )?;
-        return Ok(());
+            bundle,
+            None,
+        );
     };
     let commits = prerequisite_commits(private, base)?;
     let exclusions = commits.iter().fold(String::new(), |mut result, value| {
@@ -162,12 +249,13 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
         result.push('\n');
         result
     });
-    input(
+    let stats = create_bundle(
         git(private)
             .args(["bundle", "create"])
             .arg(bundle)
             .args(["--all", "--stdin"]),
-        exclusions.as_bytes(),
+        bundle,
+        Some(exclusions.as_bytes()),
     )?;
 
     // Git omits excluded ref tips from bundle headers. Our HEAD may be exactly
@@ -214,7 +302,7 @@ pub(super) fn write_bundle(private: &Path, bundle: &Path, base: Option<&Path>) -
     target.sync_file_counted()?;
     fs::rename(&pending, bundle)?;
     fs::File::open(bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?.sync_dir_counted()?;
-    Ok(())
+    Ok(stats)
 }
 
 #[cfg(test)]

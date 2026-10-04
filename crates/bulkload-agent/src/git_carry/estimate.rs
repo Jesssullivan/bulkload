@@ -710,23 +710,16 @@ pub(super) struct Repository {
     pub(super) ceiling: PathBuf,
 }
 
-/// [`git`] on the probed git dir, plus the estimate's no-write, no-network
-/// hardening (F1): `--no-optional-locks`, `gc.auto=0` and
-/// `core.hooksPath=/dev/null` come from [`git`]; this adds `--git-dir`,
-/// `GIT_CEILING_DIRECTORIES`, `maintenance.auto=false` and
-/// `GIT_NO_LAZY_FETCH`.
+/// [`git`] on the probed git dir. Every hardening variable and `-c` override
+/// comes from the one [`super::git_env`] table through [`git`]; this adds only
+/// `--git-dir` and the probe's own `GIT_CEILING_DIRECTORIES` (F1).
 pub(super) fn hardened(repository: &Repository) -> Command {
     let mut command = git(&repository.git_dir);
     let mut git_dir = std::ffi::OsString::from("--git-dir=");
     git_dir.push(&repository.git_dir);
     command
         .arg(git_dir)
-        .args(["-c", "maintenance.auto=false"])
-        .env("GIT_CEILING_DIRECTORIES", &repository.ceiling)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env("LANGUAGE", "");
+        .env("GIT_CEILING_DIRECTORIES", &repository.ceiling);
     command
 }
 
@@ -758,8 +751,8 @@ const PROBE_GIT_TOO_OLD: i32 = 5;
 /// carrying one oid each, then `end`.
 pub const PROBE_SCRIPT: &str = r#"set -eu
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
-export GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null LC_ALL=C LANGUAGE=
-g() { git --no-optional-locks -c maintenance.auto=false -c gc.auto=0 -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 LC_ALL=C LANGUAGE=
+g() { git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c pack.threads=2 -c pack.windowMemory=64m "$@"; }
 version=$(git version) || exit 5
 case "$version" in 'git version '*) version=${version#git version } ;; *) exit 5 ;; esac
 case "$version" in
@@ -1475,6 +1468,10 @@ mod tests {
             let repo = self.root.join(name);
             let url = format!("file://{}", origin.display());
             let mut command = git(&self.root);
+            // Making the fixture is not a source read: its checkout must
+            // fault in the blobs the filter left behind (WP1 PR 1 made
+            // `GIT_NO_LAZY_FETCH` part of every hardened child).
+            command.env_remove("GIT_NO_LAZY_FETCH");
             command.args(["clone", "--quiet", "--template=", "--filter=blob:none"]);
             if !checkout {
                 command.arg("--no-checkout");
@@ -2274,7 +2271,31 @@ mod tests {
         ] {
             assert!(g.contains(flag), "{flag}");
         }
-        assert!(PROBE_SCRIPT.contains("export GIT_NO_LAZY_FETCH=1"));
+        // WP1 PR 1: the probe preamble is the one `git_env` table, entry for
+        // entry, so the remote probe and the local builder cannot drift.
+        for config in super::super::git_env::CONFIG {
+            assert!(g.contains(&format!("-c {config} ")), "{config}");
+        }
+        let exported = PROBE_SCRIPT
+            .lines()
+            .find(|line| line.starts_with("export GIT_TERMINAL_PROMPT="))
+            .unwrap();
+        for (key, value) in super::super::git_env::SET {
+            assert!(
+                exported
+                    .split(' ')
+                    .any(|word| word == format!("{key}={value}")),
+                "{key}"
+            );
+        }
+        let unset = PROBE_SCRIPT
+            .lines()
+            .find(|line| line.starts_with("unset "))
+            .unwrap();
+        for key in super::super::git_env::CLEARED {
+            assert!(unset.split(' ').any(|word| word == *key), "{key}");
+        }
+        assert!(PROBE_SCRIPT.contains("GIT_NO_LAZY_FETCH=1"));
         // Every git call but `git version` goes through `g`.
         for line in PROBE_SCRIPT.lines().filter(|line| line.contains("git ")) {
             assert!(

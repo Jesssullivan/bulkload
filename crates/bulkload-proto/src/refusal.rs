@@ -141,6 +141,11 @@ pub enum BulkloadRefusal {
     /// and the like), where its `flock` locks cannot be trusted. Ingest
     /// destinations must be local filesystems (operator ruling OI-1001-Q17).
     GitDestinationFilesystemUnsupported,
+    /// A Git source is a partial clone (a promisor remote, a partial-clone
+    /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
+    /// store or an alternate). Reading it could fault in a lazy fetch, so v1
+    /// carry refuses it before any other read (S2, OI-1003-Q16).
+    GitSourcePartialClone,
 
     // ---- sqlite -----------------------------------------------------------
     /// `PRAGMA quick_check` or the foreign-key check failed.
@@ -236,6 +241,7 @@ impl BulkloadRefusal {
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+            Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
@@ -298,6 +304,7 @@ impl BulkloadRefusal {
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
+        "GIT_SOURCE_PARTIAL_CLONE",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
@@ -401,6 +408,7 @@ mod tests {
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitDestinationFilesystemUnsupported,
+            BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,

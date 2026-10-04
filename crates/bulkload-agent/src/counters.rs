@@ -34,6 +34,25 @@
 //! Flush counts are attempts (a failed flush is still counted). `SQLite`
 //! commit counters count successful commits only.
 //!
+//! Git children (`git bundle create`, `git pack-objects`) that pack a
+//! capture's objects from the source object store are measured from the
+//! child's own resource usage, collected by `wait4` when it exits:
+//! `read_source_pack_readback_bytes` is `ru_inblock` x 512. On Linux that is
+//! exactly the child's `/proc/<pid>/io` `read_bytes` (storage reads, 512-byte
+//! units). On Darwin `ru_inblock` counts block input operations, not sectors,
+//! so x 512 is a **lower bound**. On both, reads served from the page cache
+//! and mmap'd pack windows already resident are invisible: the counter is a
+//! lower bound on what the child read, never an over-count. The logical
+//! measure is `write_source_pack_bytes` and `write_source_pack_objects`: every
+//! object in a capture pack was read from an object store to be written.
+//!
+//! Every counter is incremented by production code; a declared counter
+//! nothing increments would read as a measured zero, so the
+//! `every_counter_is_incremented_somewhere` scan refuses one (WP2: the
+//! pack-store era's `read_other_chunk`, `write_dest_pack`,
+//! `write_legacy_chunk`, `blake3_capture_file`, `blake3_store_read_verify`
+//! and `blake3_legacy_put` were removed for that reason).
+//!
 //! Not counted as flushes: syncs done by child processes. `git` children
 //! spawned by the Git carry verbs flush on their own, so the flush counters
 //! are a lower bound on the syncs a verb causes.
@@ -71,16 +90,23 @@ macro_rules! counters {
 counters! {
     // Bytes read, by stage.
     SourceFileRead => "read_source_file_bytes",
+    // Retained capture bundles a Git capture fetched to reuse their blobs
+    // (logical: the bundle's length per fetch).
     SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
+    // Storage reads by the git children that pack a capture's objects (see
+    // the module notes: a lower bound, page-cache hits are invisible).
     SourcePackReadback => "read_source_pack_readback_bytes",
     DestLocalReuseRead => "read_dest_local_reuse_bytes",
     DestVerifyRead => "read_dest_verify_existing_bytes",
-    OtherChunkRead => "read_other_chunk_bytes",
     HashFileRead => "read_hash_file_bytes",
+    // A bundle copied into a private stage before a restore or import reads it.
+    BundleStageRead => "read_bundle_stage_bytes",
     // Bytes written, by stage.
+    // Capture bundles written by git children from source objects, and the
+    // objects their packs hold.
     SourcePackWrite => "write_source_pack_bytes",
-    DestPackWrite => "write_dest_pack_bytes",
-    LegacyChunkWrite => "write_legacy_chunk_bytes",
+    SourcePackObjects => "write_source_pack_objects",
+    BundleStageWrite => "write_bundle_stage_bytes",
     DestMaterializeWrite => "write_dest_materialize_bytes",
     // Framed transport, as seen by this process.
     WireFramesSent => "wire_frames_sent",
@@ -89,13 +115,11 @@ counters! {
     WireBytesReceived => "wire_bytes_received",
     // BLAKE3 bytes hashed, by purpose.
     HashCaptureChunk => "blake3_capture_chunk_bytes",
-    HashCaptureFile => "blake3_capture_file_bytes",
-    HashStoreReadVerify => "blake3_store_read_verify_bytes",
-    HashLegacyPut => "blake3_legacy_put_bytes",
     HashWireVerify => "blake3_dest_wire_verify_bytes",
     HashDestReuse => "blake3_dest_local_reuse_bytes",
     HashVerifyExisting => "blake3_verify_existing_bytes",
     HashFile => "blake3_hash_file_bytes",
+    HashBundleStage => "blake3_bundle_stage_bytes",
     HashOther => "blake3_other_bytes",
     // Flushes, by kind (mutually exclusive), with worker-summed nanoseconds.
     FlushFull => "flush_full_count",
@@ -130,6 +154,8 @@ counters! {
     // deleted on its first open by this engine (#125): each costs one source
     // read of its seat.
     TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
+    // Metadata censuses of a Git checkout (one walk of its worktree each).
+    CensusWalks => "census_walks",
 }
 
 const COUNT: usize = Counter::ALL.len();
@@ -328,13 +354,11 @@ impl Counters {
     pub fn blake3_total(&self) -> u64 {
         self.sum(&[
             Counter::HashCaptureChunk,
-            Counter::HashCaptureFile,
-            Counter::HashStoreReadVerify,
-            Counter::HashLegacyPut,
             Counter::HashWireVerify,
             Counter::HashDestReuse,
             Counter::HashVerifyExisting,
             Counter::HashFile,
+            Counter::HashBundleStage,
             Counter::HashOther,
         ])
     }
@@ -414,6 +438,51 @@ mod tests {
         assert!(after.blake3_total() >= 10);
         assert!(after.render().contains("blake3_other_bytes="));
         assert!(after.render().contains("blake3_total_bytes="));
+    }
+
+    // WP2 (OI-1003-Q15): a counter that nothing increments reads as a
+    // measured zero. Every variant must be named by production code outside
+    // this module (a source scan, so a test-only increment does not count).
+    #[test]
+    fn every_counter_is_incremented_somewhere() -> std::io::Result<()> {
+        fn sources(dir: &std::path::Path, out: &mut String) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "tests") {
+                        continue;
+                    }
+                    sources(&path, out)?;
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !path.ends_with("tests.rs")
+                {
+                    let text = std::fs::read_to_string(&path)?;
+                    // Production code only: stop at the inline test module.
+                    let mut production = text.split("mod tests {").next().unwrap_or("");
+                    if path.ends_with("counters.rs") {
+                        // Here only the flush wrappers count, not the table
+                        // that declares the variants nor the derived sums.
+                        let start = production.find("/// Add `amount`").unwrap_or(0);
+                        let end = production.find("impl Counters {").unwrap_or(start);
+                        production = production.get(start..end).unwrap_or("");
+                    }
+                    out.push_str(production);
+                }
+            }
+            Ok(())
+        }
+        let mut text = String::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut text,
+        )?;
+        let unused: Vec<String> = Counter::ALL
+            .iter()
+            .map(|counter| format!("{counter:?}"))
+            .filter(|name| !text.contains(&format!("Counter::{name}")))
+            .collect();
+        assert!(unused.is_empty(), "never incremented: {unused:?}");
+        Ok(())
     }
 
     #[test]
