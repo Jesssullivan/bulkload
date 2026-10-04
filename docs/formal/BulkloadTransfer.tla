@@ -260,8 +260,8 @@ HeldPhys(s, v) ==
     /\ out[s].pres /\ out[s].dd /\ out[s].nd /\ out[s].data # GARBAGE
     /\ \E r \in dstRows : r.seat = s /\ r.key % KeyBase = v /\ r.id = out[s].id
 
-\* Row keys (A/transfer.rs row_key over the authority from Start and the
-\* walked row): the key the walk offers, and the key of the walked row.
+\* Row keys (A/transfer_store.rs row_key over the authority from Start and
+\* the walked row): the key the walk offers, and the key of the walked row.
 WireKey(s) == srcAuth * KeyBase + srcStat[s]
 SKey(s) == srcAuth * KeyBase + sRow[s]
 
@@ -402,9 +402,10 @@ StartRun ==
 (* A/transfer.rs walk_source, Outbound::walked, Outbound::offer            *)
 (* (Control::Entry); A/walk.rs Walker. The walk is metadata only (stat).   *)
 (* The Entry carries the row; the destination keys it with the authority   *)
-(* from Start (A/transfer.rs receive, row_key), modelled as WireKey. The   *)
-(* Entry's b flag reports whether the source ledger holds the row key;     *)
-(* only Mutation src_ledger_carries_r25 lets the destination read it.      *)
+(* from Start (A/transfer.rs receive; A/transfer_store.rs row_key),        *)
+(* modelled as WireKey. The Entry's b flag reports whether the source      *)
+(* ledger holds the row key; only Mutation src_ledger_carries_r25 lets the *)
+(* destination read it.                                                    *)
 Walk(s) ==
     /\ sess = "on" /\ sEnt[s] = "unwalked" /\ msg[s] = NoMsg
     /\ sEnt' = [sEnt EXCEPT ![s] = "offered"]
@@ -1158,7 +1159,13 @@ S2_BackupLockBounded ==
 ClosureAccounted ==
     sess = "done" => \A s \in Seats : outc[s] \in {"applied", "applied_racy"} \cup TypedCodes
 
-WithinBudget == TLCGet("duration") < BudgetSeconds
+(* Wall-clock budget, checked by TLC on every state it explores. It is     *)
+(* state-level on purpose: TLC evaluates a zero-arity definition that      *)
+(* names no variable once, at startup, so a budget written only over        *)
+(* TLCGet("duration") never trips. The conjunct over run makes TLC          *)
+(* evaluate it per state. A trip is reported as INCONCLUSIVE, never as a   *)
+(* pass or a caught mutant (README.md; MC_budget_selftest proves it).      *)
+WithinBudget == run \in 0..MaxRuns => TLCGet("duration") < BudgetSeconds
 
 (* Liveness: with no crash, a stable source and a fair protocol, every     *)
 (* started run reaches closure, and every run is made.                     *)
