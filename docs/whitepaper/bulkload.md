@@ -1,9 +1,10 @@
 # bulkload: moving a live agent estate between machines
 
 **Whitepaper, draft of 2026-10-03.** Proof package item one (OI-1003-Q7).
-Code base: `origin/main` at `46587af`. That includes WP1 (#145, merged as
-`adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152, `6268175`) and
-WP2 PR 2 (#146, `46587af`).
+Code base: `origin/main` at `4a7b86b`. That includes WP1 (#145, merged as
+`adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152, `6268175`),
+WP2 PR 2 (#146, `46587af`) and bounded salvage with legacy-row
+invalidation (#154, `4a7b86b`).
 References use keys in square brackets (for example
 [Rsync96]); each one resolves in the [bibliography](bibliography.md), with
 a note on how it was verified.
@@ -18,7 +19,7 @@ normative document disagree, the normative document wins:
 
 Statements about the code cite a file under `crates/`. Statements about
 results cite an evidence file and its date. Work that is ratified but not on
-`main` at `46587af` is marked as such. The paper quotes no SLO number; it
+`main` at `4a7b86b` is marked as such. The paper quotes no SLO number; it
 links [`docs/slo.md`](../slo.md) for them, so a dated amendment there cannot
 leave this paper silently out of date.
 
@@ -235,9 +236,18 @@ source                                   destination
   chunks, hashes each chunk and streams it. The destination verifies every
   chunk against its digest, writes it at its offset, and checks coverage
   and the manifest root before the output joins a group commit.
-- **WantManifest and NeedChunks.** The destination chooses this when it
-  could fill chunks itself: the output path already exists, or published
-  outputs hold some of the chunks. The source sends its manifest, from its
+- **WantManifest and NeedChunks.** The destination chooses this for a
+  regular file it cannot `Reuse` when any of three things holds
+  (`Inbound::entry` in `transfer.rs`): the output path already exists; the
+  store records any chunk hint at all (`Store::has_output_hints`, checked
+  once per session, not per file); or the start-of-session sweep salvaged
+  any temporary. So in any session after one that published an output,
+  every new or changed file costs a manifest round trip, whether or not
+  the destination holds any of that file's chunks. [`docs/design.md`](../design.md)
+  ("WantManifest") states the rule more narrowly: an existing output, or
+  published outputs that hold chunks. The formal model's README at
+  `3dbfbdb` already records the salvage condition as a disagreement between
+  the code and `docs/design.md`. The source sends its manifest, from its
   ledger without reading when the stat identity is recorded. The destination
   fills what it can from verified local chunks, then asks only for the
   missing indices. A fresh manifest is built from one read kept in memory
@@ -329,20 +339,51 @@ reserves its size until its `Held`, and a write that would leave less than
 
 ### 2.6 Crash resume and racy captures
 
-A rerun after any interruption meets four kinds of leftover state:
+A rerun after an interruption, or over a store an older engine wrote, meets
+five kinds of leftover state:
 
 - **Committed captures and output records.** A seat whose stat identity is
   unchanged is answered `Reuse`, and the source reads nothing.
 - **Final names without records.** An existing output is adopted only after
   it is verified against the source's manifest (`WantManifest`).
-- **Temporaries.** The sweep removes a temporary only when it carries this
+- **Temporaries.** The sweep acts on a temporary only when it carries this
   store's tag, matches the name grammar exactly, and has the expected kind
-  and owner (R-N79). On `main`, the sweep keeps every one of this store's
-  orphaned file temporaries as a chunk source, so they save wire bytes, and
-  removes them all when the session finishes (#97). A bound on salvage, with
-  a typed refusal past it, is ratified (#124, OI-1002-Q33). Its numbers
-  were ratified as OI-1003-Q24 (Linear TIN-4543) and are not yet in
-  `docs/slo.md`. Its code is in #154, which is not on `main`.
+  and owner (R-N79). It keeps each such orphaned file temporary that has no
+  other link as a chunk source for the new session, under a session name
+  (`sweep` in `materialize.rs`). These save wire bytes only: no recorded
+  capture's bytes live only in a temporary.
+  - Since #154 (`4a7b86b`), the end of the session removes them all,
+    except those that an entry refused in that session had staged chunks
+    from. Such a refusal touched bytes: the entry's staged file was
+    filled, then failed to verify, to publish or to commit with its group.
+    Those temporaries are kept for the retry and reported as left (#124,
+    OI-1002-Q33).
+  - An entry refused before it staged anything keeps nothing, so a path
+    refused on every run never accumulates temporaries (#97).
+  - Kept salvage is bounded per session at 1024 temporaries and 4 GiB
+    (`SALVAGE_KEEP_FILES` and `SALVAGE_KEEP_BYTES` in `transfer.rs`),
+    filled greedily in salvage order (`bound_salvage`). A temporary past
+    the bound is removed and refused as a value, `SALVAGE_BOUND_EXCEEDED`
+    under its current name, and its chunks are sent again by the next run.
+  - The values were ratified as OI-1003-Q24 (Linear TIN-4543), as the
+    comment at the constants says. Their `docs/slo.md` text is on
+    `docs/coordinator-20261003` (`9784467`), not on `main`, and
+    `docs/design.md` on `main` still calls them unruled engineering
+    defaults.
+- **Rows from before the racy guard** (#125, OI-1003-Q26). Since #154, a
+  store this engine creates carries a `racy_guard` marker from its first
+  commit. A store without the marker was written by an earlier engine, some
+  of them before the racy rule below existed (#86), so none of its ledger or
+  output rows is trusted to show that its seat was not racy.
+  - The first writable open deletes every `captures` and `outputs` row in
+    the transaction that adds the marker, and counts them
+    (`transfer_legacy_rows_invalidated`). A read-only handle on an unmarked
+    store trusts none of them (`Store::open` and `Store::open_reader` in
+    `transfer_store.rs`).
+  - Each such seat is read once more, which R25 allows, and is then
+    recorded under the guard. Chunk hints are kept, so content the
+    destination still holds is adopted after verification and does not
+    cross the wire again.
 - **A failed group.** A group whose seal or store commit fails (a full disk,
   for example) answers each entry `Held{false}`. Neither store records
   them, and the next run reads each one once (#100).
@@ -476,12 +517,28 @@ budget turns an endlessly restarting backup into a typed refusal
 S2's "no locks" (WP0(b), OI-1003-Q16). The ruling requires it to be
 shared-read only, bounded and counted. The code bounds it by step count
 (`max_steps` steps of at most 128 pages, with no wait on contention), not by
-duration. No counter records backup steps or lock holds yet. A probe
-reported on 2026-10-03 indicates that this kind of open also creates a
-`-shm` file beside a source database that has none, which is a source-side
-write (section 8). Composition
-preserves unique rows on both sides and keeps conflicting snapshots for
-explicit resolution. A snapshot is never installed over a live database.
+duration. No counter records backup steps or lock holds yet.
+
+A probe reported on 2026-10-03 found that this kind of open also creates a
+`<db>-shm` file, SQLite's wal-index, beside a WAL source database that has
+none (section 8). That is a source-side write. OI-1003-Q36 (recorded on
+Linear TIN-4543) admits it by extending the Q16 exception, on conditions:
+
+- a backup-API read of a WAL-mode source may create or touch `<db>-shm`.
+  It is SQLite's coordination file, it carries no user data, and a live
+  writer on the source would create it in any case;
+- the effect is counted and recorded in S2 evidence;
+- the main database file and its `-wal` must stay byte-identical;
+- a property test asserts that the read makes no other source write.
+
+The ruling's `docs/slo.md` text is on `docs/coordinator-20261003`
+(`8dd4546`), not on `main`. Its implementation is open as #157: on `main`
+no counter records the `-shm` effect and no property test checks the
+conditions.
+
+Composition preserves unique rows on both sides and keeps conflicting
+snapshots for explicit resolution. A snapshot is never installed over a
+live database.
 
 ### 2.9 Typed refusals and closure accounting (S4)
 
@@ -497,7 +554,7 @@ section 1, problem 3). That review counted, at `727493a`:
   `output()` maps any failed Git child to that one code and drops its
   stderr.
 
-On `46587af`, a failed SQLite backup step still maps to `Io(None)`
+On `4a7b86b`, a failed SQLite backup step still maps to `Io(None)`
 (`snapshot` in `src/provider_sqlite.rs`). `closure.rs` still reads a refusal
 code back out of the receipt's Display text (`split_whitespace`), instead of
 matching a typed value. Such refusals name no cause that a disposition could
@@ -611,8 +668,13 @@ re-read for correctness.
 **Limits.** A stat identity is a reuse key, not a content digest. Changed
 files, replaced inodes, journal gaps and lost source authority invalidate
 reuse ([`docs/design.md`](../design.md)). The racy reference is the
-capturing host's wall clock, not the filesystem's. A network filesystem
-whose clock runs more than 2 s behind can defeat the guard. The counters
+capturing host's wall clock, not the filesystem's. A source on NFS or SMB
+whose server clock runs more than 2 s behind the capturing host can defeat
+the guard; one that runs ahead only makes more captures racy.
+`docs/design.md` now states this as a known limit ("Known limit: clocks",
+added by #154). It advises keeping such sources NTP-synchronised with the
+capturing host, or carrying them from a host where they are local. The
+counters
 that make R25 measurable on the file path (`source_bytes_read`,
 `transferred_content_bytes`) do not see reads made by Git child processes.
 Since WP2 PR 1, the Git children that pack a capture are counted from their
@@ -642,9 +704,13 @@ in section 4.
 **Statement** (paraphrased; the normative text and the budget are S2 and
 WP0(b) in [`docs/slo.md`](../slo.md)). S2 requires that bulkload take no
 lock on a source repository, write nothing to the source, signal no
-process, and run at background priority. The one stated exception is
-SQLite's shared read lock (OI-1003-Q5, Q9, Q16). This section says how much
-of that holds today.
+process, and run at background priority (OI-1003-Q5, Q9). Both stated
+exceptions are SQLite's: the backup's shared read lock (OI-1003-Q16), and
+the backup read's creation or touch of the `<db>-shm` wal-index
+(OI-1003-Q36, which extends Q16 on conditions; section 2.8). Q36 is
+recorded on Linear TIN-4543, and its `docs/slo.md` text is on
+`docs/coordinator-20261003` (`8dd4546`), not yet on `main`. This section
+says how much of that holds today.
 
 **Why it matters.** The source is a live workstation. A mover that takes
 `index.lock`, triggers `gc`, runs a hook, fetches from a promisor remote, or
@@ -708,8 +774,9 @@ problem 1). WP1 closed these parts of that finding:
   path today. It does not cover the Git carry or the SQLite capture.
 
 WP1's priority list is wider than WP0(f)'s list in `docs/slo.md`. A pending
-amendment (OI-1003-Q25, recorded on Linear TIN-4543), not yet in
-`docs/slo.md`, widens WP0(f) to match.
+amendment (OI-1003-Q25, recorded on Linear TIN-4543; its text is on
+`docs/coordinator-20261003` at `9784467`), not yet in `docs/slo.md` on
+`main`, widens WP0(f) to match.
 
 **What is still open:**
 
@@ -726,12 +793,17 @@ amendment (OI-1003-Q25, recorded on Linear TIN-4543), not yet in
   (`3dbfbdb`, not on `main`; section 4). It models the transfer protocol,
   and it cannot prove S2 at the level of the code. It represents Git and
   SQLite source access only as abstract typed reads, and it does not model
-  the Git carry itself.
-- **SQLite `-shm` creation.** The WP0(e) estate-corpus work reported a
-  probe on 2026-10-03: a read-only, WAL-aware open, made the way `snapshot`
-  opens a source, created `<db>-shm` beside a WAL database (section 8).
-  That is a write to the source. Whether it falls inside OI-1003-Q16's
-  SQLite exception is an open operator ruling (Linear TIN-4543).
+  the Git carry itself. Its `S2_TypedSourceAccess` has no `-shm` write: the
+  README at `3dbfbdb` leaves the backup's possible touch of `-shm` to P34.
+- **The SQLite wal-index exception** (OI-1003-Q36, #157). The WP0(e)
+  estate-corpus work reported a probe on 2026-10-03: a read-only, WAL-aware
+  open, made the way `snapshot` opens a source, created `<db>-shm` beside a
+  WAL database (section 8). Q36 admits that write inside the Q16 exception
+  on its conditions (section 2.8). None of them is built yet. #157 is to
+  add the counter and record it in S2 evidence, and a P34-family property
+  test. Over generated WAL sources, with and without an existing `-shm`,
+  that test is to show that the main file and `-wal` stay byte-identical
+  and that no other source write occurs.
 
 The idle I/O class only helps where the kernel's I/O scheduler honours
 priority classes [IoprioSet]. This is why S2's budget is measured, not
@@ -750,7 +822,7 @@ each claim. Five instruments exist or are being built.
   times the cases. There is no fuzzing (OI-1003-Q7). The method follows
   QuickCheck [QuickCheck00] through `proptest` [Proptest]. A test is retired
   only when its subsuming property catches the specific mutant the old test
-  was written for. On `main` at `46587af`, `proptest!` appears in six
+  was written for. On `main` at `4a7b86b`, `proptest!` appears in seven
   places:
   - the slab pool and chunker models (`src/io/buf/tests.rs`,
     `src/io/chunker/tests.rs`);
@@ -760,11 +832,14 @@ each claim. Five instruments exist or are being built.
   - WP10 PR 1's two properties of the shared child-drain helper,
     `drain_bounded` (`src/child.rs`, #152);
   - WP2 PR 2's P-CHAIN property of auto-prerequisite chains
-    (`estate::wp2_chain` in `src/estate.rs`, #146).
+    (`estate::wp2_chain` in `src/estate.rs`, #146);
+  - #154's salvage-bound property,
+    `the_salvage_bound_keeps_greedily_within_both_limits`, a second block
+    in `src/transfer/tests.rs` (#124, section 2.6).
 
   WP1 also added `test_support::prop_config`, the plan's fixed-seed helper,
-  in minimal form; P-S2, `drain_bounded`'s properties and P-CHAIN run
-  through it.
+  in minimal form; P-S2, `drain_bounded`'s properties, P-CHAIN and the
+  salvage-bound property run through it.
   The plan counted three places before WP1
   ([plan](../plans/2026-10-03-property-test-plan.md), section 0). The
   catalogue is mostly planned work.
@@ -797,7 +872,9 @@ each claim. Five instruments exist or are being built.
   - racy captures, source edits, third-party writes at the destination,
     failed group commits and the space refusal;
   - source access as typed reads, with the SQLite backup's shared read lock
-    as the one bounded exception;
+    as the one bounded exception. The model has no `-shm` write, so it does
+    not represent OI-1003-Q36's wal-index exception; its README leaves the
+    backup's possible touch of `-shm` to P34;
   - variants for WP0(g), the relaxed source ledger, and two candidate
     designs for WP0(d), superseding publish.
 
@@ -917,17 +994,17 @@ each claim. Five instruments exist or are being built.
   on it in addition to R23's 23-file corpus. It is in progress
   (`feat/wp0e-estate-corpus-20261003`).
 
-| SLO | Instrument | State at `46587af` |
+| SLO | Instrument | State at `4a7b86b` |
 |---|---|---|
 | S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
-| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`. The `-shm` finding awaits a ruling. |
+| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`; the model has no `-shm` write. The `-shm` wal-index write is ruled admissible on conditions (OI-1003-Q36, TIN-4543; `docs/slo.md` text on the coordinator branch, not on `main`); its counter and property test are pending (#157). |
 | S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not built. Pending gate. |
-| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
+| S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. Since #154 a store from before the racy guard has its rows invalidated once, counted (#125). In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
 | S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`; disposition ledger pending. |
 | S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is bare `IO` (WP5 PR 2). See section 2.10. |
-| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #146's source, build, test and fault-harness checks passed before it merged as `46587af`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
+| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #154's source, build, test and fault-harness checks passed before it merged as `4a7b86b`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
 
 ## 5. Results
 
@@ -1243,9 +1320,13 @@ ranks the work. This paper only points at it:
 
 - S2 source safety: WP1 is on `main` (section 3.3). Still to come: WP7 for
   typed source access in the types, WP6's S2 sampler, P34 and P35 from the
-  property-test plan, review and merge of the formal model, and a ruling
-  on the SQLite `-shm` finding;
-- bounded salvage (#124, OI-1002-Q33): code in #154, open, not on `main`;
+  property-test plan, review and merge of the formal model, and #157, the
+  counter and property test that OI-1003-Q36's wal-index exception
+  requires;
+- bounded salvage (#124, OI-1002-Q33) and legacy-row invalidation (#125,
+  OI-1003-Q26) are on `main` (#154, `4a7b86b`). The ratified bound values
+  (OI-1003-Q24) still need their `docs/slo.md` text to reach `main`, and
+  `docs/design.md`'s "unruled engineering defaults" wording to be updated;
 - one Git engine with counted, incremental v1: WP2. PR 1 (pack-read and
   census counters) and PR 2 (auto-prerequisite chains, #146) are on
   `main`. The S3 measurement on the estate corpus, and then the choice of
@@ -1333,10 +1414,13 @@ waits for the full post-train `main`.
   created `<db>-shm` beside the database. The 3.51.2 probe also showed the
   main file and `-wal` staying byte-identical. The record is in
   `docs/evidence/estate-corpus-v1-2026-10-03.md` on
-  `feat/wp0e-estate-corpus-20261003` (`7b75b26`), which is not on `main`,
-  and on Linear TIN-4543. No repository test on `main` runs bulkload's own
-  open in that state. Whether S2 and OI-1003-Q16 admit this write is an
-  open operator ruling.
+  `feat/wp0e-estate-corpus-20261003` (`7b75b26`, and still at the
+  branch's later head `ec142cf`), which is not on `main`, and on Linear
+  TIN-4543. OI-1003-Q36 admits this write on conditions (section 2.8), but
+  until #157 lands, no repository test on `main` runs bulkload's own open
+  in that state, and nothing counts the write or checks that the main file
+  and `-wal` stay byte-identical. The model does not represent the write
+  either (section 4).
 - **The stat-identity trust model is cooperative.** Reuse trusts stat
   identity and the capturing host's clock. A writer able to forge ctime, or
   a filesystem whose clock lags by more than 2 s, defeats it. Capture
