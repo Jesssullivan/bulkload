@@ -5,7 +5,9 @@
 **Rulings:** OI-1003-Q7 (proof package: whitepaper and bibliography),
 OI-1003-Q23 (lane fan-out; C is the whitepaper and bibliography),
 OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
-(receipts and this note). All are recorded on Linear TIN-4543.
+(receipts and this note). All are recorded on Linear TIN-4543. The paper
+also cites OI-1003-Q37 and Q38 (TIN-4543, 2026-10-04 08:45Z) as content;
+they are not this lane's authority.
 
 ## Commits on the branch
 
@@ -25,7 +27,10 @@ OI-1003-Q32 (the formal model is a TLA+/Dhall/Haskell hybrid), R-N13
 | `1e481b1` | Re-pin to `4a10bb8`: section 2.1's dead_code reason, WP10 PR 2 on `main`, the durability row. |
 | `dd30add` | Lanes A and B under review (#159, #160): section 4 describes `3dbfbdb` only and notes that `27581be` supersedes its run of record; sections 3.3, 4, 7 and 8 add lane A's reported Git-carry source write and its `snapshot` smoke. |
 | `3e41784` | This note: the second re-pin, the relaunch pass and check-fast run 5. |
-| next commit | This note: the ship pass (PR #164) and check-fast run 6. |
+| `8e6817c` | This note: the ship pass (PR #164) and check-fast run 6. |
+| `c3b6cc9` | Merge of `origin/main` at `dfb9604` (#159, #160, #150, #151). |
+| `eab0446` | Refresh pass: re-pin to `dfb9604`; the verification review's four mediums and one low (below). |
+| next commit | This note: the refresh pass and check-fast run 7. |
 
 The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 `04ea9cb`. This pass merged `main` instead and did not rewrite history.
@@ -33,7 +38,7 @@ The branch was first cut from `57030e1`. The review-fix pass rebased it onto
 ## Done
 
 - **Paper** (`docs/whitepaper/bulkload.md`), pinned to `origin/main`
-  `4a10bb8`. It covers the problem, the design, the invariants (R25,
+  `dfb9604`. It covers the problem, the design, the invariants (R25,
   durability ordering, S2), how each SLO is proven, results, related work,
   future work and limits. Section 5 quotes only `docs/evidence/`. SLO
   numbers are linked to `docs/slo.md`, not copied.
@@ -230,6 +235,102 @@ Relaunched by the coordinator as the only writer, to open the PR.
   `StreamCDC`, `KeyParts::carries` and S4's #40 were re-checked at
   `4a10bb8` and still hold. This pass did not change the paper.
 
+## Refresh pass (2026-10-04, after the wave-3 merges)
+
+Relaunched by the coordinator as the only writer, to fix the verification
+review of #164: four mediums and one low, all caused by the night's merges
+and rulings. Checked against `origin/main` `dfb9604`, issues #161–#163 and
+#165 over REST, `docs/formal/README.md` and
+`docs/evidence/estate-corpus-v1-2026-10-03.md` on `main`, and TIN-4543's
+comments of 08:45Z (Q37, Q38) and 10:44Z (merge train, gate (a) start).
+
+- **Merge.** `origin/main` at `dfb9604` merged cleanly as `c3b6cc9`. The
+  header is re-pinned to it and lists #159, #160, #150 and #151.
+- **N1, WP0(g) is ruled.** Section 4's WP0(g) finding now cites
+  OI-1003-Q37: source-ledger row commits may use `synchronous=NORMAL` and
+  `fullfsync=OFF`, the store-creation (authority) commit stays FULL, and
+  the relaxation lands only after #161. It says Q37 is not in
+  `docs/slo.md` on `main` (whose WP0(g) text still covers the whole
+  ledger) and that WP0(g) is not implemented. Section 7 adds the
+  ordering.
+- **N2, #161 is an open durability defect.** Named in:
+  - section 2.4 (R25's safety rests on the stores surviving power loss);
+  - section 3.2, a new paragraph: `private_dir` never seals the parent,
+    `Store::open` never seals the root, `crash_check` does not model a
+    store's own files, and the model makes it explicit as
+    `StoreRootSealed` / `MC_store_root_unsealed`;
+  - section 4, a finding row, and the durability row, now "Not met for a
+    fresh state root";
+  - the S3 row, and sections 7 and 8.
+
+  Every mention says a fix lane is running and the defect is open on
+  `main`. Nothing says the code meets the condition.
+- **N3, #162 and Q38.** Section 3.3's Git-carry bullet now cites #162
+  (freshening of existing source objects by object-writing commands; 83
+  loose objects and a pack on the smoke's first pass) and OI-1003-Q38's fix
+  lane (a private object store with the source as an alternate, plus
+  #162's P34 census property). "No ruling yet" is gone from the paper.
+  Sections 2.7, 7, 8 and the S2 row mention it; section 2.9, the S4 row
+  and section 7 add the bare-repository `IO (errno 2)` refusal as an S4
+  gap.
+  - Checked in code: v1's object writes (`hash-object -w`, `mktree`,
+    `write-tree`, `commit-tree`) already go to the private repository,
+    which borrows the source's store through `alternates`
+    (`prepare_private`). The freshening happens through that link. So
+    section 3.3 says the fix must keep Git from freshening the source's
+    copies, not only move where new objects are written. Non-test code
+    runs no `stash create`, so the paper does not list it.
+- **N4, #159 and #160 are on `main`.** Sections 2.2, 2.8, 3.3, 4, 7 and 8
+  link `docs/evidence/estate-corpus-v1-2026-10-03.md` and
+  `docs/formal/README.md` on `main`. Every branch name and branch sha for
+  them is gone.
+  - Section 4 now reports the README's run of record: 43 of 43 matched
+    (10 PASS, 3 REACHED, 28 FAIL, 1 SIMULATION, 1 INCONCLUSIVE) over
+    `8bc6672`, on 2026-10-04 01:30–01:38 EDT. `MC_main` 869,296,
+    `MC_nv_core` 15,834, `MC_nv_ledger` 142,450.
+  - It also gives the README's R25 point: `R25_NoDurableReread` is the
+    operative check, and slo.md's wording (`R25_NoCommittedCaptureReread`)
+    is vacuous in code shape. The finding rows are listed, and the
+    "held durably" reading is still to be ruled (TIN-4543, 08:45Z).
+  - Section 8 drops the 3.51.2 and 3.53.1 probe history, which the
+    evidence on `main` no longer gives, and cites the smoke instead.
+- **#151, WP3.** Section 2.9 is rewritten:
+  - no dead codes;
+  - no blanket `From` conversions, and `.refuse_at(site)`;
+  - `GIT_CHILD_FAILED` with a closed `stderr_class=` set, except where a
+    site splits by cause (bundle verification, #106);
+  - `SQLITE_BACKUP_FAILED`, `PROTOCOL_STATE_VIOLATION` and `WORKER_LOST`.
+
+  What remains:
+  - 70 no-errno `IO` sites in 20 files, 28 of them in SQLite, on a
+    shrink-only allowlist;
+  - closure's Display parsing, until WP3 PR 3.
+
+  Section 2.10's object-store drift notes that it accepts
+  `GIT_CHILD_FAILED`. The paper no longer says `GIT_INVENTORY_MALFORMED`
+  is left only for unparsed output: the code still raises it for other
+  failed checks. `proptest!` now appears in nine places; WP3's two set
+  their own fixed seeds.
+- **Low, #163.** Section 4's "What the model cannot show" and section 8
+  cite #163 where the model assumes a ledger commit never fails.
+- **SLO strength re-checked** against `docs/slo.md` at `dfb9604`:
+  - S1 is not met (2026-09-18: 3015.294 against 601.010 ms);
+  - wire v5 has no gated sample. The abstract, section 5.1, the S1 row and
+    section 7 say only that a gate (a) run on `dfb9604` started at 10:43Z,
+    with no result;
+  - the model is stated as protocol-level only: no code-level S2, no Git
+    carry, no S3 Git half;
+  - the S2 row now says "not met for the Git carry", and the S2 budget row
+    cites #165.
+- **Two older lows fixed in passing:** the section 4 mutation count (now
+  23 mutation rows over 19 mutations, the unfair-liveness row and four
+  finding rows) and `MC_main`'s edit bound (per seat).
+- Bibliography: 34 of 34 keys cited and defined (script). [Proptest]'s
+  lock pin re-checked at `dfb9604` (1.11.0).
+- **For the coordinator:** `docs/design.md` on `main` still calls the
+  salvage bounds "unruled engineering defaults" (line 384); this lane does
+  not edit it.
+
 ## Duplicate-agent incident (recorded on TIN-4543)
 
 - About 22:05 EDT on 2026-10-03, the coordinator used SendMessage to send
@@ -268,6 +369,7 @@ exited 0, and the Python contract suite ran 22 tests, OK, each time.
 | 4 | `7205183` (with #154's code) plus the refuter-fix edits | 696 passed, 0 failed |
 | 5 | `dd30add` (with #153's code, which deleted stale io tests) | 682 passed, 0 failed |
 | 6 | `3e41784` plus the ship pass's edit to this note | 682 passed, 0 failed |
+| 7 | `c3b6cc9` (with #159, #160, #150 and #151) plus the refresh pass's edits, committed as `eab0446` | 690 passed, 0 failed |
 
 During run 3, only documentation lines were edited: a rewrap in section
 2.7 and this paragraph. During run 4, only documentation was edited: two
@@ -275,7 +377,13 @@ paraphrases and one sentence in the paper, and this note. Run 5 waited
 about 15 minutes for the shared lock; during it only this note was
 edited. Run 6 waited about 20 minutes for the lock; the tree was
 `3e41784` plus this note's ship-pass edit, and only that edit's result
-row was filled in afterwards. This lane changes documentation only.
+row was filled in afterwards. Run 7 started at 10:55:57Z, waited for the
+lock held by another lane, and exited 0 at 11:15:57Z. It ran as a
+harness-tracked task, waited on by notification, because the lock wait
+could outlast the 10-minute foreground limit. Its tree was the final paper
+and bibliography (committed unchanged as `eab0446`) and a draft of this
+note; only this note's sha and result rows were filled in afterwards. This
+lane changes documentation only.
 
 - The draft's run, on `57030e1`, exited 0.
 - The review-fix pass's run was queued when its session ended. No commit
@@ -283,43 +391,47 @@ row was filled in afterwards. This lane changes documentation only.
 
 ## Open
 
-- **Formal model (#160).** Section 4 describes `3dbfbdb` and says the
-  README at `27581be` supersedes its run of record. When #160 merges,
-  re-pin section 4 to the `main` path and sha: the 43-row run, the
-  reach rows, the widened WP0(g) condition, and the README's coverage and
-  "Code and design disagreements" sections. Describe the Dhall catalogue
-  and the Haskell explorer as done only once they land, and add
-  bibliography entries for them if they are cited. Adopting WP0(g) under
-  the model's conditions has no ruling yet.
+- **#161 (store-root sealing).** Open; a fix lane is running. When it
+  merges with its `crash_check` trace over `Store::open`, update sections
+  2.4, 3.2, 4 (the store-root finding and the durability row), 7 and 8.
+  Do not call it fixed before then.
+- **#162 (Git-carry freshening, bare repositories).** Open; a fix lane is
+  running under OI-1003-Q38. When it merges, update sections 2.7, 2.9,
+  3.3, 7 and 8 and the S2 and S4 rows. Check that the fix stops freshening
+  through `alternates`, not only where new objects land, and that its P34
+  census property is on `main`.
+- **#163 (failed ledger commit).** Open, labelled `later`. Update section
+  4 and section 8 if it lands.
+- **OI-1003-Q37 (WP0(g)).** Ruled on TIN-4543; not in `docs/slo.md` on
+  `main` and not implemented. Update section 4 once slo.md carries it and
+  once the relaxation lands after #161.
+- **R25 reading, slo.md's model-obligation wording, `MC_nv_ledger` as a
+  second N-version core.** TIN-4543 lists them as still to be ruled. When
+  they are, update section 4 ("R25 in the model") and section 3.1.
+- **Formal model sprint 2.** The Dhall catalogue and Haskell explorer
+  (OI-1003-Q32, Q38) are not on `main`. Describe them as done only once
+  they land, and add bibliography entries if they are cited. The README
+  says the model is not re-checked against #154.
 - **SQLite wal-index (OI-1003-Q36).** Ruled; implementation open as #157.
-  When #157 lands, cite its counter and property test in sections 2.8,
-  3.3, 4 and 8. When #159 merges, rewrite section 8's probe text to cite
-  the evidence file's `main` path and its `snapshot` smoke (the 3.51.2 and
-  3.53.1 probes are no longer in it). Point at `docs/slo.md` once
-  `8dd4546` reaches `main`.
-- **Git-carry source write (reported on #159).** `estate-capture` moved
-  the mtime and ctime of source loose objects and packs in lane A's smoke.
-  No ruling yet. When TIN-4543 records one, or #159 merges, update sections
-  3.3 and 8 and the S2 row.
-- **Gate (a) on wire v5.** There is no evidence file for the 2026-10-03
-  attempts. Cite an `r23-2026-10-03-*` file once one lands.
-  OI-1003-Q33 holds the next attempt for the full post-train `main`.
+  When it lands, cite its counter and property test in sections 2.8, 3.3,
+  4 and 8.
 - **OI-1003-Q24, Q25, Q26 and Q36 are not in `docs/slo.md` on `main`.**
-  Their text is on `docs/coordinator-20261003` (`9784467`, `8dd4546`). The
-  paper cites them through TIN-4543. Point at `docs/slo.md` once the
-  coordinator's docs PR merges.
-- **Refresh on merge** of #136, #150, #151, #159 (estate corpus, WP0(e))
-  or #160, or of a gated gate (a) sample on corpus v1. When WP0(a)'s S3
-  measurement of the chains lands, cite it in sections 2.7 and 5.4.
+  Their text is on `docs/coordinator-20261003` (`9784467`, `8dd4546`; no
+  PR, checked over REST). Point at `docs/slo.md` once it merges.
+- **Gate (a) on wire v5.** A run on `dfb9604` started at 10:43Z on
+  2026-10-04 and retries until 15:30Z (TIN-4543). Cite its evidence file
+  once one lands, and only what it records.
+- **S2 budget (#165).** Instrument on `feat/s2-budget-20261004`, not on
+  `main`. Refresh section 5.3 when a gated run lands.
+- **S3 on the estate corpus.** The harness is not on `main` (Q38 lane).
+  When it lands, cite it in sections 2.7 and 5.4.
 - **S5 classes with no owner.** Configuration, shallow-frontier, nest
   custody and rebuildable-root movement, and directory-shape drift, still
   refuse. No ruling or work package names them.
-- **Next sprint (OI-1003-Q34).** This lane's sprint 2 is the S2 budget
-  instrument, using the v0 synthetic workload; then refresh section 5.3.
 - **PR #164.** Under OI-1003-Q29 it merges once its R-N71 review is clean
   and CI is green.
-- **Nine low refuter findings on `1fda837` are not yet fixed.** #164's body
-  lists them:
+- **Seven low refuter findings on `1fda837` are not yet fixed** (two of
+  the nine were fixed in the refresh pass). #164's body lists them:
   - §2.7: the estimate's probe script does not build its children through
     `git()`;
   - "last completed" R23 sample;
@@ -327,6 +439,4 @@ row was filled in afterwards. This lane changes documentation only.
   - verbatim runs from `docs/design.md`, and copied live PR state;
   - §6 FastCDC rate (the engine uses `StreamCDC`);
   - S4's #40 is omitted;
-  - §2.10 omits the exclude file, the stash reflog and the symbolic HEAD;
-  - the §4 mutation count includes three non-mutation rows;
-  - `MC_main`'s edit bound is per seat.
+  - §2.10 omits the exclude file, the stash reflog and the symbolic HEAD.
