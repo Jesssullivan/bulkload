@@ -132,6 +132,30 @@ as properties.
     destination's durable records.
   - This holds only if proven in the formal model.
 
+## Amendments 2026-10-03 (evening): salvage, priority and legacy rows (OI-1003-Q24..Q26)
+
+- **#124 salvage bounds (OI-1003-Q24).** At most 1024 salvaged temporaries
+  and 4 GiB of them outlive a session per destination root. Past either
+  bound, the temporary is removed and refused as a value
+  (`SALVAGE_BOUND_EXCEEDED`). This ratifies the #154 defaults.
+- **WP0(f) scope (OI-1003-Q25).** Background priority covers every verb that
+  reads a live source on its own host:
+  - `serve`, `estate-capture`, `snapshot`, `git-carry-estimate`, `git-export`
+    and `copy`;
+  - not `pull`, whose source half is the remote `serve`.
+
+  On Darwin the class is IOPOL_THROTTLE, QoS background and nice 19, which
+  extends (f)'s Darwin list. `--priority=normal` opts out and is recorded as
+  `priority_from=flag`. The bench records its class with every sample.
+- **#125 legacy rows (OI-1003-Q26).** A store written before the racy-capture
+  guard is opened in place, not refused.
+  - Its ledger and output rows are invalidated in one transaction and counted
+    in `transfer_legacy_rows_invalidated`.
+  - Each such seat is read once more; R25 allows this because its row could
+    not prove the seat was not racy.
+  - Chunk hints are kept, so the re-read costs no wire bytes for content the
+    destination still holds.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
