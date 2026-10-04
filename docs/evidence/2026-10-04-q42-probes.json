@@ -1,0 +1,1532 @@
+{
+  "agent": {
+    "path": "<private scratch>/target/release/bulkload-agent",
+    "sha256": "908c20f9564301643a10850912e5f119301f18394a7c10cd4368ed398fdd7c73"
+  },
+  "build": {
+    "commit": "8dc26c19691efc8f37665b19d9b63f795103ec38",
+    "done_utc": "2026-10-04T19:33:46Z",
+    "how": "git archive into private scratch; nix develop; cargo build --release --locked -p bulkload-agent; nice 19; CARGO_BUILD_JOBS=4; shared .check-fast.lock flock; own CARGO_TARGET_DIR",
+    "queued_utc": "2026-10-04T19:28:59Z",
+    "sha256": "908c20f9564301643a10850912e5f119301f18394a7c10cd4368ed398fdd7c73",
+    "started_utc": "2026-10-04T19:29:06Z"
+  },
+  "cap": {
+    "header_bytes": 16777216,
+    "line_bytes": 1048576
+  },
+  "corpora": {
+    "carry-119761": {
+      "corpus": {
+        "build_s": 169.48,
+        "count_objects": {
+          "count": "1099",
+          "garbage": "0",
+          "in-pack": "6402",
+          "packs": "1",
+          "prune-packable": "0",
+          "size": "4396",
+          "size-garbage": "0",
+          "size-pack": "837"
+        },
+        "dirs": 64,
+        "files_per_dir": 64,
+        "header_target": null,
+        "linked_worktree": null,
+        "model": {
+          "distinct_oids": 1032,
+          "headroom_bytes": -3967688,
+          "max_ref_line": 184,
+          "mean_ref_line": 173.219,
+          "min_ref_line": 75,
+          "modelled_header_bytes": 20744904,
+          "object_format": "sha1",
+          "over_cap": true,
+          "prerequisite_bytes_if_all_tips": 55728,
+          "ref_line_bytes": 20744887,
+          "refs": 119761,
+          "refs_at_cap_at_this_mean": 96855,
+          "repo": "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/source",
+          "signature_and_blank_bytes": 17,
+          "union_mapped_refs": 119006
+        },
+        "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/source",
+        "seed": 42,
+        "shape": "carry",
+        "split": {
+          "live_native_refs": 755,
+          "metadata_commits": 471,
+          "metadata_refs_per_namespace": 4,
+          "namespaces": 157,
+          "native_commits": 561,
+          "native_refs_per_namespace": 754,
+          "oids": 1032,
+          "refs": 119761
+        },
+        "tracked_files": 4096
+      },
+      "estate": {
+        "add": {
+          "codes": [],
+          "exit": 0,
+          "kind": "ok",
+          "outcomes": [],
+          "panicked": false,
+          "refused_lines": []
+        },
+        "group": false,
+        "passes": [
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/estate/corpus",
+              "1"
+            ],
+            "bundles": [],
+            "classified": {
+              "codes": [
+                "CONTRACT_SELF_INCONSISTENT",
+                "GIT_INVENTORY_MALFORMED"
+              ],
+              "exit": 1,
+              "kind": "typed",
+              "outcomes": [
+                "refused"
+              ],
+              "panicked": false,
+              "refused_lines": [
+                "bulkload-agent: refused: CONTRACT_SELF_INCONSISTENT"
+              ]
+            },
+            "counters": {
+              "census_walks": 3,
+              "elapsed_ns": 34414701684,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 0,
+              "write_source_pack_bytes": 0,
+              "write_source_pack_objects": 0
+            },
+            "cpu_s": 30.1723,
+            "cpu_sys_s": 20.6438,
+            "cpu_user_s": 9.5285,
+            "diagnosis_bundles": [
+              {
+                "agent_reader": "GIT_INVENTORY_MALFORMED",
+                "agent_reader_cause": "header_over_16MiB",
+                "bundle_bytes": 21620236,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 20745391,
+                "headroom_bytes": -3968175,
+                "longest_line": 184,
+                "mean_ref_line": 173.213,
+                "over_cap": true,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/estate/state/a03494f9fa924d39205d197c39ba6e98fb143f72c5715fba0f938bcade05c35b-192e914b2a385e79b2b6e7341a4587cda90ff7e707e7c3ff9a43b73936eabf1d-0/capture.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 20745374,
+                "ref_lines": 119768,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "exit": 1,
+            "label": "pass-1",
+            "load1_after": 40.17,
+            "load1_before": 37.63,
+            "priority": "background",
+            "stdout_lines": [
+              "item=a03494f9fa924d39205d197c39ba6e98fb143f72c5715fba0f938bcade05c35b source=\"/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/source\" outcome=refused reason=Some(\"GIT_INVENTORY_MALFORMED\") source_bytes_read=0"
+            ],
+            "wall_s": 34.4347
+          }
+        ]
+      },
+      "git_export": {
+        "argv": [
+          "git-export",
+          "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/source",
+          "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/export"
+        ],
+        "bundles": [
+          {
+            "agent_reader": "GIT_INVENTORY_MALFORMED",
+            "agent_reader_cause": "header_over_16MiB",
+            "bundle_bytes": 21621186,
+            "cap": 16777216,
+            "capability_lines": 0,
+            "header_bytes": 20745391,
+            "headroom_bytes": -3968175,
+            "longest_line": 184,
+            "mean_ref_line": 173.213,
+            "over_cap": true,
+            "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/carry-119761/export/capture.bundle",
+            "prerequisite_bytes": 0,
+            "prerequisite_lines": 0,
+            "ref_bytes": 20745374,
+            "ref_lines": 119768,
+            "signature": "# v2 git bundle"
+          }
+        ],
+        "classified": {
+          "codes": [
+            "GIT_INVENTORY_MALFORMED"
+          ],
+          "exit": 1,
+          "kind": "typed",
+          "outcomes": [],
+          "panicked": false,
+          "refused_lines": [
+            "bulkload-agent: refused: GIT_INVENTORY_MALFORMED"
+          ]
+        },
+        "counters": {
+          "census_walks": 2,
+          "elapsed_ns": 31493759165,
+          "priority": "background",
+          "priority_from": "default",
+          "read_source_capture_reuse_bytes": 0,
+          "read_source_pack_readback_bytes": 0,
+          "write_source_pack_bytes": 0,
+          "write_source_pack_objects": 0
+        },
+        "cpu_s": 26.5509,
+        "cpu_sys_s": 17.8542,
+        "cpu_user_s": 8.6967,
+        "exit": 1,
+        "label": "git-export",
+        "load1_after": 37.63,
+        "load1_before": 45.2,
+        "priority": "background",
+        "stdout_lines": [],
+        "wall_s": 31.5527
+      },
+      "walk": {
+        "excluded_tips": 1032,
+        "exclusion_bytes": 43344,
+        "load1_after": 45.2,
+        "load1_before": 45.2,
+        "objects-edge": {
+          "edge_lines": 0,
+          "listing_bytes": 228307,
+          "median_cpu_s": 0.2051,
+          "median_wall_s": 0.2459,
+          "objects_listed": 4162,
+          "pack_bytes": 479876,
+          "pack_cpu_s": 0.0727,
+          "pack_wall_s": 0.0723,
+          "runs": [
+            {
+              "cpu_s": 0.1916,
+              "cpu_sys_s": 0.0572,
+              "cpu_user_s": 0.1344,
+              "exit": 0,
+              "wall_s": 0.2253
+            },
+            {
+              "cpu_s": 0.3135,
+              "cpu_sys_s": 0.0781,
+              "cpu_user_s": 0.2354,
+              "exit": 0,
+              "wall_s": 0.3627
+            },
+            {
+              "cpu_s": 0.2051,
+              "cpu_sys_s": 0.0498,
+              "cpu_user_s": 0.1553,
+              "exit": 0,
+              "wall_s": 0.2459
+            }
+          ]
+        },
+        "objects-edge-aggressive": {
+          "edge_lines": 1032,
+          "listing_bytes": 43528,
+          "median_cpu_s": 0.2468,
+          "median_wall_s": 0.2614,
+          "objects_listed": 4,
+          "pack_bytes": 3342,
+          "pack_cpu_s": 0.0036,
+          "pack_wall_s": 0.0055,
+          "runs": [
+            {
+              "cpu_s": 0.2626,
+              "cpu_sys_s": 0.0865,
+              "cpu_user_s": 0.1761,
+              "exit": 0,
+              "wall_s": 0.4357
+            },
+            {
+              "cpu_s": 0.2335,
+              "cpu_sys_s": 0.0715,
+              "cpu_user_s": 0.162,
+              "exit": 0,
+              "wall_s": 0.237
+            },
+            {
+              "cpu_s": 0.2468,
+              "cpu_sys_s": 0.0816,
+              "cpu_user_s": 0.1652,
+              "exit": 0,
+              "wall_s": 0.2614
+            }
+          ]
+        },
+        "private_refs": 119763,
+        "reps": 3
+      }
+    },
+    "carry-window": {
+      "corpus": {
+        "build_s": 76.66,
+        "count_objects": {
+          "count": "1099",
+          "garbage": "0",
+          "in-pack": "6402",
+          "packs": "1",
+          "prune-packable": "0",
+          "size": "4396",
+          "size-garbage": "0",
+          "size-pack": "837"
+        },
+        "dirs": 64,
+        "files_per_dir": 64,
+        "header_target": 16757216,
+        "linked_worktree": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source-linked",
+        "model": {
+          "distinct_oids": 1032,
+          "headroom_bytes": 22335,
+          "max_ref_line": 184,
+          "mean_ref_line": 173.0,
+          "min_ref_line": 75,
+          "modelled_header_bytes": 16754881,
+          "object_format": "sha1",
+          "over_cap": false,
+          "prerequisite_bytes_if_all_tips": 55728,
+          "ref_line_bytes": 16754864,
+          "refs": 96849,
+          "refs_at_cap_at_this_mean": 96978,
+          "repo": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source",
+          "signature_and_blank_bytes": 17,
+          "union_mapped_refs": 96084
+        },
+        "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source",
+        "seed": 42,
+        "shape": "carry",
+        "split": {
+          "live_native_refs": 765,
+          "metadata_commits": 471,
+          "metadata_refs_per_namespace": 4,
+          "namespaces": 157,
+          "native_commits": 561,
+          "native_refs_per_namespace": 608,
+          "oids": 1032,
+          "refs": 96849
+        },
+        "tracked_files": 4096
+      },
+      "estate": {
+        "add": {
+          "codes": [],
+          "exit": 0,
+          "kind": "ok",
+          "outcomes": [],
+          "panicked": false,
+          "refused_lines": []
+        },
+        "group": true,
+        "passes": [
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus",
+              "1"
+            ],
+            "bundles": [
+              {
+                "agent_reader": "GIT_INVENTORY_MALFORMED",
+                "agent_reader_cause": "header_over_16MiB",
+                "bundle_bytes": 17315107,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16811096,
+                "headroom_bytes": -33880,
+                "longest_line": 184,
+                "mean_ref_line": 172.992,
+                "over_cap": true,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus/58410f3731a4e9f56abfb5db0ad6f01e68421e49899a75ca154ceb463c695f6b-e63d7183207163d61bacd7b435c3be52fdf5283371057e31682c8c384578d3fc.bundle",
+                "prerequisite_bytes": 55728,
+                "prerequisite_lines": 1032,
+                "ref_bytes": 16755351,
+                "ref_lines": 96856,
+                "signature": "# v2 git bundle"
+              },
+              {
+                "agent_reader": "GIT_INVENTORY_MALFORMED",
+                "agent_reader_cause": "header_over_16MiB",
+                "bundle_bytes": 17319446,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16811096,
+                "headroom_bytes": -33880,
+                "longest_line": 184,
+                "mean_ref_line": 172.992,
+                "over_cap": true,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus/8a5f8a2328472662a93c051a9e1ec14a84e94b7a5c0b60dce42d29f5a13ed1af-fea862204ecd4c3acc3bc59ca7d3d1c9691ab1c5ce4e8d6c3b196ab2a8edb4f2.bundle",
+                "prerequisite_bytes": 55728,
+                "prerequisite_lines": 1032,
+                "ref_bytes": 16755351,
+                "ref_lines": 96856,
+                "signature": "# v2 git bundle"
+              },
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 17605824,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16754957,
+                "headroom_bytes": 22259,
+                "longest_line": 184,
+                "mean_ref_line": 172.999,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus/shared-3ae8d2c3d506840a3b09a15de80e15eb98bee67cded302a941ec3b89a0c82e39.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 16754940,
+                "ref_lines": 96850,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "classified": {
+              "codes": [],
+              "exit": 0,
+              "kind": "ok",
+              "outcomes": [
+                "captured",
+                "captured"
+              ],
+              "panicked": false,
+              "refused_lines": []
+            },
+            "counters": {
+              "census_walks": 8,
+              "elapsed_ns": 1671441801313,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 863563776,
+              "write_source_pack_bytes": 18619065,
+              "write_source_pack_objects": 15849
+            },
+            "cpu_s": 1431.7271,
+            "cpu_sys_s": 852.78,
+            "cpu_user_s": 578.9471,
+            "diagnosis_bundles": [
+              {
+                "agent_reader": "GIT_INVENTORY_MALFORMED",
+                "agent_reader_cause": "header_over_16MiB",
+                "bundle_bytes": 17315107,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16811096,
+                "headroom_bytes": -33880,
+                "longest_line": 184,
+                "mean_ref_line": 172.992,
+                "over_cap": true,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/state/58410f3731a4e9f56abfb5db0ad6f01e68421e49899a75ca154ceb463c695f6b-3e2a267928925d20f318e4631b712ecf92b545f855bb37bd459466bfc10e30a7-0/capture.bundle",
+                "prerequisite_bytes": 55728,
+                "prerequisite_lines": 1032,
+                "ref_bytes": 16755351,
+                "ref_lines": 96856,
+                "signature": "# v2 git bundle"
+              },
+              {
+                "agent_reader": "GIT_INVENTORY_MALFORMED",
+                "agent_reader_cause": "header_over_16MiB",
+                "bundle_bytes": 17319446,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16811096,
+                "headroom_bytes": -33880,
+                "longest_line": 184,
+                "mean_ref_line": 172.992,
+                "over_cap": true,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/state/8a5f8a2328472662a93c051a9e1ec14a84e94b7a5c0b60dce42d29f5a13ed1af-26303bde7684bb88662743b1f454acff48a9d1d71e846fdeaf9cdbbfee800e93-0/capture.bundle",
+                "prerequisite_bytes": 55728,
+                "prerequisite_lines": 1032,
+                "ref_bytes": 16755351,
+                "ref_lines": 96856,
+                "signature": "# v2 git bundle"
+              },
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 17605824,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 16754957,
+                "headroom_bytes": 22259,
+                "longest_line": 184,
+                "mean_ref_line": 172.999,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/state/shared-e657866c9221900f6cd22ab2b4dd44e89fb0503cc0ee4240157a9fcf6108fec0-0/base.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 16754940,
+                "ref_lines": 96850,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "exit": 0,
+            "label": "pass-1",
+            "load1_after": 43.61,
+            "load1_before": 35.71,
+            "priority": "background",
+            "stdout_lines": [
+              "item=8a5f8a2328472662a93c051a9e1ec14a84e94b7a5c0b60dce42d29f5a13ed1af source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source\" outcome=captured reason=None source_bytes_read=417487",
+              "item=58410f3731a4e9f56abfb5db0ad6f01e68421e49899a75ca154ceb463c695f6b source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source-linked\" outcome=captured reason=None source_bytes_read=417487"
+            ],
+            "wall_s": 1671.4741
+          },
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus",
+              "1"
+            ],
+            "classified": {
+              "codes": [
+                "CONTRACT_SELF_INCONSISTENT",
+                "GIT_INVENTORY_MALFORMED"
+              ],
+              "exit": 1,
+              "kind": "typed",
+              "outcomes": [
+                "refused",
+                "refused"
+              ],
+              "panicked": false,
+              "refused_lines": [
+                "bulkload-agent: refused: CONTRACT_SELF_INCONSISTENT"
+              ]
+            },
+            "counters": {
+              "census_walks": 2,
+              "elapsed_ns": 828831042,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 0,
+              "write_source_pack_bytes": 0,
+              "write_source_pack_objects": 0
+            },
+            "cpu_s": 0.8083,
+            "cpu_sys_s": 0.2827,
+            "cpu_user_s": 0.5257,
+            "exit": 1,
+            "label": "pass-2-unchanged",
+            "load1_after": 41.88,
+            "load1_before": 43.61,
+            "priority": "background",
+            "stdout_lines": [
+              "item=8a5f8a2328472662a93c051a9e1ec14a84e94b7a5c0b60dce42d29f5a13ed1af source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source\" outcome=refused reason=Some(\"GIT_INVENTORY_MALFORMED\") source_bytes_read=0",
+              "item=58410f3731a4e9f56abfb5db0ad6f01e68421e49899a75ca154ceb463c695f6b source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source-linked\" outcome=refused reason=Some(\"GIT_INVENTORY_MALFORMED\") source_bytes_read=0"
+            ],
+            "wall_s": 0.8372
+          },
+          {
+            "argv": [
+              "estate-apply",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/corpus",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/estate/apply-state",
+              "neo",
+              "1"
+            ],
+            "classified": {
+              "codes": [
+                "CONTRACT_SELF_INCONSISTENT",
+                "GIT_INVENTORY_MALFORMED"
+              ],
+              "exit": 1,
+              "kind": "typed",
+              "outcomes": [
+                "refused",
+                "refused"
+              ],
+              "panicked": false,
+              "refused_lines": [
+                "bulkload-agent: refused: CONTRACT_SELF_INCONSISTENT"
+              ]
+            },
+            "counters": {
+              "census_walks": 0,
+              "elapsed_ns": 38044643546,
+              "priority": "normal",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 0,
+              "write_source_pack_bytes": 0,
+              "write_source_pack_objects": 0
+            },
+            "cpu_s": 35.9701,
+            "cpu_sys_s": 19.9923,
+            "cpu_user_s": 15.9778,
+            "exit": 1,
+            "label": "estate-apply",
+            "load1_after": 42.86,
+            "load1_before": 41.88,
+            "priority": "normal",
+            "stdout_lines": [
+              "item=8a5f8a2328472662a93c051a9e1ec14a84e94b7a5c0b60dce42d29f5a13ed1af source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source\" outcome=refused reason=Some(\"GIT_INVENTORY_MALFORMED\") source_bytes_read=0",
+              "item=58410f3731a4e9f56abfb5db0ad6f01e68421e49899a75ca154ceb463c695f6b source=\"/srv/scratch/jess/tmp/q42-l3-probes/run-window/carry-window/source-linked\" outcome=refused reason=Some(\"GIT_INVENTORY_MALFORMED\") source_bytes_read=0"
+            ],
+            "wall_s": 38.0519
+          }
+        ]
+      },
+      "walk": {
+        "excluded_tips": 1032,
+        "exclusion_bytes": 43344,
+        "load1_after": 35.71,
+        "load1_before": 36.29,
+        "objects-edge": {
+          "edge_lines": 0,
+          "listing_bytes": 228307,
+          "median_cpu_s": 0.1854,
+          "median_wall_s": 0.1969,
+          "objects_listed": 4162,
+          "pack_bytes": 479876,
+          "pack_cpu_s": 0.0735,
+          "pack_wall_s": 0.0798,
+          "runs": [
+            {
+              "cpu_s": 0.1854,
+              "cpu_sys_s": 0.0501,
+              "cpu_user_s": 0.1353,
+              "exit": 0,
+              "wall_s": 0.1969
+            },
+            {
+              "cpu_s": 0.144,
+              "cpu_sys_s": 0.0407,
+              "cpu_user_s": 0.1033,
+              "exit": 0,
+              "wall_s": 0.1478
+            },
+            {
+              "cpu_s": 0.2274,
+              "cpu_sys_s": 0.0643,
+              "cpu_user_s": 0.1632,
+              "exit": 0,
+              "wall_s": 0.2394
+            }
+          ]
+        },
+        "objects-edge-aggressive": {
+          "edge_lines": 1032,
+          "listing_bytes": 43528,
+          "median_cpu_s": 0.2128,
+          "median_wall_s": 0.2229,
+          "objects_listed": 4,
+          "pack_bytes": 3342,
+          "pack_cpu_s": 0.0034,
+          "pack_wall_s": 0.0049,
+          "runs": [
+            {
+              "cpu_s": 0.1977,
+              "cpu_sys_s": 0.0581,
+              "cpu_user_s": 0.1396,
+              "exit": 0,
+              "wall_s": 0.2372
+            },
+            {
+              "cpu_s": 0.2128,
+              "cpu_sys_s": 0.0646,
+              "cpu_user_s": 0.1482,
+              "exit": 0,
+              "wall_s": 0.2159
+            },
+            {
+              "cpu_s": 0.2167,
+              "cpu_sys_s": 0.0702,
+              "cpu_user_s": 0.1464,
+              "exit": 0,
+              "wall_s": 0.2229
+            }
+          ]
+        },
+        "private_refs": 96851,
+        "reps": 3
+      }
+    },
+    "compact-119761": {
+      "corpus": {
+        "build_s": 54.66,
+        "count_objects": {
+          "count": "1099",
+          "garbage": "0",
+          "in-pack": "6402",
+          "packs": "1",
+          "prune-packable": "0",
+          "size": "4396",
+          "size-garbage": "0",
+          "size-pack": "837"
+        },
+        "dirs": 64,
+        "files_per_dir": 64,
+        "header_target": null,
+        "linked_worktree": null,
+        "model": {
+          "distinct_oids": 1032,
+          "headroom_bytes": 8016144,
+          "max_ref_line": 75,
+          "mean_ref_line": 73.154,
+          "min_ref_line": 70,
+          "modelled_header_bytes": 8761072,
+          "object_format": "sha1",
+          "over_cap": false,
+          "prerequisite_bytes_if_all_tips": 55728,
+          "ref_line_bytes": 8761055,
+          "refs": 119761,
+          "refs_at_cap_at_this_mean": 229339,
+          "repo": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/source",
+          "signature_and_blank_bytes": 17,
+          "union_mapped_refs": 0
+        },
+        "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/source",
+        "seed": 42,
+        "shape": "compact",
+        "split": {
+          "live_native_refs": 755,
+          "metadata_commits": 471,
+          "metadata_refs_per_namespace": 4,
+          "namespaces": 157,
+          "native_commits": 561,
+          "native_refs_per_namespace": 754,
+          "oids": 1032,
+          "refs": 119761
+        },
+        "tracked_files": 4096
+      },
+      "estate": {
+        "add": {
+          "codes": [],
+          "exit": 0,
+          "kind": "ok",
+          "outcomes": [],
+          "panicked": false,
+          "refused_lines": []
+        },
+        "decomposed": {
+          "b_bytes_per_changed_tree": 1576.0,
+          "b_bytes_per_tree_entry": 24.62,
+          "bundle": "d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-50e52a1af0ffe02ef4bc1710fa6f54c8ce5e4af6e36489247fcbeec7766cbfad.bundle",
+          "bundle_bytes": 8845052,
+          "by_role": {
+            "configuration-v1:blob": {
+              "in_pack_bytes": 96,
+              "objects": 1,
+              "raw_bytes": 101
+            },
+            "configuration-v1:commit": {
+              "in_pack_bytes": 82,
+              "objects": 1,
+              "raw_bytes": 70
+            },
+            "configuration-v1:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "exclude:blob": {
+              "in_pack_bytes": 9,
+              "objects": 1,
+              "raw_bytes": 0
+            },
+            "exclude:commit": {
+              "in_pack_bytes": 73,
+              "objects": 1,
+              "raw_bytes": 62
+            },
+            "exclude:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "filesystem-v1:blob": {
+              "in_pack_bytes": 23627,
+              "objects": 1,
+              "raw_bytes": 195595
+            },
+            "filesystem-v1:commit": {
+              "in_pack_bytes": 80,
+              "objects": 1,
+              "raw_bytes": 68
+            },
+            "filesystem-v1:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "head-symbolic:blob": {
+              "in_pack_bytes": 24,
+              "objects": 1,
+              "raw_bytes": 15
+            },
+            "head-symbolic:commit": {
+              "in_pack_bytes": 80,
+              "objects": 1,
+              "raw_bytes": 68
+            },
+            "head-symbolic:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "staged:commit": {
+              "in_pack_bytes": 76,
+              "objects": 1,
+              "raw_bytes": 66
+            },
+            "worktree:blob": {
+              "in_pack_bytes": 103,
+              "objects": 1,
+              "raw_bytes": 113
+            },
+            "worktree:commit": {
+              "in_pack_bytes": 155,
+              "objects": 1,
+              "raw_bytes": 246
+            },
+            "worktree:tree": {
+              "entries": 128,
+              "in_pack_bytes": 3152,
+              "objects": 2,
+              "raw_bytes": 4288
+            }
+          },
+          "by_type": {
+            "blob": {
+              "in_pack_bytes": 23859,
+              "objects": 5,
+              "raw_bytes": 195824
+            },
+            "commit": {
+              "in_pack_bytes": 546,
+              "objects": 6,
+              "raw_bytes": 580
+            },
+            "tree": {
+              "in_pack_bytes": 3328,
+              "objects": 6,
+              "raw_bytes": 4420
+            }
+          },
+          "header": {
+            "agent_reader": "ok",
+            "agent_reader_cause": null,
+            "bundle_bytes": 8845052,
+            "cap": 16777216,
+            "capability_lines": 0,
+            "header_bytes": 8817287,
+            "headroom_bytes": 7959929,
+            "longest_line": 76,
+            "mean_ref_line": 73.154,
+            "over_cap": false,
+            "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/corpus/d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-50e52a1af0ffe02ef4bc1710fa6f54c8ce5e4af6e36489247fcbeec7766cbfad.bundle",
+            "prerequisite_bytes": 55728,
+            "prerequisite_lines": 1032,
+            "ref_bytes": 8761542,
+            "ref_lines": 119768,
+            "signature": "# v2 git bundle"
+          },
+          "pack_bytes": 27765,
+          "pack_file_bytes_unbundled": 27765,
+          "pack_fixed_bytes": 32,
+          "pack_objects": 17
+        },
+        "group": false,
+        "mutated": "d001/f001.txt",
+        "passes": [
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/corpus",
+              "1"
+            ],
+            "bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 9565764,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 8761559,
+                "headroom_bytes": 8015657,
+                "longest_line": 76,
+                "mean_ref_line": 73.154,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/corpus/d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-40ff9c28d9cc864cd443d95cf4bf8158c598fca868db352b05e84d8271942054.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 8761542,
+                "ref_lines": 119768,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "classified": {
+              "codes": [],
+              "exit": 0,
+              "kind": "ok",
+              "outcomes": [
+                "captured"
+              ],
+              "panicked": false,
+              "refused_lines": []
+            },
+            "counters": {
+              "census_walks": 4,
+              "elapsed_ns": 231207236211,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 993599488,
+              "write_source_pack_bytes": 9565764,
+              "write_source_pack_objects": 7515
+            },
+            "cpu_s": 47.7267,
+            "cpu_sys_s": 34.193,
+            "cpu_user_s": 13.5337,
+            "diagnosis_bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 9565764,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 8761559,
+                "headroom_bytes": 8015657,
+                "longest_line": 76,
+                "mean_ref_line": 73.154,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/state/d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-4f139c316f5d8875b4643b9ae5ec479bf3b3156d0f1f3d227e4be726c897ffe1-0/capture.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 8761542,
+                "ref_lines": 119768,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "exit": 0,
+            "label": "pass-1",
+            "load1_after": 24.48,
+            "load1_before": 49.2,
+            "priority": "background",
+            "stdout_lines": [
+              "item=d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab source=\"/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/source\" outcome=captured reason=None source_bytes_read=417487"
+            ],
+            "wall_s": 231.2171
+          },
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/corpus",
+              "1"
+            ],
+            "bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 8845052,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 8817287,
+                "headroom_bytes": 7959929,
+                "longest_line": 76,
+                "mean_ref_line": 73.154,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/estate/corpus/d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-50e52a1af0ffe02ef4bc1710fa6f54c8ce5e4af6e36489247fcbeec7766cbfad.bundle",
+                "prerequisite_bytes": 55728,
+                "prerequisite_lines": 1032,
+                "ref_bytes": 8761542,
+                "ref_lines": 119768,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "classified": {
+              "codes": [],
+              "exit": 0,
+              "kind": "ok",
+              "outcomes": [
+                "captured"
+              ],
+              "panicked": false,
+              "refused_lines": []
+            },
+            "counters": {
+              "census_walks": 4,
+              "elapsed_ns": 57189390735,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 9565764,
+              "read_source_pack_readback_bytes": 221184,
+              "write_source_pack_bytes": 8845052,
+              "write_source_pack_objects": 17
+            },
+            "cpu_s": 54.0422,
+            "cpu_sys_s": 33.1955,
+            "cpu_user_s": 20.8467,
+            "exit": 0,
+            "label": "pass-2-chained",
+            "load1_after": 34.96,
+            "load1_before": 24.44,
+            "prior_sidecars": [
+              "d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab-50e52a1af0ffe02ef4bc1710fa6f54c8ce5e4af6e36489247fcbeec7766cbfad.bundle.prior"
+            ],
+            "priority": "background",
+            "stdout_lines": [
+              "item=d84eafb5c9b510a8023587088209c3c80058239d76a7cf55b54c090d22f9ffab source=\"/srv/scratch/jess/tmp/q42-l3-probes/run/compact-119761/source\" outcome=captured reason=None source_bytes_read=113"
+            ],
+            "wall_s": 57.2016
+          }
+        ]
+      },
+      "walk": {
+        "excluded_tips": 1032,
+        "exclusion_bytes": 43344,
+        "load1_after": 49.2,
+        "load1_before": 49.2,
+        "objects-edge": {
+          "edge_lines": 0,
+          "listing_bytes": 228307,
+          "median_cpu_s": 0.1226,
+          "median_wall_s": 0.1265,
+          "objects_listed": 4162,
+          "pack_bytes": 479876,
+          "pack_cpu_s": 0.0751,
+          "pack_wall_s": 0.0642,
+          "runs": [
+            {
+              "cpu_s": 0.1576,
+              "cpu_sys_s": 0.0406,
+              "cpu_user_s": 0.117,
+              "exit": 0,
+              "wall_s": 0.1604
+            },
+            {
+              "cpu_s": 0.1226,
+              "cpu_sys_s": 0.0409,
+              "cpu_user_s": 0.0817,
+              "exit": 0,
+              "wall_s": 0.1265
+            },
+            {
+              "cpu_s": 0.1129,
+              "cpu_sys_s": 0.044,
+              "cpu_user_s": 0.069,
+              "exit": 0,
+              "wall_s": 0.1161
+            }
+          ]
+        },
+        "objects-edge-aggressive": {
+          "edge_lines": 1032,
+          "listing_bytes": 43528,
+          "median_cpu_s": 0.1307,
+          "median_wall_s": 0.1352,
+          "objects_listed": 4,
+          "pack_bytes": 3342,
+          "pack_cpu_s": 0.0034,
+          "pack_wall_s": 0.0066,
+          "runs": [
+            {
+              "cpu_s": 0.1959,
+              "cpu_sys_s": 0.0601,
+              "cpu_user_s": 0.1358,
+              "exit": 0,
+              "wall_s": 0.2377
+            },
+            {
+              "cpu_s": 0.1273,
+              "cpu_sys_s": 0.0303,
+              "cpu_user_s": 0.097,
+              "exit": 0,
+              "wall_s": 0.132
+            },
+            {
+              "cpu_s": 0.1307,
+              "cpu_sys_s": 0.0456,
+              "cpu_user_s": 0.0852,
+              "exit": 0,
+              "wall_s": 0.1352
+            }
+          ]
+        },
+        "private_refs": 119763,
+        "reps": 3
+      }
+    },
+    "small-compact": {
+      "corpus": {
+        "build_s": 3.03,
+        "count_objects": {
+          "count": "14",
+          "garbage": "0",
+          "in-pack": "4390",
+          "packs": "1",
+          "prune-packable": "0",
+          "size": "56",
+          "size-garbage": "0",
+          "size-pack": "604"
+        },
+        "dirs": 64,
+        "files_per_dir": 64,
+        "header_target": null,
+        "linked_worktree": null,
+        "model": {
+          "distinct_oids": 64,
+          "headroom_bytes": 16758807,
+          "max_ref_line": 75,
+          "mean_ref_line": 71.844,
+          "min_ref_line": 70,
+          "modelled_header_bytes": 18409,
+          "object_format": "sha1",
+          "over_cap": false,
+          "prerequisite_bytes_if_all_tips": 3456,
+          "ref_line_bytes": 18392,
+          "refs": 256,
+          "refs_at_cap_at_this_mean": 233523,
+          "repo": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/source",
+          "signature_and_blank_bytes": 17,
+          "union_mapped_refs": 0
+        },
+        "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/source",
+        "seed": 42,
+        "shape": "compact",
+        "split": {
+          "live_native_refs": 84,
+          "metadata_commits": 6,
+          "metadata_refs_per_namespace": 4,
+          "namespaces": 2,
+          "native_commits": 58,
+          "native_refs_per_namespace": 82,
+          "oids": 64,
+          "refs": 256
+        },
+        "tracked_files": 4096
+      },
+      "estate": {
+        "add": {
+          "codes": [],
+          "exit": 0,
+          "kind": "ok",
+          "outcomes": [],
+          "panicked": false,
+          "refused_lines": []
+        },
+        "decomposed": {
+          "b_bytes_per_changed_tree": 1575.5,
+          "b_bytes_per_tree_entry": 24.62,
+          "bundle": "e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-533d17b572838e706aa0221f086a281506ad7f7bc02f0b5b94d988a43e7d4760.bundle",
+          "bundle_bytes": 56091,
+          "by_role": {
+            "configuration-v1:blob": {
+              "in_pack_bytes": 96,
+              "objects": 1,
+              "raw_bytes": 101
+            },
+            "configuration-v1:commit": {
+              "in_pack_bytes": 83,
+              "objects": 1,
+              "raw_bytes": 71
+            },
+            "configuration-v1:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "exclude:blob": {
+              "in_pack_bytes": 9,
+              "objects": 1,
+              "raw_bytes": 0
+            },
+            "exclude:commit": {
+              "in_pack_bytes": 73,
+              "objects": 1,
+              "raw_bytes": 62
+            },
+            "exclude:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "filesystem-v1:blob": {
+              "in_pack_bytes": 29602,
+              "objects": 1,
+              "raw_bytes": 195594
+            },
+            "filesystem-v1:commit": {
+              "in_pack_bytes": 80,
+              "objects": 1,
+              "raw_bytes": 68
+            },
+            "filesystem-v1:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "head-symbolic:blob": {
+              "in_pack_bytes": 24,
+              "objects": 1,
+              "raw_bytes": 15
+            },
+            "head-symbolic:commit": {
+              "in_pack_bytes": 80,
+              "objects": 1,
+              "raw_bytes": 68
+            },
+            "head-symbolic:tree": {
+              "in_pack_bytes": 44,
+              "objects": 1,
+              "raw_bytes": 33
+            },
+            "staged:commit": {
+              "in_pack_bytes": 76,
+              "objects": 1,
+              "raw_bytes": 66
+            },
+            "worktree:blob": {
+              "in_pack_bytes": 103,
+              "objects": 1,
+              "raw_bytes": 113
+            },
+            "worktree:commit": {
+              "in_pack_bytes": 154,
+              "objects": 1,
+              "raw_bytes": 246
+            },
+            "worktree:tree": {
+              "entries": 128,
+              "in_pack_bytes": 3151,
+              "objects": 2,
+              "raw_bytes": 4288
+            }
+          },
+          "by_type": {
+            "blob": {
+              "in_pack_bytes": 29834,
+              "objects": 5,
+              "raw_bytes": 195823
+            },
+            "commit": {
+              "in_pack_bytes": 546,
+              "objects": 6,
+              "raw_bytes": 581
+            },
+            "tree": {
+              "in_pack_bytes": 3327,
+              "objects": 6,
+              "raw_bytes": 4420
+            }
+          },
+          "header": {
+            "agent_reader": "ok",
+            "agent_reader_cause": null,
+            "bundle_bytes": 56091,
+            "cap": 16777216,
+            "capability_lines": 0,
+            "header_bytes": 22352,
+            "headroom_bytes": 16754864,
+            "longest_line": 76,
+            "mean_ref_line": 71.783,
+            "over_cap": false,
+            "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/corpus/e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-533d17b572838e706aa0221f086a281506ad7f7bc02f0b5b94d988a43e7d4760.bundle",
+            "prerequisite_bytes": 3456,
+            "prerequisite_lines": 64,
+            "ref_bytes": 18879,
+            "ref_lines": 263,
+            "signature": "# v2 git bundle"
+          },
+          "pack_bytes": 33739,
+          "pack_file_bytes_unbundled": 33739,
+          "pack_fixed_bytes": 32,
+          "pack_objects": 17
+        },
+        "group": false,
+        "mutated": "d001/f001.txt",
+        "passes": [
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/corpus",
+              "1"
+            ],
+            "bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 545795,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 18896,
+                "headroom_bytes": 16758320,
+                "longest_line": 76,
+                "mean_ref_line": 71.783,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/corpus/e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-4bb51122ebf30a231bbbcaf48f6f7760f0bfb679347d9221a52beeee4941a83c.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 18879,
+                "ref_lines": 263,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "classified": {
+              "codes": [],
+              "exit": 0,
+              "kind": "ok",
+              "outcomes": [
+                "captured"
+              ],
+              "panicked": false,
+              "refused_lines": []
+            },
+            "counters": {
+              "census_walks": 4,
+              "elapsed_ns": 3677527353,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 0,
+              "read_source_pack_readback_bytes": 212992,
+              "write_source_pack_bytes": 545795,
+              "write_source_pack_objects": 4418
+            },
+            "cpu_s": 1.013,
+            "cpu_sys_s": 0.5565,
+            "cpu_user_s": 0.4565,
+            "diagnosis_bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 545795,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 18896,
+                "headroom_bytes": 16758320,
+                "longest_line": 76,
+                "mean_ref_line": 71.783,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/state/e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-fddc359124c92eb9b972e88a63bbdec4aaa44b4bccd7c0c56a3c639f5e1095db-0/capture.bundle",
+                "prerequisite_bytes": 0,
+                "prerequisite_lines": 0,
+                "ref_bytes": 18879,
+                "ref_lines": 263,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "exit": 0,
+            "label": "pass-1",
+            "load1_after": 58.52,
+            "load1_before": 60.39,
+            "priority": "background",
+            "stdout_lines": [
+              "item=e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df source=\"/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/source\" outcome=captured reason=None source_bytes_read=416560"
+            ],
+            "wall_s": 3.695
+          },
+          {
+            "argv": [
+              "estate-capture",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/plan.json",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/state",
+              "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/corpus",
+              "1"
+            ],
+            "bundles": [
+              {
+                "agent_reader": "ok",
+                "agent_reader_cause": null,
+                "bundle_bytes": 56091,
+                "cap": 16777216,
+                "capability_lines": 0,
+                "header_bytes": 22352,
+                "headroom_bytes": 16754864,
+                "longest_line": 76,
+                "mean_ref_line": 71.783,
+                "over_cap": false,
+                "path": "/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/estate/corpus/e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-533d17b572838e706aa0221f086a281506ad7f7bc02f0b5b94d988a43e7d4760.bundle",
+                "prerequisite_bytes": 3456,
+                "prerequisite_lines": 64,
+                "ref_bytes": 18879,
+                "ref_lines": 263,
+                "signature": "# v2 git bundle"
+              }
+            ],
+            "classified": {
+              "codes": [],
+              "exit": 0,
+              "kind": "ok",
+              "outcomes": [
+                "captured"
+              ],
+              "panicked": false,
+              "refused_lines": []
+            },
+            "counters": {
+              "census_walks": 4,
+              "elapsed_ns": 1462984260,
+              "priority": "background",
+              "priority_from": "default",
+              "read_source_capture_reuse_bytes": 545795,
+              "read_source_pack_readback_bytes": 0,
+              "write_source_pack_bytes": 56091,
+              "write_source_pack_objects": 17
+            },
+            "cpu_s": 1.2388,
+            "cpu_sys_s": 0.6183,
+            "cpu_user_s": 0.6205,
+            "exit": 0,
+            "label": "pass-2-chained",
+            "load1_after": 58.52,
+            "load1_before": 58.52,
+            "prior_sidecars": [
+              "e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df-533d17b572838e706aa0221f086a281506ad7f7bc02f0b5b94d988a43e7d4760.bundle.prior"
+            ],
+            "priority": "background",
+            "stdout_lines": [
+              "item=e5d94e3a57fa4d75cca1b31d194f7521c6dff9cae8557bfe8e71c59b83ffa5df source=\"/srv/scratch/jess/tmp/q42-l3-probes/run/small-compact/source\" outcome=captured reason=None source_bytes_read=247322"
+            ],
+            "wall_s": 1.4694
+          }
+        ]
+      },
+      "walk": {
+        "excluded_tips": 64,
+        "exclusion_bytes": 2688,
+        "load1_after": 60.39,
+        "load1_before": 60.39,
+        "objects-edge": {
+          "edge_lines": 0,
+          "listing_bytes": 228307,
+          "median_cpu_s": 0.0122,
+          "median_wall_s": 0.0209,
+          "objects_listed": 4162,
+          "pack_bytes": 474571,
+          "pack_cpu_s": 0.0414,
+          "pack_wall_s": 0.0515,
+          "runs": [
+            {
+              "cpu_s": 0.0126,
+              "cpu_sys_s": 0.0057,
+              "cpu_user_s": 0.0069,
+              "exit": 0,
+              "wall_s": 0.0175
+            },
+            {
+              "cpu_s": 0.0117,
+              "cpu_sys_s": 0.0074,
+              "cpu_user_s": 0.0042,
+              "exit": 0,
+              "wall_s": 0.0453
+            },
+            {
+              "cpu_s": 0.0122,
+              "cpu_sys_s": 0.0051,
+              "cpu_user_s": 0.0071,
+              "exit": 0,
+              "wall_s": 0.0209
+            }
+          ]
+        },
+        "objects-edge-aggressive": {
+          "edge_lines": 64,
+          "listing_bytes": 2872,
+          "median_cpu_s": 0.0093,
+          "median_wall_s": 0.0123,
+          "objects_listed": 4,
+          "pack_bytes": 3339,
+          "pack_cpu_s": 0.0055,
+          "pack_wall_s": 0.0124,
+          "runs": [
+            {
+              "cpu_s": 0.0093,
+              "cpu_sys_s": 0.0037,
+              "cpu_user_s": 0.0056,
+              "exit": 0,
+              "wall_s": 0.0123
+            },
+            {
+              "cpu_s": 0.0095,
+              "cpu_sys_s": 0.0034,
+              "cpu_user_s": 0.006,
+              "exit": 0,
+              "wall_s": 0.0155
+            },
+            {
+              "cpu_s": 0.0076,
+              "cpu_sys_s": 0.0011,
+              "cpu_user_s": 0.0065,
+              "exit": 0,
+              "wall_s": 0.0107
+            }
+          ]
+        },
+        "private_refs": 258,
+        "reps": 3
+      }
+    }
+  },
+  "host": {
+    "cpus": 32,
+    "git": "git version 2.52.0",
+    "host": "sting",
+    "kernel": "6.12.0-211.37.1.el10_2.x86_64",
+    "label": "informational, sting, ungated",
+    "probe_nice": 19,
+    "python": "3.12.14"
+  },
+  "label": "informational, sting, ungated",
+  "runs": [
+    {
+      "corpora": [
+        "carry-119761",
+        "compact-119761",
+        "small-compact"
+      ],
+      "ended": "raised building carry-window (the ref-count search bug, fixed before run 2); the three corpora above were complete and saved",
+      "started_utc": "2026-10-04T19:41:17Z"
+    },
+    {
+      "argv": "q42_probes.py run --only carry-window",
+      "corpora": [
+        "carry-window"
+      ],
+      "finished_utc": "2026-10-04T20:25:30Z",
+      "started_utc": "2026-10-04T19:55:04Z"
+    }
+  ],
+  "schema": "bulkload.q42-probes.v1",
+  "spawn_micro": {
+    "cpu_ms_per_pair": 4.78,
+    "load1": 36.33,
+    "projected_cpu_s_for_96850_heads_x_2_items": 927,
+    "wall_ms_per_pair": 8.11,
+    "what": "400 pairs of `cat-file -e <oid>` + `rev-parse --verify <oid>^{commit}` in the carry-window source, the per-head children of shared::prerequisite_commits"
+  },
+  "started_utc": "2026-10-04T19:41:17Z"
+}
