@@ -167,7 +167,7 @@ Shas:
   rulings on R25's "held durably" and slo.md's R25 wording; Linear
   (TIN-4543 and the SSOT ledger, owned by the coordinator). #160 merged
   into main on 2026-10-04 at 09:56 UTC. This branch's PR was opened by the
-  recheck stage (round 3, below) and is not merged.
+  recheck stage (round 3, below) as #170 and is not merged.
 
 ## Round 2: review fixes (2026-10-04)
 
@@ -408,7 +408,8 @@ Open, beyond round 2's list:
   README still call the sealed root an assumption the code does not meet
   yet. Updating the model's text to match the code is follow-up work for
   the model's owner. This lane did not change it.
-- the PR is open and unmerged; its URL is recorded below once it exists.
+- the PR, https://github.com/Jesssullivan/bulkload/pull/170 (to main), is
+  open and unmerged.
 
 Scratch: only this session's private `$TMPDIR/formal-hybrid-ship.*`,
 deleted at the end. The other `formal-hybrid-recheck*` directories in
