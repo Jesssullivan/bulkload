@@ -1756,11 +1756,15 @@ fn bare_marked(heads: &str) -> bool {
     })
 }
 
-// S4 (#162): a bare capture is ref custody with no index or worktree. Every
-// verb that lays down a workspace, an index or a payload attachment from a
-// capture calls this first, so it refuses before anything is written; only
-// an import (`refs-imported`) carries such a capture.
-const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
+/// S4 (#162): a bare capture is ref custody with no index or worktree. Every
+/// verb that lays down a workspace, an index or a payload attachment from a
+/// capture calls this first, so it refuses before anything is written; only
+/// an import (`refs-imported`) carries such a capture. Estate apply calls it
+/// too, before any plan base is imported for a workspace item.
+///
+/// # Errors
+/// `GIT_BARE_CAPTURE_WORKSPACE` for a capture of a bare repository.
+pub(crate) const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
     if staged.bare {
         return Err(BulkloadRefusal::GitBareCaptureWorkspace);
     }

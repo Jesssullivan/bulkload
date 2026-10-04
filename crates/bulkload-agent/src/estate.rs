@@ -1689,6 +1689,12 @@ fn apply_item(
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
+    // S4 (#162): a workspace is never laid down from a bare capture. Refused
+    // here, before a chain is flattened or a plan base imported, so the
+    // typed cause is never masked and nothing reaches the destination.
+    if item.workspace.is_some() {
+        git_carry::refuse_bare_capture(&staged)?;
+    }
     // WP2: a chained capture restores from its verified, flattened chain; a
     // capture on a shared plan base imports that base first.
     let staged = if prior_sidecar(corpus, &captured.bundle)
@@ -2765,6 +2771,78 @@ mod tests {
             .output()
             .unwrap();
         assert!(refs.stdout.is_empty(), "nothing was imported");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // S4 (#162): a bare hub and its linked worktree share a common dir, so
+    // their items share a plan base. The bare item, planned with a
+    // standalone workspace, still refuses GIT_BARE_CAPTURE_WORKSPACE at
+    // apply: the check runs before the base import, which would otherwise
+    // mask it (`GIT_DESTINATION_OCCUPIED`).
+    #[test]
+    fn a_bare_item_on_a_plan_base_refuses_its_workspace_before_the_base() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare-base");
+        let hub = root.join("hub.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                hub.to_str().unwrap(),
+            ],
+        );
+        let linked = root.join("hub-worktree");
+        git(
+            &hub,
+            &["worktree", "add", "--quiet", linked.to_str().unwrap()],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let standalone = root.join("standalone");
+        let plan = root.join("base-plan");
+        add(&plan, &hub, &standalone, Some(&standalone)).unwrap();
+        add(&plan, &linked, &repository, None).unwrap();
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row.0 == "captured" && row.1.is_none()),
+            "{rows:?}"
+        );
+        let item = inspect(&plan)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.workspace.is_some())
+            .unwrap();
+        let record: Capture =
+            read(&corpus.join(format!("{}.capture", id(&item).unwrap()))).unwrap();
+        assert!(
+            git_carry::shared::requires_base(&corpus.join(&record.bundle)).unwrap(),
+            "the bare capture is on the plan base"
+        );
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        let result = apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err());
+        let mut outcomes = outcomes.into_inner().unwrap();
+        outcomes.sort();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("refs-imported", None),
+                ("refused", Some("GIT_BARE_CAPTURE_WORKSPACE".to_owned())),
+            ]
+        );
+        assert!(!standalone.exists(), "nothing is laid down");
         fs::remove_dir_all(root).unwrap();
     }
 
