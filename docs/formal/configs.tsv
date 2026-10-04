@@ -1,0 +1,35 @@
+# TLC configs checked by `just tla-check` (docs/formal/README.md).
+# Columns (tab-separated): config, expect (pass | fail), the TLC message a
+# failing config must print (- for pass), extra TLC flags (- for none).
+# A fail row names exactly one property; WithinBudget never counts.
+MC_main	pass	-	-
+MC_deep	pass	-	-
+MC_wp0g	pass	-	-
+MC_wp0g_deep	pass	-	-
+MC_wp0g_authority	fail	Invariant R25_NoDurableReread is violated	-
+MC_wp0d_exchange	pass	-	-
+MC_wp0d_check_rename	fail	Invariant NoClobber is violated	-
+MC_s2	pass	-	-
+MC_live	pass	-	-
+MC_neg_live_unfair	fail	Temporal properties were violated	-
+MC_neg_held_before_commit	fail	Invariant HeldAfterCommit is violated	-
+MC_neg_commit_before_fsync	fail	Invariant RecordImpliesBytes is violated	-
+MC_neg_commit_before_dirseal	fail	Invariant RecordImpliesBytes is violated	-
+MC_neg_adopt_without_seal	fail	Invariant RecordImpliesBytes is violated	-
+MC_neg_ledger_before_held	fail	Invariant LedgerAfterHeld is violated	-
+MC_neg_done_before_sync	fail	Invariant DoneAfterLedger is violated	-
+MC_neg_reread_durable	fail	Invariant R25_NoDurableReread is violated	-
+MC_neg_reread_unchanged	fail	Invariant S3_UnchangedReadsZero is violated	-
+MC_neg_reread_changed_only	fail	Invariant S3_ReadsOnlyChanged is violated	-
+MC_neg_skip_output_row	fail	Invariant S3_ClosedPassIsHeld is violated	-
+MC_neg_double_read	fail	Invariant ReadOnce is violated	-
+MC_neg_src_ledger_carries_r25	fail	Invariant R25_NoDurableReread is violated	-
+MC_neg_record_racy	fail	Invariant ReuseSound is violated	-
+MC_neg_record_racy_ledger	fail	Invariant LedgerSound is violated	-
+MC_neg_untyped_space	fail	Invariant ClosureAccounted is violated	-
+MC_neg_source_write	fail	Invariant S2_TypedSourceAccess is violated	-
+MC_neg_pause_writer	fail	Invariant S2_TypedSourceAccess is violated	-
+MC_neg_git_optional_locks	fail	Invariant S2_TypedSourceAccess is violated	-
+MC_neg_unbounded_backup	fail	Invariant S2_BackupLockBounded is violated	-
+MC_neg_supersede_unchecked	fail	Invariant NoClobber is violated	-
+MC_neg_sweep_displaced	fail	Invariant NoClobber is violated	-
