@@ -87,8 +87,11 @@ least five of them, the ON command repeated for the whole window (no
 metric and --settle-seconds exactly at their pinned values, and
 --min-samples, --min-window-samples and --min-on-busy at their defaults or
 stricter; and the host must be on AC power with load1 < 2.5 at the start.
-In evidence mode every ON run must report its priority class, and an ON
-window that reaches the run cap is INCONCLUSIVE. `analyze` labels a trace
+In evidence mode every ON run must report its priority class, an ON
+window that reaches the run cap is INCONCLUSIVE, and R-N81 is checked over
+the whole run, not only at the start: a window whose power_start or
+power_end is not AC, or an OFF window whose lag-corrected load1 level is
+not under 2.5, makes the run INCONCLUSIVE and not evidence. `analyze` labels a trace
 evidence only when it was run with --evidence, its schema is this one, its
 recorded configuration and gate pass the same protocol check, and no
 override differs from the recorded gate; `evidence_problems` says why not.
@@ -723,9 +726,30 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                 f"too few samples: pooled {state} has {n} latency and {n_load} "
                 f"load1 samples (min {floor_pool})"
             )
+    evidence = bool(config.get("evidence"))
+    # R-N81: a gated sample is taken only on AC power with load1 under the
+    # limit. Under evidence, power is checked at every window boundary and
+    # each OFF window's lag-corrected level (the host baseline, without the
+    # previous ON window's EWMA tail) must stay under LOAD_LIMIT.
+    rn81 = []
+    if evidence:
+        for w in windows:
+            for key in ("power_start", "power_end"):
+                if w.get(key) != "ac":
+                    rn81.append(
+                        f"R-N81: window {w['index']} {key.replace('_', ' ')} "
+                        f"was {w.get(key, 'unrecorded')}, not AC power"
+                    )
+        for w in per_window:
+            level = w["load1_level"]
+            if w["state"] == OFF and level is not None and level >= LOAD_LIMIT:
+                rn81.append(
+                    f"R-N81: OFF window {w['index']} load1 level {level:.2f} is "
+                    f"not under {LOAD_LIMIT}"
+                )
+    structural.extend(rn81)
     if not aa:
         requested = config.get("priority")
-        evidence = bool(config.get("evidence"))
         for w in windows:
             if w["state"] != ON:
                 continue
@@ -806,7 +830,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     if not config.get("evidence"):
         evidence_problems = ["the run was made without --evidence"]
     else:
-        evidence_problems = protocol_problems(config, trace.get("gate", {}))
+        evidence_problems = protocol_problems(config, trace.get("gate", {})) + rn81
         if trace.get("schema") != SCHEMA:
             evidence_problems.append(
                 f"trace schema {trace.get('schema')} is not {SCHEMA}"

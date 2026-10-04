@@ -341,6 +341,60 @@ class OnRunTests(unittest.TestCase):
         self.assertIn("ON window 1 reached the run cap", reasons(verdict))
 
 
+class PowerAndBaselineTests(unittest.TestCase):
+    """R-N81 under evidence: AC power at every window boundary, and every
+    OFF window's load1 level under the limit; checked, not just recorded."""
+
+    def test_battery_mid_run_is_inconclusive_and_not_evidence(self) -> None:
+        trace = synth(evidence=True)
+        trace["windows"][2]["power_start"] = "battery"
+        trace["windows"][3]["power_end"] = "battery"
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("R-N81: window 2 power start was battery", reasons(verdict))
+        self.assertIn("R-N81: window 3 power end was battery", reasons(verdict))
+        self.assertIn(
+            "R-N81: window 2 power start was battery",
+            " | ".join(verdict["evidence_problems"]),
+        )
+
+    def test_every_window_ending_on_battery_is_inconclusive(self) -> None:
+        trace = synth(evidence=True)
+        for window in trace["windows"]:
+            window["power_end"] = "battery"
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+
+    def test_an_unrecorded_power_state_is_not_ac(self) -> None:
+        trace = synth(evidence=True)
+        del trace["windows"][4]["power_end"]
+        verdict = s2.analyze(trace)
+        self.assertIn("window 4 power end was unrecorded", reasons(verdict))
+
+    def test_a_busy_off_baseline_is_inconclusive(self) -> None:
+        busy = s2.analyze(synth(evidence=True, off_load=[1.0, 1.0, 2.6, 1.0, 1.0]))
+        self.assertEqual(busy["status"], "INCONCLUSIVE")
+        self.assertIn("R-N81: OFF window 2 load1 level 2.60", reasons(busy))
+        self.assertFalse(busy["evidence"])
+        quiet = s2.analyze(synth(evidence=True, off_load=2.4))
+        self.assertEqual(quiet["status"], "PASS", reasons(quiet))
+        self.assertTrue(quiet["evidence"], quiet["evidence_problems"])
+
+    def test_the_off_tail_does_not_trip_the_baseline(self) -> None:
+        trace = kernel_load(synth(evidence=True), 1.9, base=2.4)
+        verdict = s2.analyze(trace)
+        self.assertGreaterEqual(verdict["windows"][2]["load1_mean"], 2.5)
+        self.assertNotIn("R-N81", reasons(verdict))
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+
+    def test_power_is_not_checked_without_evidence(self) -> None:
+        trace = synth()
+        trace["windows"][1]["power_end"] = "battery"
+        self.assertEqual(s2.analyze(trace)["status"], "PASS")
+
+
 class EvidenceProtocolTests(unittest.TestCase):
     """The evidence label is tied to the whole measurement protocol, not
     just the budgets: no analyze override and no relaxed recorded gate."""
