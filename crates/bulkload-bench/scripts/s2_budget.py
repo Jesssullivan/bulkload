@@ -15,7 +15,12 @@ another device, inside the source, or already existing. One step runs at a fixed
   - search: `rg` over a small fixture tree, or `grep -r` when rg is absent
             (the tool used is recorded).
 `step` is the sum of the four: the latency of one agent step. A step that
-overruns its second skips the ticks it missed (counted), never runs late.
+overruns its second skips the ticks it missed, never runs late. Each missed
+tick is recorded with its due time and how long after it the loop was free
+(`missed_ticks`), and the verdict back-fills it into every latency metric
+with that wait (coordinated omission: otherwise the slowest stretches give
+the fewest samples and p95 reads low). Missed ticks are reported per window
+and per state; sample floors count measured samples only.
 Every git child runs without any inherited GIT_* variable and without the
 global or system configuration (`git_env`), so a GIT_DIR or GIT_INDEX_FILE
 exported by a hook, `rebase -x` or `bisect run` cannot point the fixture
@@ -137,7 +142,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import r23_ab  # noqa: E402  (power_source: one R-N81 power probe for every bench)
 
-SCHEMA = "bulkload.s2-budget.v0"
+SCHEMA = "bulkload.s2-budget.v1"
 RULINGS = "OI-1003-Q34, OI-1003-Q5, OI-1003-Q9, R-N11, R-N81, R-N91, R-N13"
 BUDGET_P95 = 0.25
 BUDGET_LOAD1 = 2.0
@@ -239,10 +244,20 @@ def read_load1(source: str) -> float:
     return os.getloadavg()[0]
 
 
-def cadence(origin: float, phase: float, stop: threading.Event, until: float, body):
+def cadence(
+    origin: float,
+    phase: float,
+    stop: threading.Event,
+    until: float,
+    body,
+    missed: list | None = None,
+) -> int:
     """Call body() at origin + phase + k seconds, k = 0, 1, ..., until `stop`
     is set or the next tick would fall at or past `until`. A tick that
-    overruns makes the loop skip the ticks it missed; returns how many."""
+    overruns makes the loop skip the ticks it missed; returns how many. Each
+    missed tick is appended to `missed` as (its due time from origin, how
+    long after it was due the loop was free again, in ms): the wait that
+    tick would have had before it could even start."""
     skipped = 0
     k = 0
     while not stop.is_set():
@@ -253,8 +268,15 @@ def cadence(origin: float, phase: float, stop: threading.Event, until: float, bo
         if delay > 0 and stop.wait(delay):
             break
         body()
-        following = max(k + 1, math.ceil(time.monotonic() - origin - phase))
-        skipped += following - k - 1
+        now = time.monotonic()
+        following = max(k + 1, math.ceil(now - origin - phase))
+        for j in range(k + 1, following):
+            tick = origin + phase + j
+            if tick >= until:
+                break
+            skipped += 1
+            if missed is not None:
+                missed.append((round(tick - origin, 3), round((now - tick) * 1e3, 3)))
         k = following
     return skipped
 
@@ -616,7 +638,9 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             return index
         return None
 
-    buckets = [{"lat": {m: [] for m in METRICS}, "load": []} for _ in windows]
+    buckets = [
+        {"lat": {m: [] for m in METRICS}, "load": [], "missed": 0} for _ in windows
+    ]
     failed_ops = 0
     for row in trace.get("latency", []):
         index = locate(row["t"])
@@ -625,6 +649,18 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             continue
         if index is not None and row["t"] >= windows[index]["start"] + settle:
             buckets[index]["lat"][row["op"]].append(row["ms"])
+    # Coordinated omission: a step that overran skipped the ticks it missed,
+    # so the slowest stretches would contribute the fewest samples and p95
+    # would read low. Each missed workload tick is back-filled into every
+    # metric with the wait it would have had (HdrHistogram's correction for
+    # the expected 1 s interval; a lower bound on what that tick would have
+    # seen). Sample floors count measured samples only.
+    for row in trace.get("missed_ticks", {}).get("workload", []):
+        index = locate(row["t"])
+        if index is not None and row["t"] >= windows[index]["start"] + settle:
+            buckets[index]["missed"] += 1
+            for metric in METRICS:
+                buckets[index]["lat"][metric].append(row["lag_ms"])
     load = sorted(trace.get("load", []), key=lambda row: row["t"])
     estimates = load1_windows(windows, load, settle)
     for bucket, (rows, _) in zip(buckets, estimates, strict=True):
@@ -633,6 +669,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     per_window = []
     off_p95s, off_levels = {m: [] for m in METRICS}, []
     pooled = {s: {"lat": {m: [] for m in METRICS}, "load": []} for s in (OFF, ON)}
+    missed = {OFF: 0, ON: 0}
     for window, bucket, (_, level) in zip(windows, buckets, estimates, strict=True):
         state = window["state"]
         window_p95 = {m: p95(bucket["lat"][m]) for m in METRICS}
@@ -642,13 +679,15 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             if state == OFF:
                 off_p95s[metric].append(window_p95[metric])
         pooled[state]["load"].extend(bucket["load"])
+        missed[state] += bucket["missed"]
         if state == OFF:
             off_levels.append(level)
         per_window.append(
             {
                 "index": window["index"],
                 "state": state,
-                "n": {m: len(bucket["lat"][m]) for m in METRICS},
+                "n": {m: len(bucket["lat"][m]) - bucket["missed"] for m in METRICS},
+                "missed": bucket["missed"],
                 "p95_ms": {m: rounded(window_p95[m]) for m in METRICS},
                 "load_n": len(bucket["load"]),
                 "load1_mean": rounded(window_mean),
@@ -719,7 +758,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                 f"(min {floor_window})"
             )
     for state in (OFF, ON):
-        n = min(len(pooled[state]["lat"][m]) for m in gated)
+        n = min(len(pooled[state]["lat"][m]) for m in gated) - missed[state]
         n_load = len(pooled[state]["load"])
         if n < floor_pool or n_load < floor_pool:
             structural.append(
@@ -871,7 +910,8 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         "load1_level": {s: rounded(levels[s]) for s in (OFF, ON)},
         "samples": {
             s: {
-                "latency": min(len(pooled[s]["lat"][m]) for m in gated),
+                "latency": min(len(pooled[s]["lat"][m]) for m in gated) - missed[s],
+                "missed_ticks": missed[s],
                 "load1": len(pooled[s]["load"]),
             }
             for s in (OFF, ON)
@@ -1077,6 +1117,7 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
         "load": [],
         "errors": [],
         "skipped_ticks": {},
+        "missed_ticks": {},
         "cut_short": None,
     }
     latency, load, errors = trace["latency"], trace["load"], trace["errors"]
@@ -1110,10 +1151,14 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
 
     def loop(name: str, phase: float, body) -> threading.Thread:
         def target() -> None:
+            missed: list[tuple[float, float]] = []
             try:
-                trace["skipped_ticks"][name] = cadence(origin, phase, stop, until, body)
+                trace["skipped_ticks"][name] = cadence(
+                    origin, phase, stop, until, body, missed
+                )
             except Exception as exc:  # recorded; the verdict is INCONCLUSIVE
                 errors.append(f"{name} loop: {type(exc).__name__}: {exc}")
+            trace["missed_ticks"][name] = [{"t": t, "lag_ms": lag} for t, lag in missed]
 
         return threading.Thread(target=target, name=f"s2-budget-{name}")
 
@@ -1230,7 +1275,9 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"priority `{config['priority']}`, repeat={config['repeat']}",
         f"- Workload: {config['workload']}; source `{config['source']}`, workdir "
         f"`{config['workdir']}`",
-        f"- Skipped ticks: {trace.get('skipped_ticks')}; instrument errors: "
+        f"- Skipped ticks: {trace.get('skipped_ticks')}; settled workload ticks "
+        f"missed and back-filled: OFF {verdict['samples'][OFF]['missed_ticks']}, "
+        f"ON {verdict['samples'][ON]['missed_ticks']}; instrument errors: "
         f"{len(trace.get('errors', []))}; failed operations: "
         f"{verdict['failed_operations']}",
         f"- Rulings: {trace['rulings']}",
@@ -1256,16 +1303,16 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"{num(response['corrected'], '.3f')} corrected (tau "
         f"{verdict['load1_model']['tau_s']} s).",
         "",
-        "| window | state | start s | end s | overrun s | step n | step p95 ms "
-        "| load1 mean | load1 level | load1 n | busy | runs | power |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| window | state | start s | end s | overrun s | step n | missed "
+        "| step p95 ms | load1 mean | load1 level | load1 n | busy | runs | power |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for raw, stats in zip(trace["windows"], verdict["windows"], strict=True):
         busy = "" if stats["busy"] is None else f"{stats['busy']:.0%}"
         lines.append(
             f"| {raw['index']} | {raw['state']} | {raw['start']:.1f} | "
             f"{raw['end']:.1f} | {raw.get('overrun_s', 0.0):.1f} | "
-            f"{stats['n'][STEP]} | "
+            f"{stats['n'][STEP]} | {stats['missed']} | "
             f"{num(stats['p95_ms'][STEP])} | {num(stats['load1_mean'], '.2f')} | "
             f"{num(stats['load1_level'], '.2f')} | {stats['load_n']} | {busy} | "
             f"{len(raw.get('runs', []))} | "

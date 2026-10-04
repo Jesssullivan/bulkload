@@ -304,6 +304,35 @@ class Load1LagTests(unittest.TestCase):
         self.assertLess(max(levels) - min(levels), 0.05)
 
 
+class CoordinatedOmissionTests(unittest.TestCase):
+    def test_stalls_that_skip_ticks_are_back_filled(self) -> None:
+        trace = stall(synth(evidence=True))
+        verdict = s2.analyze(trace)
+        on = [w for w in verdict["windows"] if w["state"] == "ON"]
+        self.assertTrue(all(w["missed"] > 0 for w in on))
+        self.assertTrue(all(w["n"]["step"] >= 20 for w in on))
+        self.assertEqual(verdict["samples"]["OFF"]["missed_ticks"], 0)
+        self.assertGreater(verdict["samples"]["ON"]["missed_ticks"], 30)
+        self.assertEqual(verdict["status"], "FAIL", reasons(verdict))
+        self.assertGreater(verdict["delta_p95"], 1.0)
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+
+    def test_without_the_back_fill_the_same_stalls_hide(self) -> None:
+        trace = stall(synth(evidence=True))
+        trace["missed_ticks"] = {}
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertLess(verdict["delta_p95"], 0.05)
+
+    def test_missed_ticks_in_the_settle_are_dropped(self) -> None:
+        trace = synth(evidence=True)
+        start = trace["windows"][1]["start"]
+        trace["missed_ticks"] = {"workload": [{"t": start + 5.0, "lag_ms": 9e3}]}
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["windows"][1]["missed"], 0)
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+
+
 class OnRunTests(unittest.TestCase):
     def test_a_failed_on_run_is_inconclusive(self) -> None:
         verdict = s2.analyze(synth(exit_code=3))
@@ -508,10 +537,56 @@ class CadenceTests(unittest.TestCase):
             calls.append(clock["now"])
             clock["now"] += next(durations)
 
+        missed = []
         with mock.patch.object(s2.time, "monotonic", lambda: clock["now"]):
-            skipped = s2.cadence(0.0, 0.0, Stop(), 6.0, body)
+            skipped = s2.cadence(0.0, 0.0, Stop(), 6.0, body, missed)
         self.assertEqual(skipped, 2)
         self.assertEqual([round(c, 6) for c in calls], [0.0, 1.0, 4.0, 5.0])
+        self.assertEqual(missed, [(2.0, 1500.0), (3.0, 500.0)])
+
+    def test_ticks_past_the_bound_are_not_missed(self) -> None:
+        clock = {"now": 0.0}
+
+        class Stop:
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, seconds: float) -> bool:
+                clock["now"] += seconds
+                return False
+
+        def body() -> None:
+            clock["now"] += 4.5
+
+        missed = []
+        with mock.patch.object(s2.time, "monotonic", lambda: clock["now"]):
+            skipped = s2.cadence(0.0, 0.0, Stop(), 3.0, body, missed)
+        self.assertEqual(skipped, 2)
+        self.assertEqual([t for t, _ in missed], [1.0, 2.0])
+
+
+def stall(trace, every=27, stall_ms=6000.0):
+    """Make each ON window's workload stall: one step in `every` takes
+    `stall_ms` and the ticks it overran are missed (recorded as the loop
+    records them), as an open-loop agent's steps would have been delayed."""
+    gone, lags = set(), []
+    skip = int(stall_ms // 1000)
+    for window in trace["windows"]:
+        if window["state"] != "ON":
+            continue
+        start = window["start"]
+        for k in range(0, int(window["end"] - start), every):
+            for j in range(1, skip):
+                gone.add(start + k + j)
+                lags.append({"t": start + k + j, "lag_ms": stall_ms - 1000.0 * j})
+            for row in trace["latency"]:
+                if row["t"] == start + k:
+                    row["ms"] = (
+                        stall_ms if row["op"] in ("jsonl", "step") else row["ms"]
+                    )
+    trace["latency"] = [row for row in trace["latency"] if row["t"] not in gone]
+    trace["missed_ticks"] = {"workload": lags, "sampler": []}
+    return trace
 
 
 class ArgumentTests(unittest.TestCase):
@@ -767,6 +842,10 @@ class LiveRunTests(unittest.TestCase):
         self.assertGreaterEqual(len(trace["load"]), 4)
         self.assertIsNone(trace["cut_short"])
         self.assertEqual(trace["errors"], [])
+        self.assertEqual(set(trace["missed_ticks"]), {"sampler", "workload"})
+        self.assertEqual(
+            len(trace["missed_ticks"]["workload"]), trace["skipped_ticks"]["workload"]
+        )
         self.assertIn(trace["config"]["search_tool"], ("rg", "grep -r"))
         verdict = trace["verdict"]
         self.assertIn(verdict["status"], ("PASS", "FAIL", "INCONCLUSIVE"))
