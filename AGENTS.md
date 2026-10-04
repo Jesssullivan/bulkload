@@ -52,8 +52,10 @@ installer are retired and are not recreated.
 
 - `crates/bulkload-proto`: wire frames, row schema, refusal taxonomy.
 - `crates/bulkload-agent`: walk, chunk transport, Git estate carry, SQLite
-  provider-state composition, handoff probes.
+  provider-state composition.
 - `crates/bulkload-bench`: the R23 benchmark against rclone.
+- `crates/bulkload-handoff`: the credential-class handoff probes, kept out of
+  the agent binary (WP10).
 
 Product bar: [#34](https://github.com/Jesssullivan/bulkload/issues/34) (R25).
 [docs/design.md](docs/design.md) is the product contract; `docs/evidence/` holds
