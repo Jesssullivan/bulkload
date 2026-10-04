@@ -414,23 +414,34 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Create `path` (0700) or check the private directory already there, then
+/// seal its entry in the parent (#161): the records written inside it are
+/// sealed in it, and must not outlive the directory itself. Sealed whoever
+/// created it, since a creator may have died before its seal.
 fn private_directory(path: &Path) -> Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path).refuse_at("estate::private_directory")?;
             // SAFETY: geteuid has no preconditions or side effects.
-            if metadata.is_dir()
+            if !(metadata.is_dir()
                 && metadata.mode().trailing_zeros() >= 6
-                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.uid() == unsafe { libc::geteuid() })
             {
-                Ok(())
-            } else {
-                Err(BulkloadRefusal::PathEscapesRoot)
+                return Err(BulkloadRefusal::PathEscapesRoot);
             }
         }
-        Err(error) => Err(crate::refuse::io(&error, "estate::private_directory")),
+        Err(error) => return Err(crate::refuse::io(&error, "estate::private_directory")),
     }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::File::open(parent)
+        .refuse_at("estate::private_directory")?
+        .sync_dir_counted()
+        .refuse_at("estate::private_directory")?;
+    Ok(())
 }
 
 fn filename(value: &str) -> bool {
