@@ -1,0 +1,35 @@
+//! Shared property-test configuration (OI-1003-Q7, property-test plan PR0).
+//!
+//! Every property runs through [`prop_config`], so CI runs one bounded,
+//! fixed-seed corpus and nothing is persisted between runs. Locally,
+//! `BULKLOAD_PROPTEST_DEEP=1` switches to random seeds and twenty times the
+//! cases; a failing deep run prints its seed, which is pinned as an explicit
+//! test row rather than through a persistence file.
+
+use proptest::test_runner::{Config, RngSeed};
+
+/// The fixed CI seed: every CI run draws the same cases.
+pub const CI_SEED: u64 = 0x0B01_C0AD_2026_1003;
+
+/// The environment switch for the deep local tier.
+pub const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
+
+/// The configuration for a property with `cases` CI cases.
+#[must_use]
+pub fn prop_config(cases: u32) -> Config {
+    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
+    Config {
+        cases: if deep {
+            cases.saturating_mul(20)
+        } else {
+            cases
+        },
+        rng_seed: if deep {
+            RngSeed::Random
+        } else {
+            RngSeed::Fixed(CI_SEED)
+        },
+        failure_persistence: None,
+        ..Config::default()
+    }
+}

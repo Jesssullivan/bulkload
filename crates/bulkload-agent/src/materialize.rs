@@ -46,6 +46,7 @@
 //! other than the store's, fully flushed: the store commit's own full flush
 //! drains only the store's device.
 
+use crate::refuse::RefuseAt as _;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read as _, Seek as _};
@@ -188,12 +189,14 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
-    /// This store's orphaned file temporaries, kept for their chunks and
-    /// removed when the session finishes, whatever it refused (#97): bytes
+    /// This store's orphaned file temporaries, kept for their chunks: bytes
     /// the destination already holds are not sent again within the session.
-    /// Every one is kept, however many: a session can leave up to a whole
+    /// Every one is indexed, however many: a session can leave up to a whole
     /// committer group and queue of sealed temporaries unrenamed (#77 round
-    /// 2, N2). No descriptor is held; each is opened by name when read.
+    /// 2, N2). When the session finishes, only those whose chunks a refused
+    /// entry staged outlive it, up to a bound; the rest are removed (#97,
+    /// #124, see [`Destination::retire_salvaged`]). No descriptor is held;
+    /// each is opened by name when read.
     salvage: Vec<Salvaged>,
 }
 
@@ -231,12 +234,16 @@ impl Destination {
     /// # Errors
     /// Refuses a missing root or symlink root, or a store without authority.
     pub fn open(path: &Path, store: &Store) -> Result<Self> {
-        let root = File::from(crate::io::sys::open_dir_path_nofollow(path)?);
+        let root = File::from(
+            crate::io::sys::open_dir_path_nofollow(path).refuse_at("materialize::open")?,
+        );
         Ok(Self {
             root,
-            path: std::fs::canonicalize(path)?,
+            path: std::fs::canonicalize(path).refuse_at("materialize::open")?,
             tag: temporary_tag(&store.authority()?),
-            store_device: std::fs::metadata(store.root())?.dev(),
+            store_device: std::fs::metadata(store.root())
+                .refuse_at("materialize::open")?
+                .dev(),
             last_parent: std::cell::RefCell::new(None),
             directories: Vec::new(),
             unflushed: std::collections::HashMap::new(),
@@ -258,15 +265,38 @@ impl Destination {
         open_regular(&salvaged.parent, &salvaged.name).ok()
     }
 
-    /// Remove every salvaged temporary by name, as the sweep would have, and
-    /// seal each directory that lost one. Call once the session's outputs
-    /// are queued: their bytes no longer depend on the temporaries.
+    /// The size of the salvaged temporary at `index`, by name; `None` once it
+    /// is gone or is not a regular file.
+    pub(crate) fn salvaged_size(&self, index: usize) -> Option<u64> {
+        self.salvaged_file(index)
+            .and_then(|file| file.metadata().ok())
+            .map(|metadata| metadata.len())
+    }
+
+    /// The destination-relative path the salvaged temporary at `index` has
+    /// now (the session name the sweep gave it).
+    pub(crate) fn salvaged_path(&self, index: usize) -> Option<&[u8]> {
+        self.salvage
+            .get(index)
+            .map(|salvaged| salvaged.rel_path.as_slice())
+    }
+
+    /// Retire the session's salvage: keep the temporaries at `keep` (indices
+    /// as [`Destination::salvaged_file`] takes them) for a later session,
+    /// reported in [`Sweep::left`] under their current names, and remove
+    /// every other one by name, as the sweep would have, sealing each
+    /// directory that lost one. Call once the session's outputs are queued:
+    /// their bytes no longer depend on the temporaries.
     ///
     /// # Errors
     /// Refuses a failed directory seal.
-    pub fn remove_salvaged(&mut self) -> Result<()> {
+    pub(crate) fn retire_salvaged(&mut self, keep: &[usize]) -> Result<()> {
         let mut touched: Vec<Arc<File>> = Vec::new();
-        for salvaged in std::mem::take(&mut self.salvage) {
+        for (index, salvaged) in std::mem::take(&mut self.salvage).into_iter().enumerate() {
+            if keep.contains(&index) {
+                self.swept.left.push(salvaged.rel_path);
+                continue;
+            }
             match crate::io::sys::unlinkat(&salvaged.parent, &salvaged.name, false) {
                 Ok(()) => {
                     self.swept.removed += 1;
@@ -278,9 +308,13 @@ impl Destination {
         }
         let mut sealed = std::collections::HashSet::new();
         for directory in touched {
-            let metadata = directory.metadata()?;
+            let metadata = directory
+                .metadata()
+                .refuse_at("materialize::remove_salvaged")?;
             if sealed.insert((metadata.dev(), metadata.ino())) {
-                directory.sync_dir_counted()?;
+                directory
+                    .sync_dir_counted()
+                    .refuse_at("materialize::remove_salvaged")?;
             }
         }
         Ok(())
@@ -292,7 +326,7 @@ impl Destination {
     /// # Errors
     /// Refuses an unreadable root directory.
     pub fn sweep_root(&mut self, store: &Store) -> Result<()> {
-        let root = self.root.try_clone()?;
+        let root = self.root.try_clone().refuse_at("materialize::sweep_root")?;
         self.sweep(&root, &[], store)
     }
 
@@ -321,7 +355,9 @@ impl Destination {
     pub fn identity(&self, row: &RowSchema) -> Result<Option<StatIdentity>> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
         match open_regular(&parent, &leaf) {
-            Ok(file) => Ok(Some(StatIdentity::from_metadata(&file.metadata()?))),
+            Ok(file) => Ok(Some(StatIdentity::from_metadata(
+                &file.metadata().refuse_at("materialize::identity")?,
+            ))),
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
             Err(error) => Err(error),
         }
@@ -349,7 +385,8 @@ impl Destination {
     /// directories that appear during creation.
     pub fn directory(&mut self, row: &RowSchema, store: &Store, authority: &[u8]) -> Result<()> {
         let (parent, leaf) = self.parent(&row.rel_path)?;
-        let key = postcard::to_stdvec(&(authority, &row.rel_path))?;
+        let key =
+            postcard::to_stdvec(&(authority, &row.rel_path)).refuse_at("materialize::directory")?;
         if stat_at(&parent, &leaf)?.is_some() {
             return self.existing_directory(row, &parent, &leaf, &key, store);
         }
@@ -357,10 +394,10 @@ impl Destination {
         #[cfg(feature = "fault-injection")]
         crate::fault::note_directory(Some("rename"));
         let temporary = self.temporary(Some(DIRECTORY_MARK))?;
-        crate::io::sys::mkdirat(&parent, &temporary, 0o700)?;
+        crate::io::sys::mkdirat(&parent, &temporary, 0o700).refuse_at("materialize::directory")?;
         fault_point!(DirectoryAfterMkdir);
         let bound = open_dir(&parent, &temporary)
-            .and_then(|created| Ok(created.metadata()?))
+            .and_then(|created| created.metadata().refuse_at("materialize::directory"))
             .and_then(|metadata| {
                 self.seal_entry(&parent)?;
                 store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
@@ -382,11 +419,11 @@ impl Destination {
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
                 BulkloadRefusal::GitDestinationOccupied
             } else {
-                error.into()
+                crate::refuse::io(&error, "materialize::directory")
             });
         }
         fault_point!(DirectoryAfterRename);
-        crate::io::durable::seal_dir(&parent)?;
+        crate::io::durable::seal_dir(&parent).refuse_at("materialize::directory")?;
         self.note_unflushed(parent);
         self.created.renamed += 1;
         self.directories.push(OwnedDirectory {
@@ -402,8 +439,13 @@ impl Destination {
     /// Seal `parent`'s entries ahead of a record that depends on them, with a
     /// full flush when `parent` is not on the store's device.
     fn seal_entry(&self, parent: &File) -> Result<()> {
-        crate::io::durable::seal_dir(parent)?;
-        if parent.metadata()?.dev() != self.store_device {
+        crate::io::durable::seal_dir(parent).refuse_at("materialize::seal_entry")?;
+        if parent
+            .metadata()
+            .refuse_at("materialize::seal_entry")?
+            .dev()
+            != self.store_device
+        {
             full_flush_counted(parent)?;
         }
         Ok(())
@@ -439,11 +481,13 @@ impl Destination {
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
                 BulkloadRefusal::GitDestinationOccupied
             } else {
-                error.into()
+                crate::refuse::io(&error, "materialize::fallback_directory")
             });
         }
         fault_point!(DirectoryAfterFallbackMkdir);
-        let metadata = open_dir(parent, leaf)?.metadata()?;
+        let metadata = open_dir(parent, leaf)?
+            .metadata()
+            .refuse_at("materialize::fallback_directory")?;
         self.seal_entry(parent)?;
         store.record_directory_created(&key, metadata.dev(), metadata.ino(), mode)?;
         self.created.fallback.push(row.rel_path.clone());
@@ -468,7 +512,9 @@ impl Destination {
         let mode = row.mode & 0o7777;
         let existing = open_dir(parent, leaf)?;
         self.sweep(&existing, &row.rel_path, store)?;
-        let metadata = existing.metadata()?;
+        let metadata = existing
+            .metadata()
+            .refuse_at("materialize::existing_directory")?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
         let owned = match store.directory_record(key) {
             Ok(Some(record)) if record == (PendingDirectory { dev, ino, mode }) => {
@@ -582,8 +628,8 @@ impl Destination {
                 store.clear_directories_bound_to(stat.node.dev, stat.node.ino)?;
             } else if stat.nlink == 1 {
                 // An orphan with no other name may hold a whole staged
-                // output: keep it for its chunks and remove it when the
-                // session finishes. It takes a name of this session first,
+                // output: keep it for its chunks and retire it when the
+                // session finishes (`retire_salvaged`). It takes a name of this session first,
                 // so no temporary this session stages can collide with it.
                 // A second link to a published output is removed at once;
                 // the output keeps the bytes.
@@ -596,7 +642,9 @@ impl Destination {
                     Err(_) => name,
                 };
                 if shared.is_none() {
-                    shared = Some(Arc::new(directory.try_clone()?));
+                    shared = Some(Arc::new(
+                        directory.try_clone().refuse_at("materialize::sweep")?,
+                    ));
                 }
                 let parent = Arc::clone(shared.as_ref().ok_or(BulkloadRefusal::Io(None))?);
                 // Report the name it now has (#77 round 3, F1).
@@ -625,7 +673,9 @@ impl Destination {
             }
         }
         if removed || renamed {
-            directory.sync_dir_counted()?;
+            directory
+                .sync_dir_counted()
+                .refuse_at("materialize::sweep")?;
         }
         Ok(())
     }
@@ -653,11 +703,14 @@ impl Destination {
             let (parent, leaf) = self.parent(&path)?;
             let directory = open_dir(&parent, &leaf)?;
             drop(parent);
-            let metadata = directory.metadata()?;
+            let metadata = directory
+                .metadata()
+                .refuse_at("materialize::finish_directories")?;
             if metadata.dev() != dev || metadata.ino() != ino {
                 return Err(BulkloadRefusal::GitDestinationOccupied);
             }
-            crate::io::sys::fchmod(&directory, mode)?;
+            crate::io::sys::fchmod(&directory, mode)
+                .refuse_at("materialize::finish_directories")?;
             self.seal_entry(&directory)?;
             fault_point!(DirectoryBeforeComplete);
             if let Some(pending) = self.directories.get(index) {
@@ -703,12 +756,12 @@ impl Destination {
         let target_c = cstring(target)?;
         match crate::io::sys::symlinkat(&target_c, &parent, &leaf) {
             Ok(()) => {
-                crate::io::durable::seal_dir(&parent)?;
+                crate::io::durable::seal_dir(&parent).refuse_at("materialize::symlink")?;
                 self.note_unflushed(parent);
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "materialize::symlink")),
         }
         let mut bytes = vec![0_u8; target.len().saturating_add(1)];
         // Any failure (`EINVAL`: the leaf is a file or a directory; `ENOENT`:
@@ -758,7 +811,7 @@ impl Destination {
                 {
                     attempts += 1;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(crate::refuse::io(&error, "materialize::stage")),
             }
         };
         Ok(StagedFile {
@@ -807,7 +860,7 @@ impl Destination {
 
     fn parent(&self, path: &[u8]) -> Result<(File, CString)> {
         let mut parts = path.split(|byte| *byte == b'/').peekable();
-        let mut directory = self.root.try_clone()?;
+        let mut directory = self.root.try_clone().refuse_at("materialize::parent")?;
         while let Some(part) = parts.next() {
             if part.is_empty() || part == b"." || part == b".." {
                 return Err(BulkloadRefusal::PathEscapesRoot);
@@ -843,7 +896,7 @@ impl StagedFile {
     /// Returns the failed seal; the temporary is left for the caller.
     pub(crate) fn seal(&mut self) -> Result<()> {
         if !self.sealed {
-            crate::io::durable::seal_file(&self.file)?;
+            crate::io::durable::seal_file(&self.file).refuse_at("materialize::seal")?;
             self.sealed = true;
             fault_point!(MaterializeAfterTempSeal);
         }
@@ -875,29 +928,28 @@ impl StagedFile {
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 BulkloadRefusal::GitDestinationOccupied
             } else {
-                error.into()
+                crate::refuse::io(&error, "materialize::publish")
             });
         }
         fault_point!(MaterializeAfterRename);
         counters::bump(Counter::FilesMaterialized);
         Ok((
-            StatIdentity::from_metadata(&self.file.metadata()?),
+            StatIdentity::from_metadata(&self.file.metadata().refuse_at("materialize::publish")?),
             self.parent,
         ))
     }
 }
 
 fn full_flush_counted(handle: &File) -> Result<()> {
-    Ok(counters::timed(
-        Counter::FlushFull,
-        Counter::FlushFullNs,
-        || crate::io::sys::full_flush(handle),
-    )?)
+    counters::timed(Counter::FlushFull, Counter::FlushFullNs, || {
+        crate::io::sys::full_flush(handle)
+    })
+    .refuse_at("materialize::full_flush_counted")
 }
 
 fn unlink(parent: &File, name: &CString) -> Result<()> {
     // Without AT_REMOVEDIR this removes only a non-directory entry.
-    Ok(crate::io::sys::unlinkat(parent, name, false)?)
+    crate::io::sys::unlinkat(parent, name, false).refuse_at("materialize::unlink")
 }
 
 /// The serial the next temporary name of this process takes.
@@ -958,7 +1010,9 @@ impl PublishSink {
     /// # Errors
     /// Refuses if the store root cannot be stat'ed.
     pub(crate) fn new(publisher: StorePublisher) -> Result<Self> {
-        let store_device = std::fs::metadata(publisher.store().root())?.dev();
+        let store_device = std::fs::metadata(publisher.store().root())
+            .refuse_at("materialize::new")?
+            .dev();
         Ok(Self {
             publisher,
             store_device,
@@ -1008,7 +1062,7 @@ impl TouchedDevices {
     /// follows drains only its own device. Returns the devices flushed.
     fn seal(&self, store_device: u64) -> Result<usize> {
         for directory in &self.directories {
-            crate::io::durable::seal_dir(directory)?;
+            crate::io::durable::seal_dir(directory).refuse_at("materialize::seal")?;
         }
         let mut flushed = 0;
         if crate::io::durable::durability() == crate::io::durable::Durability::Group {
@@ -1078,9 +1132,13 @@ impl crate::io::durable::GroupSink for PublishSink {
                         touched.directory(parent);
                         records.push(record);
                     }
-                    Err(error) => self
-                        .outcomes
-                        .push((record.rel_path, Err(space_refusal(error.into())))),
+                    Err(error) => self.outcomes.push((
+                        record.rel_path,
+                        Err(space_refusal(crate::refuse::io(
+                            &error,
+                            "materialize::commit",
+                        ))),
+                    )),
                 },
             }
         }
@@ -1146,8 +1204,8 @@ pub(crate) fn verify_existing(
     manifest: &Manifest,
 ) -> Result<StatIdentity> {
     let mut file = file;
-    file.rewind()?;
-    let before = file.metadata()?;
+    file.rewind().refuse_at("materialize::verify_existing")?;
+    let before = file.metadata().refuse_at("materialize::verify_existing")?;
     if before.len() != row.size
         || manifest.size() != Some(row.size)
         || before.mode() & 0o7777 != row.mode & 0o7777
@@ -1161,14 +1219,21 @@ pub(crate) fn verify_existing(
         let slot = buffer
             .get_mut(..size)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        file.read_exact(slot)?;
+        file.read_exact(slot)
+            .refuse_at("materialize::verify_existing")?;
         counters::add_len(Counter::DestVerifyRead, size);
         if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
     }
     let mut tail = [0_u8; 1];
-    if file.read(&mut tail)? != 0 || StatIdentity::from_metadata(&file.metadata()?) != identity {
+    if file
+        .read(&mut tail)
+        .refuse_at("materialize::verify_existing")?
+        != 0
+        || StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::verify_existing")?)
+            != identity
+    {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     Ok(identity)
@@ -1184,7 +1249,9 @@ fn fresh_fallback(directory: &File, metadata: &std::fs::Metadata) -> Result<bool
     Ok(metadata.is_dir()
         && metadata.mode() & 0o7777 == 0o700
         && metadata.uid() == crate::io::sys::effective_uid()
-        && crate::io::sys::list_dir(directory)?.is_empty())
+        && crate::io::sys::list_dir(directory)
+            .refuse_at("materialize::fresh_fallback")?
+            .is_empty())
 }
 
 /// Best-effort undo of a directory creation that did not publish: clear its
@@ -1203,26 +1270,35 @@ fn stat_at(parent: &File, name: &CStr) -> Result<Option<crate::io::Stat>> {
     match crate::io::sys::fstatat_nofollow(parent, name) {
         Ok(stat) => Ok(Some(stat)),
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(crate::refuse::io(&error, "materialize::stat_at")),
     }
 }
 
 /// Every entry directly inside `directory` whose name is in the temporary
 /// grammar, read through a fresh descriptor for `.` (see `sys::list_dir`).
 fn temporary_candidates(directory: &File) -> Result<Vec<(CString, TemporaryName)>> {
-    Ok(crate::io::sys::list_dir(directory)?
+    Ok(crate::io::sys::list_dir(directory)
+        .refuse_at("materialize::temporary_candidates")?
         .into_iter()
         .filter_map(|name| temporary_name(name.to_bytes()).map(|kind| (name, kind)))
         .collect())
 }
 
 fn open_dir(parent: &File, name: &CStr) -> Result<File> {
-    Ok(File::from(crate::io::sys::open_dir_at(parent, name)?))
+    Ok(File::from(
+        crate::io::sys::open_dir_at(parent, name).refuse_at("materialize::open_dir")?,
+    ))
 }
 
 fn open_regular(parent: &File, name: &CStr) -> Result<File> {
-    let file = File::from(crate::io::sys::open_read_at(parent, name)?);
-    if !file.metadata()?.is_file() {
+    let file = File::from(
+        crate::io::sys::open_read_at(parent, name).refuse_at("materialize::open_regular")?,
+    );
+    if !file
+        .metadata()
+        .refuse_at("materialize::open_regular")?
+        .is_file()
+    {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     Ok(file)
@@ -1248,9 +1324,15 @@ mod tests {
         ));
         let source = base.join("source");
         let destination = base.join("destination");
-        std::fs::create_dir_all(&source)?;
-        std::fs::create_dir_all(&destination)?;
-        std::fs::write(source.join("file"), b"ours")?;
+        std::fs::create_dir_all(&source).refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
+        std::fs::create_dir_all(&destination).refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
+        std::fs::write(source.join("file"), b"ours").refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
         let row = crate::walk::walk(
             &crate::walk::WalkOptions::new(source),
             &mut crate::freshness::NullCache,
@@ -1261,8 +1343,12 @@ mod tests {
         .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
         let staged = target.stage(&row)?;
-        (&**staged.file()).write_all(b"ours")?;
-        std::fs::write(destination.join("file"), b"theirs")?;
+        (&**staged.file()).write_all(b"ours").refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
+        std::fs::write(destination.join("file"), b"theirs").refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
         let mut sink = PublishSink::new(
             Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
         )?
@@ -1278,8 +1364,14 @@ mod tests {
             },
         }]);
         let report = sink.finish();
-        let listed = std::fs::read_dir(&destination)?.count();
-        let kept = std::fs::read(destination.join("file"))?;
+        let listed = std::fs::read_dir(&destination)
+            .refuse_at(
+                "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+            )?
+            .count();
+        let kept = std::fs::read(destination.join("file")).refuse_at(
+            "materialize::tests::publish_never_replaces_an_output_that_appeared_meanwhile",
+        )?;
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(
             report,
@@ -1305,9 +1397,12 @@ mod tests {
         ));
         let source = base.join("source");
         let destination = base.join("destination");
-        std::fs::create_dir_all(&source)?;
-        std::fs::create_dir_all(&destination)?;
-        std::fs::write(source.join("file"), b"ours")?;
+        std::fs::create_dir_all(&source)
+            .refuse_at("materialize::tests::a_failed_directory_seal_commits_no_record")?;
+        std::fs::create_dir_all(&destination)
+            .refuse_at("materialize::tests::a_failed_directory_seal_commits_no_record")?;
+        std::fs::write(source.join("file"), b"ours")
+            .refuse_at("materialize::tests::a_failed_directory_seal_commits_no_record")?;
         let row = crate::walk::walk(
             &crate::walk::WalkOptions::new(source),
             &mut crate::freshness::NullCache,
@@ -1318,7 +1413,9 @@ mod tests {
         .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
         let staged = target.stage(&row)?;
-        (&**staged.file()).write_all(b"ours")?;
+        (&**staged.file())
+            .write_all(b"ours")
+            .refuse_at("materialize::tests::a_failed_directory_seal_commits_no_record")?;
         let mut sink = PublishSink::new(
             Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
         )?;
@@ -1335,7 +1432,10 @@ mod tests {
         }]);
         crate::io::durable::fail_dir_seals(false);
         let report = sink.finish();
-        let identity = StatIdentity::from_metadata(&std::fs::metadata(destination.join("file"))?);
+        let identity = StatIdentity::from_metadata(
+            &std::fs::metadata(destination.join("file"))
+                .refuse_at("materialize::tests::a_failed_directory_seal_commits_no_record")?,
+        );
         let recorded = Store::open(&base.join("state"))?.output_matches(b"key", &identity)?;
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(
@@ -1361,12 +1461,18 @@ mod tests {
         ));
         let source = base.join("source");
         let destination = base.join("destination");
-        std::fs::create_dir_all(&source)?;
-        std::fs::create_dir_all(&destination)?;
-        std::os::unix::fs::symlink("target", source.join("as-file"))?;
-        std::os::unix::fs::symlink("target", source.join("as-dir"))?;
-        std::fs::write(destination.join("as-file"), b"someone else's")?;
-        std::fs::create_dir(destination.join("as-dir"))?;
+        std::fs::create_dir_all(&source)
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
+        std::fs::create_dir_all(&destination)
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
+        std::os::unix::fs::symlink("target", source.join("as-file"))
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
+        std::os::unix::fs::symlink("target", source.join("as-dir"))
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
+        std::fs::write(destination.join("as-file"), b"someone else's")
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
+        std::fs::create_dir(destination.join("as-dir"))
+            .refuse_at("materialize::tests::a_symlink_onto_an_occupied_leaf_refuses_as_occupied")?;
         let store = Store::open(&base.join("state"))?;
         let mut target = Destination::open(&destination, &store)?;
         let mut codes = Vec::new();
@@ -1391,8 +1497,15 @@ mod tests {
 
     #[test]
     fn a_group_fully_flushes_each_touched_device_the_store_is_not_on() -> Result<()> {
-        let directory = Arc::new(File::open(std::env::temp_dir())?);
-        let device = directory.metadata()?.dev();
+        let directory = Arc::new(File::open(std::env::temp_dir()).refuse_at(
+            "materialize::tests::a_group_fully_flushes_each_touched_device_the_store_is_not_on",
+        )?);
+        let device = directory
+            .metadata()
+            .refuse_at(
+                "materialize::tests::a_group_fully_flushes_each_touched_device_the_store_is_not_on",
+            )?
+            .dev();
         let mut touched = TouchedDevices::default();
         touched.directory(Arc::clone(&directory));
         touched.directory(directory);
@@ -1413,21 +1526,31 @@ mod tests {
         ));
         let source = base.join("source");
         let destination = base.join("destination");
-        std::fs::create_dir_all(&source)?;
-        std::fs::create_dir_all(&destination)?;
-        std::fs::write(source.join("free"), b"ours")?;
-        std::fs::write(source.join("taken"), b"ours")?;
+        std::fs::create_dir_all(&source).refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
+        std::fs::create_dir_all(&destination).refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
+        std::fs::write(source.join("free"), b"ours").refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
+        std::fs::write(source.join("taken"), b"ours").refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
         let rows = crate::walk::walk(
             &crate::walk::WalkOptions::new(source),
             &mut crate::freshness::NullCache,
         )?
         .rows;
-        std::fs::write(destination.join("taken"), b"theirs")?;
+        std::fs::write(destination.join("taken"), b"theirs").refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
         let target = Destination::open(&destination, &Store::open(&base.join("state"))?)?;
         let mut publications = Vec::new();
         for row in &rows {
             let staged = target.stage(row)?;
-            (&**staged.file()).write_all(b"ours")?;
+            (&**staged.file()).write_all(b"ours").refuse_at("materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported")?;
             publications.push(Publication::Staged {
                 staged,
                 record: PendingOutput {
@@ -1451,9 +1574,13 @@ mod tests {
         let fallbacks = counters::Counters::snapshot()
             .since(before)
             .get(Counter::PublishLinkFallback);
-        let free = std::fs::read(destination.join("free"))?;
-        let taken = std::fs::read(destination.join("taken"))?;
-        let listed = std::fs::read_dir(&destination)?.count();
+        let free = std::fs::read(destination.join("free")).refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
+        let taken = std::fs::read(destination.join("taken")).refuse_at(
+            "materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported",
+        )?;
+        let listed = std::fs::read_dir(&destination).refuse_at("materialize::tests::publish_falls_back_to_link_where_exclusive_rename_is_unsupported")?.count();
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(
             report,

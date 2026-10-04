@@ -6,6 +6,7 @@ use super::{
     write_git_pointer, IndexReservation,
 };
 use crate::counters::CountedSync as _;
+use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 use std::fs;
 use std::io::Read;
@@ -19,34 +20,42 @@ fn image(root: &Path) -> Result<Image> {
     let mut result = Vec::new();
     let mut remaining = 64 * 1024 * 1024u64;
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
+        for entry in fs::read_dir(directory).refuse_at("git_carry::registered::image")? {
+            let entry = entry.refuse_at("git_carry::registered::image")?;
             let path = entry.path();
             if path == root.join("index.lock") {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&path)?;
+            let metadata = fs::symlink_metadata(&path).refuse_at("git_carry::registered::image")?;
             if metadata.is_dir() {
                 pending.push(path);
             } else if metadata.is_file() {
                 let mut file = fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                    .open(&path)?;
+                    .open(&path)
+                    .refuse_at("git_carry::registered::image")?;
                 let before = crate::freshness::StatIdentity::from_metadata(&metadata);
-                if crate::freshness::StatIdentity::from_metadata(&file.metadata()?) != before {
+                if crate::freshness::StatIdentity::from_metadata(
+                    &file.metadata().refuse_at("git_carry::registered::image")?,
+                ) != before
+                {
                     return Err(BulkloadRefusal::GitAuthorityChanged);
                 }
                 let mut bytes = Vec::new();
                 Read::by_ref(&mut file)
                     .take(remaining + 1)
-                    .read_to_end(&mut bytes)?;
+                    .read_to_end(&mut bytes)
+                    .refuse_at("git_carry::registered::image")?;
                 remaining = remaining
                     .checked_sub(bytes.len() as u64)
                     .ok_or(BulkloadRefusal::BudgetExceeded)?;
-                if crate::freshness::StatIdentity::from_metadata(&file.metadata()?) != before
-                    || crate::freshness::StatIdentity::from_metadata(&fs::symlink_metadata(&path)?)
-                        != before
+                if crate::freshness::StatIdentity::from_metadata(
+                    &file.metadata().refuse_at("git_carry::registered::image")?,
+                ) != before
+                    || crate::freshness::StatIdentity::from_metadata(
+                        &fs::symlink_metadata(&path).refuse_at("git_carry::registered::image")?,
+                    ) != before
                 {
                     return Err(BulkloadRefusal::GitAuthorityChanged);
                 }
@@ -73,7 +82,8 @@ fn authority(repository: &Path, admin: &Path, head: &str, staged: &str) -> Resul
     }
     if !snapshot_command(admin, repository, &index)
         .args(["diff", "--cached", "--quiet", staged, "--"])
-        .status()?
+        .status()
+        .refuse_at("git_carry::registered::authority")?
         .success()
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
@@ -93,9 +103,16 @@ fn complete(
         &path,
         postcard::to_allocvec(&(destination, admin, head, staged))
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
-    )?;
-    fs::File::open(path)?.sync_file_counted()?;
-    fs::File::open(receipt)?.sync_dir_counted()?;
+    )
+    .refuse_at("git_carry::registered::complete")?;
+    fs::File::open(path)
+        .refuse_at("git_carry::registered::complete")?
+        .sync_file_counted()
+        .refuse_at("git_carry::registered::complete")?;
+    fs::File::open(receipt)
+        .refuse_at("git_carry::registered::complete")?
+        .sync_dir_counted()
+        .refuse_at("git_carry::registered::complete")?;
     Ok(())
 }
 
@@ -106,6 +123,7 @@ fn complete(
 /// operations, malformed administration or changed authority. Partial new payload
 /// and its receipt remain on refusal; existing administration is never replaced.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // WP3: every foreign-error site names itself.
 pub fn restore(
     bundle: &Path,
     repository: &Path,
@@ -114,10 +132,11 @@ pub fn restore(
     source: &str,
     receipt: &Path,
 ) -> Result<()> {
+    const SITE: &str = "git_carry::registered::restore";
     let staged = super::stage_bundle(bundle)?;
-    let repository = fs::canonicalize(repository)?;
+    let repository = fs::canonicalize(repository).refuse_at(SITE)?;
     let common = common_repository(&repository)?;
-    let admin = fs::canonicalize(admin)?;
+    let admin = fs::canonicalize(admin).refuse_at(SITE)?;
     if admin.parent() != Some(common.join("worktrees").as_path()) {
         return Err(BulkloadRefusal::GitAuthorityOutsideRoot);
     }
@@ -125,19 +144,29 @@ pub fn restore(
         destination
             .parent()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
-    )?;
+    )
+    .refuse_at(SITE)?;
     let destination = parent.join(
         destination
             .file_name()
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     );
     require_missing(&destination)?;
-    if fs::read_to_string(admin.join("gitdir"))?.trim_end()
+    if fs::read_to_string(admin.join("gitdir"))
+        .refuse_at(SITE)?
+        .trim_end()
         != destination
             .join(".git")
             .to_str()
             .ok_or(BulkloadRefusal::PathNotPortable)?
-        || fs::canonicalize(admin.join(fs::read_to_string(admin.join("commondir"))?.trim_end()))?
+        || fs::canonicalize(
+            admin.join(
+                fs::read_to_string(admin.join("commondir"))
+                    .refuse_at(SITE)?
+                    .trim_end(),
+            ),
+        )
+        .refuse_at(SITE)?
             != common
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
@@ -156,7 +185,8 @@ pub fn restore(
     }
     let before = image(&admin)?;
     let receipt_parent =
-        fs::canonicalize(receipt.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
+        fs::canonicalize(receipt.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+            .refuse_at(SITE)?;
     let receipt = receipt_parent.join(
         receipt
             .file_name()
@@ -165,14 +195,21 @@ pub fn restore(
     if receipt.starts_with(&admin) || receipt.starts_with(&destination) {
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
-    fs::DirBuilder::new().mode(0o700).create(&receipt)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&receipt)
+        .refuse_at(SITE)?;
     fs::write(
         receipt.join("original-administration.postcard"),
         postcard::to_allocvec(&before).map_err(|_| BulkloadRefusal::FrameCodec)?,
-    )?;
-    fs::copy(staged.path(), receipt.join("capture.bundle"))?;
+    )
+    .refuse_at(SITE)?;
+    fs::copy(staged.path(), receipt.join("capture.bundle")).refuse_at(SITE)?;
     sync_private_tree(&receipt)?;
-    fs::File::open(&receipt_parent)?.sync_dir_counted()?;
+    fs::File::open(&receipt_parent)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
     super::import_verified(&repository, &receipt.join("capture.bundle"), source)?;
     let heads = super::shallow::headers(&repository, &receipt.join("capture.bundle"))?;
     let head = capture_revision(&heads, "head")?;
@@ -184,10 +221,16 @@ pub fn restore(
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
     authority(&repository, &admin, &head, &staged)?;
-    fs::DirBuilder::new().mode(0o700).create(&destination)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&destination)
+        .refuse_at(SITE)?;
     let pointer = write_git_pointer(&receipt, &admin)?;
-    fs::File::open(&pointer)?.sync_file_counted()?;
-    fs::hard_link(pointer, destination.join(".git"))?;
+    fs::File::open(&pointer)
+        .refuse_at(SITE)?
+        .sync_file_counted()
+        .refuse_at(SITE)?;
+    fs::hard_link(pointer, destination.join(".git")).refuse_at(SITE)?;
     let entries = output(git(&repository).args([
         "ls-tree",
         "-r",
@@ -201,14 +244,19 @@ pub fn restore(
     }
     authority(&repository, &admin, &head, &staged)?;
     attachment_policy_matches(&repository, &repository, &heads)?;
-    fs::File::open(&destination)?.sync_dir_counted()?;
+    fs::File::open(&destination)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
     reservation.release()?;
     // The completion receipt must not precede the new target directory entry.
     fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(&parent)?
-        .sync_dir_counted()?;
+        .open(&parent)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
     complete(&receipt, &destination, &admin, &head, &staged)
 }
 

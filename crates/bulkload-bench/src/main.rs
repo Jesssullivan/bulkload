@@ -24,6 +24,8 @@ use std::time::Instant;
 use bulkload_agent::counters::Counters;
 use bulkload_agent::durable::Durability;
 use bulkload_agent::freshness::NullCache;
+use bulkload_agent::priority::PriorityClass;
+use bulkload_agent::refuse::RefuseAt as _;
 use bulkload_agent::transfer::{self, TransferTiming};
 use bulkload_agent::transfer_store::ChunkTiming;
 use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
@@ -67,6 +69,18 @@ struct Cli {
     /// `gated=false`; the verdict is then informational only.
     #[arg(long)]
     informational: bool,
+    /// The CPU and IO class both arms run at (WP0(f), OI-1003-Q17):
+    /// `background` (the default, as the source-side verbs run) or `normal`,
+    /// gate (a)'s explicit opt-out. Entered before the first sample, so the
+    /// rclone child inherits it too; the header records it.
+    #[arg(long, default_value = "background", value_parser = parse_priority)]
+    priority: PriorityClass,
+}
+
+fn parse_priority(value: &str) -> Result<PriorityClass, String> {
+    value
+        .parse()
+        .map_err(|_| format!("expected background or normal, got {value:?}"))
 }
 
 fn parse_durability(value: &str) -> Result<Durability, String> {
@@ -485,8 +499,12 @@ fn interrupt_after_payload(
     transfer::tune_stream(&receiver);
     std::thread::scope(|scope| -> io::Result<()> {
         let producer = std::thread::Builder::new().spawn_scoped(scope, move || {
-            let input = sender.try_clone()?;
-            let closer = sender.try_clone()?;
+            let input = sender
+                .try_clone()
+                .refuse_at("bench::interrupt_after_payload")?;
+            let closer = sender
+                .try_clone()
+                .refuse_at("bench::interrupt_after_payload")?;
             let served = transfer::serve(input, &mut StopBeforeDone(sender));
             // The source's reader thread holds a clone of this end; closing
             // it lets the destination see the interruption.
@@ -744,9 +762,10 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
 
 fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
     println!(
-        "benchmark revision={} durability={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={}",
+        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={}",
         cli.revision,
         cli.durability,
+        cli.priority.label(),
         cli.informational,
         rclone_identity,
         fixture.sealed_identity,
@@ -972,6 +991,11 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
 }
 
 fn run(cli: &Cli) -> io::Result<()> {
+    // WP0(f): before any thread or child, so both arms run in the class the
+    // header records.
+    if cli.priority == PriorityClass::Background {
+        bulkload_agent::priority::enter_background().map_err(io::Error::other)?;
+    }
     bulkload_agent::durable::set_durability(cli.durability);
     let _ = bulkload_agent::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
@@ -1094,6 +1118,7 @@ mod tests {
             revision: "test-revision".to_owned(),
             durability: Durability::Group,
             informational: true,
+            priority: PriorityClass::Normal,
         };
         run(&cli)?;
         // A repeated invocation cannot accidentally reuse another run's state.

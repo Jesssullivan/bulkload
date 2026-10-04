@@ -1,5 +1,6 @@
 //! Raw tree construction in one Git process, with one regular-file byte pass.
 
+use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -7,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 
+use super::estimate::StderrTap;
 use super::{commit_tree, git, output, safe_destination, text, DriftKind, DriftRow};
 use crate::{BulkloadRefusal, Result, RowSchema};
 use bulkload_proto::FileKind;
@@ -57,9 +59,9 @@ fn opened(path: &Path, row: &RowSchema) -> Result<std::result::Result<fs::File, 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Err(DriftKind::SeatRemoved))
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(crate::refuse::io(&error, "git_carry::raw_tree::opened")),
     };
-    let metadata = file.metadata()?;
+    let metadata = file.metadata().refuse_at("git_carry::raw_tree::opened")?;
     if !metadata.is_file()
         || crate::freshness::StatIdentity::from_metadata(&metadata)
             != crate::freshness::StatIdentity::from_row(row)
@@ -78,23 +80,31 @@ fn regular(
     path: &Path,
     row: &RowSchema,
 ) -> Result<Seat> {
-    writeln!(writer, "data {}", row.size)?;
-    let copied = std::io::copy(&mut Read::by_ref(file).take(row.size), writer)?;
+    writeln!(writer, "data {}", row.size).refuse_at("git_carry::raw_tree::regular")?;
+    let copied = std::io::copy(&mut Read::by_ref(file).take(row.size), writer)
+        .refuse_at("git_carry::raw_tree::regular")?;
     let identity = crate::freshness::StatIdentity::from_row(row);
     let drifted = copied != row.size
-        || crate::freshness::StatIdentity::from_metadata(&file.metadata()?) != identity
+        || crate::freshness::StatIdentity::from_metadata(
+            &file.metadata().refuse_at("git_carry::raw_tree::regular")?,
+        ) != identity
         || match fs::symlink_metadata(path) {
             Ok(metadata) => crate::freshness::StatIdentity::from_metadata(&metadata) != identity,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::raw_tree::regular")),
         };
     if drifted {
         let remaining = row.size.saturating_sub(copied);
-        std::io::copy(&mut std::io::repeat(0).take(remaining), writer)?;
-        writer.write_all(b"\n")?;
+        std::io::copy(&mut std::io::repeat(0).take(remaining), writer)
+            .refuse_at("git_carry::raw_tree::regular")?;
+        writer
+            .write_all(b"\n")
+            .refuse_at("git_carry::raw_tree::regular")?;
         return Ok(Seat::Drifted(DriftKind::SeatChanged));
     }
-    writer.write_all(b"\n")?;
+    writer
+        .write_all(b"\n")
+        .refuse_at("git_carry::raw_tree::regular")?;
     Ok(Seat::Captured(copied))
 }
 
@@ -116,7 +126,7 @@ fn stream(
 ) -> Result<u64> {
     writer.write_all(
         b"commit refs/bulkload-raw-tree\ncommitter Bulkload <bulkload@localhost> 946684800 +0000\ndata 0\n\ndeleteall\n",
-    )?;
+    ).refuse_at("git_carry::raw_tree::stream")?;
     let mut bytes_read = 0u64;
     for row in rows {
         let relative = Path::new(std::ffi::OsStr::from_bytes(&row.rel_path));
@@ -128,9 +138,13 @@ fn stream(
         // A seat a retained capture already holds at this exact StatIdentity is
         // emitted by object name. No descriptor is opened and no byte is re-read.
         if let Some(object) = reuse.get(&row.rel_path) {
-            write!(writer, "M {mode} {object} ")?;
-            writer.write_all(&quoted(&row.rel_path))?;
-            writer.write_all(b"\n")?;
+            write!(writer, "M {mode} {object} ").refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(&quoted(&row.rel_path))
+                .refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(b"\n")
+                .refuse_at("git_carry::raw_tree::stream")?;
             continue;
         }
         if row.kind == FileKind::Regular {
@@ -141,9 +155,13 @@ fn stream(
                     continue;
                 }
             };
-            write!(writer, "M {mode} inline ")?;
-            writer.write_all(&quoted(&row.rel_path))?;
-            writer.write_all(b"\n")?;
+            write!(writer, "M {mode} inline ").refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(&quoted(&row.rel_path))
+                .refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(b"\n")
+                .refuse_at("git_carry::raw_tree::stream")?;
             match regular(writer, &mut file, &path, row)? {
                 Seat::Captured(copied) => {
                     bytes_read = bytes_read
@@ -152,9 +170,15 @@ fn stream(
                 }
                 Seat::Drifted(kind) => {
                     // The announced payload is complete; withdraw the seat.
-                    writer.write_all(b"D ")?;
-                    writer.write_all(&quoted(&row.rel_path))?;
-                    writer.write_all(b"\n")?;
+                    writer
+                        .write_all(b"D ")
+                        .refuse_at("git_carry::raw_tree::stream")?;
+                    writer
+                        .write_all(&quoted(&row.rel_path))
+                        .refuse_at("git_carry::raw_tree::stream")?;
+                    writer
+                        .write_all(b"\n")
+                        .refuse_at("git_carry::raw_tree::stream")?;
                     drift.push(DriftRow::seat(kind, &row.rel_path));
                 }
             }
@@ -163,15 +187,25 @@ fn stream(
                 .link_target
                 .as_deref()
                 .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-            write!(writer, "M {mode} inline ")?;
-            writer.write_all(&quoted(&row.rel_path))?;
-            writer.write_all(b"\n")?;
-            writeln!(writer, "data {}", target.len())?;
-            writer.write_all(target)?;
-            writer.write_all(b"\n")?;
+            write!(writer, "M {mode} inline ").refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(&quoted(&row.rel_path))
+                .refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(b"\n")
+                .refuse_at("git_carry::raw_tree::stream")?;
+            writeln!(writer, "data {}", target.len()).refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(target)
+                .refuse_at("git_carry::raw_tree::stream")?;
+            writer
+                .write_all(b"\n")
+                .refuse_at("git_carry::raw_tree::stream")?;
         }
     }
-    writer.write_all(b"\ndone\n")?;
+    writer
+        .write_all(b"\ndone\n")
+        .refuse_at("git_carry::raw_tree::stream")?;
     Ok(bytes_read)
 }
 
@@ -192,7 +226,8 @@ pub(super) fn capture(
 ) -> Result<Pass> {
     if git(private)
         .args(["show-ref", "--verify", "--quiet", "refs/bulkload-raw-tree"])
-        .status()?
+        .status()
+        .refuse_at("git_carry::raw_tree::capture")?
         .success()
     {
         return Err(BulkloadRefusal::GitDestinationOccupied);
@@ -201,18 +236,20 @@ pub(super) fn capture(
         .args(["fast-import", "--quiet", "--done"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::raw_tree::capture")?;
+    let stderr = StderrTap::attach(child.stderr.take());
     let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
     let mut drift = Vec::new();
     let result = stream(&mut stdin, repo, rows, reuse, &mut drift);
     drop(stdin);
     // Even on a source refusal close the stream and reap our child normally.
     // No process is signaled, and a partial private capture remains diagnostic.
-    let status = child.wait()?;
+    let status = child.wait().refuse_at("git_carry::raw_tree::capture")?;
     let bytes_read = result?;
     if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stderr.failed());
     }
     #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax, not interpolation.
     let tree = text(git(private).args(["rev-parse", "refs/bulkload-raw-tree^{tree}"]))?;
@@ -235,7 +272,8 @@ pub(super) fn prune(private: &Path, tree: &str, paths: &[Vec<u8>]) -> Result<Str
     }
     if git(private)
         .args(["show-ref", "--verify", "--quiet", "refs/bulkload-raw-prune"])
-        .status()?
+        .status()
+        .refuse_at("git_carry::raw_tree::prune")?
         .success()
     {
         return Err(BulkloadRefusal::GitDestinationOccupied);
@@ -245,27 +283,37 @@ pub(super) fn prune(private: &Path, tree: &str, paths: &[Vec<u8>]) -> Result<Str
         .args(["fast-import", "--quiet", "--done"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::raw_tree::prune")?;
+    let stderr = StderrTap::attach(child.stderr.take());
     let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
     let result = (|| -> Result<()> {
         stdin.write_all(
             b"commit refs/bulkload-raw-prune\ncommitter Bulkload <bulkload@localhost> 946684800 +0000\ndata 0\n\n",
-        )?;
-        writeln!(stdin, "from {parent}")?;
+        ).refuse_at("git_carry::raw_tree::prune")?;
+        writeln!(stdin, "from {parent}").refuse_at("git_carry::raw_tree::prune")?;
         for path in paths {
-            stdin.write_all(b"D ")?;
-            stdin.write_all(&quoted(path))?;
-            stdin.write_all(b"\n")?;
+            stdin
+                .write_all(b"D ")
+                .refuse_at("git_carry::raw_tree::prune")?;
+            stdin
+                .write_all(&quoted(path))
+                .refuse_at("git_carry::raw_tree::prune")?;
+            stdin
+                .write_all(b"\n")
+                .refuse_at("git_carry::raw_tree::prune")?;
         }
-        stdin.write_all(b"\ndone\n")?;
+        stdin
+            .write_all(b"\ndone\n")
+            .refuse_at("git_carry::raw_tree::prune")?;
         Ok(())
     })();
     drop(stdin);
-    let status = child.wait()?;
+    let status = child.wait().refuse_at("git_carry::raw_tree::prune")?;
     result?;
     if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stderr.failed());
     }
     #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax, not interpolation.
     let pruned = text(git(private).args(["rev-parse", "refs/bulkload-raw-prune^{tree}"]))?;

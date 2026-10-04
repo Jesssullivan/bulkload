@@ -81,6 +81,7 @@
 //! commits would name parents behind the source's frontier, and a shallow file
 //! is never written into a full destination.
 
+use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
@@ -93,6 +94,7 @@ use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
 mod stderr_store;
+pub use bulkload_proto::refusal::StderrClass;
 pub(in crate::git_carry) use stderr_store::{
     create_private, cstring, open_existing, private_file, private_subdirectory, PrivateState,
 };
@@ -213,115 +215,6 @@ pub struct StderrReceipt {
     pub file_refused: Option<BulkloadRefusal>,
 }
 
-/// What a child's stderr says, from a closed set (R-N121).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StderrClass {
-    /// The path is not a repository, or the remote repository is absent.
-    NotARepository,
-    /// ssh or HTTP authentication, or host-key verification, failed.
-    AuthFailed,
-    /// The host could not be resolved or reached.
-    HostUnreachable,
-    /// A connection or operation timed out.
-    Timeout,
-    /// Git reported a missing, bad or corrupt object.
-    BadObject,
-    /// Anything else.
-    Other,
-}
-
-impl StderrClass {
-    /// The stable code printed as `stderr_class=`.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::NotARepository => "not_a_repository",
-            Self::AuthFailed => "auth_failed",
-            Self::HostUnreachable => "host_unreachable",
-            Self::Timeout => "timeout",
-            Self::BadObject => "bad_object",
-            Self::Other => "other",
-        }
-    }
-
-    /// Classify raw stderr by the phrases real git and OpenSSH print in the
-    /// C locale, which every child runs under (`LC_ALL=C`). The first class
-    /// whose pattern matches wins; the order puts timeouts ahead of the
-    /// unreachable-host phrases they share a line with. Lines from a shell's
-    /// `setlocale` warning are ignored, and "No such file or directory" only
-    /// counts after git's or the shell's change-directory failure.
-    #[must_use]
-    pub fn of(raw: &[u8]) -> Self {
-        const PATTERNS: [(StderrClass, &[&str]); 5] = [
-            (
-                StderrClass::Timeout,
-                &["timed out", "timeout, server", "connection timeout"],
-            ),
-            (
-                StderrClass::HostUnreachable,
-                &[
-                    "could not resolve hostname",
-                    "could not resolve host",
-                    "name or service not known",
-                    "nodename nor servname provided",
-                    "temporary failure in name resolution",
-                    "no route to host",
-                    "network is unreachable",
-                    "connection refused",
-                    "connection closed by remote host",
-                    "connection reset by peer",
-                ],
-            ),
-            (
-                StderrClass::AuthFailed,
-                &[
-                    "permission denied (publickey",
-                    "permission denied, please try again",
-                    "authentication failed",
-                    "host key verification failed",
-                    "could not read username",
-                    "could not read password",
-                    "too many authentication failures",
-                    "no supported authentication methods",
-                ],
-            ),
-            (
-                StderrClass::NotARepository,
-                &[
-                    "not a git repository",
-                    "does not appear to be a git repository",
-                    "repository not found",
-                    "fatal: cannot change to '",
-                    ": cd: ",
-                ],
-            ),
-            (
-                StderrClass::BadObject,
-                &[
-                    "bad object",
-                    "bad revision",
-                    "missing object",
-                    "object not found",
-                    "is corrupt",
-                    "unable to read",
-                    "invalid object",
-                    "did not receive expected object",
-                ],
-            ),
-        ];
-        let text: String = String::from_utf8_lossy(raw)
-            .to_lowercase()
-            .lines()
-            .filter(|line| !line.contains("setlocale"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        PATTERNS
-            .iter()
-            .find(|(_, phrases)| phrases.iter().any(|phrase| text.contains(phrase)))
-            .map_or(Self::Other, |(class, _)| *class)
-    }
-}
-
 impl Refused {
     const fn new(refusal: BulkloadRefusal) -> Self {
         Self {
@@ -372,12 +265,6 @@ impl Refused {
 impl From<BulkloadRefusal> for Refused {
     fn from(refusal: BulkloadRefusal) -> Self {
         Self::new(refusal)
-    }
-}
-
-impl From<std::io::Error> for Refused {
-    fn from(error: std::io::Error) -> Self {
-        BulkloadRefusal::from(error).into()
     }
 }
 
@@ -710,23 +597,47 @@ pub(super) struct Repository {
     pub(super) ceiling: PathBuf,
 }
 
-/// [`git`] on the probed git dir, plus the estimate's no-write, no-network
-/// hardening (F1): `--no-optional-locks`, `gc.auto=0` and
-/// `core.hooksPath=/dev/null` come from [`git`]; this adds `--git-dir`,
-/// `GIT_CEILING_DIRECTORIES`, `maintenance.auto=false` and
-/// `GIT_NO_LAZY_FETCH`.
+impl Repository {
+    /// A local repository whose root is `root`, resolved as [`PROBE_SCRIPT`]
+    /// resolves one: discovery is fenced at the root's parent, and the git
+    /// dir is `rev-parse --absolute-git-dir` (WP0(b): a source read names the
+    /// resolved git dir, never the given path).
+    ///
+    /// # Errors
+    /// `GIT_REPOSITORY_NOT_AT_PATH` when `root` resolves to no git dir.
+    pub(super) fn local(root: &Path) -> Result<Self> {
+        let root = std::fs::canonicalize(root).refuse_at("git_carry::estimate::local")?;
+        let ceiling = root
+            .parent()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        let git_dir = super::text(
+            git(&root)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .env("GIT_CEILING_DIRECTORIES", &ceiling)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|_| BulkloadRefusal::GitRepositoryNotAtPath)?;
+        if git_dir.is_empty() || has_control(OsStr::new(&git_dir)) {
+            return Err(BulkloadRefusal::GitRepositoryNotAtPath);
+        }
+        Ok(Self {
+            git_dir: PathBuf::from(git_dir),
+            ceiling,
+        })
+    }
+}
+
+/// [`git`] on the probed git dir. Every hardening variable and `-c` override
+/// comes from the one [`super::git_env`] table through [`git`]; this adds only
+/// `--git-dir` and the probe's own `GIT_CEILING_DIRECTORIES` (F1).
 pub(super) fn hardened(repository: &Repository) -> Command {
     let mut command = git(&repository.git_dir);
     let mut git_dir = std::ffi::OsString::from("--git-dir=");
     git_dir.push(&repository.git_dir);
     command
         .arg(git_dir)
-        .args(["-c", "maintenance.auto=false"])
-        .env("GIT_CEILING_DIRECTORIES", &repository.ceiling)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env("LANGUAGE", "");
+        .env("GIT_CEILING_DIRECTORIES", &repository.ceiling);
     command
 }
 
@@ -758,8 +669,8 @@ const PROBE_GIT_TOO_OLD: i32 = 5;
 /// carrying one oid each, then `end`.
 pub const PROBE_SCRIPT: &str = r#"set -eu
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
-export GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null LC_ALL=C LANGUAGE=
-g() { git --no-optional-locks -c maintenance.auto=false -c gc.auto=0 -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 LC_ALL=C LANGUAGE=
+g() { git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c pack.threads=2 -c pack.windowMemory=64m "$@"; }
 version=$(git version) || exit 5
 case "$version" in 'git version '*) version=${version#git version } ;; *) exit 5 ;; esac
 case "$version" in
@@ -936,7 +847,7 @@ pub(super) fn run_probe(
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        child.wait()?;
+        child.wait().refuse_at("git_carry::estimate::run_probe")?;
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
@@ -949,21 +860,25 @@ pub(super) fn run_probe(
         let read = stdout.read_to_end(&mut answer).map(|_| answer);
         (writer.join(), reader.join(), read)
     });
-    let status = child.wait()?;
-    let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::Io(None))?;
+    let status = child.wait().refuse_at("git_carry::estimate::run_probe")?;
+    let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::WorkerLost)?;
     let refusal = match status.code() {
         Some(0) => None,
         Some(PROBE_NOT_A_REPOSITORY) => Some(BulkloadRefusal::GitRepositoryNotAtPath),
         Some(PROBE_GIT_TOO_OLD | 255) | None => Some(BulkloadRefusal::GitUnavailable),
-        Some(_) => Some(BulkloadRefusal::GitInventoryMalformed),
+        Some(_) => Some(BulkloadRefusal::GitChildFailed(StderrClass::of(&head))),
     };
     let Some(refusal) = refusal else {
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
         // A child that answered in full read its whole script.
-        written.map_err(|_| BulkloadRefusal::Io(None))??;
-        return Ok(parse_probe(&answer?)?);
+        written
+            .map_err(|_| BulkloadRefusal::WorkerLost)?
+            .refuse_at("git_carry::estimate::run_probe")?;
+        return Ok(parse_probe(
+            &answer.refuse_at("git_carry::estimate::run_probe")?,
+        )?);
     };
     Err(child_refusal(
         refusal,
@@ -1017,25 +932,9 @@ pub(super) type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal
 /// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
 /// them all, and stream them all into `capture`. A capture write failure is
 /// recorded, and the stream is still drained so the child never blocks.
-pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drained {
-    let mut head = Vec::new();
-    let mut total = 0_u64;
+pub(super) fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained {
     let mut failure = None;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = match stderr.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                failure.get_or_insert_with(|| BulkloadRefusal::from(error));
-                break;
-            }
-        };
-        let chunk = buffer.get(..read).unwrap_or_default();
-        let room = CLASSIFY_LIMIT.saturating_sub(head.len()).min(chunk.len());
-        head.extend_from_slice(chunk.get(..room).unwrap_or_default());
-        total += u64::try_from(read).unwrap_or(u64::MAX);
+    let drained = crate::child::drain_bounded(stderr, CLASSIFY_LIMIT, |chunk| {
         if failure.is_none() {
             if let Some(capture) = capture.as_mut() {
                 if let Err(error) = capture.write(chunk) {
@@ -1043,8 +942,93 @@ pub(super) fn drain(mut stderr: impl Read, mut capture: Option<Capture>) -> Drai
                 }
             }
         }
+    });
+    if let Some(error) = drained.error {
+        failure.get_or_insert_with(|| crate::refuse::io(&error, "git_carry::estimate::drain"));
     }
-    (head, total, capture, failure)
+    (drained.head, drained.total, capture, failure)
+}
+
+/// A v1 Git child's stderr, drained on its own thread into the classifier
+/// (WP3, R-N121). Only the first [`CLASSIFY_LIMIT`] bytes are held, and only
+/// until they are classified; no byte is kept, printed or carried. Draining
+/// keeps the child from ever blocking on a full stderr pipe.
+pub(in crate::git_carry) struct StderrTap(Option<std::thread::JoinHandle<Vec<u8>>>);
+
+impl StderrTap {
+    /// Start draining a child's piped stderr. If no drain thread can be
+    /// started, the pipe is closed instead, so the child still cannot block
+    /// on it; its class is then `other`.
+    pub(in crate::git_carry) fn attach(stderr: Option<std::process::ChildStderr>) -> Self {
+        Self(stderr.and_then(|stderr| {
+            std::thread::Builder::new()
+                .name("git-stderr".into())
+                .spawn(move || drain(stderr, None).0)
+                .ok()
+        }))
+    }
+
+    /// The refusal of a child that exited non-zero: `GIT_CHILD_FAILED` with
+    /// its stderr class, or `WORKER_LOST` if the drain thread did not finish.
+    pub(in crate::git_carry) fn failed(self) -> BulkloadRefusal {
+        self.0
+            .map(std::thread::JoinHandle::join)
+            .transpose()
+            .map_or(BulkloadRefusal::WorkerLost, |head| {
+                BulkloadRefusal::GitChildFailed(StderrClass::of(
+                    head.as_deref().unwrap_or_default(),
+                ))
+            })
+    }
+}
+
+/// The refusal of a finished child whose stderr was captured whole by
+/// `Command::output`: `GIT_CHILD_FAILED` with its class (R-N121). The bytes
+/// are classified, never kept.
+pub(in crate::git_carry) fn child_failed(stderr: &[u8]) -> BulkloadRefusal {
+    BulkloadRefusal::GitChildFailed(StderrClass::of(
+        stderr.get(..CLASSIFY_LIMIT).unwrap_or(stderr),
+    ))
+}
+
+/// Run a v1 Git child to completion (WP3): `input`, when given, is written
+/// on stdin from its own thread (so a large answer never deadlocks against
+/// an unread request), stdout is returned, and stderr is drained into the
+/// classifier. A non-zero exit refuses `GIT_CHILD_FAILED` with the stderr
+/// class. A child that succeeded without reading all of its input did not
+/// see the whole request, and refuses as the failed write.
+pub(in crate::git_carry) fn run_git(
+    command: &mut Command,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::run_git")?;
+    let tap = StderrTap::attach(child.stderr.take());
+    let stdin = child.stdin.take();
+    let (written, result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || match (stdin, input) {
+            (Some(mut stdin), Some(bytes)) => stdin.write_all(bytes),
+            _ => Ok(()),
+        });
+        let result = child.wait_with_output();
+        (writer.join(), result)
+    });
+    let result = result.refuse_at("git_carry::estimate::run_git")?;
+    if !result.status.success() {
+        return Err(tap.failed());
+    }
+    written
+        .map_err(|_| BulkloadRefusal::WorkerLost)?
+        .refuse_at("git_carry::estimate::run_git")?;
+    Ok(result.stdout)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<Probe> {
@@ -1097,37 +1081,8 @@ fn parse_probe(stdout: &[u8]) -> Result<Probe> {
     Ok(probe)
 }
 
-/// Run `command`, feeding `bytes` on stdin from a separate thread so a large
-/// answer can never deadlock against an unread request.
-fn feed(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
-    let (writer, result) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || stdin.write_all(bytes));
-        let result = child.wait_with_output();
-        (writer.join(), result)
-    });
-    writer.map_err(|_| BulkloadRefusal::Io(None))??;
-    let result = result?;
-    if !result.status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    Ok(result.stdout)
-}
-
 fn run(command: &mut Command) -> Result<Vec<u8>> {
-    let result = command
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if !result.status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
-    Ok(result.stdout)
+    run_git(command, None)
 }
 
 /// Destination tips that exist as objects in `source`, with their types, in
@@ -1145,7 +1100,7 @@ pub(super) fn present(
         request.push_str(tip);
         request.push('\n');
     }
-    let answer = feed(
+    let answer = super::input(
         hardened(source).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
     )?;
@@ -1228,8 +1183,10 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         .arg("--stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::walk")?;
+    let list_stderr = StderrTap::attach(list.stderr.take());
     let check = hardened(source)
         .args([
             "cat-file",
@@ -1237,17 +1194,18 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn();
     let mut check = match check {
         Ok(check) => check,
         Err(error) => {
             drop(list.stdin.take());
             drop(list.stdout.take());
-            list.wait()?;
-            return Err(error.into());
+            list.wait().refuse_at("git_carry::estimate::walk")?;
+            return Err(crate::refuse::io(&error, "git_carry::estimate::walk"));
         }
     };
+    let check_stderr = StderrTap::attach(check.stderr.take());
     let pipes = (
         list.stdin.take(),
         list.stdout.take(),
@@ -1261,19 +1219,22 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         let writer = scope.spawn(move || list_in.write_all(request.as_bytes()));
         let reader = scope.spawn(move || tally(BufReader::new(check_out)));
         let unavailable = forward(BufReader::new(list_out), BufWriter::new(check_in));
-        let written = writer.join().map_err(|_| BulkloadRefusal::Io(None))?;
-        let tallied = reader.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        let written = writer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        let tallied = reader.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
         let unavailable = unavailable?;
-        written?;
+        written.refuse_at("git_carry::estimate::walk")?;
         let mut tallied = tallied?;
         tallied.unavailable += unavailable;
         Ok(tallied)
     });
-    let list_status = list.wait()?;
-    let check_status = check.wait()?;
+    let list_status = list.wait().refuse_at("git_carry::estimate::walk")?;
+    let check_status = check.wait().refuse_at("git_carry::estimate::walk")?;
     let tallied = outcome?;
-    if !list_status.success() || !check_status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+    if !list_status.success() {
+        return Err(list_stderr.failed());
+    }
+    if !check_status.success() {
+        return Err(check_stderr.failed());
     }
     Ok(tallied)
 }
@@ -1282,7 +1243,7 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
 fn forward(list: impl BufRead, mut check: impl Write) -> Result<u64> {
     let mut unavailable = 0_u64;
     for line in list.lines() {
-        let line = line?;
+        let line = line.refuse_at("git_carry::estimate::forward")?;
         if let Some(value) = line.strip_prefix('?') {
             if !oid(value) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -1296,18 +1257,22 @@ fn forward(list: impl BufRead, mut check: impl Write) -> Result<u64> {
             if !oid(&line) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
-            check.write_all(line.as_bytes())?;
-            check.write_all(b"\n")?;
+            check
+                .write_all(line.as_bytes())
+                .refuse_at("git_carry::estimate::forward")?;
+            check
+                .write_all(b"\n")
+                .refuse_at("git_carry::estimate::forward")?;
         }
     }
-    check.flush()?;
+    check.flush().refuse_at("git_carry::estimate::forward")?;
     Ok(unavailable)
 }
 
 fn tally(reader: impl BufRead) -> Result<Tally> {
     let mut tally = Tally::default();
     for line in reader.lines() {
-        tally.add(&line?)?;
+        tally.add(&line.refuse_at("git_carry::estimate::tally")?)?;
     }
     Ok(tally)
 }
@@ -1365,8 +1330,10 @@ fn thin_pack(
     let mut pack = pack
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .refuse_at("git_carry::estimate::thin_pack")?;
+    let stderr = StderrTap::attach(pack.stderr.take());
     let pipes = (pack.stdin.take(), pack.stdout.take());
     let counted = std::thread::scope(|scope| {
         let (Some(mut stdin), Some(stdout)) = pipes else {
@@ -1374,13 +1341,16 @@ fn thin_pack(
         };
         let writer = scope.spawn(move || stdin.write_all(input.as_bytes()));
         let counted = count_pack(stdout);
-        writer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        writer
+            .join()
+            .map_err(|_| BulkloadRefusal::WorkerLost)?
+            .refuse_at("git_carry::estimate::thin_pack")?;
         counted
     });
-    let status = pack.wait()?;
+    let status = pack.wait().refuse_at("git_carry::estimate::thin_pack")?;
     let counted = counted?;
     if !status.success() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stderr.failed());
     }
     if counted.objects != missing.objects() {
         return Err(BulkloadRefusal::ContractSelfInconsistent);
@@ -1398,7 +1368,7 @@ fn count_pack(mut stream: impl Read) -> Result<ThinPack> {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::estimate::count_pack")),
         };
         let chunk = buffer.get(..read).ok_or(BulkloadRefusal::Io(None))?;
         if header.len() < 12 {
@@ -1475,6 +1445,10 @@ mod tests {
             let repo = self.root.join(name);
             let url = format!("file://{}", origin.display());
             let mut command = git(&self.root);
+            // Making the fixture is not a source read: its checkout must
+            // fault in the blobs the filter left behind (WP1 PR 1 made
+            // `GIT_NO_LAZY_FETCH` part of every hardened child).
+            command.env_remove("GIT_NO_LAZY_FETCH");
             command.args(["clone", "--quiet", "--template=", "--filter=blob:none"]);
             if !checkout {
                 command.arg("--no-checkout");
@@ -2235,7 +2209,12 @@ mod tests {
             "cat >/dev/null; echo 'fatal: bad object 0123abcd' >&2; exit 1",
         ]);
         let refused = run_probe(&mut malformed, None).unwrap_err();
-        assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
+        // WP3: a failed child is GIT_CHILD_FAILED with its class, not a
+        // catch-all GIT_INVENTORY_MALFORMED.
+        assert_eq!(
+            refused.refusal,
+            BulkloadRefusal::GitChildFailed(StderrClass::BadObject)
+        );
         assert_eq!(
             refused.stderr.as_ref().map(|s| s.class),
             Some(StderrClass::BadObject)
@@ -2243,7 +2222,7 @@ mod tests {
         let lines = refused.lines();
         assert_eq!(
             lines.first().map(String::as_str),
-            Some("refused=GIT_INVENTORY_MALFORMED")
+            Some("refused=GIT_CHILD_FAILED")
         );
         assert!(lines.iter().any(|line| line == "stderr_class=bad_object"));
         assert!(!lines.join("\n").contains("0123abcd"));
@@ -2253,9 +2232,10 @@ mod tests {
         let refused = run_probe(&mut silent, None).unwrap_err();
         assert!(refused.stderr.is_none());
         assert_eq!(
-            refused.lines(),
-            vec!["refused=GIT_INVENTORY_MALFORMED".to_owned()]
+            refused.refusal,
+            BulkloadRefusal::GitChildFailed(StderrClass::Other)
         );
+        assert_eq!(refused.lines(), vec!["refused=GIT_CHILD_FAILED".to_owned()]);
     }
 
     /// F1: every Git call the probe makes carries the no-write, no-network
@@ -2274,7 +2254,31 @@ mod tests {
         ] {
             assert!(g.contains(flag), "{flag}");
         }
-        assert!(PROBE_SCRIPT.contains("export GIT_NO_LAZY_FETCH=1"));
+        // WP1 PR 1: the probe preamble is the one `git_env` table, entry for
+        // entry, so the remote probe and the local builder cannot drift.
+        for config in super::super::git_env::CONFIG {
+            assert!(g.contains(&format!("-c {config} ")), "{config}");
+        }
+        let exported = PROBE_SCRIPT
+            .lines()
+            .find(|line| line.starts_with("export GIT_TERMINAL_PROMPT="))
+            .unwrap();
+        for (key, value) in super::super::git_env::SET {
+            assert!(
+                exported
+                    .split(' ')
+                    .any(|word| word == format!("{key}={value}")),
+                "{key}"
+            );
+        }
+        let unset = PROBE_SCRIPT
+            .lines()
+            .find(|line| line.starts_with("unset "))
+            .unwrap();
+        for key in super::super::git_env::CLEARED {
+            assert!(unset.split(' ').any(|word| word == *key), "{key}");
+        }
+        assert!(PROBE_SCRIPT.contains("GIT_NO_LAZY_FETCH=1"));
         // Every git call but `git version` goes through `g`.
         for line in PROBE_SCRIPT.lines().filter(|line| line.contains("git ")) {
             assert!(
