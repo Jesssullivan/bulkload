@@ -445,7 +445,10 @@ fully flushes every file instead, for comparison.
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a
 store without the `root_sealed` setting is sealed again on open (#161, R25).
-Other private state directories seal their own entry before records go in.
+The setting commits only after the seal returns. A sealed store reopens
+without opening the root's parent; a root that still needs its seal under a
+parent the agent cannot read refuses with `IO` (`EACCES`). Other private
+state directories seal their own entry before records go in.
 
 Space preflight (OI-1001-Q2): a write that would leave its destination
 filesystem (`statvfs`; `statfs` on Darwin) with less than

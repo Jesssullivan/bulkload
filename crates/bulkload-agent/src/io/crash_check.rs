@@ -43,8 +43,9 @@
 //!    Its records are durable from then on, which the invariant reads from
 //!    [`StateInfo::commits`]; the database's contents are not modelled. The
 //!    state root and the database's entry are: `Store::open` makes them with
-//!    traced calls, so an invariant can require them wherever a commit has
-//!    returned (#161). With [`Options::commit_drains`] (Darwin,
+//!    traced calls and traces the commit of its `root_sealed` marker, so an
+//!    invariant can require them wherever a commit, the marker's included,
+//!    has returned (#161). With [`Options::commit_drains`] (Darwin,
 //!    `fullfsync=ON`) the commit also drains the drive holding the store,
 //!    like a full flush there.
 //!

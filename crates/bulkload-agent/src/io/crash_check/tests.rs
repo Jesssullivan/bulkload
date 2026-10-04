@@ -519,6 +519,7 @@ fn group_commit_trace(store: NodeId) -> Vec<Event> {
                 mode: 0o755,
             },
             CommitRecord::DirectoryComplete { key: b"d".to_vec() },
+            CommitRecord::RootSealed,
         ],
     });
     events

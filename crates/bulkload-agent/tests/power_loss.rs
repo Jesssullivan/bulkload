@@ -33,11 +33,13 @@
 //! What a store's records need on disk is proven on its own trace (#161,
 //! R25): `Store::open` and a record commit, checked from the state root's
 //! parent. In every crash state after the open returned (so before Start
-//! hands the store's authority to the peer), or after a commit returned, the
+//! hands the store's authority to the peer), after the commit of its
+//! `root_sealed` marker returned, or after a record commit returned, the
 //! state root and its database are named. The same trace with the open's
-//! directory seals cut out (the code before #161) must fail, so the proof
-//! has teeth; and a store an earlier run left unsealed is sealed by the next
-//! open.
+//! directory seals and marker cut out (the code before #161) must fail, and
+//! so must one whose seals come after the marker's commit, so the proof has
+//! teeth for the seal and for its order; and a store an earlier run left
+//! unsealed is sealed by the next open.
 //!
 //! Two syscall-order checks cover what the destination image cannot see: the
 //! source writes no content bytes at all, so a capture commit references
@@ -293,7 +295,9 @@ fn invariant(
                         }
                     }
                 }
-                CommitRecord::DirectoryCreated { node: None, .. } => {}
+                // The state roots lie outside the destination image; the
+                // store proofs below check what the marker vouches for.
+                CommitRecord::DirectoryCreated { node: None, .. } | CommitRecord::RootSealed => {}
             }
         }
     }
@@ -585,21 +589,39 @@ fn traced<T>(step: impl FnOnce() -> T) -> (T, Vec<Event>) {
     (value, recorder.take())
 }
 
+/// Whether `event` syncs one of `nodes`.
+fn syncs(event: &Event, nodes: &[NodeId]) -> bool {
+    matches!(event, Event::Sync { node, .. } if nodes.contains(node))
+}
+
 /// `events` without any sync of `nodes`: the same calls as a run that never
 /// sealed those directories.
 fn without_seals(events: &[Event], nodes: &[NodeId]) -> Vec<Event> {
     events
         .iter()
-        .filter(|event| !matches!(event, Event::Sync { node, .. } if nodes.contains(node)))
+        .filter(|event| !syncs(event, nodes))
         .cloned()
+        .collect()
+}
+
+/// Whether `event` is the commit of a store's `root_sealed` marker.
+fn is_marker(event: &Event) -> bool {
+    matches!(event, Event::Commit { records, .. }
+        if records.iter().any(|record| matches!(record, CommitRecord::RootSealed)))
+}
+
+/// `events` as the code before #161 made them: no seal of `nodes` and no
+/// `root_sealed` marker.
+fn before_the_seal(events: &[Event], nodes: &[NodeId]) -> Vec<Event> {
+    without_seals(events, nodes)
+        .into_iter()
+        .filter(|event| !is_marker(event))
         .collect()
 }
 
 /// Whether `events` hold a sync of `node`.
 fn seals(events: &[Event], node: NodeId) -> bool {
-    events
-        .iter()
-        .any(|event| matches!(event, Event::Sync { node: synced, .. } if *synced == node))
+    events.iter().any(|event| syncs(event, &[node]))
 }
 
 /// Commit one record to `store`: the R25 row a power loss must not take.
@@ -609,12 +631,27 @@ fn commit_one(store: &Store) {
         .unwrap();
 }
 
-/// #161 (R25): once `Store::open` has returned (`opened` operations in) or
-/// one of the store's commits has, the state root and its database are named
-/// in the crash state.
-fn store_kept(view: View<'_>, info: &StateInfo, opened: usize) -> Result<(), String> {
-    let after = if !info.commits.is_empty() {
+/// #161 (R25): once `Store::open` has returned (`opened` operations in), or
+/// the commit of its `root_sealed` marker has, or a record commit has, the
+/// state root and its database are named in the crash state. The marker's
+/// commit counts on its own: every later open trusts it and seals nothing,
+/// so a marker committed before its seal would leave the store unsealed for
+/// good, although the open still returns sealed.
+fn store_kept(
+    events: &[Event],
+    view: View<'_>,
+    info: &StateInfo,
+    opened: usize,
+) -> Result<(), String> {
+    let committed = |marker: bool| {
+        info.commits
+            .iter()
+            .any(|commit| is_marker(&events[*commit]) == marker)
+    };
+    let after = if committed(false) {
         "a store commit returned"
+    } else if committed(true) {
+        "the root_sealed marker committed"
     } else if info.crash_point >= opened {
         "Store::open returned"
     } else {
@@ -646,9 +683,18 @@ fn check_store(image: &Image, events: &[Event], opened: usize) -> Report {
         "a store trace writes nothing the checker models"
     );
     check_view(image, events, &Options::default(), |view, info| {
-        store_kept(view, info, opened)
+        store_kept(events, view, info, opened)
     })
     .unwrap()
+}
+
+/// The trace index of the one `root_sealed` marker commit in `events`.
+fn marker_commit(events: &[Event]) -> usize {
+    let markers: Vec<usize> = (0..events.len())
+        .filter(|index| is_marker(&events[*index]))
+        .collect();
+    assert_eq!(markers.len(), 1, "one marker commit: {events:?}");
+    markers[0]
 }
 
 /// A scanned, empty parent for one store proof, and its node.
@@ -690,20 +736,22 @@ fn every_power_loss_state_of_a_store_open_keeps_the_store() {
         report.states > report.crash_points,
         "crash points have several states"
     );
+    let marker = marker_commit(&opening);
     assert!(
-        seals(&opening, parent_node) && seals(&opening, root_node),
-        "the open seals the parent and the root: {opening:?}"
+        seals(&opening[..marker], parent_node) && seals(&opening[..marker], root_node),
+        "the open seals the parent and the root before its marker commits: {opening:?}"
     );
 
-    // A sealed store carries its marker: reopening it flushes nothing.
+    // A sealed store carries its marker: reopening it flushes and commits
+    // nothing.
     drop(store);
     let (_, reopening) = traced(|| Store::open(&state).unwrap());
     assert!(reopening.is_empty(), "{reopening:?}");
 }
 
 /// The proof has teeth (#161): the same calls without the open's directory
-/// seals, as the code made them before #161, can lose the store, and with it
-/// the record a commit made durable.
+/// seals or its marker, as the code made them before #161, can lose the
+/// store, and with it the record a commit made durable.
 #[test]
 fn a_store_open_without_its_seals_can_lose_the_store() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -714,7 +762,7 @@ fn a_store_open_without_its_seals_can_lose_the_store() {
     let (store, opening) = traced(|| Store::open(&state).unwrap());
     let root_node = node(&state);
     let ((), committing) = traced(|| commit_one(&store));
-    let opening = without_seals(&opening, &[parent_node, root_node]);
+    let opening = before_the_seal(&opening, &[parent_node, root_node]);
     let events = [opening.as_slice(), committing.as_slice()].concat();
     let report = check_store(&image, &events, opening.len());
     eprintln!("{}", report.summary(&events));
@@ -736,6 +784,44 @@ fn a_store_open_without_its_seals_can_lose_the_store() {
     );
 }
 
+/// The proof has teeth for the marker's order too (#161): an open that
+/// commits its `root_sealed` marker before it seals (the seal moved after
+/// `COMMIT`) still returns with both directories sealed, yet a power loss
+/// between the commit and the seal keeps a marker beside a root that is
+/// gone, and every later open trusts that marker.
+#[test]
+fn a_store_marker_committed_before_its_seal_can_lose_the_store() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("store-marker-first");
+    let (parent, image, parent_node) = store_parent(&scratch);
+    let state = parent.join("state");
+    let (_, opening) = traced(|| Store::open(&state).unwrap());
+    let nodes = [parent_node, node(&state)];
+    let sealing: Vec<Event> = opening
+        .iter()
+        .filter(|event| syncs(event, &nodes))
+        .cloned()
+        .collect();
+    assert_eq!(sealing.len(), 2, "one seal each: {opening:?}");
+    let mut reordered = without_seals(&opening, &nodes);
+    let after_marker = marker_commit(&reordered) + 1;
+    reordered.splice(after_marker..after_marker, sealing);
+    assert!(seals(&reordered, nodes[0]) && seals(&reordered, nodes[1]));
+    let report = check_store(&image, &reordered, reordered.len());
+    eprintln!("{}", report.summary(&reordered));
+    assert!(
+        report.violations.iter().any(|violation| violation
+            .message
+            .starts_with("the state root is None")
+            && violation
+                .message
+                .ends_with("after the root_sealed marker committed")),
+        "a marker committed before its seal must be losable: {}",
+        report.summary(&reordered)
+    );
+}
+
 /// #161: a store an earlier run created and never sealed (it died between
 /// creating the root and sealing it, or it predates #161) is sealed by the
 /// next open, before that open returns.
@@ -750,7 +836,7 @@ fn a_store_an_earlier_run_left_unsealed_is_sealed_by_the_next_open() {
     let (store, earlier) = traced(|| Store::open(&state).unwrap());
     drop(store);
     let root_node = node(&state);
-    let earlier = without_seals(&earlier, &[parent_node, root_node]);
+    let earlier = before_the_seal(&earlier, &[parent_node, root_node]);
     rusqlite::Connection::open(state.join("transfer.sqlite"))
         .unwrap()
         .execute("DELETE FROM settings WHERE key = 'root_sealed'", [])
@@ -762,9 +848,10 @@ fn a_store_an_earlier_run_left_unsealed_is_sealed_by_the_next_open() {
     let report = check_store(&image, &events, opened);
     eprintln!("{}", report.summary(&events));
     assert!(report.passed(), "{}", report.summary(&events));
+    let marker = marker_commit(&next);
     assert!(
-        seals(&next, parent_node) && seals(&next, root_node),
-        "the next open seals what the earlier run left: {next:?}"
+        seals(&next[..marker], parent_node) && seals(&next[..marker], root_node),
+        "the next open seals what the earlier run left, then records it: {next:?}"
     );
 
     // An open that sealed only what it created would leave it unsealed.
