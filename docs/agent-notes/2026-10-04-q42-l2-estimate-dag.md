@@ -48,7 +48,8 @@ Rulings cited:
   - The generator is `dag()` from `tests/git_carry_v2.rs` (L4072–4108 at
     8dc26c1) without its `small_cap` dimension: the estimate has no segment
     cap. `build()` is the same fast-import builder.
-  - PINNED rows (`pinned_dags_equal_upload_pack`):
+  - PINNED rows (`pinned_dags_equal_upload_pack`), as of round 1. Round 2
+    (below) adds two rows and makes each row require its deltas:
     - parent-held;
     - want-behind-a-have, where the oracle sends an empty 32-byte pack;
     - all-held, where there is no want;
@@ -65,11 +66,12 @@ Rulings cited:
 
 ## Evidence
 
-- CI tier, in the worktree (`cargo test -p bulkload-agent --test
-  git_estimate_dag`): 2 passed in 3.7–5.2 s. Of the 12 fixed-seed cases, 8
-  have a non-empty pack. Estimate bytes equal oracle bytes in every case,
-  for example 834/834 on parent-held and 7159/7159 on a 15-object random
-  case.
+- Round 1 numbers, superseded by round 2's content model. CI tier, in the
+  worktree (`cargo test -p bulkload-agent --test git_estimate_dag`): 2
+  passed in 3.7–5.2 s. Of the 12 fixed-seed cases, 8 have a non-empty pack.
+  Estimate bytes equal oracle bytes in every case, for example 834/834 on
+  parent-held (3 whole objects: the row was not thin, review finding 1) and
+  7159/7159 on a 15-object random case.
 - Deep tier, run twice (`BULKLOAD_PROPTEST_DEEP=1`): 240/240 passed in
   136.5 s and 240/240 in 117.7 s. 170 and 175 of the cases had a non-empty
   pack, and the largest had 26 objects. Bytes matched exactly in all 480
@@ -148,12 +150,11 @@ dispatch): unused code fails `-D warnings`.
 - P64 and P65 exist neither on main nor on any remote branch. P66 was
   numbered as the dispatch said; the two gaps are presumably reserved by
   other Q42 lanes (unverified).
-- P66 covers only P46's estimate leg, over P46's current generator. P46's
-  extra dimensions are still open in the plan: shallow frontiers, annotated
-  tags and tag-of-tag, non-commit tips, renames, gitlinks and raw-byte paths.
-  About a third of the CI cases have an empty pack, because the wants are
-  reachable from the haves. The deep tier and the PINNED rows carry the
-  non-empty shapes.
+- P66 covers only P46's estimate leg, over P46's generator plus round 2's
+  derived edits, subtrees and renames. P46's extra dimensions are still open
+  in the plan: shallow frontiers, annotated tags and tag-of-tag, non-commit
+  tips, gitlinks and raw-byte paths. After round 2, 2 of the 12 CI cases
+  have an empty pack, because the wants are reachable from the haves.
 - The P46 row and retire-list row B still describe strengthening v2's
   `check()`. After PR 3 they should point at P66. That is left for the PR 3
   lane, to avoid a conflicting plan edit here.
@@ -170,3 +171,146 @@ Reported, not verified, from `git worktree list` and the open PRs:
 
 The owners and states of those lanes are unknown from here. The coordinator
 note holds the ledger.
+
+## Round 2: review fixes (2026-10-04)
+
+The dispatch: fix the review's two medium findings with signed commits,
+re-run check-fast in the foreground, and push. The low findings are left as
+they are; they are listed under "Open after round 2". Rulings cited:
+OI-1003-Q42, OI-1003-Q44 and R-N13; OI-1003-Q7 for the corpus; R-N98 for
+fixture hooks.
+
+- **c8aa4a6** `test(git-carry): P66 makes thin and in-pack deltas observable`
+  - Finding 1. The parent-held row was not thin, and one tree delta in one
+    random case was all the thin coverage CI had.
+    - `carried()` now reads each carried object's type from its header in
+      the received bytes. A `REF_DELTA` counts as thin when `--fix-thin`
+      appended its base past the received bytes. `check()` returns this
+      `Encoding` and prints it on the `p66` line.
+    - Each PINNED row now states the minimum number of thin and in-pack
+      deltas its oracle pack must hold. parent-held requires a thin delta.
+      Its comment is corrected: 4 objects, 376 B. The commit, root tree and
+      tree `a` are whole, and the rewritten `a/f1.txt` is a `REF_DELTA` on
+      the held version.
+    - Cross-check, in a scratch copy: on every non-empty pack of the CI
+      tier, `git verify-pack -v` on the `--fix-thin` index gives the same
+      in-pack and thin delta counts as the header parse.
+  - Finding 2. Every edit wrote fresh random content into four flat files,
+    so there were no deltas, subtrees or renames.
+    - Content model. A file's first write is a fresh body of 48–99 lines
+      (over 1 KB). Every later write rewrites 1–3 lines of the file's
+      current version, and an odd seed also appends a line.
+    - The files are `f0.txt`, `a/f1.txt`, `a/sub/f2.txt` and `doc/f3.txt`.
+      `Edit::Rename` (1 edit in 6) moves `a/` to `b/` and back.
+    - fast-import writes each commit's whole tree: `deleteall`, then every
+      file inline.
+    - Two new PINNED rows:
+      - rewrites-over-a-have holds both thin and in-pack deltas.
+      - directory-rename-over-a-have moves an unchanged subtree the have
+        holds to a path the have lacks. This is the `pack.useSparse` shape.
+    - nothing-held-stranger now requires an in-pack `OFS_DELTA`, and
+      merge-over-held-branches requires a thin delta.
+  - The P66 plan row now records:
+    - the content model;
+    - the 7 PINNED rows and what each requires;
+    - the mutants the tier catches;
+    - that an in-crate `estimate.rs` fixture retires against P66 only once
+      a PINNED row reproduces its shape and every one of its assertions.
+
+### Round 2 evidence
+
+The CI toolchain is `nix develop .#default` (cargo 1.96.1, git 2.54.0).
+Runs were repeated with cargo 1.93 and git 2.52 from `PATH`, and the
+PINNED bytes were the same on both.
+
+- CI tier: 2 passed in about 3.8 s.
+  - Of the 12 fixed-seed cases, 10 have a non-empty pack (round 1: 8).
+  - 5 cases hold thin deltas (8 in all), and 4 hold in-pack `OFS_DELTA`s
+    (16 in all).
+  - PINNED rows (objects/bytes and the deltas each holds):
+    - parent-held: 4/376, 1 thin;
+    - nothing-held-stranger: 10/2034, 1 OFS;
+    - merge-over-held-branches: 9/1408, 2 thin;
+    - rewrites-over-a-have: 12/1004, 2 thin and 1 OFS;
+    - directory-rename-over-a-have: 4/1305;
+    - want-behind-a-have and all-held: empty, as before.
+- Deep tier (`BULKLOAD_PROPTEST_DEEP=1`): 3 runs of 240 cases, two on git
+  2.52 and one on git 2.54.
+  - All passed with exact bytes, in 67.8–100.4 s.
+  - Per run, 170–179 cases had a non-empty pack, 89–94 a thin delta and
+    51–60 an in-pack delta.
+  - No in-pack `REF_DELTA` appeared. The largest pack held 41 objects.
+- Mutants of `estimate::thin_pack`, run on the CI tier with the CI
+  toolchain in a scratch copy under `$TMPDIR/q42-l2-estimate-dag-fix/`.
+  The copy is not in the branch and was deleted afterwards. Each mutant
+  fails both tests:
+
+  | Mutant | First PINNED row to fail | Caught in round 1 by |
+  |---|---|---|
+  | `--thin` removed | parent-held: 955 B vs 376 B | one random case only |
+  | `--delta-base-offset` removed | nothing-held-stranger: 2052 B vs 2034 B | the deep tier only |
+  | `pack.useSparse=true` | directory-rename-over-a-have: refuses `CONTRACT_SELF_INCONSISTENT` | nothing |
+  | `--window=0` added | parent-held: 955 B vs 376 B | one random case only |
+
+- `just check-fast` ran in the foreground and was waited for, through the
+  flock and inside `nix develop .#default`. It ran on c8aa4a6, with this
+  note not yet committed.
+  - Exit 0, 9 min 50 s wall time (20:53:16Z to 21:03:06Z).
+  - 27 cargo `test result` lines, none with a failure.
+  - `git_estimate_dag`: 2 passed in 4.21 s. `git_carry_v2`: 65 passed.
+  - fault_harness: 56 passed. power_loss: 9 passed.
+  - Contract tests: 22 OK.
+
+  The only change after the run is this check-fast entry.
+
+### Open after round 2
+
+- The review's low findings are not fixed, as the dispatch said:
+  - The CI corpus is a fixed seed (OI-1003-Q7), and no `just` recipe runs
+    the 240-case deep tier.
+  - Round 1's check-fast ran as a background task.
+  - The P66 "Replaces" column lists fewer missing P46 dimensions than P46
+    does: bitmaps, gitlinks and raw-byte paths are left out. Round 2 added
+    renames and subtrees, and a `pack.useSparse=true` mutant is now caught.
+  - The mirrored `prop_config` doc says a failing deep run prints its seed.
+    With `failure_persistence: None`, proptest 1.11 prints the minimal
+    input instead. The `tests/refusal_taxonomy.rs` precedent uses a
+    different seed and has no deep switch.
+  - Four of the L7 pointers are imprecise:
+    - `peel()` is not mentioned;
+    - `sizes()` starts at L398;
+    - the shallow flag replaces `--objects-edge`; it is not added to it;
+    - the no-wants early return is not mentioned.
+  - About 450 lines of fixture plumbing are copied from
+    `tests/git_carry_v2.rs`.
+  - Round 1's workstream report is incomplete. The round 2 list below is
+    current.
+- The branch is 29 commits behind origin/main (cdfe5f4). It merges
+  cleanly, and main does not touch the plan or this test. Main was not
+  merged in.
+- No PR is open. Nothing is on a Linear issue yet, because this lane has no
+  issue ID.
+
+### Live workstreams (round 2, 2026-10-04, about 21:05Z)
+
+Sources: `git worktree list`, `gh pr list` and the branches, read from
+this lane. Owners and states beyond those are unknown here. The
+coordinator note holds the ledger.
+
+- Verified:
+  - The open PRs are #164 (whitepaper) and #136 (ingest-token).
+  - Q42 sibling lanes:
+    - L1, `feat/q42-l1-thin-base-20261004`: at c822544, pushed, 3 commits
+      ahead of main.
+    - L3, `feat/q42-l3-probes-20261004`: at a479560, pushed, 2 commits
+      ahead.
+    - L4, `docs/q42-l4-formal-custody-20261004`: at 8bb9921, 2 commits
+      ahead (it merged main), not pushed.
+  - This lane, L2: c8aa4a6 plus this note, pushed. No PR.
+- Worktrees whose owners and states are unknown from here:
+  - coordinator-20261003, formal-hybrid, tla-model and whitepaper;
+  - fix-source-odb, fix-store-root-seal, ingest-token,
+    transfer-salvage-racy-finish, r23-under-load, s2-budget, s3-estate and
+    slo-q37-q40;
+  - wp0e, wp1, wp2 (two), wp3 (two) and wp10 (two);
+  - eight detached review worktrees.
