@@ -147,6 +147,7 @@ WALK_WAIT = re.compile(r"(walk.*(wait|slot|ahead))|((slot|ahead).*wait)")
 RECV_STALL = re.compile(r"(recv|receive).*(stall|seal|block).*_ns$")
 PAIR = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
 NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
+UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
 
 
 class Abort(Exception):
@@ -507,6 +508,7 @@ def post_settle(
     deadline = time.monotonic() + args.post_settle_seconds
     while (
         not args.dry_run
+        and not args.under_load
         and float(now["load1"]) >= LOAD_LIMIT
         and time.monotonic() < deadline
     ):
@@ -529,7 +531,7 @@ def run_rep(
     root = work / "reps" / f"rep{index}-{label}-{info['sha'][:12]}"
     logs = work / "logs"
     before = conditions()
-    if not args.dry_run and not before["ok"]:
+    if not args.dry_run and not args.under_load and not before["ok"]:
         raise Abort(f"rep{index} {label} precondition failed: {before}")
     source_cache = residency(Path(info["binary"]), corpus)
     command = [
@@ -544,7 +546,7 @@ def run_rep(
         info["sha"],
     ]
     command += ["--only", "native", "--reps", "1"] if native_only else ["--reps", "3"]
-    if args.dry_run:
+    if args.dry_run or args.under_load:
         command.append("--informational")
     say(
         f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} "
@@ -594,12 +596,13 @@ def run_rep(
     if not args.dry_run:
         if after["power"] != "ac" or settled["power"] != "ac":
             problems.append(f"power={after['power']}/{settled['power']}")
-        if float(settled["load1"]) >= LOAD_LIMIT:
+        # OI-1003-Q39: an under-load sample records load but does not gate on it.
+        if not args.under_load and float(settled["load1"]) >= LOAD_LIMIT:
             problems.append(
                 f"load1={settled['load1']} still >= {LOAD_LIMIT} after "
                 f"{args.post_settle_seconds}s (right after rep: {after['load1']})"
             )
-        if not summary["all_gated"]:
+        if not args.under_load and not summary["all_gated"]:
             problems.append("a bench row was gated=false")
     if problems:
         rep["aborted"] = True
@@ -614,8 +617,13 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
     passed = sum(1 for status in statuses if status == "pass")
     if report["mode"] == "dry-run":
         verdict = "NOT A GATE SAMPLE"
-    elif report["status"] != "complete-draft":
+    elif report["status"] not in (
+        "complete-draft",
+        "complete-under-load-informational",
+    ):
         verdict = "NONE (sample aborted or refused)"
+    elif report["mode"] == "under-load":
+        verdict = f"{UNDER_LOAD}: B {passed}/{len(b_reps)} reps pass (informational)"
     elif len(b_reps) != GATE_B_REPS:
         verdict = f"NONE ({len(b_reps)} B reps; the gate needs {GATE_B_REPS})"
     elif passed == len(b_reps):
@@ -681,12 +689,23 @@ def evidence(report: dict[str, object]) -> str:
         title += " (ABORTED)"
     elif dry:
         title += f" ({NOT_GATE})"
+    elif report["mode"] == "under-load":
+        title += f" ({UNDER_LOAD})"
     else:
         title += " (DRAFT)"
     lines += [title, ""]
     if dry:
         lines += [
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
+            "",
+        ]
+    if report["mode"] == "under-load":
+        lines += [
+            f"> **{UNDER_LOAD}.** Sealed corpus v1, `--informational`. R-N81 host"
+            " gating is deliberately skipped by operator ruling OI-1003-Q39: the"
+            " run measures the engine under the host's real pressure. Power and"
+            " load1 are recorded before and after every rep. It is not an R23 gate"
+            " verdict.",
             "",
         ]
     lines += [
@@ -896,6 +915,12 @@ def main(argv: list[str] | None = None) -> int:
         help="other lanes are held quiet (R-N91); required in gated mode",
     )
     parser.add_argument("--dry-run", action="store_true", help=NOT_GATE)
+    parser.add_argument(
+        "--under-load",
+        action="store_true",
+        help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
+        " but not gated (OI-1003-Q39)",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -908,6 +933,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not set(args.pattern) <= {"A", "B"} or "B" not in args.pattern:
         say("refused: --pattern uses only A and B and needs at least one B")
+        return 2
+    if args.dry_run and args.under_load:
+        say("refused: --dry-run and --under-load are exclusive")
         return 2
     sealed = Path(args.corpus).resolve()
     if not args.dry_run:
@@ -945,7 +973,8 @@ def main(argv: list[str] | None = None) -> int:
         else (
             work / f"r23-dryrun-{stamp}.md"
             if args.dry_run
-            else evidence_dir / f"r23-{stamp}.md"
+            else evidence_dir
+            / (f"r23-underload-{stamp}.md" if args.under_load else f"r23-{stamp}.md")
         )
     )
     if args.dry_run and evidence_path.is_relative_to(evidence_dir):
@@ -985,7 +1014,9 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, object] = {
         "date": date,
         "stamp": stamp,
-        "mode": "dry-run" if args.dry_run else "gated",
+        "mode": "dry-run"
+        if args.dry_run
+        else ("under-load" if args.under_load else "gated"),
         "host": platform.node(),
         "platform": platform.platform(),
         "coordinator_quiet": args.coordinator_quiet,
@@ -1004,7 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
         "reps": [],
         "status": "running",
     }
-    if not args.dry_run:
+    if not args.dry_run and not args.under_load:
         deadline = time.monotonic() + args.settle_seconds
         while not (now := conditions())["ok"]:
             if time.monotonic() > deadline:
@@ -1046,7 +1077,11 @@ def main(argv: list[str] | None = None) -> int:
         finish(report, work, evidence_path)
         return 3
     report["status"] = (
-        "dry-run-complete-not-a-gate-sample" if args.dry_run else "complete-draft"
+        "dry-run-complete-not-a-gate-sample"
+        if args.dry_run
+        else (
+            "complete-under-load-informational" if args.under_load else "complete-draft"
+        )
     )
     finish(report, work, evidence_path)
     return 0
