@@ -808,6 +808,17 @@ amendment (OI-1003-Q25, recorded on Linear TIN-4543; its text is on
   test. Over generated WAL sources, with and without an existing `-shm`,
   that test is to show that the main file and `-wal` stay byte-identical
   and that no other source write occurs.
+- **A reported Git-carry source write** (no ruling yet). The WP0(e) lane's
+  reviewed evidence (#159 at `378b634`, not on `main`) records a smoke run
+  of `estate-capture`, built from `46587af`, over the small corpus. Each
+  pass that captured any item moved the mtime and ctime of existing loose
+  objects and a pack in source repositories. Their inode, size and bytes
+  did not change, so the corpus's own `verify` still passed; a stat diff of
+  the source showed it. The lane reads this as Git freshening objects that
+  it finds through the private repository's alternates, and leaves it to
+  S2 (WP1) for a ruling. TIN-4543 records none yet. P-S2 does not cover the
+  Git carry, and the formal model has Git only as an abstract read, so
+  nothing on `main` would catch it.
 
 The idle I/O class only helps where the kernel's I/O scheduler honours
 priority classes [IoprioSet]. This is why S2's budget is measured, not
@@ -863,9 +874,13 @@ each claim. Five instruments exist or are being built.
     verdicts on three mutations.
 
   The TLA+ model is on the branch `docs/tla-model-20261003`, which is not
-  on `main`. This section cites `3dbfbdb`, the commit with its results. The
-  branch's later origin head, `d7589e0`, changes only a lane note, and
-  nothing under `docs/formal/`. At `3dbfbdb`,
+  on `main`. This section describes `3dbfbdb`, the commit whose results
+  this paper was written against. After its review the branch moved on. It
+  is open as #160, at `27581be` when this paper last checked it
+  (2026-10-04). Its commits `8bc6672` and `7738b6e` change the
+  specification, the configurations and the README. This section has not
+  yet been re-checked against them; two of their changes bear on the
+  results below and are noted where they apply. At `3dbfbdb`,
   `docs/formal/BulkloadTransfer.tla` models:
   - wire v5 per entry, from `Entry` and `Decide` through `Held` and
     `SourceDone`;
@@ -916,6 +931,12 @@ each claim. Five instruments exist or are being built.
   seat with three runs and two crashes. TLC found no violation within
   them. That is not a proof for every estate size.
 
+  The README at `27581be` supersedes this run of record. It reports a later
+  full run, over `8bc6672`'s specification, in which all 43 configurations
+  met their expectation. It gives the reason: the earlier `MC_wp0g`
+  configuration used `MC_main`'s bound, under which the source never
+  consulted its ledger (WP0(g) below).
+
   The results carry two findings on open rulings:
   - **WP0(g).** With relaxed ledger rows, `MC_wp0g` and `MC_wp0g_deep`
     pass. `MC_wp0g_authority` also relaxes the commit that creates the
@@ -923,7 +944,15 @@ each claim. Five instruments exist or are being built.
     README concludes that WP0(g) holds for the ledger's row commits only
     if that creation commit stays durable, and it lists further
     conditions. Both stores still run at full durability in the code, so
-    WP0(g) is not implemented.
+    WP0(g) is not implemented. The review after `3dbfbdb` found that
+    `MC_wp0g`'s pass there was no evidence, because at that bound the
+    relaxed ledger was never read. At `27581be` the configuration has a
+    new bound, a reachability configuration shows that the relaxed-only
+    path is explored, and the condition is wider: the source store's whole
+    creation, its state root's directory entry included, must be durable
+    before the model's `Start`. That README also notes that the model
+    assumes a ledger commit never fails, which the code does not yet
+    honour.
   - **WP0(d).** The exchange design satisfies `NoClobber`; the
     check-then-rename design violates it. Superseding publish has no code
     yet.
@@ -995,14 +1024,14 @@ each claim. Five instruments exist or are being built.
   ([corpus evidence](../evidence/r23-corpus-v1-2026-10-02.md)).
 - **The estate-shaped corpus.** WP0(e) (OI-1003-Q19) adds a deterministic,
   sealed generator of Git-heavy, many-small-file trees. S1 is then measured
-  on it in addition to R23's 23-file corpus. It is in progress
-  (`feat/wp0e-estate-corpus-20261003`).
+  on it in addition to R23's 23-file corpus. It is open as #159
+  (`feat/wp0e-estate-corpus-20261003`), not on `main`.
 
 | SLO | Instrument | State at `4a10bb8` |
 |---|---|---|
 | S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
-| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`; the model has no `-shm` write. The `-shm` wal-index write is ruled admissible on conditions (OI-1003-Q36, TIN-4543; `docs/slo.md` text on the coordinator branch, not on `main`); its counter and property test are pending (#157). |
+| S2 properties | P6, P-S2, P34 and P35 property tests; formal model (protocol level only); existing trace and hardening tests | Partial: WP1 on `main` (hardening table, partial-clone refusal, background priority, overlap-first), with P-S2 for the file path (section 3.3). Typed source access (WP7), P34 and P35 pending. In the model, `S2_TypedSourceAccess` and `S2_BackupLockBounded` hold in `MC_s2` at `3dbfbdb`, at the protocol level only, on a branch not on `main`; the model has no `-shm` write. The `-shm` wal-index write is ruled admissible on conditions (OI-1003-Q36, TIN-4543; `docs/slo.md` text on the coordinator branch, not on `main`); its counter and property test are pending (#157). A Git-carry source write (object freshening through alternates) is reported on #159's branch, with no ruling yet (section 3.3). |
 | S2 budget | An S2 sampler of a reference workload's p95 latency and load1 (WP6) | Not built. Pending gate. |
 | S3 zero reads | Counters per run; P21, P23 and P32; fault-harness I3; formal model (file transfer only; S3's Git half is not modelled) | Partial. Holds on the file path in every recorded (pre-wire-v5) bench run (section 5.4). Git carry unmeasured in any run. Since WP2 PR 1 its pack children are counted, as a lower bound; other Git children are not (WP6). WP2 PR 2's chains are on `main`, measured on fixtures only. Since #154 a store from before the racy guard has its rows invalidated once, counted (#125). In the model, the R25 and S3 invariants hold within its bounds at `3dbfbdb`. |
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
@@ -1350,11 +1379,12 @@ ranks the work. This paper only points at it:
   evidence (section 2.1).
 
 Two proof-package items are in progress elsewhere. The formal model is on
-`docs/tla-model-20261003`, whose origin head was `d7589e0` when this was
-written. Its TLC results are committed there (`3dbfbdb`), but it is not yet
-on `main`.
+`docs/tla-model-20261003`, open as #160 (`27581be` when last checked). This
+paper describes its `3dbfbdb` results; the review fixes after that commit
+are not yet folded in (section 4). It is not yet on `main`.
 Its Dhall catalogue and Haskell explorer are sprint 2 work (OI-1003-Q32).
-The estate-shaped corpus is on `feat/wp0e-estate-corpus-20261003`. A gated
+The estate-shaped corpus is on `feat/wp0e-estate-corpus-20261003`, open as
+#159 (`633ff72` when last checked), not on `main`. A gated
 gate (a) run on corpus v1, and a first gate (b) run, are still owed.
 Linear TIN-4543 records three gate (a) attempts on 2026-10-03, none with a
 verdict:
@@ -1420,9 +1450,14 @@ waits for the full post-train `main`.
   created `<db>-shm` beside the database. The 3.51.2 probe also showed the
   main file and `-wal` staying byte-identical. The record is in
   `docs/evidence/estate-corpus-v1-2026-10-03.md` on
-  `feat/wp0e-estate-corpus-20261003` (`7b75b26`, and still at the
-  branch's later head `ec142cf`), which is not on `main`, and on Linear
-  TIN-4543. OI-1003-Q36 admits this write on conditions (section 2.8), but
+  `feat/wp0e-estate-corpus-20261003` (`7b75b26` and `ec142cf`), which is
+  not on `main`, and on Linear TIN-4543. After its review (#159,
+  `378b634`) that file no longer gives those probes. It records instead a
+  smoke run on 2026-10-04, with a release agent built from `46587af`, in
+  which bulkload's own `snapshot`, through the agent's bundled SQLite
+  3.46.0, created `storage.db-shm` beside the source's WAL image. The same
+  smoke reports a second, unruled source write by the Git carry (section
+  3.3). OI-1003-Q36 admits the `-shm` write on conditions (section 2.8), but
   until #157 lands, no repository test on `main` runs bulkload's own open
   in that state, and nothing counts the write or checks that the main file
   and `-wal` stay byte-identical. The model does not represent the write
