@@ -398,6 +398,11 @@ impl Journal {
 
     /// Open or create the file at `name` and lock it, until the locked
     /// descriptor is the file the name holds.
+    ///
+    /// The name is sealed by whoever claims it, not only by its creator
+    /// (#161): a creator that died between its create and its seal left the
+    /// entry only in the page cache, and the records this claim appends must
+    /// not outlive it.
     fn claim(directory: File, name: std::ffi::CString) -> crate::Result<Self> {
         const ATTEMPTS: u32 = 50;
         for _ in 0..ATTEMPTS {
@@ -405,10 +410,7 @@ impl Journal {
                 Ok(file) => file,
                 Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
                     match create_private(&directory, &name) {
-                        Ok(file) => {
-                            seal_dir(&directory)?;
-                            file
-                        }
+                        Ok(file) => file,
                         // Another opener created it first: open theirs.
                         Err(BulkloadRefusal::Io(Some(libc::EEXIST))) => continue,
                         Err(error) => return Err(error),
@@ -421,6 +423,7 @@ impl Journal {
                 return Err(BulkloadRefusal::JournalOwnershipConflict);
             }
             if names(&directory, &name, &file)? {
+                seal_dir(&directory)?;
                 return Ok(Self {
                     file,
                     directory,

@@ -105,18 +105,27 @@ fn w3_engine_properties() {
     assert_eq!(counted.get(Counter::FilesMaterialized), 4);
     assert!(counted.get(Counter::FlushBarrier) >= 4);
     assert_eq!(counted.get(Counter::FlushFull), 0);
-    // One commit per group, plus one schema commit per freshly created store.
+    // One commit per group, plus, per freshly created store, its schema
+    // commit and the full flush that seals its state root (#161).
+    assert_eq!(
+        counted.get(Counter::FlushDir),
+        2,
+        "one state root seal per fresh store: {}",
+        counted.render()
+    );
     assert!(
-        counted.full_flushes_total() <= counted.get(Counter::DurableGroups) + 2,
+        counted.full_flushes_total() <= counted.get(Counter::DurableGroups) + 4,
         "{}",
         counted.render()
     );
     assert!(counted.get(Counter::TransportTuned) >= 2);
 
-    // Warm: nothing is read or received.
-    let (warm, _) = run(base, "destination", "destination-state");
+    // Warm: nothing is read or received, and a sealed store root is not
+    // flushed again (#161).
+    let (warm, counted) = run(base, "destination", "destination-state");
     assert_eq!((warm.reused, warm.completed), (4, 0));
     assert_eq!((warm.source_bytes_read, warm.bytes_received), (0, 0));
+    assert_eq!(counted.get(Counter::FlushDir), 0, "{}", counted.render());
 
     // Adopt: identical outputs without records are verified, never re-sent.
     for name in names {

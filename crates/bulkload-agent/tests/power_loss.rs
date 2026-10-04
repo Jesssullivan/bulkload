@@ -27,6 +27,17 @@
 //! `Event::Commit`, durable once it returns. Writes outside the destination
 //! image would be foreign, dropped and counted, never silently; since the
 //! source keeps no pack (R-N58) a copy makes none, and the test asserts so.
+//! A copy's only foreign mutations are its two stores' state roots and
+//! databases, created outside the destination.
+//!
+//! What a store's records need on disk is proven on its own trace (#161,
+//! R25): `Store::open` and a record commit, checked from the state root's
+//! parent. In every crash state after the open returned (so before Start
+//! hands the store's authority to the peer), or after a commit returned, the
+//! state root and its database are named. The same trace with the open's
+//! directory seals cut out (the code before #161) must fail, so the proof
+//! has teeth; and a store an earlier run left unsealed is sealed by the next
+//! open.
 //!
 //! Two syscall-order checks cover what the destination image cannot see: the
 //! source writes no content bytes at all, so a capture commit references
@@ -52,11 +63,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use bulkload_agent::crash_check::{check_view, Entry, Image, Options, StateInfo, View};
+use bulkload_agent::crash_check::{check_view, Entry, Image, Options, Report, StateInfo, View};
 use bulkload_agent::durable::{set_durability, Durability};
 use bulkload_agent::trace::recorder::Recorder;
 use bulkload_agent::trace::{CommitRecord, Event, NodeId, SyncKind};
 use bulkload_agent::transfer::copy;
+use bulkload_agent::transfer_store::{Manifest, Store};
 use bulkload_proto::RowSchema;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -354,8 +366,18 @@ fn every_power_loss_state_of_a_copy_is_consistent() {
     .unwrap();
     eprintln!("{}", report.summary(&events));
     // Wire v5 keeps no source pack (R-N58): the source side makes no traced
-    // write at all, so nothing is foreign to the destination image.
-    assert_eq!(report.foreign, 0, "the source side writes no content");
+    // write at all. The only mutations foreign to the destination image are
+    // the two stores' state roots and databases (#161).
+    assert_eq!(
+        store_creations(&events),
+        4,
+        "two state roots, two databases"
+    );
+    assert_eq!(
+        report.foreign,
+        store_creations(&events),
+        "the source side writes no content"
+    );
     assert!(
         report.states > report.crash_points,
         "crash points have several states"
@@ -519,4 +541,235 @@ fn the_source_writes_no_content_bytes() {
     );
     assert!(captures > 0, "captures were committed");
     assert!(!scratch.base.join("source-state/chunks.pack").exists());
+}
+
+/// The traced creations of a copy's two state roots and their databases
+/// (#161), which lie outside the destination image.
+fn store_creations(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| match event {
+            Event::Mkdir { name, .. } => {
+                name.as_slice() == b"source-state" || name.as_slice() == b"destination-state"
+            }
+            Event::Create {
+                name: Some(name), ..
+            } => name.as_slice() == b"transfer.sqlite",
+            _ => false,
+        })
+        .count()
+}
+
+/// The state root each store proof opens, inside its scanned parent.
+const STATE: &[u8] = b"state";
+/// The state root's database.
+const DATABASE: &[u8] = b"state/transfer.sqlite";
+
+fn node(path: &Path) -> NodeId {
+    let metadata = fs::metadata(path).unwrap();
+    NodeId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
+}
+
+/// Run `step` with this thread's traced calls recorded. `Store::open` and a
+/// record commit run on the calling thread, so no other test's calls can
+/// enter the trace.
+fn traced<T>(step: impl FnOnce() -> T) -> (T, Vec<Event>) {
+    let recorder = Recorder::new();
+    let value = {
+        let _attached = recorder.attach();
+        step()
+    };
+    (value, recorder.take())
+}
+
+/// `events` without any sync of `nodes`: the same calls as a run that never
+/// sealed those directories.
+fn without_seals(events: &[Event], nodes: &[NodeId]) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|event| !matches!(event, Event::Sync { node, .. } if nodes.contains(node)))
+        .cloned()
+        .collect()
+}
+
+/// Whether `events` hold a sync of `node`.
+fn seals(events: &[Event], node: NodeId) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Sync { node: synced, .. } if *synced == node))
+}
+
+/// Commit one record to `store`: the R25 row a power loss must not take.
+fn commit_one(store: &Store) {
+    store
+        .record_capture(b"r25", &Manifest::new(Vec::new()))
+        .unwrap();
+}
+
+/// #161 (R25): once `Store::open` has returned (`opened` operations in) or
+/// one of the store's commits has, the state root and its database are named
+/// in the crash state.
+fn store_kept(view: View<'_>, info: &StateInfo, opened: usize) -> Result<(), String> {
+    let after = if !info.commits.is_empty() {
+        "a store commit returned"
+    } else if info.crash_point >= opened {
+        "Store::open returned"
+    } else {
+        return Ok(());
+    };
+    if !matches!(view.get(STATE), Some(Entry::Dir { .. })) {
+        return Err(format!(
+            "the state root is {:?} after {after}",
+            view.get(STATE)
+        ));
+    }
+    if !matches!(view.get(DATABASE), Some(Entry::File { .. })) {
+        return Err(format!(
+            "the store database is {:?} after {after}",
+            view.get(DATABASE)
+        ));
+    }
+    Ok(())
+}
+
+/// Check every power-loss state of a store trace whose first `opened`
+/// events are `Store::open`'s. Every event here lowers to one checker
+/// operation (none is a write), so `opened` is also an operation count.
+fn check_store(image: &Image, events: &[Event], opened: usize) -> Report {
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Write { .. })),
+        "a store trace writes nothing the checker models"
+    );
+    check_view(image, events, &Options::default(), |view, info| {
+        store_kept(view, info, opened)
+    })
+    .unwrap()
+}
+
+/// A scanned, empty parent for one store proof, and its node.
+fn store_parent(scratch: &Scratch) -> (PathBuf, Image, NodeId) {
+    let parent = scratch.base.join("state-parent");
+    fs::create_dir(&parent).unwrap();
+    let image = Image::scan(&parent).unwrap();
+    let id = node(&parent);
+    (parent, image, id)
+}
+
+/// #161 (R25): every power-loss state of a fresh `Store::open` and its first
+/// record commit keeps the store, and a reopen of a sealed store flushes
+/// nothing more.
+#[test]
+fn every_power_loss_state_of_a_store_open_keeps_the_store() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("store-open");
+    let (parent, image, parent_node) = store_parent(&scratch);
+    let state = parent.join("state");
+    let (store, opening) = traced(|| Store::open(&state).unwrap());
+    let root_node = node(&state);
+    let ((), committing) = traced(|| commit_one(&store));
+    assert!(
+        opening
+            .iter()
+            .any(|event| matches!(event, Event::Mkdir { .. }))
+            && opening
+                .iter()
+                .any(|event| matches!(event, Event::Create { .. })),
+        "the state root and its database are traced: {opening:?}"
+    );
+    let events = [opening.as_slice(), committing.as_slice()].concat();
+    let report = check_store(&image, &events, opening.len());
+    eprintln!("{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+    assert!(
+        report.states > report.crash_points,
+        "crash points have several states"
+    );
+    assert!(
+        seals(&opening, parent_node) && seals(&opening, root_node),
+        "the open seals the parent and the root: {opening:?}"
+    );
+
+    // A sealed store carries its marker: reopening it flushes nothing.
+    drop(store);
+    let (_, reopening) = traced(|| Store::open(&state).unwrap());
+    assert!(reopening.is_empty(), "{reopening:?}");
+}
+
+/// The proof has teeth (#161): the same calls without the open's directory
+/// seals, as the code made them before #161, can lose the store, and with it
+/// the record a commit made durable.
+#[test]
+fn a_store_open_without_its_seals_can_lose_the_store() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("store-unsealed");
+    let (parent, image, parent_node) = store_parent(&scratch);
+    let state = parent.join("state");
+    let (store, opening) = traced(|| Store::open(&state).unwrap());
+    let root_node = node(&state);
+    let ((), committing) = traced(|| commit_one(&store));
+    let opening = without_seals(&opening, &[parent_node, root_node]);
+    let events = [opening.as_slice(), committing.as_slice()].concat();
+    let report = check_store(&image, &events, opening.len());
+    eprintln!("{}", report.summary(&events));
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.message.starts_with("the state root is None")),
+        "an unsealed state root must be losable: {}",
+        report.summary(&events)
+    );
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.message.ends_with("after a store commit returned")),
+        "a committed record must be losable with it: {}",
+        report.summary(&events)
+    );
+}
+
+/// #161: a store an earlier run created and never sealed (it died between
+/// creating the root and sealing it, or it predates #161) is sealed by the
+/// next open, before that open returns.
+#[test]
+fn a_store_an_earlier_run_left_unsealed_is_sealed_by_the_next_open() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("store-adopted");
+    let (parent, image, parent_node) = store_parent(&scratch);
+    let state = parent.join("state");
+    // The earlier run: the open's calls without its seals, and no marker.
+    let (store, earlier) = traced(|| Store::open(&state).unwrap());
+    drop(store);
+    let root_node = node(&state);
+    let earlier = without_seals(&earlier, &[parent_node, root_node]);
+    rusqlite::Connection::open(state.join("transfer.sqlite"))
+        .unwrap()
+        .execute("DELETE FROM settings WHERE key = 'root_sealed'", [])
+        .unwrap();
+    let (store, next) = traced(|| Store::open(&state).unwrap());
+    let ((), committing) = traced(|| commit_one(&store));
+    let opened = earlier.len() + next.len();
+    let events = [earlier.as_slice(), next.as_slice(), committing.as_slice()].concat();
+    let report = check_store(&image, &events, opened);
+    eprintln!("{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+    assert!(
+        seals(&next, parent_node) && seals(&next, root_node),
+        "the next open seals what the earlier run left: {next:?}"
+    );
+
+    // An open that sealed only what it created would leave it unsealed.
+    let next = without_seals(&next, &[parent_node, root_node]);
+    let events = [earlier.as_slice(), next.as_slice(), committing.as_slice()].concat();
+    let report = check_store(&image, &events, earlier.len() + next.len());
+    assert!(!report.violations.is_empty(), "{}", report.summary(&events));
 }

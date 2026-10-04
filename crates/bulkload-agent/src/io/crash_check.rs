@@ -41,9 +41,12 @@
 //!    a rename or link of such a directory, requires that mkdir.
 //! 5. **Commits.** An `Event::Commit` is a store's `SQLite` commit returning.
 //!    Its records are durable from then on, which the invariant reads from
-//!    [`StateInfo::commits`]; the database itself is not modelled. With
-//!    [`Options::commit_drains`] (Darwin, `fullfsync=ON`) the commit also
-//!    drains the drive holding the store, like a full flush there.
+//!    [`StateInfo::commits`]; the database's contents are not modelled. The
+//!    state root and the database's entry are: `Store::open` makes them with
+//!    traced calls, so an invariant can require them wherever a commit has
+//!    returned (#161). With [`Options::commit_drains`] (Darwin,
+//!    `fullfsync=ON`) the commit also drains the drive holding the store,
+//!    like a full flush there.
 //!
 //! Drains and device-wide barriers act on one drive: the `dev` of the node
 //! they name. Mutations of nodes the image does not hold (a store's own

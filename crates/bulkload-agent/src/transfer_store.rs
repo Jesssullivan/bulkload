@@ -8,6 +8,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Read as _;
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -305,6 +306,12 @@ pub struct PendingDirectory {
 /// [`Store::open`]).
 const RACY_GUARD_SETTING: &str = "racy_guard";
 
+/// The `settings` row that marks a store whose state root has been sealed
+/// (#161): its entry in the parent directory and its database's entry were
+/// durable before this row committed. [`Store::open`] seals any store
+/// without it, then adds it.
+const ROOT_SEALED_SETTING: &str = "root_sealed";
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
@@ -329,26 +336,44 @@ impl Store {
     /// kept: they are re-verified on use, so the re-read costs no wire bytes
     /// for content the destination still holds.
     ///
+    /// The state root is durable before this returns, so before Start hands
+    /// the store's authority to the peer and before any record commits
+    /// (#161, R25): its entry in the parent and its database's entry are
+    /// sealed ([`crate::io::durable::seal_state_root`]) ahead of the
+    /// transaction that adds [`ROOT_SEALED_SETTING`]. A store without that
+    /// marker (new, created by an earlier run that died before its seal, or
+    /// created before #161) is sealed again on open.
+    ///
     /// # Errors
-    /// Refuses symlinks, non-private directories and database failures.
+    /// Refuses symlinks, non-private directories, flush and database failures.
     pub fn open(root: &Path) -> Result<Self> {
-        private_dir(root)?;
-        let db = root.join("transfer.sqlite");
-        if let Ok(meta) = fs::symlink_metadata(&db) {
-            if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
-                return Err(BulkloadRefusal::PathEscapesRoot);
+        let (parent, directory) = private_dir(root)?;
+        let name = c"transfer.sqlite";
+        // Created through `io::sys`, so the R-N88 trace sees the entry the
+        // root seal below makes durable.
+        match crate::io::sys::create_excl_at(directory.as_fd(), name, 0o600) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let found = crate::io::sys::fstatat_nofollow(&directory, name)?;
+                if !found.is_file() || found.mode & 0o077 != 0 {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
+                }
             }
-        } else {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&db)?;
+            Err(error) => return Err(error.into()),
         }
-        let conn = rusqlite::Connection::open(db).map_err(sqlite_error)?;
+        let conn =
+            rusqlite::Connection::open(root.join("transfer.sqlite")).map_err(sqlite_error)?;
         conn.busy_timeout(std::time::Duration::from_mins(1))
             .map_err(sqlite_error)?;
         crate::io::durable::configure_sqlite(&conn)?;
+        // #161: sealed before the transaction that records it, and outside
+        // SQLite's write lock, which a traced seal must never be taken under
+        // (D5). This first read opens the WAL, so the seal covers the
+        // database and its WAL.
+        let sealed = has_setting(&conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?;
+        if !sealed {
+            crate::io::durable::seal_state_root(&parent, &directory)?;
+        }
         let mut random = [0_u8; 32];
         fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
         let before = conn.total_changes();
@@ -386,6 +411,18 @@ impl Store {
                 conn.execute(
                     "INSERT INTO settings VALUES (?1, ?2)",
                     (RACY_GUARD_SETTING, b"#86".as_slice()),
+                )
+                .map(|_| ())
+            })
+            .and_then(|()| {
+                // Only once the seal above has returned (#161). Another
+                // opener may have recorded it meanwhile.
+                if sealed {
+                    return Ok(());
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO settings VALUES (?1, ?2)",
+                    (ROOT_SEALED_SETTING, b"#161".as_slice()),
                 )
                 .map(|_| ())
             })
@@ -1052,17 +1089,64 @@ fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
     ))?)
 }
 
-fn private_dir(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() && meta.permissions().mode().trailing_zeros() >= 6 => Ok(()),
-        Ok(_) => Err(BulkloadRefusal::PathEscapesRoot),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            use std::os::unix::fs::DirBuilderExt as _;
-            fs::DirBuilder::new().mode(0o700).create(path)?;
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
+/// Whether the store has a `settings` table holding `key`. A database
+/// [`Store::open`] has just created has no tables yet.
+fn has_setting(conn: &rusqlite::Connection, key: &str) -> rusqlite::Result<bool> {
+    let table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table {
+        return Ok(false);
     }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+        [key],
+        |row| row.get(0),
+    )
+}
+
+/// Open the private state root `path`, creating it (0700) when absent, and
+/// the directory that holds its entry, both kept open for the seal (#161).
+///
+/// A symlink, a non-directory, or a directory with any group or other bit at
+/// `path` is refused. The parent is opened through the operator's path,
+/// symlinks and all; the root itself never through a symlink. The root is
+/// made with `io::sys::mkdirat`, so the R-N88 trace sees the entry.
+fn private_dir(path: &Path) -> Result<(fs::File, fs::File)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // `.`, `..` and `x/..` name no leaf of their own: resolve them first.
+    let path = if path.file_name().is_some() {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(fs::canonicalize(path)?)
+    };
+    let leaf = path.file_name().ok_or(BulkloadRefusal::PathEscapesRoot)?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let parent = fs::File::open(parent)?;
+    let name = crate::io::c_name(leaf.as_bytes())?;
+    match crate::io::sys::mkdirat(&parent, &name, 0o700) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let root = crate::io::sys::open_dir_at(&parent, &name).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+            BulkloadRefusal::PathEscapesRoot
+        } else {
+            error.into()
+        }
+    })?;
+    let root = fs::File::from(root);
+    let found = crate::io::sys::fstat(&root)?;
+    if !found.is_dir() || found.mode & 0o077 != 0 {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok((parent, root))
 }
 
 #[allow(
@@ -1186,6 +1270,62 @@ mod tests {
                 "settings"
             ]
         );
+        Ok(())
+    }
+
+    /// #161: a state root is a private directory, never reached through a
+    /// symlink, and so is its database a private file.
+    #[test]
+    fn a_state_root_must_be_a_private_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TestRoot::new()?;
+        let private = root.0.join("private");
+        fs::create_dir(&private)?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+        std::os::unix::fs::symlink(&private, root.0.join("link"))?;
+        fs::write(root.0.join("file"), b"")?;
+        let shared = root.0.join("shared");
+        fs::create_dir(&shared)?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750))?;
+        for refused in ["link", "file", "shared"] {
+            assert!(
+                matches!(
+                    Store::open(&root.0.join(refused)),
+                    Err(BulkloadRefusal::PathEscapesRoot)
+                ),
+                "{refused}"
+            );
+        }
+        let state = root.0.join("state");
+        drop(Store::open(&state)?);
+        fs::set_permissions(
+            state.join("transfer.sqlite"),
+            fs::Permissions::from_mode(0o644),
+        )?;
+        assert!(matches!(
+            Store::open(&state),
+            Err(BulkloadRefusal::PathEscapesRoot)
+        ));
+        Ok(())
+    }
+
+    /// #161: a store records its root seal, and a store without the record
+    /// (one from before #161, or whose creator died before its seal) gets it
+    /// back on its next open.
+    #[test]
+    fn a_store_records_its_root_seal() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let store = Store::open(&state)?;
+        assert!(has_setting(&store.conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?);
+        store
+            .conn
+            .execute("DELETE FROM settings WHERE key = ?1", [ROOT_SEALED_SETTING])
+            .map_err(sqlite_error)?;
+        assert!(!has_setting(&store.conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?);
+        drop(store);
+        let store = Store::open(&state)?;
+        assert!(has_setting(&store.conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?);
         Ok(())
     }
 

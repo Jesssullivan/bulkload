@@ -442,6 +442,11 @@ flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
 
+A store's state root and its database entry are sealed (the root fully
+flushed) before `Store::open` returns, so before Start and any commit, and a
+store without the `root_sealed` setting is sealed again on open (#161, R25).
+Other private state directories seal their own entry before records go in.
+
 Space preflight (OI-1001-Q2): a write that would leave its destination
 filesystem (`statvfs`; `statfs` on Darwin) with less than
 `--min-free-percent` free (default 25%; 0 still refuses a write larger than
