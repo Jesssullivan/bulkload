@@ -99,7 +99,24 @@ Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
 paths. A bare repository (a mirror) is carried as ref custody: its refs, HEAD
 and administration, with empty staged and worktree trees, since it has
-neither an index nor a worktree (S4, #162). Import preserves divergence and leaves active HEADs, indexes and
+neither an index nor a worktree (S4, #162).
+
+- The capture marks itself bare in-band (`bare-repository-v1`, lifted into a
+  shallow envelope's headers). Every verb that lays down a workspace, an
+  index or a payload attachment refuses such a capture
+  `GIT_BARE_CAPTURE_WORKSPACE` before writing anything; it applies only as
+  `refs-imported`, planned without a workspace.
+- A bare repository is a root only at its own git dir. Reached through a
+  `.git` gitfile (the bare-plus-worktrees layout), it refuses
+  `GIT_REPOSITORY_NOT_AT_PATH`, as the estimate probe does.
+- A repository's own administration below its root, reached through a
+  gitfile (`--separate-git-dir`), is never a seat.
+- A non-bare repository with no index file (a `--no-checkout` clone or
+  worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`. Git reads the absent file
+  as an unborn index that `git checkout` populates, and an empty index file
+  does not, so no carried index restores it.
+
+Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.

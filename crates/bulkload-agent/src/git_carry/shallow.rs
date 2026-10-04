@@ -20,6 +20,12 @@ const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
 /// the custody commit, so `bundle list-heads` shows the drift without the
 /// pack ever being fetched; `unpack` refuses any envelope carrying it.
 pub(super) const DRIFT_MARKER: &str = "refs/carry-export/shallow-drift-v1";
+/// Set on a shallow envelope whose capture is of a bare repository (S4,
+/// #162). It names the custody commit, so a staged bundle shows a bare
+/// capture without the pack ever being fetched, and every verb that lays down
+/// a workspace refuses it up front. `unpack` checks it against the inner
+/// inventory, which is the truth.
+pub(super) const BARE_MARKER: &str = "refs/carry-export/shallow-bare-v1";
 
 pub(super) fn frontier(repository: &Path) -> Result<Vec<u8>> {
     let path = text(git(repository).args([
@@ -128,6 +134,11 @@ pub(super) fn write_bundle(
         super::set_ref(&envelope, DRIFT_MARKER, &custody)?;
         create.arg(DRIFT_MARKER);
     }
+    // So is the bare marker (S4, #162).
+    if super::bare_marked(&inventory) {
+        super::set_ref(&envelope, BARE_MARKER, &custody)?;
+        create.arg(BARE_MARKER);
+    }
     output(&mut create)?;
     Ok(stats)
 }
@@ -191,7 +202,10 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     let Some(value) = custody_oid(heads) else {
         return Ok(None);
     };
-    if !oid(value) || heads.lines().count() != 1 {
+    // The custody ref, and at most the bare marker naming the same commit.
+    let bare = format!("{value} {BARE_MARKER}");
+    let lifted = heads.lines().any(|line| line == bare);
+    if !oid(value) || heads.lines().count() != 1 + usize::from(lifted) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     ensure_custody_objects(repository, bundle, value)?;
@@ -201,6 +215,10 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     // it, still refuses here, before its pack is indexed (round-4 R1).
     if super::drift_marked(&inventory) {
         return Err(BulkloadRefusal::CaptureDrifted);
+    }
+    // The bare marker in the headers must be exactly the inner inventory's.
+    if lifted != super::bare_marked(&inventory) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     validate_frontier(&boundary)?;
     if boundary.is_empty() || !oid(&pack_oid) {

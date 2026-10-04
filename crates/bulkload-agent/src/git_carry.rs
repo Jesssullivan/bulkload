@@ -1086,6 +1086,7 @@ fn repair_missing_index_inner(
     const SITE: &str = "git_carry::repair_missing_index_inner";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let staged = stage_bundle(bundle)?;
+    refuse_bare_capture(&staged)?;
     bind(&staged.digest())?;
     let bundle = staged.path();
     let repo = fs::canonicalize(repo).refuse_at(SITE)?;
@@ -1523,6 +1524,11 @@ fn export_pass(
     let census = capture_census_planned(repo, common, options.policy, options.planned)?;
     let seats = &census.rows;
     let private = carry_authority(repo, capture, &before_refs, &authority)?;
+    // S4 (#162): a bare capture says so in-band, so every verb that lays down
+    // a workspace refuses it up front ([`refuse_bare_capture`]).
+    if census.bare {
+        metadata(&private, BARE_METADATA, b"true\n")?;
+    }
     let index = capture.join("index");
     // A bare repository carries no index (S4, #162); Git reads the absent
     // file as the empty index, so its staged tree is the empty tree.
@@ -1565,6 +1571,7 @@ fn export_pass(
         || census.nested_worktrees != after.nested_worktrees
         || census.nested_repositories != after.nested_repositories
         || census.omitted != after.omitted
+        || census.bare != after.bare
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
@@ -1739,6 +1746,27 @@ fn drift_marked(heads: &str) -> bool {
     })
 }
 
+// S4 (#162): whether `heads` (a bundle's headers, or a shallow envelope's
+// inner inventory) mark a capture of a bare repository.
+fn bare_marked(heads: &str) -> bool {
+    let plain = format!("refs/carry-export/{BARE_METADATA}");
+    heads.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(_, name)| name == plain || name == shallow::BARE_MARKER)
+    })
+}
+
+// S4 (#162): a bare capture is ref custody with no index or worktree. Every
+// verb that lays down a workspace, an index or a payload attachment from a
+// capture calls this first, so it refuses before anything is written; only
+// an import (`refs-imported`) carries such a capture.
+const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
+    if staged.bare {
+        return Err(BulkloadRefusal::GitBareCaptureWorkspace);
+    }
+    Ok(())
+}
+
 // A directory this process created exclusively (mode 0700, named by a
 // process-wide counter, never reused), removed when dropped. Created in the
 // first `near` directory that accepts it, else in TMPDIR.
@@ -1797,6 +1825,8 @@ pub struct StagedBundle {
     _directory: PrivateDir,
     bundle: PathBuf,
     digest: [u8; 32],
+    // Whether its headers mark a capture of a bare repository (S4, #162).
+    bare: bool,
 }
 
 impl StagedBundle {
@@ -1873,6 +1903,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
         _directory: directory,
         bundle: path,
         digest,
+        bare: bare_marked(&heads),
     })
 }
 
@@ -2309,6 +2340,10 @@ struct Census {
     /// census: a rebuildable root's contents are exactly what must not be able
     /// to invalidate a capture in flight.
     omitted: Vec<Vec<u8>>,
+    /// Whether the root is a bare repository at its own git dir (S4, #162):
+    /// ref custody only, recorded in the capture so no workspace is ever
+    /// laid down from it.
+    bare: bool,
 }
 
 /// Rebuildable roots a capture of `repo` would omit, with their measured sizes.
@@ -2398,21 +2433,42 @@ fn capture_census_planned(
 ) -> Result<Census> {
     // S4 (#162): a bare repository's root is its own administration. It has
     // no worktree, so no seat, nest or omission to census.
-    if root == common && bare(root)? {
+    if bare_root(root)? {
         return Ok(Census {
             rows: Vec::new(),
             nested_worktrees: Vec::new(),
             nested_repositories: Vec::new(),
             omitted: Vec::new(),
+            bare: true,
         });
     }
     filesystem_census(root, Some(common), policy, planned)
 }
 
-// Whether `repo` is a bare repository, by Git's own verdict: a non-bare
-// `.git` directory given as a root is not one.
-fn bare(repo: &Path) -> Result<bool> {
-    Ok(text(git(repo).args(["rev-parse", "--is-bare-repository"]))? == "true")
+// S4 (#162): whether `root` is a bare repository at its own git dir, by Git's
+// own verdict, in one child. The census and the index read share this one
+// predicate. A non-bare `.git` directory given as a root is not bare. A bare
+// repository reached through any other path, such as a `.git` gitfile naming
+// a bare git dir (the bare-plus-worktrees layout), is not a repository root
+// and refuses GIT_REPOSITORY_NOT_AT_PATH, exactly as the estimate probe does:
+// carrying it would census the bare administration as worktree seats.
+fn bare_root(root: &Path) -> Result<bool> {
+    const SITE: &str = "git_carry::bare_root";
+    let answer = text(git(root).args(["rev-parse", "--is-bare-repository", "--absolute-git-dir"]))?;
+    let (bare, git_dir) = answer
+        .split_once('\n')
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    match bare {
+        "false" => Ok(false),
+        "true"
+            if fs::canonicalize(git_dir).refuse_at(SITE)?
+                == fs::canonicalize(root).refuse_at(SITE)? =>
+        {
+            Ok(true)
+        }
+        "true" => Err(BulkloadRefusal::GitRepositoryNotAtPath),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
 }
 
 // A name on the fixed list is only rebuildable if Git tracks nothing beneath
@@ -2440,6 +2496,12 @@ const GITDIR_POINTER_LIMIT: u64 = 64 * 1024;
 
 /// Metadata ref naming the refs and seats that drifted under one capture pass.
 const CAPTURE_DRIFT_METADATA: &str = "capture-drift-v1";
+
+/// Metadata ref marking a capture of a bare repository (S4, #162): ref
+/// custody with no index or worktree. Written only for a bare source, so
+/// every other capture's bundle is unchanged. A shallow envelope lifts it
+/// into its headers ([`shallow::BARE_MARKER`]).
+const BARE_METADATA: &str = "bare-repository-v1";
 /// Largest drift list a single capture may report.
 ///
 /// Unbounded drift is indistinguishable from a rebuild of the checkout and must
@@ -3965,6 +4027,13 @@ fn filesystem_census(
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
             let path = entry.path();
+            // The repository's own administration, reached through a `.git`
+            // gitfile and lying below the root (`git init
+            // --separate-git-dir`), is no more a seat than a root `.git`
+            // directory: its refs, objects and authority are the bundle's.
+            if common.is_some_and(|common| path == common) {
+                continue;
+            }
             let meta = fs::symlink_metadata(&path).refuse_at("git_carry::filesystem_census")?;
             let relative = path
                 .strip_prefix(root)
@@ -4026,6 +4095,7 @@ fn filesystem_census(
         nested_worktrees,
         nested_repositories,
         omitted,
+        bare: false,
     })
 }
 
@@ -4472,11 +4542,21 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
     ]))?);
     let before_index = match fs::read(&index_path) {
         Ok(bytes) => bytes,
-        // S4 (#162): a bare repository has no index and no worktree for one
-        // to describe. It carries none: its staged and worktree trees are
-        // empty, and its refs, HEAD and administration are its custody.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && bare(repo)? => {
-            return Ok((index_path, Vec::new(), Vec::new()));
+        // S4 (#162): a bare repository at its own git dir has no index and no
+        // worktree for one to describe. It carries none: its staged and
+        // worktree trees are empty, and its refs, HEAD and administration are
+        // its custody. A bare repository reached through any other path
+        // refuses GIT_REPOSITORY_NOT_AT_PATH ([`bare_root`]). A non-bare
+        // repository without an index (a `--no-checkout` clone or worktree)
+        // refuses GIT_INVENTORY_INDEX_ABSENT: Git reads the absent file as an
+        // unborn index that `git checkout` populates, which no carried index
+        // file can restore.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if bare_root(repo)? {
+                Ok((index_path, Vec::new(), Vec::new()))
+            } else {
+                Err(BulkloadRefusal::GitInventoryIndexAbsent)
+            };
         }
         Err(error) => return Err(crate::refuse::io(&error, "git_carry::source_index")),
     };
@@ -5254,6 +5334,7 @@ fn attach_payload(
     const SITE: &str = "git_carry::attach_payload";
     use std::os::unix::fs::MetadataExt;
     let staged = stage_bundle(bundle)?;
+    refuse_bare_capture(&staged)?;
     let bundle = staged.path();
     let destination = fs::canonicalize(destination).refuse_at(SITE)?;
     let repository = repository
@@ -5404,6 +5485,8 @@ fn write_git_pointer(receipt: &Path, admin: &Path) -> Result<PathBuf> {
 ///
 /// # Errors
 /// Refuses malformed paths/modes, missing capture metadata, or an occupied target.
+/// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
+/// anything is created (S4, #162).
 /// Partial new destinations are retained, never cleaned by recursive deletion.
 pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result<()> {
     restore_bundle_configured(bundle, destination, source, None)
@@ -5439,6 +5522,7 @@ pub fn restore_staged(
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
     // never as a bare errno.
@@ -5521,6 +5605,8 @@ pub fn restore_staged(
 ///
 /// # Errors
 /// Refuses occupied destinations, differing common excludes, and invalid capture.
+/// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
+/// anything is imported or created (S4, #162).
 /// Partially created worktrees are retained on failure for explicit recovery.
 pub fn restore_linked(
     bundle: &Path,
@@ -5565,6 +5651,7 @@ pub fn restore_linked_staged(
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);

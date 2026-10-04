@@ -2702,6 +2702,72 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // S4 (#162): a bare repository item planned with a workspace, standalone
+    // or linked, captures as ref custody, then refuses at apply as a typed
+    // GIT_BARE_CAPTURE_WORKSPACE before anything is laid down: no workspace
+    // directory, no imported ref, no journal. A bare capture has no index or
+    // worktree, so a checkout from it would stage every HEAD path as deleted.
+    #[test]
+    fn a_bare_repository_item_with_a_workspace_refuses_typed_at_apply() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare-workspace");
+        let mirror = root.join("mirror.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let standalone = root.join("standalone");
+        let linked = root.join("linked");
+        for (name, target, workspace) in [
+            ("standalone", &standalone, &standalone),
+            ("linked", &repository, &linked),
+        ] {
+            let plan = root.join(format!("{name}-plan"));
+            add(&plan, &mirror, target, Some(workspace)).unwrap();
+            let state = root.join(format!("{name}-state"));
+            let rows = receipts(&plan, &state, &corpus).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| (row.0, row.1.as_deref()))
+                    .collect::<Vec<_>>(),
+                vec![("captured", None)],
+                "{name}"
+            );
+            let applied = root.join(format!("{name}-applied"));
+            let outcomes = Mutex::new(Vec::new());
+            let result = apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+                outcomes
+                    .lock()
+                    .unwrap()
+                    .push((row.outcome, row.reason.clone()));
+                Ok(())
+            });
+            assert!(result.is_err(), "{name}");
+            assert_eq!(
+                outcomes.into_inner().unwrap(),
+                vec![("refused", Some("GIT_BARE_CAPTURE_WORKSPACE".to_owned()))],
+                "{name}"
+            );
+            assert!(!workspace.exists(), "{name}: nothing is laid down");
+        }
+        let refs = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["for-each-ref"])
+            .output()
+            .unwrap();
+        assert!(refs.stdout.is_empty(), "nothing was imported");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // WP1 PR 4 (S5, arch 8): a lane deletes a branch and prunes under the
     // pass. The private repository reads the source through `alternates`, so
     // its bundle child fails on the pruned commit; the pack listing moved, so

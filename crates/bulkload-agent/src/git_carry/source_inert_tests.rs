@@ -14,9 +14,12 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use super::{
-    capture_key_parts, commit_object, export_repository_with_custody, git, git_env, git_writer,
-    import_bundle, input, text, CapturePolicy, Export, ExportOptions, Exported, RetainedCapture,
+    attach_matching_payload, bare_marked, capture_census, capture_key_parts, commit_object,
+    common_repository, estimate, export_repository, export_repository_with_custody, git, git_env,
+    git_writer, import_bundle, input, registered, repair_missing_index, restore_bundle,
+    restore_linked, text, CapturePolicy, Export, ExportOptions, Exported, RetainedCapture,
 };
+use crate::BulkloadRefusal;
 
 fn fresh(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -489,6 +492,7 @@ fn private_commits_are_exactly_what_commit_tree_writes() {
 /// incremental pass chains on the first, the mirror's own `lstat` census
 /// (S2) is unchanged by either, and an import names every carried ref.
 #[test]
+#[allow(clippy::too_many_lines)] // One fixture, two passes, the import.
 fn s4_a_bare_repository_is_carried_as_ref_custody() {
     let root = fresh("bare");
     let origin = build(
@@ -547,6 +551,7 @@ fn s4_a_bare_repository_is_carried_as_ref_custody() {
         heads.contains(&format!("{main} refs/carry-export/head")),
         "{heads}"
     );
+    assert!(bare_marked(&heads), "{heads}");
     // A second push, then an incremental pass that chains on the first.
     fs::write(origin.join("pushed"), b"pushed again").unwrap();
     g(&origin, &["commit", "--quiet", "-am", "again"]);
@@ -591,5 +596,271 @@ fn s4_a_bare_repository_is_carried_as_ref_custody() {
             .any(|line| line.starts_with(&main) && line.ends_with("/refs/heads/main")),
         "{imported}"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+// A small committed origin for the S4 layouts below: two commits, a nested
+// directory, and one file rewritten by the second.
+fn plain_origin(root: &Path) -> PathBuf {
+    build(
+        root,
+        &Shape {
+            first: vec![(0, 1, 40), (1, 2, 30), (2, 3, 900)],
+            packed: false,
+            second: vec![(1, 4, 70)],
+            stashes: 0,
+            untracked_stash: false,
+            staged_revert: false,
+            staged_edit: false,
+            untracked: 0,
+        },
+    )
+}
+
+// `rendered`'s refusal, if any: the `Ok` shape is not compared.
+fn refusal<T>(rendered: crate::Result<T>) -> Option<BulkloadRefusal> {
+    rendered.err()
+}
+
+/// S4 (#162): a `.git` gitfile naming a bare git dir (the bare-plus-worktrees
+/// layout: `clone --bare origin project/.bare`, `gitdir: ./.bare`) is not a
+/// repository root. Capture refuses `GIT_REPOSITORY_NOT_AT_PATH`, exactly as
+/// the estimate probe does, instead of carrying the bare administration
+/// (config, hooks, objects, worktree indexes) as worktree seats under an
+/// empty staged tree. The bare git dir itself and its linked worktree are
+/// roots, and each captures.
+#[test]
+fn s4_a_gitfile_naming_a_bare_git_dir_is_not_a_repository_root() {
+    let root = fresh("gitfile-bare");
+    let origin = plain_origin(&root);
+    let project = root.join("project");
+    fs::create_dir(&project).unwrap();
+    g(
+        &root,
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            "--no-local",
+            origin.to_str().unwrap(),
+            project.join(".bare").to_str().unwrap(),
+        ],
+    );
+    fs::write(project.join(".git"), b"gitdir: ./.bare\n").unwrap();
+    g(&project, &["worktree", "add", "--quiet", "wt"]);
+    fs::write(project.join("notes.txt"), b"beside the bare git dir").unwrap();
+    let not_at_path = Some(BulkloadRefusal::GitRepositoryNotAtPath);
+    assert_eq!(refusal(capture_key_parts(&project)), not_at_path);
+    assert_eq!(
+        refusal(export_repository(&project, &root.join("capture"))),
+        not_at_path
+    );
+    let destination = root.join("destination");
+    fs::create_dir(&destination).unwrap();
+    g(&destination, &["init", "--quiet", "--template="]);
+    assert_eq!(
+        estimate::estimate(&project, &estimate::Destination::Local(destination))
+            .unwrap_err()
+            .refusal,
+        BulkloadRefusal::GitRepositoryNotAtPath
+    );
+    capture_key_parts(&project.join(".bare")).unwrap();
+    capture_key_parts(&project.join("wt")).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// S4 (#162): a repository's own administration below its root, reached
+/// through a `.git` gitfile (`git init --separate-git-dir`), is not a seat,
+/// exactly as a root `.git` directory is not: its config, hooks and objects
+/// are never carried as worktree bytes.
+#[test]
+fn s4_a_separate_git_dir_below_the_root_is_not_a_seat() {
+    let root = fresh("separate-git-dir");
+    let checkout = root.join("checkout");
+    g(
+        &root,
+        &[
+            "init",
+            "--quiet",
+            "--template=",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            checkout.join(".gitdata").to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    fs::write(checkout.join("tracked"), b"tracked").unwrap();
+    g(&checkout, &["add", "tracked"]);
+    g(&checkout, &["commit", "--quiet", "-m", "one"]);
+    fs::write(checkout.join("untracked"), b"untracked").unwrap();
+    let common = common_repository(&checkout).unwrap();
+    assert_eq!(common, checkout.join(".gitdata"));
+    let census = capture_census(&checkout, &common, CapturePolicy::default()).unwrap();
+    let mut seats: Vec<&[u8]> = census
+        .rows
+        .iter()
+        .map(|row| row.rel_path.as_slice())
+        .collect();
+    seats.sort_unstable();
+    assert_eq!(seats, [&b"tracked"[..], b"untracked"]);
+    export_repository(&checkout, &root.join("capture")).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// S4 (#162): a non-bare repository with no index file (a `--no-checkout`
+/// clone or linked worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`, never a
+/// bare IO (errno 2). Git reads the absent file as an unborn index, which a
+/// plain `git checkout` populates; an empty index file does not, so no
+/// carried index can restore it. The source's index stays absent.
+#[test]
+fn s4_a_non_bare_repository_without_an_index_refuses_typed() {
+    let root = fresh("no-index");
+    let origin = plain_origin(&root);
+    let clone = root.join("clone");
+    g(
+        &root,
+        &[
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--no-local",
+            origin.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    let linked = root.join("linked");
+    g(
+        &origin,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--no-checkout",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let absent = Some(BulkloadRefusal::GitInventoryIndexAbsent);
+    for checkout in [&clone, &linked] {
+        let index = text(git(checkout).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ]))
+        .unwrap();
+        assert!(!Path::new(&index).exists(), "{index}");
+        assert_eq!(refusal(capture_key_parts(checkout)), absent);
+        assert_eq!(
+            refusal(export_repository(
+                checkout,
+                &root.join(format!(
+                    "capture-{}",
+                    checkout.file_name().unwrap().to_str().unwrap()
+                ))
+            )),
+            absent
+        );
+        assert!(!Path::new(&index).exists(), "{index}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// S4 (#162): a bare capture, plain or a shallow envelope, says so in its
+/// bundle headers, and every verb that lays down a workspace, an index or a
+/// payload attachment from a capture refuses it `GIT_BARE_CAPTURE_WORKSPACE`
+/// before writing anything. An import still carries its refs.
+#[test]
+fn s4_a_bare_capture_never_lays_down_a_workspace() {
+    let root = fresh("bare-workspace");
+    let origin = plain_origin(&root);
+    let workspace = Some(BulkloadRefusal::GitBareCaptureWorkspace);
+    for (name, depth) in [("mirror", None), ("shallow", Some("1"))] {
+        let source = root.join(format!("{name}.git"));
+        let url = format!("file://{}", origin.display());
+        let mut clone = vec!["clone", "--quiet", "--bare"];
+        if let Some(depth) = depth {
+            clone.extend(["--depth", depth]);
+        }
+        clone.extend([url.as_str(), source.to_str().unwrap()]);
+        g(&root, &clone);
+        let bundle = export_repository(&source, &root.join(format!("capture-{name}"))).unwrap();
+        let heads = text(git(&root).args(["bundle", "list-heads"]).arg(&bundle)).unwrap();
+        // A shallow capture is an envelope: the marker is lifted into its
+        // headers beside the custody ref.
+        let marker = if depth.is_some() {
+            super::shallow::BARE_MARKER.to_owned()
+        } else {
+            format!("refs/carry-export/{}", super::BARE_METADATA)
+        };
+        assert!(
+            heads
+                .lines()
+                .any(|line| line.ends_with(&format!(" {marker}"))),
+            "{name}: {heads}"
+        );
+        assert!(bare_marked(&heads), "{name}: {heads}");
+        let restored = root.join(format!("restored-{name}"));
+        assert_eq!(
+            refusal(restore_bundle(&bundle, &restored, "neo")),
+            workspace
+        );
+        assert!(!restored.exists(), "{name}");
+        let repository = root.join(format!("repository-{name}"));
+        fs::create_dir(&repository).unwrap();
+        g(&repository, &["init", "--quiet", "--template="]);
+        let linked = root.join(format!("linked-{name}"));
+        assert_eq!(
+            refusal(restore_linked(&bundle, &repository, &linked, "neo")),
+            workspace
+        );
+        assert!(!linked.exists(), "{name}");
+        let receipt = root.join(format!("receipt-{name}"));
+        assert_eq!(
+            refusal(repair_missing_index(&bundle, &repository, "neo", &receipt)),
+            workspace
+        );
+        let payload = root.join(format!("payload-{name}"));
+        fs::create_dir(&payload).unwrap();
+        assert_eq!(
+            refusal(attach_matching_payload(
+                &bundle,
+                &repository,
+                &payload,
+                "neo",
+                &receipt
+            )),
+            workspace
+        );
+        assert_eq!(
+            refusal(registered::restore(
+                &bundle,
+                &repository,
+                &linked,
+                &repository.join(".git/worktrees/absent"),
+                "neo",
+                &receipt
+            )),
+            workspace
+        );
+        assert!(
+            !receipt.exists() && !payload.join(".git").exists(),
+            "{name}"
+        );
+        assert!(
+            text(git(&repository).args(["for-each-ref"]))
+                .unwrap()
+                .is_empty(),
+            "{name}: nothing was imported"
+        );
+        let imported = root.join(format!("imported-{name}"));
+        fs::create_dir(&imported).unwrap();
+        g(&imported, &["init", "--quiet", "--template=", "-b", "main"]);
+        assert!(
+            import_bundle(&imported, &bundle, "neo").unwrap() > 0,
+            "{name}"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
