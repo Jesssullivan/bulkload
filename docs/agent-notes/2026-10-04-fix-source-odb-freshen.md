@@ -126,7 +126,23 @@ Rulings cited:
     `ContractSelfInconsistent`, with the item refused.
 - **Passes on the fix:** CI seed, 6 cases. The deep tier
   (`BULKLOAD_PROPTEST_DEEP=1`, random seed, 120 cases) passed in 228 s.
-- The `just check-fast` receipt is in the follow-up commit of this note.
+- **`just check-fast` receipt** (in `nix develop .#default`, under the
+  shared `.check-fast.lock`, nice 10):
+  - Exit 0 at bd74e09 (the merge below), 2026-10-04T10:12Z.
+  - 25 cargo result lines: 687 passed, 0 failed, 8 ignored. The lib suite
+    alone is 439 passed.
+  - The fault harness passed: `fault_harness`, `power_loss` (both copy
+    proofs), `resume-power-loss` (both adoption proofs) and
+    `io-partial-write-alone`.
+  - The CI contract passed: 22 tests OK.
+
+## Shas
+
+- c4c168e: fix, tests, design.md and this note (signed).
+- bd74e09: merge of origin/main cb681d3 (#159, estate corpus), with no
+  overlap (signed).
+- The follow-up commit records this receipt (signed). It is note-only, so
+  the code tree is bd74e09's.
 
 ## Open
 
