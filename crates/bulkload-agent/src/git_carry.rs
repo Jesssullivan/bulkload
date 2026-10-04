@@ -343,7 +343,7 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
         (writer.join(), result)
     });
     let result = result?;
-    written.map_err(|_| BulkloadRefusal::Io(None))??;
+    written.map_err(|_| BulkloadRefusal::WorkerLost)??;
     if !result.status.success() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }

@@ -93,6 +93,7 @@ use super::{git, oid};
 use crate::{BulkloadRefusal, Result};
 
 mod stderr_store;
+pub use bulkload_proto::refusal::StderrClass;
 pub(in crate::git_carry) use stderr_store::{
     create_private, cstring, open_existing, private_file, private_subdirectory, PrivateState,
 };
@@ -211,115 +212,6 @@ pub struct StderrReceipt {
     pub file: Option<PathBuf>,
     /// Why the store could not keep them, when it could not.
     pub file_refused: Option<BulkloadRefusal>,
-}
-
-/// What a child's stderr says, from a closed set (R-N121).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StderrClass {
-    /// The path is not a repository, or the remote repository is absent.
-    NotARepository,
-    /// ssh or HTTP authentication, or host-key verification, failed.
-    AuthFailed,
-    /// The host could not be resolved or reached.
-    HostUnreachable,
-    /// A connection or operation timed out.
-    Timeout,
-    /// Git reported a missing, bad or corrupt object.
-    BadObject,
-    /// Anything else.
-    Other,
-}
-
-impl StderrClass {
-    /// The stable code printed as `stderr_class=`.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::NotARepository => "not_a_repository",
-            Self::AuthFailed => "auth_failed",
-            Self::HostUnreachable => "host_unreachable",
-            Self::Timeout => "timeout",
-            Self::BadObject => "bad_object",
-            Self::Other => "other",
-        }
-    }
-
-    /// Classify raw stderr by the phrases real git and OpenSSH print in the
-    /// C locale, which every child runs under (`LC_ALL=C`). The first class
-    /// whose pattern matches wins; the order puts timeouts ahead of the
-    /// unreachable-host phrases they share a line with. Lines from a shell's
-    /// `setlocale` warning are ignored, and "No such file or directory" only
-    /// counts after git's or the shell's change-directory failure.
-    #[must_use]
-    pub fn of(raw: &[u8]) -> Self {
-        const PATTERNS: [(StderrClass, &[&str]); 5] = [
-            (
-                StderrClass::Timeout,
-                &["timed out", "timeout, server", "connection timeout"],
-            ),
-            (
-                StderrClass::HostUnreachable,
-                &[
-                    "could not resolve hostname",
-                    "could not resolve host",
-                    "name or service not known",
-                    "nodename nor servname provided",
-                    "temporary failure in name resolution",
-                    "no route to host",
-                    "network is unreachable",
-                    "connection refused",
-                    "connection closed by remote host",
-                    "connection reset by peer",
-                ],
-            ),
-            (
-                StderrClass::AuthFailed,
-                &[
-                    "permission denied (publickey",
-                    "permission denied, please try again",
-                    "authentication failed",
-                    "host key verification failed",
-                    "could not read username",
-                    "could not read password",
-                    "too many authentication failures",
-                    "no supported authentication methods",
-                ],
-            ),
-            (
-                StderrClass::NotARepository,
-                &[
-                    "not a git repository",
-                    "does not appear to be a git repository",
-                    "repository not found",
-                    "fatal: cannot change to '",
-                    ": cd: ",
-                ],
-            ),
-            (
-                StderrClass::BadObject,
-                &[
-                    "bad object",
-                    "bad revision",
-                    "missing object",
-                    "object not found",
-                    "is corrupt",
-                    "unable to read",
-                    "invalid object",
-                    "did not receive expected object",
-                ],
-            ),
-        ];
-        let text: String = String::from_utf8_lossy(raw)
-            .to_lowercase()
-            .lines()
-            .filter(|line| !line.contains("setlocale"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        PATTERNS
-            .iter()
-            .find(|(_, phrases)| phrases.iter().any(|phrase| text.contains(phrase)))
-            .map_or(Self::Other, |(class, _)| *class)
-    }
 }
 
 impl Refused {
@@ -974,19 +866,19 @@ pub(super) fn run_probe(
         (writer.join(), reader.join(), read)
     });
     let status = child.wait()?;
-    let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::Io(None))?;
+    let (head, total, capture, capture_error) = drained.map_err(|_| BulkloadRefusal::WorkerLost)?;
     let refusal = match status.code() {
         Some(0) => None,
         Some(PROBE_NOT_A_REPOSITORY) => Some(BulkloadRefusal::GitRepositoryNotAtPath),
         Some(PROBE_GIT_TOO_OLD | 255) | None => Some(BulkloadRefusal::GitUnavailable),
-        Some(_) => Some(BulkloadRefusal::GitInventoryMalformed),
+        Some(_) => Some(BulkloadRefusal::GitChildFailed(StderrClass::of(&head))),
     };
     let Some(refusal) = refusal else {
         if let (Some(store), Some(capture)) = (store, capture) {
             store.discard(capture);
         }
         // A child that answered in full read its whole script.
-        written.map_err(|_| BulkloadRefusal::Io(None))??;
+        written.map_err(|_| BulkloadRefusal::WorkerLost)??;
         return Ok(parse_probe(&answer?)?);
     };
     Err(child_refusal(
@@ -1250,8 +1142,8 @@ fn walk(source: &Repository, request: &str, edge_aggressive: bool) -> Result<Tal
         let writer = scope.spawn(move || list_in.write_all(request.as_bytes()));
         let reader = scope.spawn(move || tally(BufReader::new(check_out)));
         let unavailable = forward(BufReader::new(list_out), BufWriter::new(check_in));
-        let written = writer.join().map_err(|_| BulkloadRefusal::Io(None))?;
-        let tallied = reader.join().map_err(|_| BulkloadRefusal::Io(None))?;
+        let written = writer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        let tallied = reader.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
         let unavailable = unavailable?;
         written?;
         let mut tallied = tallied?;
@@ -1363,7 +1255,7 @@ fn thin_pack(
         };
         let writer = scope.spawn(move || stdin.write_all(input.as_bytes()));
         let counted = count_pack(stdout);
-        writer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        writer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
         counted
     });
     let status = pack.wait()?;
@@ -2228,7 +2120,12 @@ mod tests {
             "cat >/dev/null; echo 'fatal: bad object 0123abcd' >&2; exit 1",
         ]);
         let refused = run_probe(&mut malformed, None).unwrap_err();
-        assert_eq!(refused.refusal, BulkloadRefusal::GitInventoryMalformed);
+        // WP3: a failed child is GIT_CHILD_FAILED with its class, not a
+        // catch-all GIT_INVENTORY_MALFORMED.
+        assert_eq!(
+            refused.refusal,
+            BulkloadRefusal::GitChildFailed(StderrClass::BadObject)
+        );
         assert_eq!(
             refused.stderr.as_ref().map(|s| s.class),
             Some(StderrClass::BadObject)
@@ -2236,7 +2133,7 @@ mod tests {
         let lines = refused.lines();
         assert_eq!(
             lines.first().map(String::as_str),
-            Some("refused=GIT_INVENTORY_MALFORMED")
+            Some("refused=GIT_CHILD_FAILED")
         );
         assert!(lines.iter().any(|line| line == "stderr_class=bad_object"));
         assert!(!lines.join("\n").contains("0123abcd"));
@@ -2246,9 +2143,10 @@ mod tests {
         let refused = run_probe(&mut silent, None).unwrap_err();
         assert!(refused.stderr.is_none());
         assert_eq!(
-            refused.lines(),
-            vec!["refused=GIT_INVENTORY_MALFORMED".to_owned()]
+            refused.refusal,
+            BulkloadRefusal::GitChildFailed(StderrClass::Other)
         );
+        assert_eq!(refused.lines(), vec!["refused=GIT_CHILD_FAILED".to_owned()]);
     }
 
     /// F1: every Git call the probe makes carries the no-write, no-network

@@ -297,7 +297,7 @@ pub fn copy(
         };
         let _ = receiver.shutdown(std::net::Shutdown::Both);
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::Io(None))??;
+        producer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
         result
     })
 }
@@ -358,7 +358,7 @@ impl Credit {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.1 {
-                return Err(BulkloadRefusal::Io(None));
+                return Err(BulkloadRefusal::WorkerLost);
             }
             if state.0 >= bytes {
                 state.0 -= bytes;
@@ -758,7 +758,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         state,
     }) = read_frame(&mut input)?
     else {
-        return Err(BulkloadRefusal::FrameCodec);
+        return Err(BulkloadRefusal::ProtocolStateViolation);
     };
     if proto != PROTO_VERSION || id != wire_id() {
         return Err(BulkloadRefusal::FrameCodec);
@@ -875,11 +875,11 @@ fn spawn_reader<R: Read + Send + 'static>(
                     Ok(Frame::Control(Control::NeedChunks { entry, indices })) => {
                         Event::NeedChunks { entry, indices }
                     }
-                    Ok(_) => break BulkloadRefusal::FrameCodec,
+                    Ok(_) => break BulkloadRefusal::ProtocolStateViolation,
                     Err(refusal) => break refusal,
                 };
                 if events.send(event).is_err() {
-                    break BulkloadRefusal::Io(None);
+                    break BulkloadRefusal::WorkerLost;
                 }
             };
             credit.close();
@@ -943,7 +943,7 @@ fn send_entries<W: Write>(
         if outbound.finished() {
             return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
-        let event = events.recv().map_err(|_| BulkloadRefusal::Io(None))?;
+        let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
         outbound.handle(event)?;
     }
 }
@@ -983,7 +983,9 @@ impl<W: Write> Outbound<'_, W> {
             let Some(job) = self.queue.pop_front() else {
                 break;
             };
-            self.jobs.send(job).map_err(|_| BulkloadRefusal::Io(None))?;
+            self.jobs
+                .send(job)
+                .map_err(|_| BulkloadRefusal::WorkerLost)?;
             self.active += 1;
         }
         Ok(())
@@ -998,14 +1000,14 @@ impl<W: Write> Outbound<'_, W> {
     }
 
     fn slot(&mut self, entry: u64) -> Result<(&mut SourceEntry, &mut Option<Arc<RowSchema>>)> {
-        let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::FrameCodec)?;
+        let index = usize::try_from(entry).map_err(|_| BulkloadRefusal::ProtocolStateViolation)?;
         Ok((
             self.entries
                 .get_mut(index)
-                .ok_or(BulkloadRefusal::FrameCodec)?,
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
             self.rows
                 .get_mut(index)
-                .ok_or(BulkloadRefusal::FrameCodec)?,
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
         ))
     }
 
@@ -1013,10 +1015,10 @@ impl<W: Write> Outbound<'_, W> {
     fn finish_entry(&mut self, entry: u64) -> Result<Arc<RowSchema>> {
         let (slot, row) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
-            return Err(BulkloadRefusal::Io(None));
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         *slot = SourceEntry::Done;
-        let row = row.take().ok_or(BulkloadRefusal::Io(None))?;
+        let row = row.take().ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.active -= 1;
         Ok(row)
     }
@@ -1073,7 +1075,7 @@ impl<W: Write> Outbound<'_, W> {
                 )?;
                 let (slot, _) = self.slot(entry)?;
                 if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
-                    return Err(BulkloadRefusal::Io(None));
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 *slot = SourceEntry::Offered {
                     manifest,
@@ -1086,7 +1088,7 @@ impl<W: Write> Outbound<'_, W> {
                 let record = self
                     .awaiting
                     .remove(&entry)
-                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
                 // A capture is recorded only once the destination holds its
                 // bytes durably, so a committed capture never costs a source
                 // read again (R25, OI-1001-Q15).
@@ -1145,9 +1147,11 @@ impl<W: Write> Outbound<'_, W> {
     fn decide(&mut self, entry: u64, decision: &Decision) -> Result<()> {
         let (slot, held) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Undecided) {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
-        let row = held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?;
+        let row = held
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let regular = row.kind == FileKind::Regular;
         let (next, job) = match decision {
             Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => {
@@ -1156,7 +1160,7 @@ impl<W: Write> Outbound<'_, W> {
                 (SourceEntry::Done, None)
             }
             Decision::Send | Decision::WantManifest if !regular => {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             Decision::Send => (
                 SourceEntry::Queued,
@@ -1181,7 +1185,10 @@ impl<W: Write> Outbound<'_, W> {
 
     fn need_chunks(&mut self, entry: u64, indices: Vec<u32>) -> Result<()> {
         let (slot, held) = self.slot(entry)?;
-        let row = Arc::clone(held.as_ref().ok_or(BulkloadRefusal::FrameCodec)?);
+        let row = Arc::clone(
+            held.as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
+        );
         let SourceEntry::Offered {
             manifest,
             retained,
@@ -1189,13 +1196,13 @@ impl<W: Write> Outbound<'_, W> {
             racy,
         } = std::mem::replace(slot, SourceEntry::Working)
         else {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         };
         let count = manifest.chunks.len();
         if indices.windows(2).any(|pair| pair.first() >= pair.get(1))
             || indices.iter().any(|index| *index as usize >= count)
         {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.jobs
             .send(Job::Serve {
@@ -1207,7 +1214,7 @@ impl<W: Write> Outbound<'_, W> {
                 record,
                 racy,
             })
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     }
 }
 
@@ -1333,7 +1340,7 @@ fn send_capture(
                 },
                 data: Arc::new(data),
             })
-            .map_err(|_| BulkloadRefusal::Io(None))
+            .map_err(|_| BulkloadRefusal::WorkerLost)
     })?;
     let manifest = Manifest::new(chunks);
     Ok(Event::End {
@@ -1426,12 +1433,23 @@ fn serve_chunks(
     };
     for index in indices {
         let at = *index as usize;
-        let spec = manifest.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
-        let offset = *offsets.get(at).ok_or(BulkloadRefusal::FrameCodec)?;
+        let spec = manifest
+            .chunks
+            .get(at)
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let offset = *offsets
+            .get(at)
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let data = if let Some(held) = held {
-            Arc::clone(held.chunks.get(at).ok_or(BulkloadRefusal::FrameCodec)?)
+            Arc::clone(
+                held.chunks
+                    .get(at)
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
+            )
         } else {
-            let file = opened.as_ref().ok_or(BulkloadRefusal::Io(None))?;
+            let file = opened
+                .as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
             let mut data = vec![
                 0_u8;
                 usize::try_from(spec.size)
@@ -1463,7 +1481,7 @@ fn serve_chunks(
                 },
                 data,
             })
-            .map_err(|_| BulkloadRefusal::Io(None))?;
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
     }
     if let Some(file) = &opened {
         if StatIdentity::from_metadata(&file.metadata()?) != StatIdentity::from_row(row) {
@@ -1831,7 +1849,7 @@ impl Streaming {
         verified: bool,
     ) -> Result<()> {
         if header.index as usize != self.specs.len() || header.offset != self.offset {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         // More chunks than any manifest may hold ends the session: nothing
         // grows past the bound (#77 review F4).
@@ -1845,7 +1863,7 @@ impl Streaming {
         }
         if self.failure.is_none() && self.staged.is_none() {
             if *open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             match target.stage(&self.row) {
                 Ok(staged) => {
@@ -1986,7 +2004,7 @@ pub fn receive<R: Read, W: Write>(
         },
     )?;
     let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
-        return Err(BulkloadRefusal::FrameCodec);
+        return Err(BulkloadRefusal::ProtocolStateViolation);
     };
     let target_meta = std::fs::metadata(target.path())?;
     let output_authority = postcard::to_stdvec(&(
@@ -2053,7 +2071,7 @@ impl<W: Write> Inbound<'_, W> {
             match read_frame(input)? {
                 Frame::Control(Control::Entry { entry, row }) => {
                     if entry != offered || walk_done.is_some() {
-                        return Err(BulkloadRefusal::FrameCodec);
+                        return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
                     self.entry(entry, row)?;
@@ -2073,7 +2091,7 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 Frame::Control(Control::WalkDone { entries }) => {
                     if entries != offered || walk_done.is_some() {
-                        return Err(BulkloadRefusal::FrameCodec);
+                        return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     walk_done = Some(entries);
                     self.walk_done = true;
@@ -2098,7 +2116,7 @@ impl<W: Write> Inbound<'_, W> {
                 }) if walk_done == Some(entries) && self.incoming.is_empty() => {
                     return Ok(source_bytes_read);
                 }
-                _ => return Err(BulkloadRefusal::FrameCodec),
+                _ => return Err(BulkloadRefusal::ProtocolStateViolation),
             }
         }
     }
@@ -2219,7 +2237,7 @@ impl<W: Write> Inbound<'_, W> {
         let incoming = self
             .incoming
             .remove(&entry)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let row = match incoming {
             Incoming::Streaming(Streaming { row, staged, .. }) => {
                 if let Some(staged) = staged {
@@ -2238,7 +2256,7 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         if row.rel_path != rel_path {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.stats.refusals.push((row.rel_path, code));
         Ok(())
@@ -2250,7 +2268,7 @@ impl<W: Write> Inbound<'_, W> {
             return Err(BulkloadRefusal::FrameCodec);
         }
         let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&entry) else {
-            return Err(BulkloadRefusal::FrameCodec);
+            return Err(BulkloadRefusal::ProtocolStateViolation);
         };
         let manifest = Manifest { root, chunks };
         let mut offsets = Vec::with_capacity(manifest.chunks.len());
@@ -2264,7 +2282,7 @@ impl<W: Write> Inbound<'_, W> {
         let mut salvaged_from = Vec::new();
         let plan = if manifest.is_consistent() {
             if self.open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::FrameCodec);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
             }
             plan_file(
                 &ReceiveContext {
@@ -2326,7 +2344,7 @@ impl<W: Write> Inbound<'_, W> {
         self.granted = self
             .granted
             .checked_sub(size)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
         let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
             && counters::hash(Counter::HashWireVerify, payload) == header.digest;
@@ -2347,19 +2365,19 @@ impl<W: Write> Inbound<'_, W> {
             }
             Some(Incoming::Filling(filling)) => {
                 if filling.expected.pop_front() != Some(header.index) {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let at = header.index as usize;
                 let spec = filling
                     .manifest
                     .chunks
                     .get(at)
-                    .ok_or(BulkloadRefusal::FrameCodec)?;
+                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
                 if spec.digest != header.digest
                     || spec.size != size
                     || filling.offsets.get(at) != Some(&header.offset)
                 {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 if filling.failure.is_none() {
                     if verified {
@@ -2376,7 +2394,7 @@ impl<W: Write> Inbound<'_, W> {
                     }
                 }
             }
-            _ => return Err(BulkloadRefusal::FrameCodec),
+            _ => return Err(BulkloadRefusal::ProtocolStateViolation),
         }
         self.consumed = self.consumed.saturating_add(size);
         if self.consumed >= CREDIT_RETURN {
@@ -2402,12 +2420,12 @@ impl<W: Write> Inbound<'_, W> {
         let incoming = self
             .incoming
             .remove(&entry)
-            .ok_or(BulkloadRefusal::FrameCodec)?;
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         let (rel_path, outcome) = match incoming {
-            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::FrameCodec),
+            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::ProtocolStateViolation),
             Incoming::Streaming(streaming) => {
                 if chunks as usize != streaming.specs.len() || size != streaming.offset {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = streaming.row.rel_path.clone();
                 (rel_path, self.end_streaming(streaming, root, racy))
@@ -2418,7 +2436,7 @@ impl<W: Write> Inbound<'_, W> {
                     || root != filling.manifest.root
                     || filling.manifest.size() != Some(size)
                 {
-                    return Err(BulkloadRefusal::FrameCodec);
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = filling.row.rel_path.clone();
                 (rel_path, self.end_filling(filling, racy))
@@ -2472,7 +2490,7 @@ impl<W: Write> Inbound<'_, W> {
         if self.pending_held.is_empty() {
             Ok(())
         } else {
-            Err(BulkloadRefusal::Io(None))
+            Err(BulkloadRefusal::ProtocolStateViolation)
         }
     }
 

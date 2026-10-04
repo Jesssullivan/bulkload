@@ -63,10 +63,10 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
         return Err(BulkloadRefusal::Io(None));
     }
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| BulkloadRefusal::Io(None))?;
+        .map_err(backup_refusal)?;
     source
         .busy_timeout(Duration::ZERO)
-        .map_err(|_| BulkloadRefusal::Io(None))?;
+        .map_err(backup_refusal)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,16 +75,15 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
         .open(output)
         .map_err(|_| BulkloadRefusal::Io(None))?;
     let mut destination = Connection::open_with_flags(output, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|_| BulkloadRefusal::Io(None))?;
+        .map_err(backup_refusal)?;
     destination
         .busy_timeout(Duration::ZERO)
-        .map_err(|_| BulkloadRefusal::Io(None))?;
+        .map_err(backup_refusal)?;
     {
-        let backup =
-            Backup::new(&source, &mut destination).map_err(|_| BulkloadRefusal::Io(None))?;
+        let backup = Backup::new(&source, &mut destination).map_err(backup_refusal)?;
         let mut complete = false;
         for _ in 0..max_steps {
-            match backup.step(128).map_err(|_| BulkloadRefusal::Io(None))? {
+            match backup.step(128).map_err(backup_refusal)? {
                 StepResult::Done => {
                     complete = true;
                     break;
@@ -102,7 +101,7 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     // destination sidecars. Changing the mode affects only the new snapshot.
     let mode: String = destination
         .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-        .map_err(|_| BulkloadRefusal::Io(None))?;
+        .map_err(backup_refusal)?;
     if mode != "delete" {
         return Err(BulkloadRefusal::SqliteStateChanged);
     }
@@ -286,6 +285,19 @@ fn compose(
     }
     fs::File::open(output)?.sync_file_counted()?;
     Ok(summary)
+}
+
+/// A failed step of the online backup (WP3): `SQLite`'s extended result
+/// code when `SQLite` reported one, never the message text.
+// A `map_err` adapter: it is handed the error by value.
+#[allow(clippy::needless_pass_by_value)]
+fn backup_refusal(error: rusqlite::Error) -> BulkloadRefusal {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => {
+            BulkloadRefusal::SqliteBackupFailed(Some(failure.extended_code))
+        }
+        _ => BulkloadRefusal::SqliteBackupFailed(None),
+    }
 }
 
 fn sql_refusal(_: rusqlite::Error) -> BulkloadRefusal {
