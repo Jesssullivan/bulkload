@@ -1,10 +1,10 @@
 # bulkload: moving a live agent estate between machines
 
 **Whitepaper, draft of 2026-10-03.** Proof package item one (OI-1003-Q7).
-Code base: `origin/main` at `4a7b86b`. That includes WP1 (#145, merged as
+Code base: `origin/main` at `4a10bb8`. That includes WP1 (#145, merged as
 `adb9c66`), WP2 PR 1 (#144, `04ea9cb`), WP10 PR 1 (#152, `6268175`),
-WP2 PR 2 (#146, `46587af`) and bounded salvage with legacy-row
-invalidation (#154, `4a7b86b`).
+WP2 PR 2 (#146, `46587af`), bounded salvage with legacy-row invalidation
+(#154, `4a7b86b`) and WP10 PR 2 (#153, `4a10bb8`).
 References use keys in square brackets (for example
 [Rsync96]); each one resolves in the [bibliography](bibliography.md), with
 a note on how it was verified.
@@ -19,7 +19,7 @@ normative document disagree, the normative document wins:
 
 Statements about the code cite a file under `crates/`. Statements about
 results cite an evidence file and its date. Work that is ratified but not on
-`main` at `4a7b86b` is marked as such. The paper quotes no SLO number; it
+`main` at `4a10bb8` is marked as such. The paper quotes no SLO number; it
 links [`docs/slo.md`](../slo.md) for them, so a dated amendment there cannot
 leave this paper silently out of date.
 
@@ -181,11 +181,13 @@ enforces this (`crates/bulkload-agent/tests/dep_graph.rs`). R-N54 makes raw
 syscalls, zero-copy and reused buffers the default design choice. The engine
 does use raw syscalls (`src/io/sys_*.rs`), but buffer reuse is not wired in
 yet. The slab pool and fused chunker (`src/io/buf.rs`, `src/io/chunker.rs`)
-are compiled under `allow(dead_code)` with the reason "wired in by W4 PR 2/3"
-(`src/io/mod.rs`), and the transfer allocates a new buffer per chunk
-(`send_capture` in `src/transfer.rs`). So no S1 number in this paper includes
-buffer reuse. Wiring or deleting them is WP10 PR 3. Refusals are values,
-never panics, under a lint wall in each crate (R33).
+are compiled under a non-test `allow(dead_code)`. Since WP10 PR 2 (#153),
+its stated reason defers wiring or deleting them to the gate (a) evidence
+(#88, WP10 PR 3) (`src/io/mod.rs`). The transfer allocates a new buffer per
+chunk (`send_capture` in `src/transfer.rs`), so no S1 number in this paper
+includes buffer reuse. #153 also deleted most of the other unwired W4 io
+items. Refusals are values, never panics, under a lint wall in each crate
+(R33).
 
 ### 2.2 Wire v5
 
@@ -243,16 +245,18 @@ source                                   destination
   once per session, not per file); or the start-of-session sweep salvaged
   any temporary. So in any session after one that published an output,
   every new or changed file costs a manifest round trip, whether or not
-  the destination holds any of that file's chunks. [`docs/design.md`](../design.md)
-  ("WantManifest") states the rule more narrowly: an existing output, or
-  published outputs that hold chunks. The formal model's README at
-  `3dbfbdb` already records the salvage condition as a disagreement between
-  the code and `docs/design.md`. The source sends its manifest, from its
-  ledger without reading when the stat identity is recorded. The destination
-  fills what it can from verified local chunks, then asks only for the
-  missing indices. A fresh manifest is built from one read kept in memory
-  (512 MiB budget, `RETAIN_BYTES`); a larger file is streamed as for `Send`,
-  so no seat is read twice in a session.
+  the destination holds any of that file's chunks.
+  [`docs/design.md`](../design.md) ("WantManifest") states the rule more
+  narrowly: an existing output, or published outputs that hold chunks. The
+  formal model's README at `3dbfbdb` already records the salvage condition
+  as a disagreement between the code and `docs/design.md`.
+
+  The source sends its manifest, from its ledger without reading when the
+  stat identity is recorded. The destination fills what it can from
+  verified local chunks, then asks only for the missing indices. A fresh
+  manifest is built from one read kept in memory (512 MiB budget,
+  `RETAIN_BYTES`); a larger file is streamed as for `Send`, so no seat is
+  read twice in a session.
 - **Credit.** The destination grants 16 MiB of payload credit
   (`CREDIT_WINDOW`) and returns it as it writes. The source never has more
   than the grant in flight, nor more than 16 entries' content.
@@ -554,7 +558,7 @@ section 1, problem 3). That review counted, at `727493a`:
   `output()` maps any failed Git child to that one code and drops its
   stderr.
 
-On `4a7b86b`, a failed SQLite backup step still maps to `Io(None)`
+On `4a10bb8`, a failed SQLite backup step still maps to `Io(None)`
 (`snapshot` in `src/provider_sqlite.rs`). `closure.rs` still reads a refusal
 code back out of the receipt's Display text (`split_whitespace`), instead of
 matching a typed value. Such refusals name no cause that a disposition could
@@ -822,7 +826,7 @@ each claim. Five instruments exist or are being built.
   times the cases. There is no fuzzing (OI-1003-Q7). The method follows
   QuickCheck [QuickCheck00] through `proptest` [Proptest]. A test is retired
   only when its subsuming property catches the specific mutant the old test
-  was written for. On `main` at `4a7b86b`, `proptest!` appears in seven
+  was written for. On `main` at `4a10bb8`, `proptest!` appears in seven
   places:
   - the slab pool and chunker models (`src/io/buf/tests.rs`,
     `src/io/chunker/tests.rs`);
@@ -994,7 +998,7 @@ each claim. Five instruments exist or are being built.
   on it in addition to R23's 23-file corpus. It is in progress
   (`feat/wp0e-estate-corpus-20261003`).
 
-| SLO | Instrument | State at `4a7b86b` |
+| SLO | Instrument | State at `4a10bb8` |
 |---|---|---|
 | S1 gate (a) | R23 A/B harness, R-N81 gating, corpus v1 and the estate corpus | **Not met.** The last completed sample (2026-09-18, pre-wire-v5) failed on the initial copy. Wire v5 has no gated sample. |
 | S1 gate (b) | A remote pull-vs-rclone-over-sftp arm (WP6) | Not built. Pending gate. |
@@ -1004,7 +1008,7 @@ each claim. Five instruments exist or are being built.
 | S3 rerun ratio and delta inequalities | Bench `s3_ratio` verdict and P-S3-delta (WP6) | Not recorded. Pending gate. |
 | S4 | Native closure report and attestation; disposition ledger (WP3); P8 and P61 | Not yet provable. Closure gate on `main`; disposition ledger pending. |
 | S5 | Drift custody; P29 and P39 | Ref, seat and object-store drift on `main`. HEAD and index pending (#38, WP5). Configuration, shallow frontier, nest custody, rebuildable roots and directory shape still refuse, with no work package yet. File-path vanish is bare `IO` (WP5 PR 2). See section 2.10. |
-| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #154's source, build, test and fault-harness checks passed before it merged as `4a7b86b`. The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
+| Durability ordering | Fault harness I1–I4, R-N88 checker, R-N119 proofs; formal model (`RecordImpliesBytes`, `HeldAfterCommit`, `LedgerAfterHeld`) | In `check-fast` and PR CI; #154's and #153's source, build, test and fault-harness checks passed before they merged as `4a7b86b` and `4a10bb8`. #153 retargeted the recorded crash-check tests at the production no-replace publish, on both its rename and its link-and-unlink path (R-N119). The real-copy and adoption power-loss proofs accept bounded crash points. In the model, these invariants hold within its bounds and their mutants are caught (`3dbfbdb`, not on `main`). |
 
 ## 5. Results
 
@@ -1341,7 +1345,9 @@ ranks the work. This paper only points at it:
   a v0 synthetic reference workload (OI-1003-Q34, Linear TIN-4543);
 - one durability façade: WP8;
 - destination throughput for estate-shaped trees: WP9;
-- sprawl removal: WP10. PR 1 (#152) is on `main`; PR 2 (#153) is open.
+- sprawl removal: WP10. PR 1 (#152) and PR 2 (#153) are on `main`; PR 3
+  wires or deletes the slab pool and fused chunker on the gate (a)
+  evidence (section 2.1).
 
 Two proof-package items are in progress elsewhere. The formal model is on
 `docs/tla-model-20261003`, whose origin head was `d7589e0` when this was
