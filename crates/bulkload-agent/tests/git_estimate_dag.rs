@@ -29,6 +29,24 @@
 //!   the oids it carries equals `missing`, with nothing unavailable.
 //! - **Closure.** `source` is the same tally over the closure of the
 //!   source's tips.
+//! - **Encoding.** [`check`] returns how the oracle pack stores what it
+//!   carries, read from each object's pack header: whole, `OFS_DELTA` on an
+//!   earlier object in the pack, or `REF_DELTA` on a base that sits past the
+//!   received bytes once `--fix-thin` has appended it (a have: the thin
+//!   case). Byte equality with such a pack is what makes `--thin`,
+//!   `--delta-base-offset` and the preferred bases observable. Each PINNED row
+//!   requires the deltas its shape exists for, so no row can quietly stop
+//!   being thin or stop holding an in-pack delta.
+//!
+//! **Content.** A DAG edits four files: one at the root, two under a
+//! directory (`a/f1.txt`, `a/sub/f2.txt`) that a rename edit moves to `b/` and
+//! back, and one under `doc/`. A file's first write is a fresh body of more
+//! than 1 KB; every later write rewrites one to three lines of the file's
+//! current version, inherited from the first parent (and on odd seeds appends
+//! one), so a new blob deltifies against its previous version, inside the
+//! pack or against a have.
+//! A rename over a have moves an unchanged subtree to a path the have lacks,
+//! the shape where `pack.useSparse` would pack it again.
 //!
 //! **Corpus.** CI runs a fixed seed and 12 cases ([`prop_config`]), plus a
 //! PINNED table of shapes the generator reaches rarely.
@@ -48,7 +66,7 @@
     clippy::indexing_slicing
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -273,14 +291,27 @@ impl Rng {
     }
 }
 
-/// `count` distinct-looking lines drawn from `seed` (the bytes
-/// `tests/git_carry_v2.rs`'s `noise` writes).
-fn noise(seed: u64, count: usize) -> String {
-    use std::fmt::Write as _;
-    let mut rng = Rng(seed.wrapping_mul(2_654_435_761) + 1);
-    let mut body = String::new();
-    for i in 0..count {
-        let _ = writeln!(body, "line {i} {:016x}", rng.next());
+/// `count` distinct-looking lines drawn from `seed` (the line shape
+/// `tests/git_carry_v2.rs`'s `noise` writes), each 24 or 25 bytes.
+fn noise(seed: u64, count: usize) -> Vec<String> {
+    let mut rng = Rng(seed.wrapping_mul(2_654_435_761) | 1);
+    (0..count)
+        .map(|i| format!("line {i} {:016x}\n", rng.next()))
+        .collect()
+}
+
+/// `body` with one to three of its lines (chosen by `seed`) rewritten and,
+/// on an odd `seed`, one line appended: a small change, so the result
+/// deltifies against `body`.
+fn rewrite(mut body: Vec<String>, seed: u64) -> Vec<String> {
+    let mut rng = Rng(seed.rotate_left(17) | 1);
+    let len = u64::try_from(body.len()).unwrap();
+    for _ in 0..=seed % 3 {
+        let at = usize::try_from(rng.next() % len).unwrap();
+        body[at] = format!("edit {at} {:016x}\n", rng.next());
+    }
+    if seed % 2 == 1 {
+        body.push(format!("more {:016x}\n", rng.next()));
     }
     body
 }
@@ -501,14 +532,36 @@ fn header_count(pack: &[u8]) -> u32 {
     u32::from_be_bytes(pack[8..12].try_into().unwrap())
 }
 
+/// How a pack stores the objects it carries, by pack object type. Under
+/// `ofs-delta` a delta on an object in the pack is an `OFS_DELTA`, so a
+/// `REF_DELTA` names a base the pack does not carry: `thin_delta` counts
+/// those whose base `--fix-thin` appended past the received bytes, and
+/// `ref_delta` any whose base is inside them (none expected).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Encoding {
+    whole: usize,
+    ofs_delta: usize,
+    thin_delta: usize,
+    ref_delta: usize,
+}
+
+/// What a thin pack carries and how it stores it.
+#[derive(Debug, Default)]
+struct Carried {
+    oids: BTreeSet<String>,
+    encoding: Encoding,
+}
+
 /// The oids a thin pack carries, and proof that it indexes on its own: it is
 /// indexed with `--fix-thin` into a throwaway object directory whose only
 /// alternate is `destination`'s store, and the set is the `.idx` entries
 /// whose offset lies inside the received bytes (`--fix-thin` appends its
-/// bases after them).
-fn carried(scratch: &Scratch, destination: &Path, pack: &[u8]) -> BTreeSet<String> {
+/// bases after them). Each carried object's type is read from its header in
+/// the received bytes; a `REF_DELTA`'s base is located through the same
+/// `.idx`.
+fn carried(scratch: &Scratch, destination: &Path, pack: &[u8]) -> Carried {
     if header_count(pack) == 0 {
-        return BTreeSet::new();
+        return Carried::default();
     }
     let quarantine = scratch.path(&format!(
         "quarantine-{}",
@@ -530,16 +583,51 @@ fn carried(scratch: &Scratch, destination: &Path, pack: &[u8]) -> BTreeSet<Strin
     );
     fs::remove_dir_all(&quarantine).unwrap();
     let limit = pack.len() - 20;
-    String::from_utf8(listing)
+    let offsets: BTreeMap<String, usize> = String::from_utf8(listing)
         .unwrap()
         .lines()
-        .filter_map(|line| {
+        .map(|line| {
             let mut fields = line.split(' ');
-            let offset: usize = fields.next()?.parse().ok()?;
-            let oid = fields.next()?;
-            (offset < limit).then(|| oid.to_owned())
+            let offset = fields.next().unwrap().parse().unwrap();
+            (fields.next().unwrap().to_owned(), offset)
         })
-        .collect()
+        .collect();
+    let mut carried = Carried::default();
+    for (oid, &offset) in &offsets {
+        if offset >= limit {
+            continue;
+        }
+        carried.oids.insert(oid.clone());
+        // The type is bits 4-6 of the first header byte; the size runs on
+        // while the high bit is set, and a REF_DELTA's base id follows.
+        let kind = (pack[offset] >> 4) & 0x7;
+        let mut at = offset;
+        while pack[at] & 0x80 != 0 {
+            at += 1;
+        }
+        at += 1;
+        match kind {
+            1..=4 => carried.encoding.whole += 1,
+            6 => carried.encoding.ofs_delta += 1,
+            7 => {
+                use std::fmt::Write as _;
+                let mut base = String::new();
+                for byte in &pack[at..at + oid.len() / 2] {
+                    let _ = write!(base, "{byte:02x}");
+                }
+                let base_offset = *offsets.get(&base).unwrap_or_else(|| {
+                    panic!("REF_DELTA {oid}: base {base} is not in the indexed pack")
+                });
+                if base_offset >= limit {
+                    carried.encoding.thin_delta += 1;
+                } else {
+                    carried.encoding.ref_delta += 1;
+                }
+            }
+            other => panic!("object {oid} at {offset}: pack object type {other}"),
+        }
+    }
+    carried
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +636,8 @@ fn carried(scratch: &Scratch, destination: &Path, pack: &[u8]) -> BTreeSet<Strin
 
 /// Estimate `source` -> `destination` and assert P66 (module docs) against
 /// the oracle fed M1's first round, derived here from the repositories.
-fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path) {
+/// Returns the oracle pack's [`Encoding`], which the estimate's bytes equal.
+fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path) -> Encoding {
     let destination_tips = tips_of(destination);
     let held: BTreeSet<String> = destination_tips
         .iter()
@@ -569,20 +658,21 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path) {
             objects: u64::from(objects),
         }
     };
-    let set = carried(scratch, destination, &pack);
+    let Carried { oids, encoding } = carried(scratch, destination, &pack);
     assert_eq!(
-        u64::try_from(set.len()).unwrap(),
+        u64::try_from(oids.len()).unwrap(),
         oracle.objects,
         "{name}: the oracle pack indexes alone and carries its header count"
     );
-    let oracle_tally = tally_of(source, &set);
+    let oracle_tally = tally_of(source, &oids);
     let source_tally = tally_of(source, &closure(source, &source_tips));
 
     let measured = estimate(source, &Destination::Local(destination.to_path_buf()))
         .unwrap_or_else(|refused| panic!("{name}: estimate refused: {refused}"));
     println!(
         "p66 case={name} destination_tips={} held={} wants={} oracle_stream_bytes={} \
-         oracle_objects={} oracle_bytes={} estimate_objects={} estimate_bytes={} \
+         oracle_objects={} oracle_bytes={} oracle_whole={} oracle_ofs_delta={} \
+         oracle_thin_delta={} oracle_ref_delta={} estimate_objects={} estimate_bytes={} \
          missing_objects={} missing_bytes_disk={} source_objects={}",
         destination_tips.len(),
         haves.len(),
@@ -590,6 +680,10 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path) {
         pack.len(),
         oracle.objects,
         oracle.bytes,
+        encoding.whole,
+        encoding.ofs_delta,
+        encoding.thin_delta,
+        encoding.ref_delta,
         measured.thin_pack.objects,
         measured.thin_pack.bytes,
         measured.missing.objects(),
@@ -622,18 +716,71 @@ fn check(scratch: &Scratch, name: &str, source: &Path, destination: &Path) {
         measured.source, source_tally,
         "{name}: source == the closure of the source's tips"
     );
+    encoding
 }
 
 // ---------------------------------------------------------------------------
 // Random DAGs
 // ---------------------------------------------------------------------------
 
-/// Parent indexes, and (file, content seed) edits.
-type Commit = (Vec<usize>, Vec<(usize, u64)>);
+/// The four files a DAG edits.
+const FILES: usize = 4;
 
-/// A random history: each commit names up to two earlier parents and edits
-/// one to three of four files. `source_tips` and `held` index commits;
-/// `stranger` adds a destination-only commit the source never saw.
+/// File `file`'s path. Files 1 and 2 live under the directory an
+/// [`Edit::Rename`] toggles between `a` and `b`, file 2 in its subdirectory
+/// `sub`, so a rename moves a subtree a have may hold unchanged under the old
+/// path.
+fn path(file: usize, renamed: bool) -> String {
+    let dir = if renamed { "b" } else { "a" };
+    match file {
+        0 => "f0.txt".to_owned(),
+        1 => format!("{dir}/f1.txt"),
+        2 => format!("{dir}/sub/f2.txt"),
+        _ => "doc/f3.txt".to_owned(),
+    }
+}
+
+/// One change a commit makes to its first parent's tree.
+#[derive(Debug, Clone, Copy)]
+enum Edit {
+    /// Write file `.0` from seed `.1`: a fresh body of 48 to 99 lines (over
+    /// 1 KB) when the tree lacks the file, else [`rewrite`] of the body it
+    /// holds.
+    Write(usize, u64),
+    /// Move directory `a` to `b`, or `b` back to `a`, contents unchanged.
+    Rename,
+}
+
+/// Parent indexes, and the edits made to the first parent's tree.
+type Commit = (Vec<usize>, Vec<Edit>);
+
+/// A commit's tree as [`build`] tracks it: where the renamed directory is,
+/// and each file's lines (`None` until its first write).
+#[derive(Debug, Clone, Default)]
+struct Files {
+    renamed: bool,
+    bodies: [Option<Vec<String>>; FILES],
+}
+
+impl Files {
+    fn apply(&mut self, edit: Edit) {
+        match edit {
+            Edit::Rename => self.renamed = !self.renamed,
+            Edit::Write(file, seed) => {
+                let body = self.bodies[file].take().map_or_else(
+                    || noise(seed, 48 + usize::try_from(seed % 52).unwrap()),
+                    |body| rewrite(body, seed),
+                );
+                self.bodies[file] = Some(body);
+            }
+        }
+    }
+}
+
+/// A random history: each commit names up to two earlier parents and makes
+/// one to three edits to its first parent's tree. `source_tips` and `held`
+/// index commits; `stranger` adds a destination-only commit the source never
+/// saw.
 #[derive(Debug, Clone)]
 struct Dag {
     commits: Vec<Commit>,
@@ -642,9 +789,18 @@ struct Dag {
     stranger: bool,
 }
 
+/// A write of one of the four files (five in six), or a directory rename.
+fn any_edit() -> impl Strategy<Value = Edit> {
+    prop_oneof![
+        5 => (0..FILES, any::<u64>()).prop_map(|(file, seed)| Edit::Write(file, seed)),
+        1 => Just(Edit::Rename),
+    ]
+}
+
 /// `tests/git_carry_v2.rs`'s generator without the sender's segment-cap
-/// dimension, which the estimate does not have. The last commit is always a
-/// source tip, and the source's `HEAD`.
+/// dimension, which the estimate does not have, and with [`any_edit`]'s
+/// derived writes and renames in place of fresh content in a flat namespace.
+/// The last commit is always a source tip, and the source's `HEAD`.
 fn dag() -> impl Strategy<Value = Dag> {
     (2_usize..9).prop_flat_map(|n| {
         let commits = (0..n)
@@ -656,7 +812,7 @@ fn dag() -> impl Strategy<Value = Dag> {
                         .prop_map(|set| set.into_iter().collect())
                         .boxed()
                 };
-                let edits = proptest::collection::vec((0_usize..4, any::<u64>()), 1..=3);
+                let edits = proptest::collection::vec(any_edit(), 1..=3);
                 (parents, edits)
             })
             .collect::<Vec<_>>();
@@ -681,24 +837,20 @@ fn dag() -> impl Strategy<Value = Dag> {
     })
 }
 
-/// Build `dag` in a fresh bare source with one fast-import stream, then give
-/// a bare destination exactly the held commits.
+/// Build `dag` in a fresh bare source with one fast-import stream that
+/// writes each commit's whole tree (`deleteall`, then every file it holds),
+/// then give a bare destination exactly the held commits.
 fn build(scratch: &Scratch, dag: &Dag) -> (PathBuf, PathBuf) {
     use std::fmt::Write as _;
     let source = scratch.bare("source.git");
+    let mut trees: Vec<Files> = Vec::with_capacity(dag.commits.len());
     let mut stream = String::new();
-    let mut blob_mark = 1_000;
     for (index, (parents, edits)) in dag.commits.iter().enumerate() {
-        let mut files = Vec::new();
-        for (file, seed) in edits {
-            blob_mark += 1;
-            let body = noise(*seed, 40 + usize::try_from(seed % 60).unwrap());
-            let _ = write!(
-                stream,
-                "blob\nmark :{blob_mark}\ndata {}\n{body}\n",
-                body.len()
-            );
-            files.push((file, blob_mark));
+        let mut files = parents
+            .first()
+            .map_or_else(Files::default, |first| trees[*first].clone());
+        for edit in edits {
+            files.apply(*edit);
         }
         let message = format!("c{index}");
         let _ = write!(
@@ -715,10 +867,19 @@ fn build(scratch: &Scratch, dag: &Dag) -> (PathBuf, PathBuf) {
         for other in parents {
             let _ = writeln!(stream, "merge :{}", other + 1);
         }
-        for (file, mark) in files {
-            let _ = writeln!(stream, "M 100644 :{mark} f{file}.txt");
+        stream.push_str("deleteall\n");
+        for (file, body) in files.bodies.iter().enumerate() {
+            let Some(body) = body else { continue };
+            let body = body.concat();
+            let _ = write!(
+                stream,
+                "M 100644 inline {}\ndata {}\n{body}\n",
+                path(file, files.renamed),
+                body.len()
+            );
         }
         stream.push('\n');
+        trees.push(files);
     }
     ok(
         feed(args(&source, ["fast-import", "--quiet"]), stream.as_bytes()),
@@ -782,21 +943,36 @@ fn build(scratch: &Scratch, dag: &Dag) -> (PathBuf, PathBuf) {
     (source, destination)
 }
 
-fn check_dag(name: &str, dag: &Dag) {
+fn check_dag(name: &str, dag: &Dag) -> Encoding {
     let scratch = Scratch::new(name);
     let (source, destination) = build(&scratch, dag);
-    check(&scratch, name, &source, &destination);
+    check(&scratch, name, &source, &destination)
 }
 
-/// One edit of file `file` with content seed `seed`.
-fn edit(file: usize, seed: u64) -> Vec<(usize, u64)> {
-    vec![(file, seed)]
+/// One write of file `file` from seed `seed`.
+fn edit(file: usize, seed: u64) -> Vec<Edit> {
+    vec![Edit::Write(file, seed)]
+}
+
+/// A PINNED shape, and the deltas its oracle pack must hold at least:
+/// `thin` `REF_DELTA`s on a have and `ofs` `OFS_DELTA`s inside the pack. The
+/// estimate's bytes equal that pack's, so a row that requires a thin delta
+/// fails if the estimate loses `--thin` or its preferred bases, and one that
+/// requires an in-pack delta fails if it loses `--delta-base-offset`.
+struct Pinned {
+    name: &'static str,
+    dag: Dag,
+    thin: usize,
+    ofs: usize,
 }
 
 /// Shapes the generator reaches rarely in 12 cases, each judged by the same
 /// [`check`].
 #[test]
+#[allow(clippy::too_many_lines)] // One data row per shape.
 fn pinned_dags_equal_upload_pack() {
+    // c0 writes f0.txt, c1 writes a/f1.txt, and each later commit rewrites
+    // the file its grandparent wrote.
     let chain = |n: usize| -> Vec<Commit> {
         (0..n)
             .map(|i| {
@@ -805,71 +981,133 @@ fn pinned_dags_equal_upload_pack() {
             })
             .collect()
     };
-    let pinned: [(&str, Dag); 5] = [
-        // The thin case: the destination holds the tip's parent, so the
-        // pack is the tip's commit, tree and a blob deltified against a
-        // have.
-        (
-            "parent-held",
-            Dag {
+    let pinned = [
+        // The thin case: the destination holds c2, the tip's parent, whose
+        // tree holds the a/f1.txt c1 wrote (56 lines, 1.4 KB). The tip
+        // rewrites two of those lines, so the pack is the tip's commit, root
+        // tree and tree a whole, and the new blob as a REF_DELTA on the held
+        // version (4 objects, 376 bytes with git 2.52 and 2.54).
+        Pinned {
+            name: "parent-held",
+            dag: Dag {
                 commits: chain(4),
                 source_tips: vec![3],
                 held: vec![2],
                 stranger: false,
             },
-        ),
+            thin: 1,
+            ofs: 0,
+        },
         // A want reachable from a have: upload-pack streams an empty pack
         // (zero objects), and the estimate builds none.
-        (
-            "want-behind-a-have",
-            Dag {
+        Pinned {
+            name: "want-behind-a-have",
+            dag: Dag {
                 commits: chain(3),
                 source_tips: vec![1, 2],
                 held: vec![2],
                 stranger: false,
             },
-        ),
+            thin: 0,
+            ofs: 0,
+        },
         // Every source tip held: no want, so no pack at all.
-        (
-            "all-held",
-            Dag {
+        Pinned {
+            name: "all-held",
+            dag: Dag {
                 commits: chain(3),
                 source_tips: vec![2],
                 held: vec![2],
                 stranger: false,
             },
-        ),
+            thin: 0,
+            ofs: 0,
+        },
         // Nothing held, one destination-only tip: no have, the whole
-        // closure is missing, and the stranger counts as a tip only.
-        (
-            "nothing-held-stranger",
-            Dag {
+        // closure is missing, and the stranger counts as a tip only. Both
+        // versions of f0.txt travel, so one is an OFS_DELTA on the other.
+        Pinned {
+            name: "nothing-held-stranger",
+            dag: Dag {
                 commits: chain(3),
                 source_tips: vec![2],
                 held: Vec::new(),
                 stranger: true,
             },
-        ),
+            thin: 0,
+            ofs: 1,
+        },
         // A merge over two held branch tips, offered ancestors first, plus a
         // held commit no source ref names.
-        (
-            "merge-over-held-branches",
-            Dag {
+        Pinned {
+            name: "merge-over-held-branches",
+            dag: Dag {
                 commits: vec![
                     (Vec::new(), edit(0, 1)),
                     (vec![0], edit(1, 2)),
                     (vec![0], edit(2, 3)),
-                    (vec![1, 2], vec![(0, 4), (3, 5)]),
+                    (vec![1, 2], vec![Edit::Write(0, 4), Edit::Write(3, 5)]),
                     (vec![3], edit(1, 6)),
                 ],
                 source_tips: vec![4],
                 held: vec![0, 1, 2],
                 stranger: true,
             },
-        ),
+            thin: 1,
+            ofs: 0,
+        },
+        // Three rewrites of a/f1.txt over a held first version: the pack
+        // holds deltas both on the have and on each other.
+        Pinned {
+            name: "rewrites-over-a-have",
+            dag: Dag {
+                commits: vec![
+                    (Vec::new(), edit(1, 21)),
+                    (vec![0], edit(1, 22)),
+                    (vec![1], edit(1, 23)),
+                    (vec![2], edit(1, 24)),
+                ],
+                source_tips: vec![3],
+                held: vec![0],
+                stranger: false,
+            },
+            thin: 1,
+            ofs: 1,
+        },
+        // A directory rename over a have: the tip moves a/ to b/ and
+        // rewrites b/f1.txt, while b/sub is the subtree the have holds as
+        // a/sub. The walk leaves b/sub and its blob out; sparse edge marking
+        // (`pack.useSparse`) would pack them again, and the estimate would
+        // refuse on the count.
+        Pinned {
+            name: "directory-rename-over-a-have",
+            dag: Dag {
+                commits: vec![
+                    (
+                        Vec::new(),
+                        vec![Edit::Write(0, 31), Edit::Write(1, 32), Edit::Write(2, 33)],
+                    ),
+                    (vec![0], edit(3, 34)),
+                    (vec![1], vec![Edit::Rename, Edit::Write(1, 35)]),
+                ],
+                source_tips: vec![2],
+                held: vec![1],
+                stranger: false,
+            },
+            thin: 0,
+            ofs: 0,
+        },
     ];
-    for (name, dag) in &pinned {
-        check_dag(name, dag);
+    for row in &pinned {
+        let encoding = check_dag(row.name, &row.dag);
+        assert!(
+            encoding.thin_delta >= row.thin && encoding.ofs_delta >= row.ofs,
+            "{}: the oracle pack holds {encoding:?}; the row needs at least {} thin and {} \
+             in-pack deltas",
+            row.name,
+            row.thin,
+            row.ofs
+        );
     }
 }
 
