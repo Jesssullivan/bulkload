@@ -50,25 +50,40 @@ read a steady add X as about 0.856 X at 300 s windows and a 60 s settle
 which inverts the EWMA whatever the settle (within about 0.5 %). The trace's
 verdict records the model and what a unit add reads as, plain and corrected
 (`load1_model`). Over the settled rows, pooled per state:
-  d_p95   = p95(ON) / p95(OFF) - 1 of the gate metric: `step` by default,
-            or with --gate-metric each-op the worst of the four operations;
+  d_p95   = p95(ON) / p95(OFF) - 1, for `step` and for each operation;
   d_load1 = level(ON) - level(OFF), each window weighted by its rows
             (`delta_load1_plain` keeps the plain-mean difference).
-INCONCLUSIVE when the OFF-window noise floor exceeds half the budget (latency:
-max - min of the OFF windows' p95 over the pooled OFF p95; load1: max - min of
-the OFF windows' levels, so an ON window's EWMA tail is not counted as host
-noise); when a window has fewer than
+Each is decided on bootstrap bounds, not on its point estimate
+(`bootstrap`): 1000 seeded replicates, each resampling whole windows within
+each state and then 30 s blocks within each drawn window, so two ON windows
+that disagree, and autocorrelated stretches, widen the bounds. A metric
+PASSes when its 95th-percentile bound is within the budget and FAILs when
+its 5th-percentile bound is over it (for an operation, the 5 %/4 bound:
+Bonferroni over the four); otherwise it is undecided. The latency gates:
+  step     the sum of the four operations, one agent step;
+  each-op  PASS when every operation PASSes, FAIL when any FAILs.
+--gate-metric picks one, or `both` (the default and the evidence protocol),
+which PASSes only when both gates PASS and FAILs only when both FAIL: which
+gate defines S2 is not yet ruled (OI-1003-Q34), so a run where they
+disagree is INCONCLUSIVE, never labelled by the lenient one.
+INCONCLUSIVE when the OFF-window noise floor exceeds half the budget on any
+gated metric (latency: max - min of the OFF windows' p95 over the pooled OFF
+p95; load1: max - min of the OFF windows' levels, so an ON window's EWMA
+tail is not counted as host noise); when a window has fewer than
 --min-window-samples or a pooled state fewer than --min-samples samples;
 when there are fewer than 2 OFF windows or no ON window; when a workload
 operation or the sampler failed; when the run was cut short; or when an ON
 run failed, reported another priority class than the one recorded, or kept
-its window busy less than --min-on-busy of the time. Otherwise PASS when
-d_p95 <= +25 % and d_load1 <= +2.0, else FAIL. `raw_comparison` keeps the
-PASS/FAIL the numbers alone would give.
+its window busy less than --min-on-busy of the time. Otherwise FAIL when
+the latency gate or load1 FAILs, PASS when both PASS, and INCONCLUSIVE when
+the bounds do not decide. `raw_comparison` keeps the strict PASS/FAIL the
+point estimates alone would give; `gates` and the `*_bounds` fields keep
+each decision and its bounds.
 
 A/A noise mode (--aa): the ON windows run nothing, so the same statistics
 measure this host's own noise. QUIET when the noise floor holds and
-|d_p95| and |d_load1| are both within half the budget, NOISY otherwise,
+|d_p95| of every gated metric and |d_load1| are within half the budget (the
+point estimates; the bounds are reported), NOISY otherwise,
 INCONCLUSIVE on the structural reasons above. An A/A run never gives a
 budget verdict.
 
@@ -122,6 +137,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import datetime as dt
+import itertools
 import json
 import math
 import os
@@ -146,7 +162,13 @@ SCHEMA = "bulkload.s2-budget.v1"
 RULINGS = "OI-1003-Q34, OI-1003-Q5, OI-1003-Q9, R-N11, R-N81, R-N91, R-N13"
 BUDGET_P95 = 0.25
 BUDGET_LOAD1 = 2.0
-GATE_METRIC = "step"
+# Both latency gates are computed and both must agree: PASS needs `step`
+# (one agent step) and `each-op` (every operation on its own) to PASS, FAIL
+# needs both to FAIL. Which one defines S2 is not yet ruled (OI-1003-Q34
+# reads "each operation at 1 Hz with its own latency"), so a run where they
+# disagree is INCONCLUSIVE rather than labelled by the lenient one.
+GATE_METRIC = "both"
+GATE_METRICS = ("both", "step", "each-op")
 EVIDENCE_MIN_WINDOW = 300.0
 EVIDENCE_MIN_WINDOWS = 5
 LOAD_LIMIT = r23_ab.LOAD_LIMIT
@@ -202,6 +224,20 @@ LOAD1_TAU_S = (
 # the same window and at most this far before the span (the sampler runs at
 # 1 Hz).
 LOAD1_PREV_GAP_S = 2.0
+# Sampling uncertainty (`bootstrap`). Each replicate resamples, per state,
+# whole windows with replacement and then, inside each drawn window,
+# contiguous BOOTSTRAP_BLOCK_S blocks of its settled samples with
+# replacement, so the between-window spread (two ON windows that disagree)
+# and the within-window autocorrelation both widen the bounds. PASS needs
+# the upper bound within the budget, FAIL needs the lower bound over it.
+# The bounds are the 5th and 95th percentiles (90 % two-sided, each side
+# one-sided 95 %); for the each-op FAIL side the lower bound is taken at
+# 5 % / 4 (Bonferroni over the four operations). Seeded: `analyze` stays a
+# pure function of the trace.
+BOOTSTRAP_REPLICATES = 1000
+BOOTSTRAP_BLOCK_S = 30.0
+BOOTSTRAP_SEED = 34
+BOOTSTRAP_ALPHA = 0.05
 
 
 def say(message: str) -> None:
@@ -620,6 +656,113 @@ def load1_response(windows: list[dict], times: list[float], settle: float) -> di
     }
 
 
+def quantile(ordered: list[float], q: float) -> float:
+    """Nearest-rank quantile of an ascending list."""
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))]
+
+
+def bootstrap(samples: list[dict]) -> dict | None:
+    """Replicate distributions of d_p95 (per metric) and d_load1.
+
+    `samples` has one entry per window: its state, its settled latency
+    samples as blocks ({metric: ascending list}, in time order), and its
+    load1 level and row count. Returns {metric: sorted replicate d_p95s,
+    "load1": sorted replicate d_load1s}, or None when a state has no window
+    with samples.
+
+    A replicate's p95 is its r-th largest value, r = n - ceil(0.95 n) + 1,
+    about 5 % of n. Each block keeps aside its values at or over the state's
+    pooled 80th percentile; when a replicate's kept values number at least
+    r, its p95 is found among them alone (exactly), else by a full sort."""
+    pools = {}
+    for state in (OFF, ON):
+        windows = [w for w in samples if w["state"] == state and w["blocks"]]
+        floor = {}
+        for metric in METRICS:
+            pooled = sorted(
+                v for w in windows for block in w["blocks"] for v in block[metric]
+            )
+            floor[metric] = quantile(pooled, 0.80) if pooled else math.inf
+        pools[state] = [
+            (
+                {
+                    m: [
+                        (
+                            len(block[m]),
+                            block[m][bisect.bisect_left(block[m], floor[m]) :],
+                            block[m],
+                        )
+                        for block in w["blocks"]
+                    ]
+                    for m in METRICS
+                },
+                len(w["blocks"]),
+                w["level"] if w["load_n"] else None,
+                w["load_n"],
+            )
+            for w in windows
+        ]
+    if not pools[OFF] or not pools[ON]:
+        return None
+    draw = random.Random(BOOTSTRAP_SEED).random
+    chain = itertools.chain.from_iterable
+    out = {metric: [] for metric in (*METRICS, "load1")}
+    for _ in range(BOOTSTRAP_REPLICATES):
+        quantiles, levels = {}, {}
+        for state in (OFF, ON):
+            pool = pools[state]
+            picks = []
+            weight = level = 0.0
+            for _ in pool:
+                window = pool[int(draw() * len(pool))]
+                count = window[1]
+                picks.extend((window[0], int(draw() * count)) for _ in range(count))
+                if window[2] is not None:
+                    weight += window[3]
+                    level += window[3] * window[2]
+            for metric in METRICS:
+                chosen = [by[metric][b] for by, b in picks]
+                n = sum(size for size, _, _ in chosen)
+                if not n:
+                    quantiles[state, metric] = None
+                    continue
+                rank = n - max(0, math.ceil(0.95 * n) - 1)
+                kept = sorted(chain(top for _, top, _ in chosen))
+                if len(kept) < rank:
+                    kept = sorted(chain(full for _, _, full in chosen))
+                quantiles[state, metric] = kept[len(kept) - rank]
+            levels[state] = level / weight if weight else None
+        for metric in METRICS:
+            off, on = quantiles[OFF, metric], quantiles[ON, metric]
+            if off and on is not None:
+                out[metric].append(on / off - 1.0)
+        if None not in (levels[OFF], levels[ON]):
+            out["load1"].append(levels[ON] - levels[OFF])
+    for values in out.values():
+        values.sort()
+    return out
+
+
+def bounds(replicates: list[float] | None, alpha: float) -> tuple:
+    """(lower, upper) at alpha and 1 - alpha, or (None, None)."""
+    if not replicates:
+        return None, None
+    return quantile(replicates, alpha), quantile(replicates, 1.0 - alpha)
+
+
+def decide(point, lower, upper, budget: float) -> str | None:
+    """PASS when the upper bound is within the budget, FAIL when the lower
+    bound is over it, INCONCLUSIVE when they straddle it; None without a
+    point estimate."""
+    if point is None or lower is None or upper is None:
+        return None
+    if upper <= budget + EPS:
+        return "PASS"
+    if lower > budget + EPS:
+        return "FAIL"
+    return "INCONCLUSIVE"
+
+
 def analyze(trace: dict, overrides: dict | None = None) -> dict:
     """The verdict of one trace: a pure function of its windows and samples."""
     recorded = {**DEFAULT_GATE, **trace.get("gate", {})}
@@ -629,7 +772,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     windows = trace["windows"]
     settle = gate["settle_seconds"]
     budget, budget_load = gate["budget_p95"], gate["budget_load1"]
-    gated = (STEP,) if gate["gate_metric"] == "step" else OPS
+    gated = {"step": (STEP,), "each-op": OPS}.get(gate["gate_metric"], METRICS)
     starts = [w["start"] for w in windows]
 
     def locate(t: float) -> int | None:
@@ -639,8 +782,17 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         return None
 
     buckets = [
-        {"lat": {m: [] for m in METRICS}, "load": [], "missed": 0} for _ in windows
+        {"lat": {m: [] for m in METRICS}, "load": [], "missed": 0, "blocks": {}}
+        for _ in windows
     ]
+
+    def keep(index: int, t: float, metric: str, ms: float) -> None:
+        bucket = buckets[index]
+        bucket["lat"][metric].append(ms)
+        key = int((t - windows[index]["start"] - settle) // BOOTSTRAP_BLOCK_S)
+        block = bucket["blocks"].setdefault(key, {m: [] for m in METRICS})
+        block[metric].append(ms)
+
     failed_ops = 0
     for row in trace.get("latency", []):
         index = locate(row["t"])
@@ -648,7 +800,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             failed_ops += row["op"] != STEP
             continue
         if index is not None and row["t"] >= windows[index]["start"] + settle:
-            buckets[index]["lat"][row["op"]].append(row["ms"])
+            keep(index, row["t"], row["op"], row["ms"])
     # Coordinated omission: a step that overran skipped the ticks it missed,
     # so the slowest stretches would contribute the fewest samples and p95
     # would read low. Each missed workload tick is back-filled into every
@@ -660,7 +812,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         if index is not None and row["t"] >= windows[index]["start"] + settle:
             buckets[index]["missed"] += 1
             for metric in METRICS:
-                buckets[index]["lat"][metric].append(row["lag_ms"])
+                keep(index, row["t"], metric, row["lag_ms"])
     load = sorted(trace.get("load", []), key=lambda row: row["t"])
     estimates = load1_windows(windows, load, settle)
     for bucket, (rows, _) in zip(buckets, estimates, strict=True):
@@ -668,6 +820,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
 
     per_window = []
     off_p95s, off_levels = {m: [] for m in METRICS}, []
+    on_p95s = {m: [] for m in METRICS}
     pooled = {s: {"lat": {m: [] for m in METRICS}, "load": []} for s in (OFF, ON)}
     missed = {OFF: 0, ON: 0}
     for window, bucket, (_, level) in zip(windows, buckets, estimates, strict=True):
@@ -676,8 +829,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         window_mean = statistics.fmean(bucket["load"]) if bucket["load"] else None
         for metric in METRICS:
             pooled[state]["lat"][metric].extend(bucket["lat"][metric])
-            if state == OFF:
-                off_p95s[metric].append(window_p95[metric])
+            (off_p95s if state == OFF else on_p95s)[metric].append(window_p95[metric])
         pooled[state]["load"].extend(bucket["load"])
         missed[state] += bucket["missed"]
         if state == OFF:
@@ -712,26 +864,49 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     )
     offs = [w for w in per_window if w["state"] == OFF]
     ons = [w for w in per_window if w["state"] == ON]
-    noise = {}
-    for metric in METRICS:
-        values = off_p95s[metric]
-        pooled_off = p95s[OFF][metric]
-        noise[metric] = (
-            (max(values) - min(values)) / pooled_off
-            if len(values) >= 2 and None not in values and pooled_off
-            else None
-        )
+
+    def spread(values: list, pooled_p95) -> float | None:
+        if len(values) < 2 or None in values or not pooled_p95:
+            return None
+        return (max(values) - min(values)) / pooled_p95
+
+    noise = {m: spread(off_p95s[m], p95s[OFF][m]) for m in METRICS}
+    # Reported, not a reason: the bounds resample whole ON windows, so ON
+    # windows that disagree already keep a metric from being decided.
+    on_spread = {m: spread(on_p95s[m], p95s[ON][m]) for m in METRICS}
     noise_load = (
         max(off_levels) - min(off_levels)
         if len(off_levels) >= 2 and None not in off_levels
         else None
     )
 
-    if gate["gate_metric"] == "step":
-        worst = STEP
-    else:
-        worst = max(OPS, key=lambda m: delta[m] if delta[m] is not None else math.inf)
+    worst = max(gated, key=lambda m: delta[m] if delta[m] is not None else math.inf)
     d_p95 = delta[worst]
+    replicates = bootstrap(
+        [
+            {
+                "state": window["state"],
+                "blocks": [
+                    {m: sorted(block[m]) for m in METRICS}
+                    for _, block in sorted(bucket["blocks"].items())
+                ],
+                "level": level,
+                "load_n": len(bucket["load"]),
+            }
+            for window, bucket, (_, level) in zip(
+                windows, buckets, estimates, strict=True
+            )
+        ]
+    )
+    p95_bounds = {
+        m: bounds(replicates and replicates[m], BOOTSTRAP_ALPHA) for m in METRICS
+    }
+    load1_bounds = bounds(replicates and replicates["load1"], BOOTSTRAP_ALPHA)
+    # The each-op FAIL side: Bonferroni over the four operations.
+    op_lower = {
+        m: bounds(replicates and replicates[m], BOOTSTRAP_ALPHA / len(OPS))[0]
+        for m in OPS
+    }
     gate_noise = (
         None if any(noise[m] is None for m in gated) else max(noise[m] for m in gated)
     )
@@ -834,14 +1009,76 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             f"the budget ({budget_load / 2:.2f})"
         )
 
-    over = []
-    if d_p95 is not None and d_p95 > budget + EPS:
-        over.append(f"p95 {worst} {d_p95:+.1%} exceeds +{budget:.0%}")
-    if d_load1 is not None and d_load1 > budget_load + EPS:
-        over.append(f"load1 {d_load1:+.2f} exceeds +{budget_load:.1f}")
+    def p95_reason(metric: str, verb: str) -> str:
+        """A gated metric against the budget, with the bounds it was decided
+        on (an operation's lower bound is the Bonferroni one)."""
+        low = op_lower[metric] if metric in OPS else p95_bounds[metric][0]
+        high = p95_bounds[metric][1]
+        side = "5 %/4" if metric in OPS else "5 %"
+        return (
+            f"p95 {metric} {delta[metric]:+.1%} {verb} +{budget:.0%} (bounds "
+            f"{low:+.1%} at {side} to {high:+.1%} at 95 %)"
+        )
+
+    def load1_reason(verb: str) -> str:
+        low, high = load1_bounds
+        return (
+            f"load1 {d_load1:+.2f} {verb} +{budget_load:.1f} (bounds {low:+.2f} "
+            f"at 5 % to {high:+.2f} at 95 %)"
+        )
+
+    # Each latency gate, then load1, decided on its bounds.
+    step_status = decide(delta[STEP], *p95_bounds[STEP], budget)
+    if any(delta[m] is None for m in OPS):
+        op_status = None
+    elif all(p95_bounds[m][1] is not None for m in OPS) and all(
+        p95_bounds[m][1] <= budget + EPS for m in OPS
+    ):
+        op_status = "PASS"
+    elif any(op_lower[m] is not None and op_lower[m] > budget + EPS for m in OPS):
+        op_status = "FAIL"
+    else:
+        op_status = "INCONCLUSIVE"
+    load_status = decide(d_load1, *load1_bounds, budget_load)
+    statuses = {"step": step_status, "each-op": op_status}
+    if gate["gate_metric"] in statuses:
+        latency_status = statuses[gate["gate_metric"]]
+    elif None in (step_status, op_status):
+        latency_status = None
+    elif step_status == op_status:
+        latency_status = step_status
+    else:
+        latency_status = "INCONCLUSIVE"
+
+    over, undecided = [], []
+    if latency_status == "FAIL":
+        if STEP in gated:
+            over.append(p95_reason(STEP, "exceeds"))
+        for metric in OPS if gate["gate_metric"] != "step" else ():
+            if op_lower[metric] is not None and op_lower[metric] > budget + EPS:
+                over.append(p95_reason(metric, "exceeds"))
+    if load_status == "FAIL":
+        over.append(load1_reason("exceeds"))
+    if gate["gate_metric"] == "both" and step_status != op_status:
+        undecided.append(
+            f"the latency gates disagree (step {step_status}, each-op "
+            f"{op_status}) and the gate metric is not yet ruled (OI-1003-Q34)"
+        )
+    if latency_status == "INCONCLUSIVE":
+        for metric in gated:
+            low = op_lower[metric] if metric in OPS else p95_bounds[metric][0]
+            high = p95_bounds[metric][1]
+            if None not in (low, high) and low <= budget + EPS < high:
+                undecided.append(p95_reason(metric, "straddles"))
+    if load_status == "INCONCLUSIVE":
+        undecided.append(load1_reason("straddles"))
+    # The point estimates alone, strictly: every gated metric and load1.
     raw = None
-    if d_p95 is not None and d_load1 is not None:
-        raw = "FAIL" if over else "PASS"
+    if d_load1 is not None and all(delta[m] is not None for m in gated):
+        points_over = d_load1 > budget_load + EPS or any(
+            delta[m] > budget + EPS for m in gated
+        )
+        raw = "FAIL" if points_over else "PASS"
 
     if aa:
         mode = "aa"
@@ -849,8 +1086,10 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             status, reasons = "INCONCLUSIVE", structural
         else:
             wide = []
-            if d_p95 is not None and abs(d_p95) > budget / 2 + EPS:
-                wide.append(f"A/A p95 {worst} {d_p95:+.1%} beyond half the budget")
+            for metric in gated:
+                d = delta[metric]
+                if d is not None and abs(d) > budget / 2 + EPS:
+                    wide.append(f"A/A p95 {metric} {d:+.1%} beyond half the budget")
             if d_load1 is not None and abs(d_load1) > budget_load / 2 + EPS:
                 wide.append(f"A/A load1 {d_load1:+.2f} beyond half the budget")
             reasons = noisy + wide
@@ -859,13 +1098,18 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         mode = "budget"
         if structural or noisy:
             status, reasons = "INCONCLUSIVE", structural + noisy
-        elif raw is None:
+        elif latency_status is None or load_status is None:
             status, reasons = (
                 "INCONCLUSIVE",
                 ["no comparison: a p95 or load1 is missing"],
             )
+        elif "FAIL" in (latency_status, load_status) and over:
+            status, reasons = "FAIL", over
+        elif latency_status == "PASS" and load_status == "PASS":
+            status, reasons = "PASS", []
         else:
-            status, reasons = raw, over
+            status = "INCONCLUSIVE"
+            reasons = undecided or ["the bounds do not decide the budget"]
     if not config.get("evidence"):
         evidence_problems = ["the run was made without --evidence"]
     else:
@@ -892,6 +1136,22 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         "worst_metric": worst,
         "delta_p95": rounded(d_p95),
         "delta_load1": rounded(d_load1),
+        "gates": {
+            "step": step_status,
+            "each-op": op_status,
+            "latency": latency_status,
+            "load1": load_status,
+        },
+        "delta_p95_bounds": {m: [rounded(v) for v in p95_bounds[m]] for m in METRICS},
+        "each_op_fail_lower": {m: rounded(op_lower[m]) for m in OPS},
+        "delta_load1_bounds": [rounded(v) for v in load1_bounds],
+        "bootstrap": {
+            "replicates": BOOTSTRAP_REPLICATES,
+            "block_s": BOOTSTRAP_BLOCK_S,
+            "seed": BOOTSTRAP_SEED,
+            "alpha": BOOTSTRAP_ALPHA,
+            "resampling": "windows within each state, then blocks within windows",
+        },
         "delta_load1_plain": rounded(d_load1_plain),
         "load1_model": {
             "update_s": LOAD1_UPDATE_S,
@@ -905,6 +1165,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         "noise_load1": rounded(noise_load),
         "delta_p95_by_metric": {m: rounded(delta[m]) for m in METRICS},
         "noise_p95_by_metric": {m: rounded(noise[m]) for m in METRICS},
+        "on_spread_p95_by_metric": {m: rounded(on_spread[m]) for m in METRICS},
         "p95_ms": {s: {m: rounded(p95s[s][m]) for m in METRICS} for s in (OFF, ON)},
         "load1_mean": {s: rounded(means[s]) for s in (OFF, ON)},
         "load1_level": {s: rounded(levels[s]) for s in (OFF, ON)},
@@ -1259,8 +1520,15 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"comparison {verdict['raw_comparison']})",
         "- Reasons: " + ("; ".join(verdict["reasons"]) or "none"),
         f"- Budget: d_p95 <= +{gate['budget_p95']:.0%} on `{gate['gate_metric']}`, "
-        f"d_load1 <= +{gate['budget_load1']:.1f}; INCONCLUSIVE when the OFF noise "
-        "floor exceeds half the budget",
+        f"d_load1 <= +{gate['budget_load1']:.1f}, decided on bootstrap bounds "
+        f"({verdict['bootstrap']['replicates']} replicates; PASS at the 95 % "
+        "bound, FAIL at the 5 % bound, 5 %/4 per operation); INCONCLUSIVE when "
+        "the OFF noise floor exceeds half the budget",
+        f"- Gates: step {verdict['gates']['step']}, each-op "
+        f"{verdict['gates']['each-op']}, latency {verdict['gates']['latency']}, "
+        f"load1 {verdict['gates']['load1']} (d_load1 bounds "
+        f"{num(verdict['delta_load1_bounds'][0], '+.2f')} to "
+        f"{num(verdict['delta_load1_bounds'][1], '+.2f')})",
         f"- Result: d_p95 {pct(verdict['delta_p95'])} (worst "
         f"`{verdict['worst_metric']}`), d_load1 {num(verdict['delta_load1'], '+.2f')}; "
         f"OFF noise p95 {num(verdict['noise_p95'], '.1%')}, load1 "
@@ -1282,15 +1550,19 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"{verdict['failed_operations']}",
         f"- Rulings: {trace['rulings']}",
         "",
-        "| metric | OFF p95 ms | ON p95 ms | d_p95 | OFF noise |",
-        "|---|---:|---:|---:|---:|",
+        "| metric | OFF p95 ms | ON p95 ms | d_p95 | bounds 5 % to 95 % "
+        "| OFF noise | ON spread |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for metric in METRICS:
+        low, high = verdict["delta_p95_bounds"][metric]
         lines.append(
             f"| {metric} | {num(verdict['p95_ms'][OFF][metric])} | "
             f"{num(verdict['p95_ms'][ON][metric])} | "
             f"{pct(verdict['delta_p95_by_metric'][metric])} | "
-            f"{num(verdict['noise_p95_by_metric'][metric], '.1%')} |"
+            f"{pct(low)} to {pct(high)} | "
+            f"{num(verdict['noise_p95_by_metric'][metric], '.1%')} | "
+            f"{num(verdict['on_spread_p95_by_metric'][metric], '.1%')} |"
         )
     lines += [
         "",
@@ -1328,6 +1600,13 @@ def emit(verdict: dict) -> None:
         f"delta_p95={verdict['delta_p95']} worst={verdict['worst_metric']} "
         f"delta_load1={verdict['delta_load1']} noise_p95={verdict['noise_p95']} "
         f"noise_load1={verdict['noise_load1']} raw={verdict['raw_comparison']}"
+    )
+    gates = verdict["gates"]
+    say(
+        f"gates step={gates['step']} each_op={gates['each-op']} "
+        f"latency={gates['latency']} load1={gates['load1']} "
+        f"step_bounds={verdict['delta_p95_bounds'][STEP]} "
+        f"load1_bounds={verdict['delta_load1_bounds']}"
     )
     for reason in verdict["reasons"]:
         say(f"reason {reason}")
@@ -1422,7 +1701,7 @@ def gate_arguments(parser: argparse.ArgumentParser, defaults: bool) -> None:
     parser.add_argument("--budget-p95", type=float, default=default("budget_p95"))
     parser.add_argument("--budget-load1", type=float, default=default("budget_load1"))
     parser.add_argument(
-        "--gate-metric", choices=("step", "each-op"), default=default("gate_metric")
+        "--gate-metric", choices=GATE_METRICS, default=default("gate_metric")
     )
     parser.add_argument(
         "--settle-seconds", type=float, default=default("settle_seconds")

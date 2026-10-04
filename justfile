@@ -226,11 +226,13 @@ import? "justfile.flywheel"
 # `run --source SRC --out OUT -- <bulkload command>` runs the v0 reference
 # workload (JSONL+fsync, SQLite WAL, git status+diff, rg) at 1 Hz in a sibling
 # directory on the source's device, samples load1 at 1 Hz, and alternates
-# OFF/ON/OFF/ON/OFF windows of 300 s; the verdict is PASS (d_p95 <= +25 % and
-# d_load1 <= +2.0), FAIL or INCONCLUSIVE (noise floor over half the budget, or
-# too few samples). `--aa` is the A/A noise mode, `analyze TRACE` re-derives a
-# verdict and `selftest` runs the synthetic-trace tests. NOT EVIDENCE unless
-# --evidence; gated runs are separate from the S1 gate. Put an ON command that
+# OFF/ON/OFF/ON/OFF windows of 300 s; the verdict is PASS (the bootstrap bounds
+# of d_p95, on step and on each operation, and of the lag-corrected d_load1 are
+# within +25 % and +2.0), FAIL (beyond them) or INCONCLUSIVE (bounds straddle,
+# gates disagree, noise floor over half the budget, or too few samples). `--aa`
+# is the A/A noise mode, `analyze TRACE` re-derives a verdict and `selftest`
+# runs the synthetic-trace tests. NOT EVIDENCE unless --evidence with the whole
+# SLO protocol; gated runs are separate from the S1 gate. Put an ON command that
 # needs shell quoting in a script file: just re-joins arguments.
 # S2 measured budget instrument (OI-1003-Q34)
 bench-s2-budget *args:

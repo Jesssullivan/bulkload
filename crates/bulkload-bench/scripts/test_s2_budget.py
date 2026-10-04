@@ -15,6 +15,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import random
 import tempfile
 import threading
 import unittest
@@ -49,9 +50,11 @@ def synth(
     busy=1.0,
 ):
     """A deterministic trace: n evenly spaced samples per window. Latency
-    cycles through 20 levels (1.00 to 1.95 x base), so every window of one
-    base has the same p95 (1.9 x base at n=300) and zero noise. An evidence
-    trace follows the evidence protocol (settle 60 s, every window on AC)."""
+    cycles through 30 levels (1.00 to 1.97 x base), one cycle per 30 s
+    bootstrap block at n = window, so every window of one base, and every
+    bootstrap replicate, has the same p95 (1 + 28/30 x base) and the bounds
+    collapse onto the point. An evidence trace follows the evidence
+    protocol (settle 60 s, every window on AC)."""
     op_factor = op_factor or {}
     windows, latency, load = [], [], []
     t = 0.0
@@ -81,10 +84,14 @@ def synth(
         windows.append(record)
         for k in range(n):
             ts = t + k * window / n
-            spread = 1.0 + (k % 20) / 20.0
+            spread = 1.0 + (k % 30) / 30.0
             step = 0.0
             for op in s2.OPS:
-                factor = (on_factor * op_factor.get(op, 1.0)) if on else 1.0
+                factor = (
+                    (per_window(on_factor, index) * op_factor.get(op, 1.0))
+                    if on
+                    else 1.0
+                )
                 ms = base / 4.0 * spread * factor
                 step += ms
                 latency.append({"t": ts, "op": op, "ms": ms, "ok": True})
@@ -146,7 +153,7 @@ class StatisticsTests(unittest.TestCase):
     def test_synthetic_windows_share_one_p95(self) -> None:
         verdict = s2.analyze(synth())
         p95s = {w["p95_ms"]["step"] for w in verdict["windows"]}
-        self.assertEqual(p95s, {19.0})
+        self.assertEqual(p95s, {19.3333})
         self.assertEqual(verdict["noise_p95"], 0.0)
         self.assertEqual(verdict["noise_load1"], 0.0)
 
@@ -220,7 +227,7 @@ class VerdictTests(unittest.TestCase):
 
     def test_each_op_gate_catches_one_slow_operation(self) -> None:
         trace = synth(op_factor={"jsonl": 1.6})
-        by_step = s2.analyze(trace)
+        by_step = s2.analyze(trace, {"gate_metric": "step"})
         self.assertEqual(by_step["status"], "PASS", reasons(by_step))
         self.assertAlmostEqual(by_step["delta_p95"], 0.15, places=6)
         by_op = s2.analyze(trace, {"gate_metric": "each-op"})
@@ -229,6 +236,28 @@ class VerdictTests(unittest.TestCase):
         self.assertAlmostEqual(by_op["delta_p95"], 0.6, places=6)
         self.assertFalse(by_op["evidence"])
 
+    def test_the_default_gate_never_passes_a_hidden_operation(self) -> None:
+        """`step` alone would PASS jsonl +60 % behind step +15 %; the default
+        computes both gates and reports the disagreement, unruled."""
+        verdict = s2.analyze(synth(evidence=True, op_factor={"jsonl": 1.6}))
+        self.assertEqual(verdict["gate_metric"], "both")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertEqual(verdict["gates"]["step"], "PASS")
+        self.assertEqual(verdict["gates"]["each-op"], "FAIL")
+        self.assertIn(
+            "the latency gates disagree (step PASS, each-op FAIL)", reasons(verdict)
+        )
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(verdict["worst_metric"], "jsonl")
+        self.assertEqual(verdict["raw_comparison"], "FAIL")
+
+    def test_the_default_gate_fails_when_both_gates_fail(self) -> None:
+        verdict = s2.analyze(synth(evidence=True, op_factor={"git": 2.5}))
+        self.assertEqual(verdict["gates"]["step"], "FAIL")
+        self.assertEqual(verdict["gates"]["each-op"], "FAIL")
+        self.assertEqual(verdict["status"], "FAIL")
+        self.assertIn("p95 git +150.0% exceeds +25%", reasons(verdict))
+
     def test_settle_drops_the_switch_transient(self) -> None:
         trace = synth()
         for window in trace["windows"]:
@@ -236,7 +265,9 @@ class VerdictTests(unittest.TestCase):
                 for row in trace["latency"]:
                     if window["start"] <= row["t"] < window["start"] + 20.0:
                         row["ms"] *= 5.0
-        self.assertEqual(s2.analyze(trace)["status"], "FAIL")
+        unsettled = s2.analyze(trace)
+        self.assertEqual(unsettled["raw_comparison"], "FAIL")
+        self.assertNotEqual(unsettled["status"], "PASS")
         settled = s2.analyze(trace, {"settle_seconds": 25.0})
         self.assertEqual(settled["status"], "PASS", reasons(settled))
 
@@ -321,7 +352,7 @@ class CoordinatedOmissionTests(unittest.TestCase):
         trace = stall(synth(evidence=True))
         trace["missed_ticks"] = {}
         verdict = s2.analyze(trace)
-        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertEqual(verdict["raw_comparison"], "PASS", reasons(verdict))
         self.assertLess(verdict["delta_p95"], 0.05)
 
     def test_missed_ticks_in_the_settle_are_dropped(self) -> None:
@@ -516,6 +547,120 @@ class AaTests(unittest.TestCase):
 
     def test_too_few_samples(self) -> None:
         self.assertEqual(s2.analyze(synth(aa=True, n=5))["status"], "INCONCLUSIVE")
+
+
+def lognormal_trace(on_factor, sigma, seed, evidence=True):
+    """An evidence-shaped trace whose latencies are iid lognormal (no host
+    drift): each op's ms = base x lognormal(0, sigma), x on_factor in ON."""
+    rng = random.Random(seed)
+    trace = synth(evidence=evidence)
+    for row in trace["latency"]:
+        if row["op"] != "step":
+            row["ms"] = 2.5 * rng.lognormvariate(0.0, sigma)
+    starts = {w["index"]: w for w in trace["windows"]}
+    steps = {}
+    for row in trace["latency"]:
+        window = starts[int(row["t"] // 300)]
+        if row["op"] != "step" and window["state"] == "ON":
+            row["ms"] *= per_window(on_factor, window["index"])
+        if row["op"] != "step":
+            steps[row["t"]] = steps.get(row["t"], 0.0) + row["ms"]
+    for row in trace["latency"]:
+        if row["op"] == "step":
+            row["ms"] = steps[row["t"]]
+    return trace
+
+
+class UncertaintyTests(unittest.TestCase):
+    """PASS and FAIL come from bootstrap bounds, not a point estimate: whole
+    windows are resampled within each state, then 30 s blocks within each
+    drawn window."""
+
+    def test_on_windows_that_disagree_are_inconclusive(self) -> None:
+        trace = synth(evidence=True, on_factor=[1.0, 1.10, 1.0, 1.40, 1.0])
+        verdict = s2.analyze(trace)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        low, high = verdict["delta_p95_bounds"]["step"]
+        self.assertAlmostEqual(low, 0.10, places=3)
+        self.assertAlmostEqual(high, 0.40, places=3)
+        self.assertIn("straddles +25%", reasons(verdict))
+        agree = s2.analyze(synth(evidence=True, on_factor=[1.0, 1.10, 1.0, 1.15, 1.0]))
+        self.assertEqual(agree["status"], "PASS", reasons(agree))
+
+    def test_bounds_collapse_on_a_noiseless_trace(self) -> None:
+        verdict = s2.analyze(synth(evidence=True, on_factor=1.2, on_add=1.0))
+        self.assertEqual(verdict["delta_p95_bounds"]["step"], [0.2, 0.2])
+        self.assertEqual(verdict["delta_load1_bounds"], [1.0, 1.0])
+        self.assertEqual(verdict["status"], "PASS")
+
+    def test_a_clear_regression_fails_through_the_noise(self) -> None:
+        verdict = s2.analyze(lognormal_trace(1.6, 0.3, seed=2))
+        self.assertEqual(verdict["status"], "FAIL", reasons(verdict))
+        self.assertGreater(verdict["delta_p95_bounds"]["step"][0], 0.25)
+
+    def test_a_quiet_host_with_no_effect_passes(self) -> None:
+        verdict = s2.analyze(lognormal_trace(1.0, 0.2, seed=2))
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertLess(verdict["delta_p95_bounds"]["step"][1], 0.25)
+
+    def test_an_effect_near_the_budget_is_not_decided_by_its_point(self) -> None:
+        verdict = s2.analyze(lognormal_trace(1.25, 0.3, seed=3))
+        low, high = verdict["delta_p95_bounds"]["step"]
+        self.assertLess(low, 0.25)
+        self.assertGreater(high, 0.25)
+        self.assertNotEqual(verdict["status"], "PASS")
+
+    def test_the_bootstrap_is_seeded(self) -> None:
+        trace = lognormal_trace(1.1, 0.3, seed=4)
+        self.assertEqual(
+            s2.analyze(trace)["delta_p95_bounds"], s2.analyze(trace)["delta_p95_bounds"]
+        )
+
+    def test_the_kept_values_shortcut_matches_a_full_sort(self) -> None:
+        rng = random.Random(7)
+        samples = []
+        for index, state in enumerate(FIVE):
+            blocks = []
+            for _ in range(rng.randint(1, 9)):
+                size = rng.randint(1, 30)
+                blocks.append(
+                    {
+                        m: sorted(rng.lognormvariate(0, 0.5) for _ in range(size))
+                        for m in s2.METRICS
+                    }
+                )
+            samples.append(
+                {"state": state, "blocks": blocks, "level": float(index), "load_n": 9}
+            )
+
+        def reference() -> dict:
+            pools = {
+                st: [w for w in samples if w["state"] == st] for st in ("OFF", "ON")
+            }
+            draw = random.Random(s2.BOOTSTRAP_SEED).random
+            out = {m: [] for m in (*s2.METRICS, "load1")}
+            for _ in range(s2.BOOTSTRAP_REPLICATES):
+                q, lv = {}, {}
+                for st in ("OFF", "ON"):
+                    pool, picks, weight, level = pools[st], [], 0.0, 0.0
+                    for _ in pool:
+                        w = pool[int(draw() * len(pool))]
+                        count = len(w["blocks"])
+                        picks.extend(
+                            w["blocks"][int(draw() * count)] for _ in range(count)
+                        )
+                        weight += w["load_n"]
+                        level += w["load_n"] * w["level"]
+                    for m in s2.METRICS:
+                        q[st, m] = s2.p95([v for block in picks for v in block[m]])
+                    lv[st] = level / weight
+                for m in s2.METRICS:
+                    out[m].append(q["ON", m] / q["OFF", m] - 1.0)
+                out["load1"].append(lv["ON"] - lv["OFF"])
+            return {k: sorted(v) for k, v in out.items()}
+
+        with mock.patch.object(s2, "BOOTSTRAP_REPLICATES", 60):
+            self.assertEqual(s2.bootstrap(samples), reference())
 
 
 class CadenceTests(unittest.TestCase):
