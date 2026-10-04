@@ -101,7 +101,25 @@ Identities are unchanged: `b3645454…` and `0bd1104e…`.
 ## Validation
 
 - `just bench-estate-corpus-selftest`: ok, 0 failures, 9 to 15 s, recorded identity matched.
-- `nix develop .#default --command just check-fast`: in progress at this checkpoint commit; the final result is in the next commit.
+- `nix develop .#default --command just check-fast`: pass (exit 0). The run
+  covered HEAD 8bead15 plus the working tree that later became f01155d. The
+  contract tests passed (22 tests OK) and gitleaks found no leaks. The Rust
+  gates do not read the bench script, and the Q35 script hunks were
+  ruff-clean and passed the self-test.
+
+## Commits
+
+- `58b1c2e`: the generator and the just recipes.
+- `8bead15`: the evidence doc and this note.
+- `f01155d`: OI-1003-Q35 support.
+- this commit: the check-fast result.
+
+A concurrent agent in this worktree made `58b1c2e`, `8bead15` and
+`f01155d` from this lane's work. All three are signed. `f01155d`'s last line
+reads `Rulings: OI-1003-Q35, OI-1003-Q18, OI-1003-Q19, R-N13`, not the lane's
+`Rulings: OI-1003-Q19, OI-1003-Q23, R-N13`, and it was left as made. The
+unstaged history-heavy (#48 repack shape) code in `estate_corpus.py` belongs
+to that agent, so it was neither committed nor reverted here.
 
 ## Open
 
