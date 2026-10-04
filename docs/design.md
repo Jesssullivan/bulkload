@@ -76,6 +76,17 @@ Source safety (S2, WP1):
   is tested against the same table.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
+- The source's object store is read-only to a capture (#162).
+  - Git freshens (re-stamps the mtime of) any existing copy of an object it
+    writes, alternates included.
+  - So the private repository's object writers (`hash-object -w`, `mktree`,
+    `write-tree` and its archival commits) run against a write store that
+    borrows nothing (`git_env::WRITE_STORE`).
+  - `fast-import` never explodes its pack into loose objects
+    (`fastimport.unpackLimit=0`).
+  - Readers see the write store, then the source, through `alternates`.
+  - The P34 property holds every `lstat` field of the source fixed across a
+    capture and its chained reruns.
 - Source-side verbs (`serve`, `estate-capture`, `snapshot`,
   `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
   priority before anything else (WP0(f)), inherited by every thread and
@@ -86,7 +97,26 @@ Source safety (S2, WP1):
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
-paths. Import preserves divergence and leaves active HEADs, indexes and
+paths. A bare repository (a mirror) is carried as ref custody: its refs, HEAD
+and administration, with empty staged and worktree trees, since it has
+neither an index nor a worktree (S4, #162).
+
+- The capture marks itself bare in-band (`bare-repository-v1`, lifted into a
+  shallow envelope's headers). Every verb that lays down a workspace, an
+  index or a payload attachment refuses such a capture
+  `GIT_BARE_CAPTURE_WORKSPACE` before writing anything; it applies only as
+  `refs-imported`, planned without a workspace.
+- A bare repository is a root only at its own git dir. Reached through a
+  `.git` gitfile (the bare-plus-worktrees layout), it refuses
+  `GIT_REPOSITORY_NOT_AT_PATH`, as the estimate probe does.
+- A repository's own administration below its root, reached through a
+  gitfile (`--separate-git-dir`), is never a seat.
+- A non-bare repository with no index file (a `--no-checkout` clone or
+  worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`. Git reads the absent file
+  as an unborn index that `git checkout` populates, and an empty index file
+  does not, so no carried index restores it.
+
+Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.
@@ -452,6 +482,14 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+A store's state root and its database entry are sealed (the root fully
+flushed) before `Store::open` returns, so before Start and any commit, and a
+store without the `root_sealed` setting is sealed again on open (#161, R25).
+The setting commits only after the seal returns. A sealed store reopens
+without opening the root's parent; a root that still needs its seal under a
+parent the agent cannot read refuses with `IO` (`EACCES`). Other private
+state directories seal their own entry before records go in.
 
 Space preflight (OI-1001-Q2): a write that would leave its destination
 filesystem (`statvfs`; `statfs` on Darwin) with less than

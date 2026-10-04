@@ -223,6 +223,10 @@ impl StderrStore {
         if guard.is_none() {
             let directory = private_subdirectory(self.state.directory(), "stderr", true)?
                 .ok_or(BulkloadRefusal::Io(None))?;
+            // #161: `stderr/`'s own entry is durable before any capture in
+            // it is, whoever created it (a creator may have died unsealed).
+            crate::counters::sync_dir(self.state.directory())
+                .refuse_at("git_carry::estimate::stderr_store::with_opened")?;
             let key = key(&directory)?;
             *guard = Some(Opened { directory, key });
         }
