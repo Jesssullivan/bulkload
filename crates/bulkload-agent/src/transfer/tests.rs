@@ -251,10 +251,9 @@ fn orphans_with_this_pid_never_block_a_stage() {
 }
 
 /// #97: salvaged temporaries are removed when a session finishes, even one
-/// with a destination-side refusal, so a path refused on every run never
-/// keeps them: no later session re-indexes them or asks for a manifest of
-/// every file because of them. Salvage only ever saved wire bytes: a
-/// refused entry's capture was never recorded, so it is read again anyway.
+/// with a destination-side refusal that staged nothing from them (#124), so
+/// a path refused on every run never keeps them: no later session
+/// re-indexes them or asks for a manifest of every file because of them.
 #[test]
 fn salvage_is_removed_even_when_a_path_is_refused_every_run() {
     let corpus = Corpus::new();
@@ -309,6 +308,244 @@ fn salvage_is_removed_even_when_a_path_is_refused_every_run() {
     let clean = corpus.run().unwrap();
     assert!(clean.refusals.is_empty(), "{:?}", clean.refusals);
     assert!(clean.temporaries_left.is_empty());
+}
+
+/// The canonical destination store root, which keys the group-commit fault.
+fn destination_store_root(corpus: &Corpus) -> PathBuf {
+    Store::open(&corpus.base.join("destination-state"))
+        .unwrap()
+        .root()
+        .to_path_buf()
+}
+
+/// Names in this store's temporary grammar directly under the destination.
+fn destination_orphans(corpus: &Corpus) -> usize {
+    std::fs::read_dir(corpus.base.join("destination"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(b".bulkload-")
+        })
+        .count()
+}
+
+/// Pins a salvage bound for one destination root while it lives.
+struct PinnedSalvageBound(PathBuf);
+impl PinnedSalvageBound {
+    fn at(corpus: &Corpus, files: usize, bytes: u64) -> Self {
+        let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
+        let mut bounds = SALVAGE_BOUND_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        bounds.retain(|(pinned, _)| *pinned != root);
+        bounds.push((root.clone(), (files, bytes)));
+        drop(bounds);
+        Self(root)
+    }
+}
+impl Drop for PinnedSalvageBound {
+    fn drop(&mut self) {
+        SALVAGE_BOUND_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(pinned, _)| *pinned != self.0);
+    }
+}
+
+/// Turn each published output named in `files` back into this store's
+/// orphaned temporary, as a crash between its seal and its rename leaves
+/// it; its capture stays in the source ledger.
+fn orphan_outputs(corpus: &Corpus, files: &[&str]) {
+    for (serial, file) in (0_u64..).zip(files) {
+        std::fs::rename(
+            corpus.base.join("destination").join(file),
+            own_temporary(corpus, 1, 1_000 + serial),
+        )
+        .unwrap();
+    }
+}
+
+/// #124 (OI-1002-Q33), N4 restored for byte-touching refusals: an entry
+/// that staged its chunks from a salvaged temporary and was then refused (its
+/// group commit failed, `Held{false}`) keeps that temporary for the next
+/// run, reported in `temporaries_left`. The retry fills from it again: 0
+/// source bytes for the entry (its capture is in the ledger) and nothing on
+/// the wire. The run that completes it removes the temporary.
+#[test]
+fn a_byte_touching_refusal_keeps_its_salvage() {
+    let corpus = Corpus::new();
+    let bytes = noise(43, 1 << 20);
+    std::fs::write(corpus.base.join("source/held"), &bytes).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    orphan_outputs(&corpus, &["held"]);
+    let store_root = destination_store_root(&corpus);
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let refused = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    let refused = refused.unwrap();
+    assert_eq!(
+        refused.refusals,
+        vec![(
+            b"held".to_vec(),
+            "DESTINATION_SPACE_INSUFFICIENT".to_owned()
+        )]
+    );
+    assert_eq!(refused.source_bytes_read, 0);
+    assert_eq!(refused.bytes_received, 0, "filled from the salvage");
+    assert_eq!(refused.temporaries_removed, 0);
+    assert_eq!(
+        refused.temporaries_left.len(),
+        1,
+        "{:?}",
+        refused.temporaries_left
+    );
+    let left = &refused.temporaries_left[0];
+    assert!(corpus
+        .base
+        .join("destination")
+        .join(std::ffi::OsStr::from_bytes(left))
+        .is_file());
+    // The refused group's rename is not durably held (no output row): set
+    // it aside, so the retry must fill from the kept temporary.
+    std::fs::remove_file(corpus.base.join("destination/held")).unwrap();
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.completed, 1);
+    assert_eq!(resumed.source_bytes_read, 0);
+    assert_eq!(resumed.bytes_received, 0);
+    assert_eq!(resumed.temporaries_removed, 1);
+    assert!(resumed.temporaries_left.is_empty());
+    assert_eq!(destination_orphans(&corpus), 0);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/held")).unwrap(),
+        bytes
+    );
+}
+
+/// #124 (OI-1002-Q33): an entry refused before it staged anything (its path
+/// is taken by a directory at its decision) touched no bytes, so the
+/// salvaged temporary holding its content is removed when the session
+/// ends. The retry's manifest comes from the ledger, but its chunks are
+/// read from the source and sent once more: the temporary was never a
+/// durable record, so R25 does not cover it (OI-1002-Q33).
+#[test]
+fn a_refusal_that_staged_nothing_drops_the_salvage() {
+    let corpus = Corpus::new();
+    let bytes = noise(41, 1 << 20);
+    std::fs::write(corpus.base.join("source/held"), &bytes).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    orphan_outputs(&corpus, &["held"]);
+    std::fs::create_dir(corpus.base.join("destination/held")).unwrap();
+    let refused = corpus.run().unwrap();
+    assert_eq!(refused.refusals.len(), 1, "{:?}", refused.refusals);
+    assert_eq!(refused.temporaries_removed, 1);
+    assert!(
+        refused.temporaries_left.is_empty(),
+        "{:?}",
+        refused.temporaries_left
+    );
+    assert_eq!(destination_orphans(&corpus), 0);
+    std::fs::remove_dir(corpus.base.join("destination/held")).unwrap();
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.source_bytes_read, bytes.len() as u64);
+    assert_eq!(resumed.bytes_received, bytes.len() as u64);
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/held")).unwrap(),
+        bytes
+    );
+}
+
+/// #124 (OI-1002-Q33): kept salvage is bounded by count and by bytes. A
+/// temporary past either bound is removed and refused as a value,
+/// `SALVAGE_BOUND_EXCEEDED` under its current name.
+#[test]
+fn salvage_past_its_bound_is_a_typed_refusal() {
+    const SIZE: usize = 300_000;
+    // (files, bytes) bound, and how many of the two temporaries it keeps.
+    for (files, bound_bytes, kept) in [
+        (1, u64::MAX, 1_usize),
+        (10, SIZE as u64 - 1, 0),
+        (10, 2 * SIZE as u64, 2),
+    ] {
+        let corpus = Corpus::new();
+        for (seed, file) in [(51, "a"), (52, "b")] {
+            std::fs::write(corpus.base.join("source").join(file), noise(seed, SIZE)).unwrap();
+        }
+        assert!(corpus.run().unwrap().refusals.is_empty());
+        orphan_outputs(&corpus, &["a", "b"]);
+        let _bound = PinnedSalvageBound::at(&corpus, files, bound_bytes);
+        let store_root = destination_store_root(&corpus);
+        crate::transfer_store::fail_output_commits(&store_root, true);
+        let refused = corpus.run();
+        crate::transfer_store::fail_output_commits(&store_root, false);
+        let refused = refused.unwrap();
+        let space = refused
+            .refusals
+            .iter()
+            .filter(|(_, code)| code == "DESTINATION_SPACE_INSUFFICIENT")
+            .count();
+        let bound: Vec<&Vec<u8>> = refused
+            .refusals
+            .iter()
+            .filter(|(_, code)| code == "SALVAGE_BOUND_EXCEEDED")
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(space, 2, "{:?}", refused.refusals);
+        assert_eq!(bound.len(), 2 - kept, "{:?}", refused.refusals);
+        assert_eq!(refused.temporaries_left.len(), kept);
+        assert_eq!(refused.temporaries_removed, (2 - kept) as u64);
+        for path in bound {
+            assert!(path.starts_with(b".bulkload-"), "named by its temporary");
+            assert!(!corpus
+                .base
+                .join("destination")
+                .join(std::ffi::OsStr::from_bytes(path))
+                .exists());
+        }
+        assert_eq!(destination_orphans(&corpus), kept);
+    }
+}
+
+/// #125: rows a store wrote before the racy guard (#86) are not proven
+/// non-racy. On the first run after the upgrade both stores drop them: the
+/// source reads each seat once more (and records it under the guard), the
+/// destination verifies and adopts its existing outputs, so nothing crosses
+/// the wire. The run after that reads nothing.
+#[test]
+fn rows_from_before_the_racy_guard_are_read_again_once() {
+    const FILES: usize = 3;
+    const SIZE: usize = 100_000;
+    let corpus = Corpus::new();
+    for index in 0..FILES {
+        std::fs::write(
+            corpus.base.join("source").join(format!("file-{index}")),
+            noise(60 + index as u64, SIZE),
+        )
+        .unwrap();
+    }
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let warm = corpus.run().unwrap();
+    assert_eq!((warm.reused, warm.source_bytes_read), (FILES as u64, 0));
+    for state in ["source-state", "destination-state"] {
+        Store::open(&corpus.base.join(state))
+            .unwrap()
+            .forget_racy_guard()
+            .unwrap();
+    }
+    let upgraded = corpus.run().unwrap();
+    assert!(upgraded.refusals.is_empty(), "{:?}", upgraded.refusals);
+    assert_eq!(upgraded.reused, 0);
+    assert_eq!(upgraded.completed, FILES as u64);
+    assert_eq!(upgraded.source_bytes_read, (FILES * SIZE) as u64);
+    assert_eq!(upgraded.bytes_received, 0, "existing outputs are adopted");
+    assert_eq!(rows(&corpus), (FILES as u64, FILES as u64));
+    let after = corpus.run().unwrap();
+    assert_eq!((after.reused, after.source_bytes_read), (FILES as u64, 0));
 }
 
 /// A file the destination staged and sealed but never published (a crash
@@ -1546,4 +1783,37 @@ fn a_capped_subtree_is_reported_never_carried() {
     let destination = corpus.base.join("destination");
     assert!(!destination.join(&capped).join("hidden").exists());
     assert_eq!(std::fs::read(destination.join("kept")).unwrap(), b"carried");
+}
+
+proptest::proptest! {
+    #![proptest_config(crate::test_support::prop_config(256))]
+
+    /// #124 (OI-1002-Q33): the salvage bound partitions the candidates, in
+    /// order, into kept and over; what is kept never exceeds either bound;
+    /// and a candidate is over only if it would not fit beside every one
+    /// kept before it (no temporary is refused that the bound had room for).
+    #[test]
+    fn the_salvage_bound_keeps_greedily_within_both_limits(
+        sizes in proptest::collection::vec(0_u64..1_000, 0..40),
+        max_files in 0_usize..12,
+        max_bytes in 0_u64..6_000,
+    ) {
+        let candidates: Vec<(usize, u64)> = sizes.iter().copied().enumerate().collect();
+        let (keep, over) = bound_salvage(candidates.iter().copied(), max_files, max_bytes);
+        proptest::prop_assert!(keep.len() <= max_files);
+        let kept_bytes: u64 = keep.iter().map(|&at| sizes[at]).sum();
+        proptest::prop_assert!(kept_bytes <= max_bytes);
+        let mut all: Vec<usize> = keep.iter().chain(&over).copied().collect();
+        all.sort_unstable();
+        proptest::prop_assert_eq!(all, (0..sizes.len()).collect::<Vec<_>>());
+        proptest::prop_assert!(keep.windows(2).all(|pair| pair[0] < pair[1]));
+        for &at in &over {
+            let before: Vec<usize> = keep.iter().copied().filter(|&kept| kept < at).collect();
+            let bytes: u64 = before.iter().map(|&kept| sizes[kept]).sum();
+            proptest::prop_assert!(
+                before.len() >= max_files || bytes + sizes[at] > max_bytes,
+                "candidate {} had room", at
+            );
+        }
+    }
 }

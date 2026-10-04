@@ -45,5 +45,12 @@ Validation: `nix develop .#default --command just check-fast` green (rustc
 
 ## Open
 
-- PR #145 (WP1) adds `GitSourcePartialClone` next to the same lines in
-  `refusal.rs`: a trivial textual merge for whichever lands second.
+- Merged main 4a7b86b (#146 v1 auto-prerequisite chains, #154 bounded
+  salvage) on 2026-10-04 (R-N71, OI-1003-Q23). `refusal.rs` keeps main's
+  live `SalvageBoundExceeded` before `FrameCodec` in the enum, `code()`,
+  `CODES` and the test list, and still drops the dead
+  `TransportAuthorityMismatch` (no constructor on main either). #146 folded
+  estimate's `feed` into `git_carry::input`; the writer-thread join there
+  now refuses `WORKER_LOST`, as `feed`'s did on this branch.
+- `refusal_taxonomy.rs` keeps its local `prop_config`; folding it into
+  `test_support::prop_config` (now on main) is a follow-up.

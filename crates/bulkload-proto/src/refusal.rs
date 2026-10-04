@@ -167,6 +167,11 @@ pub enum BulkloadRefusal {
     /// less free space than the configured floor (`--min-free-percent`,
     /// default 25%), or with no room at all (OI-1001-Q2).
     DestinationSpaceInsufficient,
+    /// A salvaged destination temporary that a refused entry staged chunks
+    /// from could not be kept for the next run: the session's salvage bound
+    /// (by count and bytes) was already reached, so it was removed and its
+    /// chunks are sent again (#124, OI-1002-Q33).
+    SalvageBoundExceeded,
     /// The frame could not be encoded or decoded.
     FrameCodec,
     /// A well-formed frame arrived that the session's state does not allow
@@ -241,6 +246,7 @@ impl BulkloadRefusal {
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
+            Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
             Self::WorkerLost => "WORKER_LOST",
@@ -298,6 +304,7 @@ impl BulkloadRefusal {
         "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
+        "SALVAGE_BOUND_EXCEEDED",
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
         "WORKER_LOST",
@@ -512,6 +519,7 @@ mod tests {
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
+            BulkloadRefusal::SalvageBoundExceeded,
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,
             BulkloadRefusal::WorkerLost,
