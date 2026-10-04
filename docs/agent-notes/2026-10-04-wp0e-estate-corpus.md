@@ -7,7 +7,10 @@ CPU ratio on this corpus), R-N13.
 - **Branch:** `feat/wp0e-estate-corpus-20261003`, on top of ec142cf.
 - **Worktree:** `bulkload.worktrees/wp0e-estate-corpus-20261003`. This
   session was its only writer. The earlier duplicate copies had all ended.
-- **Push:** pushed to `origin`; no PR (a PR is not in this lane's scope).
+- **Push:** pushed to `origin` as a fast-forward (ec142cf..378b634).
+- **PR:** [#159](https://github.com/Jesssullivan/bulkload/pull/159), opened
+  2026-10-04 at 378b634 against main 4a10bb8 (merges cleanly). Not merged:
+  that is out of this lane's scope.
 - **Facts:** the evidence doc,
   [estate-corpus-v1-2026-10-03.md](../evidence/estate-corpus-v1-2026-10-03.md),
   holds the measurements. This note records what was done and what is open.
@@ -126,11 +129,14 @@ toolchain as before: git 2.54.0 with zlib-ng 2.3.3, SQLite 3.53.1, zstd
 - `fbd980e`: the script (signed; the hooks ran, and the process-safety
   audit passed). Its SHAKE-256, `4d9d1350bd0b`…, is the
   `generator_shake256` of both new receipts.
-- The commit after it: the evidence doc and the agent notes (signed).
+- `378b634`: the evidence doc and the agent notes (signed).
+- The commit after it: this note's PR line (signed), docs only.
 
 ## Open
 
-- The S3 measurement harness (#144 and #146 are merged).
+- Review and merge of #159 (operator).
+- The S3 measurement harness, `s3_estate.py`, in Sprint 2 (#144 and #146
+  are merged).
 - S1 samples on this corpus (gated, R-N81/R-N91), per class and on the
   subset without `data/` and `git/history-heavy`.
 - WP1: the object freshening above, and the provider_sqlite `-shm`
