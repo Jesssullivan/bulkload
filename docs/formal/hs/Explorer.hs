@@ -13,11 +13,12 @@ version: an independent implementation of the same transition relation, in
 another language and another state representation (one record per seat
 instead of one function per variable). It reads no TLA+, no .cfg and no
 generated file, and shares no code with the spec. The same actions and the
-same invariants are implemented from the model's description
-(docs/formal/README.md, "Abstraction map") and the code it cites, where
-A = crates/bulkload-agent/src. Its distinct-state count must equal TLC's,
-and each core mutation must violate the same named invariant
-(docs/formal/README.md, "Hybrid roles").
+same invariants were written by hand, from the spec's action definitions,
+its abstraction map (docs/formal/README.md) and the code they cite, where
+A = crates/bulkload-agent/src; nothing here is generated from the TLA+
+text. Its distinct-state count must equal TLC's, and each core mutation
+must violate the same named invariant (docs/formal/README.md, "Hybrid
+roles").
 
 Only the core's actions are here. Out of the core, and absent: the failed
 group commit (CommitFail), the space refusal, a relaxed source ledger or

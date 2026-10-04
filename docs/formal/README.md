@@ -387,8 +387,8 @@ What `tla-render` and `tla-check` add in the shell:
 rendering, `gen_cfgs.py`'s output and the committed files were identical:
 44 files, with the same sha256 manifest `259bd98c…f340` for all three. The
 next commit changed only each file's provenance comment line (43 `\*`
-lines and one `#` line) and deleted `gen_cfgs.py`. TLC ignores both kinds
-of comment, so no state or verdict moved.
+lines and one `#` line) and deleted `gen_cfgs.py`. TLC ignores `\*`
+comments and `tla-check` skips `#` lines, so no state or verdict moved.
 
 ### The explorer
 
@@ -398,10 +398,11 @@ actions and invariants as the spec, on the core.
 - **Independent implementation.** It is a separate program in another
   language, with another state representation (one record per seat instead
   of one function per variable). It reads no TLA+, no `.cfg` and no rendered
-  file, and shares no code with the spec. It was written from the model's
-  action descriptions and the code they cite. So it is an independent
-  implementation, but not independent authorship: a misreading of the
-  protocol shared by both texts would not show.
+  file, and shares no code with the spec. It was written by hand from the
+  spec's action definitions and the code they cite; nothing in it is
+  generated from the TLA+ text. So it is an independent implementation,
+  but not independent authorship: a misreading of the protocol shared by
+  both texts would not show.
 - **The core's actions only.** It has the 27 actions that TLC's coverage
   shows enabled in `MC_nv_ledger`: `StartRun`, the 13 per-seat protocol
   actions, `Commit`, `LedgerCommit`, `SendSourceDone`, `Finish`, `Edit`,
