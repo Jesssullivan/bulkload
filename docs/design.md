@@ -230,7 +230,15 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   requests are written, so a prior with thousands of refs cannot hang a
   capture on a full pipe. The capture counters
   (`write_source_pack_bytes`, `write_source_pack_objects`,
-  `read_source_pack_readback_bytes`, `census_walks`) measure it.
+  `read_source_pack_readback_bytes`, `census_walks`) measure it. A chained
+  link or a grouped item bundle is thin (OI-1003-Q42): its deltas name
+  bases its prerequisites hold, which packing reads but never writes, so
+  `write_source_pack_bytes` no longer bounds the source reads of a thin
+  capture; `read_source_pack_readback_bytes` sees them, as a lower bound.
+  The next pass's blob-reuse fetch of a thin retained capture completes it
+  with `index-pack --fix-thin`, reading every base from the source object
+  store: `read_source_capture_reuse_bytes` counts those bases beside the
+  bundle, and the fetch's storage reads join the readback counter.
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
