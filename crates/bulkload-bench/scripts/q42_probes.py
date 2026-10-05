@@ -2449,6 +2449,11 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume,
         )
         result = {"out": str(args.out), "corpora": sorted(result["corpora"])}
+    if args.command != "run":
+        # A standalone measurement kept as evidence (e.g. `header` of a real
+        # inventory) names the script revision that produced it, as `run`'s
+        # record does.
+        result = {**result, "script": script_provenance()}
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

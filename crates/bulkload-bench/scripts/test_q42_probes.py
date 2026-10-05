@@ -10,6 +10,9 @@ end. Run with `python3 q42_probes.py selftest`.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import shutil
 import tempfile
 import unittest
@@ -411,6 +414,23 @@ class Corpus(unittest.TestCase):
         self.assertEqual(got["by_subcommand"]["version"]["count"], 2)
         self.assertEqual(got["by_subcommand"]["rev-parse"]["failed"], 1)
         self.assertEqual(q.bash_seconds("1m2.500s"), 62.5)
+
+    def test_header_output_records_the_script_revision(self) -> None:
+        corpus = q.build_corpus(
+            self.dir / "source",
+            shape="carry",
+            refs=60,
+            oids=16,
+            namespaces=2,
+            dirs=3,
+            files_per_dir=4,
+        )
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(q.main(["header", corpus["path"]]), 0)
+        got = json.loads(printed.getvalue())
+        self.assertEqual(got["refs"], 60)
+        self.assertEqual(got["script"]["sha256"], q.script_provenance()["sha256"])
 
     def test_header_target_search_steps_over_counts_too_small_to_split(self) -> None:
         # 20 namespaces over 200 oids need about 3,000 refs before the live
