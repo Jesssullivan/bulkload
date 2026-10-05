@@ -1174,7 +1174,7 @@ fn decide_capture(
     } else {
         decide::BaseState::NoGroup
     };
-    let (mut inputs, retained) = retained_capture(
+    let (recorded, retained) = retained_capture(
         record,
         corpus,
         parts,
@@ -1182,13 +1182,15 @@ fn decide_capture(
         authority,
         decide::Inputs::new(base.is_some(), state, decide::Policy::V1),
     )?;
-    if let Some(held) = &retained {
-        // A hit on a bundle bound to a base needs that base retained.
-        if decide::reads_prev_base(&inputs) {
-            inputs.prev_base = bound_base(corpus, &held.previous.bundle)?;
-        }
-    }
-    Ok((decide::decide(&inputs), inputs, retained))
+    // A hit on a bundle bound to a base needs that base retained. The core
+    // asks for it only then, which is only for a held record.
+    let (decision, inputs) = decide::decide_recorded(recorded, || {
+        let held = retained
+            .as_ref()
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+        bound_base(corpus, &held.previous.bundle)
+    })?;
+    Ok((decision, inputs, retained))
 }
 
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
@@ -2422,6 +2424,123 @@ mod tests {
             fs::read(second_target.join("file")).unwrap(),
             b"second dirty"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // P67's v1 row `Held ... Based Lost -> Refuse`, through the code: the
+    // group's base record is retained, but a retained based bundle is bound
+    // (`{bundle}.base`) to a base that is lost. That happens when the group's
+    // base record was regenerated after its old base was lost. Every other
+    // condition of a reuse hit holds, so only the lazily read bound base
+    // (`decide::decide_recorded`, `bound_base`) keeps the record from being
+    // reused: each item refuses RECEIPT_BINDING_INVALID and its record stays.
+    #[test]
+    fn a_retained_based_bundle_bound_to_a_lost_base_is_never_a_reuse_hit() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-bound-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let second = root.join("second");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                second.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let plan = root.join("plan");
+        add(
+            &plan,
+            &source,
+            &repository,
+            Some(&root.join("first-target")),
+        )
+        .unwrap();
+        add(
+            &plan,
+            &second,
+            &repository,
+            Some(&root.join("second-target")),
+        )
+        .unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+        settle();
+        let outcomes = |corpus: &Path| {
+            let rows = Mutex::new(Vec::new());
+            let result = capture(&plan, &state, corpus, 2, &|row| {
+                rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                Ok(())
+            });
+            (result, rows.into_inner().unwrap())
+        };
+        capture(&plan, &state, &corpus, 2, &|_| Ok(())).unwrap();
+        // The records are reuse hits while their bound base is retained.
+        let (result, rows) = outcomes(&corpus);
+        result.unwrap();
+        assert_eq!(rows, vec![("capture-reused-after-census", None); 2]);
+        let items = inspect(&plan).unwrap();
+        let records: Vec<(PathBuf, Vec<u8>)> = items
+            .iter()
+            .map(|item| {
+                let path = corpus.join(format!("{}.capture", id(item).unwrap()));
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let mut bound = Vec::new();
+        for (path, _) in &records {
+            let record: Capture = read(path).unwrap();
+            assert!(git_carry::shared::requires_base(&corpus.join(&record.bundle)).unwrap());
+            let base: Base = read(&corpus.join(format!("{}.base", record.bundle))).unwrap();
+            bound.push(base);
+        }
+        let named = |base: &Base| (base.bundle.clone(), base.digest, base.identity);
+        assert_eq!(bound.first().map(named), bound.last().map(named));
+        let lost = bound.first().unwrap();
+        // The old base is lost, and the group's base record regenerated: the
+        // next pass's `prepare_base` exports and records a retained base.
+        let groups: Vec<PathBuf> = fs::read_dir(&corpus)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.starts_with("shared-")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension == "base")
+            })
+            .collect();
+        assert_eq!(groups.len(), 1);
+        fs::rename(corpus.join(&lost.bundle), root.join("lost-base")).unwrap();
+        fs::remove_file(groups.first().unwrap()).unwrap();
+        let (result, rows) = outcomes(&corpus);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("RECEIPT_BINDING_INVALID".to_owned())); 2]
+        );
+        // The group's base record is back and retained, and it is not the
+        // base the records are bound to.
+        let regenerated: Base = read(groups.first().unwrap()).unwrap();
+        assert!(retained_base(&corpus, &regenerated).unwrap());
+        assert_ne!(regenerated.identity, lost.identity);
+        assert!(!retained_base(&corpus, lost).unwrap());
+        // Neither record was replaced: the missing custody stays visible.
+        for (path, bytes) in &records {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

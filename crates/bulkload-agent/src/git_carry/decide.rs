@@ -14,10 +14,11 @@
 //!
 //! The reference copy is `decide` in `docs/formal/hs/GitCarryCore.hs`, and
 //! its pinned rows (`tests/data/decide_rows.tsv`) pin this function: P67
-//! checks every `v1` row, drawing each "-" input at random. Every policy the
-//! reference has is implemented here (L6b's chain under a plan base, Q46's
-//! root window), but the code runs only [`Policy::V1`]; their rows wait for
-//! the lanes that land the custody they need.
+//! checks every row of every lane (`v1`, `L6b`, `L8`), drawing each "-"
+//! input at random. The policy is a column of each row, so every policy the
+//! reference has is checked here (L6b's chain under a plan base, Q46's root
+//! window). The code runs only [`Policy::V1`]: acting on the other policies
+//! waits for the lanes that land the custody they need.
 //!
 //! **Staged inputs.** The code reads its inputs in stages and decides at
 //! each: the decision never rests on an input not read yet, because it is
@@ -29,20 +30,23 @@
 //!   else.
 //! - `capture_item` reads the record ([`Inputs::new`], then
 //!   `retained_capture`) with the write-time inputs at the values under
-//!   which a writer honours every offer. It acts on a hit or a refusal, and
-//!   for an export offers the writer the plan base or the chain link the
-//!   basis names. A retained bundle's bound base is read only when the
-//!   decision rests on it ([`reads_prev_base`]: a hit on a based bundle).
+//!   which a writer honours every offer, and decides through
+//!   [`decide_recorded`]. It acts on a hit or a refusal, and for an export
+//!   offers the writer the plan base or the chain link the basis names. A
+//!   retained bundle's bound base is read only when the decision rests on
+//!   it ([`reads_prev_base`]: a hit on a based bundle).
 //! - The writer (`shared::write_capture`) decides again on that offer
-//!   ([`Inputs::offered`]) once it has read whether the source is shallow,
-//!   and reads whether the source holds a tip of the link only when the
-//!   decision rests on it ([`reads_tips_held`]).
+//!   through [`decide_offered`] ([`Inputs::offered`]) once it has read
+//!   whether the source is shallow, and reads whether the source holds a
+//!   tip of the link only when the decision rests on it
+//!   ([`reads_tips_held`]).
 //!
-//! P67 checks that these stages, composed, decide what one call on every
-//! input decides, under [`Policy::V1`].
+//! The two stage functions take the lazy reads as callbacks, so the code
+//! and P67 run the same staging: P67 checks that these stages, composed,
+//! decide what one call on every input decides, under [`Policy::V1`].
 
 use super::chain::CHAIN_DEPTH_LIMIT;
-use crate::BulkloadRefusal;
+use crate::{BulkloadRefusal, Result};
 
 /// The policy a capture runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +362,55 @@ pub fn reads_tips_held(inputs: &Inputs) -> bool {
         ..*inputs
     };
     decide(&held) != decide(&none)
+}
+
+/// The estate's stage (`estate::decide_capture`).
+///
+/// The decision on `recorded`, an item's inputs once its capture record is
+/// read ([`Inputs::new`], then `retained_capture`), reading the retained
+/// bundle's bound base through `bound_base` only when the decision rests on
+/// it ([`reads_prev_base`]). Returns the decision and the inputs it read.
+///
+/// # Errors
+/// What `bound_base` refuses.
+pub fn decide_recorded(
+    recorded: Inputs,
+    bound_base: impl FnOnce() -> Result<PrevBase>,
+) -> Result<(Decision, Inputs)> {
+    let mut inputs = recorded;
+    if reads_prev_base(&inputs) {
+        inputs.prev_base = bound_base()?;
+    }
+    Ok((decide(&inputs), inputs))
+}
+
+/// The writer's stage (`shared::write_capture`).
+///
+/// The plan for the caller's offer ([`Inputs::offered`]: a plan base, a
+/// `link` to chain on, and whether the source is `shallow`), reading whether
+/// the source holds a tip of the link through `tips_held` only when the
+/// decision rests on it ([`reads_tips_held`]).
+///
+/// # Errors
+/// What `tips_held` refuses, and `CONTRACT_SELF_INCONSISTENT` for a decision
+/// that is not an export (no offer decides one).
+pub fn decide_offered<L>(
+    base: bool,
+    link: Option<L>,
+    shallow: bool,
+    policy: Policy,
+    tips_held: impl FnOnce(L) -> Result<bool>,
+) -> Result<Plan> {
+    let mut inputs = Inputs::offered(base, link.is_some(), shallow, policy);
+    if let Some(link) = link {
+        if reads_tips_held(&inputs) {
+            inputs.tips_held = tips_held(link)?;
+        }
+    }
+    match decide(&inputs) {
+        Decision::Export(plan) => Ok(plan),
+        Decision::Hit | Decision::Refuse(_) => Err(BulkloadRefusal::ContractSelfInconsistent),
+    }
 }
 
 /// A fresh root: a plan base's delta, else self-contained. A shallow source

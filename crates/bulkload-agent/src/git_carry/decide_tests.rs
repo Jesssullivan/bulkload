@@ -1,12 +1,15 @@
 //! P67 DECISION-CORE (Q42 lane L6a, OI-1003-Q43): git carry's decision core,
 //! [`decide`], against its Haskell reference and its own laws.
 //!
-//! - **Pinned rows.** Every `v1` row of `tests/data/decide_rows.tsv`, which
+//! - **Pinned rows.** Every row of `tests/data/decide_rows.tsv`, which
 //!   `docs/formal/hs/GitCarryCore.hs rows` renders from the reference
-//!   `decide`, decides exactly the row's output, with each "-" input drawn at
-//!   random (fixed seed in CI; `BULKLOAD_PROPTEST_DEEP=1` draws more, at
-//!   random seeds). The `L6b` and `L8` rows are parsed, so their labels must
-//!   be the core's, but not compared: their lanes land the custody they need.
+//!   `decide`, decides exactly the row's output under the row's policy, with
+//!   each "-" input drawn at random (fixed seed in CI;
+//!   `BULKLOAD_PROPTEST_DEEP=1` draws more, at random seeds). That is all
+//!   three lanes: `v1`, whose policy is [`Policy::V1`], the one the code
+//!   runs, and `L6b` (a chain under a plan base) and `L8` (Q46's root
+//!   window), whose policies `decide` implements before their lanes land the
+//!   custody the callers need to act on them.
 //! - **Labels.** The rows' output columns, over every lane, use exactly the
 //!   labels of the Rust unions. The reference refuses to render rows that
 //!   leave a label unreached, and `just formal-nv` requires its labels to be
@@ -21,7 +24,11 @@
 //!   the bound base only when the decision rests on it, and the write-time
 //!   inputs at their requested values), then the writer's decision on that
 //!   offer (the tips read only when the decision rests on them), equal one
-//!   decision on every input in kind, basis, depth and reuse offer.
+//!   decision on every input in kind, basis, depth and reuse offer. Each
+//!   stage is the function the code calls ([`decide_recorded`] in
+//!   `estate::decide_capture`, [`decide_offered`] in
+//!   `shared::write_capture`), with its lazy read answered from the drawn
+//!   inputs.
 
 use std::fmt::Debug;
 
@@ -30,8 +37,9 @@ use proptest::test_runner::TestRunner;
 
 use super::chain::CHAIN_DEPTH_LIMIT;
 use super::decide::{
-    decide, reads_prev_base, reads_tips_held, BaseState, Basis, Decision, Inputs, Plan, Policy,
-    PrevBase, Rebase, Refusal, RetainedState, ReuseEligibility, Shape,
+    decide, decide_offered, decide_recorded, reads_prev_base, reads_tips_held, BaseState, Basis,
+    Decision, Inputs, Plan, Policy, PrevBase, Rebase, Refusal, RetainedState, ReuseEligibility,
+    Shape,
 };
 use crate::test_support::prop_config;
 
@@ -436,37 +444,35 @@ fn well_formed(inputs: &Inputs, decision: Decision) -> Result<(), String> {
 }
 
 /// The estate's decision, then the writer's on its offer, as the code makes
-/// them under [`Policy::V1`] (`estate::capture_item`,
-/// `shared::write_capture`), on inputs the code reads in stages.
+/// them under [`Policy::V1`]: [`decide_recorded`] (`estate::decide_capture`)
+/// and [`decide_offered`] (`shared::write_capture`), each lazy read answered
+/// from `inputs`.
 fn staged(inputs: &Inputs) -> Decision {
     // What `Inputs::new` leaves for later: the bound base and the write-time
-    // inputs.
+    // inputs. `retained_capture` reads the rest, the record.
     let fresh = Inputs::new(inputs.grouped, inputs.base, Policy::V1);
-    let mut estate = Inputs {
+    let recorded = Inputs {
         prev_base: fresh.prev_base,
         tips_held: fresh.tips_held,
         root_held: fresh.root_held,
         shallow: fresh.shallow,
         ..*inputs
     };
-    if reads_prev_base(&estate) {
-        estate.prev_base = inputs.prev_base;
-    }
-    let Decision::Export(plan) = decide(&estate) else {
-        return decide(&estate);
+    let (decision, _) = decide_recorded(recorded, || Ok(inputs.prev_base))
+        .unwrap_or_else(|refusal| panic!("the estate refused {refusal:?} on {inputs:?}"));
+    let Decision::Export(plan) = decision else {
+        return decision;
     };
-    let mut writer = Inputs::offered(
+    // `capture_item` offers the plan base when the basis is based, and
+    // `chain_offer` the link when it is chained.
+    let written = decide_offered(
         plan.basis.based(),
-        plan.basis.chained(),
+        plan.basis.chained().then_some(()),
         inputs.shallow,
         Policy::V1,
-    );
-    if plan.basis.chained() && reads_tips_held(&writer) {
-        writer.tips_held = inputs.tips_held;
-    }
-    let Decision::Export(written) = decide(&writer) else {
-        panic!("the writer decided {:?} on {writer:?}", decide(&writer));
-    };
+        |()| Ok(inputs.tips_held),
+    )
+    .unwrap_or_else(|refusal| panic!("the writer refused {refusal:?} on {plan:?}, {inputs:?}"));
     Decision::Export(Plan {
         basis: written.basis,
         depth: if written.basis.chained() {
@@ -544,12 +550,13 @@ fn p67_the_rows_use_exactly_the_core_s_labels() {
     );
 }
 
-/// P67, pinned: every v1 row decides the reference's output, whatever its
-/// "-" inputs are.
+/// P67, pinned: every row, of every lane, decides the reference's output
+/// under its own policy, whatever its "-" inputs are. The policy is a column
+/// of the row, so the L6b and L8 rows need no custody to check `decide`.
 #[test]
-fn p67_every_v1_row_decides_what_the_reference_decides() {
-    let rows: Vec<Row> = rows().into_iter().filter(|row| row.lane == "v1").collect();
-    assert_eq!(rows.len(), 79);
+fn p67_every_row_decides_what_the_reference_decides() {
+    let rows = rows();
+    assert_eq!(rows.len(), 363);
     for row in &rows {
         let mut runner = TestRunner::new(prop_config(DRAWS_PER_ROW));
         let expected = row.decision;
@@ -559,7 +566,7 @@ fn p67_every_v1_row_decides_what_the_reference_decides() {
                 prop_assert_eq!(decide(&inputs), expected, "line {}: {:?}", line, inputs);
                 Ok(())
             })
-            .unwrap_or_else(|failure| panic!("P67 line {line}: {failure}"));
+            .unwrap_or_else(|failure| panic!("P67 {} line {line}: {failure}", row.lane));
     }
 }
 

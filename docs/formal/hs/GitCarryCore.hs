@@ -7,7 +7,8 @@ Roles (OI-1003-Q43, which widens OI-1003-Q32 for this layer):
   * `decide :: Inputs -> Decision` is the reference copy of the pure,
     total decision a v1 capture makes before it exports. Lane L6a moved
     the code's decision into `git_carry/decide.rs`, which a fixed-seed
-    property test (P67) checks against this copy's v1 pinned rows.
+    property test (P67) checks against every one of this copy's pinned
+    rows, of all three lanes (each row carries its policy).
     So here Haskell is a differential oracle for the code, not only a
     second encoding of the TLA+ spec.
   * `rows` renders those pinned rows, crates/bulkload-agent/tests/data/

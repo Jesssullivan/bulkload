@@ -1165,7 +1165,8 @@ parity) to Rust `decide.rs` (P67). The explorer itself has the limit
 Explorer.hs has (independent code, shared design): it and the spec were both
 transliterated from the same reading of the Rust code, so parity cannot
 catch a misreading they share. The pinned rows can: P67 checks the Rust
-`decide`, which the code calls, against every v1 row.
+`decide`, which the code calls, against every row of all three lanes (the
+policy is a column of each row).
 
 L6a grounds `decide.rs`. `ChainDepthBounded` and `BrokenLinkNeverReuseHit`
 cite `decide` and a type only decide.rs defines (`Rebase`, `Inputs`): the
@@ -1219,8 +1220,12 @@ bound base only when the decision rests on it. The writer
 `shared::write_capture`, which `export_pass` calls, decides again on the
 offer once the pass has read whether the source is shallow. It queries the
 source's tips only when the decision rests on them, exactly where v1 did.
-P67 checks that the stages, composed, decide what one call on all the
-inputs decides.
+Each stage is a function of `decide.rs` that takes its lazy read as a
+callback (`decide_recorded`, `decide_offered`), so P67 checks that the
+stages the code runs, composed, decide what one call on all the inputs
+decides. An estate test drives the bound-base read through `capture`
+itself: a retained based bundle bound to a lost base refuses
+`RECEIPT_BINDING_INVALID` while the group's regenerated base is retained.
 
 **Q46's re-root policy, as this model reads it.** The ruling (Decision 4,
 option A) is "a re-root policy plus STATE/corpus GC that never deletes a
@@ -1552,10 +1557,11 @@ differed.
 - **Bare captures** (#172). `apply_item` refuses a bare capture planned with
   a workspace (`refuse_bare_capture`), before any chain or base step. That
   is a typed refusal outside custody.
-- **The code's `decide` beyond v1.** P67 checks the Rust `decide` against
-  the 79 v1 rows. It implements the L6b and L8 policies too, but the code
-  runs only v1's (`Policy::V1`), so for those lanes the rules here are a
-  reading, not a check, until each lands its custody and enables its rows.
+- **The code beyond v1.** P67 checks the Rust `decide` against all 363
+  rows, so its L6b and L8 policies are checked too. The callers run only
+  v1's (`Policy::V1`) and refuse a plan v1 cannot carry out, so what the
+  code does with an L6b or L8 decision is unchecked until each lane lands
+  its custody.
 
 ## Frozen names
 

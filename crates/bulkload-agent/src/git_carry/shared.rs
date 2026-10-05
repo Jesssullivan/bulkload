@@ -13,7 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use super::decide::{self, Basis, Decision, Inputs, Policy};
+use super::decide::{self, Basis, Policy};
 use super::{capture_refs, git, input, oid, output, prepare_private, refs, set_ref, text};
 use crate::{BulkloadRefusal, Result};
 
@@ -440,22 +440,17 @@ pub(super) fn write_capture(
     cap: usize,
 ) -> Result<(PackStats, bool)> {
     let boundary = super::shallow::frontier(private)?;
-    let mut inputs = Inputs::offered(
+    let mut tips = BTreeSet::new();
+    let plan = decide::decide_offered(
         offer.base.is_some(),
-        offer.link.is_some(),
+        offer.link,
         !boundary.is_empty(),
         Policy::V1,
-    );
-    let mut tips = BTreeSet::new();
-    if let Some(link) = offer.link {
-        if decide::reads_tips_held(&inputs) {
+        |link| {
             tips = super::chain::source_held_tips(link.source, link.prior)?;
-            inputs.tips_held = !tips.is_empty();
-        }
-    }
-    let Decision::Export(plan) = decide::decide(&inputs) else {
-        return Err(BulkloadRefusal::ContractSelfInconsistent);
-    };
+            Ok(!tips.is_empty())
+        },
+    )?;
     match plan.basis {
         // A shallow frontier is not a bundle prerequisite. Preserve the entire
         // locally available shallow closure as explicit custody instead.
