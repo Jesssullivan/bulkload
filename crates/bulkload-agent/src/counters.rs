@@ -35,16 +35,27 @@
 //! commit counters count successful commits only.
 //!
 //! Git children (`git bundle create`, `git pack-objects`) that pack a
-//! capture's objects from the source object store are measured from the
+//! capture's objects from the source object store, and the fetch that
+//! completes a retained capture for blob reuse, are measured from the
 //! child's own resource usage, collected by `wait4` when it exits:
 //! `read_source_pack_readback_bytes` is `ru_inblock` x 512. On Linux that is
 //! exactly the child's `/proc/<pid>/io` `read_bytes` (storage reads, 512-byte
 //! units). On Darwin `ru_inblock` counts block input operations, not sectors,
 //! so x 512 is a **lower bound**. On both, reads served from the page cache
 //! and mmap'd pack windows already resident are invisible: the counter is a
-//! lower bound on what the child read, never an over-count. The logical
-//! measure is `write_source_pack_bytes` and `write_source_pack_objects`: every
-//! object in a capture pack was read from an object store to be written.
+//! lower bound on what the child read, never an over-count.
+//!
+//! The logical measure is `write_source_pack_bytes` and
+//! `write_source_pack_objects`: every object in a capture pack was read from
+//! an object store to be written. That bounds a self-contained pack's reads,
+//! not a thin one's. A grouped item or a chained link (OI-1003-Q42) deltas
+//! against preferred bases its prerequisites hold: each base is read to
+//! delta against and never written, so for those captures
+//! `write_source_pack_bytes` counts the pack, not what packing read. The next
+//! pass's reuse fetch of such a capture completes it with `index-pack
+//! --fix-thin`, reading every base from the source object store:
+//! `read_source_capture_reuse_bytes` counts those bases (the written pack's
+//! growth) beside the bundle's length.
 //!
 //! Every counter is incremented by production code; a declared counter
 //! nothing increments would read as a measured zero, so the
@@ -91,10 +102,12 @@ counters! {
     // Bytes read, by stage.
     SourceFileRead => "read_source_file_bytes",
     // Retained capture bundles a Git capture fetched to reuse their blobs
-    // (logical: the bundle's length per fetch).
+    // (logical: the bundle's length per fetch, plus the delta bases a thin
+    // bundle's fetch read from the source object store to complete it).
     SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
-    // Storage reads by the git children that pack a capture's objects (see
-    // the module notes: a lower bound, page-cache hits are invisible).
+    // Storage reads by the git children that pack a capture's objects or
+    // complete a retained one for reuse (see the module notes: a lower
+    // bound, page-cache hits are invisible).
     SourcePackReadback => "read_source_pack_readback_bytes",
     DestLocalReuseRead => "read_dest_local_reuse_bytes",
     DestVerifyRead => "read_dest_verify_existing_bytes",
