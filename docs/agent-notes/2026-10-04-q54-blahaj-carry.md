@@ -1,0 +1,123 @@
+# 2026-10-05 — Q54 lane: blahaj carries under v1's ref table (sting)
+
+Lane: q54-blahaj-carry, host sting. Worktree
+`bulkload.worktrees/q54-blahaj-carry-20261005`, branch
+`docs/q54-blahaj-carry-20261005`, cut from origin/main `40adca8` (#182
+merged). This lane proves the Q54 precondition on the real blahaj before L5
+deletes carry_v2. No PR is opened: the branch is pushed for the
+coordinator. The file name keeps the dispatch's date; the work ran on
+2026-10-05, 14:25Z to about 14:45Z.
+
+**Result: the Q54 precondition is MET.** See
+[the evidence page](../evidence/2026-10-05-blahaj-v1-carry.md).
+
+Rulings cited:
+
+- **OI-1003-Q54, OI-1003-Q55.** v1 must carry refs-heavy repositories
+  before carry_v2 is deleted, proved on the real blahaj. This lane is that
+  proof. Their text is cited as the dispatch gave it.
+- **OI-1003-Q35.** Byte counters, `census_walks`, pack bytes and the
+  rusage CPU are admissible; wall time is informational.
+- **R-N13.** Every step below cites its ruling, and this note is the
+  session record.
+- **R-N11, R-N104, R-N92.** No process was signalled, and no PID was
+  checked. Waits were on this lane's own background tasks and on files.
+- **R-N98.** No hook was bypassed.
+- **R-N12, R-N101.** No guard hook refused anything this session.
+- **R-N56.** The capture read the real blahaj into private scratch, under
+  Q54/Q55's ruling, as test evidence. Nothing was applied to any estate
+  destination.
+
+## What was done
+
+1. **Worktree** (OI-1003-Q54, R-N13). Created from origin/main `40adca8`
+   as the dispatch specified.
+2. **Build** (OI-1003-Q54, Q55). `s3_estate.py build --rev 40adca8 --jobs
+   4` under the shared `.check-fast.lock`, at nice 19, with its own target
+   dir in private scratch. The tree came from `git archive`. Queued
+   14:27:06Z; cargo took 3 min 31 s. Binary sha256 `74a6e0ce…71493ad8`.
+3. **Harness** (OI-1003-Q54, Q35):
+   `docs/evidence/2026-10-05-blahaj-v1-carry-harness.py`. It is stdlib
+   plus `s3_estate`'s Runner, parsers and `git_env`. In blahaj it runs
+   only reads, with `GIT_OPTIONAL_LOCKS=0`, plus an lstat census of
+   `.git`.
+4. **Run** (OI-1003-Q54, Q55, Q35), 14:31:10Z to 14:36:10Z. The steps
+   were: census `t0`, baseline `before`, census `t1`, `estate-add-batch`
+   (one item, no workspace), `estate-capture` pass 1, census, pass 2,
+   census, baseline `after`, census, `git init --bare` destination,
+   `estate-apply` (`blahaj-q54`, refs only), compare, destination fsck,
+   census `final`.
+5. **Evidence** (OI-1003-Q54, R-N13). The page
+   `docs/evidence/2026-10-05-blahaj-v1-carry.md` and the record
+   `docs/evidence/2026-10-05-blahaj-v1-carry.json`, which holds every
+   step, the raw logs and the build record.
+6. **Scratch cleanup** (R-N13). Deleted by literal paths: the private
+   state, corpus, destination, apply state, plan, baseline listings and the
+   build tree and binary. The kept files are `run/q54-blahaj.json`,
+   `run/logs/`, `run/census/` and the build log and JSON, under
+   `/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/` (scratch, not
+   durable; the committed JSON carries them). A census `post-cleanup`
+   followed.
+7. **Validation** (OI-1001-Q2). `just check-fast` in `nix develop
+   .#default`, under the shared flock at nice 10, 14:38:37Z to 14:49:20Z,
+   on the tree this note is committed with (the docs below, before this
+   line was added). **Green, exit 0:**
+   - 29 cargo test results, all ok (747 passed, 0 failed);
+   - gitleaks found no leaks;
+   - repo-manifest PASS, and CI contract 22 OK.
+
+   The Bash tool moved the command to the background at its 600 s limit.
+   It was not stopped, and its exit was awaited.
+
+## Key numbers
+
+| Measure | Value |
+|---|---|
+| blahaj refs / distinct objects | 122,994 / 2,382 (119,761 canonical carry, 3,233 native, 2 symrefs, 0 stashes, shallow) |
+| Old-format header, modelled | 24,439,460 B (refused at 16 MiB) |
+| New header equivalent (shallow-envelope manifest) | 265,281 B; inner inventory 2,393 lines (2,382 tips + table + 10 metadata) |
+| pass 1 | `captured`; bundle 229,677,508 B; source read 6,008,771,154 B; CPU 61.08 s; wall 57.5 s |
+| pass 2 (unchanged) | `capture-reused-after-census`; 0 B read, 0 B written; CPU 0.885 s (1.45 %) |
+| apply | `refs-imported`; CPU 38.39 s; wall 35.9 s |
+| Exact compare | 0 missing, 0 extra, 0 oid differences; HEAD and its symbolic branch equal; 80/80 nested worktrees equal; shallow frontier equal |
+| Difference | 2 non-HEAD symrefs restored as plain refs at the identical oid (documented) |
+| S2 | `.git` census identical 7 times (2,884 entries, sha256 `136cb1bd…`) |
+
+## Shas
+
+- origin/main measured: `40adca8043a1bc5075a59979743cdddd5dbadf8f`.
+- Harness sha256 `e7597a76…` (the `census t0` step ran `576abfb7…`, which
+  differs only by the per-step sha line).
+- The branch commit is in the dispatch's structured result.
+
+## Open
+
+1. **A changed rerun of a shallow checkout re-reads every seat** (from the
+   code; not measured). `reuse_unavailable=shallow`, and every changed
+   pass writes a whole envelope: about 6.0 GB read and 230 MB written per
+   changed blahaj pass. This is an S3 delta cost of shallow custody, not of
+   the ref format. A mutable copy of blahaj would measure it.
+2. **Non-HEAD symref targets are not carried.** Carrying them would need a
+   metadata ref, and an operator ruling.
+3. **No workspace restore.** About 6.0 GB was not written to shared
+   scratch.
+4. **Counter placement.** The git half's source reads appear in the item
+   receipt (`source_bytes_read`), not in the process counters'
+   `read_source_file_bytes`, which is 0 for `estate-capture`.
+5. **Linear.** The facts above belong on the Q54 owning issue, but this
+   lane has no Linear write in its dispatch. The coordinator should post
+   them.
+
+## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z)
+
+These rows come from `gh pr list` and `git worktree list` on sting. They
+are **reported, not verified**. The Linear SSOT ledger was not read.
+
+| Stream | Owner | Branch / PR | State (reported) | Next |
+|---|---|---|---|---|
+| **Q54 blahaj carry (this lane)** | this lane | `docs/q54-blahaj-carry-20261005` | measured; MET; pushed, no PR (dispatch) | coordinator review; then L5 |
+| Q54 v1 header | lane | PR #182 | merged 13:32Z | none here |
+| Q42 L6a decide | lane | worktree `q42-l6a-decide-20261005` at `40adca8` | unknown | unknown |
+| Q42 L5 (delete carry_v2) | coordinator | none seen | waits on this proof | coordinator |
+| Whitepaper | docs lane | PR #164 | open | review |
+| #120 ingest token | lane | PR #136 | open, held by WP0(a) | held |
