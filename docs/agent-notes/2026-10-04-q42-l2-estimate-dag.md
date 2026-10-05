@@ -321,6 +321,10 @@ corpus.
 
 ### Verdict: clean
 
+The PR is
+[#175](https://github.com/Jesssullivan/bulkload/pull/175). It was opened
+from 0e82a4f (this entry) against main and was not merged.
+
 - **Finding 1: fixed.** parent-held is now thin.
   - On the CI tier at df1a08e it carries 4 objects in 376 B: 3 whole, and
     the rewritten `a/f1.txt` as a thin `REF_DELTA`. The estimate equals the
@@ -402,15 +406,15 @@ All runs used the CI toolchain, `nix develop .#default` (git 2.54.0, cargo
 Sources: `gh pr list` and the remote branches, read from this lane.
 
 - Verified:
-  - The open PRs are #164 (whitepaper) and #136 (ingest-token), plus this
-    lane's PR (recorded below once opened).
+  - The open PRs are #164 (whitepaper), #136 (ingest-token) and #175
+    (this lane).
   - Q42 sibling lanes:
     - L1, `feat/q42-l1-thin-base-20261004`: c822544 on the remote, 3 commits
       ahead of main. Its local branch is at c2e080f, which is not pushed.
     - L3, `feat/q42-l3-probes-20261004`: a479560, pushed, 2 commits ahead.
     - L4, `docs/q42-l4-formal-custody-20261004`: 8bb9921, not pushed.
-  - This lane, L2: df1a08e plus this round 3 entry. No Q42 PR was open
-    before this one.
+  - This lane, L2: PR #175, opened from 0e82a4f and not merged. No other
+    Q42 PR was open.
 - Not reread in round 3: the other worktrees listed under round 2. Their
   owners and states are unknown here; the coordinator note holds the
   ledger.
