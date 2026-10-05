@@ -161,16 +161,10 @@ dispatch): unused code fails `-D warnings`.
 - Distilled facts are not yet on the owning Linear issue: this lane had no
   issue ID. The Linear SSOT ledger is not reconciled.
 
-## Live workstreams (as seen from this lane, 2026-10-04)
+## Live workstreams (round 1)
 
-Reported, not verified, from `git worktree list` and the open PRs:
-- open PRs #173 (s3-estate), #172 (source-odb-freshen), #171 (slo-q37-q40),
-  #164 (whitepaper) and #136 (ingest-token);
-- worktrees for `q42-l1-thin-base`, `r23-under-load`, `s2-budget`,
-  `fix-store-root-seal` and the wp0e, wp1, wp2, wp3 and wp10 lanes.
-
-The owners and states of those lanes are unknown from here. The coordinator
-note holds the ledger.
+Round 1's list is no longer true: PRs #171, #172 and #173 have merged since
+then. It was removed under R-N55. The current list is under round 3.
 
 ## Round 2: review fixes (2026-10-04)
 
@@ -314,3 +308,109 @@ coordinator note holds the ledger.
     slo-q37-q40;
   - wp0e, wp1, wp2 (two), wp3 (two) and wp10 (two);
   - eight detached review worktrees.
+
+## Round 3: recheck and PR (2026-10-05)
+
+The dispatch: verify adversarially that the review's medium findings are
+fixed on `origin/feat/q42-l2-estimate-dag-20261004` (df1a08e). Verify too
+that the fix round added no new defect. If the branch is clean, open the PR
+and do not merge it.
+
+Rulings cited: OI-1003-Q42, OI-1003-Q44 and R-N13; OI-1003-Q7 for the
+corpus.
+
+### Verdict: clean
+
+- **Finding 1: fixed.** parent-held is now thin.
+  - On the CI tier at df1a08e it carries 4 objects in 376 B: 3 whole, and
+    the rewritten `a/f1.txt` as a thin `REF_DELTA`. The estimate equals the
+    oracle.
+  - Every PINNED row asserts its minimum deltas, and the measured packs meet
+    them:
+    - merge-over-held-branches: 2 thin;
+    - rewrites-over-a-have: 2 thin and 1 in-pack;
+    - nothing-held-stranger: 1 in-pack.
+- **Finding 2: fixed for the estimate leg.**
+  - `dag()` and `build()` carry the derived edits, the `a/sub` and `doc/`
+    paths and the directory rename edit.
+  - The plan row lets an `estimate.rs` fixture retire against P66 only once
+    a PINNED row reproduces its shape and every one of its assertions.
+  - P46's other dimensions remain open, as listed under "Open after
+    round 2".
+- **No new defect found in the fix round.** The following all match the
+  measured packs:
+  - the header parse;
+  - the thin test (a `REF_DELTA` whose base `--fix-thin` appended past the
+    received bytes);
+  - the derived content;
+  - each PINNED comment's counts.
+
+### Round 3 evidence
+
+All runs used the CI toolchain, `nix develop .#default` (git 2.54.0, cargo
+1.96.2).
+
+- **CI tier at df1a08e: 2 passed.**
+  - Every PINNED row matched the numbers round 2 recorded.
+  - Of the 12 fixed-seed cases, 10 have a non-empty pack. 5 hold thin
+    deltas (8 in total) and 4 hold in-pack deltas (16 in total).
+- **Deep tier** (`BULKLOAD_PROPTEST_DEEP=1`, the test binary built at
+  df1a08e): 240 of 240 passed in 86.3 s, with exact bytes in every case.
+  - 172 cases had a non-empty pack, 82 a thin delta and 48 an in-pack delta.
+  - No in-pack `REF_DELTA` appeared. The largest pack held 40 objects.
+- **Two mutants, rerun independently.** Each ran in a scratch copy under
+  `$TMPDIR/q42-l2-recheck-mutants.*`, deleted afterwards, and each fails
+  both tests:
+  - `pack.useSparse=true`: directory-rename-over-a-have and a fixed-seed
+    case refuse `CONTRACT_SELF_INCONSISTENT`.
+  - `--thin` removed: parent-held gives 955 B against the oracle's 376 B.
+
+  The other two mutants (`--delta-base-offset` removed, `--window=0`) were
+  not rerun.
+- **The sparse shape, checked in plain git.** A have holds `a/sub`, and the
+  want moves `a/` to `b/`. `pack-objects --thin --revs` then packs 6 objects
+  with `pack.useSparse=true` and 4 with `false`, and `rev-list --objects`
+  lists 4. That gap is the count the estimate refuses on.
+- **Merge state.** The branch merges cleanly into origin/main (cdfe5f4).
+  Since 8dc26c1, main's only change to `estimate.rs` is the probe's
+  `fastimport.unpackLimit=0`, which P66 does not exercise.
+- **`just check-fast`: exit 0.**
+  - It ran on df1a08e, with this round 3 entry in the tree but not yet
+    committed. The only later change is this check-fast item.
+  - It was started in the foreground, through the flock and inside
+    `nix develop .#default`, at 01:33:11Z, and was waited for until it
+    exited at 02:12:59Z.
+  - Most of that time was spent waiting for the shared lock, which other
+    lanes held. The harness's 10-minute foreground cap therefore moved the
+    waiting call to a tracked background task. Its exit was waited for
+    before anything was committed.
+  - 27 cargo `test result` lines, none with a failure.
+    - `git_estimate_dag`: 2 passed in 8.26 s.
+    - `git_carry_v2`: 65 passed.
+    - fault_harness: 56 passed. power_loss: 9 passed.
+  - Contract tests: 22 OK.
+
+### Open after round 3
+
+- The review's low findings stay open as listed under "Open after round 2".
+  The PR body carries their disposition.
+- Distilled facts are not on a Linear issue, because this lane has no issue
+  ID. The Linear SSOT ledger is not reconciled from this lane.
+
+### Live workstreams (round 3, 2026-10-05, about 02:00Z)
+
+Sources: `gh pr list` and the remote branches, read from this lane.
+
+- Verified:
+  - The open PRs are #164 (whitepaper) and #136 (ingest-token), plus this
+    lane's PR (recorded below once opened).
+  - Q42 sibling lanes:
+    - L1, `feat/q42-l1-thin-base-20261004`: c822544 on the remote, 3 commits
+      ahead of main. Its local branch is at c2e080f, which is not pushed.
+    - L3, `feat/q42-l3-probes-20261004`: a479560, pushed, 2 commits ahead.
+    - L4, `docs/q42-l4-formal-custody-20261004`: 8bb9921, not pushed.
+  - This lane, L2: df1a08e plus this round 3 entry. No Q42 PR was open
+    before this one.
+- Not reread in round 3: the other worktrees listed under round 2. Their
+  owners and states are unknown here; the coordinator note holds the
+  ledger.
