@@ -1,8 +1,9 @@
 //! Read-only measurement of what a negotiated thin-pack carry would move
-//! (R-N60 baseline; R-N74 and R-N97 gate metric; R-N75 refusals). It was git
-//! carry v2's projection; carry v2 itself was deleted under OI-1003-Q44 and
-//! OI-1003-Q56 (tag `carry-v2-final`), and the estimate stays as a read-only
-//! verb. "The M1 sender" below is the sender that tag holds.
+//! (R-N60 baseline; R-N74 and R-N97 gate metric; R-N75 refusals).
+//!
+//! It was git carry v2's projection. carry v2 itself was deleted under
+//! OI-1003-Q44 and OI-1003-Q56 (tag `carry-v2-final`), and the estimate stays
+//! as a read-only verb. "The M1 sender" below is the sender that tag holds.
 //!
 //! One probe script, [`PROBE_SCRIPT`], reads a repository's offer: every ref
 //! tip, every worktree's `HEAD` and per-worktree refs (`refs/worktree/`,
