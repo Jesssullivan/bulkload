@@ -1,0 +1,1193 @@
+{
+ "agent": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+ "agent_sha256": "74a6e0ce06e1f5614cd54c4955a3fb4142d4e4f8c796d5e437d71f1271493ad8",
+ "build": {
+  "argv": "s3_estate.py build --out <scratch>/build --rev 40adca8 --jobs 4 --lock <lock> (nice 19, CARGO_BUILD_JOBS=4, own CARGO_TARGET_DIR, cargo build --release --locked -p bulkload-agent in the archived tree's nix develop)",
+  "binary": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+  "finished": "2026-10-05T14:30:45Z",
+  "jobs": 4,
+  "lock": "/srv/fast-local/jess/git/bulkload.worktrees/.check-fast.lock",
+  "queued": "2026-10-05T14:27:06Z",
+  "rev": "40adca8",
+  "sha": "40adca8043a1bc5075a59979743cdddd5dbadf8f",
+  "sha256": "74a6e0ce06e1f5614cd54c4955a3fb4142d4e4f8c796d5e437d71f1271493ad8",
+  "started": "2026-10-05T14:27:07Z"
+ },
+ "format": "bulkload-q54-blahaj-carry-v1",
+ "harness_sha256": "576abfb772200c9161275b008d2b8d020c577e00f83ca2ac775a8bcaf9f4c2be",
+ "host": "sting",
+ "label": "informational, sting, ungated",
+ "logs": {
+  "logs/apply/estate-apply.err": "counters verb=estate-apply side=local scope=process priority=normal priority_from=default elapsed_ns=35940898067 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=229677508 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=229677508 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=229677508 blake3_other_bytes=0 flush_full_count=3 flush_full_ns=36121002 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=5 flush_dir_ns=50276532 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=0 blake3_total_bytes=229677508 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=8\n",
+  "logs/apply/estate-apply.out": "item=7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3 source=\"/srv/fast-local/jess/git/blahaj\" outcome=refs-imported reason=None source_bytes_read=0\n",
+  "logs/pass1/estate-capture.err": "counters verb=estate-capture side=local scope=process priority=background priority_from=default elapsed_ns=57515625108 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=217313280 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=229677508 read_bundle_stage_bytes=0 write_source_pack_bytes=236378653 write_source_pack_objects=63079 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=229677508 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=5 flush_full_ns=1041627058 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=5 flush_dir_ns=50850979 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=4 blake3_total_bytes=229677508 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=10\n",
+  "logs/pass1/estate-capture.out": "item=7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3 source=\"/srv/fast-local/jess/git/blahaj\" outcome=captured reason=None source_bytes_read=6008771154\n",
+  "logs/pass2/estate-capture.err": "counters verb=estate-capture side=local scope=process priority=background priority_from=default elapsed_ns=811369750 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=0 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=1 flush_full_ns=12582699 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=3 flush_dir_ns=27984898 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=1 blake3_total_bytes=0 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=4\n",
+  "logs/pass2/estate-capture.out": "item=7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3 source=\"/srv/fast-local/jess/git/blahaj\" outcome=capture-reused-after-census reason=None source_bytes_read=0\n",
+  "logs/plan/estate-add-batch.err": "counters verb=estate-add-batch side=local scope=process priority=normal priority_from=default elapsed_ns=28157685 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=0 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=1 flush_full_ns=21045943 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=1 flush_dir_ns=6460262 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=0 blake3_total_bytes=0 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=2\n",
+  "logs/plan/estate-add-batch.out": ""
+ },
+ "notes": [
+  "census/t0 ran harness revision sha256 576abfb7... (the record's top-level harness_sha256); every later step ran e7597a76..., which only adds the per-step harness_sha256 line.",
+  "Raw outputs (baseline ref listings, census files) stayed in private scratch; their sha256 digests are recorded here.",
+  "census/post-cleanup was taken after the lane deleted its own scratch (state, corpus, destination, build tree) by literal paths."
+ ],
+ "rulings": "OI-1003-Q54, OI-1003-Q55, OI-1003-Q35, R-N13",
+ "source": "/srv/fast-local/jess/git/blahaj",
+ "source_label": "blahaj-q54",
+ "steps": {
+  "apply": {
+   "after": {
+    "at": "2026-10-05T14:34:02Z",
+    "load1": 10.24
+   },
+   "apply_state_bytes": 61,
+   "argv": [
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+    "estate-apply",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/plan/plan.json",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/corpus",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/apply-state",
+    "blahaj-q54",
+    "1"
+   ],
+   "before": {
+    "at": "2026-10-05T14:33:26Z",
+    "load1": 10.03
+   },
+   "counters": {
+    "blake3_bundle_stage_bytes": 229677508,
+    "blake3_capture_chunk_bytes": 0,
+    "blake3_dest_bytes": 0,
+    "blake3_dest_local_reuse_bytes": 0,
+    "blake3_dest_wire_verify_bytes": 0,
+    "blake3_hash_file_bytes": 0,
+    "blake3_other_bytes": 0,
+    "blake3_total_bytes": 229677508,
+    "blake3_verify_existing_bytes": 0,
+    "census_walks": 0,
+    "directories_finished": 0,
+    "durable_groups": 0,
+    "elapsed_ns": 35940898067,
+    "files_materialized": 0,
+    "flush_barrier_count": 0,
+    "flush_barrier_ns": 0,
+    "flush_dir_barrier_count": 0,
+    "flush_dir_barrier_ns": 0,
+    "flush_dir_count": 5,
+    "flush_dir_ns": 50276532,
+    "flush_fdatasync_count": 0,
+    "flush_fdatasync_ns": 0,
+    "flush_full_count": 3,
+    "flush_full_ns": 36121002,
+    "full_flushes_total": 8,
+    "priority": "normal",
+    "priority_from": "default",
+    "publish_link_fallback": 0,
+    "read_bundle_stage_bytes": 229677508,
+    "read_dest_local_reuse_bytes": 0,
+    "read_dest_verify_existing_bytes": 0,
+    "read_hash_file_bytes": 0,
+    "read_source_capture_reuse_bytes": 0,
+    "read_source_file_bytes": 0,
+    "read_source_pack_readback_bytes": 0,
+    "scope": "process",
+    "side": "local",
+    "sqlite_commit_ns": 0,
+    "sqlite_commits_total": 0,
+    "sqlite_directory_complete_commits": 0,
+    "sqlite_directory_pending_commits": 0,
+    "sqlite_group_dest_commits": 0,
+    "sqlite_group_source_commits": 0,
+    "sqlite_record_capture_commits": 0,
+    "sqlite_schema_commits": 0,
+    "transfer_legacy_rows_invalidated": 0,
+    "transfer_racy_captures": 0,
+    "transport_buffers_raised": 0,
+    "verb": "estate-apply",
+    "wire_bytes_received": 0,
+    "wire_bytes_sent": 0,
+    "wire_frames_received": 0,
+    "wire_frames_sent": 0,
+    "write_bundle_stage_bytes": 229677508,
+    "write_dest_materialize_bytes": 0,
+    "write_source_pack_bytes": 0,
+    "write_source_pack_objects": 0
+   },
+   "cpu_s": 38.389418,
+   "dest_bytes": 473120264,
+   "dest_init_exit": 0,
+   "exit": 0,
+   "final_refusal": null,
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "maxrss_kib": 459780,
+   "receipts": [
+    {
+     "extra": [],
+     "item": "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3",
+     "outcome": "refs-imported",
+     "reason": "None",
+     "source": "/srv/fast-local/jess/git/blahaj",
+     "source_bytes_read": 0
+    }
+   ],
+   "stderr_tail": [
+    "counters verb=estate-apply side=local scope=process priority=normal priority_from=default elapsed_ns=35940898067 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=229677508 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=229677508 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=229677508 blake3_other_bytes=0 flush_full_count=3 flush_full_ns=36121002 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=5 flush_dir_ns=50276532 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=0 blake3_total_bytes=229677508 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=8"
+   ],
+   "step": "apply/estate-apply",
+   "sys_s": 16.507389,
+   "user_s": 21.882029,
+   "wall_ns": 35947664933
+  },
+  "baseline/after": {
+   "canonical_carry_refs": 119761,
+   "distinct_oids": 2382,
+   "for-each-ref": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "for-each-ref",
+     "--format=%(objectname) %(refname) %(symref)"
+    ],
+    "bytes": 22947396,
+    "exit": 0,
+    "lines": 122994,
+    "sha256": "ba95aa7fa0e1f847a2a2f6cb59f1fb7cc88e2eead47bc3c0471b81a4d585df4e"
+   },
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "head": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--verify",
+     "HEAD"
+    ],
+    "bytes": 41,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "e0bc1f33c2b18dfc925d2a329b7e9ab2a941839331765c97ab86b812588ece01",
+    "value": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8"
+   },
+   "head-symbolic": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "symbolic-ref",
+     "-q",
+     "HEAD"
+    ],
+    "bytes": 51,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "e40449b415f1e43d4b4dd3f17756a35df8d4f86a8ba15ddcc3606e04706021a8",
+    "value": "refs/heads/backup/glorious-build-tenant-pre-rebase"
+   },
+   "native_refs": 3233,
+   "object-format": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--show-object-format"
+    ],
+    "bytes": 5,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "335277ee77cfc8d51d6602e4137232cf6041aac2bc663777e384b90d5ae74d51",
+    "value": "sha1"
+   },
+   "old_format_header_model_bytes": 24439443,
+   "refs": 122994,
+   "refset_sha256": "ba95aa7fa0e1f847a2a2f6cb59f1fb7cc88e2eead47bc3c0471b81a4d585df4e",
+   "shallow-file": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--path-format=absolute",
+     "--git-path",
+     "shallow"
+    ],
+    "bytes": 45,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "d9a2d82cabe7f6078cb80cf1730149958158caa659cd41cfd872f07091df8583"
+   },
+   "shallow_frontier_lines": 1,
+   "stash-list": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "stash",
+     "list",
+     "--format=%H"
+    ],
+    "bytes": 0,
+    "exit": 0,
+    "lines": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "stashes": [],
+   "symrefs": {
+    "refs/remotes/github/HEAD": "refs/remotes/github/main",
+    "refs/remotes/yoga/HEAD": "refs/remotes/yoga/main"
+   },
+   "taken": "2026-10-05T14:33:17Z",
+   "worktree-list": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "worktree",
+     "list",
+     "--porcelain"
+    ],
+    "bytes": 27086,
+    "exit": 0,
+    "lines": 484,
+    "sha256": "557ed0e0785013c263843a28c5e3eb708f216bc9706450a8a1b9790f143562c0"
+   },
+   "worktrees": {
+    "main": {
+     "HEAD": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8",
+     "branch": "refs/heads/backup/glorious-build-tenant-pre-rebase",
+     "worktree": "/srv/fast-local/jess/git/blahaj"
+    },
+    "nested": {
+     ".claude/worktrees/wf_03cb49f9-b33-1": "6e5eb16501036f839e40b5c065a754134a788512",
+     ".claude/worktrees/wf_03cb49f9-b33-2": "6e5eb16501036f839e40b5c065a754134a788512",
+     ".claude/worktrees/wf_03cb49f9-b33-3": "191fba84b0800751a8130b8171b16c3b0fa6bcff",
+     ".claude/worktrees/wf_0564cf77-fbd-1": "33555fd23667c438959c5ff4186e4ca706dcf47e",
+     ".claude/worktrees/wf_0564cf77-fbd-2": "33555fd23667c438959c5ff4186e4ca706dcf47e",
+     ".claude/worktrees/wf_11c0e3dd-09b-1": "b070740c12f6c5f4cba3557f5f0c4bcb25bd0e68",
+     ".claude/worktrees/wf_11c0e3dd-09b-2": "5902f5ba4992ec7d3c393cbbc241669cf745f211",
+     ".claude/worktrees/wf_11c0e3dd-09b-3": "21c24ec7378fecf72e8d652b6f760d262be4d507",
+     ".claude/worktrees/wf_11c0e3dd-09b-4": "862ce2183c6890ff01b8f02b71f14b001ea759ff",
+     ".claude/worktrees/wf_19dfff03-8ed-1": "7055008d42ade22fac338f01c18b517bd0a92094",
+     ".claude/worktrees/wf_19dfff03-8ed-10": "869fb5d172a43a68a924bb97db21b903b3753849",
+     ".claude/worktrees/wf_19dfff03-8ed-11": "aba2700218c837c14cedea61f9309111d5a3e113",
+     ".claude/worktrees/wf_19dfff03-8ed-12": "3fb0619724253af798446d06353017f496657d7e",
+     ".claude/worktrees/wf_19dfff03-8ed-13": "fd242222c46370d57fb1d5001c35c9334e3ef428",
+     ".claude/worktrees/wf_19dfff03-8ed-14": "8a7939ff23e24de83f7607daf87c360a3d015a83",
+     ".claude/worktrees/wf_19dfff03-8ed-3": "635c8cdf056954fde8d7e713270969298d83bdee",
+     ".claude/worktrees/wf_19dfff03-8ed-4": "aba2700218c837c14cedea61f9309111d5a3e113",
+     ".claude/worktrees/wf_19dfff03-8ed-5": "fd242222c46370d57fb1d5001c35c9334e3ef428",
+     ".claude/worktrees/wf_19dfff03-8ed-6": "7055008d42ade22fac338f01c18b517bd0a92094",
+     ".claude/worktrees/wf_19dfff03-8ed-7": "635c8cdf056954fde8d7e713270969298d83bdee",
+     ".claude/worktrees/wf_19dfff03-8ed-8": "390b12bf784e0f299a53e04c95b0e744b73e3cc5",
+     ".claude/worktrees/wf_19dfff03-8ed-9": "488c913a7653d03c983442d0ced111627ece1678",
+     ".claude/worktrees/wf_1eadd173-dad-1": "abd3e8fa6fed63565d8406c6f82387fd55f12671",
+     ".claude/worktrees/wf_1eadd173-dad-2": "abd3e8fa6fed63565d8406c6f82387fd55f12671",
+     ".claude/worktrees/wf_1fb4bd0c-411-1": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_35de7748-468-3": "feb75180d0a1386caf9ba1061d821520bcc6840d",
+     ".claude/worktrees/wf_3c30f5d4-0d5-1": "f26472757e3e9ee354ec9332ca9a50c044f4d541",
+     ".claude/worktrees/wf_503fd89b-389-1": "ee9a9b515e55c16159e1dd871cba3a180fb1f969",
+     ".claude/worktrees/wf_73318d86-7e6-1": "18b4e443a3ba38a5feaff88ab3afa2e9606158fe",
+     ".claude/worktrees/wf_73318d86-7e6-2": "18b4e443a3ba38a5feaff88ab3afa2e9606158fe",
+     ".claude/worktrees/wf_73318d86-7e6-3": "65911337209350ba8a4a5d1a09987e2500dd9e78",
+     ".claude/worktrees/wf_8287d6b6-14e-1": "826e00a3350f84851069d8c16314d6841144dc50",
+     ".claude/worktrees/wf_8287d6b6-14e-2": "0a1017734973c7c2ce7c1c3400f5520fbdded9fd",
+     ".claude/worktrees/wf_8287d6b6-14e-3": "826e00a3350f84851069d8c16314d6841144dc50",
+     ".claude/worktrees/wf_8287d6b6-14e-4": "0a1017734973c7c2ce7c1c3400f5520fbdded9fd",
+     ".claude/worktrees/wf_8287d6b6-14e-5": "5f2903b7223e40e0db18eccf2cf60bda3aeb10ba",
+     ".claude/worktrees/wf_8287d6b6-14e-6": "a309583266a15679fd4f66cd5e78b3c016f45b2b",
+     ".claude/worktrees/wf_9dea663b-77e-1": "b8547dc17bcbba964873b75481e3f6fd48b2f0ed",
+     ".claude/worktrees/wf_9dea663b-77e-10": "a8bb8b257c9bb1d6b89a8c85fc83e360cbf5cb98",
+     ".claude/worktrees/wf_9dea663b-77e-11": "4ce11233678a80b77828a168fe95c6c5d801a30d",
+     ".claude/worktrees/wf_9dea663b-77e-12": "0c3e63e8d8566d53dc0097a6d12a627857bc8e21",
+     ".claude/worktrees/wf_9dea663b-77e-13": "faed6557e78a466375e5d79fb43a079ae9b2991f",
+     ".claude/worktrees/wf_9dea663b-77e-14": "e300d9a8bd7510fa3e55b5c0e205e6f9d4874d1c",
+     ".claude/worktrees/wf_9dea663b-77e-15": "ee326ea06c2ec9a69cf92ec13cab802562c945c9",
+     ".claude/worktrees/wf_9dea663b-77e-16": "b8547dc17bcbba964873b75481e3f6fd48b2f0ed",
+     ".claude/worktrees/wf_9dea663b-77e-2": "b60f8211cb7ff3fbae67a0bbc93cfa61009c1ed8",
+     ".claude/worktrees/wf_9dea663b-77e-3": "8908911a8b3f8ded6c557a0dc0ef55439473cfad",
+     ".claude/worktrees/wf_9dea663b-77e-4": "34ed0340c77673d5d8696c3df3a293387fbb0b38",
+     ".claude/worktrees/wf_9dea663b-77e-6": "a8bb8b257c9bb1d6b89a8c85fc83e360cbf5cb98",
+     ".claude/worktrees/wf_9dea663b-77e-7": "b60f8211cb7ff3fbae67a0bbc93cfa61009c1ed8",
+     ".claude/worktrees/wf_9dea663b-77e-8": "34ed0340c77673d5d8696c3df3a293387fbb0b38",
+     ".claude/worktrees/wf_9dea663b-77e-9": "8908911a8b3f8ded6c557a0dc0ef55439473cfad",
+     ".claude/worktrees/wf_b1b19569-a60-1": "c45ef0d8d2fd7c31f859ab2ceca52f34c9835d32",
+     ".claude/worktrees/wf_b1b19569-a60-2": "c45ef0d8d2fd7c31f859ab2ceca52f34c9835d32",
+     ".claude/worktrees/wf_ba416e24-474-1": "c7e16ee098272c145d258a8762fdf79e6279cbe1",
+     ".claude/worktrees/wf_ba416e24-474-2": "c7e16ee098272c145d258a8762fdf79e6279cbe1",
+     ".claude/worktrees/wf_d2d12a7d-d6c-1": "589b2116d6c20bcc3b018680dbfcf555dc471b04",
+     ".claude/worktrees/wf_d2d12a7d-d6c-10": "d977471e890dcef6ecd6f2e5923859d1d5b1a2de",
+     ".claude/worktrees/wf_d2d12a7d-d6c-11": "80ba11ad2f4510d1c32647521aef03e8809a12c3",
+     ".claude/worktrees/wf_d2d12a7d-d6c-12": "cec5892e56fc224d4b4d97b56176f1ac7da6e42f",
+     ".claude/worktrees/wf_d2d12a7d-d6c-13": "11b40230abc0e53b731c2bd0abe3d908de01940b",
+     ".claude/worktrees/wf_d2d12a7d-d6c-14": "97d24632cf1abc3693aa1ccd1c5ab053cdd73177",
+     ".claude/worktrees/wf_d2d12a7d-d6c-15": "f526223e27f7aadcb9cc2fff7a004740e214fe1a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-2": "9ac4d175eaba054e315334ee5f9153196b382e9a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-3": "0a9bc84fc4fd7ad5c0557f7545bc49d8f2ba4c3c",
+     ".claude/worktrees/wf_d2d12a7d-d6c-5": "7662ebeaf09b78983946a55373193003832795d9",
+     ".claude/worktrees/wf_d2d12a7d-d6c-6": "9ac4d175eaba054e315334ee5f9153196b382e9a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-7": "0a9bc84fc4fd7ad5c0557f7545bc49d8f2ba4c3c",
+     ".claude/worktrees/wf_d2d12a7d-d6c-8": "7662ebeaf09b78983946a55373193003832795d9",
+     ".claude/worktrees/wf_d2d12a7d-d6c-9": "589b2116d6c20bcc3b018680dbfcf555dc471b04",
+     ".claude/worktrees/wf_e79cc9dc-743-2": "5902f5ba4992ec7d3c393cbbc241669cf745f211",
+     ".claude/worktrees/wf_eb9a75cf-105-1": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_eb9a75cf-105-2": "befb5dead852c2eb65eebfd398171a8d64fcc258",
+     ".claude/worktrees/wf_eb9a75cf-105-3": "72cf05b6dfd815e12192d2088ad8a72c3e3de0d5",
+     ".claude/worktrees/wf_eb9a75cf-105-5": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_eb9a75cf-105-6": "befb5dead852c2eb65eebfd398171a8d64fcc258",
+     ".claude/worktrees/wf_eb9a75cf-105-7": "72cf05b6dfd815e12192d2088ad8a72c3e3de0d5",
+     ".worktrees/dhall-legacy-20260906": "300f251402645063b6f3b3224155f6b26484491a",
+     ".worktrees/disarm-gf-worker-host-writer-20260824": "9680758829671edc93242bc94c23fe61b96480c0",
+     ".worktrees/kf3-sting-agent-admin-20260921": "c78fdd7dd2034dc6bc15f2fd6dd223ae939f8c5c"
+    },
+    "nested_inside_checkout": 80,
+    "outside_checkout": 40,
+    "total": 121
+   }
+  },
+  "baseline/before": {
+   "canonical_carry_refs": 119761,
+   "distinct_oids": 2382,
+   "for-each-ref": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "for-each-ref",
+     "--format=%(objectname) %(refname) %(symref)"
+    ],
+    "bytes": 22947396,
+    "exit": 0,
+    "lines": 122994,
+    "sha256": "ba95aa7fa0e1f847a2a2f6cb59f1fb7cc88e2eead47bc3c0471b81a4d585df4e"
+   },
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "head": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--verify",
+     "HEAD"
+    ],
+    "bytes": 41,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "e0bc1f33c2b18dfc925d2a329b7e9ab2a941839331765c97ab86b812588ece01",
+    "value": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8"
+   },
+   "head-symbolic": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "symbolic-ref",
+     "-q",
+     "HEAD"
+    ],
+    "bytes": 51,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "e40449b415f1e43d4b4dd3f17756a35df8d4f86a8ba15ddcc3606e04706021a8",
+    "value": "refs/heads/backup/glorious-build-tenant-pre-rebase"
+   },
+   "native_refs": 3233,
+   "object-format": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--show-object-format"
+    ],
+    "bytes": 5,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "335277ee77cfc8d51d6602e4137232cf6041aac2bc663777e384b90d5ae74d51",
+    "value": "sha1"
+   },
+   "old_format_header_model_bytes": 24439443,
+   "refs": 122994,
+   "refset_sha256": "ba95aa7fa0e1f847a2a2f6cb59f1fb7cc88e2eead47bc3c0471b81a4d585df4e",
+   "shallow-file": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "rev-parse",
+     "--path-format=absolute",
+     "--git-path",
+     "shallow"
+    ],
+    "bytes": 45,
+    "exit": 0,
+    "lines": 1,
+    "sha256": "d9a2d82cabe7f6078cb80cf1730149958158caa659cd41cfd872f07091df8583"
+   },
+   "shallow_frontier_lines": 1,
+   "stash-list": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "stash",
+     "list",
+     "--format=%H"
+    ],
+    "bytes": 0,
+    "exit": 0,
+    "lines": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "stashes": [],
+   "symrefs": {
+    "refs/remotes/github/HEAD": "refs/remotes/github/main",
+    "refs/remotes/yoga/HEAD": "refs/remotes/yoga/main"
+   },
+   "taken": "2026-10-05T14:31:16Z",
+   "worktree-list": {
+    "argv": [
+     "git",
+     "-C",
+     "/srv/fast-local/jess/git/blahaj",
+     "worktree",
+     "list",
+     "--porcelain"
+    ],
+    "bytes": 27086,
+    "exit": 0,
+    "lines": 484,
+    "sha256": "557ed0e0785013c263843a28c5e3eb708f216bc9706450a8a1b9790f143562c0"
+   },
+   "worktrees": {
+    "main": {
+     "HEAD": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8",
+     "branch": "refs/heads/backup/glorious-build-tenant-pre-rebase",
+     "worktree": "/srv/fast-local/jess/git/blahaj"
+    },
+    "nested": {
+     ".claude/worktrees/wf_03cb49f9-b33-1": "6e5eb16501036f839e40b5c065a754134a788512",
+     ".claude/worktrees/wf_03cb49f9-b33-2": "6e5eb16501036f839e40b5c065a754134a788512",
+     ".claude/worktrees/wf_03cb49f9-b33-3": "191fba84b0800751a8130b8171b16c3b0fa6bcff",
+     ".claude/worktrees/wf_0564cf77-fbd-1": "33555fd23667c438959c5ff4186e4ca706dcf47e",
+     ".claude/worktrees/wf_0564cf77-fbd-2": "33555fd23667c438959c5ff4186e4ca706dcf47e",
+     ".claude/worktrees/wf_11c0e3dd-09b-1": "b070740c12f6c5f4cba3557f5f0c4bcb25bd0e68",
+     ".claude/worktrees/wf_11c0e3dd-09b-2": "5902f5ba4992ec7d3c393cbbc241669cf745f211",
+     ".claude/worktrees/wf_11c0e3dd-09b-3": "21c24ec7378fecf72e8d652b6f760d262be4d507",
+     ".claude/worktrees/wf_11c0e3dd-09b-4": "862ce2183c6890ff01b8f02b71f14b001ea759ff",
+     ".claude/worktrees/wf_19dfff03-8ed-1": "7055008d42ade22fac338f01c18b517bd0a92094",
+     ".claude/worktrees/wf_19dfff03-8ed-10": "869fb5d172a43a68a924bb97db21b903b3753849",
+     ".claude/worktrees/wf_19dfff03-8ed-11": "aba2700218c837c14cedea61f9309111d5a3e113",
+     ".claude/worktrees/wf_19dfff03-8ed-12": "3fb0619724253af798446d06353017f496657d7e",
+     ".claude/worktrees/wf_19dfff03-8ed-13": "fd242222c46370d57fb1d5001c35c9334e3ef428",
+     ".claude/worktrees/wf_19dfff03-8ed-14": "8a7939ff23e24de83f7607daf87c360a3d015a83",
+     ".claude/worktrees/wf_19dfff03-8ed-3": "635c8cdf056954fde8d7e713270969298d83bdee",
+     ".claude/worktrees/wf_19dfff03-8ed-4": "aba2700218c837c14cedea61f9309111d5a3e113",
+     ".claude/worktrees/wf_19dfff03-8ed-5": "fd242222c46370d57fb1d5001c35c9334e3ef428",
+     ".claude/worktrees/wf_19dfff03-8ed-6": "7055008d42ade22fac338f01c18b517bd0a92094",
+     ".claude/worktrees/wf_19dfff03-8ed-7": "635c8cdf056954fde8d7e713270969298d83bdee",
+     ".claude/worktrees/wf_19dfff03-8ed-8": "390b12bf784e0f299a53e04c95b0e744b73e3cc5",
+     ".claude/worktrees/wf_19dfff03-8ed-9": "488c913a7653d03c983442d0ced111627ece1678",
+     ".claude/worktrees/wf_1eadd173-dad-1": "abd3e8fa6fed63565d8406c6f82387fd55f12671",
+     ".claude/worktrees/wf_1eadd173-dad-2": "abd3e8fa6fed63565d8406c6f82387fd55f12671",
+     ".claude/worktrees/wf_1fb4bd0c-411-1": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_35de7748-468-3": "feb75180d0a1386caf9ba1061d821520bcc6840d",
+     ".claude/worktrees/wf_3c30f5d4-0d5-1": "f26472757e3e9ee354ec9332ca9a50c044f4d541",
+     ".claude/worktrees/wf_503fd89b-389-1": "ee9a9b515e55c16159e1dd871cba3a180fb1f969",
+     ".claude/worktrees/wf_73318d86-7e6-1": "18b4e443a3ba38a5feaff88ab3afa2e9606158fe",
+     ".claude/worktrees/wf_73318d86-7e6-2": "18b4e443a3ba38a5feaff88ab3afa2e9606158fe",
+     ".claude/worktrees/wf_73318d86-7e6-3": "65911337209350ba8a4a5d1a09987e2500dd9e78",
+     ".claude/worktrees/wf_8287d6b6-14e-1": "826e00a3350f84851069d8c16314d6841144dc50",
+     ".claude/worktrees/wf_8287d6b6-14e-2": "0a1017734973c7c2ce7c1c3400f5520fbdded9fd",
+     ".claude/worktrees/wf_8287d6b6-14e-3": "826e00a3350f84851069d8c16314d6841144dc50",
+     ".claude/worktrees/wf_8287d6b6-14e-4": "0a1017734973c7c2ce7c1c3400f5520fbdded9fd",
+     ".claude/worktrees/wf_8287d6b6-14e-5": "5f2903b7223e40e0db18eccf2cf60bda3aeb10ba",
+     ".claude/worktrees/wf_8287d6b6-14e-6": "a309583266a15679fd4f66cd5e78b3c016f45b2b",
+     ".claude/worktrees/wf_9dea663b-77e-1": "b8547dc17bcbba964873b75481e3f6fd48b2f0ed",
+     ".claude/worktrees/wf_9dea663b-77e-10": "a8bb8b257c9bb1d6b89a8c85fc83e360cbf5cb98",
+     ".claude/worktrees/wf_9dea663b-77e-11": "4ce11233678a80b77828a168fe95c6c5d801a30d",
+     ".claude/worktrees/wf_9dea663b-77e-12": "0c3e63e8d8566d53dc0097a6d12a627857bc8e21",
+     ".claude/worktrees/wf_9dea663b-77e-13": "faed6557e78a466375e5d79fb43a079ae9b2991f",
+     ".claude/worktrees/wf_9dea663b-77e-14": "e300d9a8bd7510fa3e55b5c0e205e6f9d4874d1c",
+     ".claude/worktrees/wf_9dea663b-77e-15": "ee326ea06c2ec9a69cf92ec13cab802562c945c9",
+     ".claude/worktrees/wf_9dea663b-77e-16": "b8547dc17bcbba964873b75481e3f6fd48b2f0ed",
+     ".claude/worktrees/wf_9dea663b-77e-2": "b60f8211cb7ff3fbae67a0bbc93cfa61009c1ed8",
+     ".claude/worktrees/wf_9dea663b-77e-3": "8908911a8b3f8ded6c557a0dc0ef55439473cfad",
+     ".claude/worktrees/wf_9dea663b-77e-4": "34ed0340c77673d5d8696c3df3a293387fbb0b38",
+     ".claude/worktrees/wf_9dea663b-77e-6": "a8bb8b257c9bb1d6b89a8c85fc83e360cbf5cb98",
+     ".claude/worktrees/wf_9dea663b-77e-7": "b60f8211cb7ff3fbae67a0bbc93cfa61009c1ed8",
+     ".claude/worktrees/wf_9dea663b-77e-8": "34ed0340c77673d5d8696c3df3a293387fbb0b38",
+     ".claude/worktrees/wf_9dea663b-77e-9": "8908911a8b3f8ded6c557a0dc0ef55439473cfad",
+     ".claude/worktrees/wf_b1b19569-a60-1": "c45ef0d8d2fd7c31f859ab2ceca52f34c9835d32",
+     ".claude/worktrees/wf_b1b19569-a60-2": "c45ef0d8d2fd7c31f859ab2ceca52f34c9835d32",
+     ".claude/worktrees/wf_ba416e24-474-1": "c7e16ee098272c145d258a8762fdf79e6279cbe1",
+     ".claude/worktrees/wf_ba416e24-474-2": "c7e16ee098272c145d258a8762fdf79e6279cbe1",
+     ".claude/worktrees/wf_d2d12a7d-d6c-1": "589b2116d6c20bcc3b018680dbfcf555dc471b04",
+     ".claude/worktrees/wf_d2d12a7d-d6c-10": "d977471e890dcef6ecd6f2e5923859d1d5b1a2de",
+     ".claude/worktrees/wf_d2d12a7d-d6c-11": "80ba11ad2f4510d1c32647521aef03e8809a12c3",
+     ".claude/worktrees/wf_d2d12a7d-d6c-12": "cec5892e56fc224d4b4d97b56176f1ac7da6e42f",
+     ".claude/worktrees/wf_d2d12a7d-d6c-13": "11b40230abc0e53b731c2bd0abe3d908de01940b",
+     ".claude/worktrees/wf_d2d12a7d-d6c-14": "97d24632cf1abc3693aa1ccd1c5ab053cdd73177",
+     ".claude/worktrees/wf_d2d12a7d-d6c-15": "f526223e27f7aadcb9cc2fff7a004740e214fe1a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-2": "9ac4d175eaba054e315334ee5f9153196b382e9a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-3": "0a9bc84fc4fd7ad5c0557f7545bc49d8f2ba4c3c",
+     ".claude/worktrees/wf_d2d12a7d-d6c-5": "7662ebeaf09b78983946a55373193003832795d9",
+     ".claude/worktrees/wf_d2d12a7d-d6c-6": "9ac4d175eaba054e315334ee5f9153196b382e9a",
+     ".claude/worktrees/wf_d2d12a7d-d6c-7": "0a9bc84fc4fd7ad5c0557f7545bc49d8f2ba4c3c",
+     ".claude/worktrees/wf_d2d12a7d-d6c-8": "7662ebeaf09b78983946a55373193003832795d9",
+     ".claude/worktrees/wf_d2d12a7d-d6c-9": "589b2116d6c20bcc3b018680dbfcf555dc471b04",
+     ".claude/worktrees/wf_e79cc9dc-743-2": "5902f5ba4992ec7d3c393cbbc241669cf745f211",
+     ".claude/worktrees/wf_eb9a75cf-105-1": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_eb9a75cf-105-2": "befb5dead852c2eb65eebfd398171a8d64fcc258",
+     ".claude/worktrees/wf_eb9a75cf-105-3": "72cf05b6dfd815e12192d2088ad8a72c3e3de0d5",
+     ".claude/worktrees/wf_eb9a75cf-105-5": "82a1637cb8e33822bae27a61aa66fa771d2987d7",
+     ".claude/worktrees/wf_eb9a75cf-105-6": "befb5dead852c2eb65eebfd398171a8d64fcc258",
+     ".claude/worktrees/wf_eb9a75cf-105-7": "72cf05b6dfd815e12192d2088ad8a72c3e3de0d5",
+     ".worktrees/dhall-legacy-20260906": "300f251402645063b6f3b3224155f6b26484491a",
+     ".worktrees/disarm-gf-worker-host-writer-20260824": "9680758829671edc93242bc94c23fe61b96480c0",
+     ".worktrees/kf3-sting-agent-admin-20260921": "c78fdd7dd2034dc6bc15f2fd6dd223ae939f8c5c"
+    },
+    "nested_inside_checkout": 80,
+    "outside_checkout": 40,
+    "total": 121
+   }
+  },
+  "capture/pass1": {
+   "after": {
+    "at": "2026-10-05T14:32:39Z",
+    "load1": 14.45
+   },
+   "argv": [
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+    "estate-capture",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/plan/plan.json",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/state",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/corpus",
+    "2"
+   ],
+   "before": {
+    "at": "2026-10-05T14:31:41Z",
+    "load1": 20.66
+   },
+   "corpus_new_or_changed": {
+    "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-35bb043f39f0edd4984fd9d478ea5a22a61015d4ac99544d7bcf8d0de5caa53e.bundle": 229677508,
+    "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-35bb043f39f0edd4984fd9d478ea5a22a61015d4ac99544d7bcf8d0de5caa53e.bundle.parts": 41,
+    "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3.capture": 231
+   },
+   "corpus_total_bytes": 229677780,
+   "counters": {
+    "blake3_bundle_stage_bytes": 0,
+    "blake3_capture_chunk_bytes": 0,
+    "blake3_dest_bytes": 0,
+    "blake3_dest_local_reuse_bytes": 0,
+    "blake3_dest_wire_verify_bytes": 0,
+    "blake3_hash_file_bytes": 229677508,
+    "blake3_other_bytes": 0,
+    "blake3_total_bytes": 229677508,
+    "blake3_verify_existing_bytes": 0,
+    "census_walks": 4,
+    "directories_finished": 0,
+    "durable_groups": 0,
+    "elapsed_ns": 57515625108,
+    "files_materialized": 0,
+    "flush_barrier_count": 0,
+    "flush_barrier_ns": 0,
+    "flush_dir_barrier_count": 0,
+    "flush_dir_barrier_ns": 0,
+    "flush_dir_count": 5,
+    "flush_dir_ns": 50850979,
+    "flush_fdatasync_count": 0,
+    "flush_fdatasync_ns": 0,
+    "flush_full_count": 5,
+    "flush_full_ns": 1041627058,
+    "full_flushes_total": 10,
+    "priority": "background",
+    "priority_from": "default",
+    "publish_link_fallback": 0,
+    "read_bundle_stage_bytes": 0,
+    "read_dest_local_reuse_bytes": 0,
+    "read_dest_verify_existing_bytes": 0,
+    "read_hash_file_bytes": 229677508,
+    "read_source_capture_reuse_bytes": 0,
+    "read_source_file_bytes": 0,
+    "read_source_pack_readback_bytes": 217313280,
+    "scope": "process",
+    "side": "local",
+    "sqlite_commit_ns": 0,
+    "sqlite_commits_total": 0,
+    "sqlite_directory_complete_commits": 0,
+    "sqlite_directory_pending_commits": 0,
+    "sqlite_group_dest_commits": 0,
+    "sqlite_group_source_commits": 0,
+    "sqlite_record_capture_commits": 0,
+    "sqlite_schema_commits": 0,
+    "transfer_legacy_rows_invalidated": 0,
+    "transfer_racy_captures": 0,
+    "transport_buffers_raised": 0,
+    "verb": "estate-capture",
+    "wire_bytes_received": 0,
+    "wire_bytes_sent": 0,
+    "wire_frames_received": 0,
+    "wire_frames_sent": 0,
+    "write_bundle_stage_bytes": 0,
+    "write_dest_materialize_bytes": 0,
+    "write_source_pack_bytes": 236378653,
+    "write_source_pack_objects": 63079
+   },
+   "cpu_s": 61.08074,
+   "envelopes": {
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/state/7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-f5f6dab4e6007726c5b232a131a1d739f759d61ac6372126fa456f452620cd34-0/shallow-envelope.git": {
+     "custody": "92ae39652be9107f92ec2089cbead15c0ae132d7",
+     "frontier_bytes": 41,
+     "inner_inventory_bytes": 265195,
+     "inner_inventory_lines": 2393,
+     "inner_pack_bytes": 236378653,
+     "inner_pack_oid": "36269b159e76c0f1b5cd40e08d0e01d9f1ea75f0",
+     "manifest_bytes": 265281,
+     "manifest_cap": 16777216,
+     "metadata_lines": [
+      "refs/carry-export/configuration-v1",
+      "refs/carry-export/exclude",
+      "refs/carry-export/filesystem-v1",
+      "refs/carry-export/head",
+      "refs/carry-export/head-symbolic",
+      "refs/carry-export/nested-worktrees-v1",
+      "refs/carry-export/rebuildable-omissions-v1",
+      "refs/carry-export/shallow-frontier-v1",
+      "refs/carry-export/staged",
+      "refs/carry-export/worktree"
+     ],
+     "ref_table_lines": 1,
+     "ref_tip_lines": 2382,
+     "trailing_bytes": 0
+    }
+   },
+   "exit": 0,
+   "final_refusal": null,
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "headers": {
+    "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-35bb043f39f0edd4984fd9d478ea5a22a61015d4ac99544d7bcf8d0de5caa53e.bundle": {
+     "bundle_bytes": 229677508,
+     "capability_lines": 0,
+     "header_bytes": 95,
+     "prerequisite_lines": 0,
+     "ref_lines": 1,
+     "ref_names": [
+      "refs/carry-export/shallow-custody-v1"
+     ],
+     "signature": "# v2 git bundle"
+    }
+   },
+   "maxrss_kib": 472284,
+   "new_bundle_bytes": 229677508,
+   "private_repositories": {
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/state/7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-f5f6dab4e6007726c5b232a131a1d739f759d61ac6372126fa456f452620cd34-0/repository.git": {
+     "ref_table": true,
+     "ref_tips": 2382,
+     "refs": 2393,
+     "table_blob_bytes": 11424561,
+     "table_blobs": 158
+    }
+   },
+   "receipts": [
+    {
+     "extra": [],
+     "item": "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3",
+     "outcome": "captured",
+     "reason": "None",
+     "source": "/srv/fast-local/jess/git/blahaj",
+     "source_bytes_read": 6008771154
+    }
+   ],
+   "source_bytes_read": 6008771154,
+   "state_bytes": 709758497,
+   "stderr_tail": [
+    "counters verb=estate-capture side=local scope=process priority=background priority_from=default elapsed_ns=57515625108 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=217313280 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=229677508 read_bundle_stage_bytes=0 write_source_pack_bytes=236378653 write_source_pack_objects=63079 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=229677508 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=5 flush_full_ns=1041627058 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=5 flush_dir_ns=50850979 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=4 blake3_total_bytes=229677508 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=10"
+   ],
+   "step": "pass1/estate-capture",
+   "sys_s": 10.399497,
+   "user_s": 50.681243,
+   "wall_ns": 57531468076
+  },
+  "capture/pass2": {
+   "after": {
+    "at": "2026-10-05T14:32:58Z",
+    "load1": 12.34
+   },
+   "argv": [
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+    "estate-capture",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/plan/plan.json",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/state",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/corpus",
+    "2"
+   ],
+   "before": {
+    "at": "2026-10-05T14:32:57Z",
+    "load1": 12.34
+   },
+   "corpus_new_or_changed": {},
+   "corpus_total_bytes": 229677780,
+   "counters": {
+    "blake3_bundle_stage_bytes": 0,
+    "blake3_capture_chunk_bytes": 0,
+    "blake3_dest_bytes": 0,
+    "blake3_dest_local_reuse_bytes": 0,
+    "blake3_dest_wire_verify_bytes": 0,
+    "blake3_hash_file_bytes": 0,
+    "blake3_other_bytes": 0,
+    "blake3_total_bytes": 0,
+    "blake3_verify_existing_bytes": 0,
+    "census_walks": 1,
+    "directories_finished": 0,
+    "durable_groups": 0,
+    "elapsed_ns": 811369750,
+    "files_materialized": 0,
+    "flush_barrier_count": 0,
+    "flush_barrier_ns": 0,
+    "flush_dir_barrier_count": 0,
+    "flush_dir_barrier_ns": 0,
+    "flush_dir_count": 3,
+    "flush_dir_ns": 27984898,
+    "flush_fdatasync_count": 0,
+    "flush_fdatasync_ns": 0,
+    "flush_full_count": 1,
+    "flush_full_ns": 12582699,
+    "full_flushes_total": 4,
+    "priority": "background",
+    "priority_from": "default",
+    "publish_link_fallback": 0,
+    "read_bundle_stage_bytes": 0,
+    "read_dest_local_reuse_bytes": 0,
+    "read_dest_verify_existing_bytes": 0,
+    "read_hash_file_bytes": 0,
+    "read_source_capture_reuse_bytes": 0,
+    "read_source_file_bytes": 0,
+    "read_source_pack_readback_bytes": 0,
+    "scope": "process",
+    "side": "local",
+    "sqlite_commit_ns": 0,
+    "sqlite_commits_total": 0,
+    "sqlite_directory_complete_commits": 0,
+    "sqlite_directory_pending_commits": 0,
+    "sqlite_group_dest_commits": 0,
+    "sqlite_group_source_commits": 0,
+    "sqlite_record_capture_commits": 0,
+    "sqlite_schema_commits": 0,
+    "transfer_legacy_rows_invalidated": 0,
+    "transfer_racy_captures": 0,
+    "transport_buffers_raised": 0,
+    "verb": "estate-capture",
+    "wire_bytes_received": 0,
+    "wire_bytes_sent": 0,
+    "wire_frames_received": 0,
+    "wire_frames_sent": 0,
+    "write_bundle_stage_bytes": 0,
+    "write_dest_materialize_bytes": 0,
+    "write_source_pack_bytes": 0,
+    "write_source_pack_objects": 0
+   },
+   "cpu_s": 0.884788,
+   "envelopes": {},
+   "exit": 0,
+   "final_refusal": null,
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "headers": {},
+   "maxrss_kib": 48396,
+   "new_bundle_bytes": 0,
+   "private_repositories": {
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/state/7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3-f5f6dab4e6007726c5b232a131a1d739f759d61ac6372126fa456f452620cd34-0/repository.git": {
+     "ref_table": true,
+     "ref_tips": 2382,
+     "refs": 2393,
+     "table_blob_bytes": 11424561,
+     "table_blobs": 158
+    }
+   },
+   "receipts": [
+    {
+     "extra": [],
+     "item": "7c7a799fd653a684ddf96364e06a3a302b3e96edeecdf4b4a32c4a7f84d5f3d3",
+     "outcome": "capture-reused-after-census",
+     "reason": "None",
+     "source": "/srv/fast-local/jess/git/blahaj",
+     "source_bytes_read": 0
+    }
+   ],
+   "source_bytes_read": 0,
+   "state_bytes": 709758516,
+   "stderr_tail": [
+    "counters verb=estate-capture side=local scope=process priority=background priority_from=default elapsed_ns=811369750 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=0 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=1 flush_full_ns=12582699 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=3 flush_dir_ns=27984898 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=1 blake3_total_bytes=0 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=4"
+   ],
+   "step": "pass2/estate-capture",
+   "sys_s": 0.40477,
+   "user_s": 0.480018,
+   "wall_ns": 814386271
+  },
+  "census-diff/after-pass1..after-pass2": {
+   "a": "after-pass1",
+   "added": [],
+   "b": "after-pass2",
+   "changed": {},
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "identical": true,
+   "removed": []
+  },
+  "census-diff/t0..final": {
+   "a": "t0",
+   "added": [],
+   "b": "final",
+   "changed": {},
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "identical": true,
+   "removed": []
+  },
+  "census-diff/t0..post-cleanup": {
+   "a": "t0",
+   "added": [],
+   "b": "post-cleanup",
+   "changed": {},
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "identical": true,
+   "removed": []
+  },
+  "census-diff/t0..t1": {
+   "a": "t0",
+   "added": [],
+   "b": "t1",
+   "changed": {},
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "identical": true,
+   "removed": []
+  },
+  "census-diff/t1..after-pass1": {
+   "a": "t1",
+   "added": [],
+   "b": "after-pass1",
+   "changed": {},
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "identical": true,
+   "removed": []
+  },
+  "census/after-pass1": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/after-pass1.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.367,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:32:50Z"
+  },
+  "census/after-pass2": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/after-pass2.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.439,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:33:17Z"
+  },
+  "census/final": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/final.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.379,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:34:33Z"
+  },
+  "census/post-cleanup": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/post-cleanup.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.359,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:36:10Z"
+  },
+  "census/t-after-baseline": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/t-after-baseline.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.361,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:33:21Z"
+  },
+  "census/t0": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/t0.json",
+   "seconds": 0.504,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:31:10Z"
+  },
+  "census/t1": {
+   "entries": 2884,
+   "fields": [
+    "mode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "ino",
+    "nlink"
+   ],
+   "file": "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/census/t1.json",
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "seconds": 0.452,
+   "sha256": "136cb1bdbc28b3508c6b8f36672d11542d7d479f88e89fc82fcbbdd466c28d65",
+   "taken": "2026-10-05T14:31:32Z"
+  },
+  "compare/before": {
+   "baseline": "before",
+   "baseline_refs": 122994,
+   "exact_names_oids": true,
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "head": {
+    "carried_oid": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8",
+    "carried_symbolic": "refs/heads/backup/glorious-build-tenant-pre-rebase",
+    "equal": true,
+    "source_oid": "bb62d090aae9562e0a8a842dc2e49a9b7ca6bdf8",
+    "source_symbolic": "refs/heads/backup/glorious-build-tenant-pre-rebase",
+    "symbolic_equal": true
+   },
+   "metadata_refs": [
+    "configuration-v1",
+    "exclude",
+    "filesystem-v1",
+    "head",
+    "head-symbolic",
+    "nested-worktrees-v1",
+    "rebuildable-omissions-v1",
+    "shallow-frontier-v1",
+    "staged",
+    "worktree"
+   ],
+   "names_extra": [],
+   "names_extra_count": 0,
+   "names_missing": [],
+   "names_missing_count": 0,
+   "native_refs": 3233,
+   "nested_worktrees": {
+    "baseline": 80,
+    "carried": 80,
+    "equal": true,
+    "extra": [],
+    "head_diff": [],
+    "missing": []
+   },
+   "oid_diff": [],
+   "oid_diff_count": 0,
+   "ref_tip_refs_imported": 0,
+   "restored_refs": 123004,
+   "restored_symrefs": [],
+   "shallow": {
+    "dest": [
+     "bf9acf31359f1578fa3f369f7e2c8bc36d5dfa76"
+    ],
+    "equal": true,
+    "source": [
+     "bf9acf31359f1578fa3f369f7e2c8bc36d5dfa76"
+    ]
+   },
+   "snapshot_digests": [
+    "6bad6325e0fded8e6294b52159d23d912b3aaa1011de7e5bedd7534b8659462d"
+   ],
+   "source_symrefs": {
+    "refs/remotes/github/HEAD": {
+     "restored_as": "plain ref at the resolved oid",
+     "restored_oid": "f0e481dec0b1db7e382758a47bb9dda075a29d26",
+     "source_resolved_oid": "f0e481dec0b1db7e382758a47bb9dda075a29d26",
+     "source_symref": "refs/remotes/github/main"
+    },
+    "refs/remotes/yoga/HEAD": {
+     "restored_as": "plain ref at the resolved oid",
+     "restored_oid": "bf9acf31359f1578fa3f369f7e2c8bc36d5dfa76",
+     "source_resolved_oid": "bf9acf31359f1578fa3f369f7e2c8bc36d5dfa76",
+     "source_symref": "refs/remotes/yoga/main"
+    }
+   },
+   "stash_refs": 0,
+   "stashes": {
+    "carried": [],
+    "equal": true,
+    "source": []
+   },
+   "unexpected_outside_carry": [],
+   "union_refs": 119761
+  },
+  "dest-fsck": {
+   "argv": [
+    "git",
+    "--git-dir",
+    "<dest>/blahaj.git",
+    "fsck",
+    "--connectivity-only",
+    "--no-dangling"
+   ],
+   "count_objects": {
+    "in_pack": 63083,
+    "packs": 2,
+    "size_pack_kib": 456859
+   },
+   "exit": 0,
+   "stderr": "notice: HEAD points to an unborn branch (master)",
+   "stdout_bytes": 0
+  },
+  "plan": {
+   "after": {
+    "at": "2026-10-05T14:31:36Z",
+    "load1": 20.97
+   },
+   "argv": [
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/build/bin/bulkload-agent-40adca8043a1",
+    "estate-add-batch",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/plan/plan.json",
+    "/srv/fast-local/jess/git/blahaj",
+    "/srv/scratch/jess/tmp/q54-blahaj-carry-20261005/run/dest/blahaj.git",
+    "-"
+   ],
+   "before": {
+    "at": "2026-10-05T14:31:36Z",
+    "load1": 20.97
+   },
+   "counters": {
+    "blake3_bundle_stage_bytes": 0,
+    "blake3_capture_chunk_bytes": 0,
+    "blake3_dest_bytes": 0,
+    "blake3_dest_local_reuse_bytes": 0,
+    "blake3_dest_wire_verify_bytes": 0,
+    "blake3_hash_file_bytes": 0,
+    "blake3_other_bytes": 0,
+    "blake3_total_bytes": 0,
+    "blake3_verify_existing_bytes": 0,
+    "census_walks": 0,
+    "directories_finished": 0,
+    "durable_groups": 0,
+    "elapsed_ns": 28157685,
+    "files_materialized": 0,
+    "flush_barrier_count": 0,
+    "flush_barrier_ns": 0,
+    "flush_dir_barrier_count": 0,
+    "flush_dir_barrier_ns": 0,
+    "flush_dir_count": 1,
+    "flush_dir_ns": 6460262,
+    "flush_fdatasync_count": 0,
+    "flush_fdatasync_ns": 0,
+    "flush_full_count": 1,
+    "flush_full_ns": 21045943,
+    "full_flushes_total": 2,
+    "priority": "normal",
+    "priority_from": "default",
+    "publish_link_fallback": 0,
+    "read_bundle_stage_bytes": 0,
+    "read_dest_local_reuse_bytes": 0,
+    "read_dest_verify_existing_bytes": 0,
+    "read_hash_file_bytes": 0,
+    "read_source_capture_reuse_bytes": 0,
+    "read_source_file_bytes": 0,
+    "read_source_pack_readback_bytes": 0,
+    "scope": "process",
+    "side": "local",
+    "sqlite_commit_ns": 0,
+    "sqlite_commits_total": 0,
+    "sqlite_directory_complete_commits": 0,
+    "sqlite_directory_pending_commits": 0,
+    "sqlite_group_dest_commits": 0,
+    "sqlite_group_source_commits": 0,
+    "sqlite_record_capture_commits": 0,
+    "sqlite_schema_commits": 0,
+    "transfer_legacy_rows_invalidated": 0,
+    "transfer_racy_captures": 0,
+    "transport_buffers_raised": 0,
+    "verb": "estate-add-batch",
+    "wire_bytes_received": 0,
+    "wire_bytes_sent": 0,
+    "wire_frames_received": 0,
+    "wire_frames_sent": 0,
+    "write_bundle_stage_bytes": 0,
+    "write_dest_materialize_bytes": 0,
+    "write_source_pack_bytes": 0,
+    "write_source_pack_objects": 0
+   },
+   "cpu_s": 0.002448,
+   "exit": 0,
+   "final_refusal": null,
+   "harness_sha256": "e7597a7629c789145d6826a87c17122535900d367c91b18e9ac4b8a79efd185c",
+   "maxrss_kib": 28972,
+   "receipts": [],
+   "stderr_tail": [
+    "counters verb=estate-add-batch side=local scope=process priority=normal priority_from=default elapsed_ns=28157685 read_source_file_bytes=0 read_source_capture_reuse_bytes=0 read_source_pack_readback_bytes=0 read_dest_local_reuse_bytes=0 read_dest_verify_existing_bytes=0 read_hash_file_bytes=0 read_bundle_stage_bytes=0 write_source_pack_bytes=0 write_source_pack_objects=0 write_bundle_stage_bytes=0 write_dest_materialize_bytes=0 wire_frames_sent=0 wire_bytes_sent=0 wire_frames_received=0 wire_bytes_received=0 blake3_capture_chunk_bytes=0 blake3_dest_wire_verify_bytes=0 blake3_dest_local_reuse_bytes=0 blake3_verify_existing_bytes=0 blake3_hash_file_bytes=0 blake3_bundle_stage_bytes=0 blake3_other_bytes=0 flush_full_count=1 flush_full_ns=21045943 flush_barrier_count=0 flush_barrier_ns=0 flush_fdatasync_count=0 flush_fdatasync_ns=0 flush_dir_count=1 flush_dir_ns=6460262 flush_dir_barrier_count=0 flush_dir_barrier_ns=0 durable_groups=0 transport_buffers_raised=0 publish_link_fallback=0 sqlite_schema_commits=0 sqlite_group_source_commits=0 sqlite_group_dest_commits=0 sqlite_record_capture_commits=0 sqlite_directory_pending_commits=0 sqlite_directory_complete_commits=0 sqlite_commit_ns=0 files_materialized=0 directories_finished=0 transfer_racy_captures=0 transfer_legacy_rows_invalidated=0 census_walks=0 blake3_total_bytes=0 blake3_dest_bytes=0 sqlite_commits_total=0 full_flushes_total=2"
+   ],
+   "step": "plan/estate-add-batch",
+   "sys_s": 0.001224,
+   "user_s": 0.001224,
+   "wall_ns": 31127482
+  },
+  "ref-table-packed": {
+   "blobs": {
+    "bytes": 11424561,
+    "count": 158,
+    "disk_bytes": 200212
+   },
+   "commit": {
+    "bytes": 212,
+    "count": 1,
+    "disk_bytes": 106
+   },
+   "how": "by hand after apply: ls-tree -r -t of the private repository's refs/carry-ref-table/v1, then cat-file --batch-check objectsize and objectsize:disk in the restored destination's packs",
+   "table_commit": "60eed697cc2807f7288e5b9bc0d12a365d2c44cc",
+   "trees": {
+    "bytes": 21980,
+    "count": 162,
+    "disk_bytes": 19466
+   }
+  }
+ },
+ "written": "2026-10-05T14:36:16Z"
+}
