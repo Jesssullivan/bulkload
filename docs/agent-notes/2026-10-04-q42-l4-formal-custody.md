@@ -253,6 +253,80 @@ does the same for a base linked but never recorded. A fix could move a
 file whose digest differs from its name to a non-colliding quarantine
 name, then link the fresh bytes.
 
+## Recheck and ship (2026-10-05)
+
+The recheck-and-ship stage of the review: one session, the only writer
+in this worktree, with the same rulings (OI-1003-Q42, OI-1003-Q43,
+OI-1003-Q46, OI-1003-Q32, R-N13). It read the diff since the build head
+`027295e` (the fix round `ba6b85c`, `5b11343`, `c5d2b41` and the merge
+`4fe39b3`) against the review's one high and five medium findings, and
+re-ran the lane's checks. **Verdict: clean.** Every high and medium
+finding is fixed, or, for the one-CORPUS-writer finding, stated as an L8
+requirement (header, README, pending P71 symbol). The fix round
+introduced no new defect that this stage found.
+
+What was checked, and how:
+
+1. **Content names (high).** `Capture`, `Publish`, `StartBase` and
+   `Sidecars` against `estate.rs` `publish_bundle` (1316), `prepare_base`
+   (821) and `publish_prior` (1293): the same reuse, re-link and
+   `DIGEST_MISMATCH` branches, and `publish_prior`'s keep condition
+   (`.prior` exists and `chain_links` under Custody is intact). A
+   self-link cannot arise in the model: a chaining capture's tip always
+   differs from its link's. TLC with one worker on `MC_gc_live_rewritten`
+   gave the genuine stuck loop: record, rewrite in place, then a
+   re-export at the same tip refused by `Publish` on every pass.
+2. **Re-root bounds (medium).** Each reach row has its pass row's
+   constants exactly, and each was REACHED again (below).
+3. **Declared prerequisites (medium).** `meta.pre` and `.prior` are
+   separate. `MC_gc_neg_reroot_pre_mismatch` (MaxDamage 0) fails
+   `PrereqsSatisfiedByEarlierLinks` again.
+4. **One CORPUS writer (medium).** Stated in the header's ABSTRACTIONS,
+   the README's not-proven list and a pending L8 symbol.
+5. **Grounding (medium).** Every one of GitCarry's 24 symbols has a
+   real, non-comment item definition in non-test Rust (checked line by
+   line). `decide_rows.tsv` is outside the pathspec.
+6. **Closed unions (medium).** A scratch copy of the catalogue with
+   `Delta` added to `Basis`, `Jump` to `Rebase` or `Miss` to `Decision`
+   fails `dhall-to-json` with `Missing handler`; the real one renders.
+7. **#177 (merged at `4fe39b3`).** `write_bundle` now calls
+   `write_excluding_tip_trees`, which still writes `-{commit} shared base`
+   header lines, so a based or chained bundle still declares prerequisites
+   (`requires_base`), as the model's `pre` assumes. The thin packs change
+   pack contents, not custody.
+
+Runs (sting, scratch under `/srv/scratch/jess/tmp/q42-l4-recheck-*`,
+each under the shared check-fast lock):
+
+- `just tla-render --check`: all 68 committed files equal the rendering.
+- `just tla-check` on 8 GitCarry rows (01:39 EDT, 61 s): all matched.
+  Grounding: 31 operators, 14 constants, 7 mutations, 5 label sets, 24
+  code symbols; BulkloadTransfer 19. `MC_gc_core` PASS 45,062 (as of
+  record); the three reach rows REACHED; `MC_gc_live_rewritten` FAIL
+  `ChainRecovery` (12 states); `MC_gc_neg_base_replaced_live`,
+  `MC_gc_neg_skip_flatten_verify` and `MC_gc_neg_reroot_pre_mismatch`
+  FAIL on their named properties. Reach and fail rows stop at the first
+  violation with 3 workers, so their counts vary from run to run.
+- `just formal-nv` (01:45 to 01:50 EDT, over `c5d2b41`): **55 rows
+  matched, 0 differed**, exit 0. `rows --check` (363 rows) and the
+  schema (5 unions) passed. The seven GitCarry presets equal the counts
+  of record exactly, with their required decisions. All 8 GitCarry
+  mutation rows and their every-invariant runs matched.
+- check-fast (`flock ... nix develop .#default --command just
+  check-fast`, in the foreground, 01:50 to 01:55 EDT, over `c5d2b41`'s
+  tree): **green**, exit 0. 730 passed, 0 failed, 9 ignored. The
+  fault harness (56), the power-loss proofs, the CI contract (22 tests)
+  and gitleaks (no leaks) all passed. The EPIPE transfer flake did not
+  recur.
+
+PR: [#179](https://github.com/Jesssullivan/bulkload/pull/179), opened
+from `c5d2b41` and not merged. This note's commit follows it on the same
+branch. The PR body carries the review summary: lenses, the 12 findings
+and their disposition. The six low findings, and the two code findings
+(the content-name `DIGEST_MISMATCH` and `import_base`'s bare IO), stay
+under Open below; neither code finding has an issue yet. This stage
+filed none, because filing was outside its brief.
+
 ## Open
 
 - **Q46's window semantics (L8, operator).** The model's reading: a
