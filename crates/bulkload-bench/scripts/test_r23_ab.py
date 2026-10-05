@@ -30,12 +30,40 @@ if [ "$1" = micro ]; then
   echo "micro name=residency source=x files=1 source_resident_fraction=1.0000"
   exit 0
 fi
+# Like the real bench: with --informational (dry run, under load) and the host
+# outside the R-N81 gate, rows say gated=false and the verdict is informational
+# with no wins; --only runs one arm and gives a diagnostic verdict.
+informational=0
+only=0
+for arg in "$@"; do
+  case "$arg" in
+    --informational) informational=1 ;;
+    --only) only=1 ;;
+  esac
+done
+gated=${STUB_GATED:-}
+if [ -z "$gated" ]; then
+  if [ "$informational" = 1 ]; then gated=false; else gated=true; fi
+fi
+power=${STUB_POWER:-ac}
 sealed=$(cat "$2"/* 2>/dev/null | cksum | cut -d' ' -f1)
 echo "benchmark revision=r rclone_version=\\"rclone v1.75.0\\" sealed_corpus_blake3=s$sealed"
-echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=ac load1=1.00 gated=true"
+echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=$power load1=1.00 gated=$gated"
 echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1"
 echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10"
-echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=ac load1=1.00 gated=true"
+echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=$power load1=1.00 gated=$gated"
+if [ "$only" = 1 ]; then
+  echo "verdict status=diagnostic-only reason=single-arm-run"
+  exit 0
+fi
+if [ "$gated" = false ]; then
+  echo "median phase=initial native_ms=100.000 rclone_ms=80.000 gated=false"
+  echo "median phase=delta native_ms=10.000 rclone_ms=20.000 gated=false"
+  echo "verdict status=informational reason=r-n81-preflight ungated_samples=2 r25_warm_zero=true r25_interrupted_zero=true native_rss_below_2gib=true"
+  exit 0
+fi
+echo "median phase=initial native_ms=100.000 rclone_ms=80.000 native_wins=false"
+echo "median phase=delta native_ms=10.000 rclone_ms=20.000 native_wins=true"
 echo "verdict status=${STUB_VERDICT:-fail} r23_initial_win=false"
 exit 1
 """
@@ -71,13 +99,27 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(summary["all_gated"])
 
 
-def cond(ok: bool = True, load: float | None = None) -> dict[str, object]:
+def cond(
+    ok: bool = True, load: float | None = None, power: str = "ac"
+) -> dict[str, object]:
     return {
         "utc": "t",
         "load1": load if load is not None else (1.0 if ok else 9.0),
-        "power": "ac",
-        "ok": ok,
+        "power": power,
+        "ok": ok and power == "ac",
     }
+
+
+def refuse_call(n: int) -> contextlib.AbstractContextManager[object]:
+    """Make the n-th parsed bench run look refused (no verdict line)."""
+    real = ab.parse_bench
+    calls = {"n": 0}
+
+    def parse(stdout: str) -> dict[str, object]:
+        calls["n"] += 1
+        return {} if calls["n"] == n else real(stdout)
+
+    return mock.patch.object(ab, "parse_bench", side_effect=parse)
 
 
 class HarnessTests(unittest.TestCase):
@@ -130,6 +172,23 @@ class HarnessTests(unittest.TestCase):
             "--post-settle-seconds",
             "0",
         ]
+
+    def under_load(self) -> list[str]:
+        """Under-load args: no --coordinator-quiet (OI-1003-Q39), *underload* evidence."""
+        return [
+            "--corpus",
+            str(self.corpus),
+            "--under-load",
+            "--evidence",
+            str(self.tmp / "r23-underload-test.md"),
+            "--post-settle-seconds",
+            "0",
+            "--settle-seconds",
+            "0",
+        ]
+
+    def evidence_md(self) -> str:
+        return (self.tmp / "r23-underload-test.md").read_text()
 
     def report(self) -> dict[str, object]:
         return json.loads((self.tmp / "work" / "r23-ab.json").read_text())
@@ -223,6 +282,315 @@ class HarnessTests(unittest.TestCase):
     def test_gated_rollup_fails_when_any_b_rep_fails(self) -> None:
         self.assertEqual(self.main(self.gated()), 0)
         self.assertEqual(self.report()["gate"]["verdict"], "FAIL")
+
+    def test_under_load_and_dry_run_are_exclusive(self) -> None:
+        self.assertEqual(self.main(["--dry-run", "--under-load"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_under_load_records_load_but_does_not_gate_on_it(self) -> None:
+        high = mock.patch.object(ab, "conditions", return_value=cond(False))
+        self.assertEqual(self.main(self.under_load(), conditions=high), 0)
+        report = self.report()
+        self.assertEqual(report["mode"], "under-load")
+        self.assertEqual(report["status"], "complete-under-load-informational")
+        self.assertFalse(report["load_gated"])
+        self.assertTrue(
+            all(r["conditions_before"]["load1"] == 9.0 for r in report["reps"])
+        )
+        md = self.evidence_md()
+        self.assertIn(ab.UNDER_LOAD, md.splitlines()[0])
+        self.assertIn("not an R23 gate", md)
+
+    def test_under_load_rollup_reports_statuses_and_medians_not_a_pass_count(
+        self,
+    ) -> None:
+        # The stub, like the real bench under load, prints gated=false rows,
+        # status=informational and no r23_*_win keys.
+        self.assertEqual(self.main(self.under_load()), 0)
+        report = self.report()
+        gate = report["gate"]
+        self.assertEqual(gate["b_statuses"], ["informational"] * 3)
+        self.assertEqual(gate["b_status_counts"], "informational x3")
+        self.assertTrue(gate["verdict"].startswith(ab.UNDER_LOAD))
+        self.assertIn("informational x3", gate["verdict"])
+        self.assertIn("initial native 100.000 ms vs rclone 80.000 ms", gate["verdict"])
+        self.assertIn("delta native 10.000 ms vs rclone 20.000 ms", gate["verdict"])
+        self.assertNotIn("pass", gate["verdict"])
+        self.assertEqual(
+            gate["b_bench_medians"],
+            {
+                "initial": {"native_ms": 100.0, "rclone_ms": 80.0},
+                "delta": {"native_ms": 10.0, "rclone_ms": 20.0},
+            },
+        )
+        self.assertTrue(
+            all(not r["summary"]["all_gated"] for r in report["reps"]),
+            "the stub must print gated=false under load, like the real bench",
+        )
+        md = self.evidence_md()
+        self.assertNotIn("B reps pass", md)
+        self.assertNotIn("R23 gate verdict for B", md)
+        self.assertIn(
+            "not an R23 gate verdict:** INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE:"
+            " B bench statuses informational x3;",
+            md,
+        )
+        self.assertIn("## Bench medians (informational, under load)", md)
+        self.assertIn("| B median | B | informational x3 | 100.000 | 80.000 |", md)
+
+    def test_under_load_with_a_quiet_host_still_reports_statuses(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"STUB_GATED": "true", "STUB_VERDICT": "pass"}
+        ):
+            self.assertEqual(self.main(self.under_load()), 0)
+        gate = self.report()["gate"]
+        self.assertEqual(gate["b_status_counts"], "pass x3")
+        self.assertIn("pass x3", gate["verdict"])
+        self.assertTrue(gate["verdict"].startswith(ab.UNDER_LOAD))
+
+    def test_under_load_cites_its_rulings_and_does_not_need_coordinator_quiet(
+        self,
+    ) -> None:
+        self.assertEqual(self.main(self.under_load()), 0)
+        report = self.report()
+        self.assertFalse(report["coordinator_quiet"])
+        self.assertEqual(report["rulings"], ab.RULINGS_UNDER_LOAD)
+        md = self.evidence_md()
+        rulings = next(line for line in md.splitlines() if line.startswith("Rulings:"))
+        self.assertIn("OI-1003-Q39", rulings)
+        self.assertIn("OI-1003-Q50", rulings)
+        self.assertNotIn("R-N91", rulings)
+        self.assertNotIn("R-N81", rulings)
+        self.assertIn("not required under load", md)
+        self.assertNotIn("(R-N91).", md)
+
+    def test_under_load_records_coordinator_quiet_as_acknowledged_only(self) -> None:
+        self.assertEqual(self.main([*self.under_load(), "--coordinator-quiet"]), 0)
+        report = self.report()
+        self.assertTrue(report["coordinator_quiet"])
+        self.assertIn("not R-N91 gated", report["coordinator_quiet_meaning"])
+        md = self.evidence_md()
+        self.assertIn("acknowledged only; an under-load sample is not R-N91 gated", md)
+        self.assertNotIn("(R-N91).", md)
+
+    def test_gated_evidence_still_cites_r_n91(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        md = (self.tmp / "ev.md").read_text()
+        self.assertIn(f"Rulings: {ab.RULINGS}.", md)
+        self.assertIn("coordinator-quiet acknowledged: `True` (R-N91)", md)
+
+    def test_under_load_default_evidence_name_is_underload(self) -> None:
+        args = [a for a in self.under_load()]
+        at = args.index("--evidence")
+        del args[at : at + 2]
+        self.assertEqual(self.main(args), 0)
+        written = sorted((self.tmp / "docs" / "evidence").iterdir())
+        self.assertEqual(len(written), 1)
+        self.assertRegex(
+            written[0].name, r"^r23-underload-\d{4}-\d{2}-\d{2}-\d{4}Z\.md$"
+        )
+        self.assertIn(ab.UNDER_LOAD, written[0].read_text().splitlines()[0])
+
+    def test_under_load_refuses_a_gate_style_evidence_name(self) -> None:
+        for name in ("ev.md", "r23-2026-10-04-1842Z.md"):
+            args = self.under_load()
+            args[args.index("--evidence") + 1] = str(self.tmp / name)
+            self.assertEqual(self.main(args), 2)
+            self.assertFalse((self.tmp / "work").exists())
+            self.assertFalse((self.tmp / name).exists())
+
+    def test_informational_flag_only_in_under_load_rep_commands(self) -> None:
+        self.assertEqual(self.main(self.under_load()), 0)
+        under = self.report()["reps"]
+        self.assertTrue(all("--informational" in r["command"] for r in under))
+        (self.tmp / "work").rename(self.tmp / "work-under-load")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        gated = self.report()["reps"]
+        self.assertEqual(len(gated), 6)
+        self.assertTrue(all("--informational" not in r["command"] for r in gated))
+
+    def test_under_load_refuses_to_start_off_ac_power(self) -> None:
+        battery = mock.patch.object(
+            ab, "conditions", return_value=cond(load=9.0, power="battery")
+        )
+        with mock.patch.object(ab.time, "sleep"):
+            self.assertEqual(self.main(self.under_load(), conditions=battery), 2)
+        report = self.report()
+        self.assertEqual(report["status"], "refused")
+        self.assertIn("never settled (AC power)", report["reason"])
+        self.assertEqual(report["reps"], [])
+
+    def test_under_load_waits_for_ac_before_the_first_rep(self) -> None:
+        states = iter([cond(load=9.0, power="battery")])
+        settle = mock.patch.object(
+            ab, "conditions", side_effect=lambda: next(states, cond(load=9.0))
+        )
+        args = self.under_load()
+        args[args.index("--settle-seconds") + 1] = "3600"
+        with mock.patch.object(ab.time, "sleep") as sleep:
+            self.assertEqual(self.main(args, conditions=settle), 0)
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_under_load_aborts_when_power_fails_before_a_rep(self) -> None:
+        # Calls: the opening check, rep 0 before and after (no settle wait
+        # under load), then rep 1 before, on battery.
+        states = iter([cond(False)] * 3 + [cond(load=9.0, power="battery")])
+        flip = mock.patch.object(
+            ab, "conditions", side_effect=lambda: next(states, cond(False))
+        )
+        self.assertEqual(self.main(self.under_load(), conditions=flip), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertEqual(len(report["reps"]), 1)
+        self.assertIn("rep1 A precondition failed", report["reason"])
+        self.assertIn("'power': 'battery'", report["reason"])
+
+    def test_under_load_aborts_when_power_fails_after_a_rep(self) -> None:
+        states = iter([cond(False)] * 2 + [cond(load=9.0, power="battery")])
+        flip = mock.patch.object(
+            ab, "conditions", side_effect=lambda: next(states, cond(False))
+        )
+        self.assertEqual(self.main(self.under_load(), conditions=flip), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn(
+            "rep0 B post-check failed: power=battery/battery", report["reason"]
+        )
+        self.assertTrue(report["reps"][0]["aborted"])
+
+    def test_under_load_aborts_when_a_bench_row_is_off_ac_power(self) -> None:
+        # --informational lets the bench run an arm on battery; the harness
+        # must refuse the rows even though its own checks saw AC.
+        with mock.patch.dict(os.environ, {"STUB_POWER": "battery"}):
+            self.assertEqual(self.main(self.under_load()), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn("2 bench row(s) not on AC power", report["reason"])
+        self.assertIn("Native/initial power=battery", report["reason"])
+
+    def test_under_load_refused_informational_rep_off_ac_power_aborts(self) -> None:
+        # Rep 1 (A) is refused, and its post-rep power check fails: that is a
+        # power failure, not a recordable informational refusal.
+        states = iter([cond(False)] * 4 + [cond(load=9.0, power="battery")])
+        flip = mock.patch.object(
+            ab, "conditions", side_effect=lambda: next(states, cond(False))
+        )
+        self.assertEqual(
+            self.main(self.under_load(), conditions=flip, parse_bench=refuse_call(2)),
+            3,
+        )
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertNotIn("refused_reps", report)
+        self.assertIn("rep1 A bench refused", report["reason"])
+        self.assertIn("power=battery/battery", report["reason"])
+
+    def test_under_load_refused_informational_rep_with_battery_rows_aborts(
+        self,
+    ) -> None:
+        real = ab.parse_bench
+        calls = {"n": 0}
+
+        def parse(stdout: str) -> dict[str, object]:
+            calls["n"] += 1
+            parsed = real(stdout)
+            if calls["n"] == 2:
+                del parsed["verdict"]
+                parsed["samples"][0]["power"] = "battery"
+            return parsed
+
+        refuse_a = mock.patch.object(ab, "parse_bench", side_effect=parse)
+        self.assertEqual(self.main(self.under_load(), parse_bench=refuse_a), 3)
+        report = self.report()
+        self.assertNotIn("refused_reps", report)
+        self.assertIn("rep1 A bench refused", report["reason"])
+        self.assertIn("1 bench row(s) not on AC power", report["reason"])
+
+    def test_under_load_records_a_refused_informational_rep_and_continues(self) -> None:
+        self.assertEqual(self.main(self.under_load(), parse_bench=refuse_call(2)), 0)
+        report = self.report()
+        self.assertEqual(report["status"], "complete-under-load-informational")
+        self.assertEqual([r["label"] for r in report["refused_reps"]], ["A"])
+        self.assertEqual(
+            [r["label"] for r in report["reps"]], ["B", "B", "A", "B", "V4"]
+        )
+        self.assertIn("refused under load", self.evidence_md())
+
+    def test_under_load_aborts_on_a_refused_b_rep(self) -> None:
+        self.assertEqual(self.main(self.under_load(), parse_bench=refuse_call(1)), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn("rep0 B bench refused", report["reason"])
+        self.assertNotIn("refused_reps", report)
+        self.assertTrue(report["gate"]["verdict"].startswith("NONE"))
+        self.assertIn("(ABORTED)", self.evidence_md().splitlines()[0])
+
+    def test_under_load_aborts_when_corpus_changes_between_reps(self) -> None:
+        calls = {"n": 0}
+
+        def tamper(_binary: Path, corpus: Path) -> float:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                (corpus / "f").write_bytes(b"y" * 7)
+            return 1.0
+
+        patch = mock.patch.object(ab, "residency", side_effect=tamper)
+        self.assertEqual(self.main(self.under_load(), residency=patch), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn("sealed_corpus_blake3", report["reason"])
+
+    def test_under_load_aborts_when_corpus_fails_final_verify(self) -> None:
+        results = iter([0, 0, 1, 0])
+        late = mock.patch.object(
+            ab, "corpus_verify", side_effect=lambda _c: next(results, 1)
+        )
+        self.assertEqual(self.main(self.under_load(), corpus_verify=late), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertFalse(report["content_verified_after"])
+        self.assertIn("no longer verifies", report["reason"])
+
+    def test_under_load_refuses_a_sealed_corpus_that_does_not_verify(self) -> None:
+        bad = mock.patch.object(ab, "corpus_verify", return_value=1)
+        self.assertEqual(self.main(self.under_load(), corpus_verify=bad), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_under_load_skips_the_post_settle_wait(self) -> None:
+        args = ab.argparse.Namespace(
+            dry_run=False, under_load=True, post_settle_seconds=3600
+        )
+        with (
+            mock.patch.object(ab, "conditions", return_value=cond(False)),
+            mock.patch.object(ab.time, "sleep", side_effect=AssertionError("waited")),
+        ):
+            first, settled = ab.post_settle(args)
+        self.assertEqual(first["load1"], 9.0)
+        self.assertIs(first, settled)
+
+    def test_gated_post_settle_waits_for_load(self) -> None:
+        args = ab.argparse.Namespace(
+            dry_run=False, under_load=False, post_settle_seconds=3600
+        )
+        states = iter([cond(False), cond()])
+        with (
+            mock.patch.object(ab, "conditions", side_effect=lambda: next(states)),
+            mock.patch.object(ab.time, "sleep") as sleep,
+        ):
+            first, settled = ab.post_settle(args)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual((first["load1"], settled["load1"]), (9.0, 1.0))
+
+    def test_gated_aborts_on_a_gated_false_row(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_GATED": "false"}):
+            self.assertEqual(self.main(self.gated()), 3)
+        self.assertIn("a bench row was gated=false", self.report()["reason"])
+
+    def test_gated_mode_still_aborts_on_a_refused_rep(self) -> None:
+        self.assertEqual(self.main(self.gated(), parse_bench=refuse_call(2)), 3)
+        self.assertIn("bench refused", self.report()["reason"])
 
     def test_aborts_when_conditions_fail_between_reps(self) -> None:
         states = iter([cond(), cond(), cond(), cond(False)])

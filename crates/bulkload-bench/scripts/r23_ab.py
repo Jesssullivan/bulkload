@@ -30,7 +30,7 @@ Preconditions (gated mode, the default):
   - Darwin only. The bench's own R-N81 preflight reads `pmset`; on Linux it
     reports power=unknown and refuses every gated sample.
   - --coordinator-quiet: the operator or coordinator holds other lanes quiet
-    (R-N91). It is recorded, not checked.
+    (R-N91). It is recorded, not checked. --under-load does not require it.
   - The corpus is R23 corpus v1 (r23_corpus.py, OI-1002-Q28): 23 regular
     files, 239,819,837 bytes, and `r23_corpus.py verify` matches the
     committed manifest (content identity f4a7619f...). Gated mode refuses
@@ -53,7 +53,9 @@ AC power and load1 < 2.5, and checks again before every repetition. After
 every repetition, power must still be AC, every bench row must say
 gated=true, and load1 must fall below 2.5 within --post-settle-seconds (the
 bench's own work raises it during the rep). The bench itself checks before
-every arm. A failed check ends the sample: status=aborted, exit 3.
+every arm. A failed check ends the sample: status=aborted, exit 3. Under
+--under-load only the power checks apply (see below), and every bench row
+must say power=ac instead of gated=true.
 
 Page cache: the cache is never dropped, on either host. The bench verifies
 the source with a full BLAKE3 walk before every arm, so every timed arm,
@@ -81,6 +83,25 @@ the platform, corpus-verify, quiet and load checks. Its output says
 NOT A GATE SAMPLE everywhere and goes to the work root. It refuses to
 write under docs/evidence.
 
+--under-load (operator rulings OI-1003-Q39 and OI-1003-Q50) is an
+informational R23 sample under the host's real pressure; it is never an R23
+gate verdict. It keeps the gated mode's Darwin, corpus v1, verify and seal
+checks, and passes --informational to the bench. It lifts only the load gate:
+load1 is recorded before and right after every rep, but it is not required
+to be below 2.5, and the post-rep load wait is skipped. AC power is
+still required: once before the first rep (waiting up to --settle-seconds),
+before every rep, right after every rep, and on every bench sample row,
+refused informational reps included. Because --informational stops the bench
+refusing an arm on battery, the harness checks the rows itself. Lanes need
+not be held quiet: --coordinator-quiet is not required, and when given it is
+recorded as acknowledged, not as R-N91 gating. A non-B rep (A or V4) that the
+bench refuses is recorded in refused_reps and the sample continues
+(OI-1003-Q50); a refused B rep aborts (exit 3). The rollup reports B's bench
+statuses (for example `informational x3`) and the bench's informational
+native-vs-rclone initial and delta medians, not a pass count. The evidence
+goes to docs/evidence/r23-underload-<date>-<HHMM>Z.md; an --evidence name
+that does not contain `underload` is refused.
+
 Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
@@ -88,6 +109,7 @@ Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import hashlib
 import json
@@ -120,6 +142,11 @@ DEFAULT_V4 = "41bf9a4"
 RULINGS = (
     "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
 )
+# An under-load sample is not R-N81 load-gated and not R-N91 quiet-gated
+# (OI-1003-Q39), so it does not cite them as followed.
+RULINGS_UNDER_LOAD = (
+    "OI-1003-Q39, OI-1003-Q50, OI-1002-Q30, OI-1002-Q28, R23, R-N57, R-N134, R-N13"
+)
 DEFAULT_PATTERN = "BABAB"
 GATE_B_REPS = DEFAULT_PATTERN.count("B")
 SEAL_KEYS = (
@@ -147,6 +174,19 @@ WALK_WAIT = re.compile(r"(walk.*(wait|slot|ahead))|((slot|ahead).*wait)")
 RECV_STALL = re.compile(r"(recv|receive).*(stall|seal|block).*_ns$")
 PAIR = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
 NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
+UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
+
+
+class InformationalRefusal(Exception):
+    """An informational (non-B) rep that the bench refused in --under-load mode.
+
+    OI-1003-Q50: under host pressure the A or V4 baseline may fail on its own; the
+    sample records the refusal and continues, because only B decides anything.
+    """
+
+    def __init__(self, message: str, record: dict[str, object]) -> None:
+        super().__init__(message)
+        self.record = record
 
 
 class Abort(Exception):
@@ -490,8 +530,49 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
         },
         "new_timing_keys": sorted(timing_keys - KNOWN_TIMING),
         "all_gated": all(bool(s.get("gated")) for s in parsed["samples"]),
+        "all_power_ac": all(s.get("power") == "ac" for s in parsed["samples"]),
+        # The bench's own native-vs-rclone medians; under load (gated=false
+        # rows) they are informational and the verdict carries no wins.
+        "bench_medians": {
+            str(m.get("phase")): {
+                "native_ms": m.get("native_ms"),
+                "rclone_ms": m.get("rclone_ms"),
+            }
+            for m in parsed["medians"]
+        },
         "verdict": parsed.get("verdict", {}),
     }
+
+
+def host_ready(now: dict[str, object], under_load: bool) -> bool:
+    """Gated: AC power and load1 < 2.5 (R-N81). Under load: AC power only.
+
+    OI-1003-Q39 lifts only the load gate; power stays required.
+    """
+    return now["power"] == "ac" if under_load else bool(now["ok"])
+
+
+def power_problems(
+    after: dict[str, object], settled: dict[str, object], parsed: dict[str, object]
+) -> list[str]:
+    """AC power right after a rep, after the settle wait, and on every bench row.
+
+    With --informational the bench records an arm on battery instead of
+    refusing it, so under load these checks are what keep power gated.
+    """
+    problems = []
+    if after["power"] != "ac" or settled["power"] != "ac":
+        problems.append(f"power={after['power']}/{settled['power']}")
+    off_ac = [s for s in parsed.get("samples", []) if s.get("power") != "ac"]
+    if off_ac:
+        problems.append(
+            f"{len(off_ac)} bench row(s) not on AC power: "
+            + ", ".join(
+                f"{s.get('arm')}/{s.get('phase')} power={s.get('power')}"
+                for s in off_ac
+            )
+        )
+    return problems
 
 
 def post_settle(
@@ -501,12 +582,15 @@ def post_settle(
 
     Power must be AC at once. Load1 may wait up to --post-settle-seconds to fall
     below the limit, because the bench's own work raises it during the rep.
+    Under --under-load the wait is skipped: load is recorded, not gated
+    (OI-1003-Q39).
     """
     first = conditions()
     now = first
     deadline = time.monotonic() + args.post_settle_seconds
     while (
         not args.dry_run
+        and not args.under_load
         and float(now["load1"]) >= LOAD_LIMIT
         and time.monotonic() < deadline
     ):
@@ -529,7 +613,7 @@ def run_rep(
     root = work / "reps" / f"rep{index}-{label}-{info['sha'][:12]}"
     logs = work / "logs"
     before = conditions()
-    if not args.dry_run and not before["ok"]:
+    if not args.dry_run and not host_ready(before, args.under_load):
         raise Abort(f"rep{index} {label} precondition failed: {before}")
     source_cache = residency(Path(info["binary"]), corpus)
     command = [
@@ -544,7 +628,7 @@ def run_rep(
         info["sha"],
     ]
     command += ["--only", "native", "--reps", "1"] if native_only else ["--reps", "3"]
-    if args.dry_run:
+    if args.dry_run or args.under_load:
         command.append("--informational")
     say(
         f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} "
@@ -557,11 +641,30 @@ def run_rep(
     (logs / f"rep{index}-{label}.stderr").write_text(result.stderr)
     after, settled = post_settle(args)
     parsed = parse_bench(result.stdout)
+    power = [] if args.dry_run else power_problems(after, settled, parsed)
     if "verdict" not in parsed:
-        raise Abort(
+        message = (
             f"rep{index} {label} bench refused (exit {result.returncode}): "
             f"{result.stderr.strip().splitlines()[-1:]}"
         )
+        # A refused informational rep is recorded only when power held; a
+        # power failure ends the sample like any other rep (OI-1003-Q39).
+        if args.under_load and label != "B" and not power:
+            raise InformationalRefusal(
+                message,
+                {
+                    "index": index,
+                    "label": label,
+                    "sha": info["sha"],
+                    "exit": result.returncode,
+                    "wall_s": round(wall_s, 3),
+                    "reason": message,
+                    "conditions_before": before,
+                    "conditions_after": after,
+                    "conditions_after_settled": settled,
+                },
+            )
+        raise Abort("; ".join([message, *power]))
     # The timed arms read the bench's private per-rep fixture, not the sealed
     # source; its residency is measured after the rep (the bench is one process).
     fixture = root / "native-sealed-fixture"
@@ -591,9 +694,10 @@ def run_rep(
     expected = state.setdefault("sealed_corpus_blake3", sealed)
     if sealed is None or sealed != expected:
         problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
-    if not args.dry_run:
-        if after["power"] != "ac" or settled["power"] != "ac":
-            problems.append(f"power={after['power']}/{settled['power']}")
+    problems += power
+    # OI-1003-Q39: an under-load sample records load but does not gate on it,
+    # and its rows are gated=false by design; power is checked above instead.
+    if not args.dry_run and not args.under_load:
         if float(settled["load1"]) >= LOAD_LIMIT:
             problems.append(
                 f"load1={settled['load1']} still >= {LOAD_LIMIT} after "
@@ -607,15 +711,61 @@ def run_rep(
     return rep
 
 
+def status_counts(statuses: list[object]) -> str:
+    """`informational x3`, `pass x2, fail x1`: bench statuses in first-seen order."""
+    counts = collections.Counter(str(status) for status in statuses)
+    return ", ".join(f"{status} x{n}" for status, n in counts.items()) or "none"
+
+
+def bench_medians(reps: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """Median over reps of the bench's own native/rclone medians, per phase."""
+    out: dict[str, dict[str, object]] = {}
+    for phase in ("initial", "delta"):
+        out[phase] = {}
+        for arm in ("native_ms", "rclone_ms"):
+            values = [
+                r["summary"].get("bench_medians", {}).get(phase, {}).get(arm)
+                for r in reps
+            ]
+            out[phase][arm] = median(
+                [float(v) for v in values if isinstance(v, int | float)]
+            )
+    return out
+
+
+def medians_text(medians: dict[str, dict[str, object]]) -> str:
+    parts = [
+        f"{phase} native {fmt(m['native_ms'])} ms vs rclone {fmt(m['rclone_ms'])} ms"
+        for phase, m in medians.items()
+        if m["native_ms"] is not None or m["rclone_ms"] is not None
+    ]
+    if not parts:
+        return "the bench printed no median rows"
+    return "median of the bench's informational medians: " + "; ".join(parts)
+
+
 def gate_rollup(report: dict[str, object]) -> dict[str, object]:
-    """OI-1002-Q30: B passes R23 iff every B rep's bench verdict is pass."""
+    """OI-1002-Q30: B passes R23 iff every B rep's bench verdict is pass.
+
+    Under load (OI-1003-Q39) there is no gate verdict: the bench reports
+    `status=informational` with no wins, so a pass count would read as a
+    failure. The rollup names B's statuses and medians instead.
+    """
     b_reps = [r for r in report["reps"] if r["label"] == "B"]
     statuses = [r["summary"]["verdict"].get("status") for r in b_reps]
     passed = sum(1 for status in statuses if status == "pass")
+    counts = status_counts(statuses)
+    medians = bench_medians(b_reps)
+    under_load = report["mode"] == "under-load"
     if report["mode"] == "dry-run":
         verdict = "NOT A GATE SAMPLE"
-    elif report["status"] != "complete-draft":
+    elif report["status"] not in (
+        "complete-draft",
+        "complete-under-load-informational",
+    ):
         verdict = "NONE (sample aborted or refused)"
+    elif under_load:
+        verdict = f"{UNDER_LOAD}: B bench statuses {counts}; {medians_text(medians)}"
     elif len(b_reps) != GATE_B_REPS:
         verdict = f"NONE ({len(b_reps)} B reps; the gate needs {GATE_B_REPS})"
     elif passed == len(b_reps):
@@ -623,10 +773,19 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
     else:
         verdict = "FAIL"
     return {
-        "rule": "B passes R23 iff every B rep's bench verdict passes; A is informational (OI-1002-Q30)",
+        "rule": (
+            "under load there is no R23 verdict; B's bench statuses and the"
+            " bench's informational native-vs-rclone medians are reported"
+            " (OI-1003-Q39, OI-1003-Q50)"
+            if under_load
+            else "B passes R23 iff every B rep's bench verdict passes;"
+            " A is informational (OI-1002-Q30)"
+        ),
         "b_reps": len(b_reps),
         "b_reps_pass": passed,
         "b_statuses": statuses,
+        "b_status_counts": counts,
+        "b_bench_medians": medians,
         "verdict": verdict,
     }
 
@@ -681,6 +840,8 @@ def evidence(report: dict[str, object]) -> str:
         title += " (ABORTED)"
     elif dry:
         title += f" ({NOT_GATE})"
+    elif report["mode"] == "under-load":
+        title += f" ({UNDER_LOAD})"
     else:
         title += " (DRAFT)"
     lines += [title, ""]
@@ -689,20 +850,56 @@ def evidence(report: dict[str, object]) -> str:
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
             "",
         ]
+    if report.get("refused_reps"):
+        lines += [
+            "Informational reps the bench refused under load (recorded, not fatal; OI-1003-Q50):",
+            "",
+        ]
+        lines += [f"- {r['reason']}" for r in report["refused_reps"]]
+        lines += [""]
+    under_load = report["mode"] == "under-load"
+    if under_load:
+        lines += [
+            f"> **{UNDER_LOAD}.** Sealed corpus v1, `--informational`, by operator"
+            " rulings OI-1003-Q39 and OI-1003-Q50: the run measures the engine"
+            " under the host's real pressure. The R-N81 load gate and R-N91 quiet"
+            " lanes are set aside (OI-1003-Q39); load1 is recorded before and right"
+            " after every rep. AC power is still required before the"
+            " first rep, before and after every rep and on every bench row. A"
+            " refused A or V4 rep is recorded and the sample continues"
+            " (OI-1003-Q50). It is not an R23 gate verdict.",
+            "",
+        ]
+        result = (
+            f"**Informational result for B, not an R23 gate verdict:**"
+            f" {gate['verdict']}. Rule: {gate['rule']}."
+        )
+        quiet = f"coordinator-quiet: `{report['coordinator_quiet']}`" + (
+            " (acknowledged only; an under-load sample is not R-N91 gated)"
+            if report["coordinator_quiet"]
+            else " (not required under load, OI-1003-Q39)"
+        )
+    else:
+        result = (
+            f"**R23 gate verdict for B: {gate['verdict']}** ({gate['b_reps_pass']}/"
+            f"{gate['b_reps']} B reps pass). Rule: {gate['rule']}."
+        )
+        quiet = (
+            f"coordinator-quiet acknowledged: `{report['coordinator_quiet']}` (R-N91)"
+        )
     lines += [
         f"Status: **{report['status']}**"
         + (f" - {report['reason']}" if report.get("reason") else ""),
         "",
-        f"**R23 gate verdict for B: {gate['verdict']}** ({gate['b_reps_pass']}/"
-        f"{gate['b_reps']} B reps pass). Rule: {gate['rule']}.",
+        result,
         "",
-        f"Rulings: {RULINGS}. Harness: `crates/bulkload-bench/scripts/r23_ab.py`.",
+        f"Rulings: {report['rulings']}. Harness:"
+        " `crates/bulkload-bench/scripts/r23_ab.py`.",
         "",
         "## Identity",
         "",
         f"- Host: `{report['host']}` ({report['platform']}); mode `{report['mode']}`;"
-        f" order `{report['pattern']}`; coordinator-quiet acknowledged:"
-        f" `{report['coordinator_quiet']}` (R-N91).",
+        f" order `{report['pattern']}`; {quiet}.",
         f"- Sealed corpus: `{report['sealed_corpus']}`. Working copy read by the bench:"
         f" `{report['corpus']}`, {fmt(report['corpus_files'])} regular files,"
         f" {fmt(report['corpus_bytes'])} bytes.",
@@ -742,6 +939,38 @@ def evidence(report: dict[str, object]) -> str:
             f" {v.get('r23_initial_win', 'n/a')} | {v.get('r23_delta_win', 'n/a')} |"
             f" {v.get('r25_warm_zero', 'n/a')} | {v.get('r25_interrupted_zero', 'n/a')} |"
             f" {v.get('native_rss_below_2gib', 'n/a')} |"
+        )
+    if under_load:
+        lines += [
+            "",
+            "## Bench medians (informational, under load)",
+            "",
+            "The bench prints these with `gated=false` when a row ran outside the"
+            " R-N81 load gate; they are a measurement under pressure, not a win.",
+            "",
+            "| # | label | status | initial native ms | initial rclone ms |"
+            " delta native ms | delta rclone ms | all rows on AC |",
+            "|---:|---|---|---:|---:|---:|---:|---|",
+        ]
+        for rep in report["reps"]:
+            s = rep["summary"]
+            m = s.get("bench_medians", {})
+            lines.append(
+                f"| {rep['index']} | {rep['label']} |"
+                f" {s['verdict'].get('status', 'n/a')} |"
+                f" {fmt(m.get('initial', {}).get('native_ms'))} |"
+                f" {fmt(m.get('initial', {}).get('rclone_ms'))} |"
+                f" {fmt(m.get('delta', {}).get('native_ms'))} |"
+                f" {fmt(m.get('delta', {}).get('rclone_ms'))} |"
+                f" {s.get('all_power_ac', 'n/a')} |"
+            )
+        b_medians = gate["b_bench_medians"]
+        lines.append(
+            f"| B median | B | {gate['b_status_counts']} |"
+            f" {fmt(b_medians['initial']['native_ms'])} |"
+            f" {fmt(b_medians['initial']['rclone_ms'])} |"
+            f" {fmt(b_medians['delta']['native_ms'])} |"
+            f" {fmt(b_medians['delta']['rclone_ms'])} | |"
         )
     lines += [
         "",
@@ -893,9 +1122,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--coordinator-quiet",
         action="store_true",
-        help="other lanes are held quiet (R-N91); required in gated mode",
+        help="other lanes are held quiet (R-N91); required in gated mode,"
+        " only acknowledged under --under-load",
     )
     parser.add_argument("--dry-run", action="store_true", help=NOT_GATE)
+    parser.add_argument(
+        "--under-load",
+        action="store_true",
+        help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
+        " but not gated, AC power still required (OI-1003-Q39, OI-1003-Q50)",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -909,6 +1145,9 @@ def main(argv: list[str] | None = None) -> int:
     if not set(args.pattern) <= {"A", "B"} or "B" not in args.pattern:
         say("refused: --pattern uses only A and B and needs at least one B")
         return 2
+    if args.dry_run and args.under_load:
+        say("refused: --dry-run and --under-load are exclusive")
+        return 2
     sealed = Path(args.corpus).resolve()
     if not args.dry_run:
         if platform.system() != "Darwin":
@@ -916,7 +1155,8 @@ def main(argv: list[str] | None = None) -> int:
                 "refused: gated samples need Darwin (the bench R-N81 preflight reads pmset); run on neo"
             )
             return 2
-        if not args.coordinator_quiet:
+        # OI-1003-Q39: an under-load sample runs with the lanes as they are.
+        if not args.coordinator_quiet and not args.under_load:
             say("refused: --coordinator-quiet is required (R-N91)")
             return 2
         if args.pattern != DEFAULT_PATTERN:
@@ -945,11 +1185,18 @@ def main(argv: list[str] | None = None) -> int:
         else (
             work / f"r23-dryrun-{stamp}.md"
             if args.dry_run
-            else evidence_dir / f"r23-{stamp}.md"
+            else evidence_dir
+            / (f"r23-underload-{stamp}.md" if args.under_load else f"r23-{stamp}.md")
         )
     )
     if args.dry_run and evidence_path.is_relative_to(evidence_dir):
         say("refused: dry-run evidence never goes under docs/evidence")
+        return 2
+    if args.under_load and "underload" not in evidence_path.name:
+        say(
+            "refused: under-load evidence must be named *underload* so it is"
+            f" never read as a gate sample: {evidence_path.name}"
+        )
         return 2
     if evidence_path.exists():
         say(f"refused: evidence file exists: {evidence_path}")
@@ -985,10 +1232,17 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, object] = {
         "date": date,
         "stamp": stamp,
-        "mode": "dry-run" if args.dry_run else "gated",
+        "mode": "dry-run"
+        if args.dry_run
+        else ("under-load" if args.under_load else "gated"),
         "host": platform.node(),
         "platform": platform.platform(),
         "coordinator_quiet": args.coordinator_quiet,
+        "coordinator_quiet_meaning": (
+            "acknowledged only; an under-load sample is not R-N91 gated (OI-1003-Q39)"
+            if args.under_load
+            else "R-N91: other lanes held quiet (recorded, not checked)"
+        ),
         "sealed_corpus": str(sealed) if not args.dry_run else "n/a (synthetic)",
         "corpus": str(corpus),
         "corpus_files": files,
@@ -1000,17 +1254,20 @@ def main(argv: list[str] | None = None) -> int:
         "builds": builds,
         "pattern": args.pattern,
         "load_limit": LOAD_LIMIT,
-        "rulings": RULINGS,
+        "load_gated": not args.under_load,
+        "rulings": RULINGS_UNDER_LOAD if args.under_load else RULINGS,
         "reps": [],
         "status": "running",
     }
     if not args.dry_run:
+        # Gated: AC and load1 < 2.5. Under load: AC power once before the
+        # first rep; the load gate alone is lifted (OI-1003-Q39).
         deadline = time.monotonic() + args.settle_seconds
-        while not (now := conditions())["ok"]:
+        while not host_ready(now := conditions(), args.under_load):
             if time.monotonic() > deadline:
                 report["status"], report["reason"] = (
                     "refused",
-                    f"host never settled: {now}",
+                    f"host never settled ({'AC power' if args.under_load else 'AC power and load1'}): {now}",
                 )
                 finish(report, work, evidence_path)
                 return 2
@@ -1021,19 +1278,23 @@ def main(argv: list[str] | None = None) -> int:
     state: dict[str, object] = {}
     try:
         for index, (label, native_only) in enumerate(order):
-            report["reps"].append(
-                run_rep(
-                    label,
-                    builds[label],
-                    args,
-                    work,
-                    corpus,
-                    rclone,
-                    index,
-                    native_only,
-                    state,
+            try:
+                report["reps"].append(
+                    run_rep(
+                        label,
+                        builds[label],
+                        args,
+                        work,
+                        corpus,
+                        rclone,
+                        index,
+                        native_only,
+                        state,
+                    )
                 )
-            )
+            except InformationalRefusal as refusal:
+                say(f"{refusal}; recorded and continuing (informational, OI-1003-Q50)")
+                report.setdefault("refused_reps", []).append(refusal.record)
         if not args.dry_run:
             after = corpus_verify(corpus) == 0 and corpus_verify(sealed) == 0
             report["content_verified_after"] = after
@@ -1046,7 +1307,11 @@ def main(argv: list[str] | None = None) -> int:
         finish(report, work, evidence_path)
         return 3
     report["status"] = (
-        "dry-run-complete-not-a-gate-sample" if args.dry_run else "complete-draft"
+        "dry-run-complete-not-a-gate-sample"
+        if args.dry_run
+        else (
+            "complete-under-load-informational" if args.under_load else "complete-draft"
+        )
     )
     finish(report, work, evidence_path)
     return 0
