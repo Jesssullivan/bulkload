@@ -195,9 +195,9 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 #                   power-loss proofs, refusal taxonomy, R34 dependency wall,
 #                   R33 lint wall, CI contract). PR CI runs this tier through
 #                   its source, fault-harness and test gates.
-#   check-optional  optional tier: spike evidence, bench-script stubs, the
-#                   estate corpus self-test (OI-1003-Q19), the history secret
-#                   scan and the Nix/Bazel graph. On demand.
+#   check-optional  optional tier: bench-script stubs, the estate corpus
+#                   self-test (OI-1003-Q19), the history secret scan and the
+#                   Nix/Bazel graph. On demand.
 #   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
 
 # The repository and CI contract tests, run directly instead of through
@@ -211,8 +211,6 @@ check-fast: check-source fault-harness contract-test
 
 # Optional tier: on demand, never a PR gate (OI-1001-Q2).
 check-optional:
-    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features m1-spike -- -D warnings
-    cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py

@@ -126,28 +126,6 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
     full_flush(directory)
 }
 
-/// [`rename_exclusive_at`], then on `EINVAL`/`ENOSYS` `linkat` and `unlinkat`
-/// (no-clobber, two directory operations). For files only: `linkat` on a
-/// directory is `EPERM`.
-///
-/// # Errors
-/// Returns the rename, link or unlink failure; an occupied `to` is `EEXIST`.
-pub fn rename_noreplace_at(
-    from_dir: impl AsFd,
-    from: &CStr,
-    to_dir: impl AsFd,
-    to: &CStr,
-) -> io::Result<()> {
-    let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
-    match rename_exclusive_at(from_dir, from, to_dir, to) {
-        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
-            linkat(from_dir, from, to_dir, to)?;
-            unlinkat(from_dir, from, false)
-        }
-        other => other,
-    }
-}
-
 /// [`rename_exclusive_at`] within one directory.
 ///
 /// # Errors

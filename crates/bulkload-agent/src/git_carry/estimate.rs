@@ -1,5 +1,8 @@
-//! Read-only measurement of what git carry v2 would move (R-N60 baseline;
-//! R-N74 and R-N97 gate metric; R-N75 refusals).
+//! Read-only measurement of what a negotiated thin-pack carry would move
+//! (R-N60 baseline; R-N74 and R-N97 gate metric; R-N75 refusals). It was git
+//! carry v2's projection; carry v2 itself was deleted under OI-1003-Q44 and
+//! OI-1003-Q56 (tag `carry-v2-final`), and the estimate stays as a read-only
+//! verb. "The M1 sender" below is the sender that tag holds.
 //!
 //! One probe script, [`PROBE_SCRIPT`], reads a repository's offer: every ref
 //! tip, every worktree's `HEAD` and per-worktree refs (`refs/worktree/`,
@@ -95,9 +98,6 @@ use crate::{BulkloadRefusal, Result};
 
 mod stderr_store;
 pub use bulkload_proto::refusal::StderrClass;
-pub(in crate::git_carry) use stderr_store::{
-    create_private, cstring, open_existing, private_file, private_subdirectory, PrivateState,
-};
 pub use stderr_store::{Capture, StderrStore, CLASSIFY_LIMIT};
 
 /// Where the destination's offer is read from.
@@ -225,7 +225,7 @@ impl Refused {
         }
     }
 
-    pub(super) const fn because(refusal: BulkloadRefusal, reason: &'static str) -> Self {
+    const fn because(refusal: BulkloadRefusal, reason: &'static str) -> Self {
         Self {
             refusal,
             reason: Some(reason),
@@ -584,7 +584,7 @@ pub fn estimate_with(
     })
 }
 
-pub(super) fn has_control(path: &OsStr) -> bool {
+fn has_control(path: &OsStr) -> bool {
     path.as_bytes().iter().any(u8::is_ascii_control)
 }
 
@@ -592,9 +592,9 @@ pub(super) fn has_control(path: &OsStr) -> bool {
 #[derive(Debug)]
 pub(super) struct Repository {
     /// `rev-parse --absolute-git-dir` of the probed root.
-    pub(super) git_dir: PathBuf,
+    git_dir: PathBuf,
     /// The root's parent: discovery never climbs above the root.
-    pub(super) ceiling: PathBuf,
+    ceiling: PathBuf,
 }
 
 impl Repository {
@@ -643,14 +643,14 @@ pub(super) fn hardened(repository: &Repository) -> Command {
 
 /// What one repository offers, as [`PROBE_SCRIPT`] reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct Probe {
-    pub(super) tips: BTreeSet<String>,
-    pub(super) shallow: BTreeSet<String>,
-    pub(super) partial: bool,
-    pub(super) git_dir: PathBuf,
-    pub(super) ceiling: PathBuf,
-    pub(super) root: PathBuf,
-    pub(super) common: PathBuf,
+struct Probe {
+    tips: BTreeSet<String>,
+    shallow: BTreeSet<String>,
+    partial: bool,
+    git_dir: PathBuf,
+    ceiling: PathBuf,
+    root: PathBuf,
+    common: PathBuf,
 }
 
 /// Exit status of [`PROBE_SCRIPT`] when its argument is not a repository root.
@@ -770,7 +770,7 @@ done
 printf 'end\n'
 "#;
 
-pub(super) fn local_probe(repository: &Path) -> Command {
+fn local_probe(repository: &Path) -> Command {
     let mut command = Command::new("bash");
     command.args(["-s", "--"]).arg(repository);
     for key in [
@@ -828,7 +828,7 @@ fn remote_command(path: &str) -> String {
 // large-error threshold. A refusal is the cold path; boxing it would change
 // this public shape for no measured gain.
 #[allow(clippy::result_large_err)]
-pub(super) fn run_probe(
+fn run_probe(
     command: &mut Command,
     store: Option<&StderrStore>,
 ) -> std::result::Result<Probe, Refused> {
@@ -891,7 +891,7 @@ pub(super) fn run_probe(
 /// A refusal raised by a child, with its drained stderr classified and, with
 /// a `store`, kept privately under its keyed digest (R-N121). No byte of the
 /// stderr reaches the returned value.
-pub(super) fn child_refusal(
+fn child_refusal(
     refusal: BulkloadRefusal,
     reason: Option<&'static str>,
     store: Option<&StderrStore>,
@@ -927,12 +927,12 @@ pub(super) fn child_refusal(
 
 /// A drained stderr stream: the classified head, the total byte count, the
 /// private capture (with a store) and why the capture failed, if it did.
-pub(super) type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal>);
+type Drained = (Vec<u8>, u64, Option<Capture>, Option<BulkloadRefusal>);
 
 /// Read `stderr` to its end: keep the first [`CLASSIFY_LIMIT`] bytes, count
 /// them all, and stream them all into `capture`. A capture write failure is
 /// recorded, and the stream is still drained so the child never blocks.
-pub(super) fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained {
+fn drain(stderr: impl Read, mut capture: Option<Capture>) -> Drained {
     let mut failure = None;
     let drained = crate::child::drain_bounded(stderr, CLASSIFY_LIMIT, |chunk| {
         if failure.is_none() {
@@ -1088,10 +1088,7 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
 /// Destination tips that exist as objects in `source`, with their types, in
 /// oid order. With `GIT_NO_LAZY_FETCH` a partial source answers `missing` for
 /// a tip only its promisor holds instead of fetching it (F1).
-pub(super) fn present(
-    source: &Repository,
-    tips: &BTreeSet<String>,
-) -> Result<Vec<(String, String)>> {
+fn present(source: &Repository, tips: &BTreeSet<String>) -> Result<Vec<(String, String)>> {
     if tips.is_empty() {
         return Ok(Vec::new());
     }
@@ -1126,7 +1123,7 @@ pub(super) fn present(
 }
 
 /// Every stash reflog entry, newest first; empty when there is no stash.
-pub(super) fn stash_entries(source: &Repository) -> Result<Vec<String>> {
+fn stash_entries(source: &Repository) -> Result<Vec<String>> {
     let stash =
         run(hardened(source).args(["for-each-ref", "--format=%(objectname)", "refs/stash"]))?;
     if stash.is_empty() {
@@ -1148,7 +1145,7 @@ pub(super) fn stash_entries(source: &Repository) -> Result<Vec<String>> {
 
 /// `rev-list`/`pack-objects --revs` stdin: the wants, then `--not` and the
 /// haves when there are any.
-pub(super) fn revisions(wants: &BTreeSet<String>, haves: &[String]) -> String {
+fn revisions(wants: &BTreeSet<String>, haves: &[String]) -> String {
     let mut request = String::new();
     for value in wants {
         request.push_str(value);

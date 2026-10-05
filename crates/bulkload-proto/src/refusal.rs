@@ -2,7 +2,7 @@
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
 //! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Journal*`, `Protocol*` and `Budget*`.
+//! `Sqlite*`, `Path*`, `Protocol*` and `Budget*`.
 //!
 //! Every variant has at least one constructor outside test code
 //! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
@@ -150,11 +150,6 @@ pub enum BulkloadRefusal {
     /// A destination's refs do not prove it holds their history: it is a
     /// partial clone, or shallow at a frontier other than the source's (R-N75).
     GitHavesUnprovable,
-    /// A Git destination's object store or common dir is on a filesystem
-    /// the ingest does not support: a network filesystem (NFS, SMB, `WebDAV`
-    /// and the like), where its `flock` locks cannot be trusted. Ingest
-    /// destinations must be local filesystems (operator ruling OI-1001-Q17).
-    GitDestinationFilesystemUnsupported,
     /// A Git source is a partial clone (a promisor remote, a partial-clone
     /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
     /// store or an alternate). Reading it could fault in a lazy fetch, so v1
@@ -175,10 +170,6 @@ pub enum BulkloadRefusal {
     /// The `SQLite` online backup (open, step or finish) failed (WP3).
     /// Carries `SQLite`'s extended result code when `SQLite` reported one.
     SqliteBackupFailed(Option<i32>),
-
-    // ---- journal -----------------------------------------------------------
-    /// An existing journal belongs to a different transaction.
-    JournalOwnershipConflict,
 
     // ---- budgets / transport ------------------------------------------------
     /// A capture, row, or spill budget was exceeded.
@@ -259,14 +250,12 @@ impl BulkloadRefusal {
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
-            Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::GitChildFailed(_) => "GIT_CHILD_FAILED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
-            Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
@@ -320,14 +309,12 @@ impl BulkloadRefusal {
         "GIT_NEST_CARRIER_REFUSED",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
-        "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
         "GIT_SOURCE_PARTIAL_CLONE",
         "GIT_CHILD_FAILED",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
         "SQLITE_BACKUP_FAILED",
-        "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
         "SALVAGE_BOUND_EXCEEDED",
@@ -526,14 +513,12 @@ mod tests {
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
-            BulkloadRefusal::GitDestinationFilesystemUnsupported,
             BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::GitChildFailed(StderrClass::Other),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
             BulkloadRefusal::SqliteBackupFailed(None),
-            BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SalvageBoundExceeded,

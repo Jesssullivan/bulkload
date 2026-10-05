@@ -1014,9 +1014,10 @@ The model proves the protocol, within its bounds. It does not prove:
 - **Git carry, in BulkloadTransfer.tla.** Only estate capture's typed reads
   (one git read, the SQLite backup) are modelled there. v1's chain and base
   custody is GitCarry.tla's ([what it does not
-  prove](#what-gitcarry-does-not-prove)); carry_v2 (frozen by WP0(a), deleted
-  by Q44), the ingest journal, the git sub-stream and estate apply's `.done`
-  journals are modelled nowhere.
+  prove](#what-gitcarry-does-not-prove)). carry_v2 and its ingest journal
+  are deleted (OI-1003-Q44, OI-1003-Q56; tag `carry-v2-final`), so there is
+  nothing of them to model. The reserved git sub-stream frames and estate
+  apply's `.done` journals are modelled nowhere.
 - **The tree.** Directories and their records (R-N102), symlinks, `Skip`,
   engine temporaries, walk caps and devices other than the store's.
 - **Storage below the store.** The Darwin barrier model belongs to

@@ -3,8 +3,9 @@
 //! R-N97, R-N113, R-N116).
 //!
 //! This is the estimate half of `random_dags_equal_upload_pack` in
-//! `tests/git_carry_v2.rs`, rehomed so it survives the deletion of carry v2
-//! (architecture review WP2 PR 3). It uses nothing PR 3 deletes: the product
+//! `tests/git_carry_v2.rs` (deleted with carry v2 by architecture review WP2
+//! PR 3, OI-1003-Q56; tag `carry-v2-final` holds it), rehomed so it outlives
+//! carry v2. It uses nothing PR 3 deleted: the product
 //! code under test is `bulkload_agent::git_carry::estimate::estimate`, and
 //! the request the oracle is fed is derived here from the two repositories
 //! with plain `git`, not from the sender's first round.
