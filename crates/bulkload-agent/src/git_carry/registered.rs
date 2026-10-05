@@ -134,6 +134,7 @@ pub fn restore(
 ) -> Result<()> {
     const SITE: &str = "git_carry::registered::restore";
     let staged = super::stage_bundle(bundle)?;
+    super::refuse_bare_capture(&staged)?;
     let repository = fs::canonicalize(repository).refuse_at(SITE)?;
     let common = common_repository(&repository)?;
     let admin = fs::canonicalize(admin).refuse_at(SITE)?;
