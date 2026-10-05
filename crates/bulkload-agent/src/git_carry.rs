@@ -342,7 +342,8 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Run a git child that packs objects (`bundle create`, `pack-objects`,
-/// `rev-list`), feeding it `stdin`, and reap it with `wait4` so its own
+/// `rev-list`) or completes a thin pack it fetched (`fetch` of a retained
+/// capture), feeding it `stdin`, and reap it with `wait4` so its own
 /// resource usage is measured. Returns its storage reads in bytes
 /// (`ru_inblock` x 512; see the `counters` module notes for why this is a
 /// lower bound, and only a lower bound on Darwin). The caller sets stdout;
@@ -1990,24 +1991,43 @@ fn retained_blobs(
     seats: &[crate::RowSchema],
     now_ns: i128,
 ) -> Result<raw_tree::Reuse> {
+    use crate::counters::{add, Counter};
     use bulkload_proto::FileKind;
+    const SITE: &str = "git_carry::retained_blobs";
     let mut reuse = raw_tree::Reuse::new();
     // The fetch reads the whole retained bundle, whatever it then keeps.
-    crate::counters::add(
-        crate::counters::Counter::SourceCaptureReuseRead,
-        fs::symlink_metadata(retained.bundle)
-            .refuse_at("git_carry::retained_blobs")?
-            .len(),
+    add(
+        Counter::SourceCaptureReuseRead,
+        fs::symlink_metadata(retained.bundle).refuse_at(SITE)?.len(),
     );
-    output(
+    let packs = private.join("objects/pack");
+    let before = pack_files(&packs)?;
+    // Measured like the packing children (R25): a thin retained capture (a
+    // chained link or a grouped item, OI-1003-Q42) names delta bases it does
+    // not carry, and the fetch's `index-pack --fix-thin` reads each one from
+    // the source object store to complete the pack it writes here.
+    let storage_read = pack_child(
         git(private)
             .args(["fetch", "--no-tags", "--quiet"])
             .arg(retained.bundle)
             .args([
                 "+refs/carry-export/worktree:refs/carry-reuse/worktree",
                 "+refs/carry-export/filesystem-v1:refs/carry-reuse/filesystem-v1",
-            ]),
+            ])
+            .stdout(std::process::Stdio::null()),
+        None,
     )?;
+    add(Counter::SourcePackReadback, storage_read);
+    // Those bases are source reads beside the bundle: the written pack's
+    // growth over the bundle's own pack, exactly what fix-thin appended.
+    let written = pack_files(&packs)?
+        .into_iter()
+        .filter(|(name, _)| !before.contains_key(name))
+        .fold(0u64, |total, (_, length)| total.saturating_add(length));
+    add(
+        Counter::SourceCaptureReuseRead,
+        written.saturating_sub(shared::bundle_pack_len(retained.bundle)?),
+    );
     let held: Vec<crate::RowSchema> = postcard::from_bytes(&output(
         git(private).args(["show", "refs/carry-reuse/filesystem-v1:value"]),
     )?)
@@ -2055,6 +2075,23 @@ fn retained_blobs(
         }
     }
     Ok(reuse)
+}
+
+// The `.pack` files in a pack directory, by name, with their lengths.
+fn pack_files(packs: &Path) -> Result<std::collections::BTreeMap<std::ffi::OsString, u64>> {
+    const SITE: &str = "git_carry::pack_files";
+    let mut found = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(packs).refuse_at(SITE)? {
+        let entry = entry.refuse_at(SITE)?;
+        let name = entry.file_name();
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext == "pack")
+        {
+            found.insert(name, entry.metadata().refuse_at(SITE)?.len());
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
