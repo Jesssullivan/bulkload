@@ -91,7 +91,11 @@ Rulings cited:
 - origin/main measured: `40adca8043a1bc5075a59979743cdddd5dbadf8f`.
 - Harness sha256 `e7597a76…` (the `census t0` step ran `576abfb7…`, which
   differs only by the per-step sha line).
-- The branch commit is in the dispatch's structured result.
+- Round 1 evidence commit: `32f24d1`. Round 2 review-fix commit:
+  `4e7c51e`. The commit that records round 2's validation is in the
+  dispatch's structured result.
+- Pre-#182 code cited in round 2: main `73952f9` (`shallow.rs` as at
+  `3b634ba`).
 
 ## Open
 
@@ -156,6 +160,17 @@ agent, git or census command ran against blahaj in this round.
    - R-N56 versus Q55;
    - the headline is refs only;
    - the scratch inventory and check-fast's tree.
+4. **Validation** (OI-1001-Q2). `just check-fast` in `nix develop
+   .#default`, in the foreground under the shared flock at nice 10,
+   15:06:05Z to 15:11:54Z, on exactly commit `4e7c51e`'s tree. **Green,
+   exit 0:**
+   - 29 cargo test results, all ok (747 passed, 0 failed);
+   - gitleaks found no leaks;
+   - repo-manifest PASS, and CI contract 22 OK.
+
+   The commit after `4e7c51e` adds only this item to this note. The log is
+   in scratch at `r2/check-fast.log`, which is not durable; the figures
+   above are the record.
 
 ## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z; rechecked 15:05Z)
 
