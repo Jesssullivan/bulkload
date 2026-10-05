@@ -248,12 +248,15 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let digest = head.digest();
+    // The flattened refs are exactly `head`'s, so is its bare marker.
+    let bare = head.bare;
     // The head's own stage is no longer read; remove it now.
     drop(head);
     Ok(StagedBundle {
         _directory: directory,
         bundle: flat,
         digest,
+        bare,
     })
 }
 

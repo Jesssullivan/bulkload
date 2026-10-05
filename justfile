@@ -169,6 +169,18 @@ bench-estate-corpus dest seed="bulkload-estate-corpus-v1" scale="small":
 bench-estate-corpus-selftest:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/estate_corpus.py selftest
 
+# `run --agent BIN --work WORK [--scale small|estate]` generates the estate
+# corpus in place under a new private WORK, runs a first pass, three unchanged
+# reruns and reruns after `mutate 1` and `mutate 10` (copy, snapshot,
+# estate-capture, and git-carry-estimate as the v2 projection), evaluates the
+# OI-1003-Q18 inequalities and writes WORK/s3-estate.json. `build --out DIR`
+# release-builds bulkload-agent at origin/main; `report JSON` renders tables;
+# `evaluate JSON --out NEW` re-runs the evaluation of a recorded run into a
+# new file. Informational and ungated; never deletes a target.
+# S3 estate measurement harness, Sprint 2 lane A (OI-1003-Q35, OI-1003-Q18)
+bench-s3-estate *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/s3_estate.py {{ args }}
+
 flake-check:
     cd {{ root }} && nix flake check --no-build --no-write-lock-file
 
@@ -204,6 +216,7 @@ check-optional:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_s3_estate.py
     cd {{ root }} && {{ just_executable() }} bench-estate-corpus-selftest
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
@@ -242,11 +255,55 @@ ci:
 
 import? "justfile.flywheel"
 
+# docs/formal's typed catalogue (OI-1003-Q32): render configs.tsv and every
+# MC_*.cfg from docs/formal/catalogue/Catalogue.dhall into OUT (default
+# docs/formal). Every MC_*.cfg already in OUT is removed first, so a config
+# dropped from the catalogue leaves no stale file. dhall-to-json evaluates
+# the catalogue, which also checks its asserts (a mutation without a verdict
+# or a primary row does not type-check), and jq writes one file per entry.
+# Both come from the flake's pinned nixpkgs (no flake change). JSON, when
+# given, keeps the evaluated catalogue for tla-check's grounding step.
+# Render docs/formal's TLC configs from the Dhall catalogue.
+tla-render out="" json="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}/docs/formal
+    out='{{ out }}'
+    out=${out:-{{ root }}/docs/formal}
+    json='{{ json }}'
+    if [[ -z $json ]]; then
+        json=$(mktemp "${TMPDIR:-/tmp}/tla-render.XXXXXX")
+        trap 'rm -f "$json"' EXIT
+    fi
+    read -r d2j jq < <(nix shell --inputs-from {{ root }} nixpkgs#dhall-json nixpkgs#jq --command sh -c 'printf "%s %s\n" "$(command -v dhall-to-json)" "$(command -v jq)"')
+    "$d2j" --file catalogue/Catalogue.dhall --output "$json"
+    if ! "$jq" -e '[.files[].name] | (length == (unique | length)) and all(test("^(MC_[A-Za-z0-9_]+[.]cfg|configs[.]tsv)$"))' "$json" >/dev/null; then
+        echo "tla-render: the catalogue's file names are duplicated or unsafe" >&2
+        exit 1
+    fi
+    mkdir -p "$out"
+    rm -f "$out"/MC_*.cfg
+    count=$("$jq" '.files | length' "$json")
+    for ((i = 0; i < count; i++)); do
+        name=$("$jq" -r ".files[$i].name" "$json")
+        "$jq" -j ".files[$i].text" "$json" >"$out/$name"
+    done
+    echo "tla-render: $count files into $out"
+
 # TLA+ model of wire v5, Held, the group commits and resume (proof package,
 # OI-1003-Q7; docs/formal/README.md). Standalone and on demand: no tier
 # depends on it, so check-fast, check-optional, check-full and CI never start
-# TLC. TLC comes from the flake's pinned nixpkgs (no flake change). The rows
-# of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
+# TLC. TLC comes from the flake's pinned nixpkgs (no flake change). Before
+# any TLC run, two catalogue checks (OI-1003-Q32) must pass. Staleness: the
+# catalogue, rendered into scratch, equals the committed configs.tsv and
+# MC_*.cfg byte for byte, with no file missing or extra. Grounding: every
+# operator the catalogue names (properties, witnesses, actions, the specs)
+# is defined in BulkloadTransfer.tla; the catalogue's constants are exactly
+# the spec's CONSTANTS, and its mutations exactly the spec's Mutations set
+# ("none" aside), each checked in both directions; and every code symbol is
+# found by `git grep -w` under crates/. A failed check removes the scratch
+# and stops.
+# The rows of docs/formal/configs.tsv run in order, one JVM at a time (-Xmx4g,
 # 3 workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. The first row is the budget self-test: it
 # must finish with WithinBudget, and nothing else, violated, or nothing else
@@ -267,7 +324,81 @@ tla-check *configs:
     set -euo pipefail
     cd {{ root }}/docs/formal
     tlc=$(nix shell --inputs-from {{ root }} nixpkgs#tlaplus --command sh -c 'command -v tlc')
+    jq=$(nix shell --inputs-from {{ root }} nixpkgs#jq --command sh -c 'command -v jq')
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/tla-check.XXXXXX")
+    # Staleness: the committed configs are exactly the catalogue's rendering.
+    (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >/dev/null
+    committed=$(ls MC_*.cfg configs.tsv | LC_ALL=C sort)
+    rendered=$(cd "$scratch/rendered" && ls | LC_ALL=C sort)
+    stale=0
+    if [[ $committed != "$rendered" ]]; then
+        echo "tla-check: the committed configs and the catalogue's differ in their file set:" >&2
+        diff <(echo "$committed") <(echo "$rendered") >&2 || true
+        stale=1
+    fi
+    for file in $rendered; do
+        if [[ -f $file ]] && ! cmp -s "$file" "$scratch/rendered/$file"; then
+            echo "tla-check: $file differs from the catalogue's rendering" >&2
+            stale=1
+        fi
+    done
+    if [[ $stale -ne 0 ]]; then
+        echo "tla-check: stale configs; run just tla-render and commit the result" >&2
+        rm -rf "$scratch"
+        exit 1
+    fi
+    # Grounding: every catalogue name exists in the spec, every code symbol in crates/.
+    ungrounded=0
+    declared=$(awk '/^CONSTANTS/ { on = 1; next } on && /^$/ { on = 0 } on' BulkloadTransfer.tla)
+    mutations=$(awk '/^Mutations ==/ { on = 1 } on { print } on && /}/ { exit }' BulkloadTransfer.tla)
+    operators=$("$jq" -r '.grounding.operators[]' "$scratch/catalogue.json")
+    constants=$("$jq" -r '.grounding.constants[]' "$scratch/catalogue.json")
+    mutants=$("$jq" -r '.grounding.mutations[]' "$scratch/catalogue.json")
+    symbols=$("$jq" -r '.grounding.codeSymbols | unique | .[]' "$scratch/catalogue.json")
+    for name in $operators; do
+        if ! grep -qE "^${name}"'(\(.*\))? ==' BulkloadTransfer.tla; then
+            echo "tla-check: $name is not defined in BulkloadTransfer.tla" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    # Constants and mutations must agree in both directions: the catalogue
+    # sets every declared constant and no other, and it has an entry (a
+    # verdict and a primary MC_neg_ row) for every rule break in the spec's
+    # Mutations set ("none" aside) and no other.
+    declared_names=$({ grep -oE '^ +[A-Za-z][A-Za-z0-9_]*' <<<"$declared" || true; } | tr -d ' ' | LC_ALL=C sort -u)
+    catalogue_constants=$(LC_ALL=C sort -u <<<"$constants")
+    while read -r name; do
+        echo "tla-check: constant $name is not declared in BulkloadTransfer.tla" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -13 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
+    while read -r name; do
+        echo "tla-check: constant $name is declared in BulkloadTransfer.tla but the catalogue does not set it" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -23 <(echo "$declared_names") <(echo "$catalogue_constants") | sed '/^$/d')
+    spec_mutations=$({ grep -oE '"[A-Za-z0-9_]+"' <<<"$mutations" || true; } | tr -d '"' | sed '/^none$/d' | LC_ALL=C sort -u)
+    catalogue_mutations=$(LC_ALL=C sort -u <<<"$mutants")
+    while read -r name; do
+        echo "tla-check: mutation $name is not in the spec's Mutations set" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -13 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
+    while read -r name; do
+        echo "tla-check: the spec's mutation $name has no catalogue entry (no verdict, no MC_neg_ row)" >&2
+        ungrounded=$((ungrounded + 1))
+    done < <(LC_ALL=C comm -23 <(echo "$spec_mutations") <(echo "$catalogue_mutations") | sed '/^$/d')
+    for name in $symbols; do
+        if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
+            echo "tla-check: code symbol $name is not found under crates/" >&2
+            ungrounded=$((ungrounded + 1))
+        fi
+    done
+    if [[ $ungrounded -ne 0 ]]; then
+        echo "tla-check: $ungrounded catalogue name(s) are not grounded" >&2
+        rm -rf "$scratch"
+        exit 1
+    fi
+    printf 'catalogue: %s files current; grounded %s operators, %s constants, %s mutations, %s code symbols\n' \
+        "$(wc -w <<<"$rendered")" "$(wc -w <<<"$operators")" "$(wc -w <<<"$constants")" \
+        "$(wc -w <<<"$mutants")" "$(wc -w <<<"$symbols")"
     mkdir -p "$scratch/java"
     export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/java -Xmx4g"
     measure=()
@@ -410,6 +541,118 @@ tla-check *configs:
         exit 1
     fi
     rm -rf "$scratch"
+
+# Haskell N-version explorer (OI-1003-Q32; docs/formal/README.md, "Hybrid
+# roles"). Standalone and on demand: no tier depends on it, so check-fast,
+# check-optional, check-full and CI never build it. GHC, TLC, Dhall and jq
+# come from the flake's pinned nixpkgs (no flake change).
+# docs/formal/hs/Explorer.hs uses base and containers only; it is built with
+# -O1 -Wall -Werror into a private mktemp directory under TMPDIR. Its rows:
+# - the presets nv_core and nv_ledger must reach TLC's distinct-state counts
+#   of record, MC_nv_core's 15,834 and MC_nv_ledger's 142,450, with no
+#   invariant violated and no deadlock;
+# - every MC_neg_ row of the catalogue inside the explorer's domain (the
+#   evaluated catalogue's nversion list) runs at its own bound, passed as
+#   the explorer's bound flags, checking TypeOK and the row's named
+#   property, as its TLC config does; it must violate exactly that property;
+# - each primary row among them runs again with every safety invariant
+#   checked, on the explorer and on TLC with one worker (the catalogue's
+#   scratch config for it): both must stop at the same first violated
+#   invariant after the same number of states.
+# Each explorer counterexample is written as JSON; that directory is kept
+# and printed, and so are the TLC logs.
+# Cross-check the TLA+ model with the Haskell N-version explorer.
+formal-nv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}/docs/formal
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/formal-nv.XXXXXX")
+    mkdir -p "$scratch/build" "$scratch/counterexamples" "$scratch/tlc/java"
+    if ! (cd {{ root }} && {{ just_executable() }} tla-render "$scratch/rendered" "$scratch/catalogue.json") >"$scratch/render.log" 2>&1; then
+        cat "$scratch/render.log" >&2
+        echo "formal-nv: the catalogue did not evaluate; log kept at $scratch/render.log" >&2
+        exit 1
+    fi
+    tlc=$(nix shell --inputs-from {{ root }} nixpkgs#tlaplus --command sh -c 'command -v tlc')
+    jq=$(nix shell --inputs-from {{ root }} nixpkgs#jq --command sh -c 'command -v jq')
+    if ! nix shell --inputs-from {{ root }} nixpkgs#ghc --command nice -n 10 ghc -O1 -Wall -Werror -outputdir "$scratch/build" -o "$scratch/explorer" hs/Explorer.hs >"$scratch/ghc.log" 2>&1; then
+        cat "$scratch/ghc.log" >&2
+        echo "formal-nv: the explorer did not build; log kept at $scratch/ghc.log" >&2
+        exit 1
+    fi
+    # TLC's distinct-state counts of record (README.md, "N-version core").
+    declare -A tlc_distinct=([nv_core]=15834 [nv_ledger]=142450)
+    field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<" $2"; }
+    mismatches=0
+    format='%-34s %-42s %-42s %9s %10s %6s %s\n'
+    printf "$format" row expect explorer distinct generated depth match
+    for preset in nv_core nv_ledger; do
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" --preset "$preset") || status=$?
+        want="pass (${tlc_distinct[$preset]})"
+        got="$(field outcome "$line") ($(field distinct "$line"))"
+        match=yes
+        if [[ $status -ne 0 || $got != "$want" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+        fi
+        printf "$format" "$(field row "$line")" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+    done
+    rows=$("$jq" '.nversion | length' "$scratch/catalogue.json")
+    if [[ $rows -eq 0 ]]; then
+        echo "formal-nv: the catalogue has no mutation row in the explorer's domain" >&2
+        exit 1
+    fi
+    export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch/tlc/java -Xmx2g"
+    for ((i = 0; i < rows; i++)); do
+        IFS=$'\t' read -r name mutation named primary seats runs crashes edits foreign < <(
+            "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, .seats, .runs, .crashes, .edits, .foreign] | @tsv" "$scratch/catalogue.json")
+        bound=(--seats "$seats" --runs "$runs" --crashes "$crashes" --edits "$edits" --foreign "$foreign" --mutation "$mutation")
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$name" --check "TypeOK,$named" --json "$scratch/counterexamples") || status=$?
+        got="$(field outcome "$line") $(field violated "$line")"
+        match=yes
+        if [[ $status -ne 1 || $got != "violation $named" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+        fi
+        printf "$format" "$name" "fail $named" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+        if [[ $primary != true ]]; then
+            continue
+        fi
+        # Every safety invariant, on TLC (one worker, so its breadth-first
+        # order is fixed) and on the explorer: the first invariant violated,
+        # in the configs' order, and the counterexample's length must agree.
+        every="${name}_all"
+        log="$scratch/tlc/$every.log"
+        "$jq" -j ".nversion[$i].everyInvariant" "$scratch/catalogue.json" >"$scratch/tlc/$every.cfg"
+        nice -n 10 "$tlc" -workers 1 -metadir "$scratch/tlc/$every.states" -config "$scratch/tlc/$every.cfg" BulkloadTransfer.tla >"$log" 2>&1 || true
+        rm -rf "$scratch/tlc/$every.states"
+        tlc_first=$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | head -n 1 | cut -d' ' -f2 || true)
+        if grep -qF 'Deadlock reached' "$log"; then
+            tlc_first=deadlock
+        fi
+        tlc_states=$(grep -cE '^State [0-9]+:' "$log" || true)
+        status=0
+        line=$(nice -n 10 "$scratch/explorer" "${bound[@]}" --name "$every" --check all --json "$scratch/counterexamples") || status=$?
+        first=$(field violated "$line")
+        first=${first%%,*}
+        want="TLC first ${tlc_first:-none}, $tlc_states states"
+        got="explorer first $first, $(field states "$line") states"
+        match=yes
+        if [[ $status -ne 1 || -z $tlc_first || $got != "explorer first $tlc_first, $tlc_states states" ]]; then
+            match=no
+            mismatches=$((mismatches + 1))
+            echo "formal-nv: $every disagrees with TLC; TLC log kept at $log" >&2
+        fi
+        printf "$format" "$every" "$want" "$got" "$(field distinct "$line")" "$(field generated "$line")" "$(field depth "$line")" "$match"
+    done
+    rm -rf "$scratch/build" "$scratch/explorer" "$scratch/rendered" "$scratch/tlc/java"
+    echo "counterexamples (JSON): $scratch/counterexamples; TLC logs: $scratch/tlc"
+    if [[ $mismatches -ne 0 ]]; then
+        echo "formal-nv: $mismatches row(s) disagree with TLC" >&2
+        exit 1
+    fi
 
 # `run --source SRC --out OUT -- <bulkload command>` runs the v0 reference
 # workload (JSONL+fsync, SQLite WAL, git status+diff, rg) at 1 Hz in a sibling
