@@ -5,9 +5,9 @@ explorer of GitCarry.tla's custody model (Q42 lane L4, OI-1003-Q43).
 Roles (OI-1003-Q43, which widens OI-1003-Q32 for this layer):
 
   * `decide :: Inputs -> Decision` is the reference copy of the pure,
-    total decision a v1 capture makes before it exports. Lane L6 moves the
-    code's decision into `git_carry/decide.rs` (pending) and checks it
-    against this copy's pinned rows with a fixed-seed property test (P67).
+    total decision a v1 capture makes before it exports. Lane L6a moved
+    the code's decision into `git_carry/decide.rs`, which a fixed-seed
+    property test (P67) checks against this copy's v1 pinned rows.
     So here Haskell is a differential oracle for the code, not only a
     second encoding of the TLA+ spec.
   * `rows` renders those pinned rows, crates/bulkload-agent/tests/data/
@@ -21,7 +21,7 @@ Roles (OI-1003-Q43, which widens OI-1003-Q32 for this layer):
     encoding (independent code, shared design): it was transliterated by
     hand from GitCarry.tla, and it cannot catch a misreading of the Rust
     code that the spec makes. The pinned rows are what tie decide to the
-    code, once L6 lands.
+    code (P67).
   * `schema` prints the closed unions' labels; `formal-nv` requires them
     to equal catalogue/Types.dhall's.
 
@@ -132,7 +132,7 @@ data Shape = Unchained | Based | Chained
 data PrevBase = PrevNone | PrevRetained | PrevLost
   deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | What the code reads before it decides (the Rust Inputs is lane L6).
+-- | What the code reads before it decides (the Rust Inputs is lane L6a's).
 data Inputs = Inputs
   { grouped :: Bool -- ^ the item shares its common repository (capture_groups)
   , base :: BaseState
