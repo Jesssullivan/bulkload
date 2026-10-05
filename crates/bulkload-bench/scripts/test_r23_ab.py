@@ -224,6 +224,61 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(self.main(self.gated()), 0)
         self.assertEqual(self.report()["gate"]["verdict"], "FAIL")
 
+    def test_under_load_and_dry_run_are_exclusive(self) -> None:
+        self.assertEqual(self.main(["--dry-run", "--under-load"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_under_load_records_load_but_does_not_gate_on_it(self) -> None:
+        high = mock.patch.object(ab, "conditions", return_value=cond(False))
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(
+                self.main([*self.gated(), "--under-load"], conditions=high), 0
+            )
+        report = self.report()
+        self.assertEqual(report["mode"], "under-load")
+        self.assertEqual(report["status"], "complete-under-load-informational")
+        self.assertTrue(report["gate"]["verdict"].startswith(ab.UNDER_LOAD))
+        self.assertIn("3/3", report["gate"]["verdict"])
+        self.assertTrue(
+            all(r["conditions_before"]["load1"] == 9.0 for r in report["reps"])
+        )
+        md = (self.tmp / "ev.md").read_text()
+        self.assertIn(ab.UNDER_LOAD, md.splitlines()[0])
+        self.assertIn("not an R23 gate", md)
+
+    def test_under_load_records_a_refused_informational_rep_and_continues(self) -> None:
+        real = ab.parse_bench
+        calls = {"n": 0}
+
+        def parse(stdout: str) -> dict[str, object]:
+            calls["n"] += 1
+            return {} if calls["n"] == 2 else real(stdout)
+
+        refuse_a = mock.patch.object(ab, "parse_bench", side_effect=parse)
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(
+                self.main([*self.gated(), "--under-load"], parse_bench=refuse_a), 0
+            )
+        report = self.report()
+        self.assertEqual(report["status"], "complete-under-load-informational")
+        self.assertEqual([r["label"] for r in report["refused_reps"]], ["A"])
+        self.assertEqual(
+            [r["label"] for r in report["reps"]], ["B", "B", "A", "B", "V4"]
+        )
+        self.assertIn("refused under load", (self.tmp / "ev.md").read_text())
+
+    def test_gated_mode_still_aborts_on_a_refused_rep(self) -> None:
+        real = ab.parse_bench
+        calls = {"n": 0}
+
+        def parse(stdout: str) -> dict[str, object]:
+            calls["n"] += 1
+            return {} if calls["n"] == 2 else real(stdout)
+
+        refuse_a = mock.patch.object(ab, "parse_bench", side_effect=parse)
+        self.assertEqual(self.main(self.gated(), parse_bench=refuse_a), 3)
+        self.assertIn("bench refused", self.report()["reason"])
+
     def test_aborts_when_conditions_fail_between_reps(self) -> None:
         states = iter([cond(), cond(), cond(), cond(False)])
         flip = mock.patch.object(

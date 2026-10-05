@@ -150,6 +150,18 @@ NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
 UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
 
 
+class InformationalRefusal(Exception):
+    """An informational (non-B) rep that the bench refused in --under-load mode.
+
+    OI-1003-Q50: under host pressure the A or V4 baseline may fail on its own; the
+    sample records the refusal and continues, because only B decides anything.
+    """
+
+    def __init__(self, message: str, record: dict[str, object]) -> None:
+        super().__init__(message)
+        self.record = record
+
+
 class Abort(Exception):
     """The sample ended early; the evidence is written as aborted."""
 
@@ -560,10 +572,26 @@ def run_rep(
     after, settled = post_settle(args)
     parsed = parse_bench(result.stdout)
     if "verdict" not in parsed:
-        raise Abort(
+        message = (
             f"rep{index} {label} bench refused (exit {result.returncode}): "
             f"{result.stderr.strip().splitlines()[-1:]}"
         )
+        if args.under_load and label != "B":
+            raise InformationalRefusal(
+                message,
+                {
+                    "index": index,
+                    "label": label,
+                    "sha": info["sha"],
+                    "exit": result.returncode,
+                    "wall_s": round(wall_s, 3),
+                    "reason": message,
+                    "conditions_before": before,
+                    "conditions_after": after,
+                    "conditions_after_settled": settled,
+                },
+            )
+        raise Abort(message)
     # The timed arms read the bench's private per-rep fixture, not the sealed
     # source; its residency is measured after the rep (the bench is one process).
     fixture = root / "native-sealed-fixture"
@@ -699,6 +727,13 @@ def evidence(report: dict[str, object]) -> str:
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
             "",
         ]
+    if report.get("refused_reps"):
+        lines += [
+            "Informational reps the bench refused under load (recorded, not fatal; OI-1003-Q50):",
+            "",
+        ]
+        lines += [f"- {r['reason']}" for r in report["refused_reps"]]
+        lines += [""]
     if report["mode"] == "under-load":
         lines += [
             f"> **{UNDER_LOAD}.** Sealed corpus v1, `--informational`. R-N81 host"
@@ -1052,19 +1087,23 @@ def main(argv: list[str] | None = None) -> int:
     state: dict[str, object] = {}
     try:
         for index, (label, native_only) in enumerate(order):
-            report["reps"].append(
-                run_rep(
-                    label,
-                    builds[label],
-                    args,
-                    work,
-                    corpus,
-                    rclone,
-                    index,
-                    native_only,
-                    state,
+            try:
+                report["reps"].append(
+                    run_rep(
+                        label,
+                        builds[label],
+                        args,
+                        work,
+                        corpus,
+                        rclone,
+                        index,
+                        native_only,
+                        state,
+                    )
                 )
-            )
+            except InformationalRefusal as refusal:
+                say(f"{refusal}; recorded and continuing (informational, OI-1003-Q50)")
+                report.setdefault("refused_reps", []).append(refusal.record)
         if not args.dry_run:
             after = corpus_verify(corpus) == 0 and corpus_verify(sealed) == 0
             report["content_verified_after"] = after
