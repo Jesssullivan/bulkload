@@ -4,9 +4,11 @@ Lane: q54-blahaj-carry, host sting. Worktree
 `bulkload.worktrees/q54-blahaj-carry-20261005`, branch
 `docs/q54-blahaj-carry-20261005`, cut from origin/main `40adca8` (#182
 merged). This lane proves the Q54 precondition on the real blahaj before L5
-deletes carry_v2. No PR is opened: the branch is pushed for the
-coordinator. The file name keeps the dispatch's date; the work ran on
-2026-10-05, 14:25Z to about 14:45Z.
+deletes carry_v2. Rounds 1 and 2 pushed the branch for the coordinator
+without a PR; round 3, the recheck-and-ship stage, opened
+[PR #184](https://github.com/Jesssullivan/bulkload/pull/184) (not merged).
+The file name keeps the dispatch's date; the work ran on 2026-10-05, from
+14:25Z to about 15:35Z.
 
 **Result: the Q54 precondition is MET, on the shallow-envelope path, from
 an empty corpus.** See
@@ -92,8 +94,8 @@ Rulings cited:
 - Harness sha256 `e7597a76…` (the `census t0` step ran `576abfb7…`, which
   differs only by the per-step sha line).
 - Round 1 evidence commit: `32f24d1`. Round 2 review-fix commit:
-  `4e7c51e`. The commit that records round 2's validation is in the
-  dispatch's structured result.
+  `4e7c51e`. Round 2 validation record: `04339a6`. Round 3's note commit
+  is the head of PR #184.
 - Pre-#182 code cited in round 2: main `73952f9` (`shallow.rs` as at
   `3b634ba`).
 
@@ -122,7 +124,10 @@ Rulings cited:
 7. **Pass 2's zero read is not measured** (round 2). Measuring it needs an
    independent read measure for the agent and its git children.
 
-## Round 2: review fixes (2026-10-05, about 14:55Z to 15:30Z)
+## Round 2: review fixes (2026-10-05, about 14:55Z to 15:12Z)
+
+In this section, "Open 5" and "Open 6" are the evidence page's items. In
+this note they are Open 6 and Open 7.
 
 Rulings: OI-1003-Q54, OI-1003-Q55, OI-1003-Q35, R-N13. Docs only; no
 agent, git or census command ran against blahaj in this round.
@@ -172,16 +177,66 @@ agent, git or census command ran against blahaj in this round.
    in scratch at `r2/check-fast.log`, which is not durable; the figures
    above are the record.
 
-## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z; rechecked 15:05Z)
+## Round 3: recheck and ship (2026-10-05, about 15:13Z to 15:35Z)
+
+Rulings: OI-1003-Q54, OI-1003-Q55, OI-1003-Q35, R-N13. This round changed
+docs only and opened a PR. No agent, git write or census touched blahaj.
+
+1. **Recheck** (OI-1003-Q54, R-N13). Both medium findings are fixed. The
+   code read (`git show`, read only) was main before #182 (`73952f9`) and
+   `40adca8`:
+   - **Medium 1.** At `73952f9`, `shallow::write_bundle` writes the whole
+     `for-each-ref` inventory into the manifest with no cap.
+     `custody_manifest` reads it with a 16 MiB limit, and
+     `batch_objects::copy_into` refuses `BUDGET_EXCEEDED`. Its callers
+     are all restore or attach paths: `import_verified`,
+     `prepare_attachment`, `prepare_linked_attachment`, `restore_staged`,
+     `restore_linked_staged`, `repair_missing_index_inner` and
+     `registered::restore`. The old export path ends at
+     `git bundle verify` and never reads the manifest.
+   - **Medium 2.** At `40adca8`:
+     - `Retained::Hit` returns `Completion::clean`, which has
+       `bytes_read: 0`;
+     - `retained_capture` on a hit reads only the outer header, through
+       `requires_base`;
+     - `custody_manifest` maps `BUDGET_EXCEEDED` to
+       `GIT_INVENTORY_OVER_CAP`;
+     - #182 did not change the capture key, so the premise of page Open 5
+       holds.
+   - The JSON matches the restated figures: state 709,758,497 B to
+     709,758,516 B, corpus 229,677,780 B, `flush_full_count=1` and
+     `flush_dir_count=3`.
+   - No new medium or high defect was found. Round 3 corrected three small
+     things: round 2's end time, its Open cross-references, and this
+     note's "no PR" line. The ten low findings stay deferred (round 2,
+     item 3).
+2. **PR** (OI-1003-Q54, R-N13).
+   [#184](https://github.com/Jesssullivan/bulkload/pull/184) was opened
+   against main and is not merged. Its body covers what and why, how to
+   run, the evidence and the review summary.
+3. **Validation** (OI-1001-Q2). `just check-fast` in `nix develop
+   .#default`, in the foreground under the shared flock at nice 10, on
+   this note's final tree. Only the text of this item differed from the
+   committed tree. The run was 15:18:30Z to 15:24:22Z. **Green, exit 0:**
+   - 29 cargo test results, all ok (747 passed, 0 failed);
+   - gitleaks found no leaks;
+   - repo-manifest PASS, and CI contract 22 OK.
+
+   The log is in scratch, which is not durable; these figures are the
+   record.
+
+## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z; rechecked 15:05Z and 15:17Z)
 
 These rows come from `gh pr list` and `git worktree list` on sting. They
 are **reported, not verified**. The Linear SSOT ledger was not read. At
-the 15:05Z recheck the open PRs were still #164 and #136, and the L6a
-worktree was still at `40adca8`.
+the 15:17Z recheck:
+
+- the open PRs were #164 and #136, plus this lane's #184 once opened;
+- the L6a worktree was still at `40adca8`.
 
 | Stream | Owner | Branch / PR | State (reported) | Next |
 |---|---|---|---|---|
-| **Q54 blahaj carry (this lane)** | this lane | `docs/q54-blahaj-carry-20261005` | measured; MET (shallow-envelope path, empty corpus); round 2 review fixes pushed, no PR (dispatch) | coordinator review; retained old-format captures (Open 6) before L5 |
+| **Q54 blahaj carry (this lane)** | this lane | `docs/q54-blahaj-carry-20261005`, PR #184 | measured; MET (shallow-envelope path, empty corpus); round 3 recheck CLEAN; PR open, not merged | coordinator review and merge; retained old-format captures (Open 6) before L5 |
 | Q54 v1 header | lane | PR #182 | merged 13:32Z | none here |
 | Q42 L6a decide | lane | worktree `q42-l6a-decide-20261005` at `40adca8` | unknown | unknown |
 | Q42 L5 (delete carry_v2) | coordinator | none seen | waits on this proof | coordinator |
