@@ -117,15 +117,25 @@ neither an index nor a worktree (S4, #162).
   does not, so no carried index restores it.
 - A capture's header does not list every carried ref (OI-1003-Q54, #178;
   `docs/plans/2026-10-05-v1-header.md`). The refs travel in a
-  content-addressed ref table commit (`refs/carry-export/ref-table-v1`),
-  with one tip ref per distinct object they name, so the header grows with
-  the distinct objects (111 B each, SHA-1), not the refs. Import expands the
+  content-addressed ref table commit (`refs/carry-ref-table/v1`), with one
+  tip ref per distinct object they name, so the header grows with the
+  distinct objects, not the refs: 111 B each self-contained and 165 B each
+  in a thin bundle (SHA-1; 159 B and 237 B on SHA-256). Import expands the
   table into exactly the refs the old format carried; a capture without a
-  table (every capture written before) imports as it always did.
+  table (every capture written before) imports as it always did. Import is
+  linear in the bundle: `bundle unbundle` and one connectivity walk, no
+  ref-name matching.
+- **No mixed-version apply.** A capture with a ref table is applied only by
+  a build that reads one. The table ref sits outside `refs/carry-export/`
+  on purpose: every earlier build refuses such a capture
+  `GIT_INVENTORY_MALFORMED` before it writes a ref, never imports it as a
+  wrong ref set.
 - A bundle header, a ref table or a shallow envelope's manifest over its
   size bound refuses `GIT_INVENTORY_OVER_CAP`, never
   `GIT_INVENTORY_MALFORMED`. Writers measure the header before they write
-  it, so no capture is recorded that a later reader refuses for size.
+  it, so no capture is recorded that a later reader refuses for size. A
+  thin bundle (a chained link or a plan base's item) whose header would be
+  over the cap is written self-contained instead of refused.
 
 Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores

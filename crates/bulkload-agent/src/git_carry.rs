@@ -4823,10 +4823,10 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
     let unpacked = shallow::unpack(repo, &bundle, &listed)?;
     let advertised = unpacked.as_ref().unwrap_or(&listed);
     if unpacked.is_none() {
-        fetch_advertised(repo, &bundle, advertised)?;
+        unbundle_objects(repo, &bundle, advertised)?;
     }
     // A ref table (OI-1003-Q54) expands to exactly the old format's lines,
-    // read from the objects just fetched; an old-format header is used as is.
+    // read from the objects just taken; an old-format header is used as is.
     let expanded = ref_table::expand(repo, advertised)?;
     let heads = expanded.as_ref().unwrap_or(advertised);
     let mut native: Vec<_> = heads
@@ -4917,7 +4917,8 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
 /// repository, never in a source.
 ///
 /// # Errors
-/// Whatever `bundle list-heads`, the fetch or [`ref_table::expand`] refuses.
+/// Whatever `bundle list-heads`, [`unbundle_objects`] or [`ref_table::expand`]
+/// refuses.
 #[cfg(test)]
 pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<String> {
     let directory = PrivateDir::create(None)?;
@@ -4947,50 +4948,68 @@ pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<Str
         )
         .refuse_at("git_carry::carried_heads")?;
     }
-    fetch_advertised(&repository, bundle, &listed)?;
+    unbundle_objects(&repository, bundle, &listed)?;
     Ok(ref_table::expand(&repository, &listed)?.unwrap_or(listed))
 }
 
-// Fetch the objects of every ref `bundle` advertises, and no ref: the
-// compare-and-create in `import_verified` cannot clobber a native ref.
+// Take the objects of every ref `bundle` advertises into `repo`, and no ref:
+// the compare-and-create in `import_verified` cannot clobber a native ref.
 //
-// One refspec per distinct object: fetch's connectivity check then covers
-// the closure of every object a carried ref names, so of every carried ref.
-// Git matches each exact refspec by a scan of the advertised refs, so naming
-// every ref of an old-format header (one line per carried ref) was quadratic
-// in the refs, and more than one argv holds at tens of thousands of refs
-// (the old import refused 119,761 refs `IO`, errno E2BIG). The refspecs go
-// on stdin.
-fn fetch_advertised(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
-    let mut refspecs = String::new();
+// Linear in the bundle (#178 review): `git bundle unbundle` indexes its pack
+// (completing a thin one from the prerequisites `repo` holds) and writes no
+// ref, then one `rev-list --objects` walk proves every advertised object's
+// closure is present, which is the guarantee `fetch` gave by its
+// connectivity check. `fetch` with exact refspecs matched each one by a scan
+// of every advertised ref: O(distinct x advertised), quadratic in a
+// distinct-heavy capture (sting, git 2.52: 56 s, 232 s and 1,001 s of CPU at
+// 10k, 20k and 40k tips). Names are not matched here at all; the header's
+// names are read by `import_verified` and `ref_table::expand`.
+//
+// As `fetch` did, a `repo` that already holds every closure takes nothing:
+// re-importing a capture does not index its pack again. The walk stops at
+// `repo`'s refs and at the bundle's prerequisites, which `bundle verify` has
+// already found complete, so it reads only what the bundle brings.
+fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
+    let mut walk = String::new();
     let mut objects = std::collections::BTreeSet::new();
     for line in advertised.lines() {
         let (value, name) = line
             .split_once(' ')
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !oid(value) || !name.starts_with("refs/carry-export/") {
+        if !oid(value) || !ref_table::carried_name(name) {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         if objects.insert(value) {
-            refspecs.push_str(name);
-            refspecs.push('\n');
+            walk.push_str(value);
+            walk.push('\n');
         }
     }
-    if !refspecs.is_empty() {
-        input(
-            git(repo)
-                .args([
-                    "fetch",
-                    "--no-write-fetch-head",
-                    "--no-auto-maintenance",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--stdin",
-                ])
-                .arg(bundle),
-            refspecs.as_bytes(),
-        )?;
+    if walk.is_empty() {
+        return Ok(());
     }
+    for prerequisite in shared::prerequisites(bundle)? {
+        walk.push('^');
+        walk.push_str(&prerequisite);
+        walk.push('\n');
+    }
+    let connected = || {
+        input(
+            git(repo).args([
+                "rev-list",
+                "--objects",
+                "--quiet",
+                "--stdin",
+                "--not",
+                "--all",
+            ]),
+            walk.as_bytes(),
+        )
+    };
+    if connected().is_ok() {
+        return Ok(());
+    }
+    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
+    connected()?;
     Ok(())
 }
 

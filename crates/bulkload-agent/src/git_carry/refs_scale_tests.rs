@@ -23,6 +23,21 @@
 //! refspecs no longer fit one argv), and a capture written by the old binary
 //! itself (`tests/fixtures/v1-old-format`) imports to exactly the refs that
 //! binary imported. A new capture chains on an old-format prior and flattens.
+//!
+//! **Old readers refuse the new format.** The header-name rule of every
+//! reader before the ref table, frozen from main `818926a`
+//! ([`read_before_the_table`]), refuses every kind of new-format capture, so
+//! a pre-change build refuses one instead of importing its tip refs as the
+//! source's refs.
+//!
+//! **Distinct objects, not refs.** The header law and the import's cost are
+//! per distinct object. These rows hold few distinct objects per ref (the
+//! blahaj shape), where the header is far smaller than the old format's;
+//! with one object per ref it is only about 1.3x smaller. The distinct-heavy
+//! regime (one commit per ref, the import's CPU bounded per distinct object,
+//! a chained pass and its fallback) is `tests/refs_scale_distinct.rs`. A
+//! thin header over the cap is written self-contained
+//! ([`a_chained_pass_over_the_thin_cap_is_written_self_contained`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -914,12 +929,14 @@ fn every_header_reader_refuses_an_over_cap_header_by_size() {
     );
 }
 
-/// Writers measure the header before they write: a thin bundle (a plan
+/// Writers measure the header before they write. A thin bundle (a plan
 /// base's item, a chained link) whose prerequisite lines would put it over
-/// the cap, and a self-contained bundle whose private refs would, are refused
-/// by size with nothing left at the bundle path.
+/// the cap is written self-contained instead, never refused while that fits.
+/// A self-contained bundle whose private refs would be over the cap is
+/// refused by size, and so is the thin writer's fallback to it, with nothing
+/// left at the bundle path.
 #[test]
-fn writers_refuse_an_over_cap_header_before_writing_it() {
+fn writers_measure_an_over_cap_header_before_writing_it() {
     let work = scratch("over-cap-writer");
     let private = work.0.join("repository.git");
     g(
@@ -930,16 +947,29 @@ fn writers_refuse_an_over_cap_header_before_writing_it() {
         .unwrap()
         .trim()
         .to_owned();
-    // Thin: 320,000 prerequisite lines of 54 B, about 17.3 MB.
+    g(
+        &private,
+        &[
+            "update-ref",
+            &format!("{}{blob}", ref_table::TIP_PREFIX),
+            &blob,
+        ],
+    );
+    // Thin: 320,000 prerequisite lines of 54 B, about 17.3 MB, over the cap;
+    // the self-contained header is one line.
     let commits: BTreeSet<String> = (0..320_000u32)
         .map(|index| blake3::hash(&index.to_le_bytes()).to_hex()[..40].to_owned())
         .collect();
     let thin = work.0.join("thin.bundle");
-    assert_eq!(
-        shared::write_excluding_tip_trees(&private, &thin, &commits),
-        Err(BulkloadRefusal::GitInventoryOverCap)
+    let (_, chained) =
+        shared::write_excluding_tip_trees(&private, &thin, &commits, shared::HEADER_CAP).unwrap();
+    assert!(
+        !chained,
+        "an over-cap thin header is written self-contained"
     );
-    for leftover in ["bundle", "objects-pending", "header-pending"] {
+    assert!(shared::prerequisites(&thin).unwrap().is_empty());
+    assert!(header_len(&thin) < 1024);
+    for leftover in ["objects-pending", "header-pending"] {
         assert!(!thin.with_extension(leftover).exists(), "{leftover}");
     }
     // Self-contained: 170,000 private refs of about 104 B each.
@@ -957,4 +987,204 @@ fn writers_refuse_an_over_cap_header_before_writing_it() {
         Err(BulkloadRefusal::GitInventoryOverCap)
     );
     assert!(!full.exists());
+    let over = work.0.join("over.bundle");
+    assert_eq!(
+        shared::write_excluding_tip_trees(&private, &over, &commits, shared::HEADER_CAP)
+            .map(|(_, chained)| chained),
+        Err(BulkloadRefusal::GitInventoryOverCap)
+    );
+    for leftover in ["bundle", "objects-pending", "header-pending"] {
+        assert!(!over.with_extension(leftover).exists(), "{leftover}");
+    }
+}
+
+/// A chained pass whose thin header would be over the cap is written
+/// self-contained, `chained == false`, and imports exactly; at its own header
+/// length the same pass stays thin. The cap is lowered to this pass's thin
+/// header (the production cap needs about 101,680 distinct commits on SHA-1;
+/// the deep tier of `tests/refs_scale_distinct.rs` runs that size). Before,
+/// the pass refused `GIT_INVENTORY_OVER_CAP`, and so did every later pass
+/// offered the same chain.
+#[test]
+fn a_chained_pass_over_the_thin_cap_is_written_self_contained() {
+    let shape = Shape {
+        commits: 12,
+        annotated: 2,
+        native: 10,
+        namespaces: 2,
+        loose_per_mille: 300,
+        shadowed: 1,
+        pack_all: false,
+        stash: false,
+        sha256: false,
+    };
+    let mut source = generate("thin-cap", &shape);
+    let work = scratch("thin-cap-work");
+    let prior = export_repository(&source.path, &work.0.join("first")).unwrap();
+    fs::write(source.path.join("f1"), b"changed after the prior\n").unwrap();
+    g(
+        &source.path,
+        &["commit", "--quiet", "-am", "after the prior"],
+    );
+    g(&source.path, &["update-ref", "refs/heads/added", "HEAD"]);
+    source.inventory = g(
+        &source.path,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    )
+    .lines()
+    .map(|line| {
+        let (name, value) = line.split_once(' ').unwrap();
+        (name.to_owned(), value.to_owned())
+    })
+    .collect();
+    let second = work.0.join("second");
+    let export = export_repository_with_drift(
+        &source.path,
+        &second,
+        &ExportOptions {
+            chain: Some(&prior),
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(export.chained);
+    let thin = header_len(&export.bundle);
+    let private = second.join("repository.git");
+    let fallback = work.0.join("fallback.bundle");
+    let (_, chained) =
+        shared::write_chained_capped(&private, &fallback, &source.path, &prior, thin - 1).unwrap();
+    assert!(!chained, "over the cap: self-contained");
+    assert!(shared::prerequisites(&fallback).unwrap().is_empty());
+    assert!(header_len(&fallback) < thin);
+    check_exact(&source, &fallback, &work.0, "fallback");
+    let kept = work.0.join("kept.bundle");
+    let (_, chained) =
+        shared::write_chained_capped(&private, &kept, &source.path, &prior, thin).unwrap();
+    assert!(chained, "at its own header length: thin");
+    assert_eq!(header_len(&kept), thin);
+    assert_eq!(
+        shared::prerequisites(&kept).unwrap(),
+        shared::prerequisites(&export.bundle).unwrap()
+    );
+}
+
+/// The header-name rule of every reader before the ref table, frozen from
+/// main `818926a` (`import_verified`; `shallow::unpack` and a plan base's
+/// `prerequisite_commits` check a subset): every line is `<oid>
+/// refs/carry-export/<suffix>`, and a `union/v1/` suffix is a canonical tail.
+/// It ran before that reader fetched or wrote anything. The count of refs it
+/// would import, or its refusal. Frozen on purpose: it is what a pre-change
+/// build in the field runs, whatever this tree's readers become.
+fn read_before_the_table(heads: &str) -> Result<usize, BulkloadRefusal> {
+    let mut count = 0usize;
+    for line in heads.lines() {
+        let (value, name) = line
+            .split_once(' ')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let suffix = name
+            .strip_prefix("refs/carry-export/")
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if !super::oid(value) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        if suffix
+            .strip_prefix("union/v1/")
+            .is_some_and(|tail| !canonical_tail(tail))
+        {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Old readers refuse the new format (#178 review). A build before the ref
+/// table imported a new-format capture's tip refs as if they were source
+/// refs (`.../ref-tip-v1/<oid>`, none of the source's names) and reported
+/// success. The table ref now sits outside `refs/carry-export/`, so the
+/// pre-table rule refuses every kind of new-format capture before it writes
+/// anything: self-contained, a plan base, a chained link, and a shallow
+/// envelope's inner inventory. The same rule still reads the old binary's
+/// own capture, and this tree's reader imports the new format exactly.
+#[test]
+fn a_reader_before_the_table_refuses_a_new_format_capture() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-old-format");
+    let work = scratch("pre-table-reader");
+    let listed = |bundle: &Path| g(&work.0, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+    assert_eq!(
+        read_before_the_table(&listed(&fixtures.join("capture.bundle"))),
+        Ok(23)
+    );
+    let shape = Shape {
+        commits: 6,
+        annotated: 2,
+        native: 4,
+        namespaces: 2,
+        loose_per_mille: 300,
+        shadowed: 1,
+        pack_all: false,
+        stash: true,
+        sha256: false,
+    };
+    let source = generate("pre-table", &shape);
+    let full = export_repository(&source.path, &work.0.join("full")).unwrap();
+    check_exact(&source, &full, &work.0, "current-reader");
+    let base = shared::export_base(&source.path, &work.0.join("base")).unwrap();
+    fs::write(source.path.join("f2"), b"after the first capture\n").unwrap();
+    g(&source.path, &["commit", "--quiet", "-am", "later"]);
+    let chained = export_repository_with_drift(
+        &source.path,
+        &work.0.join("chained"),
+        &ExportOptions {
+            chain: Some(&full),
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(chained.chained);
+    let table = format!(" {}", ref_table::TABLE_REF);
+    for (kind, bundle) in [
+        ("self-contained", full.as_path()),
+        ("plan base", base.as_path()),
+        ("chained link", chained.bundle.as_path()),
+    ] {
+        let heads = listed(bundle);
+        assert!(heads.lines().any(|line| line.ends_with(&table)), "{kind}");
+        assert_eq!(
+            read_before_the_table(&heads),
+            Err(BulkloadRefusal::GitInventoryMalformed),
+            "{kind}"
+        );
+    }
+    // A shallow capture: the envelope's own header is the custody ref, and
+    // its inner inventory, which the old `shallow::unpack` checked, names
+    // the table.
+    let shallow = work.0.join("shallow");
+    g(
+        &work.0,
+        &[
+            "clone",
+            "--quiet",
+            "--depth=1",
+            "--no-local",
+            &format!("file://{}", source.path.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    g(
+        &shallow,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://example.test/shallow.git",
+        ],
+    );
+    let envelope = export_repository(&shallow, &work.0.join("shallow-capture")).unwrap();
+    let reader = fresh_repository(&work.0, "envelope-reader", false);
+    let inner = super::shallow::headers(&reader, &envelope).unwrap();
+    assert!(inner.lines().any(|line| line.ends_with(&table)));
+    assert_eq!(
+        read_before_the_table(&inner),
+        Err(BulkloadRefusal::GitInventoryMalformed)
+    );
 }

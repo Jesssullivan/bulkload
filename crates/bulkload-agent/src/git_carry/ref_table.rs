@@ -21,6 +21,16 @@
 //! [`expand`] rebuilds the old format's header lines byte for byte, so the
 //! import that follows is the one it always was. A header without
 //! [`TABLE_REF`] is the old format and passes through untouched.
+//!
+//! **Old readers refuse the new format.** [`TABLE_REF`] is the format marker,
+//! and it is named outside `refs/carry-export/` on purpose. Every reader
+//! before this format (main `818926a`: `import_verified`, `shallow::unpack`
+//! and a plan base's `prerequisite_commits`) refuses a header name outside
+//! that prefix `GIT_INVENTORY_MALFORMED` before it writes a ref. A pre-change
+//! build therefore refuses a new-format capture instead of importing its
+//! tip refs as if they were the source's refs and reporting success. No
+//! mixed-version apply: a capture written in this format is applied by a
+//! build that reads it ([`carried_name`]).
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,8 +43,12 @@ use super::{
 };
 use crate::{BulkloadRefusal, Result};
 
-/// The private ref naming a capture's ref table.
-pub(super) const TABLE_REF: &str = "refs/carry-export/ref-table-v1";
+/// The private ref naming a capture's ref table, and the format's marker.
+///
+/// Outside `refs/carry-export/`, so that every pre-table reader refuses a
+/// header that names it (module notes). Never a source ref's exported name,
+/// which always starts `refs/carry-export/`.
+pub(super) const TABLE_REF: &str = "refs/carry-ref-table/v1";
 /// The private refs naming each distinct object the table maps a ref to.
 pub(super) const TIP_PREFIX: &str = "refs/carry-export/ref-tip-v1/";
 /// Every carried name lives under this prefix.
@@ -206,6 +220,13 @@ fn import_stream(encoded: &Encoded) -> Vec<u8> {
 /// Whether a header names the ref table (`<oid> <name>` lines).
 pub(super) fn is_table(name: &str) -> bool {
     name == TABLE_REF
+}
+
+/// Whether `name` is one a v1 capture header may carry: an exported name
+/// under `refs/carry-export/`, or the ref table. What each name means is
+/// checked where it is read ([`expand`], and the import's own name rules).
+pub(super) fn carried_name(name: &str) -> bool {
+    name.starts_with(EXPORT) || is_table(name)
 }
 
 /// The old format's header lines for a bundle whose header (or a shallow
@@ -436,6 +457,7 @@ mod tests {
         for name in [
             "refs/carry-export/head",
             "refs/carry-export/ref-table-v1",
+            TABLE_REF,
             "refs/heads/main",
             "refs/carry-export/refs/",
             "refs/carry-export/union/v1/neo/short/refs/heads/x",

@@ -91,17 +91,18 @@ pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
 // object peeled to a commit: a ref may legally name a tree or blob, which is
 // no prerequisite and stays in the item's pack. A ref table (OI-1003-Q54)
 // is the base's own commit, in its pack only, so it is never a
-// prerequisite: its tips carry what it maps.
+// prerequisite: its tips carry what it maps. Any other name outside
+// `refs/carry-export/` is malformed, as it was before the table.
 fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<String>> {
     output(git(private).args(["bundle", "verify"]).arg(base))?;
     let mut request = String::new();
     let mut asked = 0usize;
     for (value, name) in super::chain::advertised(base)? {
-        if !name.starts_with("refs/carry-export/") {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
         if super::ref_table::is_table(&name) {
             continue;
+        }
+        if !name.starts_with("refs/carry-export/") {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         writeln!(request, "{value}\n{value}^{{commit}}")
             .map_err(|_| BulkloadRefusal::FrameCodec)?;
@@ -361,13 +362,27 @@ pub(super) fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
 
 /// Write a capture bundle whose prerequisites are `prior`'s source-held tips
 /// (see `chain`). Returns its pack cost and whether it declared any
-/// prerequisite; `false` means it is self-contained (a shallow capture, or no
-/// source-held tip).
+/// prerequisite; `false` means it is self-contained (a shallow capture, no
+/// source-held tip, or a thin header that would be over the cap, see
+/// [`write_excluding_tip_trees`]).
 pub(super) fn write_chained(
     private: &Path,
     bundle: &Path,
     source: &Path,
     prior: &Path,
+) -> Result<(PackStats, bool)> {
+    write_chained_capped(private, bundle, source, prior, HEADER_CAP)
+}
+
+/// [`write_chained`] with the thin header held to `cap` bytes (at most
+/// [`HEADER_CAP`]): the tests lower it to reach the fallback without
+/// 100,000 distinct objects.
+pub(super) fn write_chained_capped(
+    private: &Path,
+    bundle: &Path,
+    source: &Path,
+    prior: &Path,
+    cap: usize,
 ) -> Result<(PackStats, bool)> {
     let boundary = super::shallow::frontier(private)?;
     if !boundary.is_empty() {
@@ -380,12 +395,43 @@ pub(super) fn write_chained(
     if commits.is_empty() {
         return Ok((write_full(private, bundle)?, false));
     }
-    Ok((write_excluding_tip_trees(private, bundle, &commits)?, true))
+    write_excluding_tip_trees(private, bundle, &commits, cap)
+}
+
+// The header a thin bundle declaring `commits` writes: its signature, one
+// `-<oid> shared base` line per prerequisite, one `<oid> <name>` line per
+// private ref, and the blank line. 54 B per prerequisite on SHA-1 (78 B on
+// SHA-256) on top of a self-contained header's 111 B (159 B) per distinct
+// object, so a thin header reaches the cap first: at about 101,680 distinct
+// commit tips on SHA-1 (237 B each on SHA-256: about 70,790), against about
+// 151,100 (105,500) self-contained.
+fn thin_header(private: &Path, commits: &BTreeSet<String>) -> Result<Vec<u8>> {
+    const SITE: &str = "git_carry::shared::thin_header";
+    let mut header = signature(private)?.to_vec();
+    for value in commits {
+        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
+    }
+    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
+    Ok(header)
 }
 
 // A thin bundle declaring `commits` as prerequisites, which deltas against
-// them. Both prerequisite kinds come here: a shared plan base's tips
-// (`write_bundle`) and a prior capture's source-held tips (`write_chained`).
+// them; `true` with its pack cost. Both prerequisite kinds come here: a
+// shared plan base's tips (`write_bundle`) and a prior capture's source-held
+// tips (`write_chained`).
+//
+// **Over the cap, self-contained.** The final header, prerequisites
+// included, is measured before the walk and before any byte is written
+// (#178: a grouped item's rewritten header was recorded 33,880 B over the
+// cap and refused by every later reader). A thin header over `cap` (never
+// more than the readers' [`HEADER_CAP`]) is not refused: the capture is
+// written self-contained instead (`write_full`, `false`), whose header has no
+// prerequisite line and fits wherever the source's distinct objects do.
+// Refusing would strand the item: every later pass is offered the same
+// prerequisites (a chain that never grows never reaches the depth reset, and
+// a plan base never changes), while a self-contained bundle carries it. Only
+// a capture whose self-contained header is itself over the cap is refused,
+// `GIT_INVENTORY_OVER_CAP` from `write_full`, before it writes.
 //
 // What its pack omits is what the walk marks uninteresting, P64 in
 // `tests/git_group_minimality.rs`: every commit `commits` reach, and every
@@ -431,8 +477,13 @@ pub(super) fn write_excluding_tip_trees(
     private: &Path,
     bundle: &Path,
     commits: &BTreeSet<String>,
-) -> Result<PackStats> {
-    let written = write_excluding_tip_trees_pending(private, bundle, commits);
+    cap: usize,
+) -> Result<(PackStats, bool)> {
+    let header = thin_header(private, commits)?;
+    if header.len() > cap.min(HEADER_CAP) {
+        return Ok((write_full(private, bundle)?, false));
+    }
+    let written = write_excluding_tip_trees_pending(private, bundle, commits, &header);
     if written.is_err() {
         for leftover in ["objects-pending", "header-pending"] {
             // Best effort: the refusal being returned is the one that matters,
@@ -440,25 +491,16 @@ pub(super) fn write_excluding_tip_trees(
             let _ = fs::remove_file(bundle.with_extension(leftover));
         }
     }
-    written
+    Ok((written?, true))
 }
 
 fn write_excluding_tip_trees_pending(
     private: &Path,
     bundle: &Path,
     commits: &BTreeSet<String>,
+    header: &[u8],
 ) -> Result<PackStats> {
     const SITE: &str = "git_carry::shared::write_excluding_tip_trees_pending";
-    // The final header, prerequisites included, is measured against the
-    // readers' cap before the walk and before any byte is written (#178: a
-    // grouped item's rewritten header was recorded 33,880 B over the cap and
-    // refused by every later reader).
-    let mut header = signature(private)?.to_vec();
-    for value in commits {
-        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
-    }
-    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
-    within_cap(header.len())?;
     let listing = bundle.with_extension("objects-pending");
     let list = fs::OpenOptions::new()
         .read(true)
@@ -494,7 +536,7 @@ fn write_excluding_tip_trees_pending(
         .mode(0o600)
         .open(&pending)
         .refuse_at(SITE)?;
-    target.write_all(&header).refuse_at(SITE)?;
+    target.write_all(header).refuse_at(SITE)?;
     target.flush().refuse_at(SITE)?;
     let pack_read = super::pack_child(
         git(private)
@@ -513,11 +555,12 @@ fn write_excluding_tip_trees_pending(
 
 /// Write a capture bundle: a shallow envelope, a self-contained bundle, or,
 /// with a shared plan `base`, a thin bundle whose prerequisites are the
-/// base's commit tips. Its pack holds no commit the base reaches and no
-/// object under the tree of a base tip, of a capture ref the base reaches
-/// (HEAD's) or of an edge parent. It can still hold an object the base
-/// holds only deeper in its history, and it holds the capture's untracked
-/// and ignored payload on every pass (OI-1003-Q42, P64; see
+/// base's commit tips (self-contained when that thin header would be over
+/// the cap, [`write_excluding_tip_trees`]). Its pack holds no commit the base
+/// reaches and no object under the tree of a base tip, of a capture ref the
+/// base reaches (HEAD's) or of an edge parent. It can still hold an object
+/// the base holds only deeper in its history, and it holds the capture's
+/// untracked and ignored payload on every pass (OI-1003-Q42, P64; see
 /// `write_excluding_tip_trees`).
 pub(super) fn write_bundle(
     private: &Path,
@@ -533,7 +576,8 @@ pub(super) fn write_bundle(
     let Some(base) = base else {
         return write_full(private, bundle);
     };
-    write_excluding_tip_trees(private, bundle, &prerequisite_commits(private, base)?)
+    let commits = prerequisite_commits(private, base)?;
+    Ok(write_excluding_tip_trees(private, bundle, &commits, HEADER_CAP)?.0)
 }
 
 #[cfg(test)]

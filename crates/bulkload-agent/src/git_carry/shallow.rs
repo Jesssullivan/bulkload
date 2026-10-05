@@ -252,7 +252,9 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
         let (object, name) = line
             .split_once(' ')
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !oid(object) || !name.starts_with("refs/carry-export/") {
+        // An exported name, or the ref table (OI-1003-Q54), which a reader
+        // before the table refuses here: the format's marker.
+        if !oid(object) || !super::ref_table::carried_name(name) {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         output(git(repository).args(["check-ref-format", name]))?;
