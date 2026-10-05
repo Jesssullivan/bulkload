@@ -391,7 +391,7 @@ tla-check *configs:
     catalogue=$scratch/catalogue.json
     # The quoted strings of a module's set definition NAME == {...}.
     set_members() {
-        awk -v name="$2" '$0 ~ "^" name " ==" { on = 1 } on { print } on && /}/ { exit }' "$1" |
+        awk -v name="$2" '$0 ~ "^" name " +==" { on = 1 } on { print } on && /}/ { exit }' "$1" |
             { grep -oE '"[A-Za-z0-9_]+"' || true; } | tr -d '"' | LC_ALL=C sort -u
     }
     # Both directions: names in the catalogue the module lacks, and back.

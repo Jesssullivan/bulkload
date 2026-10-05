@@ -171,6 +171,13 @@ all 43 rows again: 10 PASS, 3 REACHED, 28 FAIL, 1 SIMULATION and
 1 INCONCLUSIVE. Every pass row's distinct and generated counts and diameter
 equalled the table's. Total wall time 529 s; peak RSS 1,865 MiB.
 
+The Q42 lane L4 run (2026-10-04 16:42 to 16:58 EDT, sting, over `8bb9921`)
+ran both modules after the recipe gained a second one. The 44 rendered
+BulkloadTransfer files are byte-identical to `8dc26c1`'s, and this spec is
+unchanged. All 43 rows matched again, and every pass row's distinct and
+generated counts and diameter equalled the table's ([Results
+(GitCarry)](#results-gitcarry)).
+
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
 | `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 4,785 | 15,753 | 9 | 8s | 589 |
@@ -1081,6 +1088,323 @@ The model follows the code where the code and docs/design.md differ:
 - **R25's model obligation in slo.md** is worded as
   `R25_NoCommittedCaptureReread`, which is vacuous in code shape
   ([Properties](#properties-slos-rulings-and-tests)).
+
+## GitCarry: chain and base custody (OI-1003-Q43, OI-1003-Q46)
+
+[`GitCarry.tla`](GitCarry.tla) is lane L4 of the Q42 git-carry push. It
+models v1 git carry's custody of what a capture depends on:
+
+- the plan base a group of items shares (`prepare_base`,
+  `shared-{group}.base`);
+- the chain links of a capture that declares its retained predecessor's
+  tips as prerequisites (WP2, `{bundle}.prior`), and the chain's depth
+  (`CHAIN_DEPTH_LIMIT`);
+- Q46's re-root policy and CORPUS GC (lane L8, no code yet);
+- L6b's fix 2, a chain kept under a plan base (no code yet);
+- crashes between the bundle, its sidecars and the `{item}.capture`
+  record;
+- third-party damage to CORPUS, source history moving and being rewritten;
+- what estate-apply would do with every record (restore or a refusal),
+  and what the next capture would do with it (reuse, recapture or a
+  refusal).
+
+It models the code at **8dc26c1** (`origin/main` after #170), re-checked
+at **cdfe5f4** (after #171, #172 and #173). #172 adds
+`refuse_bare_capture` to `apply_item`, before any custody step, and leaves
+every cited symbol unchanged. Every code symbol below was found with
+`git grep -w` at both; `tla-check` checks it again on every run. The
+module's header states the scope, the abstractions and the code map.
+
+### Roles (OI-1003-Q43)
+
+| Role | Tool | What it does | Run |
+|---|---|---|---|
+| Decision core of record | Rust `git_carry/decide.rs`, lane L6 (**pending**) | A pure, total `decide(&Inputs) -> Decision` that replaces `ExportOptions{prerequisite, chain}`, its "Ignored when prerequisite is set" rule and `export_pass`'s match. | P67 (L6) |
+| Reference decision core, a differential oracle | Haskell `decide` in [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | Derived by hand from the v1 rules at main and Q46's re-root policy. It renders 363 pinned rows to [`crates/bulkload-agent/tests/data/decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv), which L6's fixed-seed property test (P67) checks the Rust `decide` against. | `just formal-nv` (`rows --check`) |
+| Typed closed unions | Dhall: `Basis`, `Rebase`, `ReuseEligibility`, `Refusal`, `Decision` in [`catalogue/Types.dhall`](catalogue/Types.dhall) | The labels of what `decide` returns. `formal-nv` requires GitCarryCore's constructors (`schema`) to equal them; `tla-check` requires GitCarry.tla's `Decisions`, `Bases`, `Rebases`, `Reuses` and `Refusals` sets to equal them. | `just formal-nv`, `just tla-check` |
+| Custody and crash order | TLA+ with TLC: [`GitCarry.tla`](GitCarry.tla) | Seven safety invariants and one liveness property over chain links, the plan base, GC and crash order. TLC checks only this; the decision's own rules are the pinned rows' job. | `just tla-check` |
+| Explorer parity | Haskell `explore` in GitCarryCore.hs | An explicit-state BFS of GitCarry.tla whose capture step calls the Haskell `decide`. It must reach TLC's state counts, so TLC's `DecideCore` and the Haskell `decide` agree on every input reachable in those bounds. | `just formal-nv` |
+
+This widens OI-1003-Q32 for this layer. Haskell is no longer only a second
+encoding of the spec: through the pinned rows it checks the code, once L6
+lands. The chain is TLA+ (custody) to Haskell `decide` (explorer parity) to
+Rust `decide.rs` (P67). The explorer itself has the limit Explorer.hs has
+(independent code, shared design): it and the spec were both transliterated
+from the same reading of the Rust code, so parity cannot catch a misreading
+they share. The pinned rows can, once a Rust `decide` written from the code
+is checked against them.
+
+Code-symbol grounding for `decide.rs` lands with L6. Until then every
+traceability row lists the symbols no code has yet as **pending**, typed
+with the lane that lands them (`T.Lane`), and `tla-check` prints them
+without grepping.
+
+### The decision core
+
+`decide :: Inputs -> Decision` is what a v1 capture decides before it
+exports. The inputs are what the code reads first:
+
+- the group's base record (`prepare_base`): absent, retained or lost;
+- the item's record (`retained_capture`): none, a bundle gone, or held;
+- for a held record: the key, drift and pass-start conditions of a hit;
+  the retained bundle's shape (self-contained, based or chained); whether
+  its chain is intact (`chain_links` under `LinkBinding::Custody`); its
+  bound base; its chain depth and root age; whether the source still
+  holds its tips and its root's tips (`source_held_tips`); a shallow
+  source;
+- the policy: the depth limit, Q46's root window, fix 2.
+
+The decision is a hit, a typed refusal, or an export with a basis
+(`SelfContained`, `Base`, `Chain`, `BaseAndChain`), a depth, a rebase
+(`NoRebase`, `NewRoot`, `Reroot`) and the reuse offer (`NoRetained`,
+`BlobReuse`, `PassStartUnrecorded`). The rules, each from the code at
+8dc26c1:
+
+- **A lost base refuses.** `prepare_base` refuses `RECEIPT_BINDING_INVALID`
+  rather than replace a base that older deltas depend on.
+- **No record, or a gone bundle, captures afresh**, with no reuse offer
+  (`Retained::None`).
+- **A hit** needs the same key, no drift, a settled pass start and a
+  restorable chain. A hit on a based bundle needs its bound base retained,
+  else `RECEIPT_BINDING_INVALID`.
+- **Otherwise the capture extends.** `chainable` never chains on a broken
+  chain or a based bundle, and chains on a prior only below
+  `CHAIN_DEPTH_LIMIT`. `chain_offer` drops the link under a plan base
+  (`ExportOptions.chain` is "Ignored when prerequisite is set").
+  `export_pass`'s match then writes a chained bundle (`write_chained`),
+  except for a shallow source or when the source holds none of the prior's
+  tips. In those cases, and with no link, it writes a based or
+  self-contained one (`write_bundle`). At the limit, v1 re-bases: a
+  self-contained bundle, which re-packs the item's whole history.
+
+**Q46's re-root policy, as this model reads it.** The ruling (Decision 4,
+option A) is "a re-root policy plus STATE/corpus GC that never deletes a
+link something depends on". The plan's L8 text is "at the depth limit,
+chain on the root's tips, with a policy that advances the root". The model
+fixes that as follows, with `RootWindow` captures per root (0 is v1):
+
+- A capture whose root would reach the window starts a new root
+  (`NewRoot`), so a full re-pack happens at most once per window.
+- At the depth limit, a capture chains on its chain's root (`Reroot`,
+  depth 1) instead of re-packing, while the source still holds the root's
+  tips.
+
+The window's value, and whether the age rule should also apply below the
+limit, are L8's to set. This is an open question, not a ruling.
+
+**The pinned rows.** `rows` renders three lanes' rows:
+
+| Lane | Policy | Rows |
+|---|---|---:|
+| `v1` | main's behaviour: depth limit 8, no re-root, no chain under a base | 79 |
+| `L6b` | fix 2: a chain kept under a plan base | 85 |
+| `L8` | Q46: root window 27 (a row parameter, not a ruling), fix 2 | 199 |
+
+Each row covers a family: a lost base; no record or a gone bundle; the hit
+path on each shape; each reason to leave it; the extend path over shape,
+depth (1, 7, 8), held tips and root, and age; a shallow source; an
+unrecorded pass start. A `-` input means `decide` must not depend on that
+input in that row. `rows` checks this over the input's whole domain
+(every union value and Bool, and depths and ages around the limit and the
+window) and refuses to render otherwise. It also refuses unless every label
+of every closed union is reached by some row. P67 draws `-` inputs. `rows
+--check FILE` is byte-identical or fails, and runs in `formal-nv`.
+
+### Properties
+
+| Property | Statement | SLO | Rulings | Code symbols (pending) | P-tests |
+|---|---|---|---|---|---|
+| `ChainDepthBounded` | Every bundle's chain is at most the limit deep, so a restore stages at most limit + 1 bundles. Under Q46 its root is younger than the window. | S3, S4 | OI-1003-Q15, OI-1003-Q46 | `CHAIN_DEPTH_LIMIT`, `chainable`, `chain_offer`, `chain_links`, `ExportOptions`, `export_pass`, `write_chained` (decide.rs L6a; the re-root window L8) | P67, P71 |
+| `PrereqsSatisfiedByEarlierLinks` | A restore that completes applied every bundle after the bundles its prerequisites name, each at its recorded bytes. The oldest link is self-contained, or its base came first. | S4 | OI-1003-Q15, R-N72 | `flatten`, `prerequisites`, `verify_bundle`, `source_held_tips`, `write_bundle` (flatten's base import L6b) | P68, P67 |
+| `BrokenLinkNeverReuseHit` | A capture never reuses a record whose custody is broken: a missing or rewritten link, a lost base, a missing sidecar. | S3, S4 | OI-1003-Q15, R-N72 | `retained_capture`, `chain_links`, `LinkBinding` (decide.rs L6a) | P42, P67 |
+| `BaseNotReplacedWhileDepended` | The plan base record never moves while a record depends on its base. | S4 | OI-1003-Q15, R-N72 | `prepare_base`, `retained_base`, `requires_base` (the never-replace assertion L6b) | P68 |
+| `GCNeverDeletesDepended` | GC never removes a bundle that a record or the base record depends on. | S4 | OI-1003-Q46 | `chain_links` (STATE and CORPUS GC L8) | P71 |
+| `SidecarsBeforeRecord` | A record names a published bundle whose dependency sidecars exist. | Durability, S4 | OI-1003-Q15, R-N86 | `capture_item`, `publish_bundle`, `publish_prior`, `publish_sidecars` (the `.reuse` sidecar L7) | P70 |
+| `RestoreOrRecapture` | Every record restores, or its item's next capture recaptures, or it refuses by name and keeps the missing custody visible. An apply that does not restore is a typed refusal, never a bare IO. | S4, S5 | OI-1003-Q1, OI-1003-Q46, R-N72 | `apply_item`, `import_base`, `stage_bundle`, `retained_capture` (GC L8) | P68, P69, P71 |
+| `ChainRecovery` | Under `WF_vars(Protocol)`, once the environment stops, every item whose record does not restore (or has none) gets one that does. | S4, S5 | OI-1003-Q46 | `chainable`, `retained_capture` (the re-root window L8) | P71, P68 |
+
+`TypeOK` also evaluates the decision and the restore on every state, so a
+partial or ill-typed definition is a TLC error rather than a silent gap.
+There is no `PackExcludesHeld`: what a pack excludes is the Rust pack scan's
+job (P64, lane L1).
+
+### Mutations
+
+| Mutation | What it breaks (the code it would undo) | Property that must fail |
+|---|---|---|
+| `chain_ignores_depth` | `chainable`'s `CHAIN_DEPTH_LIMIT` check | `ChainDepthBounded` |
+| `gc_deletes_depended` | Q46 GC keeps only what the records name, forgetting their chain links | `GCNeverDeletesDepended` |
+| `base_replaced_live` | `prepare_base` replaces a missing base that older deltas depend on | `BaseNotReplacedWhileDepended` |
+| `sidecar_after_record` | `capture_item` writes the record before `publish_prior` | `SidecarsBeforeRecord` |
+| `skip_flatten_verify` | `chain::flatten` restores without checking digests, the oldest link or prerequisites | `PrereqsSatisfiedByEarlierLinks` |
+| `hit_ignores_chain` | `retained_capture` drops `restorable` | `BrokenLinkNeverReuseHit`; also `RestoreOrRecapture` (`MC_gc_neg_hit_ignores_chain_restore`) |
+
+The plan named five mutations. `hit_ignores_chain` is a sixth: none of the
+five can reach `BrokenLinkNeverReuseHit`. The catalogue asserts, as for
+BulkloadTransfer, that every safety invariant but `TypeOK` has a fail row,
+and the sixth mutation is what gives `BrokenLinkNeverReuseHit` one.
+`RestoreOrRecapture` has two: `MC_gc_neg_hit_ignores_chain_restore` and the
+finding `MC_gc_base_missing_untyped`.
+
+### Results (GitCarry)
+
+The run of record: one full `just tla-check` on host sting (32 cores, Linux
+6.12, TLC 2.19 on OpenJDK 8), 2026-10-04 16:42 to 16:58 EDT, at a load
+average between 20 and 48 from other lanes, over the configs and spec
+committed in `1740c53` and merged with main at `8bb9921`. It ran both
+modules. **All 58 rows matched their expectation.** BulkloadTransfer's 43
+rows matched again (10 PASS, 3 REACHED, 28 FAIL, 1 SIMULATION, 1
+INCONCLUSIVE), and every pass row's distinct and generated counts and
+diameter equalled the table above (`MC_nv_core` is still **15,834**).
+GitCarry's 15 rows were 5 PASS, 9 FAIL and 1 INCONCLUSIVE (its budget
+self-test). Every pass row's never-enabled actions equalled its `never`
+column. Before any TLC run the grounding step found, for GitCarry.tla, 28
+operators, 13 constants, 6 mutations, 5 closed-union label sets and 24 code
+symbols, and printed its 6 pending symbols. **GitCarry's rows took 533 s in
+all, the slowest `MC_gc_fix2` at 195 s; the core, `MC_gc_core`, took 14 s.**
+The whole run took 934 s, with a peak RSS of 2,117 MiB.
+
+| Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| `MC_gc_budget_selftest` | i1 L2 W4 gc C4 R1 X1 D1 budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 71,885 | 132,161 | 17 | 6s | 753 |
+| `MC_gc_core` | i1 L2 C3 R1 X1 D1 | pass | **PASS** | – | 111,680 | 189,325 | 31 | 14s | 1088 |
+| `MC_gc_q46` | i1 L2 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 943,611 | 1,719,089 | 37 | 105s | 1747 |
+| `MC_gc_grouped` | i1,i2 L2 C2 X1 D1 db typed | pass | **PASS** | – | 149,749 | 286,977 | 38 | 23s | 1367 |
+| `MC_gc_fix2` | i1,i2 L1 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 770,065 | 1,424,341 | 39 | 195s | 2117 |
+| `MC_gc_live` | i1 L2 W4 gc C3 R1 X1 D1, `LiveSpec` | pass | **PASS** | – | 232,067 | 420,139 | 32 | 176s | 1681 |
+| `MC_gc_base_missing_untyped` | i1,i2 L2 C0 D1 db budget 300 s | fail | **FAIL** | `RestoreOrRecapture` | 56 | 84 | 9 | 2s | 227 |
+| `MC_gc_neg_live_unfair` | i1 L2 C0 budget 300 s | fail | **FAIL** | `ChainRecovery` | 4 | 5 | – | 1s | 195 |
+| `MC_gc_neg_chain_ignores_depth` | i1 L1 C2 | fail | **FAIL** | `ChainDepthBounded` | 38 | 53 | 11 | 2s | 205 |
+| `MC_gc_neg_gc_deletes_depended` | i1 L2 gc C1 | fail | **FAIL** | `GCNeverDeletesDepended` | 16 | 21 | 10 | 1s | 226 |
+| `MC_gc_neg_base_replaced_live` | i1,i2 L2 C0 D1 db typed | fail | **FAIL** | `BaseNotReplacedWhileDepended` | 102 | 136 | 10 | 1s | 206 |
+| `MC_gc_neg_sidecar_after_record` | i1 L2 C1 | fail | **FAIL** | `SidecarsBeforeRecord` | 14 | 18 | 8 | 2s | 226 |
+| `MC_gc_neg_skip_flatten_verify` | i1 L2 C1 D1 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 82 | 120 | 13 | 1s | 228 |
+| `MC_gc_neg_hit_ignores_chain` | i1 L2 C1 D1 | fail | **FAIL** | `BrokenLinkNeverReuseHit` | 79 | 118 | 13 | 2s | 234 |
+| `MC_gc_neg_hit_ignores_chain_restore` | i1 L2 C1 D1 | fail | **FAIL** | `RestoreOrRecapture` | 79 | 118 | 13 | 2s | 242 |
+
+Reading the table:
+
+- **Constants.** Items; `L` is `DepthLimit` (8 in the code; 2 here, so a
+  chain reaches its limit in a few commits) and `W` is `RootWindow`
+  (absent: 0, v1). `cub` is `ChainUnderBase`, `gc` is `GCOn`. `C`, `R`,
+  `X` and `D` are `MaxCommits`, `MaxRewrites`, `MaxCrashes` and
+  `MaxDamage`. `db` is `DamageBase`, and `typed` is
+  `BaseMissingTyped = TRUE` (an assumption: [Findings](#findings)). The
+  budget is 600 s unless shown.
+- **Fail rows** stop at the first violation, as for BulkloadTransfer. Every
+  fail row also checks `TypeOK`.
+- **Never enabled**, by pass row:
+  - `MC_gc_core`: `BaseRecord`, `GC`, `StartBase` (one item has no plan
+    base; v1 has no GC);
+  - `MC_gc_q46` and `MC_gc_live`: `BaseRecord`, `StartBase`;
+  - `MC_gc_grouped`: `GC`, `Rewrite`;
+  - `MC_gc_fix2`: `Rewrite`.
+
+  Every action is enabled in some pass row.
+- **Bounds.** `MC_gc_fix2` was first drafted at `L2 W4 C3`, on two items
+  with every fault. Its budget tripped at 600 s after 2,462,299 distinct
+  states (a scratch run, not a result), so it runs at `L1 W3 C2`. At that
+  bound it still re-roots on a based root (below).
+
+### Explorer parity (GitCarry)
+
+`just formal-nv` builds GitCarryCore.hs and checks four presets against
+TLC's counts of record. Each must also take the capture decisions it exists
+for; the explorer lists every decision a step of its search took. Built
+with `ghc -O1` on sting:
+
+| Preset | TLC | Explorer | Decisions the search took | Match |
+|---|---|---|---|---|
+| `gc_core` (`MC_gc_core`) | 111,680 distinct, 189,325 generated, diameter 31 | 111,680, 189,325, 31 levels | `Hit`, `Export:Chain:NoRebase`, `Export:SelfContained:NoRebase`, `Export:SelfContained:NewRoot` (v1's re-base) | yes |
+| `gc_q46` (`MC_gc_q46`) | 943,611, 1,719,089, 37 | 943,611, 1,719,089, 37 | as `gc_core`, plus `Export:Chain:Reroot` | yes |
+| `gc_grouped` (`MC_gc_grouped`) | 149,749, 286,977, 38 | 149,749, 286,977, 38 | `Hit`, `Export:Base:NoRebase`, `Refuse:ReceiptBindingInvalid` | yes |
+| `gc_fix2` (`MC_gc_fix2`) | 770,065, 1,424,341, 39 | 770,065, 1,424,341, 39 | `Hit`, `Export:Base:NoRebase`, `Export:BaseAndChain:NoRebase`, `Export:BaseAndChain:Reroot`, `Refuse:ReceiptBindingInvalid` | yes |
+
+The generated counts match too. GitCarry.tla writes a guard that chooses no
+successor as an `IF`, never as a disjunction, because TLC branches on every
+disjunction inside an action. Written as `DamageBase \/ kind = "capture"`,
+the damage guard made TLC count each damage successor twice whenever both
+held: 346,545 generated in `MC_gc_grouped` against the explorer's 286,977,
+with the same distinct count.
+
+The mutation rows, from one `just formal-nv` run (2026-10-04 21:30 to 22:04
+EDT, sting, load average near 500, after waiting for the shared lock). Every
+`MC_gc_neg_` row ran on the explorer at its own bound and violated its named
+property. Each primary row ran again with every safety invariant checked, on
+the explorer and on TLC with one worker. Both stopped at the same first
+invariant after the same number of states:
+
+| Row | Named property (explorer) | Every invariant: TLC | Every invariant: explorer |
+|---|---|---|---|
+| `MC_gc_neg_chain_ignores_depth` | `ChainDepthBounded`, 11 states | `ChainDepthBounded`, 11 | `ChainDepthBounded`, 11 |
+| `MC_gc_neg_gc_deletes_depended` | `GCNeverDeletesDepended`, 10 | `GCNeverDeletesDepended`, 10 | `GCNeverDeletesDepended`, 10 |
+| `MC_gc_neg_base_replaced_live` | `BaseNotReplacedWhileDepended`, 10 | `BaseNotReplacedWhileDepended`, 10 | `BaseNotReplacedWhileDepended`, 10 |
+| `MC_gc_neg_sidecar_after_record` | `SidecarsBeforeRecord`, 8 | `SidecarsBeforeRecord`, 8 | `SidecarsBeforeRecord`, 8 |
+| `MC_gc_neg_skip_flatten_verify` | `PrereqsSatisfiedByEarlierLinks`, 10 | `PrereqsSatisfiedByEarlierLinks`, 10 | `PrereqsSatisfiedByEarlierLinks`, 10 |
+| `MC_gc_neg_hit_ignores_chain` | `BrokenLinkNeverReuseHit`, 10 | `BrokenLinkNeverReuseHit`, 10 | `BrokenLinkNeverReuseHit`, 10 |
+| `MC_gc_neg_hit_ignores_chain_restore` | `RestoreOrRecapture`, 10 | (an `also` row) | |
+
+Every primary row stops first at its own verdict. Two counterexamples also
+violate `RestoreOrRecapture` in their last state:
+
+- `sidecar_after_record`'s: the record without its sidecar fails apply and
+  the hit path with a bare IO;
+- `hit_ignores_chain`'s: the reused record does not restore.
+
+The same `formal-nv` run passed every BulkloadTransfer row again: both
+presets, all 17 mutation rows and all 14 every-invariant runs. It also
+passed `rows --check` (363 rows) and the schema check (5 unions). 50 rows
+matched; none differed.
+
+### Findings
+
+- **A missing plan base restores as a bare IO** (`MC_gc_base_missing_untyped`
+  fails `RestoreOrRecapture`). `estate::import_base` reads `{bundle}.base`,
+  then stages the base with `git_carry::stage_bundle`. That calls
+  `fs::canonicalize`, which fails `ENOENT` for a deleted base, so the apply
+  refuses `IO`. `apply_item` maps the same `ENOENT` to
+  `SEALED_OBJECT_MISSING` for the head bundle, and `chain_links` refuses a
+  missing link as `SEALED_OBJECT_MISSING`. A bare IO never counts (S4,
+  OI-1003-Q1). The positive grouped configs assume the typed refusal
+  (`BaseMissingTyped = TRUE`). The fix is outside this lane: map the
+  base's `ENOENT` as the head's is mapped.
+- **A record written before its sidecar is stuck while the source holds
+  still.** In `sidecar_after_record`'s 8-state counterexample, the record
+  names a chained bundle with no `.prior`. Apply then reads the absent
+  `.base` sidecar (`requires_base` is true for a chained bundle) and fails
+  `IO`. The next capture's hit path fails `IO` on the same read. So the
+  record neither restores nor is recaptured until the source moves and the
+  capture leaves the hit path. The same state also violates
+  `RestoreOrRecapture`. This is why `SidecarsBeforeRecord` is
+  load-bearing.
+- **v1 keeps a lost base as visible custody.** A group whose base is lost
+  refuses `RECEIPT_BINDING_INVALID` on every pass, by design. Recovery is
+  an operator act, so `ChainRecovery` is claimed only where damage cannot
+  reach a base (`MC_gc_live`).
+
+### What GitCarry does not prove
+
+- **Pack contents and the object-set laws** (Q45). A bundle's content is
+  the source tip it captured; its prerequisites are its prior's tips or its
+  base. What a pack holds, and the `PackExcludesHeld` property, are P64 and
+  P65's (lane L1).
+- **Drift, racy seats, shallow sources.** They are inputs of `decide`, and
+  the pinned rows vary them. The model holds them fixed (no drift, settled,
+  start recorded, not shallow).
+- **Two capture jobs at once.** The code runs up to two jobs inside
+  `estate.lock`, and the model runs one. The jobs share no custody state
+  except the plan base, which is created once under the group's mutex.
+- **STATE GC.** STATE attempt directories are never depended on, because
+  `publish_bundle` and `prepare_base` hard-link into CORPUS. So collecting
+  them under the lock cannot break custody, and they are not modelled.
+- **Sidecar damage, the `.reuse` sidecar (L7), torn writes.** Every
+  durable write is atomic (`estate::write`). Only bundle files are damaged.
+- **Bare captures** (#172). `apply_item` refuses a bare capture planned with
+  a workspace (`refuse_bare_capture`), before any chain or base step. That
+  is a typed refusal outside custody.
+- **The code's `decide`.** It is pending (L6). Until P67 checks it against
+  the pinned rows, the decision rules here are a reading of the code at
+  8dc26c1 and cdfe5f4, not a check of it.
 
 ## Frozen names
 
