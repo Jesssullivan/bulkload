@@ -338,9 +338,15 @@ tla-render out="" json="":
 # set ("none" aside), and each closed union of the decision core exactly
 # the module's set of the same name (GitCarry: Decisions, Bases, Rebases,
 # Reuses, Refusals), each checked in both directions; and every code symbol
-# is found by `git grep -w` under crates/. Symbols the code does not have
-# yet are printed as pending, with the lane that lands them. A failed check
-# removes the scratch and stops.
+# is in the Rust sources, a crates/ .rs file outside tests/, as the
+# module's symbolMatch says: `definition` (GitCarry) needs `fn`, `const`,
+# `static`, `struct`, `enum`, `trait`, `type` or `mod` then the symbol as a
+# whole word; `code` (BulkloadTransfer, whose symbols include variants,
+# fields and parameters) needs the whole word on a line that is not a
+# comment. A data file, a test or a comment that only names a symbol never
+# grounds it. Symbols the code does not have yet are printed as pending,
+# with the lane that lands them. A failed check removes the scratch and
+# stops.
 # Each module's rows run in its run order, one JVM at a time (-Xmx4g, 3
 # workers, nice 10, coverage on), with TLC state and logs in a private
 # mktemp directory under TMPDIR. A module's first row is its budget
@@ -387,7 +393,14 @@ tla-check *configs:
         exit 1
     fi
     # Grounding, per module: every catalogue name exists in its module,
-    # every code symbol in crates/.
+    # every code symbol in crates/' Rust sources (outside tests/).
+    rust=(-- 'crates/*.rs' ':!crates/*/tests/*')
+    # The lines of non-test Rust code naming $1 as a whole word, comments
+    # stripped (a // comment's text, and /* or * comment lines).
+    code_lines() {
+        { git -C {{ root }} grep -h -w -F -e "$1" "${rust[@]}" || true; } |
+            sed -E -e 's|//.*$||' -e '/^[[:space:]]*(\/\*|\*)/d' | { grep -w -F -e "$1" || true; }
+    }
     catalogue=$scratch/catalogue.json
     # The quoted strings of a module's set definition NAME == {...}.
     set_members() {
@@ -416,6 +429,7 @@ tla-check *configs:
         constants=$("$jq" -r "$g.constants[]" "$catalogue")
         mutants=$("$jq" -r "$g.mutations[]" "$catalogue")
         symbols=$("$jq" -r "$g.codeSymbols | unique | .[]" "$catalogue")
+        symbol_match=$("$jq" -r "$g.symbolMatch" "$catalogue")
         for name in $operators; do
             if ! grep -qE "^${name}"'(\(.*\))? ==' "$spec"; then
                 echo "tla-check: $name is not defined in $spec" >&2
@@ -439,8 +453,18 @@ tla-check *configs:
             agree "$set label" "$spec" "$(set_members "$spec" "$set")" "$labels"
         done
         for name in $symbols; do
-            if ! git -C {{ root }} grep -q -w -F -e "$name" -- crates/; then
-                echo "tla-check: code symbol $name is not found under crates/" >&2
+            if [[ ! $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "tla-check: code symbol $name is not a Rust identifier" >&2
+                ungrounded=$((ungrounded + 1))
+            elif [[ $symbol_match == definition ]]; then
+                if ! git -C {{ root }} grep -q -E \
+                    -e "(^|[^A-Za-z0-9_])(fn|const|static|struct|enum|trait|type|mod)[[:space:]]+${name}([^A-Za-z0-9_]|\$)" \
+                    "${rust[@]}"; then
+                    echo "tla-check: code symbol $name has no definition in crates/' Rust sources" >&2
+                    ungrounded=$((ungrounded + 1))
+                fi
+            elif [[ $symbol_match != code || -z $(code_lines "$name") ]]; then
+                echo "tla-check: code symbol $name is not in crates/' Rust code ($symbol_match)" >&2
                 ungrounded=$((ungrounded + 1))
             fi
         done
@@ -632,10 +656,12 @@ tla-check *configs:
 #   GitCarryCore's rendering byte for byte (`rows --check`), and its
 #   closed unions (`schema`) must equal the catalogue's Basis and Decision
 #   labels;
-# - GitCarry's explorer presets gc_core, gc_q46, gc_grouped and gc_fix2
-#   must reach TLC's distinct-state counts of record for MC_gc_core
-#   (111,680), MC_gc_q46 (943,611), MC_gc_grouped (149,749) and MC_gc_fix2
-#   (770,065), with no invariant violated, and each must take the capture
+# - GitCarry's explorer presets gc_core, gc_q46, gc_grouped, gc_fix2,
+#   gc_reroot, gc_reroot_extended and gc_fix2_deep must reach TLC's
+#   distinct-state counts of record for MC_gc_core (45,062), MC_gc_q46
+#   (699,419), MC_gc_grouped (85,941), MC_gc_fix2 (392,515), MC_gc_reroot
+#   (675,517), MC_gc_reroot_extended (706,430) and MC_gc_fix2_deep
+#   (366,285), with no invariant violated, and each must take the capture
 #   decisions it exists for (v1's re-base, Q46's re-root, the base refusal,
 #   fix 2's chain under a base); every MC_gc_neg_ row (gitCarryNversion) is
 #   checked as the MC_neg_ rows are, against GitCarry.tla.
@@ -787,10 +813,13 @@ formal-nv:
         mismatches=$((mismatches + 1))
     fi
     cross_check "$scratch/gitcarry explore" GitCarry.tla gitCarryNversion \
-        gc_core=111680=Hit,Export:Chain:NoRebase,Export:SelfContained:NewRoot \
-        gc_q46=943611=Export:Chain:Reroot,Export:SelfContained:NewRoot \
-        gc_grouped=149749=Export:Base:NoRebase,Refuse:ReceiptBindingInvalid \
-        gc_fix2=770065=Export:BaseAndChain:NoRebase,Export:BaseAndChain:Reroot,Refuse:ReceiptBindingInvalid
+        gc_core=45062=Hit,Export:Chain:NoRebase,Export:SelfContained:NewRoot \
+        gc_q46=699419=Export:Chain:Reroot,Export:SelfContained:NewRoot \
+        gc_grouped=85941=Export:Base:NoRebase,Refuse:ReceiptBindingInvalid \
+        gc_fix2=392515=Export:BaseAndChain:NoRebase,Export:BaseAndChain:Reroot,Refuse:ReceiptBindingInvalid \
+        gc_reroot=675517=Export:Chain:Reroot,Export:SelfContained:NewRoot \
+        gc_reroot_extended=706430=Export:Chain:Reroot \
+        gc_fix2_deep=366285=Export:BaseAndChain:NoRebase
     rm -rf "$scratch/build" "$scratch/build-gc" "$scratch/explorer" "$scratch/gitcarry" "$scratch/rendered" "$scratch/tlc/java"
     echo "counterexamples (JSON): $scratch/counterexamples; TLC logs: $scratch/tlc"
     if [[ $mismatches -ne 0 ]]; then

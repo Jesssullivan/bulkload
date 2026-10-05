@@ -64,7 +64,9 @@ Base and containers only:
 explore options (each overrides the preset's value; TLC's constant in
 brackets):
 
-  --preset gc_core|gc_q46|gc_grouped|gc_fix2   the base bound (default gc_core)
+  --preset NAME              the base bound (default gc_core): gc_core,
+                             gc_q46, gc_grouped, gc_fix2, gc_reroot,
+                             gc_reroot_extended or gc_fix2_deep
   --items N                  plan items [Items = {i1, ..., iN}]
   --depth-limit N            [DepthLimit]
   --root-window N            [RootWindow]
@@ -75,6 +77,7 @@ brackets):
   --crashes N                [MaxCrashes]
   --damage N                 [MaxDamage]
   --damage-base BOOL         [DamageBase]
+  --damage-rewrites BOOL     [DamageRewrites]
   --base-missing-typed BOOL  [BaseMissingTyped]
   --mutation NAME            one deliberate rule break (default none)
   --check all|NAME[,NAME...] the invariants to check (default all)
@@ -175,6 +178,29 @@ decisionLabel d = case d of
   Hit -> "Hit"
   Export _ -> "Export"
   Refuse _ -> "Refuse"
+
+-- | One tag per Decision constructor. decisionTag and decisionExample are
+-- total case analyses, so under -Wall -Werror (formal-nv's build) a
+-- constructor added to Decision does not build until it has a tag and an
+-- example; `schema` and the rows' coverage check then list its label.
+data DecisionTag = TagHit | TagExport | TagRefuse
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+decisionTag :: Decision -> DecisionTag
+decisionTag d = case d of
+  Hit -> TagHit
+  Export _ -> TagExport
+  Refuse _ -> TagRefuse
+
+decisionExample :: DecisionTag -> Decision
+decisionExample t = case t of
+  TagHit -> Hit
+  TagExport -> Export (Plan minBound 0 minBound minBound)
+  TagRefuse -> Refuse minBound
+
+-- | One value of each Decision constructor, in constructor order.
+allDecisions :: [Decision]
+allDecisions = map decisionExample allOf
 
 -- | The explorer's rule breaks of the core (GitCarry.tla's mutations
 -- chain_ignores_depth and hit_ignores_chain). decide is Faithful.
@@ -466,14 +492,17 @@ renderRows = do
       seen f = S.fromList (concatMap f decisions)
       plans = [pl | Export pl <- decisions]
       missing =
-        [l | l <- ["Hit", "Export", "Refuse"], l `S.notMember` seen (pure . decisionLabel)]
+        [l | l <- map decisionLabel allDecisions, l `S.notMember` seen (pure . decisionLabel)]
           ++ [show b | b <- allOf :: [Basis], b `notElem` map basis plans]
           ++ [show r | r <- allOf :: [Rebase], r `notElem` map rebase plans]
           ++ [show r | r <- allOf :: [Reuse], r `notElem` map reuse plans]
           ++ [show r | r <- allOf :: [Refusal], Refuse r `notElem` decisions]
-  if null missing
-    then Right (unlines (rowsHeader ++ [intercalate "\t" columns] ++ map fst body))
-    else Left ("no row reaches " ++ unwords missing)
+  if map (decisionTag . decisionExample) allOf /= allOf
+    then Left "decisionExample does not give one example per DecisionTag"
+    else
+      if null missing
+        then Right (unlines (rowsHeader ++ [intercalate "\t" columns] ++ map fst body))
+        else Left ("no row reaches " ++ unwords missing)
   where
     one (lane, p) = case rowDecision p of
       Right d -> Right (renderRow lane p d, d)
@@ -481,7 +510,7 @@ renderRows = do
 
 schemaLines :: [String]
 schemaLines =
-  [ unwords ("decision" : ["Hit", "Export", "Refuse"])
+  [ unwords ("decision" : map decisionLabel allDecisions)
   , unwords ("basis" : map show (allOf :: [Basis]))
   , unwords ("rebase" : map show (allOf :: [Rebase]))
   , unwords ("reuse" : map show (allOf :: [Reuse]))
@@ -498,6 +527,7 @@ data Mutation
   | SidecarAfterRecord
   | SkipFlattenVerify
   | HitIgnoresChainM
+  | RerootPreMismatch
   deriving (Eq, Enum, Bounded)
 
 mutationName :: Mutation -> String
@@ -508,6 +538,7 @@ mutationName m = case m of
   SidecarAfterRecord -> "sidecar_after_record"
   SkipFlattenVerify -> "skip_flatten_verify"
   HitIgnoresChainM -> "hit_ignores_chain"
+  RerootPreMismatch -> "reroot_pre_mismatch"
 
 data Config = Config
   { cPreset :: String
@@ -519,20 +550,30 @@ data Config = Config
   , cCrashes :: Int
   , cDamage :: Int
   , cDamageBase :: Bool
+  , cDamageRewrites :: Bool
   , cBaseMissingTyped :: Bool
   , cMutation :: Maybe Mutation
   }
 
 -- | The presets: GitCarry.tla's MC_gc_core (the code today), MC_gc_q46
--- (Q46's re-root and GC), MC_gc_grouped (two items on a plan base) and
--- MC_gc_fix2 (L6b's fix 2 with Q46, on two items).
+-- (Q46's re-root and GC), MC_gc_grouped (two items on a plan base),
+-- MC_gc_fix2 (L6b's fix 2 with Q46, on two items), MC_gc_reroot (Q46's
+-- re-root twice in one window, at depth limit 1), MC_gc_reroot_extended
+-- (a chain extended past a re-root: window = depth limit + 3) and
+-- MC_gc_fix2_deep (fix 2 over two links under the plan base).
 preset :: String -> Maybe Config
 preset name = case name of
-  "gc_core" -> Just (Config name 1 (Policy 2 0 False) False 3 1 1 1 False False Nothing)
-  "gc_q46" -> Just (Config name 1 (Policy 2 4 False) True 4 1 1 1 False False Nothing)
-  "gc_grouped" -> Just (Config name 2 (Policy 2 0 False) False 2 0 1 1 True True Nothing)
-  "gc_fix2" -> Just (Config name 2 (Policy 1 3 True) True 2 0 1 1 True True Nothing)
+  "gc_core" -> Just (Config name 1 (Policy 2 0 False) False 3 1 1 1 False True False Nothing)
+  "gc_q46" -> Just (Config name 1 (Policy 2 4 False) True 4 1 1 1 False True False Nothing)
+  "gc_grouped" -> Just (Config name 2 (Policy 2 0 False) False 2 0 1 1 True True True Nothing)
+  "gc_fix2" -> Just (Config name 2 (Policy 1 3 True) True 2 0 1 1 True True True Nothing)
+  "gc_reroot" -> Just (Config name 1 (Policy 1 4 False) True 4 1 1 1 False True False Nothing)
+  "gc_reroot_extended" -> Just (Config name 1 (Policy 2 5 False) True 4 1 1 1 False True False Nothing)
+  "gc_fix2_deep" -> Just (Config name 2 (Policy 2 3 True) True 2 0 1 1 True True True Nothing)
   _ -> Nothing
+
+presetNames :: [String]
+presetNames = ["gc_core", "gc_q46", "gc_grouped", "gc_fix2", "gc_reroot", "gc_reroot_extended", "gc_fix2_deep"]
 
 mut :: Config -> Mutation -> Bool
 mut cfg m = cMutation cfg == Just m
@@ -546,16 +587,30 @@ tweak cfg
 data Kind = KBase | KCapture
   deriving (Eq, Ord)
 
+-- | A source tip, (ver, gen).
+type Tip = (Int, Int)
+
+-- | A bundle's CORPUS name, i.e. its bytes (GitCarry.tla's meta): kind,
+-- item, the tip it captured, its basis and the prerequisite tips its header
+-- declares (a set of at most one tip there, a Maybe here).
 data Meta = Meta
   { mKind :: !Kind
+  , mItem :: !Int
   , mVer :: !Int
   , mGen :: !Int
-  , mPrior :: !Int
-  , mBase :: !Int
-  , mDepth :: !Int
-  , mAge :: !Int
+  , mBasis :: !Basis
+  , mPre :: !(Maybe Tip)
   }
   deriving (Eq, Ord)
+
+-- | A bundle's dependency sidecars (GitCarry.tla's sidecar): its .prior
+-- (the link, and the link's depth as the .prior records it), its .base
+-- and Q46's root age. noSide: no sidecar file.
+data Side = Side {scPrior :: !Int, scPDepth :: !Int, scBase :: !Int, scAge :: !Int}
+  deriving (Eq, Ord)
+
+noSide :: Side
+noSide = Side 0 0 0 0
 
 data Phys = Staged | POk | PMissing | PReplaced | PCollected
   deriving (Eq, Ord)
@@ -563,7 +618,7 @@ data Phys = Staged | POk | PMissing | PReplaced | PCollected
 data CapSt = CIdle | CBaseRec | CDecide | CPublish | CSidecars | CRecord
   deriving (Eq, Ord)
 
-data Cap = Cap {capSt :: !CapSt, capItem :: !Int, capB :: !Int}
+data Cap = Cap {capSt :: !CapSt, capItem :: !Int, capB :: !Int, capPlan :: !Side}
   deriving (Eq, Ord)
 
 -- | GitCarry.tla's variables, one field each.
@@ -572,7 +627,7 @@ data St = St
   , sGen :: !Int
   , sMeta :: !(M.Map Int Meta)
   , sCorpus :: !(M.Map Int Phys)
-  , sSide :: !(S.Set Int)
+  , sSidecar :: !(M.Map Int Side)
   , sRec :: !(M.Map Int Int)
   , sBaseRec :: !Int
   , sCap :: !Cap
@@ -581,9 +636,13 @@ data St = St
   }
   deriving (Eq, Ord)
 
--- | Idle: TLC's CHOOSE picks one fixed item; any fixed item will do.
+-- | GitCarry.tla's Group and Idle: TLC's CHOOSE picks one fixed item; any
+-- fixed item will do.
+groupItem :: Int
+groupItem = 1
+
 idleCap :: Cap
-idleCap = Cap CIdle 1 0
+idleCap = Cap CIdle groupItem 0 noSide
 
 items :: Config -> [Int]
 items cfg = [1 .. cItems cfg]
@@ -592,7 +651,7 @@ isGrouped :: Config -> Bool
 isGrouped cfg = cItems cfg > 1
 
 initial :: Config -> St
-initial cfg = St 0 0 M.empty M.empty S.empty (M.fromList [(i, 0) | i <- items cfg]) 0 idleCap 0 0
+initial cfg = St 0 0 M.empty M.empty M.empty (M.fromList [(i, 0) | i <- items cfg]) 0 idleCap 0 0
 
 nIds :: St -> Int
 nIds = M.size . sMeta
@@ -603,55 +662,66 @@ metaOf st b = sMeta st M.! b
 physOf :: St -> Int -> Phys
 physOf st b = sCorpus st M.! b
 
+sideOf :: St -> Int -> Side
+sideOf st b = sSidecar st M.! b
+
 recOf :: St -> Int -> Int
 recOf st i = sRec st M.! i
+
+-- | The bundle a CORPUS name already denotes, if any.
+named :: St -> Meta -> Maybe Int
+named st m = case [b | (b, x) <- M.toList (sMeta st), x == m] of
+  b : _ -> Just b
+  [] -> Nothing
 
 present :: St -> Int -> Bool
 present st b = physOf st b `elem` [POk, PReplaced]
 
+hasSidecars :: St -> Int -> Bool
+hasSidecars st b = sideOf st b /= noSide
+
+linkOf :: St -> Int -> Int
+linkOf st b = scPrior (sideOf st b)
+
+boundOf :: St -> Int -> Int
+boundOf st b = scBase (sideOf st b)
+
 hasPrior :: St -> Int -> Bool
-hasPrior st b = b `S.member` sSide st && mPrior (metaOf st b) /= 0
+hasPrior st b = b /= 0 && linkOf st b /= 0
+
+depthOf :: St -> Int -> Int
+depthOf st b = if hasPrior st b then scPDepth (sideOf st b) + 1 else 0
+
+tipOf :: St -> Int -> Tip
+tipOf st b = let m = metaOf st b in (mVer m, mGen m)
 
 declaresPrereqs :: St -> Int -> Bool
-declaresPrereqs st b = let m = metaOf st b in mPrior m /= 0 || mBase m /= 0
+declaresPrereqs st b = mPre (metaOf st b) /= Nothing
 
 closure :: St -> Int -> S.Set Int
 closure st b
   | b == 0 = S.empty
-  | otherwise = let m = metaOf st b in S.insert b (closure st (mPrior m) `S.union` closure st (mBase m))
+  | otherwise = S.insert b (closure st (linkOf st b) `S.union` closure st (boundOf st b))
 
 depended :: St -> S.Set Int
 depended st = S.unions [closure st r | r <- M.elems (sRec st)]
 
-prereqs :: St -> Int -> [Int]
-prereqs st b
-  | mPrior m /= 0 = [mPrior m]
-  | mBase m /= 0 = [mBase m]
-  | otherwise = []
-  where
-    m = metaOf st b
-
--- | ChainWalk: the links of b's chain, oldest first, or Nothing (refused).
+-- | ChainWalk: the links of h's chain, oldest first, or Nothing (refused).
+-- `ex` is the depth the current link's .prior must record once the walk
+-- has left the head.
 chainWalk :: Config -> St -> Int -> Bool -> Maybe [Int]
-chainWalk cfg st h custody = go h []
+chainWalk cfg st h custody = go h [] 0
   where
-    go cur acc
+    go cur acc ex
       | not (hasPrior st cur) = if null acc then Just [] else Nothing
-      | otherwise =
-          let p = mPrior (metaOf st cur)
-              d = mDepth (metaOf st p)
-           in if d >= depthLimit (cPolicy cfg)
-                then Nothing
-                else
-                  if not (present st p)
-                    then Nothing
-                    else
-                      if custody && physOf st p == PReplaced
-                        then Nothing
-                        else
-                          if d == 0
-                            then if hasPrior st p then Nothing else Just (p : acc)
-                            else go p (p : acc)
+      | d >= depthLimit (cPolicy cfg) || (not (null acc) && d /= ex) = Nothing
+      | not (present st p) = Nothing
+      | custody && physOf st p == PReplaced = Nothing
+      | d == 0 = if hasPrior st p then Nothing else Just (p : acc)
+      | otherwise = go p (p : acc) (d - 1)
+      where
+        p = linkOf st cur
+        d = scPDepth (sideOf st cur)
 
 rootOf :: Config -> St -> Int -> Int
 rootOf cfg st b = case chainWalk cfg st b True of
@@ -675,9 +745,10 @@ flattenOutcome cfg st h = case chainWalk cfg st h False of
     | any (\l -> physOf st l == PReplaced) links -> Refused
     | otherwise -> case links of
         oldest : _
-          | mBase (metaOf st oldest) == 0 -> Restored
+          | not (declaresPrereqs st oldest) -> Restored
           | not (chainUnderBase (cPolicy cfg)) -> Refused
-          | otherwise -> baseOutcome cfg st (mBase (metaOf st oldest))
+          | boundOf st oldest == 0 -> Io
+          | otherwise -> baseOutcome cfg st (boundOf st oldest)
         [] -> Restored
 
 applyOutcome :: Config -> St -> Int -> Apply
@@ -686,7 +757,7 @@ applyOutcome cfg st i
   | not (present st h) = Refused
   | physOf st h == PReplaced = Refused
   | hasPrior st h = flattenOutcome cfg st h
-  | declaresPrereqs st h = if h `S.notMember` sSide st then Io else baseOutcome cfg st (mBase (metaOf st h))
+  | declaresPrereqs st h = if boundOf st h == 0 then Io else baseOutcome cfg st (boundOf st h)
   | otherwise = Restored
   where
     h = recOf st i
@@ -698,20 +769,22 @@ applySeq :: Config -> St -> Int -> [Int]
 applySeq cfg st i
   | hasPrior st h = case chainWalk cfg st h False of
       Just links@(oldest : _) ->
-        let b0 = mBase (metaOf st oldest)
+        let b0 = boundOf st oldest
          in [b0 | b0 /= 0, chainUnderBase (cPolicy cfg)] ++ links ++ [h]
       _ -> [h]
-  | declaresPrereqs st h = [mBase (metaOf st h), h]
+  | declaresPrereqs st h = [boundOf st h, h]
   | otherwise = [h]
   where
     h = recOf st i
 
+-- | Every declared prerequisite tip is the tip of an intact bundle applied
+-- before it.
 satisfied :: St -> [Int] -> Bool
 satisfied st sq =
   and
-    [ or [j < k && x == p && physOf st p == POk | (j, x) <- indexed]
+    [ or [j < k && tipOf st x == t && physOf st x == POk | (j, x) <- indexed]
     | (k, b) <- indexed
-    , p <- prereqs st b
+    , Just t <- [mPre (metaOf st b)]
     ]
   where
     indexed = zip [1 :: Int ..] sq
@@ -719,7 +792,7 @@ satisfied st sq =
 intact :: St -> Int -> Bool
 intact st i =
   h /= 0
-    && all (\b -> physOf st b == POk && (not (declaresPrereqs st b) || b `S.member` sSide st)) (S.toList (closure st h))
+    && all (\b -> physOf st b == POk && (not (declaresPrereqs st b) || hasSidecars st b)) (S.toList (closure st h))
   where
     h = recOf st i
 
@@ -730,7 +803,7 @@ inputsOf cfg st i =
       { grouped = isGrouped cfg
       , base = baseState
       , retained = if h == 0 then NoRecord else if not held then BundleGone else Held
-      , keyEqual = held && mVer m == sVer st && mGen m == sGen st
+      , keyEqual = held && tipOf st h == (sVer st, sGen st)
       , drifted = False
       , settled = True
       , passStart = True
@@ -740,7 +813,7 @@ inputsOf cfg st i =
       , depth = case walk of
           Just links | held && hasPrior st h -> length links
           _ -> 0
-      , age = if held then mAge m else 0
+      , age = if held then scAge (sideOf st h) else 0
       , tipsHeld = held && mGen m == sGen st
       , rootHeld = held && mGen (metaOf st (rootOf cfg st h)) == sGen st
       , shallow = False
@@ -761,9 +834,9 @@ inputsOf cfg st i =
       | otherwise = Unchained
     (pb, unreadable)
       | shp == Unchained = (PrevNone, False)
-      | h `S.notMember` sSide st = (PrevNone, True)
-      | mBase m == 0 = (PrevNone, False)
-      | physOf st (mBase m) == POk = (PrevRetained, False)
+      | not (hasSidecars st h) = (PrevNone, True)
+      | boundOf st h == 0 = (PrevNone, False)
+      | physOf st (boundOf st h) == POk = (PrevRetained, False)
       | otherwise = (PrevLost, False)
     baseState
       | not (isGrouped cfg) = NoGroup
@@ -791,21 +864,34 @@ captureOutcome cfg st i
     tw = tweak cfg
     (inp, unreadable) = inputsOf cfg st i
 
-newMeta :: Config -> St -> Int -> Plan -> Meta
-newMeta cfg st i pl =
-  Meta
-    KCapture
-    (sVer st)
-    (sGen st)
-    link
-    (if basis pl `elem` [Base, BaseAndChain] then sBaseRec st else 0)
-    (planDepth pl)
-    (if planDepth pl == 0 then 0 else mAge (metaOf st h) + 1)
+-- | LinkOf: the link an exported capture chains on (its .prior).
+linkFor :: Config -> St -> Int -> Plan -> Int
+linkFor cfg st i pl
+  | basis pl `elem` [Chain, BaseAndChain] = if rebase pl == Reroot then rootOf cfg st h else h
+  | otherwise = 0
   where
     h = recOf st i
-    link
-      | basis pl `elem` [Chain, BaseAndChain] = if rebase pl == Reroot then rootOf cfg st h else h
-      | otherwise = 0
+
+-- | DeclaredTips: the prerequisite tips its header declares.
+declaredTips :: Config -> St -> Int -> Plan -> Maybe Tip
+declaredTips cfg st i pl
+  | basis pl `elem` [Chain, BaseAndChain] =
+      Just (tipOf st (if rebase pl == Reroot && mut cfg RerootPreMismatch then recOf st i else linkFor cfg st i pl))
+  | basis pl == Base = Just (tipOf st (sBaseRec st))
+  | otherwise = Nothing
+
+newMeta :: Config -> St -> Int -> Plan -> Meta
+newMeta cfg st i pl = Meta KCapture i (sVer st) (sGen st) (basis pl) (declaredTips cfg st i pl)
+
+newPlan :: Config -> St -> Int -> Plan -> Side
+newPlan cfg st i pl =
+  Side
+    l
+    (if l == 0 then 0 else planDepth pl - 1)
+    (if basis pl `elem` [Base, BaseAndChain] then sBaseRec st else 0)
+    (if planDepth pl == 0 then 0 else scAge (sideOf st (recOf st i)) + 1)
+  where
+    l = linkFor cfg st i pl
 
 -- ---------------------------------------------------------------------------
 -- Actions, in Next's disjunct order (TLC's one-worker search order)
@@ -833,19 +919,29 @@ baseNeeded cfg st =
 itemName :: Int -> String
 itemName i = "i" ++ show i
 
+-- | StartBase: a name that holds other bytes refuses DIGEST_MISMATCH and
+-- leaves the state as it was.
 startBase :: Config -> St -> Int -> [Step]
 startBase cfg st i
   | capSt (sCap st) == CIdle && isGrouped cfg && baseNeeded cfg st =
-      let b = nIds st + 1
-       in [ ( "StartBase(" ++ itemName i ++ ")"
-            , st
-                { sMeta = M.insert b (Meta KBase (sVer st) (sGen st) 0 0 0 0) (sMeta st)
-                , sCorpus = M.insert b POk (sCorpus st)
-                , sCap = Cap CBaseRec i b
-                }
-            )
-          ]
+      [ ( "StartBase(" ++ itemName i ++ ")"
+        , case named st bm of
+            Just b
+              | physOf st b == PReplaced -> st
+              | otherwise -> st {sCorpus = M.insert b POk (sCorpus st), sCap = Cap CBaseRec i b noSide}
+            Nothing ->
+              let b = nIds st + 1
+               in st
+                    { sMeta = M.insert b bm (sMeta st)
+                    , sCorpus = M.insert b POk (sCorpus st)
+                    , sSidecar = M.insert b noSide (sSidecar st)
+                    , sCap = Cap CBaseRec i b noSide
+                    }
+        )
+      ]
   | otherwise = []
+  where
+    bm = Meta KBase groupItem (sVer st) (sGen st) SelfContained Nothing
 
 baseRecord :: St -> [Step]
 baseRecord st
@@ -858,15 +954,21 @@ capture :: Config -> St -> Int -> [Step]
 capture cfg st i
   | enabled = case outcome of
       Decided (Export pl) ->
-        let b = nIds st + 1
-         in [ ( label
-              , st
-                  { sMeta = M.insert b (newMeta cfg st i pl) (sMeta st)
-                  , sCorpus = M.insert b Staged (sCorpus st)
-                  , sCap = Cap CPublish i b
-                  }
-              )
-            ]
+        let m = newMeta cfg st i pl
+            plan = newPlan cfg st i pl
+         in case named st m of
+              Just b -> [(label, st {sCap = Cap CPublish i b plan})]
+              Nothing ->
+                let b = nIds st + 1
+                 in [ ( label
+                      , st
+                          { sMeta = M.insert b m (sMeta st)
+                          , sCorpus = M.insert b Staged (sCorpus st)
+                          , sSidecar = M.insert b noSide (sSidecar st)
+                          , sCap = Cap CPublish i b plan
+                          }
+                      )
+                    ]
       _ -> [(label, st {sCap = idleCap})]
   | otherwise = []
   where
@@ -877,32 +979,39 @@ capture cfg st i
       (capSt c == CIdle && not (isGrouped cfg && baseNeeded cfg st))
         || (capSt c == CDecide && capItem c == i)
 
+-- | Publish: a name rewritten in place refuses DIGEST_MISMATCH; the pass
+-- ends with no record.
 publish :: Config -> St -> [Step]
 publish cfg st
   | capSt c == CPublish =
       [ ( "Publish"
-        , st
-            { sCorpus = M.insert (capB c) POk (sCorpus st)
-            , sCap =
-                c
-                  { capSt =
-                      if declaresPrereqs st (capB c) && not (mut cfg SidecarAfterRecord)
-                        then CSidecars
-                        else CRecord
-                  }
-            }
+        , if physOf st (capB c) == PReplaced
+            then st {sCap = idleCap}
+            else
+              st
+                { sCorpus = M.insert (capB c) POk (sCorpus st)
+                , sCap =
+                    c
+                      { capSt =
+                          if declaresPrereqs st (capB c) && not (mut cfg SidecarAfterRecord)
+                            then CSidecars
+                            else CRecord
+                      }
+                }
         )
       ]
   | otherwise = []
   where
     c = sCap st
 
+-- | Sidecars: publish_prior keeps an intact chain already recorded for the
+-- name; a pass that does not chain writes no .prior.
 sidecars :: Config -> St -> [Step]
 sidecars cfg st
   | capSt c == CSidecars =
       [ ( "Sidecars"
         , st
-            { sSide = S.insert (capB c) (sSide st)
+            { sSidecar = M.insert b written (sSidecar st)
             , sCap = if mut cfg SidecarAfterRecord then idleCap else c {capSt = CRecord}
             }
         )
@@ -910,6 +1019,10 @@ sidecars cfg st
   | otherwise = []
   where
     c = sCap st
+    b = capB c
+    plan = capPlan c
+    keep = scPrior plan == 0 || (hasPrior st b && chainWalk cfg st b True /= Nothing)
+    written = if keep then (sideOf st b) {scBase = scBase plan} else plan
 
 record :: Config -> St -> [Step]
 record cfg st
@@ -938,19 +1051,19 @@ garbage cfg st = [b | b <- [1 .. nIds st], present st b, b `S.notMember` live]
   where
     live = gcLive cfg st
 
+-- | GC: one garbage bundle and its sidecars per step.
 gc :: Config -> St -> [Step]
 gc cfg st
-  | cGC cfg && capSt (sCap st) == CIdle && not (null gone) =
-      [ ( "GC"
+  | cGC cfg && capSt (sCap st) == CIdle =
+      [ ( "GC(" ++ show b ++ ")"
         , st
-            { sCorpus = foldr (\b -> M.insert b PCollected) (sCorpus st) gone
-            , sSide = sSide st `S.difference` S.fromList gone
+            { sCorpus = M.insert b PCollected (sCorpus st)
+            , sSidecar = M.insert b noSide (sSidecar st)
             }
         )
+      | b <- garbage cfg st
       ]
   | otherwise = []
-  where
-    gone = garbage cfg st
 
 advance :: Config -> St -> [Step]
 advance cfg st
@@ -969,7 +1082,7 @@ damage cfg st
       | b <- [1 .. nIds st]
       , physOf st b == POk
       , cDamageBase cfg || mKind (metaOf st b) == KCapture
-      , how <- [PMissing, PReplaced]
+      , how <- if cDamageRewrites cfg then [PMissing, PReplaced] else [PMissing]
       ]
   | otherwise = []
 
@@ -1002,20 +1115,25 @@ typeOK cfg st =
   sVer st <= cCommits cfg
     && sGen st <= cRewrites cfg
     && M.keys (sCorpus st) == M.keys (sMeta st)
+    && M.keys (sSidecar st) == M.keys (sMeta st)
     && M.keys (sMeta st) == [1 .. nIds st]
-    && and [mPrior m < b && mBase m < b && mVer m <= cCommits cfg && mGen m <= cRewrites cfg | (b, m) <- M.toList (sMeta st)]
-    && all (\b -> b >= 1 && b <= nIds st) (S.toList (sSide st))
-    && all (\r -> r >= 0 && r <= nIds st) (M.elems (sRec st))
-    && sBaseRec st <= nIds st
-    && capB (sCap st) <= nIds st
+    && and [mVer m <= cCommits cfg && mGen m <= cRewrites cfg && maybe True tipOk (mPre m) | m <- M.elems (sMeta st)]
+    && and [inRange (scPrior s) && inRange (scBase s) && scPDepth s >= 0 && scAge s >= 0 | s <- M.elems (sSidecar st)]
+    && S.size (S.fromList (M.elems (sMeta st))) == nIds st
+    && all inRange (M.elems (sRec st))
+    && inRange (sBaseRec st)
+    && inRange (capB (sCap st))
     && sCrashes st <= cCrashes cfg
     && sDamage st <= cDamage cfg
+  where
+    inRange b = b >= 0 && b <= nIds st
+    tipOk (v, g) = v >= 0 && v <= cCommits cfg && g >= 0 && g <= cRewrites cfg
 
 chainDepthBounded :: Config -> St -> Bool
 chainDepthBounded cfg st =
   all
-    (\m -> mDepth m <= depthLimit p && (rootWindow p == 0 || mAge m < rootWindow p))
-    (M.elems (sMeta st))
+    (\b -> depthOf st b <= depthLimit p && (rootWindow p == 0 || scAge (sideOf st b) < rootWindow p))
+    [1 .. nIds st]
   where
     p = cPolicy cfg
 
@@ -1043,7 +1161,7 @@ gcNeverDeletesDepended _ st =
 sidecarsBeforeRecord :: Config -> St -> Bool
 sidecarsBeforeRecord _ st =
   and
-    [ physOf st h /= Staged && (not (declaresPrereqs st h) || h `S.member` sSide st)
+    [ physOf st h /= Staged && (not (declaresPrereqs st h) || hasSidecars st h)
     | h <- M.elems (sRec st)
     , h /= 0
     ]
@@ -1159,10 +1277,10 @@ stateJ st =
     [ ("src", JO [("ver", JN (sVer st)), ("gen", JN (sGen st))])
     , ("meta", JA (map metaJ (M.elems (sMeta st))))
     , ("corpus", JA (map (JS . physName) (M.elems (sCorpus st))))
-    , ("side", JA (map JN (S.toList (sSide st))))
+    , ("sidecar", JA (map sideJ (M.elems (sSidecar st))))
     , ("rec", JO [(itemName i, JN b) | (i, b) <- M.toList (sRec st)])
     , ("baseRec", JN (sBaseRec st))
-    , ("cap", JO [("st", JS (capStName (capSt c))), ("item", JS (itemName (capItem c))), ("b", JN (capB c))])
+    , ("cap", JO [("st", JS (capStName (capSt c))), ("item", JS (itemName (capItem c))), ("b", JN (capB c)), ("plan", sideJ (capPlan c))])
     , ("crashes", JN (sCrashes st))
     , ("damage", JN (sDamage st))
     ]
@@ -1171,12 +1289,18 @@ stateJ st =
     metaJ m =
       JO
         [ ("kind", JS (if mKind m == KBase then "base" else "capture"))
+        , ("item", JS (itemName (mItem m)))
         , ("ver", JN (mVer m))
         , ("gen", JN (mGen m))
-        , ("prior", JN (mPrior m))
-        , ("base", JN (mBase m))
-        , ("depth", JN (mDepth m))
-        , ("age", JN (mAge m))
+        , ("basis", JS (show (mBasis m)))
+        , ("pre", JA [JO [("ver", JN v), ("gen", JN g)] | Just (v, g) <- [mPre m]])
+        ]
+    sideJ x =
+      JO
+        [ ("prior", JN (scPrior x))
+        , ("pdepth", JN (scPDepth x))
+        , ("base", JN (scBase x))
+        , ("age", JN (scAge x))
         ]
 
 boundName :: Config -> String
@@ -1193,6 +1317,7 @@ boundName cfg =
     , "X=" ++ show (cCrashes cfg)
     , "D=" ++ show (cDamage cfg)
     , "db=" ++ showBool (cDamageBase cfg)
+    , "dr=" ++ showBool (cDamageRewrites cfg)
     , "bmt=" ++ showBool (cBaseMissingTyped cfg)
     ]
   where
@@ -1229,7 +1354,7 @@ counterexample cfg name checked f =
 usage :: String -> IO a
 usage err = do
   hPutStrLn stderr ("GitCarryCore: " ++ err)
-  hPutStrLn stderr "usage: GitCarryCore rows [--check FILE] | schema | explore [--preset gc_core|gc_q46|gc_grouped|gc_fix2] [--items N] [--depth-limit N] [--root-window N] [--chain-under-base BOOL] [--gc BOOL] [--commits N] [--rewrites N] [--crashes N] [--damage N] [--damage-base BOOL] [--base-missing-typed BOOL] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]"
+  hPutStrLn stderr ("usage: GitCarryCore rows [--check FILE] | schema | explore [--preset " ++ intercalate "|" presetNames ++ "] [--items N] [--depth-limit N] [--root-window N] [--chain-under-base BOOL] [--gc BOOL] [--commits N] [--rewrites N] [--crashes N] [--damage N] [--damage-base BOOL] [--damage-rewrites BOOL] [--base-missing-typed BOOL] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]")
   exitWith (ExitFailure 2)
 
 splitOn :: Char -> String -> [String]
@@ -1274,6 +1399,7 @@ parseExplore = go (Opts "gc_core" [] Nothing "all" Nothing Nothing)
     go o ("--crashes" : v : rest) = go (set o (\c -> count v >>= \n -> Right c {cCrashes = n})) rest
     go o ("--damage" : v : rest) = go (set o (\c -> count v >>= \n -> Right c {cDamage = n})) rest
     go o ("--damage-base" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cDamageBase = b})) rest
+    go o ("--damage-rewrites" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cDamageRewrites = b})) rest
     go o ("--base-missing-typed" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cBaseMissingTyped = b})) rest
     go o ("--mutation" : v : rest) = go o {oMutation = if v == "none" then Nothing else Just v} rest
     go o ("--check" : v : rest) = go o {oCheck = v} rest

@@ -23,15 +23,26 @@
 (*     ExportOptions match in git_carry::export_pass), then publish_bundle,*)
 (*     the dependency sidecars ({bundle}.base, {bundle}.prior) and the     *)
 (*     {item}.capture record, each a separate durable step.                *)
+(*   - Content names. A bundle's CORPUS name is its content               *)
+(*     ({identity}-{digest}.bundle, shared-{digest}.bundle), so a          *)
+(*     re-export of the same content lands on the same name: publish_      *)
+(*     bundle and prepare_base reuse a file at that digest, link a deleted *)
+(*     or collected one again, and refuse DIGEST_MISMATCH for a name that  *)
+(*     holds other bytes. publish_prior keeps an intact chain already      *)
+(*     recorded for the name.                                              *)
+(*   - What a bundle's header declares (its prerequisite tips, `pre`) and  *)
+(*     what its .prior sidecar names (`prior`) are separate values, each   *)
+(*     set from the decision's chain path.                                 *)
 (*   - Chain depth (chain::CHAIN_DEPTH_LIMIT), re-basing at the limit, and *)
 (*     Q46's re-root policy (RootWindow > 0, no code yet: lane L8).        *)
-(*   - Q46's CORPUS GC between passes (GCOn, no code yet: lane L8).        *)
+(*   - Q46's CORPUS GC between passes (GCOn, no code yet: lane L8), one    *)
+(*     bundle per step.                                                    *)
 (*   - L6b's fix 2, a chain kept under a plan base (ChainUnderBase, no     *)
 (*     code yet).                                                          *)
 (*   - Crashes of the capture host between any two durable steps, in      *)
 (*     particular between the sidecars and the record.                    *)
 (*   - Third-party damage to CORPUS: a bundle deleted, or rewritten in     *)
-(*     place (a new identity and digest).                                  *)
+(*     place (a new identity and digest at the same name).                 *)
 (*   - Source history moving (a new tip) and being rewritten (the          *)
 (*     retained tips pruned at the source: chain::source_held_tips).       *)
 (*   - Restore (estate::apply_item, import_base, chain_links under         *)
@@ -39,16 +50,26 @@
 (*     in every state rather than run as an action.                        *)
 (*                                                                         *)
 (* ABSTRACTIONS (what is NOT modelled)                                     *)
-(*   - Content. A bundle records the source tip it captured, as (ver,     *)
-(*     gen); its prerequisites are its prior link's tips or its base's.   *)
-(*     Pack contents and the object-set laws are P64/P65's job (the Rust  *)
-(*     pack scan); there is no PackExcludesHeld here.                      *)
+(*   - Pack content. A bundle's name is (kind, item, the tip it captured  *)
+(*     as (ver, gen), its basis, its declared prerequisite tips): the     *)
+(*     writer and its inputs, which fix the bytes. Pack contents and the  *)
+(*     object-set laws are P64/P65's job (the Rust pack scan); there is no *)
+(*     PackExcludesHeld here.                                              *)
+(*   - Identity. A file linked again under its name (after a delete or     *)
+(*     GC) keeps one identity here. The code gives it a new StatIdentity, *)
+(*     so a capture-side (Custody) reference recorded before it sees a     *)
+(*     changed file and recaptures, as it does for a rewritten link, while *)
+(*     apply binds by digest and sees what the model sees.                 *)
+(*   - Source tips only move forward. A source returning to an earlier tip *)
+(*     re-exports an earlier name; its outcomes are those of the same-tip *)
+(*     re-export the model reaches (reuse, a new link, DIGEST_MISMATCH),  *)
+(*     plus the identity effect above on links recorded before.           *)
 (*   - Each durable write (estate::write: temporary, fsync, rename, then  *)
 (*     a directory seal) is one atomic step, durable at once. publish_     *)
 (*     bundle's hard link is durable when it returns: its directory entry *)
 (*     is sealed by the next write in CORPUS, before any record names it, *)
 (*     and an orphan that a crash drops is never depended on.             *)
-(*   - The two dependency sidecars are one step (`side`). Only fix 2      *)
+(*   - The two dependency sidecars are one step (`sidecar`). Only fix 2   *)
 (*     writes both; a crash between them leaves an orphan either way.     *)
 (*   - The capture key is the source tip. Drift, racy seats and the pass  *)
 (*     start (.drift, .parts) are inputs of the decision core that the    *)
@@ -57,6 +78,16 @@
 (*   - Items capture one at a time (estate.lock, jobs = 1); the code may  *)
 (*     run two jobs inside the lock, which shares no custody state but    *)
 (*     the plan base, created once under the group's mutex.              *)
+(*   - One CORPUS writer. estate.lock lives in STATE, and two STATE dirs  *)
+(*     may share one CORPUS (estate.rs, two_state_dirs_sharing_a_corpus_   *)
+(*     fail_closed_on_interleaved_records). GC is safe here only because   *)
+(*     no capture or apply runs beside it: L8 must make GC take a CORPUS-  *)
+(*     level exclusive lock that every capture and every apply also take. *)
+(*     A GC racing a second STATE's pass, or an apply, is not modelled.   *)
+(*   - GC deletes one bundle with its sidecars per step and recomputes    *)
+(*     what is garbage before each; a crash between two deletions is a    *)
+(*     stop between steps. The order of a bundle and its sidecars inside  *)
+(*     one deletion is not modelled.                                      *)
 (*   - STATE attempt directories are never depended on: publish_bundle    *)
 (*     and prepare_base hard-link into CORPUS, so collecting an attempt   *)
 (*     under the lock cannot break custody. STATE GC is not modelled.     *)
@@ -100,6 +131,7 @@ CONSTANTS
     MaxCrashes,       \* capture-host crashes inside a pass
     MaxDamage,        \* third-party deletes or rewrites of CORPUS bundles
     DamageBase,       \* damage may reach a plan base bundle
+    DamageRewrites,   \* damage may rewrite a bundle in place (else it deletes)
     BaseMissingTyped, \* apply refuses a missing plan base by name (an
                       \* assumption the code does not meet: import_base
                       \* stages it with a bare IO; README)
@@ -108,7 +140,8 @@ CONSTANTS
 
 Mutations == {"none", "chain_ignores_depth", "gc_deletes_depended",
               "base_replaced_live", "sidecar_after_record",
-              "skip_flatten_verify", "hit_ignores_chain"}
+              "skip_flatten_verify", "hit_ignores_chain",
+              "reroot_pre_mismatch"}
 
 (* The decision core's closed unions: catalogue/Types.dhall types them, and *)
 (* tla-check requires these sets to equal the catalogue's labels.          *)
@@ -123,29 +156,38 @@ ASSUME /\ IsFiniteSet(Items) /\ Items # {}
        /\ ChainUnderBase \in BOOLEAN /\ GCOn \in BOOLEAN
        /\ MaxCommits \in Nat /\ MaxRewrites \in Nat /\ MaxCrashes \in Nat
        /\ MaxDamage \in Nat /\ DamageBase \in BOOLEAN
-       /\ BaseMissingTyped \in BOOLEAN
+       /\ DamageRewrites \in BOOLEAN /\ BaseMissingTyped \in BOOLEAN
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
 
 \* Two or more items share one common repository, so one plan base.
 Grouped == Cardinality(Items) > 1
 
+\* The item field of a plan base's name: shared-{digest} names the group.
+Group == CHOOSE x \in Items : TRUE
+
+\* A bundle's dependency sidecars: its .prior (the link it chains on, and
+\* that link's depth as the .prior records it) and its .base (the plan
+\* base it was bound to), with Q46's root age. NoSidecar: no sidecar file.
+NoSidecar == [prior |-> 0, pdepth |-> 0, base |-> 0, age |-> 0]
+
 VARIABLES
     src,      \* the source repository's tip: [ver, gen]
-    meta,     \* bundle id -> what its header and sidecars record (immutable)
-    corpus,   \* bundle id -> "staged" | "ok" | "missing" | "replaced"
-              \*              | "collected"
-    side,     \* bundles whose dependency sidecars (.base, .prior) exist
+    meta,     \* bundle id -> its CORPUS name, i.e. its bytes (immutable)
+    corpus,   \* bundle id -> the file at that name: "staged" (exported,
+              \*   never published) | "ok" | "missing" | "replaced"
+              \*   | "collected"
+    sidecar,  \* bundle id -> its dependency sidecars, or NoSidecar
     rec,      \* item -> the bundle its {item}.capture record names (0: none)
     baseRec,  \* the bundle shared-{group}.base names (0: none)
     cap,      \* the capture pass in flight (one at a time: estate.lock)
     crashes,  \* crashes so far
     damage    \* third-party damage so far
 
-vars == <<src, meta, corpus, side, rec, baseRec, cap, crashes, damage>>
+vars == <<src, meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
 
 Ids == 1..Len(meta)
 
-Idle == [st |-> "idle", item |-> CHOOSE x \in Items : TRUE, b |-> 0]
+Idle == [st |-> "idle", item |-> Group, b |-> 0, plan |-> NoSidecar]
 
 -----------------------------------------------------------------------------
 (* Custody helpers *)
@@ -153,60 +195,74 @@ Idle == [st |-> "idle", item |-> CHOOSE x \in Items : TRUE, b |-> 0]
 \* A file is at the bundle's CORPUS name (bytes possibly rewritten).
 Present(b) == corpus[b] \in {"ok", "replaced"}
 
-\* The {bundle}.prior sidecar: the bundle chains on an earlier link.
-HasPrior(b) == b \in side /\ meta[b].prior # 0
+\* The bundle's dependency sidecars exist.
+HasSidecars(b) == sidecar[b] # NoSidecar
+
+\* What its .prior and .base sidecars name (0: no such sidecar).
+Link(b) == sidecar[b].prior
+Bound(b) == sidecar[b].base
+
+\* The {bundle}.prior sidecar: the bundle chains on an earlier link (0 is
+\* no bundle: an item with no record).
+HasPrior(b) == b # 0 /\ Link(b) # 0
+
+\* Its chain's depth, as its .prior records it.
+Depth(b) == IF HasPrior(b) THEN sidecar[b].pdepth + 1 ELSE 0
+
+\* The source tip a bundle captured.
+Tip(b) == [ver |-> meta[b].ver, gen |-> meta[b].gen]
 
 \* shared::requires_base: the bundle's header declares prerequisites.
-DeclaresPrereqs(b) == meta[b].prior # 0 \/ meta[b].base # 0
+DeclaresPrereqs(b) == meta[b].pre # {}
 
-\* What a bundle depends on: its prior link and its plan base, transitively.
+\* What a bundle depends on, as its sidecars name it: its prior link and its
+\* plan base, transitively. A link's tip is below its bundle's, so this ends.
 RECURSIVE Closure(_)
 Closure(b) ==
     IF b = 0 THEN {}
-    ELSE {b} \cup Closure(meta[b].prior) \cup Closure(meta[b].base)
+    ELSE {b} \cup Closure(Link(b)) \cup Closure(Bound(b))
 
 \* Every bundle some item's record depends on.
 Depended == UNION {Closure(rec[i]) : i \in Items}
 
-\* The prerequisites a bundle's header declares: its prior link's tips, else
-\* its base's commits (shared::prerequisites).
-Prereqs(b) ==
-    IF meta[b].prior # 0 THEN {meta[b].prior}
-    ELSE IF meta[b].base # 0 THEN {meta[b].base}
-    ELSE {}
+Walked(code, links) == [code |-> code, links |-> links]
 
 \* estate::chain_links from bundle `cur`: walk the .prior sidecars, oldest
-\* link first. Under LinkBinding::Custody (capture side) a link rewritten
-\* in place is refused; under Digest (apply side) flatten checks digests.
-\* Recorded depths are consistent by construction (meta is immutable), so
-\* the walk's `expected` check is folded away.
-RECURSIVE ChainWalk(_, _, _)
-ChainWalk(cur, acc, custody) ==
+\* link first. `exp` is the depth cur's own link must record once the walk
+\* has left the head (acc # <<>>). Under LinkBinding::Custody (capture side)
+\* a link rewritten in place is refused; under Digest (apply side) flatten
+\* checks digests.
+RECURSIVE ChainWalk(_, _, _, _)
+ChainWalk(cur, acc, exp, custody) ==
     IF ~HasPrior(cur)
-    THEN IF acc = <<>> THEN [code |-> "ok", links |-> acc]
-         ELSE [code |-> "ReceiptBindingInvalid", links |-> <<>>]
-    ELSE LET p == meta[cur].prior
-             d == meta[p].depth
-         IN IF d >= DepthLimit
-            THEN [code |-> "ReceiptBindingInvalid", links |-> <<>>]
+    THEN IF acc = <<>> THEN Walked("ok", acc)
+         ELSE Walked("ReceiptBindingInvalid", <<>>)
+    ELSE LET p == Link(cur)
+             d == sidecar[cur].pdepth
+         IN IF d >= DepthLimit \/ (acc # <<>> /\ d # exp)
+            THEN Walked("ReceiptBindingInvalid", <<>>)
             ELSE IF ~Present(p)
-            THEN [code |-> "SealedObjectMissing", links |-> <<>>]
+            THEN Walked("SealedObjectMissing", <<>>)
             ELSE IF custody /\ corpus[p] = "replaced"
-            THEN [code |-> "ReceiptBindingInvalid", links |-> <<>>]
+            THEN Walked("ReceiptBindingInvalid", <<>>)
             ELSE IF d = 0
             THEN IF HasPrior(p)
-                 THEN [code |-> "ReceiptBindingInvalid", links |-> <<>>]
-                 ELSE [code |-> "ok", links |-> <<p>> \o acc]
-            ELSE ChainWalk(p, <<p>> \o acc, custody)
+                 THEN Walked("ReceiptBindingInvalid", <<>>)
+                 ELSE Walked("ok", <<p>> \o acc)
+            ELSE ChainWalk(p, <<p>> \o acc, d - 1, custody)
+
+Walk(b, custody) == ChainWalk(b, <<>>, 0, custody)
 
 \* The oldest link of b's intact chain (b itself when it is unchained).
 RootOf(b) ==
-    LET w == ChainWalk(b, <<>>, TRUE)
+    LET w == Walk(b, TRUE)
     IN IF w.code = "ok" /\ w.links # <<>> THEN w.links[1] ELSE b
 
 -----------------------------------------------------------------------------
 (* Restore: what estate-apply would do with item i's record now.          *)
 (* "restored", "refused" (a typed refusal) or "io" (a bare IO error).     *)
+(* verify_bundle's prerequisite check is not part of it: that it never    *)
+(* fails on a chain whose digests check is PrereqsSatisfiedByEarlierLinks.*)
 
 \* stage_bundle of a plan base: a missing file is canonicalize's ENOENT.
 BaseOutcome(b) ==
@@ -215,17 +271,17 @@ BaseOutcome(b) ==
     ELSE "restored"
 
 \* chain::flatten over chain_links(Digest): every link digest-checked, the
-\* oldest self-contained (fix 2: its base imported first), every later
-\* link's prerequisites satisfied by the links before it (verify_bundle).
+\* oldest self-contained by its header (fix 2: its base imported first).
 FlattenOutcome(h) ==
-    LET w == ChainWalk(h, <<>>, FALSE)
+    LET w == Walk(h, FALSE)
     IN IF w.code # "ok" THEN "refused"
        ELSE IF Mutation = "skip_flatten_verify" THEN "restored"
        ELSE IF \E k \in 1..Len(w.links) : corpus[w.links[k]] = "replaced"
        THEN "refused"                               \* DIGEST_MISMATCH
-       ELSE IF meta[w.links[1]].base = 0 THEN "restored"
+       ELSE IF ~DeclaresPrereqs(w.links[1]) THEN "restored"
        ELSE IF ~ChainUnderBase THEN "refused"       \* RECEIPT_BINDING_INVALID
-       ELSE BaseOutcome(meta[w.links[1]].base)
+       ELSE IF Bound(w.links[1]) = 0 THEN "io"      \* an absent .base
+       ELSE BaseOutcome(Bound(w.links[1]))
 
 ApplyOutcome(i) ==
     LET h == rec[i]
@@ -234,34 +290,36 @@ ApplyOutcome(i) ==
        ELSE IF corpus[h] = "replaced" THEN "refused" \* DIGEST_MISMATCH
        ELSE IF HasPrior(h) THEN FlattenOutcome(h)
        ELSE IF DeclaresPrereqs(h)
-       THEN IF h \notin side THEN "io"   \* import_base reads an absent .base
-            ELSE BaseOutcome(meta[h].base)
+       THEN IF Bound(h) = 0 THEN "io"    \* import_base reads an absent .base
+            ELSE BaseOutcome(Bound(h))
        ELSE "restored"
 
 Restorable(i) == ApplyOutcome(i) = "restored"
 
-\* The bundles a completed restore read, in the order it applied them.
+\* The bundles a completed restore read, in the order it applied them: the
+\* sidecars' chain, and the base the oldest link (or the head) is bound to.
 ApplySeq(i) ==
     LET h == rec[i]
     IN IF HasPrior(h)
-       THEN LET links == ChainWalk(h, <<>>, FALSE).links
-                b0 == meta[links[1]].base
+       THEN LET links == Walk(h, FALSE).links
+                b0 == Bound(links[1])
             IN (IF b0 # 0 /\ ChainUnderBase THEN <<b0>> ELSE <<>>)
                \o links \o <<h>>
-       ELSE IF DeclaresPrereqs(h) THEN <<meta[h].base, h>>
+       ELSE IF DeclaresPrereqs(h) THEN <<Bound(h), h>>
        ELSE <<h>>
 
-\* Every bundle's prerequisites name an intact bundle applied before it.
+\* Every prerequisite tip a bundle's header declares is the tip of an intact
+\* bundle applied before it (what verify_bundle checks).
 Satisfied(seq) ==
-    \A k \in 1..Len(seq) : \A p \in Prereqs(seq[k]) :
-        \E j \in 1..(k - 1) : seq[j] = p /\ corpus[p] = "ok"
+    \A k \in 1..Len(seq) : \A t \in meta[seq[k]].pre :
+        \E j \in 1..(k - 1) : Tip(seq[j]) = t /\ corpus[seq[j]] = "ok"
 
 \* Every bundle in item i's custody is at its recorded bytes, with its
 \* dependency sidecars.
 Intact(i) ==
     /\ rec[i] # 0
     /\ \A b \in Closure(rec[i]) :
-           corpus[b] = "ok" /\ (DeclaresPrereqs(b) => b \in side)
+           corpus[b] = "ok" /\ (DeclaresPrereqs(b) => HasSidecars(b))
 
 -----------------------------------------------------------------------------
 (* The decision core: DecideCore(Inputs(i)) is hs/GitCarryCore.hs's       *)
@@ -271,12 +329,12 @@ Inputs(i) ==
     LET h == rec[i]
         held == h # 0 /\ corpus[h] = "ok"
         chained == held /\ HasPrior(h)
-        walk == ChainWalk(h, <<>>, TRUE)
+        walk == Walk(h, TRUE)
         shape == IF ~held THEN "Unchained"
                  ELSE IF HasPrior(h) THEN "Chained"
                  ELSE IF DeclaresPrereqs(h) THEN "Based"
                  ELSE "Unchained"
-        bound == meta[h].base
+        bound == Bound(h)
     IN [grouped |-> Grouped,
         base |-> IF ~Grouped THEN "NoGroup"
                  ELSE IF baseRec = 0 THEN "Absent"
@@ -285,19 +343,19 @@ Inputs(i) ==
         retained |-> IF h = 0 THEN "NoRecord"
                      ELSE IF ~held THEN "BundleGone"
                      ELSE "Held",
-        keyEqual |-> held /\ meta[h].ver = src.ver /\ meta[h].gen = src.gen,
+        keyEqual |-> held /\ Tip(h) = src,
         drifted |-> FALSE,
         settled |-> TRUE,
         passStart |-> TRUE,
         shape |-> shape,
         chainIntact |-> walk.code = "ok",
         prevBase |-> IF shape = "Unchained" THEN "None"
-                     ELSE IF h \notin side THEN "Unreadable"
+                     ELSE IF ~HasSidecars(h) THEN "Unreadable"
                      ELSE IF bound = 0 THEN "None"
                      ELSE IF corpus[bound] = "ok" THEN "Retained"
                      ELSE "Lost",
         depth |-> IF chained /\ walk.code = "ok" THEN Len(walk.links) ELSE 0,
-        age |-> IF held THEN meta[h].age ELSE 0,
+        age |-> IF held THEN sidecar[h].age ELSE 0,
         tipsHeld |-> held /\ meta[h].gen = src.gen,
         rootHeld |-> held /\ meta[RootOf(h)].gen = src.gen,
         shallow |-> FALSE]
@@ -369,17 +427,36 @@ CaptureOutcome(i) ==
        THEN IoOutcome
        ELSE DecideCore(inp)
 
-\* The bundle an exported capture records.
+\* The link an exported capture chains on: its .prior.
+LinkOf(i, o) ==
+    IF o.basis \in {"Chain", "BaseAndChain"}
+    THEN IF o.rebase = "Reroot" THEN RootOf(rec[i]) ELSE rec[i]
+    ELSE 0
+
+\* The prerequisite tips its header declares (shared::prerequisites): the
+\* tips of the link the chain path chose, else its base's commits.
+\* reroot_pre_mismatch declares the head's tips on a re-root while the
+\* .prior names the root.
+DeclaredTips(i, o) ==
+    IF o.basis \in {"Chain", "BaseAndChain"}
+    THEN {Tip(IF o.rebase = "Reroot" /\ Mutation = "reroot_pre_mismatch"
+              THEN rec[i] ELSE LinkOf(i, o))}
+    ELSE IF o.basis = "Base" THEN {Tip(baseRec)}
+    ELSE {}
+
+\* The CORPUS name an exported capture lands on: its content.
 NewMeta(i, o) ==
-    LET h == rec[i]
-        link == IF o.basis \in {"Chain", "BaseAndChain"}
-                THEN IF o.rebase = "Reroot" THEN RootOf(h) ELSE h
-                ELSE 0
-    IN [kind |-> "capture", ver |-> src.ver, gen |-> src.gen,
-        prior |-> link,
+    [kind |-> "capture", item |-> i, ver |-> src.ver, gen |-> src.gen,
+     basis |-> o.basis, pre |-> DeclaredTips(i, o)]
+
+\* The sidecars the pass writes for it, unless publish_prior keeps the ones
+\* already recorded for that name.
+NewPlan(i, o) ==
+    LET link == LinkOf(i, o)
+    IN [prior |-> link,
+        pdepth |-> IF link = 0 THEN 0 ELSE o.depth - 1,
         base |-> IF o.basis \in {"Base", "BaseAndChain"} THEN baseRec ELSE 0,
-        depth |-> o.depth,
-        age |-> IF o.depth = 0 THEN 0 ELSE meta[h].age + 1]
+        age |-> IF o.depth = 0 THEN 0 ELSE sidecar[rec[i]].age + 1]
 
 -----------------------------------------------------------------------------
 (* Protocol *)
@@ -388,52 +465,91 @@ BaseNeeded ==
     IF baseRec = 0 THEN TRUE
     ELSE Mutation = "base_replaced_live" /\ corpus[baseRec] # "ok"
 
+\* The CORPUS name of a plan base exported now.
+BaseMeta ==
+    [kind |-> "base", item |-> Group, ver |-> src.ver, gen |-> src.gen,
+     basis |-> "SelfContained", pre |-> {}]
+
 \* prepare_base: export_base into a STATE attempt, hard-link the bundle into
-\* CORPUS and seal it. Its record follows (BaseRecord). With a record whose
-\* base is missing or rewritten, prepare_base refuses instead of replacing
-\* it (DecideCore's first branch); base_replaced_live replaces it.
+\* CORPUS under its content name and seal it. A name that holds other bytes
+\* refuses DIGEST_MISMATCH (the pass ends, nothing changes). Its record
+\* follows (BaseRecord). With a record whose base is missing or rewritten,
+\* prepare_base refuses instead of replacing it (DecideCore's first branch);
+\* base_replaced_live replaces it.
 StartBase(i) ==
     /\ cap.st = "idle" /\ Grouped /\ BaseNeeded
-    /\ meta' = Append(meta, [kind |-> "base", ver |-> src.ver, gen |-> src.gen,
-                             prior |-> 0, base |-> 0, depth |-> 0, age |-> 0])
-    /\ corpus' = Append(corpus, "ok")
-    /\ cap' = [st |-> "baserec", item |-> i, b |-> Len(meta) + 1]
-    /\ UNCHANGED <<src, side, rec, baseRec, crashes, damage>>
+    /\ IF \E b \in Ids : meta[b] = BaseMeta
+       THEN LET b == CHOOSE b \in Ids : meta[b] = BaseMeta
+            IN IF corpus[b] = "replaced"
+               THEN UNCHANGED <<meta, corpus, sidecar, cap>>
+               ELSE /\ corpus' = [corpus EXCEPT ![b] = "ok"]
+                    /\ cap' = [Idle EXCEPT !.st = "baserec", !.item = i, !.b = b]
+                    /\ UNCHANGED <<meta, sidecar>>
+       ELSE /\ meta' = Append(meta, BaseMeta)
+            /\ corpus' = Append(corpus, "ok")
+            /\ sidecar' = Append(sidecar, NoSidecar)
+            /\ cap' = [Idle EXCEPT !.st = "baserec", !.item = i,
+                                   !.b = Len(meta) + 1]
+    /\ UNCHANGED <<src, rec, baseRec, crashes, damage>>
 
 \* prepare_base's write of shared-{group}.base; the pass goes on.
 BaseRecord ==
     /\ cap.st = "baserec"
     /\ baseRec' = cap.b
     /\ cap' = [cap EXCEPT !.st = "decide", !.b = 0]
-    /\ UNCHANGED <<src, meta, corpus, side, rec, crashes, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, rec, crashes, damage>>
 
 \* capture_item: decide, then export into a STATE attempt (or reuse the
-\* retained capture, or refuse by name).
+\* retained capture, or refuse by name). The export's name is its content:
+\* an existing name is the same bundle.
 Capture(i) ==
     /\ \/ cap.st = "idle" /\ ~(Grouped /\ BaseNeeded)
        \/ cap.st = "decide" /\ cap.item = i
     /\ LET o == CaptureOutcome(i)
        IN IF o.d = "Export"
-          THEN /\ meta' = Append(meta, NewMeta(i, o))
-               /\ corpus' = Append(corpus, "staged")
-               /\ cap' = [st |-> "publish", item |-> i, b |-> Len(meta) + 1]
+          THEN LET m == NewMeta(i, o)
+                   plan == NewPlan(i, o)
+               IN IF \E b \in Ids : meta[b] = m
+                  THEN /\ cap' = [st |-> "publish", item |-> i,
+                                  b |-> CHOOSE b \in Ids : meta[b] = m,
+                                  plan |-> plan]
+                       /\ UNCHANGED <<meta, corpus, sidecar>>
+                  ELSE /\ meta' = Append(meta, m)
+                       /\ corpus' = Append(corpus, "staged")
+                       /\ sidecar' = Append(sidecar, NoSidecar)
+                       /\ cap' = [st |-> "publish", item |-> i,
+                                  b |-> Len(meta) + 1, plan |-> plan]
           ELSE /\ cap' = Idle
-               /\ UNCHANGED <<meta, corpus>>
-    /\ UNCHANGED <<src, side, rec, baseRec, crashes, damage>>
+               /\ UNCHANGED <<meta, corpus, sidecar>>
+    /\ UNCHANGED <<src, rec, baseRec, crashes, damage>>
 
-\* publish_bundle: hard link into CORPUS, sealed.
+\* publish_bundle: hard link into CORPUS under the content name, sealed. A
+\* file already there at the same digest is reused; one rewritten in place
+\* refuses DIGEST_MISMATCH and the pass ends with no record.
 Publish ==
     /\ cap.st = "publish"
-    /\ corpus' = [corpus EXCEPT ![cap.b] = "ok"]
-    /\ cap' = [cap EXCEPT !.st =
-                 IF DeclaresPrereqs(cap.b) /\ Mutation # "sidecar_after_record"
-                 THEN "sidecars" ELSE "record"]
-    /\ UNCHANGED <<src, meta, side, rec, baseRec, crashes, damage>>
+    /\ IF corpus[cap.b] = "replaced"
+       THEN /\ cap' = Idle
+            /\ UNCHANGED corpus
+       ELSE /\ corpus' = [corpus EXCEPT ![cap.b] = "ok"]
+            /\ cap' = [cap EXCEPT !.st =
+                         IF DeclaresPrereqs(cap.b)
+                            /\ Mutation # "sidecar_after_record"
+                         THEN "sidecars" ELSE "record"]
+    /\ UNCHANGED <<src, meta, sidecar, rec, baseRec, crashes, damage>>
 
-\* {bundle}.base and publish_prior's {bundle}.prior, before the record.
+\* {bundle}.base and publish_prior's {bundle}.prior, before the record. An
+\* intact chain already recorded for this name stands (identical bytes
+\* declare identical prerequisites); otherwise the pass's own link is
+\* written. A pass that does not chain writes no .prior.
 Sidecars ==
     /\ cap.st = "sidecars"
-    /\ side' = side \cup {cap.b}
+    /\ LET b == cap.b
+           keep == \/ cap.plan.prior = 0
+                   \/ HasPrior(b) /\ Walk(b, TRUE).code = "ok"
+       IN sidecar' = [sidecar EXCEPT ![b] =
+                        IF keep THEN [@ EXCEPT !.base = cap.plan.base]
+                        ELSE cap.plan]
     /\ cap' = IF Mutation = "sidecar_after_record" THEN Idle
               ELSE [cap EXCEPT !.st = "record"]
     /\ UNCHANGED <<src, meta, corpus, rec, baseRec, crashes, damage>>
@@ -444,11 +560,12 @@ Record ==
     /\ rec' = [rec EXCEPT ![cap.item] = cap.b]
     /\ cap' = IF Mutation = "sidecar_after_record" /\ DeclaresPrereqs(cap.b)
               THEN [cap EXCEPT !.st = "sidecars"] ELSE Idle
-    /\ UNCHANGED <<src, meta, corpus, side, baseRec, crashes, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, baseRec, crashes, damage>>
 
-\* Q46 GC under estate.lock: remove every CORPUS bundle (and its sidecars)
-\* that no record and no base record depends on. gc_deletes_depended keeps
-\* only what the records name directly, forgetting their chain links.
+\* Q46 GC under estate.lock: remove a CORPUS bundle (and its sidecars) that
+\* no record and no base record depends on, one per step. gc_deletes_
+\* depended keeps only what the records name directly, forgetting their
+\* chain links.
 GCLive ==
     IF Mutation = "gc_deletes_depended"
     THEN {rec[i] : i \in Items} \cup {baseRec}
@@ -457,9 +574,10 @@ GCLive ==
 Garbage == {b \in Ids : Present(b) /\ b \notin GCLive}
 
 GC ==
-    /\ GCOn /\ cap.st = "idle" /\ Garbage # {}
-    /\ corpus' = [b \in Ids |-> IF b \in Garbage THEN "collected" ELSE corpus[b]]
-    /\ side' = side \ Garbage
+    /\ GCOn /\ cap.st = "idle"
+    /\ \E b \in Garbage :
+          /\ corpus' = [corpus EXCEPT ![b] = "collected"]
+          /\ sidecar' = [sidecar EXCEPT ![b] = NoSidecar]
     /\ UNCHANGED <<src, meta, rec, baseRec, cap, crashes, damage>>
 
 (* Environment *)
@@ -468,13 +586,13 @@ GC ==
 Advance ==
     /\ src.ver < MaxCommits
     /\ src' = [src EXCEPT !.ver = @ + 1]
-    /\ UNCHANGED <<meta, corpus, side, rec, baseRec, cap, crashes, damage>>
+    /\ UNCHANGED <<meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
 
 \* The source history is rewritten and pruned: no retained tip is held.
 Rewrite ==
     /\ src.gen < MaxRewrites
     /\ src' = [src EXCEPT !.gen = @ + 1]
-    /\ UNCHANGED <<meta, corpus, side, rec, baseRec, cap, crashes, damage>>
+    /\ UNCHANGED <<meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
 
 \* A third party deletes a CORPUS bundle or rewrites it in place.
 Damage ==
@@ -484,10 +602,11 @@ Damage ==
           \* An IF, not a disjunction: TLC branches on a disjunction inside an
           \* action and would count each successor twice (README, "GitCarry").
           /\ IF DamageBase THEN TRUE ELSE meta[b].kind = "capture"
-          /\ \E how \in {"missing", "replaced"} :
+          /\ \E how \in IF DamageRewrites THEN {"missing", "replaced"}
+                        ELSE {"missing"} :
                 corpus' = [corpus EXCEPT ![b] = how]
     /\ damage' = damage + 1
-    /\ UNCHANGED <<src, meta, side, rec, baseRec, cap, crashes>>
+    /\ UNCHANGED <<src, meta, sidecar, rec, baseRec, cap, crashes>>
 
 \* The capture host crashes inside a pass: every durable step stands, the
 \* STATE attempt is left behind, the pass is lost.
@@ -495,13 +614,13 @@ Crash ==
     /\ crashes < MaxCrashes /\ cap.st # "idle"
     /\ cap' = Idle
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<src, meta, corpus, side, rec, baseRec, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, rec, baseRec, damage>>
 
 Init ==
     /\ src = [ver |-> 0, gen |-> 0]
     /\ meta = <<>>
     /\ corpus = <<>>
-    /\ side = {}
+    /\ sidecar = <<>>
     /\ rec = [i \in Items |-> 0]
     /\ baseRec = 0
     /\ cap = Idle
@@ -526,9 +645,12 @@ LiveSpec == Spec /\ WF_vars(Protocol)
 -----------------------------------------------------------------------------
 (* PROPERTIES                                                               *)
 
-MetaRec == [kind : {"base", "capture"}, ver : 0..MaxCommits,
-            gen : 0..MaxRewrites, prior : Nat, base : Nat, depth : Nat,
-            age : Nat]
+TipRec == [ver : 0..MaxCommits, gen : 0..MaxRewrites]
+
+MetaRec == [kind : {"base", "capture"}, item : Items, ver : 0..MaxCommits,
+            gen : 0..MaxRewrites, basis : Bases, pre : SUBSET TipRec]
+
+SidecarRec == [prior : Nat, pdepth : Nat, base : Nat, age : Nat]
 
 OutcomeRec == [d : Decisions \cup {"Io"}, basis : Bases \cup {"none"},
                depth : Nat, rebase : Rebases \cup {"none"},
@@ -537,17 +659,20 @@ OutcomeRec == [d : Decisions \cup {"Io"}, basis : Bases \cup {"none"},
 \* Also evaluates the decision core and the restore on every state, so a
 \* partial or ill-typed definition is a TLC error, not a silent gap.
 TypeOK ==
-    /\ src \in [ver : 0..MaxCommits, gen : 0..MaxRewrites]
+    /\ src \in TipRec
     /\ meta \in Seq(MetaRec)
-    /\ Len(corpus) = Len(meta)
+    /\ Len(corpus) = Len(meta) /\ Len(sidecar) = Len(meta)
     /\ \A b \in Ids :
           /\ corpus[b] \in {"staged", "ok", "missing", "replaced", "collected"}
-          /\ meta[b].prior < b /\ meta[b].base < b
-    /\ side \subseteq Ids
+          /\ sidecar[b] \in SidecarRec
+          /\ Link(b) \in 0..Len(meta) /\ Bound(b) \in 0..Len(meta)
+          /\ Cardinality(meta[b].pre) <= 1
+    \* One bundle per CORPUS name.
+    /\ \A b, c \in Ids : meta[b] = meta[c] => b = c
     /\ rec \in [Items -> 0..Len(meta)]
     /\ baseRec \in 0..Len(meta)
     /\ cap.st \in {"idle", "baserec", "decide", "publish", "sidecars", "record"}
-    /\ cap.item \in Items /\ cap.b \in 0..Len(meta)
+    /\ cap.item \in Items /\ cap.b \in 0..Len(meta) /\ cap.plan \in SidecarRec
     /\ crashes \in 0..MaxCrashes /\ damage \in 0..MaxDamage
     /\ \A i \in Items :
           /\ CaptureOutcome(i) \in OutcomeRec
@@ -558,13 +683,14 @@ TypeOK ==
 \* window, so a full re-pack happens at most once per window.
 ChainDepthBounded ==
     \A b \in Ids :
-        /\ meta[b].depth <= DepthLimit
-        /\ RootWindow > 0 => meta[b].age < RootWindow
+        /\ Depth(b) <= DepthLimit
+        /\ RootWindow > 0 => sidecar[b].age < RootWindow
 
-\* A restore that completes applied every bundle after the bundles its
-\* prerequisites name, each at its recorded bytes: the oldest link is
-\* self-contained (or its base came first), and each later link's
-\* prerequisites are satisfied by the links before it (chain::flatten).
+\* A restore whose digests check never fails verify_bundle: every bundle it
+\* applies, the oldest link's base first (fix 2), declares only prerequisite
+\* tips of intact bundles applied before it. The header's tips and the
+\* sidecars' chain are written separately, so this is the claim that the
+\* capture side keeps them in step.
 PrereqsSatisfiedByEarlierLinks ==
     \A i \in Items : rec[i] # 0 /\ Restorable(i) => Satisfied(ApplySeq(i))
 
@@ -586,11 +712,14 @@ GCNeverDeletesDepended ==
 SidecarsBeforeRecord ==
     \A i \in Items : rec[i] # 0 =>
         /\ corpus[rec[i]] # "staged"
-        /\ DeclaresPrereqs(rec[i]) => rec[i] \in side
+        /\ DeclaresPrereqs(rec[i]) => HasSidecars(rec[i])
 
 \* Every record restores; or its item's next capture recaptures (exports a
 \* new record) or refuses by name, keeping the missing custody visible. An
-\* apply that does not restore is a typed refusal, never a bare IO.
+\* export whose content name holds rewritten bytes ends in publish_bundle's
+\* DIGEST_MISMATCH, a refusal by name, so it counts here too; that it can
+\* repeat on every pass is ChainRecovery's to show (MC_gc_live_rewritten).
+\* An apply that does not restore is a typed refusal, never a bare IO.
 RestoreOrRecapture ==
     \A i \in Items : rec[i] # 0 =>
         /\ ApplyOutcome(i) # "io"
@@ -599,6 +728,25 @@ RestoreOrRecapture ==
 \* Wall-clock budget, evaluated on every state (README, "The budget is
 \* state-level"): the conjunct over src makes it state-level.
 WithinBudget == src.ver \in 0..MaxCommits => TLCGet("duration") < BudgetSeconds
+
+\* REACHED witnesses (expected violated): the bound explores the state.
+\* A capture chained on a link of a re-rooted chain: a link whose root age
+\* exceeds its depth.
+Witness_RerootExtended ==
+    ~\E b \in Ids : HasPrior(b) /\ sidecar[Link(b)].age > Depth(Link(b))
+
+\* A chain re-rooted twice: its age exceeds its depth by two depth limits.
+Witness_SecondReroot ==
+    ~\E b \in Ids : HasPrior(b) /\ sidecar[b].age >= Depth(b) + 2 * DepthLimit
+
+\* Fix 2 over several links: a record whose chain has two links before its
+\* head, the oldest bound to a plan base, restores (flatten imports the base,
+\* then applies both links).
+Witness_BasedChainRestored ==
+    ~\E i \in Items :
+        /\ rec[i] # 0 /\ HasPrior(rec[i]) /\ Restorable(i)
+        /\ LET links == Walk(rec[i], FALSE).links
+           IN Len(links) >= 2 /\ Bound(links[1]) # 0
 
 \* Liveness: under a fair protocol, once the environment stops, every item
 \* whose record does not restore (or has none) gets one that does.

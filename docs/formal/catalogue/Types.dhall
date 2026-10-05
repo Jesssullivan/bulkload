@@ -440,7 +440,24 @@ let witnessSelf = \(w : Witness) -> merge witnessTable w
 -}
 let Module = < BulkloadTransfer | GitCarry >
 
-let ModuleEntry = { module : Module, index : Natural, spec : Text, tsv : Text }
+{- How tla-check grounds a module's code symbols. Either way only a Rust
+   source under crates/ outside a tests/ directory counts, never a data
+   file such as decide_rows.tsv:
+   - definition: an item definition, `fn`, `const`, `static`, `struct`,
+     `enum`, `trait`, `type` or `mod` followed by the symbol;
+   - code: the symbol as a whole word on a line that is not a comment.
+     BulkloadTransfer's symbols include enum variants, fields and
+     parameters, which have no item definition of their own.
+-}
+let SymbolMatch = < definition | code >
+
+let ModuleEntry =
+      { module : Module
+      , index : Natural
+      , spec : Text
+      , tsv : Text
+      , symbols : SymbolMatch
+      }
 
 let moduleTable =
       { BulkloadTransfer =
@@ -448,12 +465,14 @@ let moduleTable =
         , index = 0
         , spec = "BulkloadTransfer.tla"
         , tsv = "configs.tsv"
+        , symbols = SymbolMatch.code
         }
       , GitCarry =
         { module = Module.GitCarry
         , index = 1
         , spec = "GitCarry.tla"
         , tsv = "configs_gc.tsv"
+        , symbols = SymbolMatch.definition
         }
       }
 
@@ -475,6 +494,7 @@ let GcMutation =
       | sidecar_after_record
       | skip_flatten_verify
       | hit_ignores_chain
+      | reroot_pre_mismatch
       >
 
 -- GitCarry.tla's properties: its safety invariants, its budget and ChainRecovery.
@@ -490,6 +510,26 @@ let GcProperty =
       | WithinBudget
       | ChainRecovery
       >
+
+{- GitCarry.tla's reachability witnesses: each holds until the bound explores
+   the state it names, so a reach row's REACHED shows that state is reached
+   (OI-1003-Q46: a chain extended past a re-root, and a chain re-rooted
+   twice; fix 2: a restore of two links under a plan base).
+-}
+let GcWitness =
+      < Witness_RerootExtended
+      | Witness_SecondReroot
+      | Witness_BasedChainRestored
+      >
+
+-- The witness table: one field per GcWitness label, its value. Total.
+let gcWitnessTable =
+      { Witness_RerootExtended = GcWitness.Witness_RerootExtended
+      , Witness_SecondReroot = GcWitness.Witness_SecondReroot
+      , Witness_BasedChainRestored = GcWitness.Witness_BasedChainRestored
+      }
+
+let gcWitnessSelf = \(w : GcWitness) -> merge gcWitnessTable w
 
 -- The 11 actions of GitCarry.tla's Next, in the sorted order of the never column.
 let GcAction =
@@ -518,6 +558,7 @@ let GcConstants =
       , MaxCrashes : Natural
       , MaxDamage : Natural
       , DamageBase : Bool
+      , DamageRewrites : Bool
       , BaseMissingTyped : Bool
       , Mutation : Optional GcMutation
       , BudgetSeconds : Natural
@@ -529,8 +570,11 @@ let GcPass =
       , never : List GcAction
       }
 
--- A GitCarry row's expectation: pass, fail on one property, or the budget self-test.
-let GcExpect = < pass : GcPass | fail : GcProperty | inconclusive >
+{- A GitCarry row's expectation: pass, fail on one property, reach one
+   witness, or the budget self-test.
+-}
+let GcExpect =
+      < pass : GcPass | fail : GcProperty | reach : GcWitness | inconclusive >
 
 let GcRow =
       { name : Text
@@ -653,6 +697,7 @@ let gcMutationIndex =
           , sidecar_after_record = 3
           , skip_flatten_verify = 4
           , hit_ignores_chain = 5
+          , reroot_pre_mismatch = 6
           }
           m
 
@@ -707,9 +752,14 @@ let Plan =
 
 let Decision = < Hit | Export : Plan | Refuse : Refusal >
 
-{- One field per label, holding that label's value: Catalogue.dhall lists
+{- One field per label, holding that label's value. GitCarry.dhall lists
    each union from its table (toMap) and asserts every field holds its own
-   label, as it does for the property table.
+   label. Each table is also merged over its union below (basisSelf,
+   rebaseSelf, reuseSelf, refusalSelf, decisionSelf), as witnessTable is:
+   a label without a field is a "Missing handler" error, and a field
+   without a label an "Unused handler" error (for Decision, a failed
+   assert). So each table, and the label list GitCarry.dhall takes from
+   it, holds exactly its union's labels.
 -}
 let basisTable =
       { SelfContained = Basis.SelfContained
@@ -744,6 +794,29 @@ let decisionTable =
       , Refuse = Decision.Refuse Refusal.ReceiptBindingInvalid
       }
 
+let basisSelf = \(b : Basis) -> merge basisTable b
+
+let rebaseSelf = \(r : Rebase) -> merge rebaseTable r
+
+let reuseSelf = \(r : ReuseEligibility) -> merge reuseTable r
+
+let refusalSelf = \(r : Refusal) -> merge refusalTable r
+
+{- Decision's labels carry payloads, so its table cannot be the handler
+   record itself: each handler returns that label's table entry, so a label
+   added to Decision needs a handler, and its handler a table entry. A
+   table field without a label fails GitCarry.dhall's assert that every
+   field holds its own label.
+-}
+let decisionSelf =
+      \(d : Decision) ->
+        merge
+          { Hit = decisionTable.Hit
+          , Export = \(_ : Plan) -> decisionTable.Export
+          , Refuse = \(_ : Refusal) -> decisionTable.Refuse
+          }
+          d
+
 in  { Seat
     , SupersedeMode
     , Mutation
@@ -773,11 +846,15 @@ in  { Seat
     , witnessTable
     , witnessSelf
     , Module
+    , SymbolMatch
     , ModuleEntry
     , moduleTable
     , moduleEntry
     , Item
     , GcMutation
+    , GcWitness
+    , gcWitnessTable
+    , gcWitnessSelf
     , GcProperty
     , GcAction
     , GcConstants
@@ -811,4 +888,9 @@ in  { Seat
     , reuseTable
     , refusalTable
     , decisionTable
+    , basisSelf
+    , rebaseSelf
+    , reuseSelf
+    , refusalSelf
+    , decisionSelf
     }

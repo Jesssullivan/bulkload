@@ -1404,6 +1404,7 @@ in  { files =
               Text
               (\(r : T.InvariantRow) -> r.codeSymbol)
               invariants
+        , symbolMatch = showConstructor module.symbols
         , pendingSymbols = [] : List Text
         , labelSets = [] : List { name : Text, labels : List Text }
         }

@@ -42,6 +42,8 @@ let P = T.GcProperty
 
 let A = T.GcAction
 
+let W = T.GcWitness
+
 let M = T.GcMutation
 
 let Item = T.Item
@@ -64,6 +66,8 @@ let showP = \(p : P) -> showConstructor p
 let showA = \(a : A) -> showConstructor a
 
 let showM = \(m : M) -> showConstructor m
+
+let showW = \(w : W) -> showConstructor w
 
 let propertyEq =
       \(p : P) -> \(q : P) -> natEq (T.gcPropertyIndex p) (T.gcPropertyIndex q)
@@ -126,7 +130,23 @@ let _ =
       :     map A Natural T.gcActionIndex allActions
         ===  range (List/length ActionRow actionRows)
 
--- The decision core's labels, each union from its table, each field its own label.
+let WitnessRow = { mapKey : Text, mapValue : W }
+
+let witnessRows = toMap T.gcWitnessTable
+
+let _ =
+        assert
+      :     map WitnessRow Text (\(e : WitnessRow) -> e.mapKey) witnessRows
+        ===  map WitnessRow Text (\(e : WitnessRow) -> showW e.mapValue) witnessRows
+
+let allWitnesses = map WitnessRow W (\(e : WitnessRow) -> e.mapValue) witnessRows
+
+{- The decision core's labels, each union from its table, each field its own
+   label. Types.dhall merges each table over its union (basisSelf, ...,
+   decisionSelf), so a table holds exactly its union's labels; the asserts
+   below check that each field holds its own label, and for Decision, that
+   decisionSelf returns each field's own entry.
+-}
 let labels =
       \(a : Type) ->
       \(rows : List { mapKey : Text, mapValue : a }) ->
@@ -179,6 +199,14 @@ let _ =
         assert
       :     labels T.Decision decisionRows
         ===  shown T.Decision (\(x : T.Decision) -> showConstructor x) decisionRows
+
+let _ =
+        assert
+      :     labels T.Decision decisionRows
+        ===  shown
+               T.Decision
+               (\(x : T.Decision) -> showConstructor (T.decisionSelf x))
+               decisionRows
 
 {- Each closed union's labels, in table order, with the name of the
    GitCarry.tla set that must hold exactly them. hs/GitCarryCore.hs's
@@ -237,6 +265,10 @@ let constantLines =
               , pad = "      "
               , value = showBool c.DamageBase
               }
+            , { name = "DamageRewrites"
+              , pad = "  "
+              , value = showBool c.DamageRewrites
+              }
             , { name = "BaseMissingTyped"
               , pad = ""
               , value = showBool c.BaseMissingTyped
@@ -264,6 +296,12 @@ let defaults
       , MaxCrashes = 1
       , MaxDamage = 1
       , DamageBase = False
+      , DamageRewrites =
+          {- A third party may rewrite a bundle in place as well as delete
+             it. MC_gc_live turns it off: a bundle rewritten at its content
+             name blocks recapture at the same tip (MC_gc_live_rewritten).
+          -}
+          True
       , BaseMissingTyped =
           {- The code today refuses a missing plan base with a bare IO
              (MC_gc_base_missing_untyped). Configs without a base cannot
@@ -308,6 +346,27 @@ let fix2 =
           , GCOn = True
           }
 
+{- Q46's re-root twice in one window (preset gc_reroot): depth limit 1, so
+   every capture past the first link re-roots, and a 4-capture window. Four
+   commits re-root twice (ages 2 and 3), so GC can collect the re-root
+   bundle the second re-root abandons, and the window then starts a new
+   root (an age of 4 would reach it).
+-}
+let reroot = q46 // { DepthLimit = 1 }
+
+{- Q46's re-rooted chain extended (preset gc_reroot_extended): RootWindow =
+   DepthLimit + 3, so the capture after the re-root (age 3, depth 1) chains
+   on it (age 4, depth 2) instead of ending the window. At RootWindow =
+   DepthLimit + 2, as in MC_gc_q46, the window ends first.
+-}
+let rerootExtended = q46 // { RootWindow = 5 }
+
+{- Fix 2 over two links (preset gc_fix2_deep): depth limit 2 and a
+   3-capture window, so a chain of two links stays under the plan base and
+   a restore imports the base, then flattens both links.
+-}
+let fix2Deep = fix2 // { DepthLimit = 2 }
+
 -- One item, one commit, no faults: the base of most mutation configs.
 let one =
           defaults
@@ -335,6 +394,7 @@ let verdict
           , sidecar_after_record = P.SidecarsBeforeRecord
           , skip_flatten_verify = P.PrereqsSatisfiedByEarlierLinks
           , hit_ignores_chain = P.BrokenLinkNeverReuseHit
+          , reroot_pre_mismatch = P.PrereqsSatisfiedByEarlierLinks
           }
           m
 
@@ -446,6 +506,35 @@ let positives =
           , "the base. Explorer preset gc_fix2."
           ]
           fix2
+      , row
+          "MC_gc_reroot"
+          (pass noBase)
+          [ "OI-1003-Q46's re-root twice in one window, on one item: depth limit"
+          , "1 and a 4-capture window, so GC can collect the re-root bundle a"
+          , "second re-root abandons; every fault. Explorer preset gc_reroot."
+          , "MC_gc_reach_second_reroot shows the second re-root is reached."
+          ]
+          reroot
+      , row
+          "MC_gc_reroot_extended"
+          (pass noBase)
+          [ "OI-1003-Q46's re-rooted chain extended, on one item: depth limit 2"
+          , "and a 5-capture window (RootWindow = DepthLimit + 3), so a capture"
+          , "chains on a re-root bundle and RootOf, GC and restore run through"
+          , "it; every fault. Explorer preset gc_reroot_extended."
+          , "MC_gc_reach_reroot_extended shows the extension is reached."
+          ]
+          rerootExtended
+      , row
+          "MC_gc_fix2_deep"
+          (pass [ A.Rewrite ])
+          [ "Lane L6b's fix 2 over two links (no code yet): two items, depth"
+          , "limit 2 and a 3-capture window, so a restore imports the plan base"
+          , "and flattens a chain of two links under it; CORPUS GC and every"
+          , "fault, damage reaching the base. Explorer preset gc_fix2_deep."
+          , "MC_gc_reach_based_chain shows such a restore is reached."
+          ]
+          fix2Deep
       ,     row
               "MC_gc_live"
               ( T.GcExpect.pass
@@ -456,13 +545,43 @@ let positives =
               )
               [ "Liveness under WF_vars(Protocol): once the environment stops, every"
               , "item whose record does not restore gets one that does (Q46's"
-              , "re-root and GC on; damage may not reach a base, whose loss v1"
-              , "keeps as visible custody by design)."
+              , "re-root and GC on). Damage deletes bundles only: an in-place"
+              , "rewrite blocks recovery while the source holds still"
+              , "(MC_gc_live_rewritten), and damage may not reach a base, whose"
+              , "loss v1 keeps as visible custody by design."
               ]
               (     q46
-                //  { MaxCommits = 3 }
+                //  { MaxCommits = 3, DamageRewrites = False }
               )
         //  { spec = T.Specification.LiveSpec }
+      ]
+
+-- Reachability witnesses: expected REACHED.
+let witnesses =
+      [ row
+          "MC_gc_reach_reroot_extended"
+          (T.GcExpect.reach W.Witness_RerootExtended)
+          [ "REACH (expected REACHED): at MC_gc_reroot_extended's bound a capture"
+          , "chains on a link whose root age exceeds its depth, a re-root bundle,"
+          , "so that pass row explores a chain extended past a re-root."
+          ]
+          rerootExtended
+      , row
+          "MC_gc_reach_second_reroot"
+          (T.GcExpect.reach W.Witness_SecondReroot)
+          [ "REACH (expected REACHED): at MC_gc_reroot's bound a chain is"
+          , "re-rooted twice (its root age exceeds its depth by two depth"
+          , "limits), so that pass row explores the second re-root."
+          ]
+          reroot
+      , row
+          "MC_gc_reach_based_chain"
+          (T.GcExpect.reach W.Witness_BasedChainRestored)
+          [ "REACH (expected REACHED): at MC_gc_fix2_deep's bound a record whose"
+          , "chain has two links under a plan base restores, so that pass row"
+          , "explores fix 2's flatten after a base import over several links."
+          ]
+          fix2Deep
       ]
 
 let findings =
@@ -482,6 +601,20 @@ let findings =
                 , BudgetSeconds = 300
                 }
           )
+      ,     row
+              "MC_gc_live_rewritten"
+              (T.GcExpect.fail P.ChainRecovery)
+              [ "CODE FINDING (expected to fail): one item whose bundle a third party"
+              , "rewrites in place, the source holding still. The record no longer"
+              , "restores (DIGEST_MISMATCH), and retained_capture recaptures, but the"
+              , "re-export at the same tip has the same bytes, so the same content"
+              , "name, and publish_bundle refuses DIGEST_MISMATCH on the rewritten"
+              , "file, on every pass, until the source moves. prepare_base does the"
+              , "same for a plan base. RestoreOrRecapture holds (each refusal is"
+              , "typed); ChainRecovery does not."
+              ]
+              (one // { MaxCommits = 0, MaxDamage = 1 })
+        //  { spec = T.Specification.LiveSpec }
       , row
           "MC_gc_neg_live_unfair"
           (T.GcExpect.fail P.ChainRecovery)
@@ -519,10 +652,15 @@ let primary =
         { mutation = M.base_replaced_live
         , constants =
                 grouped
-            //  { MaxCommits = 0, MaxCrashes = 0, BudgetSeconds = 300 }
+            //  { MaxCommits = 1, MaxCrashes = 0, BudgetSeconds = 300 }
         , comment =
-            line
+          { head =
               "prepare_base replaces a missing base that older deltas depend on."
+          , tail =
+            [ "One commit: a base re-exported at the same tip has the same content"
+            , "name, so only a later tip can replace it."
+            ]
+          }
         }
       , sidecar_after_record =
         { mutation = M.sidecar_after_record
@@ -544,6 +682,18 @@ let primary =
         , comment =
             line
               "retained_capture reuses a record without checking its chain."
+        }
+      , reroot_pre_mismatch =
+        { mutation = M.reroot_pre_mismatch
+        , constants = one // { DepthLimit = 1, RootWindow = 3, MaxCommits = 2 }
+        , comment =
+          { head =
+              "a re-root's header declares the head's tips while its .prior names"
+          , tail =
+            [ "the root: the two are derived separately (ExportOptions.chain and"
+            , "the link Prior), so a restore cannot satisfy the header."
+            ]
+          }
         }
       }
 
@@ -593,6 +743,7 @@ let negRows
             line
               "as hit_ignores_chain, against RestoreOrRecapture's recapture half."
         }
+      , primaryOf M.reroot_pre_mismatch
       ]
 
 let primaryPositions =
@@ -618,6 +769,7 @@ let _ =
 let rows =
         [ budgetSelftest ]
       # positives
+      # witnesses
       # findings
       # map T.GcNegRow T.GcRow neg negRows
 
@@ -628,6 +780,7 @@ let failProperty =
         merge
           { pass = \(_ : T.GcPass) -> [] : List P
           , fail = \(p : P) -> [ p ]
+          , reach = \(_ : W) -> [] : List P
           , inconclusive = [] : List P
           }
           r.expect
@@ -663,6 +816,9 @@ let checks =
                 else  { invariants = [ "TypeOK", showP p ]
                       , properties = [] : List Text
                       }
+          , reach =
+              \(w : W) ->
+                { invariants = [ "TypeOK", showW w ], properties = [] : List Text }
           , inconclusive =
             { invariants = [ "TypeOK" ], properties = [] : List Text }
           }
@@ -705,12 +861,14 @@ let tsvRow =
           , merge
               { pass = \(_ : T.GcPass) -> "all"
               , fail = showP
+              , reach = showW
               , inconclusive = "WithinBudget"
               }
               r.expect
           , merge
               { pass = \(p : T.GcPass) -> neverColumn p.never
               , fail = \(_ : P) -> "*"
+              , reach = \(_ : W) -> "*"
               , inconclusive = "*"
               }
               r.expect
@@ -723,8 +881,9 @@ let tsv =
             , provenance.tsv
             , "# Tab-separated columns, as configs.tsv's:"
             , "#   name            the config, MC_<name>.cfg"
-            , "#   expect          pass | fail | inconclusive"
+            , "#   expect          pass | fail | reach | inconclusive"
             , "#   named-property  fail: the one property it must violate;"
+            , "#                   reach: the Witness_ invariant it must violate;"
             , "#                   inconclusive: WithinBudget; otherwise all"
             , "#   never           pass: the actions coverage must show never enabled,"
             , "#                   comma-separated and sorted (- for none);"
@@ -772,6 +931,9 @@ let invariants
           ]
         , pending =
           [ pending "chain::flatten imports a base before the oldest link" Lane.L6b
+          , pending
+              "a re-root's header prerequisites and .prior, from one chain path"
+              Lane.L8
           ]
         , ptest = [ Id.P68, Id.P67 ]
         }
@@ -794,7 +956,12 @@ let invariants
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q46" ]
         , codeSymbol = [ "chain_links" ]
-        , pending = [ pending "STATE and CORPUS GC" Lane.L8 ]
+        , pending =
+          [ pending "STATE and CORPUS GC" Lane.L8
+          , pending
+              "GC's CORPUS-level exclusive lock, also taken by every capture and apply"
+              Lane.L8
+          ]
         , ptest = [ Id.P71 ]
         }
       , { tla = P.SidecarsBeforeRecord
@@ -816,7 +983,8 @@ let invariants
       , { tla = P.ChainRecovery
         , slo = [ S.S4, S.S5 ]
         , ruling = [ "OI-1003-Q46" ]
-        , codeSymbol = [ "chainable", "retained_capture" ]
+        , codeSymbol =
+          [ "chainable", "retained_capture", "publish_bundle", "prepare_base" ]
         , pending = [ pending "the Q46 re-root window" Lane.L8 ]
         , ptest = [ Id.P71, Id.P68 ]
         }
@@ -880,6 +1048,8 @@ let explorerFlags =
           , Natural/show c.MaxDamage
           , "--damage-base"
           , flag c.DamageBase
+          , "--damage-rewrites"
+          , flag c.DamageRewrites
           , "--base-missing-typed"
           , flag c.BaseMissingTyped
           ]
@@ -944,6 +1114,7 @@ in  { files =
       , tsv = module.tsv
       , operators =
             map P Text showP allProperties
+          # map W Text showW allWitnesses
           # map A Text showA allActions
           # [ showConstructor T.Specification.Spec
             , showConstructor T.Specification.LiveSpec
@@ -961,6 +1132,7 @@ in  { files =
             Text
             (\(r : T.GcInvariantRow) -> r.codeSymbol)
             invariants
+      , symbolMatch = showConstructor module.symbols
       , pendingSymbols =
           concatMap
             T.GcInvariantRow
