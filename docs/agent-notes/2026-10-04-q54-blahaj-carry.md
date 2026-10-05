@@ -8,8 +8,11 @@ deletes carry_v2. No PR is opened: the branch is pushed for the
 coordinator. The file name keeps the dispatch's date; the work ran on
 2026-10-05, 14:25Z to about 14:45Z.
 
-**Result: the Q54 precondition is MET.** See
-[the evidence page](../evidence/2026-10-05-blahaj-v1-carry.md).
+**Result: the Q54 precondition is MET, on the shallow-envelope path, from
+an empty corpus.** See
+[the evidence page](../evidence/2026-10-05-blahaj-v1-carry.md). Round 2
+(below) corrected two claims: blahaj's old-format outcome is not observed,
+and pass 2's zero read is a constant, not a measurement.
 
 Rulings cited:
 
@@ -74,10 +77,10 @@ Rulings cited:
 | Measure | Value |
 |---|---|
 | blahaj refs / distinct objects | 122,994 / 2,382 (119,761 canonical carry, 3,233 native, 2 symrefs, 0 stashes, shallow) |
-| Old-format header, modelled | 24,439,460 B (refused at 16 MiB) |
+| Old-format header, modelled | 24,439,460 B, over 16 MiB, on the non-shallow path blahaj never takes; blahaj's old-format outcome not observed |
 | New header equivalent (shallow-envelope manifest) | 265,281 B; inner inventory 2,393 lines (2,382 tips + table + 10 metadata) |
 | pass 1 | `captured`; bundle 229,677,508 B; source read 6,008,771,154 B; CPU 61.08 s; wall 57.5 s |
-| pass 2 (unchanged) | `capture-reused-after-census`; 0 B read, 0 B written; CPU 0.885 s (1.45 %) |
+| pass 2 (unchanged) | `capture-reused-after-census`; 0 bundle and 0 pack bytes; +19 B of private state; `source_bytes_read=0` is the hit path's constant; CPU 0.885 s (1.45 %) |
 | apply | `refs-imported`; CPU 38.39 s; wall 35.9 s |
 | Exact compare | 0 missing, 0 extra, 0 oid differences; HEAD and its symbolic branch equal; 80/80 nested worktrees equal; shallow frontier equal |
 | Difference | 2 non-HEAD symrefs restored as plain refs at the identical oid (documented) |
@@ -107,15 +110,63 @@ Rulings cited:
 5. **Linear.** The facts above belong on the Q54 owning issue, but this
    lane has no Linear write in its dispatch. The coordinator should post
    them.
+6. **Retained old-format blahaj captures, before L5** (round 2). An old
+   capture stays a reuse hit under the new binary, and from the code its
+   roughly 24 MB manifest refuses `GIT_INVENTORY_OVER_CAP` at restore.
+   Find any such capture in any corpus before L5, or observe the old
+   outcome with a one-off pre-#182 capture into scratch.
+7. **Pass 2's zero read is not measured** (round 2). Measuring it needs an
+   independent read measure for the agent and its git children.
 
-## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z)
+## Round 2: review fixes (2026-10-05, about 14:55Z to 15:30Z)
+
+Rulings: OI-1003-Q54, OI-1003-Q55, OI-1003-Q35, R-N13. Docs only; no
+agent, git or census command ran against blahaj in this round.
+
+1. **Old-format claim restated** (OI-1003-Q54, R-N13; review medium 1).
+   The page said the old format refused blahaj on every pass with
+   `GIT_INVENTORY_MALFORMED` at a modelled 24.4 MB header. Nobody observed
+   that. blahaj is shallow, so `shared::write_bundle` and
+   `write_chained_capped` take `shallow::write_bundle` before `write_full`.
+   Main before #182 (`73952f9`, the same `shallow.rs` as `3b634ba`) wrote
+   the whole inventory into the envelope manifest with no cap. Only the
+   restore-side readers capped it at 16 MiB, refusing `BUDGET_EXCEEDED`.
+   Changes:
+   - the page now says the 24.4 MB figure models the non-shallow path;
+   - MET is scoped to "shallow-envelope path, empty corpus";
+   - the page states which #182 header-cap code the run did not reach;
+   - Open 5 is the retained-capture migration case.
+2. **Pass 2's zero restated** (OI-1003-Q35, R-N13; review medium 2).
+   - `source_bytes_read=0` is `Completion::clean`'s constant on the
+     `Retained::Hit` path.
+   - `read_source_file_bytes` cannot see the git half; it is 0 on pass 1
+     too.
+   - CPU and wall time are the only physical bound.
+   - "Read and wrote 0 bytes" is now "0 bundle and 0 pack bytes; +19 B of
+     private state", from the JSON's `state_bytes`, `flush_full_count=1`
+     and `flush_dir_count=3`.
+   - Open 6 asks for an independent read measure.
+3. **Low findings not fixed** (dispatch). They are listed in the
+   dispatch's structured result:
+   - S2's census covers `.git` only;
+   - the comparison's destination digest and metadata exclusion;
+   - MET covers 1 of 121 worktree items;
+   - hand-made JSON steps and the harness sha;
+   - the harness path and ruff;
+   - R-N56 versus Q55;
+   - the headline is refs only;
+   - the scratch inventory and check-fast's tree.
+
+## Workstreams (restated per AGENTS.md, 2026-10-05 about 14:40Z; rechecked 15:05Z)
 
 These rows come from `gh pr list` and `git worktree list` on sting. They
-are **reported, not verified**. The Linear SSOT ledger was not read.
+are **reported, not verified**. The Linear SSOT ledger was not read. At
+the 15:05Z recheck the open PRs were still #164 and #136, and the L6a
+worktree was still at `40adca8`.
 
 | Stream | Owner | Branch / PR | State (reported) | Next |
 |---|---|---|---|---|
-| **Q54 blahaj carry (this lane)** | this lane | `docs/q54-blahaj-carry-20261005` | measured; MET; pushed, no PR (dispatch) | coordinator review; then L5 |
+| **Q54 blahaj carry (this lane)** | this lane | `docs/q54-blahaj-carry-20261005` | measured; MET (shallow-envelope path, empty corpus); round 2 review fixes pushed, no PR (dispatch) | coordinator review; retained old-format captures (Open 6) before L5 |
 | Q54 v1 header | lane | PR #182 | merged 13:32Z | none here |
 | Q42 L6a decide | lane | worktree `q42-l6a-decide-20261005` at `40adca8` | unknown | unknown |
 | Q42 L5 (delete carry_v2) | coordinator | none seen | waits on this proof | coordinator |
