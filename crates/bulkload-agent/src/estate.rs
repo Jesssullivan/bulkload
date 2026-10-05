@@ -3054,16 +3054,7 @@ mod tests {
         assert_eq!(*drift, vec!["RefRemoved \"refs/heads/side\"".to_owned()]);
         assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
         // The capture the second pass recorded holds the ref and its commit.
-        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
-        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
-        let heads = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["bundle", "list-heads"])
-            .arg(corpus.join(&record.bundle))
-            .output()
-            .unwrap();
-        let heads = String::from_utf8(heads.stdout).unwrap();
+        let heads = recorded_heads(&plan, &corpus, &source);
         assert!(heads
             .lines()
             .any(|line| line.starts_with(&side) && line.ends_with("refs/heads/side")));
@@ -3165,17 +3156,29 @@ mod tests {
         corpus.join(format!("{}.drift", record.bundle))
     }
 
+    // The ref lines the item's recorded capture carries (its header, or its
+    // ref table's expansion, OI-1003-Q54); a chained bundle's prerequisites
+    // are read from the source's object store.
     fn recorded_heads(plan: &Path, corpus: &Path, source: &Path) -> String {
         let item = id(inspect(plan).unwrap().first().unwrap()).unwrap();
         let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
-        let heads = Command::new("git")
+        let objects = Command::new("git")
             .arg("-C")
             .arg(source)
-            .args(["bundle", "list-heads"])
-            .arg(corpus.join(&record.bundle))
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ])
             .output()
             .unwrap();
-        String::from_utf8(heads.stdout).unwrap()
+        let objects = String::from_utf8(objects.stdout).unwrap();
+        git_carry::carried_heads(
+            &corpus.join(&record.bundle),
+            Some(Path::new(objects.trim_end())),
+        )
+        .unwrap()
     }
 
     fn update_ref_at(repo: &Path, stage: git_carry::mid_pass::Stage, args: &[&str]) {

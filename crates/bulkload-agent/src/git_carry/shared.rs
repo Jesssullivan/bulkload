@@ -6,14 +6,32 @@
 use crate::counters::CountedSync as _;
 use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use super::{capture_refs, git, oid, output, prepare_private, refs, set_ref, text};
+use super::{capture_refs, git, input, oid, output, prepare_private, refs, set_ref, text};
 use crate::{BulkloadRefusal, Result};
+
+/// The most bytes a v1 bundle header may hold.
+///
+/// That is its signature, prerequisite and ref lines and the blank line that
+/// ends it. Every reader refuses a longer one, and every writer measures its
+/// header against it before it writes, so no capture is recorded that a
+/// reader refuses for size. Over it is `GIT_INVENTORY_OVER_CAP`, never
+/// `GIT_INVENTORY_MALFORMED` (OI-1003-Q54, #178).
+pub const HEADER_CAP: usize = 16 * 1024 * 1024;
+
+/// The longest header line a reader accepts. A longer one is malformed.
+const HEADER_LINE: u64 = 1024 * 1024;
+
+// A header that has consumed `consumed` bytes is over the cap.
+const fn over_cap(consumed: usize) -> bool {
+    consumed > HEADER_CAP
+}
 
 fn stash_history(repo: &Path, inventory: &str) -> Result<Vec<u8>> {
     if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
@@ -64,30 +82,59 @@ pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
     Ok(bundle)
 }
 
+// The commits a plan base's refs name, peeled, as the private repository
+// holds them: an item bundle's prerequisites.
+//
+// One `cat-file --batch-check` answers every head (#178: two children per
+// head cost about 4 ms each, 0.79 ks of CPU at 96,850 heads and 2 items).
+// For each head it asks the object itself, which must be held, and the
+// object peeled to a commit: a ref may legally name a tree or blob, which is
+// no prerequisite and stays in the item's pack. A ref table (OI-1003-Q54)
+// is the base's own commit, in its pack only, so it is never a
+// prerequisite: its tips carry what it maps.
 fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<String>> {
     output(git(private).args(["bundle", "verify"]).arg(base))?;
-    let heads = text(git(private).args(["bundle", "list-heads"]).arg(base))?;
-    let mut commits = BTreeSet::new();
-    for line in heads.lines() {
-        let (value, name) = line
-            .split_once(' ')
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !oid(value) || !name.starts_with("refs/carry-export/") {
+    let mut request = String::new();
+    let mut asked = 0usize;
+    for (value, name) in super::chain::advertised(base)? {
+        if !name.starts_with("refs/carry-export/") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
-        // A ref may legally point to a tree/blob. Only commits can be bundle
-        // prerequisites; non-commit objects remain in the workspace pack.
-        output(git(private).args(["cat-file", "-e", value]))?;
-        if let Ok(commit) =
-            text(git(private).args(["rev-parse", "--verify", &format!("{value}^{{commit}}")]))
-        {
-            if !oid(&commit) {
+        if super::ref_table::is_table(&name) {
+            continue;
+        }
+        writeln!(request, "{value}\n{value}^{{commit}}")
+            .map_err(|_| BulkloadRefusal::FrameCodec)?;
+        asked = asked.saturating_add(1);
+    }
+    let answer = input(
+        git(private).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+        request.as_bytes(),
+    )?;
+    let answer =
+        std::str::from_utf8(&answer).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let mut lines = answer.lines();
+    let mut commits = BTreeSet::new();
+    for _ in 0..asked {
+        let (Some(object), Some(peeled)) = (lines.next(), lines.next()) else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        };
+        // A missing name answers `<name> missing`: a base head this
+        // repository does not hold cannot be declared.
+        let held = object
+            .split_once(' ')
+            .is_some_and(|(value, kind)| oid(value) && kind != "missing");
+        if !held {
+            return Err(BulkloadRefusal::GitInventoryMissingPrerequisite);
+        }
+        if let Some((commit, "commit")) = peeled.split_once(' ') {
+            if !oid(commit) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
-            commits.insert(commit);
+            commits.insert(commit.to_owned());
         }
     }
-    if commits.is_empty() {
+    if lines.next().is_some() || commits.is_empty() {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     Ok(commits)
@@ -119,7 +166,7 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
         let mut line = Vec::new();
         let count = source
             .by_ref()
-            .take(1024 * 1024)
+            .take(HEADER_LINE)
             .read_until(b'\n', &mut line)
             .refuse_at("git_carry::shared::prerequisites")?;
         if consumed == 0 && line != b"# v2 git bundle\n" && line != b"# v3 git bundle\n" {
@@ -128,7 +175,10 @@ pub fn prerequisites(bundle: &Path) -> Result<Vec<String>> {
         consumed = consumed
             .checked_add(count)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
+        if over_cap(consumed) {
+            return Err(BulkloadRefusal::GitInventoryOverCap);
+        }
+        if count == 0 || !line.ends_with(b"\n") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         if line == b"\n" {
@@ -192,13 +242,16 @@ fn skip_header(source: &mut BufReader<fs::File>, site: &'static str) -> Result<u
         let mut line = Vec::new();
         let count = source
             .by_ref()
-            .take(1024 * 1024)
+            .take(HEADER_LINE)
             .read_until(b'\n', &mut line)
             .refuse_at(site)?;
         consumed = consumed
             .checked_add(count)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
+        if over_cap(consumed) {
+            return Err(BulkloadRefusal::GitInventoryOverCap);
+        }
+        if count == 0 || !line.ends_with(b"\n") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         if line == b"\n" {
@@ -252,10 +305,49 @@ fn pack_object_count(path: &Path, raw: bool) -> Result<u64> {
     Ok(u64::from(u32::from_be_bytes(count)))
 }
 
+// The bundle signature for `private`'s object format: v2 for SHA-1, v3 with
+// its capability line for SHA-256.
+fn signature(private: &Path) -> Result<&'static [u8]> {
+    match text(git(private).args(["rev-parse", "--show-object-format"]))?.as_str() {
+        "sha1" => Ok(b"# v2 git bundle\n"),
+        "sha256" => Ok(b"# v3 git bundle\n@object-format=sha256\n"),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+}
+
+// Refuse a header of `length` bytes over the cap, before anything is written.
+const fn within_cap(length: usize) -> Result<()> {
+    if over_cap(length) {
+        return Err(BulkloadRefusal::GitInventoryOverCap);
+    }
+    Ok(())
+}
+
+// The header `bundle create --all` writes for `private`: its signature, one
+// `<oid> <name>` line per private ref and the blank line. A bare private
+// repository's HEAD is unborn, so it adds no line.
+fn full_header_len(private: &Path) -> Result<usize> {
+    let listed = refs(private)?;
+    let lines = listed
+        .lines()
+        .try_fold(0usize, |total, line| {
+            total.checked_add(line.len().checked_add(1)?)
+        })
+        .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    signature(private)?
+        .len()
+        .checked_add(lines)
+        .and_then(|length| length.checked_add(1))
+        .ok_or(BulkloadRefusal::BudgetExceeded)
+}
+
 // A self-contained bundle of every private ref: `git bundle create` through
 // the measured child path. A failed child refuses GIT_CHILD_FAILED with its
-// stderr class (WP3, R-N121).
-fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
+// stderr class (WP3, R-N121). Its header is measured before git writes a
+// byte, so an over-cap capture is refused here, never written and refused by
+// its reader (`PackStats::record` reads it back under the same cap).
+pub(super) fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
+    within_cap(full_header_len(private)?)?;
     let storage_read = super::pack_child(
         git(private)
             .args(["bundle", "create"])
@@ -335,7 +427,7 @@ pub(super) fn write_chained(
 //
 // A failed write removes its pending object list and header, so a refused
 // pass leaves no partial file beside the bundle path.
-fn write_excluding_tip_trees(
+pub(super) fn write_excluding_tip_trees(
     private: &Path,
     bundle: &Path,
     commits: &BTreeSet<String>,
@@ -357,6 +449,16 @@ fn write_excluding_tip_trees_pending(
     commits: &BTreeSet<String>,
 ) -> Result<PackStats> {
     const SITE: &str = "git_carry::shared::write_excluding_tip_trees_pending";
+    // The final header, prerequisites included, is measured against the
+    // readers' cap before the walk and before any byte is written (#178: a
+    // grouped item's rewritten header was recorded 33,880 B over the cap and
+    // refused by every later reader).
+    let mut header = signature(private)?.to_vec();
+    for value in commits {
+        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
+    }
+    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
+    within_cap(header.len())?;
     let listing = bundle.with_extension("objects-pending");
     let list = fs::OpenOptions::new()
         .read(true)
@@ -385,16 +487,6 @@ fn write_excluding_tip_trees_pending(
         .read_to_end(&mut objects)
         .refuse_at(SITE)?;
     fs::remove_file(&listing).refuse_at(SITE)?;
-    let format = text(git(private).args(["rev-parse", "--show-object-format"]))?;
-    let mut header = match format.as_str() {
-        "sha1" => b"# v2 git bundle\n".to_vec(),
-        "sha256" => b"# v3 git bundle\n@object-format=sha256\n".to_vec(),
-        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
-    };
-    for value in commits {
-        writeln!(header, "-{value} shared base").refuse_at(SITE)?;
-    }
-    writeln!(header, "{}\n", refs(private)?).refuse_at(SITE)?;
     let pending = bundle.with_extension("header-pending");
     let mut target = fs::OpenOptions::new()
         .write(true)

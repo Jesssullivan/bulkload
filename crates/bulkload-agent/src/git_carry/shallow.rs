@@ -26,6 +26,10 @@ pub(super) const DRIFT_MARKER: &str = "refs/carry-export/shallow-drift-v1";
 /// a workspace refuses it up front. `unpack` checks it against the inner
 /// inventory, which is the truth.
 pub(super) const BARE_MARKER: &str = "refs/carry-export/shallow-bare-v1";
+/// The most bytes an envelope's manifest (frontier, inner inventory, pack
+/// name) may hold. The writer measures it before it writes the envelope and
+/// the reader refuses a larger one, both `GIT_INVENTORY_OVER_CAP` (#178).
+const MANIFEST_CAP: u64 = 16 * 1024 * 1024;
 
 pub(super) fn frontier(repository: &Path) -> Result<Vec<u8>> {
     let path = text(git(repository).args([
@@ -61,6 +65,10 @@ pub(super) fn write_bundle(
     boundary: &[u8],
 ) -> Result<super::shared::PackStats> {
     validate_frontier(boundary)?;
+    // The inner inventory is read before the pack is written, so an envelope
+    // whose manifest could not fit refuses before any byte of it.
+    let inventory = refs(private)?;
+    over_manifest_cap(boundary.len().saturating_add(inventory.len()))?;
     let parent = bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let pack = bundle.with_extension("objects.pack");
     let file = fs::OpenOptions::new()
@@ -100,9 +108,9 @@ pub(super) fn write_bundle(
             .args(["hash-object", "-w", "--no-filters", "--"])
             .arg(&pack),
     )?;
-    let inventory = refs(private)?;
     let manifest = postcard::to_allocvec(&(boundary, &inventory, &pack_oid))
         .map_err(|_| BulkloadRefusal::FrameCodec)?;
+    over_manifest_cap(manifest.len())?;
     // A metadata commit must actually reference the raw-pack blob so ordinary
     // bundle traversal carries it, without traversing the shallow source graph.
     let value = input(
@@ -143,6 +151,14 @@ pub(super) fn write_bundle(
     Ok(stats)
 }
 
+// Refuse a manifest of `length` bytes that its reader would refuse.
+fn over_manifest_cap(length: usize) -> Result<()> {
+    if u64::try_from(length).map_or(true, |length| length > MANIFEST_CAP) {
+        return Err(BulkloadRefusal::GitInventoryOverCap);
+    }
+    Ok(())
+}
+
 fn custody_oid(heads: &str) -> Option<&str> {
     heads.lines().find_map(|line| {
         line.split_once(' ')
@@ -169,7 +185,12 @@ fn custody_manifest(repository: &Path, value: &str) -> Result<(Vec<u8>, String, 
     let object = text(git(repository).args(["rev-parse", &format!("{value}:value")]))?;
     let mut reader = super::batch_objects::BatchObjects::new(repository)?;
     let mut bytes = Vec::new();
-    reader.copy_into(&object, &mut bytes, Some(16 * 1024 * 1024))?;
+    reader
+        .copy_into(&object, &mut bytes, Some(MANIFEST_CAP))
+        .map_err(|error| match error {
+            BulkloadRefusal::BudgetExceeded => BulkloadRefusal::GitInventoryOverCap,
+            other => other,
+        })?;
     reader.finish()?;
     postcard::from_bytes(&bytes).map_err(|_| BulkloadRefusal::FrameCodec)
 }

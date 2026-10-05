@@ -115,6 +115,17 @@ neither an index nor a worktree (S4, #162).
   worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`. Git reads the absent file
   as an unborn index that `git checkout` populates, and an empty index file
   does not, so no carried index restores it.
+- A capture's header does not list every carried ref (OI-1003-Q54, #178;
+  `docs/plans/2026-10-05-v1-header.md`). The refs travel in a
+  content-addressed ref table commit (`refs/carry-export/ref-table-v1`),
+  with one tip ref per distinct object they name, so the header grows with
+  the distinct objects (111 B each, SHA-1), not the refs. Import expands the
+  table into exactly the refs the old format carried; a capture without a
+  table (every capture written before) imports as it always did.
+- A bundle header, a ref table or a shallow envelope's manifest over its
+  size bound refuses `GIT_INVENTORY_OVER_CAP`, never
+  `GIT_INVENTORY_MALFORMED`. Writers measure the header before they write
+  it, so no capture is recorded that a later reader refuses for size.
 
 Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores

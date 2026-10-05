@@ -535,12 +535,9 @@ fn s4_a_bare_repository_is_carried_as_ref_custody() {
     let first = captured(&mirror, &root.join("capture-1"), None);
     let changed = moved(&before, &lstat_census(&mirror));
     assert!(changed.is_empty(), "{}", changed.join("\n"));
-    let heads = text(
-        git(&mirror)
-            .args(["bundle", "list-heads"])
-            .arg(&first.bundle),
-    )
-    .unwrap();
+    // The carried refs, read from the first (self-contained) bundle alone:
+    // with a ref table (OI-1003-Q54) they are its expansion, not the header.
+    let heads = super::carried_heads(&first.bundle, None).unwrap();
     let main = text(git(&mirror).args(["rev-parse", "refs/heads/main"])).unwrap();
     assert!(
         heads.contains(&format!("{main} refs/carry-export/refs/heads/main")),

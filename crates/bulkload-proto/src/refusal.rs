@@ -97,6 +97,14 @@ pub enum BulkloadRefusal {
     /// refuses rather than lay down a checkout whose every HEAD path is a
     /// staged deletion.
     GitInventoryIndexAbsent,
+    /// A Git inventory is well formed but larger than a carry size bound
+    /// (OI-1003-Q54, #178): a v1 bundle header over its 16 MiB cap, a ref
+    /// table over its bound, or a shallow envelope's manifest over its cap.
+    /// Writers check before they write, so no capture is recorded that a
+    /// later reader refuses for size; a reader meeting one refuses here, not
+    /// `GIT_INVENTORY_MALFORMED`. The disposition is the inventory's size
+    /// (most often the distinct objects its refs name), not corruption.
+    GitInventoryOverCap,
     /// A capture of a bare repository (ref custody only, with no worktree)
     /// was asked to lay down a workspace: a restore, a linked worktree, an
     /// attachment or an index repair (S4, #162). Refused before anything is
@@ -238,6 +246,7 @@ impl BulkloadRefusal {
             Self::GitInventoryMissingPrerequisite => "GIT_INVENTORY_MISSING_PREREQUISITE",
             Self::GitInventoryIntentToAdd => "GIT_INVENTORY_INTENT_TO_ADD",
             Self::GitInventoryIndexAbsent => "GIT_INVENTORY_INDEX_ABSENT",
+            Self::GitInventoryOverCap => "GIT_INVENTORY_OVER_CAP",
             Self::GitBareCaptureWorkspace => "GIT_BARE_CAPTURE_WORKSPACE",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
@@ -298,6 +307,7 @@ impl BulkloadRefusal {
         "GIT_INVENTORY_MISSING_PREREQUISITE",
         "GIT_INVENTORY_INTENT_TO_ADD",
         "GIT_INVENTORY_INDEX_ABSENT",
+        "GIT_INVENTORY_OVER_CAP",
         "GIT_BARE_CAPTURE_WORKSPACE",
         "GIT_DESTINATION_OCCUPIED",
         "GIT_IGNORE_POLICY_CONFLICT",
@@ -503,6 +513,7 @@ mod tests {
             BulkloadRefusal::GitInventoryMissingPrerequisite,
             BulkloadRefusal::GitInventoryIntentToAdd,
             BulkloadRefusal::GitInventoryIndexAbsent,
+            BulkloadRefusal::GitInventoryOverCap,
             BulkloadRefusal::GitBareCaptureWorkspace,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,

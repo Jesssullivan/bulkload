@@ -23,6 +23,15 @@ pub mod carry_v2;
 pub mod chain;
 pub mod estimate;
 mod raw_tree;
+mod ref_table;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod refs_scale_tests;
 pub mod registered;
 mod shallow;
 pub mod shared;
@@ -509,7 +518,23 @@ fn capture_tree(private: &Path, repo: &Path, _index: &Path) -> Result<String> {
 
 // `stash` is the reflog read with the carried authority, never re-read here:
 // the bundle carries exactly the stash commits the snapshot saw.
+//
+// The carried map is written as the private repository's ref table and one
+// tip ref per distinct object (OI-1003-Q54, `ref_table`), not as one private
+// ref per carried ref: the bundle header then grows with the distinct
+// objects, and the private repository writes that many refs, not one per
+// carried ref (#178).
 fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
+    ref_table::write(private, &exported_refs(inventory, stash)?)
+}
+
+// Every ref a capture carries, by exported name: the inventory's refs under
+// `refs/carry-export/` (a canonical carry ref under `union/v1/`), then each
+// stash commit not already named.
+fn exported_refs(
+    inventory: &str,
+    stash: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut pending = std::collections::BTreeMap::new();
     for line in inventory.lines() {
         let (value, name) = line
@@ -539,23 +564,7 @@ fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
         let name = format!("refs/carry-export/stashes/{value}");
         pending.entry(name).or_insert_with(|| value.to_owned());
     }
-    // One create-only Git transaction instead of one process per ref. NUL
-    // framing preserves legal quote characters without command interpolation.
-    let mut commands = Vec::new();
-    for (name, value) in pending {
-        commands.extend_from_slice(b"create ");
-        commands.extend_from_slice(name.as_bytes());
-        commands.push(0);
-        commands.extend_from_slice(value.as_bytes());
-        commands.push(0);
-    }
-    if !commands.is_empty() {
-        input(
-            git(private).args(["update-ref", "--stdin", "-z"]),
-            &commands,
-        )?;
-    }
-    Ok(())
+    Ok(pending)
 }
 
 fn source_slug(source: &str) -> bool {
@@ -4810,9 +4819,16 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
     }
     let bundle = fs::canonicalize(bundle).refuse_at("git_carry::import_verified")?;
     verify_bundle(repo, &bundle)?;
-    let heads = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
-    let unpacked = shallow::unpack(repo, &bundle, &heads)?;
-    let heads = unpacked.as_ref().unwrap_or(&heads);
+    let listed = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
+    let unpacked = shallow::unpack(repo, &bundle, &listed)?;
+    let advertised = unpacked.as_ref().unwrap_or(&listed);
+    if unpacked.is_none() {
+        fetch_advertised(repo, &bundle, advertised)?;
+    }
+    // A ref table (OI-1003-Q54) expands to exactly the old format's lines,
+    // read from the objects just fetched; an old-format header is used as is.
+    let expanded = ref_table::expand(repo, advertised)?;
+    let heads = expanded.as_ref().unwrap_or(advertised);
     let mut native: Vec<_> = heads
         .lines()
         .filter(|line| {
@@ -4848,22 +4864,7 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         } else {
             format!("refs/carry/v1/{source}/{digest}/{suffix}")
         };
-        names.push((value.to_owned(), name.to_owned(), target));
-    }
-    // Fetch objects only. Compare-and-create below cannot clobber a native ref.
-    if unpacked.is_none() {
-        output(
-            git(repo)
-                .args([
-                    "fetch",
-                    "--no-write-fetch-head",
-                    "--no-auto-maintenance",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                ])
-                .arg(&bundle)
-                .args(names.iter().map(|(_, name, _)| name)),
-        )?;
+        names.push((value.to_owned(), target));
     }
     let inventory = text(git(repo).args([
         "for-each-ref",
@@ -4880,7 +4881,7 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         }
     }
     let mut desired = std::collections::BTreeMap::new();
-    for (value, _, target) in &names {
+    for (value, target) in &names {
         if target.contains('\0')
             || desired
                 .insert(target.as_str(), value.as_str())
@@ -4907,6 +4908,90 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         )?;
     }
     Ok(names.len())
+}
+
+/// The ref lines `bundle` carries, in the old format's terms: its header, or,
+/// beside a ref table (OI-1003-Q54), the lines the table expands to. A thin
+/// bundle's prerequisites come from `objects`, an object store added as an
+/// alternate. Test support: the bundle is read in a private scratch
+/// repository, never in a source.
+///
+/// # Errors
+/// Whatever `bundle list-heads`, the fetch or [`ref_table::expand`] refuses.
+#[cfg(test)]
+pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<String> {
+    let directory = PrivateDir::create(None)?;
+    let listed = text(
+        git(directory.path())
+            .args(["bundle", "list-heads"])
+            .arg(bundle),
+    )?;
+    let format = bundle_object_format(&listed)?;
+    let repository = directory.path().join("heads.git");
+    output(
+        git(directory.path())
+            .args([
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                &format!("--object-format={format}"),
+            ])
+            .arg(&repository),
+    )?;
+    if let Some(objects) = objects {
+        let objects = fs::canonicalize(objects).refuse_at("git_carry::carried_heads")?;
+        fs::write(
+            repository.join("objects/info/alternates"),
+            format!("{}\n", objects.display()),
+        )
+        .refuse_at("git_carry::carried_heads")?;
+    }
+    fetch_advertised(&repository, bundle, &listed)?;
+    Ok(ref_table::expand(&repository, &listed)?.unwrap_or(listed))
+}
+
+// Fetch the objects of every ref `bundle` advertises, and no ref: the
+// compare-and-create in `import_verified` cannot clobber a native ref.
+//
+// One refspec per distinct object: fetch's connectivity check then covers
+// the closure of every object a carried ref names, so of every carried ref.
+// Git matches each exact refspec by a scan of the advertised refs, so naming
+// every ref of an old-format header (one line per carried ref) was quadratic
+// in the refs, and more than one argv holds at tens of thousands of refs
+// (the old import refused 119,761 refs `IO`, errno E2BIG). The refspecs go
+// on stdin.
+fn fetch_advertised(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
+    let mut refspecs = String::new();
+    let mut objects = std::collections::BTreeSet::new();
+    for line in advertised.lines() {
+        let (value, name) = line
+            .split_once(' ')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if !oid(value) || !name.starts_with("refs/carry-export/") {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        if objects.insert(value) {
+            refspecs.push_str(name);
+            refspecs.push('\n');
+        }
+    }
+    if !refspecs.is_empty() {
+        input(
+            git(repo)
+                .args([
+                    "fetch",
+                    "--no-write-fetch-head",
+                    "--no-auto-maintenance",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--stdin",
+                ])
+                .arg(bundle),
+            refspecs.as_bytes(),
+        )?;
+    }
+    Ok(())
 }
 
 fn capture_revision(heads: &str, suffix: &str) -> Result<String> {
@@ -6464,11 +6549,9 @@ mod tests {
         let dest_head = fs::read(dest.join(".git/HEAD")).unwrap();
         let native = refs(&dest).unwrap();
         let bundle = export_repository(&source, &root.join("capture")).unwrap();
-        assert!(
-            text(git(&source).args(["bundle", "list-heads"]).arg(&bundle))
-                .unwrap()
-                .contains("refs/carry-export/refs/heads/quote\"branch")
-        );
+        assert!(carried_heads(&bundle, None)
+            .unwrap()
+            .contains("refs/carry-export/refs/heads/quote\"branch"));
         let count = import_bundle(&dest, &bundle, "neo").unwrap();
         assert!(count >= 6);
         assert_eq!(count, import_bundle(&dest, &bundle, "neo").unwrap());
@@ -8822,13 +8905,35 @@ mod tests {
             assert!(export.drift.is_empty());
             let private = capture.join("repository.git");
             assert!(!drift_ref_present(&private));
+            // The carried ref set, which a restore lays down, is the
+            // pre-change set exactly; the private repository holds it as a
+            // ref table and one tip per distinct object (OI-1003-Q54).
+            let mut heads: Vec<String> =
+                carried_heads(&export.bundle, Some(&source.join(".git/objects")))
+                    .unwrap()
+                    .lines()
+                    .map(|line| line.split_once(' ').unwrap().1.to_owned())
+                    .collect();
+            heads.sort();
+            assert_eq!(heads, expected);
+            let tip = text(git(&source).args(["rev-parse", &symbolic])).unwrap();
+            let mut private_names: Vec<String> = expected
+                .iter()
+                .filter(|name| !name.starts_with("refs/carry-export/refs/"))
+                .cloned()
+                .chain([
+                    ref_table::TABLE_REF.to_owned(),
+                    format!("{}{tip}", ref_table::TIP_PREFIX),
+                ])
+                .collect();
+            private_names.sort();
             let names: Vec<String> = refs(&private)
                 .unwrap()
                 .lines()
                 .map(|line| line.split_once(' ').unwrap().1.to_owned())
                 .collect();
-            assert_eq!(names, expected);
-            let heads: Vec<String> = text(
+            assert_eq!(names, private_names);
+            let listed: Vec<String> = text(
                 git(&source)
                     .args(["bundle", "list-heads"])
                     .arg(&export.bundle),
@@ -8837,7 +8942,7 @@ mod tests {
             .lines()
             .map(|line| line.split_once(' ').unwrap().1.to_owned())
             .collect();
-            assert_eq!(heads, expected);
+            assert_eq!(listed, private_names);
             shapes.push((
                 text(git(&private).args(["rev-parse", "refs/carry-export/worktree^{tree}"]))
                     .unwrap(),
