@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "6b3df5845e5f33c4d6acdabcd912898846d69695930373ff14bca7f8152f61f2"
+WORKFLOW_SHA256 = "88912d6d7867551c4191e84e671d4e5e4f8b0fca5456579246773ce1113b1b84"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -87,6 +87,13 @@ UPLOAD_EXPRESSION = (
 )
 MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
 TERMINAL_GATES = ("source", "build", "test", "fault-harness")
+# The gates the CI workflow matrix runs. OI-1003-Q65 (2026-10-06) dropped the
+# Bazel `build` and `test` gates from the matrix: they duplicated the compile
+# that `source` and `fault-harness` already run. The composite action still
+# validates all four TERMINAL_GATES paths; only the workflow stops selecting
+# the Bazel two.
+WORKFLOW_GATES = ("source", "fault-harness")
+WORKFLOW_GATE_MATRIX = "        gate: [" + ", ".join(WORKFLOW_GATES) + "]"
 TERMINAL_CONSUMERS = {
     "source": "Run repository-owned source gates",
     "build": "Build the Bulkload documentation through the public Flywheel action",
@@ -219,7 +226,7 @@ PINNED_JUST_RECIPES = {
         (),
     ),
     "ci-source": (
-        "ci-source: check-source secrets-scan-history",
+        "ci-source: check-source secrets-scan-history contract-test",
         (),
     ),
     "ci-fault-harness": (
@@ -414,7 +421,7 @@ def validate_job_routing(workflow: str) -> None:
         "    strategy:\n"
         "      fail-fast: false\n"
         "      matrix:\n"
-        "        gate: [source, build, test, fault-harness]\n"
+        f"{WORKFLOW_GATE_MATRIX}\n"
     )
     if workflow.count(matrix) != 1:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
@@ -2394,15 +2401,18 @@ class CiContractTest(unittest.TestCase):
 
     def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
         workflow_variants = [
+            self.workflow.replace(WORKFLOW_GATE_MATRIX, "        gate: [source]", 1),
             self.workflow.replace(
+                WORKFLOW_GATE_MATRIX, "        gate: [fault-harness, source]", 1
+            ),
+            # The Bazel gates stay out of the matrix (OI-1003-Q65).
+            self.workflow.replace(
+                WORKFLOW_GATE_MATRIX,
                 "        gate: [source, build, test, fault-harness]",
-                "        gate: [source, build, test]",
                 1,
             ),
             self.workflow.replace(
-                "        gate: [source, build, test, fault-harness]",
-                "        gate: [build, source, test, fault-harness]",
-                1,
+                WORKFLOW_GATE_MATRIX, "        gate: [source, test, fault-harness]", 1
             ),
             self.workflow.replace("      fail-fast: false", "      fail-fast: true", 1),
             self.workflow.replace(

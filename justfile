@@ -237,7 +237,8 @@ check-local: check-source test-local
 
 # Toolchain-complete source gates for CI. The repo flake owns these linters and
 # scanners; the pinned GloriousFlywheel shell owns the front door and Bazel.
-ci-source: check-source secrets-scan-history
+# contract-test rides here since the Bazel `test` gate was dropped (OI-1003-Q65).
+ci-source: check-source secrets-scan-history contract-test
 
 # The CI `fault-harness` terminal gate (R-N122); the composite action execs it
 # inside the repo flake, like `ci-source`.
