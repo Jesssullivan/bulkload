@@ -35,16 +35,18 @@
 //!
 //! The legs: an in-process `copy` (free and held), the `serve` verb as its
 //! own process (held), a v1 `export_repository` (held), an `estate::capture`
-//! of two repositories (held), and the `SQLite` backup against a writer
-//! process, idle and committing. Self-tests prove the lock table, the
+//! of two repositories (held), a local `git-carry-estimate` of two
+//! repositories (held), and the `SQLite` backup against a writer process,
+//! idle and committing. Self-tests prove the lock table, the
 //! descriptor sample and the write watch each see what they claim on this
 //! kernel, and that the Git fixture's index is one an unhardened `git status`
 //! does rewrite.
 //!
 //! **Not covered here**, and so still open for S2's lock property:
-//! `estate::apply`, `git-carry-estimate`, `export_repository_with_policy`
-//! and the prerequisite and drift paths, `hydrate-state`, a real `pull` over
-//! ssh, and every verb on Darwin (no `/proc`, no inotify).
+//! `estate::apply`, `git-carry-estimate` over ssh (the far host's probe),
+//! `export_repository_with_policy` and the prerequisite and drift paths,
+//! `hydrate-state`, a real `pull` over ssh, and every verb on Darwin (no
+//! `/proc`, no inotify).
 //!
 //! What this cannot see: a non-blocking `flock`/`fcntl` attempt whose failure
 //! the verb ignores, made under the holder, and missed by sampling in the
@@ -1351,6 +1353,88 @@ fn an_estate_capture_never_locks_or_writes_its_sources() {
             .iter()
             .map(|(_, outcome, _)| *outcome)
             .collect::<Vec<_>>()
+    );
+}
+
+/// P77, estimate leg: a local `git-carry-estimate` reads two live
+/// repositories, the source and the destination, through the `bash` probe
+/// and the hardened Git children behind it. With every node of both held and
+/// both indexes stale, the estimate finishes, and no process writes,
+/// creates, renames, re-stamps or opens for writing anything in either, and
+/// no `flock` or `fcntl` lock is taken or waited for on either. The estimate
+/// over ssh runs the same probe on the far host and is not run here.
+#[test]
+fn a_git_carry_estimate_never_locks_or_writes_either_repository() {
+    use bulkload_agent::git_carry::estimate::{estimate, Destination};
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("estimate-held");
+    let repos = [scratch.path("source"), scratch.path("destination")];
+    for repo in &repos {
+        stale_index_repository(repo);
+    }
+    let holders: Vec<Holder> = repos
+        .iter()
+        .map(|repo| Holder::take(repo, &BTreeSet::new()))
+        .collect();
+    let mut held = Held::default();
+    let mut keys = BTreeSet::new();
+    let mut census = Vec::new();
+    for (repo, holder) in repos.iter().zip(&holders) {
+        settle_racy_window(repo).unwrap();
+        let shape = holder.shape();
+        held.keys.extend(shape.keys);
+        held.descriptors.extend(shape.descriptors);
+        keys.extend(lock_keys(repo).into_keys());
+        census.push(lstat_census(repo));
+    }
+    let watch = Watch::start(&[&repos[0], &repos[1]]);
+    let sampler = Sampler::start(repos.to_vec(), keys, held);
+    let ((estimated, written), blocked) = {
+        let (source, destination) = (repos[0].clone(), repos[1].clone());
+        within_deadline(holders, move || {
+            let estimated = estimate(&source, &Destination::Local(destination))
+                .map(|estimate| estimate.lines())
+                .map_err(|refused| refused.lines());
+            (estimated, watch.drain())
+        })
+    };
+    let observed = sampler.finish();
+    assert!(
+        !blocked,
+        "the estimate waited on a source lock: {:?}",
+        observed.locks
+    );
+    let lines = estimated.unwrap();
+    assert!(!lines.is_empty(), "the estimate reported nothing");
+    assert_eq!(
+        written,
+        [],
+        "write events in a repository during an estimate (a `.lock` file is \
+         how Git locks)"
+    );
+    assert!(
+        observed.locks.is_empty(),
+        "lock attempts on a repository during an estimate: {:?}",
+        observed.locks
+    );
+    assert!(
+        observed.opens.is_empty(),
+        "write-mode opens of repository paths during an estimate: {:?}",
+        observed.opens
+    );
+    for (repo, before) in repos.iter().zip(&census) {
+        assert_eq!(
+            &lstat_census(repo),
+            before,
+            "the estimate changed {}",
+            repo.display()
+        );
+    }
+    eprintln!(
+        "p77 estimate holder run: {} samples, mean period {} us, {} report lines",
+        observed.samples,
+        observed.period_us(),
+        lines.len()
     );
 }
 
