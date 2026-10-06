@@ -13,6 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use super::decide::{self, Basis, Policy};
 use super::{capture_refs, git, input, oid, output, prepare_private, refs, set_ref, text};
 use crate::{BulkloadRefusal, Result};
 
@@ -31,6 +32,36 @@ const HEADER_LINE: u64 = 1024 * 1024;
 // A header that has consumed `consumed` bytes is over the cap.
 const fn over_cap(consumed: usize) -> bool {
     consumed > HEADER_CAP
+}
+
+/// A commit a capture bundle declares as a prerequisite (`-<oid>` in its
+/// header, `^<oid>` to the walk): a well-formed object name, checked once
+/// when it enters the prerequisite path, so the writer never declares a
+/// malformed one (Q42 lane L6a).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Oid(String);
+
+impl Oid {
+    /// `value` as a prerequisite; `GIT_INVENTORY_MALFORMED` unless it is a
+    /// SHA-1 or SHA-256 object name.
+    pub(super) fn new(value: &str) -> Result<Self> {
+        if oid(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(BulkloadRefusal::GitInventoryMalformed)
+        }
+    }
+
+    /// The object name.
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Oid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 fn stash_history(repo: &Path, inventory: &str) -> Result<Vec<u8>> {
@@ -93,7 +124,7 @@ pub fn export_base(repo: &Path, capture: &Path) -> Result<PathBuf> {
 // is the base's own commit, in its pack only, so it is never a
 // prerequisite: its tips carry what it maps. Any other name outside
 // `refs/carry-export/` is malformed, as it was before the table.
-fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<String>> {
+fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<Oid>> {
     output(git(private).args(["bundle", "verify"]).arg(base))?;
     let mut request = String::new();
     let mut asked = 0usize;
@@ -129,10 +160,7 @@ fn prerequisite_commits(private: &Path, base: &Path) -> Result<BTreeSet<String>>
             return Err(BulkloadRefusal::GitInventoryMissingPrerequisite);
         }
         if let Some((commit, "commit")) = peeled.split_once(' ') {
-            if !oid(commit) {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            commits.insert(commit.to_owned());
+            commits.insert(Oid::new(commit)?);
         }
     }
     if lines.next().is_some() || commits.is_empty() {
@@ -360,23 +388,93 @@ pub(super) fn write_full(private: &Path, bundle: &Path) -> Result<PackStats> {
     PackStats::record(bundle, false, storage_read)
 }
 
-/// Write a capture bundle whose prerequisites are `prior`'s source-held tips
-/// (see `chain`). Returns its pack cost and whether it declared any
-/// prerequisite; `false` means it is self-contained (a shallow capture, no
-/// source-held tip, or a thin header that would be over the cap, see
-/// [`write_excluding_tip_trees`]).
-pub(super) fn write_chained(
-    private: &Path,
-    bundle: &Path,
-    source: &Path,
-    prior: &Path,
-) -> Result<(PackStats, bool)> {
-    write_chained_capped(private, bundle, source, prior, HEADER_CAP)
+/// A retained capture bundle a capture may chain on (WP2, see `chain`), and
+/// the source whose object store must hold its tips.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Link<'a> {
+    /// The retained capture bundle.
+    pub prior: &'a Path,
+    /// The checkout it captured.
+    pub source: &'a Path,
 }
 
-/// [`write_chained`] with the thin header held to `cap` bytes (at most
-/// [`HEADER_CAP`]): the tests lower it to reach the fallback without
-/// 100,000 distinct objects.
+/// What a capture's decision offers its writer, as [`super::ExportOptions`]
+/// carries it: a shared plan base and a retained capture to chain on.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Offer<'a> {
+    /// The plan base whose commit closure the capture may exclude.
+    pub base: Option<&'a Path>,
+    /// The retained capture whose source-held tips may become prerequisites.
+    pub link: Option<Link<'a>>,
+}
+
+impl<'a> Offer<'a> {
+    /// `ExportOptions`' plan `base` and retained capture `prior` of `source`.
+    pub(super) fn of(base: Option<&'a Path>, prior: Option<&'a Path>, source: &'a Path) -> Self {
+        Self {
+            base,
+            link: prior.map(|prior| Link { prior, source }),
+        }
+    }
+}
+
+/// Write a capture bundle on what the decision core decides for `offer`
+/// (`decide::decide`, OI-1003-Q43), once this pass has read what only it can
+/// read: whether the source is shallow (the private repository carries its
+/// frontier), and, only when the decision rests on it, whether the source
+/// holds a tip of the link (`chain::source_held_tips`). Under v1's policy a
+/// plan base wins over a link, a shallow source is always self-contained
+/// and a source that holds none of the link's tips gets a self-contained
+/// bundle.
+///
+/// Returns the pack cost and whether the bundle declares the link's tips as
+/// prerequisites. A self-contained bundle (a shallow envelope, nothing
+/// offered, no source-held tip, or a thin header over `cap`, see
+/// [`write_excluding_tip_trees`]) does not, and nor does a plan base's
+/// delta. A decision v1 cannot write (L6b's chain under a plan base) refuses
+/// `CONTRACT_SELF_INCONSISTENT`, as does a decision that is not an export.
+pub(super) fn write_capture(
+    private: &Path,
+    bundle: &Path,
+    offer: Offer<'_>,
+    cap: usize,
+) -> Result<(PackStats, bool)> {
+    let boundary = super::shallow::frontier(private)?;
+    let mut tips = BTreeSet::new();
+    let plan = decide::decide_offered(
+        offer.base.is_some(),
+        offer.link,
+        !boundary.is_empty(),
+        Policy::V1,
+        |link| {
+            tips = super::chain::source_held_tips(link.source, link.prior)?;
+            Ok(!tips.is_empty())
+        },
+    )?;
+    match plan.basis {
+        // A shallow frontier is not a bundle prerequisite. Preserve the entire
+        // locally available shallow closure as explicit custody instead.
+        Basis::SelfContained if !boundary.is_empty() => Ok((
+            super::shallow::write_bundle(private, bundle, &boundary)?,
+            false,
+        )),
+        Basis::SelfContained => Ok((write_full(private, bundle)?, false)),
+        Basis::Base => {
+            let base = offer
+                .base
+                .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            let commits = prerequisite_commits(private, base)?;
+            Ok((write_thin(private, bundle, &commits, cap)?.0, false))
+        }
+        Basis::Chain => write_excluding_tip_trees(private, bundle, &tips, cap),
+        Basis::BaseAndChain => Err(BulkloadRefusal::ContractSelfInconsistent),
+    }
+}
+
+/// The chain writer: [`write_capture`] offered `prior` alone, with the thin
+/// header held to `cap` bytes (at most [`HEADER_CAP`]). REFS-SCALE lowers
+/// the cap to reach the fallback without 100,000 distinct objects.
+#[cfg(test)]
 pub(super) fn write_chained_capped(
     private: &Path,
     bundle: &Path,
@@ -384,18 +482,15 @@ pub(super) fn write_chained_capped(
     prior: &Path,
     cap: usize,
 ) -> Result<(PackStats, bool)> {
-    let boundary = super::shallow::frontier(private)?;
-    if !boundary.is_empty() {
-        return Ok((
-            super::shallow::write_bundle(private, bundle, &boundary)?,
-            false,
-        ));
-    }
-    let commits = super::chain::source_held_tips(source, prior)?;
-    if commits.is_empty() {
-        return Ok((write_full(private, bundle)?, false));
-    }
-    write_excluding_tip_trees(private, bundle, &commits, cap)
+    write_capture(
+        private,
+        bundle,
+        Offer {
+            base: None,
+            link: Some(Link { prior, source }),
+        },
+        cap,
+    )
 }
 
 // The header a thin bundle declaring `commits` writes: its signature, one
@@ -405,7 +500,7 @@ pub(super) fn write_chained_capped(
 // object, so a thin header reaches the cap first: at about 101,680 distinct
 // commit tips on SHA-1 (237 B each on SHA-256: about 70,790), against about
 // 151,100 (105,500) self-contained.
-fn thin_header(private: &Path, commits: &BTreeSet<String>) -> Result<Vec<u8>> {
+fn thin_header(private: &Path, commits: &BTreeSet<Oid>) -> Result<Vec<u8>> {
     const SITE: &str = "git_carry::shared::thin_header";
     let mut header = signature(private)?.to_vec();
     for value in commits {
@@ -416,9 +511,11 @@ fn thin_header(private: &Path, commits: &BTreeSet<String>) -> Result<Vec<u8>> {
 }
 
 // A thin bundle declaring `commits` as prerequisites, which deltas against
-// them; `true` with its pack cost. Both prerequisite kinds come here: a
-// shared plan base's tips (`write_bundle`) and a prior capture's source-held
-// tips (`write_chained`).
+// them; `true` with its pack cost. Both prerequisite kinds come here, as the
+// decision core's basis says (`write_capture`): a shared plan base's tips
+// and a prior capture's source-held tips. Each commit enters the
+// prerequisite path as an [`Oid`], so a malformed name refuses
+// `GIT_INVENTORY_MALFORMED` before anything is written.
 //
 // **Over the cap, self-contained.** The final header, prerequisites
 // included, is measured before the walk and before any byte is written
@@ -479,6 +576,20 @@ pub(super) fn write_excluding_tip_trees(
     commits: &BTreeSet<String>,
     cap: usize,
 ) -> Result<(PackStats, bool)> {
+    let commits = commits
+        .iter()
+        .map(|value| Oid::new(value))
+        .collect::<Result<BTreeSet<Oid>>>()?;
+    write_thin(private, bundle, &commits, cap)
+}
+
+// [`write_excluding_tip_trees`] on commits already checked as prerequisites.
+fn write_thin(
+    private: &Path,
+    bundle: &Path,
+    commits: &BTreeSet<Oid>,
+    cap: usize,
+) -> Result<(PackStats, bool)> {
     let header = thin_header(private, commits)?;
     if header.len() > cap.min(HEADER_CAP) {
         return Ok((write_full(private, bundle)?, false));
@@ -497,7 +608,7 @@ pub(super) fn write_excluding_tip_trees(
 fn write_excluding_tip_trees_pending(
     private: &Path,
     bundle: &Path,
-    commits: &BTreeSet<String>,
+    commits: &BTreeSet<Oid>,
     header: &[u8],
 ) -> Result<PackStats> {
     const SITE: &str = "git_carry::shared::write_excluding_tip_trees_pending";
@@ -511,7 +622,7 @@ fn write_excluding_tip_trees_pending(
         .refuse_at(SITE)?;
     let exclusions = commits.iter().fold(String::new(), |mut result, value| {
         result.push('^');
-        result.push_str(value);
+        result.push_str(value.as_str());
         result.push('\n');
         result
     });
@@ -553,13 +664,14 @@ fn write_excluding_tip_trees_pending(
     PackStats::record(bundle, false, list_read.saturating_add(pack_read))
 }
 
-/// Write a capture bundle: a shallow envelope, a self-contained bundle, or,
-/// with a shared plan `base`, a thin bundle whose prerequisites are the
-/// base's commit tips (self-contained when that thin header would be over
-/// the cap, [`write_excluding_tip_trees`]). Its pack holds no commit the base
-/// reaches and no object under the tree of a base tip, of a capture ref the
-/// base reaches (HEAD's) or of an edge parent. It can still hold an object
-/// the base holds only deeper in its history, and it holds the capture's
+/// Write a capture bundle with no link to chain on ([`write_capture`]): a
+/// shallow envelope, a self-contained bundle, or, with a shared plan `base`,
+/// a thin bundle whose prerequisites are the base's commit tips
+/// (self-contained when that thin header would be over the cap,
+/// [`write_excluding_tip_trees`]). Its pack holds no commit the base reaches
+/// and no object under the tree of a base tip, of a capture ref the base
+/// reaches (HEAD's) or of an edge parent. It can still hold an object the
+/// base holds only deeper in its history, and it holds the capture's
 /// untracked and ignored payload on every pass (OI-1003-Q42, P64; see
 /// `write_excluding_tip_trees`).
 pub(super) fn write_bundle(
@@ -567,17 +679,7 @@ pub(super) fn write_bundle(
     bundle: &Path,
     base: Option<&Path>,
 ) -> Result<PackStats> {
-    let boundary = super::shallow::frontier(private)?;
-    if !boundary.is_empty() {
-        // A shallow frontier is not a bundle prerequisite. Preserve the entire
-        // locally available shallow closure as explicit custody instead.
-        return super::shallow::write_bundle(private, bundle, &boundary);
-    }
-    let Some(base) = base else {
-        return write_full(private, bundle);
-    };
-    let commits = prerequisite_commits(private, base)?;
-    Ok(write_excluding_tip_trees(private, bundle, &commits, HEADER_CAP)?.0)
+    Ok(write_capture(private, bundle, Offer { base, link: None }, HEADER_CAP)?.0)
 }
 
 #[cfg(test)]
