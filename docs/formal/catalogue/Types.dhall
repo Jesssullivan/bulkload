@@ -732,8 +732,8 @@ let gcActionIndex = \(a : GcAction) -> (merge gcActionTable a).index
    The labels are the constructors of hs/GitCarryCore.hs (its `schema`) and
    the strings of GitCarry.tla's Decisions, Bases, Rebases, Reuses and
    Refusals sets; formal-nv and tla-check require all three to be equal, and
-   decide_rows.tsv's output columns use them. The Rust decide.rs (lane L6)
-   is to use the same labels.
+   decide_rows.tsv's output columns use them. The Rust decide.rs (lane L6a)
+   uses the same labels, and its P67 test requires them to be the rows'.
    - Basis: what a capture's bundle depends on: nothing, a plan base, a
      chain link, or (L6b's fix 2) both.
    - Rebase: NewRoot when the depth limit (v1) or the Q46 window ends the

@@ -1210,29 +1210,42 @@ run, so a symbol that only a data file (`decide_rows.tsv`), a test or a
 comment names does not ground. The module's header states the scope, the
 abstractions and the code map.
 
+Lane L6a (OI-1003-Q43) moved the decision into
+[`git_carry/decide.rs`](../../crates/bulkload-agent/src/git_carry/decide.rs)
+without changing what the code does: bundles, records and restores are as
+before, and every existing git carry test passes unchanged. `write_capture`
+replaced `write_chained`, whose only caller was `export_pass`'s match, and
+`chainable` and `chain_offer` keep their names: the first now only reads
+what the decision needs, the second acts on the decision's plan. The
+catalogue cites `write_capture`, and decide.rs's `decide`, `Rebase` and
+`Inputs`. Each is a definition at L6a's head.
+
 ### Roles (OI-1003-Q43)
 
 | Role | Tool | What it does | Run |
 |---|---|---|---|
-| Decision core of record | Rust `git_carry/decide.rs`, lane L6 (**pending**) | A pure, total `decide(&Inputs) -> Decision` that replaces `ExportOptions{prerequisite, chain}`, its "Ignored when prerequisite is set" rule and `export_pass`'s match. | P67 (L6) |
+| Decision core of record | Rust [`git_carry/decide.rs`](../../crates/bulkload-agent/src/git_carry/decide.rs), lane L6a | A pure, total `decide(&Inputs) -> Decision`. It replaced the logic of `ExportOptions{prerequisite, chain}`: the "Ignored when prerequisite is set" rule (`chain_offer`'s filter), `chainable`'s rules and `export_pass`'s match. `prepare_base`, `capture_item` and the writer `shared::write_capture` call it and act on the decision. | P67 |
 | Reference decision core, a differential oracle | Haskell `decide` in [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | Derived by hand from the v1 rules at main and Q46's re-root policy. It renders 363 pinned rows to [`crates/bulkload-agent/tests/data/decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv), which L6's fixed-seed property test (P67) checks the Rust `decide` against. | `just formal-nv` (`rows --check`) |
 | Typed closed unions | Dhall: `Basis`, `Rebase`, `ReuseEligibility`, `Refusal`, `Decision` in [`catalogue/Types.dhall`](catalogue/Types.dhall) | The labels of what `decide` returns. Each union's table is merged over the union, so the label lists hold exactly its labels. `formal-nv` requires GitCarryCore's constructors (`schema`, from total case analyses, not a literal list) to equal them; `tla-check` requires GitCarry.tla's `Decisions`, `Bases`, `Rebases`, `Reuses` and `Refusals` sets to equal them. | `just formal-nv`, `just tla-check` |
 | Custody and crash order | TLA+ with TLC: [`GitCarry.tla`](GitCarry.tla) | Seven safety invariants and one liveness property over chain links, the plan base, GC and crash order. TLC checks only this; the decision's own rules are the pinned rows' job. | `just tla-check` |
 | Explorer parity | Haskell `explore` in GitCarryCore.hs | An explicit-state BFS of GitCarry.tla whose capture step calls the Haskell `decide`. It must reach TLC's state counts, so TLC's `DecideCore` and the Haskell `decide` agree on every input reachable in those bounds. | `just formal-nv` |
 
 This widens OI-1003-Q32 for this layer. Haskell is no longer only a second
-encoding of the spec: through the pinned rows it checks the code, once L6
-lands. The chain is TLA+ (custody) to Haskell `decide` (explorer parity) to
-Rust `decide.rs` (P67). The explorer itself has the limit Explorer.hs has
-(independent code, shared design): it and the spec were both transliterated
-from the same reading of the Rust code, so parity cannot catch a misreading
-they share. The pinned rows can, once a Rust `decide` written from the code
-is checked against them.
+encoding of the spec: through the pinned rows it checks the code (P67,
+since L6a). The chain is TLA+ (custody) to Haskell `decide` (explorer
+parity) to Rust `decide.rs` (P67). The explorer itself has the limit
+Explorer.hs has (independent code, shared design): it and the spec were both
+transliterated from the same reading of the Rust code, so parity cannot
+catch a misreading they share. The pinned rows can: P67 checks the Rust
+`decide`, which the code calls, against every row of all three lanes (the
+policy is a column of each row).
 
-Code-symbol grounding for `decide.rs` lands with L6. Until then every
-traceability row lists the symbols no code has yet as **pending**, typed
-with the lane that lands them (`T.Lane`), and `tla-check` prints them
-without grepping.
+L6a grounds `decide.rs`. `ChainDepthBounded` and `BrokenLinkNeverReuseHit`
+cite `decide` and a type only decide.rs defines (`Rebase`, `Inputs`): the
+bare name `decide` also matches transfer.rs's `Outbound::decide`, so it alone
+would not show that decide.rs exists. Every traceability row lists the
+symbols no code has yet as **pending**, typed with the lane that lands them
+(`T.Lane`), and `tla-check` prints them without grepping.
 
 ### The decision core
 
@@ -1262,15 +1275,29 @@ The decision is a hit, a typed refusal, or an export with a basis
 - **A hit** needs the same key, no drift, a settled pass start and a
   restorable chain. A hit on a based bundle needs its bound base retained,
   else `RECEIPT_BINDING_INVALID`.
-- **Otherwise the capture extends.** `chainable` never chains on a broken
-  chain or a based bundle, and chains on a prior only below
-  `CHAIN_DEPTH_LIMIT`. `chain_offer` drops the link under a plan base
-  (`ExportOptions.chain` is "Ignored when prerequisite is set").
-  `export_pass`'s match then writes a chained bundle (`write_chained`),
-  except for a shallow source or when the source holds none of the prior's
-  tips. In those cases, and with no link, it writes a based or
+- **Otherwise the capture extends.** v1's `chainable` never chained on a
+  broken chain or a based bundle, and chained on a prior only below
+  `CHAIN_DEPTH_LIMIT`. Its `chain_offer` dropped the link under a plan base
+  (`ExportOptions.chain` was "Ignored when prerequisite is set").
+  `export_pass`'s match then wrote a chained bundle (`write_chained`),
+  except for a shallow source or when the source held none of the prior's
+  tips. In those cases, and with no link, it wrote a based or
   self-contained one (`write_bundle`). At the limit, v1 re-bases: a
   self-contained bundle, which re-packs the item's whole history.
+
+Since L6a these rules are `git_carry::decide::decide`, and the code reads
+its inputs in stages, deciding at each. `prepare_base` decides on the base
+alone. `capture_item` decides on the record, reading a retained bundle's
+bound base only when the decision rests on it. The writer
+`shared::write_capture`, which `export_pass` calls, decides again on the
+offer once the pass has read whether the source is shallow. It queries the
+source's tips only when the decision rests on them, exactly where v1 did.
+Each stage is a function of `decide.rs` that takes its lazy read as a
+callback (`decide_recorded`, `decide_offered`), so P67 checks that the
+stages the code runs, composed, decide what one call on all the inputs
+decides. An estate test drives the bound-base read through `capture`
+itself: a retained based bundle bound to a lost base refuses
+`RECEIPT_BINDING_INVALID` while the group's regenerated base is retained.
 
 **Q46's re-root policy, as this model reads it.** The ruling (Decision 4,
 option A) is "a re-root policy plus STATE/corpus GC that never deletes a
@@ -1327,9 +1354,9 @@ of every closed union is reached by some row. P67 draws `-` inputs. `rows
 
 | Property | Statement | SLO | Rulings | Code symbols (pending) | P-tests |
 |---|---|---|---|---|---|
-| `ChainDepthBounded` | Every bundle's chain is at most the limit deep, so a restore stages at most limit + 1 bundles. Under Q46 its root is younger than the window. | S3, S4 | OI-1003-Q15, OI-1003-Q46 | `CHAIN_DEPTH_LIMIT`, `chainable`, `chain_offer`, `chain_links`, `ExportOptions`, `export_pass`, `write_chained` (decide.rs L6a; the re-root window L8) | P67, P71 |
+| `ChainDepthBounded` | Every bundle's chain is at most the limit deep, so a restore stages at most limit + 1 bundles. Under Q46 its root is younger than the window. | S3, S4 | OI-1003-Q15, OI-1003-Q46 | `CHAIN_DEPTH_LIMIT`, `chainable`, `chain_offer`, `chain_links`, `ExportOptions`, `export_pass`, `write_capture`, `decide`, `Rebase` (the re-root window L8) | P67, P71 |
 | `PrereqsSatisfiedByEarlierLinks` | A restore whose digests check never fails `verify_bundle`: every bundle it applies (the oldest link's base first, under fix 2) declares only the prerequisite tips of intact bundles applied before it. A bundle's header (`ExportOptions.chain`'s tips, or the base's) and its `.prior` (the link `Prior`) are separate values in the model, as in the code, so this is the claim that a capture keeps them in step. | S4 | OI-1003-Q15, R-N72 | `flatten`, `prerequisites`, `verify_bundle`, `source_held_tips`, `write_bundle` (flatten's base import L6b; a re-root's header prerequisites and `.prior` from one chain path L8) | P68, P67 |
-| `BrokenLinkNeverReuseHit` | A capture never reuses a record whose custody is broken: a missing or rewritten link, a lost base, a missing sidecar. | S3, S4 | OI-1003-Q15, R-N72 | `retained_capture`, `chain_links`, `LinkBinding` (decide.rs L6a) | P42, P67 |
+| `BrokenLinkNeverReuseHit` | A capture never reuses a record whose custody is broken: a missing or rewritten link, a lost base, a missing sidecar. | S3, S4 | OI-1003-Q15, R-N72 | `retained_capture`, `chain_links`, `LinkBinding`, `decide`, `Inputs` | P42, P67 |
 | `BaseNotReplacedWhileDepended` | The plan base record never moves while a record depends on its base. | S4 | OI-1003-Q15, R-N72 | `prepare_base`, `retained_base`, `requires_base` (the never-replace assertion L6b) | P68 |
 | `GCNeverDeletesDepended` | GC never removes a bundle that a record or the base record depends on. GC's own choice is definitional (it collects one bundle that nothing depends on per step); what the invariant checks is that no later step makes a record depend on a collected bundle. It holds only with one CORPUS writer at a time: L8's GC must take a CORPUS-level exclusive lock that every capture and every apply also take. | S4 | OI-1003-Q46 | `chain_links` (STATE and CORPUS GC L8; GC's CORPUS-level exclusive lock L8) | P71 |
 | `SidecarsBeforeRecord` | A record names a published bundle whose dependency sidecars exist. | Durability, S4 | OI-1003-Q15, R-N86 | `capture_item`, `publish_bundle`, `publish_prior`, `publish_sidecars` (the `.reuse` sidecar L7) | P70 |
@@ -1388,6 +1415,13 @@ symbols. The slowest row was `MC_gc_live` at 304 s (liveness); the core,
 its configs are unchanged since the first round's run, in which its 43 rows
 matched; its grounding (66 operators, 16 constants, 19 mutations, 19 code
 symbols) passed again under the new rule.
+
+L6a's check (2026-10-05, sting, load about 6): `just tla-check MC_gc_core`
+grounded 27 GitCarry code symbols (with `write_capture` for `write_chained`,
+and `decide`, `Rebase` and `Inputs`) and printed 7 pending ones. The
+self-test was INCONCLUSIVE as expected, and `MC_gc_core` passed at 45,062
+distinct states, unchanged. `just formal-nv` matched all 55 rows, 0
+differing, and `rows --check` found the 363 rows current.
 
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
@@ -1595,9 +1629,11 @@ differed.
 - **Bare captures** (#172). `apply_item` refuses a bare capture planned with
   a workspace (`refuse_bare_capture`), before any chain or base step. That
   is a typed refusal outside custody.
-- **The code's `decide`.** It is pending (L6). Until P67 checks it against
-  the pinned rows, the decision rules here are a reading of the code at
-  8dc26c1, cdfe5f4 and b8521c2, not a check of it.
+- **The code beyond v1.** P67 checks the Rust `decide` against all 363
+  rows, so its L6b and L8 policies are checked too. The callers run only
+  v1's (`Policy::V1`) and refuse a plan v1 cannot carry out, so what the
+  code does with an L6b or L8 decision is unchecked until each lane lands
+  its custody.
 
 ## Frozen names
 
