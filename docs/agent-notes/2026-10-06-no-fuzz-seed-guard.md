@@ -7,6 +7,13 @@ No PR opened (the coordinator opens it).
 **Rulings:** OI-1003-Q7 (property tests with fixed seeds, no fuzzing),
 OI-1003-Q14, OI-1003-Q60, R-N13 (this note).
 
+## Shas
+
+- `2046563`: seed every proptest through `prop_config`; add the guard.
+- `9e36a98`: review round 1. The guard accepts only the helper call as the
+  whole config; the plan bullet is reworded to match.
+- The commit that carries this note follows `9e36a98`.
+
 ## What was wrong
 
 `ProptestConfig::default()` means `RngSeed::Random` and a
@@ -23,7 +30,7 @@ Two more files carried their own fixed-seed configs instead of
 (a mirrored copy of the helper). `tests/refusal_taxonomy.rs` does the same and
 is L5's file, so it was left alone.
 
-## What changed
+## What changed (`2046563`)
 
 - P1 and P2 run through `crate::test_support::prop_config` with their old case
   counts (P1: 256, 8 under Miri; P2: 48). Their seed moved from random to
@@ -34,56 +41,89 @@ is L5's file, so it was left alone.
   shape.
 - `git_estimate_dag.rs` drops its mirror and compiles `src/test_support.rs` as a
   `#[path]` module. The seed (`CI_SEED`), the 12 cases and the deep switch are
-  identical, and the two can no longer drift. No library API was widened.
+  identical. No library API was widened.
 - New `crates/bulkload-agent/tests/prop_seed_guard.rs`, auto-discovered (no
-  `Cargo.toml` edit), so it runs in `cargo test --workspace` and check-fast. It
-  reads every workspace `.rs` file (symlinks not followed; hidden dirs,
-  `target`, `bazel-*` skipped; comment lines ignored) and fails on:
-  - a `ProptestConfig` or `test_runner::Config` construction;
-  - any `RngSeed`;
-  - a local `fn prop_config`;
-  - a `#[proptest]` or `TestRunner::` without the helper;
-  - a `proptest!` block whose first item is not
-    `#![proptest_config(test_support::prop_config(..))]`. A bare
-    `prop_config(..)` passes only where the file imports
-    `test_support::prop_config`.
+  `Cargo.toml` edit), so it runs in `cargo test --workspace` and check-fast.
+- `docs/plans/2026-10-03-property-test-plan.md`: the P1, P2 and P66 rows, the
+  inventory row, §1 Conventions and the §3 contract-test bullet.
 
-  The guard skips two files: the helper and the guard itself, whose test
-  inputs spell the patterns it refuses. Its tests:
-  - `the_helper_fixes_the_seed_and_persists_nothing` checks `RngSeed::Fixed(CI_SEED)`
-    and `failure_persistence: None`;
-  - `the_guard_refuses_each_escape` and `the_guard_accepts_the_helper` cover the
-    patterns;
-  - `the_exemption_list_only_shrinks` keeps at most 2 entries and 9 findings,
-    with the list sorted and unique.
-- Exemptions, each pinned to its **exact** finding count (fewer or more fails):
-  - `tests/git_carry_v2.rs`: 3 findings. It disappears with L5 (carry_v2
-    deletion). A missing exempt file is tolerated and logged, so L5 does not
-    have to edit the guard. Drop the entry afterwards.
-  - `tests/refusal_taxonomy.rs`: 6 findings. It migrates onto the helper
-    after L5 lands.
-- `docs/plans/2026-10-03-property-test-plan.md` changes:
-  - the P1 and P2 rows state their seed policy;
-  - the inventory row records the move;
-  - §1 Conventions describes the guard;
-  - the §3 contract-test bullet is marked landed;
-  - P66's "mirrored `prop_config`" now names the `#[path]` module.
+## Review round 1 (`9e36a98`)
+
+The first guard was a substring test: a line passed if it contained
+`test_support::prop_config(` anywhere. A struct update over the helper, a
+trailing comment that spelled the helper, and a `Config` brought in by a
+braced or glob import all passed with no finding. The guard now reads this
+way (still text based, one line at a time):
+
+- **Accepted, and nothing else:** the helper call as the whole config on one
+  line.
+  - `#![proptest_config(test_support::prop_config(<cases>))]`, with an optional
+    `crate::`, `self::` or `super::`; only a `//` comment may follow `))]`.
+  - `TestRunner::new(test_support::prop_config(<cases>))`, plus the plain
+    import `use proptest::test_runner::TestRunner;`.
+  - A bare `prop_config(..)` only under the plain import
+    `use <path>::test_support::prop_config;`.
+- **Refused on any line** (a trailing comment is read as code):
+  - `ProptestConfig`;
+  - `test_runner::Config`, `test_runner::{`, `test_runner::*`,
+    `test_runner as`;
+  - the bare word `Config` in a file that uses proptest;
+  - `RngSeed` / `rng_seed`; `FileFailurePersistence` / `failure_persistence`;
+  - `fn prop_config`, `as prop_config`, `as test_support`;
+  - any other `proptest_config(`, `#[proptest` or `TestRunner`;
+  - a `proptest!` block with no config.
+- New test `the_guard_refuses_a_config_built_over_the_helper` holds the
+  review's inputs with the lines that must be findings;
+  `the_guard_refuses_each_escape` grew from 9 to 35 rows.
+- **Exemption counts moved because the rules are stricter, not because the
+  files changed:** `git_carry_v2.rs` 3 to 4, `refusal_taxonomy.rs` 6 to 7,
+  `FINDINGS_CEILING` 9 to 11. The guard is not on main yet, so the "never
+  raised" ceilings are set here for the first time. L5's copy of
+  `refusal_taxonomy.rs` also scores exactly 7.
+- The plan's §1 guard bullet now says the check is a line-based text match
+  and lists what it accepts and refuses.
 
 ## Evidence
 
-- Green run: `cargo test -p bulkload-agent --test prop_seed_guard`: 5 passed,
+- `cargo test -p bulkload-agent --test prop_seed_guard`: 6 passed,
   `scanned=83 exempt_present=2 escapes=0`.
-- Red run, in a scratch copy of the tree: P1 was reverted to
-  `ProptestConfig { cases: 256, ..ProptestConfig::default() }` and the guard
-  failed with these two findings:
-  - `crates/bulkload-agent/src/io/buf/tests.rs:116: proptest! block without
-    #![proptest_config(test_support::prop_config(..))]`
-  - `crates/bulkload-agent/src/io/buf/tests.rs:118: ProptestConfig outside the
-    helper`
+- Red run of `2046563`, in a scratch copy of the tree: P1 reverted to
+  `ProptestConfig { cases: 256, ..ProptestConfig::default() }` failed the guard
+  at `io/buf/tests.rs:116` and `:118`. The scratch copy was deleted.
+- `just check-fast` on `9e36a98`'s tree (CI toolchain, `nix develop .#default`,
+  under the shared check-fast lock, exit 0; it queued about 90 minutes behind the other lanes on the lock).
 
-  The scratch copy was deleted afterwards.
-- `just check-fast` (CI toolchain, `nix develop .#default`, under the shared
-  check-fast lock): green; see the commit's lane receipt.
+## Landing order (blocks two other lanes)
+
+The guard was sized against `origin/main` `b6ecd50`. Two concurrent lanes add
+integration tests that mirror the helper the way `git_estimate_dag.rs` used
+to. A mirror is seeded, so it follows the policy, but the guard refuses it.
+Each branch passes check-fast alone; main goes red on
+`every_property_routes_through_the_shared_helper` once this guard and either
+of them are both merged. Counts from a read-only scan of the sibling
+worktrees with this round's rules:
+
+| Lane | File | Findings |
+|---|---|---|
+| s3-props-p21-p23 | `tests/s3_transfer_resume.rs` | 15 |
+| s3-props-p21-p23 | `tests/s3_walk_resume.rs` | 10 |
+| s2-shm-157 | `tests/sqlite_wal_index.rs` | 13 |
+
+What each of those files needs before the second merge:
+
+- delete the local `CI_SEED`, `DEEP` and `fn prop_config`, and the
+  `use proptest::test_runner::{Config, RngSeed, ..};` line;
+- add `#[path = "../src/test_support.rs"] mod test_support;`;
+- write each block as `#![proptest_config(test_support::prop_config(N))]`;
+- in `sqlite_wal_index.rs`, import `use proptest::test_runner::TestRunner;`
+  and build the runner as `TestRunner::new(test_support::prop_config(12))`,
+  with no other use of the `TestRunner` name (a return type counts).
+
+The exemption ceilings are not the way out for them. Either order works:
+they switch before merging, or this guard lands first and they merge main and
+switch. Re-run check-fast on the merged result before the second merge.
+This lane cannot write in their worktrees; the coordinator has to pass this
+on.
 
 ## Open
 
@@ -92,9 +132,22 @@ is L5's file, so it was left alone.
   - migrate `refusal_taxonomy.rs` onto the helper (its seed
     `0x5733_7265_6675_7365` becomes `CI_SEED`) and drop its entry;
   - lower `EXEMPT_CEILING` and `FINDINGS_CEILING` to match.
-- The guard is text based. It does not see a config built through a macro
-  that hides the `proptest!` spelling, or a block comment (`/* */`) that
-  hides a pattern.
-- The guard does not refuse a stray `proptest-regressions/` directory. A
-  leftover in a developer's checkout would make it red locally without
-  showing a regression in the tree.
+- The plan's P66 row edit conflicts with L5 (rewrites P59 and P66) and L6a
+  (adds P67 below P66). Whoever merges second resolves it by hand.
+- The guard is text based and reads one line at a time.
+  - It refuses valid helper-routed code in another layout: a config split
+    over two lines, a braced helper import, `TestRunner` as a type in a
+    signature, a refused word in a trailing comment.
+  - It does not see a config built through a macro or an alias that hides
+    every refused spelling, a block comment (`/* */`) that hides a pattern,
+    or code pulled in by `include!` from a non-`.rs` file.
+- Exemptions are pinned by count, not by content, and a missing exempt file
+  is tolerated. The ceilings are literals in the guard's own file, so they
+  bind by review only.
+- The helper ends with `..Config::default()`, which reads `PROPTEST_*`
+  environment variables for the fields it does not set. Nothing asserts that
+  `BULKLOAD_PROPTEST_DEEP` is unset in CI.
+- `tests/refs_scale_distinct.rs` still mirrors `test_support::DEEP` as a local
+  constant. The guard does not look for that.
+- The plan's inventory row still says "Existing `proptest!` blocks: 3".
+- The guard does not refuse a stray `proptest-regressions/` directory.
