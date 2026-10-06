@@ -80,11 +80,17 @@
 (*     Under AdoptUnrowed (the code since #169) each such output carries  *)
 (*     its capture record and is adopted on resume without a read         *)
 (*     (MC_r25_unrowed_bytes, MC_r25_strict_deep). The record is a field  *)
-(*     of the file (rec): the key it was captured under and the bytes it  *)
-(*     names; the output's hash check is equality of versions. Losing the *)
-(*     record (no extended attributes) only costs today's re-read, so it  *)
-(*     is not modelled. Salvaged temporaries are folded away (see above)  *)
-(*     and not covered by it.                                             *)
+(*     of the file (rec): the walked row it was captured from (its stat   *)
+(*     version, with no authority) and the bytes it names; the output's   *)
+(*     hash check is equality of versions. A staged file gets it before   *)
+(*     its seal (NewOut); an existing output adopted against a manifest   *)
+(*     gets it once verified (RecvEnd), and counts as held strictly once  *)
+(*     its adoption is sealed (SealAdopted). ASSUMPTION: the record can   *)
+(*     be written. A file system without extended attributes, or an       *)
+(*     adopted output its owner cannot write, keeps none and costs the    *)
+(*     re-read of before #169 (MC_r25_unrowed_no_adopt); the strict       *)
+(*     reading does not hold there. Salvaged temporaries are folded away  *)
+(*     (see above) and not covered by it.                                 *)
 (*   - A seal (file or directory) is durable at once. On Darwin a seal is *)
 (*     F_BARRIERFSYNC, an ordering barrier, and the group's full flush or  *)
 (*     the store commit's fullfsync is the durability point. That only     *)
@@ -115,7 +121,8 @@
 (*   RecvNeed        A/transfer.rs Outbound::need_chunks, serve_chunks     *)
 (*   RecvEnd         A/transfer.rs Inbound::end, end_streaming,            *)
 (*                   end_filling, publish, adopt;                          *)
-(*                   A/materialize.rs verify_existing                      *)
+(*                   A/materialize.rs verify_existing;                     *)
+(*                   A/transfer/unrowed.rs refresh                         *)
 (*   RecvRefused     A/transfer.rs Inbound::refused                        *)
 (*   SealTemp        A/materialize.rs StagedFile::seal;                    *)
 (*                   A/io/durable.rs seal_file                             *)
@@ -193,7 +200,8 @@ Mutations == {"none", "held_before_commit", "commit_before_fsync",
               "git_optional_locks", "pause_writer", "unbounded_backup",
               "supersede_unchecked", "sweep_displaced", "double_read",
               "untyped_space", "done_before_sync", "skip_output_row",
-              "adopt_unkeyed", "adopt_unverified"}
+              "adopt_unkeyed", "adopt_unverified", "reuse_ignores_row",
+              "adopt_unrecorded"}
 
 ASSUME /\ IsFiniteSet(Seats) /\ Seats # {}
        /\ MaxRuns \in Nat /\ MaxCrashes \in Nat /\ MaxEdits \in Nat
@@ -213,12 +221,19 @@ FirstForeignId == 50 \* bulkload's own output identities are run numbers
 KeyBase == 10        \* row key = authority epoch * KeyBase + stat version
 ASSUME MaxEdits < KeyBase
 
-\* A file's capture record (#169, only under AdoptUnrowed): the row key the
-\* capture was made under and the bytes it names. Key 0 is no record.
+\* A file's capture record (#169, only under AdoptUnrowed): the walked row
+\* the capture was made from and the bytes it names. Key 0 is no record.
 NoRecord == [key |-> 0, data |-> 0]
 
+\* A capture record's key for the entry of row key k
+\* (A/transfer/unrowed.rs record_key): the walked row alone, its stat
+\* version here, with no store authority, so a source store that lost its
+\* authority still finds its outputs' records. Never 0.
+RecordKey(k) == (k % KeyBase) + 1
+
 \* A file at a destination path. cl (ghost, only under TrackStrictHeld):
-\* bulkload published it from a non-racy capture. rec: its capture record.
+\* bulkload published it from a non-racy capture, or verified it against
+\* one and sealed that adoption. rec: its capture record.
 NoFile == [pres |-> FALSE, id |-> 0, data |-> 0, dd |-> TRUE, nd |-> TRUE,
            cl |-> FALSE, rec |-> NoRecord]
 NoTmp  == [st |-> "none", data |-> 0]
@@ -364,7 +379,7 @@ NewOut(s, d, sealed) ==
     [pres |-> TRUE, id |-> run, data |-> d, dd |-> sealed, nd |-> FALSE,
      cl |-> TrackStrictHeld /\ ~dRec[s].racy,
      rec |-> IF AdoptUnrowed /\ ~dRec[s].racy
-             THEN [key |-> dRec[s].key, data |-> d] ELSE NoRecord]
+             THEN [key |-> RecordKey(dRec[s].key), data |-> d] ELSE NoRecord]
 
 Durable(f) == IF f.pres THEN [f EXCEPT !.dd = TRUE, !.nd = TRUE] ELSE f
 
@@ -499,7 +514,7 @@ Walk(s) ==
 (* A/transfer.rs Inbound::entry: Reuse iff the output at the path has the  *)
 (* identity this store recorded under the row key (Destination::identity, *)
 (* Store::output_matches). #169 (AdoptUnrowed): otherwise an existing      *)
-(* output whose capture record names this row key and whose own bytes     *)
+(* output whose capture record names this entry's row and whose own bytes *)
 (* hash to the record's root is adopted, also answered Reuse              *)
 (* (Inbound::adopt_unrowed, A/transfer/unrowed.rs prove): it is queued as  *)
 (* an adopted publication, sealed before its row commits, and the source   *)
@@ -508,15 +523,25 @@ Walk(s) ==
 (* absent output Send, or WantManifest when published outputs or salvaged  *)
 (* temporaries could fill chunks (free choice here). The space preflight   *)
 (* (Inbound::admit) may refuse DESTINATION_SPACE_INSUFFICIENT.             *)
+(* Mutations reread_durable / reread_ignore_ledger: the destination never  *)
+(* answers Reuse, by its row or by a capture record. Mutation              *)
+(* src_ledger_carries_r25: either Reuse also needs the source ledger's     *)
+(* row. Mutation reuse_ignores_row: only the row check is gone             *)
+(* (Store::output_matches always false), so a rowed output is adopted      *)
+(* again from its record, hashed, sealed and re-rowed on every run, with   *)
+(* no source read to show it (AdoptOnlyUnrowed).                           *)
 RecvEntry(s) ==
     /\ sess = "on" /\ dEnt[s] = "none" /\ msg[s].t = "entry"
     /\ LET k == msg[s].v
            reuse == /\ RowMatches(s, k)
-                    /\ Mutation \notin {"reread_durable", "reread_ignore_ledger"}
+                    /\ Mutation \notin {"reread_durable", "reread_ignore_ledger",
+                                         "reuse_ignores_row"}
                     /\ (Mutation = "src_ledger_carries_r25" => msg[s].b)
            adopt == /\ AdoptUnrowed
+                    /\ Mutation \notin {"reread_durable", "reread_ignore_ledger"}
+                    /\ (Mutation = "src_ledger_carries_r25" => msg[s].b)
                     /\ out[s].pres /\ out[s].rec.key # 0
-                    /\ (out[s].rec.key = k \/ Mutation = "adopt_unkeyed")
+                    /\ (out[s].rec.key = RecordKey(k) \/ Mutation = "adopt_unkeyed")
                     /\ (out[s].data = out[s].rec.data \/ Mutation = "adopt_unverified")
            choices == IF reuse THEN {"reuse"}
                       ELSE IF adopt THEN {"adopt_unrowed"}
@@ -656,7 +681,14 @@ RecvNeed(s) ==
 (* A/transfer.rs Inbound::end, end_streaming, end_filling: a written or    *)
 (* superseding output is staged and queued for its group commit (publish); *)
 (* an adopted one is verified byte for byte (verify_existing) and queued,  *)
-(* or refused GIT_DESTINATION_OCCUPIED with Held{false} at once.           *)
+(* or refused GIT_DESTINATION_OCCUPIED with Held{false} at once. #169: a   *)
+(* verified output of a non-racy capture gets that capture's record before *)
+(* it is queued (Inbound::adopt, A/transfer/unrowed.rs refresh), as a      *)
+(* staged file does in NewOut, so an adoption whose row never commits is   *)
+(* adopted from it next run. A power loss before the adoption's seal may   *)
+(* lose the record; that leaves the state a crash before this step leaves. *)
+(* Mutation adopt_unrecorded: no record is written here (the code before   *)
+(* the #169 review).                                                       *)
 RecvEnd(s) ==
     /\ sess = "on" /\ msg[s].t = "end" /\ dEnt[s] \in {"streaming", "filling"}
     /\ LET d == msg[s].v
@@ -670,12 +702,15 @@ RecvEnd(s) ==
                                               racy |-> racy, id |-> 0, kind |-> plan]]
               /\ dEnt' = [dEnt EXCEPT ![s] = "queued"]
               /\ msg' = [msg EXCEPT ![s] = NoMsg]
-              /\ UNCHANGED outc
+              /\ UNCHANGED <<out, outc>>
          [] plan = "adopt" /\ out[s].pres /\ out[s].data = d ->
               /\ dPub' = [dPub EXCEPT ![s] = "adopt_wait"]
               /\ dRec' = [dRec EXCEPT ![s] = [key |-> dKey[s], data |-> d,
                                               racy |-> racy, id |-> out[s].id,
                                               kind |-> "adopt"]]
+              /\ out' = [out EXCEPT ![s].rec =
+                           IF AdoptUnrowed /\ ~racy /\ Mutation # "adopt_unrecorded"
+                           THEN [key |-> RecordKey(dKey[s]), data |-> d] ELSE @]
               /\ dEnt' = [dEnt EXCEPT ![s] = "queued"]
               /\ msg' = [msg EXCEPT ![s] = NoMsg]
               /\ UNCHANGED <<tmp, outc>>
@@ -683,8 +718,8 @@ RecvEnd(s) ==
               /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, FALSE, "none")]
               /\ dEnt' = [dEnt EXCEPT ![s] = "done"]
               /\ outc' = [outc EXCEPT ![s] = "GIT_DESTINATION_OCCUPIED"]
-              /\ UNCHANGED <<tmp, dPub, dRec>>
-    /\ UNCHANGED <<srcVars, authVars, sVars, dKey, dPlan, out, outPrev, disp, dstRows,
+              /\ UNCHANGED <<tmp, dPub, dRec, out>>
+    /\ UNCHANGED <<srcVars, authVars, sVars, dKey, dPlan, outPrev, disp, dstRows,
                    runVars, estVars, reads, srcOps, rc, runReads, heldAtStart,
                    changedRun, committedRun, everCommitted, clobbered>>
 
@@ -747,12 +782,16 @@ DirSeal(s) ==
 
 (* A/materialize.rs PublishSink::commit, Publication::Adopted: seal_file  *)
 (* on the verified descriptor, then its directory is sealed with the group.*)
+(* From here the destination holds a non-racy capture's verified bytes     *)
+(* durably, row or no row (ghost cl, under TrackStrictHeld).               *)
 SealAdopted(s) ==
     /\ dPub[s] = "adopt_wait"
     /\ out' = [out EXCEPT ![s] =
                  IF /\ out[s].pres /\ out[s].id = dRec[s].id
                     /\ Mutation # "adopt_without_seal"
-                 THEN Durable(out[s]) ELSE out[s]]
+                 THEN [Durable(out[s]) EXCEPT
+                         !.cl = @ \/ (TrackStrictHeld /\ ~dRec[s].racy)]
+                 ELSE out[s]]
     /\ dPub' = [dPub EXCEPT ![s] = "ready"]
     /\ UNCHANGED <<PipeUnchanged, dRec, tmp, outPrev, disp, cfails, clobbered>>
 
@@ -1227,14 +1266,28 @@ R25_NoDurableReread == \A r \in reads : ~r.held
 R25_NoCommittedCaptureReread == \A r \in reads : ~r.committed
 
 (* R25 under the strict reading of "held durably" (OI-1002-Q33), where     *)
-(* bulkload's own durable output from a non-racy capture counts as held    *)
-(* with or without a row. Meaningful only under TrackStrictHeld. The code  *)
-(* before #169 fails it (MC_r25_unrowed_no_adopt), the gap between         *)
-(* R25_NoDurableReread and the strict reading; with the capture record's   *)
-(* adoption (AdoptUnrowed, #169) it holds (MC_r25_unrowed_bytes,           *)
-(* MC_r25_strict_deep). OI-1003-Q40 keeps R25_NoDurableReread the SLO's    *)
-(* obligation.                                                             *)
+(* bulkload's own durable output from a non-racy capture, published or     *)
+(* adopted and sealed, counts as held with or without a row. Meaningful    *)
+(* only under TrackStrictHeld. The code before #169 fails it               *)
+(* (MC_r25_unrowed_no_adopt), the gap between R25_NoDurableReread and the  *)
+(* strict reading; with the capture record's adoption (AdoptUnrowed, #169) *)
+(* it holds (MC_r25_unrowed_bytes, MC_r25_strict_deep, MC_r25_strict_main, *)
+(* and MC_r25_strict_unsealed across a lost source authority), for         *)
+(* non-racy captures whose record could be written (header, ABSTRACTIONS). *)
+(* OI-1003-Q40 keeps R25_NoDurableReread the SLO's obligation.             *)
 R25_StrictNoDurableReread == \A r \in reads : ~r.strict
+
+(* #169: the capture record's adoption is for outputs with no row. An      *)
+(* output this store holds a matching row for is answered Reuse from the   *)
+(* row (Store::output_matches) and is never adopted, hashed and re-rowed   *)
+(* again. Such a re-adoption reads no source byte, so no R25 or S3         *)
+(* property sees it; this one does (MC_neg_reuse_ignores_row). Trivial     *)
+(* unless AdoptUnrowed.                                                    *)
+AdoptOnlyUnrowed ==
+    \A s \in Seats :
+        (dEnt[s] = "adopt_queued" /\ dPub[s] = "adopt_wait")
+            => ~\E r \in dstRows :
+                    r.seat = s /\ r.key = dRec[s].key /\ r.id = dRec[s].id
 
 (* A seat is read at most once a session (P23).                            *)
 ReadOnce == \A s \in Seats : rc[s] <= 1

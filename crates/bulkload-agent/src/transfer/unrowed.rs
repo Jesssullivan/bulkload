@@ -5,36 +5,55 @@
 //! and its group's row commit, or a group whose store commit failed (#100),
 //! leaves the output's bytes durable at the final path with no row. Before
 //! #169 the next run asked the source for a manifest, which reads the seat
-//! once more (`MC_r25_unrowed_bytes`).
+//! once more (`MC_r25_unrowed_no_adopt`).
 //!
-//! The capture record closes that gap. Before a staged file is sealed, the
-//! destination writes on it, as an extended attribute, which capture its
-//! bytes are: a digest of the source-side row key (the source store's
-//! authority from `Start` and the walked row, stat identity included), the
+//! The capture record closes that gap. The destination writes on the output,
+//! as an extended attribute, which capture its bytes are: a digest of the
+//! walked row (the seat's path and stat identity, [`record_key`]), the
 //! capture's manifest root and its size. Only a non-racy capture gets one: a
-//! racy capture's stat identity cannot vouch for its bytes (#86). The group's
-//! file seal makes the record durable with the data (class meta, like the
-//! mode), so wherever a crash leaves the published bytes, it leaves the
-//! record too (`materialize::adoption_power_loss`).
+//! racy capture's stat identity cannot vouch for its bytes (#86). There are
+//! two writers:
+//!
+//! - a staged file gets its record before its seal (`Inbound::publish`), so
+//!   the group's file seal makes the record durable with the data (class
+//!   meta, like the mode), and wherever a crash leaves the published bytes
+//!   it leaves the record too (`materialize::adoption_power_loss`);
+//! - an existing output adopted against a manifest gets, or has refreshed,
+//!   its record once its bytes are verified (`Inbound::adopt`, [`refresh`]),
+//!   and its row records the identity after that write. Its adoption's file
+//!   seal makes the record durable before its row commits.
+//!
+//! The key holds no store authority. The walked row's device, inode, size
+//! and times already name the seat, and the output's own hash proves the
+//! bytes, so a source store that was recreated (a new authority) still finds
+//! its outputs' records.
 //!
 //! On resume, an entry whose output exists with no matching row is adopted
-//! when its record names this entry's row key (the seat's stat identity has
-//! not moved since that non-racy capture, so its content has not either),
-//! and the output's own bytes, chunked as the source chunks and hashed, give
-//! the recorded root and size under an unchanged identity and the row's
-//! mode. The entry is then answered `Reuse`: the source reads nothing. The
-//! output is queued as an adopted publication, so its file and directory are
-//! sealed before its row commits, as for any adoption (#77 round 2, N4).
+//! when its record names this entry's row (the seat's stat identity has not
+//! moved since that non-racy capture, so its content has not either), and
+//! the output's own bytes, chunked as the source chunks and hashed, give the
+//! recorded root and size under an unchanged identity and the row's mode.
+//! The entry is then answered `Reuse`: the source reads nothing. The output
+//! is queued as an adopted publication, so its file and directory are sealed
+//! before its row commits, as for any adoption (#77 round 2, N4).
 //!
-//! What cannot be proven falls back to the manifest path of before and is
-//! counted on the counters line (`transfer_unrowed_unproven`): an existing
-//! output with no record (a racy capture's, one published before #169, one
-//! on a file system without extended attributes, or a file bulkload did not
-//! publish) or with a record that does not verify (bytes rewritten in place,
-//! a changed mode). A record of another row key is not counted: the seat
-//! moved since that capture, and reading it again is required. A staged file
-//! whose record could not be written is counted when it is written
-//! (`transfer_capture_records_unset`).
+//! What cannot be proven falls back to the manifest path of before, which
+//! reads the seat:
+//!
+//! - counted `transfer_unrowed_unproven`: an existing output with no record
+//!   (a racy capture's, one published before #169, one on a file system
+//!   without extended attributes, one whose record could not be written, or
+//!   a file bulkload did not publish) or with a record that does not verify
+//!   (bytes rewritten in place, a changed mode);
+//! - not counted: a record that names another row. The seat's row changed
+//!   since that capture (its stat identity moved, or the walk now fills
+//!   other row fields), and reading it again is required.
+//!
+//! A record that could not be written is counted when the write fails
+//! (`transfer_capture_records_unset`): a file system without extended
+//! attributes, or an adopted output whose mode gives its owner no write
+//! permission (a `user.` attribute needs it; a staged file is still 0600
+//! when its record is written).
 //!
 //! The record stays on the output after its row commits: removing it would
 //! move the output's ctime, which is part of the identity its row records.
@@ -47,8 +66,9 @@ use bulkload_proto::frame::{manifest_root, ChunkSpec};
 
 use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
+use crate::refuse::RefuseAt as _;
 use crate::transfer_store::{row_key, ChunkHint};
-use crate::{Result, RowSchema};
+use crate::{BulkloadRefusal, Result, RowSchema};
 
 /// Encoding version of a capture record.
 const RECORD_VERSION: u8 = 1;
@@ -96,14 +116,18 @@ impl CaptureRecord {
     }
 }
 
-/// The capture record's key for `row` walked under the source store's
-/// `authority` (from `Start`): a digest of [`row_key`] over them, so it is
-/// the same wherever the destination root lives.
+/// Domain of a capture record's key, in the place a row key has a store
+/// authority.
+const RECORD_DOMAIN: &[u8] = b"bulkload capture record";
+
+/// The capture record's key for a walked `row`: a digest of the row under
+/// [`RECORD_DOMAIN`]. It names the seat by its path and stat identity alone,
+/// so it is the same for every source store, session and destination root.
 ///
 /// # Errors
 /// Refuses a row that does not encode.
-pub fn record_key(authority: &[u8], row: &RowSchema) -> Result<[u8; 32]> {
-    Ok(crate::hash::hash_bytes(&row_key(authority, row)?))
+pub fn record_key(row: &RowSchema) -> Result<[u8; 32]> {
+    Ok(crate::hash::hash_bytes(&row_key(RECORD_DOMAIN, row)?))
 }
 
 /// Write `record` on a staged file, before its seal. A file system without
@@ -123,13 +147,48 @@ pub fn read_record(file: &File) -> Option<CaptureRecord> {
         .and_then(|bytes| CaptureRecord::decode(&bytes))
 }
 
+/// Give an existing output, whose bytes were just verified against a
+/// non-racy capture's manifest under the identity `verified`, that capture's
+/// `record`, and return the identity its row must record.
+///
+/// An output that already carries exactly this record is left alone, so its
+/// ctime does not move. Otherwise the record is written (replacing a stale
+/// one), which moves the ctime: the identity is taken again, and it must
+/// differ from `verified` in nothing else, or the file changed after its
+/// bytes were checked. A record that cannot be written is counted
+/// ([`write_record`]) and the output keeps its verified identity.
+///
+/// # Errors
+/// Refuses an output that changed between its verification and its record.
+pub fn refresh(
+    file: &File,
+    record: &CaptureRecord,
+    verified: StatIdentity,
+) -> Result<StatIdentity> {
+    if read_record(file) == Some(*record) {
+        return Ok(verified);
+    }
+    write_record(file, record);
+    let after = StatIdentity::from_metadata(&file.metadata().refuse_at("unrowed::refresh")?);
+    if (StatIdentity {
+        ctime_ns: verified.ctime_ns,
+        ..after
+    }) == verified
+    {
+        Ok(after)
+    } else {
+        Err(BulkloadRefusal::GitDestinationOccupied)
+    }
+}
+
 /// What an existing output with no matching row proves.
 #[derive(Debug)]
 pub enum Verdict {
     /// Its bytes are the capture `key` names: the identity they were proven
     /// under, and the first occurrence of each chunk, for the output row.
     Proven(StatIdentity, Vec<ChunkHint>),
-    /// Its record names another capture of the seat: read it again.
+    /// Its record names another row: the seat's row changed since that
+    /// capture, so read it again (not counted).
     Other,
     /// Nothing proves it: the manifest path of before (counted).
     Unproven,

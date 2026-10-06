@@ -46,10 +46,13 @@ let Mutation =
       | sweep_displaced
       | adopt_unkeyed
       | adopt_unverified
+      | reuse_ignores_row
+      | adopt_unrecorded
       >
 
 {- Model properties a config can name: the frozen safety invariants, the
-   wall-clock budget, the strict R25 reading and the temporal properties.
+   wall-clock budget, #169's two properties (the strict R25 reading and
+   AdoptOnlyUnrowed) and the temporal properties.
    The reachability witnesses are a separate type (Witness), so a fail row
    can never name one and a reach row can name nothing else.
 -}
@@ -73,6 +76,7 @@ let Property =
       | ClosureAccounted
       | WithinBudget
       | R25_StrictNoDurableReread
+      | AdoptOnlyUnrowed
       | RunsClose
       | AllRunsFinish
       >
@@ -210,9 +214,11 @@ let InvariantRow =
      is the sanity check. Every pass row checks all of them, and every one
      but TypeOK must have a fail row and a traceability row.
    - budget: the wall-clock bound (WithinBudget), checked by every config.
-   - finding: R25's strict reading, beside the safety invariants: checked
-     by its finding row (the code before #169) and by the pass rows that
-     model #169's capture-record adoption.
+   - finding: #169's properties, beside the safety invariants and not
+     frozen. R25's strict reading is checked by its finding row (the code
+     before #169) and by the strict pass rows; AdoptOnlyUnrowed by every
+     pass row that models #169's capture-record adoption, and by its
+     mutation row.
    - temporal: a temporal property, checked under PROPERTY.
 -}
 let PropertyClass = < safety | budget | finding | temporal >
@@ -325,14 +331,19 @@ let propertyTable =
         , index = 18
         , class = PropertyClass.finding
         }
+      , AdoptOnlyUnrowed =
+        { property = Property.AdoptOnlyUnrowed
+        , index = 19
+        , class = PropertyClass.finding
+        }
       , RunsClose =
         { property = Property.RunsClose
-        , index = 19
+        , index = 20
         , class = PropertyClass.temporal
         }
       , AllRunsFinish =
         { property = Property.AllRunsFinish
-        , index = 20
+        , index = 21
         , class = PropertyClass.temporal
         }
       }
@@ -381,6 +392,8 @@ let mutationIndex =
           , sweep_displaced = 18
           , adopt_unkeyed = 19
           , adopt_unverified = 20
+          , reuse_ignores_row = 21
+          , adopt_unrecorded = 22
           }
           m
 

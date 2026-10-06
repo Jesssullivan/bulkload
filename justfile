@@ -647,15 +647,20 @@ tla-check *configs:
 # mktemp directory under TMPDIR. Its rows:
 # - BulkloadTransfer: the presets nv_core and nv_ledger must reach TLC's
 #   distinct-state counts of record, MC_nv_core's 15,834 and MC_nv_ledger's
-#   142,450, with no invariant violated and no deadlock;
+#   142,450 (the transfer before #169), and nv_core_adopt and
+#   nv_ledger_adopt must reach MC_nv_core_adopt's 17,027 and
+#   MC_nv_ledger_adopt's 185,852 (the code since #169: the capture record
+#   and its adoption), with no invariant violated and no deadlock;
 # - every MC_neg_ row of the catalogue inside the explorer's domain (the
 #   evaluated catalogue's nversion list) runs at its own bound, passed as
-#   the explorer's bound flags, checking TypeOK and the row's named
-#   property, as its TLC config does; it must violate exactly that property;
+#   the explorer's bound flags and switches (--adopt, --strict-held),
+#   checking TypeOK and the row's named property, as its TLC config does;
+#   it must violate exactly that property;
 # - each primary row among them runs again with every safety invariant
-#   checked, on the explorer and on TLC with one worker (the catalogue's
-#   scratch config for it): both must stop at the same first violated
-#   invariant after the same number of states;
+#   checked (and #169's, where the row's constants set them), on the
+#   explorer and on TLC with one worker (the catalogue's scratch config for
+#   it): both must stop at the same first violated invariant after the same
+#   number of states;
 # - GitCarry: crates/bulkload-agent/tests/data/decide_rows.tsv must be
 #   GitCarryCore's rendering byte for byte (`rows --check`), and its
 #   closed unions (`schema`) must equal the catalogue's Basis and Decision
@@ -749,7 +754,7 @@ formal-nv:
         for ((i = 0; i < rows; i++)); do
             if [[ $rows_key == nversion ]]; then
                 IFS=$'\t' read -r name mutation named primary flags < <(
-                    "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, \"--seats \" + .seats + \" --runs \" + (.runs | tostring) + \" --crashes \" + (.crashes | tostring) + \" --edits \" + (.edits | tostring) + \" --foreign \" + (.foreign | tostring)] | @tsv" "$scratch/catalogue.json")
+                    "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, \"--seats \" + .seats + \" --runs \" + (.runs | tostring) + \" --crashes \" + (.crashes | tostring) + \" --edits \" + (.edits | tostring) + \" --foreign \" + (.foreign | tostring) + .switches] | @tsv" "$scratch/catalogue.json")
             else
                 IFS=$'\t' read -r name mutation named primary flags < <(
                     "$jq" -r ".$rows_key[$i] | [.name, .mutation, .property, .primary, .flags] | @tsv" "$scratch/catalogue.json")
@@ -798,7 +803,7 @@ formal-nv:
     }
     # BulkloadTransfer.tla: TLC's distinct-state counts of record (README.md,
     # "N-version core").
-    cross_check "$scratch/explorer" BulkloadTransfer.tla nversion nv_core=15834 nv_ledger=142450
+    cross_check "$scratch/explorer" BulkloadTransfer.tla nversion nv_core=15834 nv_ledger=142450 nv_core_adopt=17027 nv_ledger_adopt=185852
     # GitCarry.tla (OI-1003-Q43): the pinned rows, the closed unions, then
     # the custody explorer at TLC's counts of record (README.md, "GitCarry").
     rows_file={{ root }}/crates/bulkload-agent/tests/data/decide_rows.tsv

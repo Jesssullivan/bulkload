@@ -233,17 +233,17 @@ fn a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit() {
 /// sealed, renamed into place and its directory sealed, and no commit. The
 /// checker builds every power-loss state of that run, and each one is
 /// resumed by a real `copy` into its own materialized destination, from a
-/// fresh copy of the source store (its authority, no ledger row: the crashed
-/// run never got `Held`). A state whose output survived at the final path
-/// with its bytes must be adopted from its record with 0 source bytes read;
-/// any other state is completed by reading the seat once. Both kinds must
-/// occur.
+/// source store of its own (a new authority and no ledger row: the crashed
+/// run never got `Held`, and the record's key holds no authority). A state
+/// whose output survived at the final path with its bytes must be adopted
+/// from its record with 0 source bytes read; any other state is completed by
+/// reading the seat once. Both kinds must occur.
 #[test]
 fn an_unrowed_output_is_adopted_without_source_reads() {
     const SIZE: usize = 150_000;
     let base = scratch("unrowed");
     let (source, destination) = (base.join("source"), base.join("destination"));
-    let (source_state, destination_state) = (base.join("source-state"), base.join("state"));
+    let destination_state = base.join("state");
     let payload: Vec<u8> = (0..SIZE)
         .map(|at| u8::try_from((at * 7 + at / 251) % 256).unwrap())
         .collect();
@@ -252,19 +252,8 @@ fn an_unrowed_output_is_adopted_without_source_reads() {
         .into_iter()
         .find(|row| row.rel_path == b"f")
         .unwrap();
-    // The `Start` authority a resume's serve sends: the source store's
-    // authority and the source root's path and identity.
-    let source_root = std::fs::canonicalize(&source).unwrap();
-    let root_meta = std::fs::metadata(&source_root).unwrap();
-    let start = postcard::to_stdvec(&(
-        Store::open(&source_state).unwrap().authority().unwrap(),
-        source_root.as_os_str().as_encoded_bytes(),
-        root_meta.dev(),
-        root_meta.ino(),
-    ))
-    .unwrap();
     let record = crate::transfer::unrowed::CaptureRecord {
-        key: crate::transfer::unrowed::record_key(&start, &row).unwrap(),
+        key: crate::transfer::unrowed::record_key(&row).unwrap(),
         root: bulkload_proto::frame::manifest_root(&chunk_specs(&payload)),
         size: SIZE as u64,
     };
@@ -302,12 +291,10 @@ fn an_unrowed_output_is_adopted_without_source_reads() {
     let report = check(&image, &events, &options, |state, _| {
         serial += 1;
         let survived = std::fs::read(state.join("f")).ok().as_deref() == Some(payload.as_slice());
-        let resume_source_state = base.join(format!("resume-source-state-{serial}"));
-        copy_state(&source_state, &resume_source_state);
         let stats = crate::transfer::copy(
             &source,
             state,
-            &resume_source_state,
+            &base.join(format!("resume-source-state-{serial}")),
             &base.join(format!("resume-state-{serial}")),
         )
         .map_err(|refusal| format!("resume refused: {refusal:?}"))?;
@@ -347,16 +334,6 @@ fn an_unrowed_output_is_adopted_without_source_reads() {
         adopted > 0 && completed > 0,
         "states adopted {adopted}, completed {completed}"
     );
-}
-
-/// Copy a closed store's state root (its database, so its authority).
-fn copy_state(from: &Path, to: &Path) {
-    std::fs::create_dir(to).unwrap();
-    std::fs::set_permissions(to, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
-    }
 }
 
 /// The chunks a capture of `data` sends: `FastCDC` with the engine's bounds,

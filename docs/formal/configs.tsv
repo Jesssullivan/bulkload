@@ -18,6 +18,8 @@ MC_main_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,Chec
 MC_dest_faults	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_nv_core	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
 MC_nv_ledger	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_nv_core_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_nv_ledger_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0g	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
@@ -25,6 +27,9 @@ MC_s2	pass	all	CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,RenameRep
 MC_live	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_r25_unrowed_bytes	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_r25_strict_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_r25_strict_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_r25_strict_unsealed	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_strict_authority	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003
 MC_reach_ledger_manifest	reach	Witness_LedgerManifest	*	-
 MC_reach_ledger_chunks	reach	Witness_LedgerChunkRead	*	-
@@ -59,3 +64,5 @@ MC_neg_supersede_unchecked	fail	NoClobber	*	-
 MC_neg_sweep_displaced	fail	NoClobber	*	-
 MC_neg_adopt_unkeyed	fail	ReuseSound	*	-
 MC_neg_adopt_unverified	fail	RecordImpliesBytes	*	-
+MC_neg_reuse_ignores_row	fail	AdoptOnlyUnrowed	*	-
+MC_neg_adopt_unrecorded	fail	R25_StrictNoDurableReread	*	-

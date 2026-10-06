@@ -1972,9 +1972,6 @@ struct Inbound<'a, W> {
     target: &'a mut Destination,
     store: &'a Store,
     authority: Vec<u8>,
-    /// The source store's authority from `Start`, which keys capture records
-    /// (#169, [`unrowed::record_key`]).
-    source_authority: Vec<u8>,
     committer: &'a Committer<PublishSink>,
     session: SessionChunks,
     stats: TransferStats,
@@ -2065,7 +2062,6 @@ pub fn receive<R: Read, W: Write>(
         target: &mut target,
         store: &store,
         authority: output_authority,
-        source_authority: authority,
         committer: &committer,
         session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
         stats: TransferStats::default(),
@@ -2246,7 +2242,7 @@ impl<W: Write> Inbound<'_, W> {
     /// so the source reads nothing. Its commit outcome reaches the session's
     /// report like any output's. See [`unrowed`].
     fn adopt_unrowed(&mut self, row: &RowSchema, key: &[u8]) -> Result<bool> {
-        let record_key = unrowed::record_key(&self.source_authority, row)?;
+        let record_key = unrowed::record_key(row)?;
         let verdict = match self.target.existing(row) {
             Ok(Some((file, parent))) => match unrowed::prove(&file, row, &record_key) {
                 unrowed::Verdict::Proven(identity, hints) => {
@@ -2612,7 +2608,7 @@ impl<W: Write> Inbound<'_, W> {
                         chunks: specs,
                     };
                     let identity = verify_existing(&file, &row, &manifest)?;
-                    return self.adopt(file, parent, &row, (key, racy), identity);
+                    return self.adopt(file, parent, &row, (key, racy, root), identity);
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -2652,7 +2648,7 @@ impl<W: Write> Inbound<'_, W> {
             Plan::Refuse(refusal) => Err(refusal),
             Plan::Adopt(file, parent) => {
                 let identity = verify_existing(&file, &row, &manifest)?;
-                self.adopt(file, parent, &row, (key, racy), identity)
+                self.adopt(file, parent, &row, (key, racy, root), identity)
             }
             Plan::Write(staging) => {
                 self.open -= 1;
@@ -2669,14 +2665,34 @@ impl<W: Write> Inbound<'_, W> {
     /// Queue a verified existing output for its group commit, which seals
     /// it and its directory before the commit (#77 round 2, N4: an adopted
     /// output is reported held only after that commit).
+    ///
+    /// A non-racy capture's output first gets that capture's record (#169,
+    /// [`unrowed::refresh`]), as a staged file does in [`Self::publish`]: if
+    /// its row then never commits (a failed group, a crash), the next run
+    /// adopts it from the record without a source read. Its row records the
+    /// identity after the record's write, and the group's file seal makes
+    /// the record durable before the row commits.
     fn adopt(
         &self,
         file: std::fs::File,
         parent: Arc<std::fs::File>,
         row: &RowSchema,
-        (key, racy): (Vec<u8>, bool),
+        (key, racy, root): (Vec<u8>, bool, [u8; 32]),
         identity: StatIdentity,
     ) -> Result<()> {
+        let identity = if racy {
+            identity
+        } else {
+            unrowed::refresh(
+                &file,
+                &unrowed::CaptureRecord {
+                    key: unrowed::record_key(row)?,
+                    root,
+                    size: row.size,
+                },
+                identity,
+            )?
+        };
         self.committer.submit(Publication::Adopted {
             record: OutputRecord {
                 key,
@@ -2702,7 +2718,7 @@ impl<W: Write> Inbound<'_, W> {
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
         if !racy {
-            match unrowed::record_key(&self.source_authority, row) {
+            match unrowed::record_key(row) {
                 Ok(record_key) => unrowed::write_record(
                     staged.file(),
                     &unrowed::CaptureRecord {

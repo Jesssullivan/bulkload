@@ -2085,3 +2085,227 @@ fn a_racy_unrowed_output_is_read_again_and_counted() {
     let warm = corpus.run().unwrap();
     assert_eq!((warm.reused, warm.source_bytes_read), (1, 0));
 }
+
+/// #169 review: only a staged publish used to write a capture record, so an
+/// output adopted against a manifest had none (or kept a stale one), and a
+/// group commit that then failed left it durable with no row and no proof:
+/// the next run read its source again. Run 1 captures the seat racily (no
+/// record, no row kept). Run 2 captures it non-racily: the destination
+/// verifies the existing output against the manifest, gives it that
+/// capture's record and queues its adoption, and the group's store commit
+/// fails. Run 3 finds durable bytes with no row and adopts them from the
+/// record: 0 source bytes.
+#[test]
+fn an_output_adopted_against_a_manifest_carries_its_capture_record() {
+    const SIZE: usize = 90_000;
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    std::fs::write(&seat, noise(1691, SIZE)).unwrap();
+    let store_root = destination_store_root(&corpus);
+    let record = || {
+        unrowed::read_record(&std::fs::File::open(corpus.base.join("destination/seat")).unwrap())
+    };
+
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 500_000_000);
+    let racy = corpus.run().unwrap();
+    assert!(racy.refusals.is_empty(), "{racy:?}");
+    drop(clock);
+    assert_eq!(record(), None, "a racy capture has no record");
+    assert_eq!(rows(&corpus), (0, 0), "a racy capture keeps no row");
+
+    let _clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 60 * RACY_GRANULARITY_NS);
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let failed = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    let failed = failed.unwrap();
+    assert_eq!(failed.refusals.len(), 1, "{failed:?}");
+    assert_eq!(
+        (
+            failed.source_bytes_read,
+            failed.bytes_received,
+            failed.unrowed_unproven
+        ),
+        (SIZE as u64, 0, 1),
+        "the manifest path reads the seat once and adopts the output: {failed:?}"
+    );
+    assert_eq!(rows(&corpus), (0, 0), "the failed group recorded nothing");
+    assert!(
+        record().is_some(),
+        "the adopted output carries the capture's record"
+    );
+
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{resumed:?}");
+    assert_eq!(
+        (
+            resumed.source_bytes_read,
+            resumed.unrowed_adopted,
+            resumed.unrowed_unproven
+        ),
+        (0, 1, 0),
+        "durable bytes with no row are adopted from the record: {resumed:?}"
+    );
+    let warm = corpus.run().unwrap();
+    assert_eq!(
+        (warm.reused, warm.source_bytes_read, warm.unrowed_adopted),
+        (1, 0, 0)
+    );
+}
+
+/// #169 review: a seat whose stat identity moved with its bytes unchanged (a
+/// touch) leaves its output with the old capture's record. The manifest
+/// adoption refreshes it to the new capture's, so when that adoption's row
+/// never commits, the next run still reads 0 source bytes. A record of
+/// another row is not counted unproven.
+#[test]
+fn a_stale_capture_record_is_refreshed_by_a_manifest_adoption() {
+    const SIZE: usize = 70_000;
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    std::fs::write(&seat, noise(1692, SIZE)).unwrap();
+    let store_root = destination_store_root(&corpus);
+    let record = || {
+        unrowed::read_record(&std::fs::File::open(corpus.base.join("destination/seat")).unwrap())
+            .unwrap()
+    };
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 60 * RACY_GRANULARITY_NS);
+    let first = corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{first:?}");
+    drop(clock);
+    let stale = record();
+
+    let touched = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&seat)
+        .unwrap()
+        .set_modified(touched)
+        .unwrap();
+    let _clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 60 * RACY_GRANULARITY_NS);
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let failed = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    let failed = failed.unwrap();
+    assert_eq!(failed.refusals.len(), 1, "{failed:?}");
+    assert_eq!(
+        (
+            failed.source_bytes_read,
+            failed.unrowed_adopted,
+            failed.unrowed_unproven
+        ),
+        (SIZE as u64, 0, 0),
+        "a moved seat is read once, and its old record is not counted: {failed:?}"
+    );
+    let refreshed = record();
+    assert_ne!(refreshed.key, stale.key, "the record names the new row");
+    assert_eq!((refreshed.root, refreshed.size), (stale.root, stale.size));
+
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{resumed:?}");
+    assert_eq!(
+        (resumed.source_bytes_read, resumed.unrowed_adopted),
+        (0, 1),
+        "{resumed:?}"
+    );
+}
+
+/// #169 review (`AdoptOnlyUnrowed` in docs/formal): the record's adoption is
+/// for outputs with no row. A clean rerun answers every rowed output `Reuse`
+/// from its row: it adopts nothing, proves nothing, and so hashes no
+/// destination byte, whatever the source-read counter says. A regression of
+/// `Store::output_matches` would otherwise hide behind the adoption, which
+/// also reads 0 source bytes.
+#[test]
+fn a_clean_rerun_reuses_rowed_outputs_and_adopts_none() {
+    const SIZES: [usize; 4] = [0, 1, 70_000, 300_000];
+    let corpus = Corpus::new();
+    for (index, size) in SIZES.iter().enumerate() {
+        std::fs::write(
+            corpus.base.join(format!("source/file-{index}")),
+            noise(1_693 + index as u64, *size),
+        )
+        .unwrap();
+    }
+    let latest = (0..SIZES.len())
+        .map(|index| stamp_ns(&corpus.base.join(format!("source/file-{index}"))))
+        .max()
+        .unwrap();
+    let _clock = PinnedClock::at(&corpus, latest + 60 * RACY_GRANULARITY_NS);
+    let first = corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{first:?}");
+    assert_eq!(rows(&corpus), (SIZES.len() as u64, SIZES.len() as u64));
+    for _ in 0..2 {
+        let rerun = corpus.run().unwrap();
+        assert!(rerun.refusals.is_empty(), "{rerun:?}");
+        assert_eq!(
+            (
+                rerun.reused,
+                rerun.unrowed_adopted,
+                rerun.unrowed_unproven,
+                rerun.source_bytes_read,
+                rerun.bytes_received
+            ),
+            (SIZES.len() as u64, 0, 0, 0, 0),
+            "{rerun:?}"
+        );
+    }
+}
+
+/// #169 review: the record's key holds no store authority, so a source store
+/// that was recreated (a new authority, which re-keys every row on both
+/// sides) still finds its outputs' records. Unrowed outputs, and rowed ones
+/// whose rows the new authority no longer matches, are adopted from their
+/// records: 0 source bytes, where every seat was read again before.
+#[test]
+fn a_recreated_source_store_adopts_from_capture_records() {
+    const FILES: usize = 3;
+    const SIZE: usize = 80_000;
+    let corpus = Corpus::new();
+    for index in 0..FILES {
+        std::fs::write(
+            corpus.base.join(format!("source/file-{index}")),
+            noise(1_697 + index as u64, SIZE),
+        )
+        .unwrap();
+    }
+    let latest = (0..FILES)
+        .map(|index| stamp_ns(&corpus.base.join(format!("source/file-{index}"))))
+        .max()
+        .unwrap();
+    let _clock = PinnedClock::at(&corpus, latest + 60 * RACY_GRANULARITY_NS);
+    let store_root = destination_store_root(&corpus);
+    let recreate = || std::fs::remove_dir_all(corpus.base.join("source-state")).unwrap();
+
+    // Unrowed: published by a group whose store commit failed.
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let failed = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    assert_eq!(failed.unwrap().refusals.len(), FILES);
+    recreate();
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{resumed:?}");
+    assert_eq!(
+        (resumed.source_bytes_read, resumed.unrowed_adopted),
+        (0, FILES as u64),
+        "{resumed:?}"
+    );
+
+    // Rowed, under the authority that is about to be lost.
+    recreate();
+    let rekeyed = corpus.run().unwrap();
+    assert!(rekeyed.refusals.is_empty(), "{rekeyed:?}");
+    assert_eq!(
+        (
+            rekeyed.source_bytes_read,
+            rekeyed.reused,
+            rekeyed.unrowed_adopted
+        ),
+        (0, 0, FILES as u64),
+        "{rekeyed:?}"
+    );
+    let warm = corpus.run().unwrap();
+    assert_eq!(
+        (warm.reused, warm.source_bytes_read, warm.unrowed_adopted),
+        (FILES as u64, 0, 0)
+    );
+}
