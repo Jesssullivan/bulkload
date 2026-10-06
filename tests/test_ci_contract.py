@@ -45,6 +45,13 @@ BOOTSTRAP_IMPL_LINE = (
 BAZEL_VERSION_SHA256 = (
     "4fa9948d0ae7007cbd1cc05768bc3e7cc6ec46ad0ea84c87df79e7a0c48d76b4"
 )
+# OI-1003-Q65 took the Bazel graph out of PR CI, so nothing on a PR loads
+# MODULE.bazel any more. Pinning its digest keeps a bzlmod or rules_python
+# change a reviewed contract edit instead of a silent main-only breakage.
+MODULE_BAZEL_SHA256 = (
+    "8182bbe9cf04ddb0743bd1e68a9653a851b8dbf104234ab367bc1386899c26e3"
+)
+CONTRACT_TEST_TARGET = "ci_contract_test"
 FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf"
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
 EXPECTED_SHA_EXPRESSION = (
@@ -346,6 +353,38 @@ def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
 
 def sha256(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
+
+
+def bazel_target_data(build: str, target: str) -> tuple[str, ...]:
+    """The literal `data` list of one BUILD.bazel py_test target."""
+    target_match = re.search(
+        r'^py_test\(\n    name = "'
+        + re.escape(target)
+        + r'",\n(?P<body>(?:    .*\n)*?)\)$',
+        build,
+        re.M,
+    )
+    if target_match is None:
+        raise ContractError(f"BUILD.bazel has no py_test {target}")
+    data_match = re.search(
+        r'^    data = \[\n(?P<items>(?:        "[^"\n]+",\n)*)    \],$',
+        target_match.group("body"),
+        re.M,
+    )
+    if data_match is None:
+        raise ContractError(f"{target} must declare one literal data list")
+    return tuple(re.findall(r'"([^"\n]+)"', data_match.group("items")))
+
+
+def workspace_reads(source: str) -> set[str]:
+    """Workspace paths a test source reads through `root / <path>`."""
+    reads = set(re.findall(r'\broot / "([^"\n]+)"', source))
+    for name in re.findall(r"\broot / ([A-Z][A-Z0-9_]*)\b", source):
+        value = globals().get(name)
+        if not isinstance(value, str):
+            raise ContractError(f"workspace read {name} is not a path constant")
+        reads.add(value)
+    return reads
 
 
 def find_workspace() -> Path:
@@ -3534,6 +3573,39 @@ class CiContractTest(unittest.TestCase):
         self.assertNotRegex(self.bazelrc, r"(?:grpc|grpcs|http|https)://")
         self.assertIn(
             "try-import %workspace%/.bazelrc.flywheel", self.workspace_bazelrc
+        )
+
+    def test_bazel_data_lists_every_workspace_read(self) -> None:
+        # OI-1003-Q65 dropped the Bazel `test` gate, so PR CI runs this file
+        # through `contract-test`, outside the //:tests sandbox, where a
+        # missing `data` entry is invisible. Keep the declared inputs whole so
+        # `just test`, `just test-local` and `just ci` do not break on main.
+        source = Path(__file__).read_text(encoding="utf-8")
+        reads = workspace_reads(source)
+        self.assertIn("MODULE.bazel", reads)
+        self.assertIn(LOCAL_ACTION_PATH, reads)
+        data = bazel_target_data(self.build, CONTRACT_TEST_TARGET)
+        self.assertEqual(len(data), len(set(data)))
+        self.assertEqual(sorted(reads - set(data)), [])
+        dropped = bazel_target_data(
+            self.build.replace('        "MODULE.bazel",\n', "", 1),
+            CONTRACT_TEST_TARGET,
+        )
+        self.assertNotIn("MODULE.bazel", dropped)
+        with self.assertRaises(ContractError):
+            bazel_target_data(self.build, "missing_contract_test")
+        with self.assertRaises(ContractError):
+            bazel_target_data(
+                self.build.replace("    data = [\n", "    data = glob([\n", 1),
+                CONTRACT_TEST_TARGET,
+            )
+
+    def test_bazel_module_digest_is_pinned(self) -> None:
+        module = (self.root / "MODULE.bazel").read_text(encoding="utf-8")
+        self.assertEqual(sha256(module), MODULE_BAZEL_SHA256)
+        self.assertNotEqual(
+            sha256(module.replace('version = "2.2.0"', 'version = "2.2.1"', 1)),
+            MODULE_BAZEL_SHA256,
         )
 
     def test_bazelrc_authority_mutations_fail_closed(self) -> None:
