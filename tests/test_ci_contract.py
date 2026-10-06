@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "88912d6d7867551c4191e84e671d4e5e4f8b0fca5456579246773ce1113b1b84"
+WORKFLOW_SHA256 = "2f3d115f5011c6be4c6181924ab8ebeb05ef8381f5b80d1d30ba10cc12f75c10"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -479,13 +479,15 @@ def validate_job_routing(workflow: str) -> None:
         workflow,
     ):
         raise ContractError("CI workflow must not suppress a job or step failure")
-    # The single job-level cap applies to every matrix gate (R-N122).
+    # The single job-level cap applies to every matrix gate (R-N122). It was 15
+    # minutes until OI-1003-Q71 raised it to 25: the source gate ran 432-690 s on
+    # a quiet host and was cancelled at 900 s twice under shared-runner load.
     timeouts = re.findall(
         r"(?mi)^\s*(?:timeout-minutes|\"timeout-minutes\"|'timeout-minutes')\s*:.*$",
         workflow,
     )
-    if timeouts != ["    timeout-minutes: 15"]:
-        raise ContractError("every terminal gate must keep the audited 15-minute cap")
+    if timeouts != ["    timeout-minutes: 25"]:
+        raise ContractError("every terminal gate must keep the audited 25-minute cap")
 
     declarations = [
         line
@@ -2366,7 +2368,7 @@ class CiContractTest(unittest.TestCase):
     def test_workflow_triggers_cap_and_failure_suppression_mutations_fail_closed(
         self,
     ) -> None:
-        cap = "    timeout-minutes: 15\n"
+        cap = "    timeout-minutes: 25\n"
         queue = "  merge_group:\n    types: [checks_requested]\n"
         variants = [
             self.workflow.replace(queue, "", 1),

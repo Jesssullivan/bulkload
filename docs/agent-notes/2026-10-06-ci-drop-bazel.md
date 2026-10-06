@@ -122,3 +122,7 @@ That is expected.
    finding, left.
 7. **No PR opened by this lane.** The PR body must carry all six rulings and
    both coordinator merge-time steps.
+
+## Job cap raised to 25 minutes (OI-1003-Q71, 2026-10-06)
+
+PR #190's source gate was cancelled at the 900 s cap twice (run 37508668378 and its one rerun), both times while still in the Rust tests. sting's load average was about 30–55, and its runners share the host with other sessions' builds. On a quiet host the gate takes 432–690 s. The operator ruled the cap up to 25 minutes in this PR. `ci.yml` now has `timeout-minutes: 25`, `WORKFLOW_SHA256` is re-pinned, and the contract test's cap check and mutation test use the new value.
