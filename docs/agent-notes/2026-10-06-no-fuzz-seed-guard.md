@@ -124,6 +124,17 @@ against probe inputs in an untracked directory (deleted afterwards).
   L6a's P67 row kept below it), as `3828ddd`. check-fast on that tree:
   exit 0. PR #194 was opened from `3828ddd`.
 
+## Blocked after opening (2026-10-06)
+
+#192 (`feat/s3-properties-20261006`) merged to main as `48bd697` after
+PR #194 was opened. Main now holds `tests/s3_transfer_resume.rs` (15
+findings) and `tests/s3_walk_resume.rs` (10) with the mirrored helper, so
+#194 merged with main fails
+`every_property_routes_through_the_shared_helper`. The branch still merges
+without a text conflict. #194 must not merge until those two files use the
+`#[path]` module (edits listed below). They are outside this lane's file
+list, so this lane did not change them.
+
 ## Landing order (blocks two other lanes)
 
 The guard was sized against `origin/main` `b6ecd50`. Two concurrent lanes add
