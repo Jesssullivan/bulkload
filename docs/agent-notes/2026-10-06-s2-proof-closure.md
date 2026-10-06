@@ -59,5 +59,11 @@ No PR is opened, per the lane brief.
 - #165 (the S2 budget run on neo), the load1-lag estimator ruling, FADV,
   #188, the `-wal` open on #157, the no-signals scan, and the Darwin
   channel. Details are in the evidence doc, section 2.
-- Shas: see the commit on the branch. The structured lane result carries
-  the head sha.
+
+## Shas
+
+- `f3df6dc` holds the tests, the plan rows, the evidence doc and this note.
+  `just check-fast` was green on that tree: exit 0, with 31
+  `test result: ok` lines.
+- The commit after it is docs only. It adds the check-fast receipt and
+  these shas.

@@ -19,7 +19,13 @@ Measured on branch `feat/s2-proof-closure-20261006`, based on main
 load1 was about 90 to 130 throughout. Tests were run with
 `cargo test -p bulkload-agent --test source_command_registry` and
 `--test source_lock_trace` inside `nix develop`, and the whole lane passed
-`just check-fast`. Section 1 gives the check-fast receipt.
+`just check-fast`.
+
+**check-fast receipt (commit `f3df6dc`).** It ran under the shared
+`.check-fast.lock` in `nix develop .#default` and exited 0, with 31
+`test result: ok` lines and 0 `FAILED`. Within it,
+`source_command_registry` reported 8 passed and `source_lock_trace`
+reported 6 passed.
 
 ## 1. What is now proved, and how strongly
 
