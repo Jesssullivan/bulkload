@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::git_carry::decide;
 use crate::{git_carry, BulkloadRefusal, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,32 +146,39 @@ fn chain_links(
     }
 }
 
-/// The link a new capture may chain onto `previous`, if any: `None` when
-/// `previous` depends on a shared plan base, its own chain is not intact, or
-/// it already sits at the depth limit (the next capture re-bases).
-fn chainable(corpus: &Path, previous: &Capture, bundle: &Path) -> Result<Option<Prior>> {
-    let depth = if prior_sidecar(corpus, &previous.bundle)
+/// What the decision core needs to know to chain a new capture onto
+/// `previous` (`decide`): its shape (a chain link, a shared plan base's
+/// delta, or self-contained), whether its chain is intact under
+/// [`LinkBinding::Custody`], and its depth. Whether it chains is the
+/// decision's: never on a broken chain or a based bundle, and only below the
+/// depth limit (the capture at the limit re-bases).
+fn chainable(
+    corpus: &Path,
+    previous: &Capture,
+    bundle: &Path,
+) -> Result<(decide::Shape, bool, u32)> {
+    if prior_sidecar(corpus, &previous.bundle)
         .try_exists()
         .refuse_at("estate::chainable")?
     {
-        match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
-            Ok(links) => u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
-            // A broken chain is never extended; the next bundle re-bases.
-            Err(_) => return Ok(None),
-        }
-    } else if git_carry::shared::requires_base(bundle)? {
-        return Ok(None);
+        return Ok(
+            match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
+                Ok(links) => (
+                    decide::Shape::Chained,
+                    true,
+                    u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                ),
+                // A broken chain is neither a hit nor extended.
+                Err(_) => (decide::Shape::Chained, false, 0),
+            },
+        );
+    }
+    // No `.prior`: `chain_links` finds no link to break.
+    Ok(if git_carry::shared::requires_base(bundle)? {
+        (decide::Shape::Based, true, 0)
     } else {
-        0
-    };
-    Ok(
-        (depth < git_carry::chain::CHAIN_DEPTH_LIMIT).then(|| Prior {
-            bundle: previous.bundle.clone(),
-            digest: previous.digest,
-            identity: previous.identity,
-            depth,
-        }),
-    )
+        (decide::Shape::Unchained, true, 0)
+    })
 }
 
 #[derive(Debug)]
@@ -821,6 +829,20 @@ fn retained_base(corpus: &Path, base: &Base) -> Result<bool> {
             ))
 }
 
+// The decision on a group whose base record names a lost bundle. It comes
+// before any item's record is read: the decision core's first rule reads
+// only the base, so every item of the group refuses
+// `RECEIPT_BINDING_INVALID` (P67 draws every other input of that row).
+fn lost_base() -> BulkloadRefusal {
+    let inputs = decide::Inputs::new(true, decide::BaseState::Lost, decide::Policy::V1);
+    match decide::decide(&inputs) {
+        decide::Decision::Refuse(refusal) => refusal.into(),
+        decide::Decision::Hit | decide::Decision::Export(_) => {
+            BulkloadRefusal::ContractSelfInconsistent
+        }
+    }
+}
+
 fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result<Base> {
     let record = corpus.join(format!("shared-{group}.base"));
     if record.try_exists().refuse_at("estate::prepare_base")? {
@@ -830,7 +852,7 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
         }
         // Do not replace a missing or changed prerequisite while older deltas
         // still depend on it. Keep the missing custody visible.
-        return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        return Err(lost_base());
     }
     let mut generation = 0u64;
     let attempt = loop {
@@ -873,37 +895,43 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
     Ok(base)
 }
 
-/// What a retained capture record offers the next pass.
-enum Retained {
-    /// Same key, no drift, no racy seat: the retained bundle is the capture.
-    Hit,
-    /// A retained bundle of this checkout whose blobs this pass may reuse:
-    /// every seat at an unchanged, non-racy `StatIdentity` costs zero source
-    /// bytes (R25). `started_ns` is its recorded pass start, absent for a
-    /// capture from before that was recorded. `extends` says the retained
-    /// capture drifted and the difference is confined to the ref inventory and
+/// A retained capture of this checkout, at its recorded identity: what
+/// acting on the decision needs beside the decision's inputs.
+struct Retained {
+    /// Its record.
+    previous: Capture,
+    /// Its bundle in the corpus. Every seat at an unchanged, non-racy
+    /// `StatIdentity` may be reused from it at zero source bytes (R25).
+    bundle: PathBuf,
+    /// Its recorded pass start, absent for a capture from before that was
+    /// recorded.
+    started_ns: Option<i128>,
+    /// It drifted and the difference is confined to the ref inventory and
     /// the worktree census, so this pass completes it.
-    Extend {
-        bundle: PathBuf,
-        started_ns: Option<i128>,
-        extends: bool,
-        /// The link this pass may chain onto (WP2), if the retained bundle
-        /// is chainable.
-        chain: Option<Prior>,
-    },
-    /// Nothing retained.
-    None,
+    extends: bool,
 }
 
+/// The item's capture record as the decision core reads it: `inputs` with
+/// the record's state and, for a retained bundle, its key, drift, pass start
+/// and chain filled in; and the retained capture, if any. Nothing here
+/// decides. The retained bundle's bound base is read later, and only when
+/// the decision rests on it (`decide::reads_prev_base`).
 fn retained_capture(
     record: &Path,
     corpus: &Path,
     parts: &git_carry::KeyParts,
     key: [u8; 32],
     authority: [u8; 32],
-) -> Result<Retained> {
+    inputs: decide::Inputs,
+) -> Result<(decide::Inputs, Option<Retained>)> {
     if !record.try_exists().refuse_at("estate::retained_capture")? {
-        return Ok(Retained::None);
+        return Ok((
+            decide::Inputs {
+                retained: decide::RetainedState::NoRecord,
+                ..inputs
+            },
+            None,
+        ));
     }
     let previous: Capture = read(record)?;
     if !filename(&previous.bundle) {
@@ -916,7 +944,13 @@ fn retained_capture(
                 &fs::symlink_metadata(&bundle).refuse_at("estate::retained_capture")?,
             )
     {
-        return Ok(Retained::None);
+        return Ok((
+            decide::Inputs {
+                retained: decide::RetainedState::BundleGone,
+                ..inputs
+            },
+            None,
+        ));
     }
     let drift = retained_drift(corpus, &previous.bundle)?;
     let recorded = retained_parts(corpus, &previous.bundle)?;
@@ -929,33 +963,46 @@ fn retained_capture(
     let settled = recorded
         .as_ref()
         .is_some_and(|recorded| !parts.racy_since(recorded.started_ns, git_carry::pass_start_ns()));
-    let chained = prior_sidecar(corpus, &previous.bundle)
-        .try_exists()
-        .refuse_at("estate::retained_capture")?;
     // A chained bundle is a hit only while its whole chain is retained: a
     // broken chain recaptures (self-contained) instead of standing as custody
     // no restore can satisfy.
-    let restorable =
-        !chained || chain_links(corpus, &previous.bundle, LinkBinding::Custody).is_ok();
-    if previous.key == key && drift.is_empty() && settled && restorable {
-        if !chained && git_carry::shared::requires_base(&bundle)? {
-            let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
-            if !retained_base(corpus, &bound)? {
-                return Err(BulkloadRefusal::ReceiptBindingInvalid);
-            }
-        }
-        return Ok(Retained::Hit);
-    }
+    let (shape, chain_intact, depth) = chainable(corpus, &previous, &bundle)?;
     let extends = !drift.is_empty()
         && recorded
             .as_ref()
             .is_some_and(|recorded| recorded.authority == authority);
-    let chain = chainable(corpus, &previous, &bundle)?;
-    Ok(Retained::Extend {
-        bundle,
-        started_ns: recorded.map(|recorded| recorded.started_ns),
-        extends,
-        chain,
+    let inputs = decide::Inputs {
+        retained: decide::RetainedState::Held,
+        key_equal: previous.key == key,
+        drifted: !drift.is_empty(),
+        settled,
+        pass_start: recorded.is_some(),
+        shape,
+        chain_intact,
+        depth,
+        // v1 never re-roots, so a chain's root is as old as it is deep.
+        age: depth,
+        ..inputs
+    };
+    Ok((
+        inputs,
+        Some(Retained {
+            previous,
+            bundle,
+            started_ns: recorded.map(|recorded| recorded.started_ns),
+            extends,
+        }),
+    ))
+}
+
+// The base a retained based bundle's `{bundle}.base` names: retained at its
+// recorded identity, or lost.
+fn bound_base(corpus: &Path, bundle: &str) -> Result<decide::PrevBase> {
+    let bound: Base = read(&corpus.join(format!("{bundle}.base")))?;
+    Ok(if retained_base(corpus, &bound)? {
+        decide::PrevBase::Retained
+    } else {
+        decide::PrevBase::Lost
     })
 }
 
@@ -969,22 +1016,34 @@ fn poisoned(key: [u8; 32]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-// Without a recorded pass start no retained seat can be proved non-racy.
-const fn reuse_offer(
-    retained: Option<&Path>,
-    started_ns: Option<i128>,
-) -> (
+// The blob-reuse offer the plan makes (R25): the retained capture with its
+// recorded pass start, or why none is made. Without a recorded pass start no
+// retained seat can be proved non-racy.
+fn reuse_offer(
+    plan: decide::Plan,
+    retained: Option<&Retained>,
+) -> Result<(
     Option<git_carry::RetainedCapture<'_>>,
     Option<git_carry::ReuseUnavailable>,
-) {
-    match (retained, started_ns) {
-        (Some(bundle), Some(started_ns)) => (
-            Some(git_carry::RetainedCapture { bundle, started_ns }),
-            None,
-        ),
-        (Some(_), None) => (None, Some(git_carry::ReuseUnavailable::PassStartUnrecorded)),
-        (None, _) => (None, None),
-    }
+)> {
+    Ok(match plan.reuse {
+        decide::ReuseEligibility::NoRetained => (None, None),
+        decide::ReuseEligibility::BlobReuse => {
+            let retained = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            (
+                Some(git_carry::RetainedCapture {
+                    bundle: &retained.bundle,
+                    started_ns: retained
+                        .started_ns
+                        .ok_or(BulkloadRefusal::ContractSelfInconsistent)?,
+                }),
+                None,
+            )
+        }
+        decide::ReuseEligibility::PassStartUnrecorded => {
+            (None, Some(git_carry::ReuseUnavailable::PassStartUnrecorded))
+        }
+    })
 }
 
 // Failed private attempts are retained, never silently overwritten.
@@ -1099,6 +1158,44 @@ fn preflight(
     Ok(planned)
 }
 
+// The decision on one item (OI-1003-Q43), from the group's `base` and the
+// item's record: a reuse hit, a typed refusal, or an export and what it may
+// depend on. The writer decides again on what its pass observes
+// (`git_carry::shared::write_capture`). Returns the decision, the inputs it
+// read (among them the retained bundle's depth, which a chain link records)
+// and the retained capture.
+fn decide_capture(
+    record: &Path,
+    corpus: &Path,
+    parts: &git_carry::KeyParts,
+    key: [u8; 32],
+    authority: [u8; 32],
+    base: Option<&Base>,
+) -> Result<(decide::Decision, decide::Inputs, Option<Retained>)> {
+    let state = if base.is_some() {
+        decide::BaseState::Retained
+    } else {
+        decide::BaseState::NoGroup
+    };
+    let (recorded, retained) = retained_capture(
+        record,
+        corpus,
+        parts,
+        key,
+        authority,
+        decide::Inputs::new(base.is_some(), state, decide::Policy::V1),
+    )?;
+    // A hit on a bundle bound to a base needs that base retained. The core
+    // asks for it only then, which is only for a held record.
+    let (decision, inputs) = decide::decide_recorded(recorded, || {
+        let held = retained
+            .as_ref()
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+        bound_base(corpus, &held.previous.bundle)
+    })?;
+    Ok((decision, inputs, retained))
+}
+
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
 fn capture_item(
     item: &Item,
@@ -1122,32 +1219,32 @@ fn capture_item(
     let nested = nest_lines(item, owners, parts.nested_repositories());
     let key = parts.digest()?;
     let authority = parts.authority()?;
-    let (retained, started_ns, extends, link) =
-        match retained_capture(&record, corpus, &parts, key, authority)? {
-            Retained::Hit => {
-                return Ok(Completion::clean("capture-reused-after-census").naming(nested));
-            }
-            Retained::Extend {
-                bundle,
-                started_ns,
-                extends,
-                chain,
-            } => (Some(bundle), started_ns, extends, chain),
-            Retained::None => (None, None, false, None),
-        };
-    // WP2: without a plan base, pack only what is new since the retained
-    // capture, by declaring its source-held tips as prerequisites.
-    let (link, chain) = chain_offer(corpus, link, base.is_none())?;
+    let (decision, inputs, retained) =
+        decide_capture(&record, corpus, &parts, key, authority, base)?;
+    let plan = match decision {
+        decide::Decision::Hit => {
+            return Ok(Completion::clean("capture-reused-after-census").naming(nested));
+        }
+        decide::Decision::Refuse(refusal) => return Err(refusal.into()),
+        decide::Decision::Export(plan) => plan,
+    };
+    let extends = retained.as_ref().is_some_and(|held| held.extends);
+    // WP2: pack only what is new since the retained capture, by declaring its
+    // source-held tips as prerequisites, when the plan chains on it.
+    let (link, chain) = chain_offer(corpus, plan, retained.as_ref(), inputs.depth)?;
+    let retained_bundle = retained.as_ref().map(|held| held.bundle.as_path());
     // #101 (OI-1002-Q11): before this item's export writes a byte, charge its
     // estimated bundle to CORPUS. An item that does not fit refuses
     // DESTINATION_SPACE_INSUFFICIENT as its own receipt; the pass goes on.
-    let _reservation = space.reserve(estimated_bundle(&parts, retained.as_deref())?)?;
-    let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
+    let _reservation = space.reserve(estimated_bundle(&parts, retained_bundle)?)?;
+    let (reuse, unrecorded) = reuse_offer(plan, retained.as_ref())?;
     // A future-stamped seat blocked the whole-capture reuse above, and will on
     // every pass until the clock passes it: say so (round-3 N5).
     let future = (retained.is_some() && parts.stamped_after(git_carry::pass_start_ns()))
         .then_some(git_carry::ReuseUnavailable::FutureStamp);
     let attempt = attempt_directory(state, &identity, key)?;
+    // The plan base, when the plan's basis names it.
+    let base = base.filter(|_| plan.basis.based());
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
     let export = match git_carry::export_repository_with_custody(
         &item.source,
@@ -1277,13 +1374,36 @@ fn link_path(corpus: &Path, link: &Prior) -> Result<PathBuf> {
     )
 }
 
-// The link a capture chains onto and its corpus path: none under a plan base.
+// The link a capture chains onto and its corpus path, as the decision's plan
+// says (WP2): the retained bundle at its own `depth` for a chained basis,
+// none otherwise. A plan v1 cannot carry out refuses
+// CONTRACT_SELF_INCONSISTENT: a chain under a plan base (L6b's fix 2), a
+// re-root on the chain's root (Q46, L8), or a depth that is not one more
+// than the link's.
 fn chain_offer(
     corpus: &Path,
-    link: Option<Prior>,
-    unbased: bool,
+    plan: decide::Plan,
+    retained: Option<&Retained>,
+    depth: u32,
 ) -> Result<(Option<Prior>, Option<PathBuf>)> {
-    let link = link.filter(|_| unbased);
+    let link = match (plan.basis, plan.rebase) {
+        (decide::Basis::BaseAndChain, _) | (_, decide::Rebase::Reroot) => {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        (decide::Basis::Chain, _) => {
+            let held = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            if depth.checked_add(1) != Some(plan.depth) {
+                return Err(BulkloadRefusal::ContractSelfInconsistent);
+            }
+            Some(Prior {
+                bundle: held.previous.bundle.clone(),
+                digest: held.previous.digest,
+                identity: held.previous.identity,
+                depth,
+            })
+        }
+        (decide::Basis::SelfContained | decide::Basis::Base, _) => None,
+    };
     let path = link
         .as_ref()
         .map(|link| link_path(corpus, link))
@@ -2336,6 +2456,123 @@ mod tests {
             fs::read(second_target.join("file")).unwrap(),
             b"second dirty"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // P67's v1 row `Held ... Based Lost -> Refuse`, through the code: the
+    // group's base record is retained, but a retained based bundle is bound
+    // (`{bundle}.base`) to a base that is lost. That happens when the group's
+    // base record was regenerated after its old base was lost. Every other
+    // condition of a reuse hit holds, so only the lazily read bound base
+    // (`decide::decide_recorded`, `bound_base`) keeps the record from being
+    // reused: each item refuses RECEIPT_BINDING_INVALID and its record stays.
+    #[test]
+    fn a_retained_based_bundle_bound_to_a_lost_base_is_never_a_reuse_hit() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-bound-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let second = root.join("second");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                second.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let plan = root.join("plan");
+        add(
+            &plan,
+            &source,
+            &repository,
+            Some(&root.join("first-target")),
+        )
+        .unwrap();
+        add(
+            &plan,
+            &second,
+            &repository,
+            Some(&root.join("second-target")),
+        )
+        .unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+        settle();
+        let outcomes = |corpus: &Path| {
+            let rows = Mutex::new(Vec::new());
+            let result = capture(&plan, &state, corpus, 2, &|row| {
+                rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                Ok(())
+            });
+            (result, rows.into_inner().unwrap())
+        };
+        capture(&plan, &state, &corpus, 2, &|_| Ok(())).unwrap();
+        // The records are reuse hits while their bound base is retained.
+        let (result, rows) = outcomes(&corpus);
+        result.unwrap();
+        assert_eq!(rows, vec![("capture-reused-after-census", None); 2]);
+        let items = inspect(&plan).unwrap();
+        let records: Vec<(PathBuf, Vec<u8>)> = items
+            .iter()
+            .map(|item| {
+                let path = corpus.join(format!("{}.capture", id(item).unwrap()));
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let mut bound = Vec::new();
+        for (path, _) in &records {
+            let record: Capture = read(path).unwrap();
+            assert!(git_carry::shared::requires_base(&corpus.join(&record.bundle)).unwrap());
+            let base: Base = read(&corpus.join(format!("{}.base", record.bundle))).unwrap();
+            bound.push(base);
+        }
+        let named = |base: &Base| (base.bundle.clone(), base.digest, base.identity);
+        assert_eq!(bound.first().map(named), bound.last().map(named));
+        let lost = bound.first().unwrap();
+        // The old base is lost, and the group's base record regenerated: the
+        // next pass's `prepare_base` exports and records a retained base.
+        let groups: Vec<PathBuf> = fs::read_dir(&corpus)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.starts_with("shared-")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension == "base")
+            })
+            .collect();
+        assert_eq!(groups.len(), 1);
+        fs::rename(corpus.join(&lost.bundle), root.join("lost-base")).unwrap();
+        fs::remove_file(groups.first().unwrap()).unwrap();
+        let (result, rows) = outcomes(&corpus);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("RECEIPT_BINDING_INVALID".to_owned())); 2]
+        );
+        // The group's base record is back and retained, and it is not the
+        // base the records are bound to.
+        let regenerated: Base = read(groups.first().unwrap()).unwrap();
+        assert!(retained_base(&corpus, &regenerated).unwrap());
+        assert_ne!(regenerated.identity, lost.identity);
+        assert!(!retained_base(&corpus, lost).unwrap());
+        // Neither record was replaced: the missing custody stays visible.
+        for (path, bytes) in &records {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

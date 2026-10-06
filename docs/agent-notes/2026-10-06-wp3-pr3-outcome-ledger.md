@@ -161,3 +161,32 @@ Unmutated: 31 of 31 in `outcome:: disposition:: closure::`, 6 of 6 in
 - A `re-carry` review counts as a disposition for the gate; nothing yet
   checks that the re-carry later happened.
 - Reviewer names are free text; nothing authenticates them.
+
+## Recheck and ship (2026-10-06)
+
+Recheck stage over `f6490d9`, diff read since the build head `a0d78df`.
+Rulings as above.
+
+- All seven medium/high review findings verified fixed by reading the code
+  and re-running the lane's tests. No new medium/high defect found in the
+  fix round.
+- `origin/main` had moved to `48bd697` (#191 lane L6a, #192 S3 properties).
+  Merged with a signed merge commit (no rebase); `estate.rs` merged without
+  conflict and the writer's ten outcome literals are unchanged, so every one
+  still maps through `outcome::NAMED`.
+- On the merged tree: 31 of 31 in `outcome:: disposition:: closure::`, 6 of 6
+  in `tests/space_closure_cli.rs`, then `just check-fast` inside
+  `nix develop`. The merge commit carrying this section was made only after
+  check-fast exited 0.
+- Verdict CLEAN; the PR is opened by this stage and not merged.
+
+Still open, beyond the list above (all low, none fixed here):
+
+- `disposition::plan_digest` hashes the bytes it read and then validates the
+  plan by path with a second read; the two reads are not one snapshot.
+- With several state directories the last one holding an `{item}.outcome`
+  record wins (unchanged behaviour), so the refusal instance and the
+  untyped-refusal check follow the directories the operator names.
+- A legacy `refused` reason whose first word happens to be an upper-case
+  token (not a taxonomy code) reads as `refusal-code-retired`, not
+  `refusal-untyped`. Both are unaccounted and neither can be attested.
