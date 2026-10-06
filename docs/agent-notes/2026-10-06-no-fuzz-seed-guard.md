@@ -3,7 +3,7 @@
 **Lane:** no-fuzz-seed-guard (workflow subagent, sting).
 **Branch:** `feat/seeded-proptests-20261006`, worktree
 `bulkload.worktrees/seed-guard-20261006`, based on `origin/main` `b6ecd50`.
-PR: see "Recheck and ship" below.
+PR: #194 (opened by the recheck stage, not merged).
 **Rulings:** OI-1003-Q7 (property tests with fixed seeds, no fuzzing),
 OI-1003-Q14, OI-1003-Q60, R-N13 (this note).
 
@@ -121,8 +121,8 @@ against probe inputs in an untracked directory (deleted afterwards).
 - `just check-fast` on the `81c5f4a` tree (CI toolchain, shared lock): exit 0.
 - #191 (L6a) merged while that check ran. Main `8e23b1d` was merged in a
   second time; the one conflict was the plan's P66 row (this lane's row kept,
-  L6a's P67 row kept below it). check-fast was run again on that tree; the
-  PR records the result.
+  L6a's P67 row kept below it), as `3828ddd`. check-fast on that tree:
+  exit 0. PR #194 was opened from `3828ddd`.
 
 ## Landing order (blocks two other lanes)
 
