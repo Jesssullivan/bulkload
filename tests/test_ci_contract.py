@@ -48,9 +48,7 @@ BAZEL_VERSION_SHA256 = (
 # OI-1003-Q65 took the Bazel graph out of PR CI, so nothing on a PR loads
 # MODULE.bazel any more. Pinning its digest keeps a bzlmod or rules_python
 # change a reviewed contract edit instead of a silent main-only breakage.
-MODULE_BAZEL_SHA256 = (
-    "8182bbe9cf04ddb0743bd1e68a9653a851b8dbf104234ab367bc1386899c26e3"
-)
+MODULE_BAZEL_SHA256 = "8182bbe9cf04ddb0743bd1e68a9653a851b8dbf104234ab367bc1386899c26e3"
 CONTRACT_TEST_TARGET = "ci_contract_test"
 FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf"
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
