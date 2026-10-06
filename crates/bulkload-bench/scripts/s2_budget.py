@@ -118,6 +118,14 @@ and no override differs from the recorded gate; `evidence_problems` says
 why not. So a verdict cannot be chosen after the fact and keep the label.
 Gated S2 runs are separate from the S1 gate (OI-1003-Q34).
 
+SQLite wal-index (OI-1003-Q36). A provider SQLite snapshot may create or
+touch its source's `<db>-shm`, S2's one stated source write; bulkload counts
+it as `source_wal_index_touched` on every counters line. Each ON run records
+the sum over its counters lines (`source_wal_index_touched`, None when no
+line reports it), and the verdict records the total and how many runs
+reported it. In evidence mode an ON run that does not report the counter is
+INCONCLUSIVE, so evidence always carries it.
+
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
 directory is removed at the end unless --keep-workdir.
@@ -159,7 +167,7 @@ sys.path.insert(0, str(HERE))
 import r23_ab  # noqa: E402  (power_source: one R-N81 power probe for every bench)
 
 SCHEMA = "bulkload.s2-budget.v1"
-RULINGS = "OI-1003-Q34, OI-1003-Q5, OI-1003-Q9, R-N11, R-N81, R-N91, R-N13"
+RULINGS = "OI-1003-Q34, OI-1003-Q36, OI-1003-Q5, OI-1003-Q9, R-N11, R-N81, R-N91, R-N13"
 BUDGET_P95 = 0.25
 BUDGET_LOAD1 = 2.0
 # Both latency gates are computed and both must agree: PASS needs `step`
@@ -204,6 +212,9 @@ FIXTURE_ENV = {
     "GIT_COMMITTER_DATE": "2026-10-03T00:00:00Z",
 }
 COUNTERS_PRIORITY = re.compile(r"(?:^|\s)priority=(\S+)")
+# OI-1003-Q36: the source wal-index files (`<db>-shm`) a provider SQLite
+# snapshot created or touched, from each `counters` line of an ON run.
+COUNTERS_WAL_INDEX = re.compile(r"(?:^|\s)source_wal_index_touched=(\d+)(?=\s|$)")
 # The kernel's load1 model (Linux and Darwin alike): every 5 s,
 # load1 <- load1 * e + n * (1 - e), with e = exp(-5/60) and n the run queue.
 # Over the K updates in (t0, t1], sum(n) = sum(load1) + e/(1-e) (load1(t1) -
@@ -986,6 +997,11 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     structural.append(
                         f"ON run {run['run']} did not report its priority class"
                     )
+                if run.get("source_wal_index_touched") is None and evidence:
+                    structural.append(
+                        f"ON run {run['run']} did not report "
+                        "source_wal_index_touched (OI-1003-Q36)"
+                    )
             if w.get("run_cap_reached") and evidence:
                 structural.append(
                     f"ON window {w['index']} reached the run cap (--max-runs)"
@@ -1178,6 +1194,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             for s in (OFF, ON)
         },
         "failed_operations": failed_ops,
+        "source_wal_index_touched": wal_index_summary(windows),
         "windows": per_window,
     }
 
@@ -1276,6 +1293,40 @@ def priorities_in(log: Path) -> list[str]:
     return sorted(seen)
 
 
+def wal_index_in(log: Path) -> int | None:
+    """OI-1003-Q36: the source wal-index files an ON run's bulkload verbs
+    created or touched, summed over its `counters` lines; None when no
+    counters line reports the counter (a build that predates it)."""
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return None
+    values = [
+        int(value)
+        for line in text.splitlines()
+        if line.startswith("counters")
+        for value in COUNTERS_WAL_INDEX.findall(line)
+    ]
+    return sum(values) if values else None
+
+
+def wal_index_summary(windows: list[dict]) -> dict:
+    """The ON runs' wal-index counter (OI-1003-Q36): the total, and how many
+    runs reported it."""
+    total = reported = unreported = 0
+    for window in windows:
+        if window["state"] != ON:
+            continue
+        for run in window.get("runs", []):
+            value = run.get("source_wal_index_touched")
+            if value is None:
+                unreported += 1
+            else:
+                total += value
+                reported += 1
+    return {"total": total, "runs_reported": reported, "runs_unreported": unreported}
+
+
 def run_once(command, priority, run, runs_dir, origin) -> dict:
     """Start one ON run and wait for it to exit: no deadline, no signal."""
     run_dir = runs_dir / f"r{run:04}"
@@ -1304,6 +1355,7 @@ def run_once(command, priority, run, runs_dir, origin) -> dict:
     record["seconds"] = round(record["end"] - record["start"], 3)
     record["log"] = str(log)
     record["priority_observed"] = priorities_in(log)
+    record["source_wal_index_touched"] = wal_index_in(log)
     return record
 
 
@@ -1459,7 +1511,10 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
                     say(
                         f"on_run run={run['run']} window={index} exit={run['exit']} "
                         f"seconds={run['seconds']} "
-                        f"priority={','.join(run['priority_observed']) or 'unreported'}"
+                        "priority="
+                        f"{','.join(run['priority_observed']) or 'unreported'} "
+                        "source_wal_index_touched="
+                        f"{run['source_wal_index_touched']}"
                     )
                     if run["exit"] != 0:
                         trace["cut_short"] = f"ON run {run['run']} failed"
@@ -1496,6 +1551,7 @@ def render_summary(trace: dict, verdict: dict) -> str:
     kind = "A/A noise run" if config["aa"] else "S2 budget run"
     gate = verdict["gate"]
     response = verdict["load1_model"]["response_to_unit_add"]
+    wal_index = verdict["source_wal_index_touched"]
 
     def pct(value: float | None) -> str:
         return "n/a" if value is None else f"{value:+.1%}"
@@ -1548,6 +1604,9 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"ON {verdict['samples'][ON]['missed_ticks']}; instrument errors: "
         f"{len(trace.get('errors', []))}; failed operations: "
         f"{verdict['failed_operations']}",
+        f"- Source wal-index files created or touched (OI-1003-Q36): "
+        f"{wal_index['total']} over {wal_index['runs_reported']} reporting ON "
+        f"runs ({wal_index['runs_unreported']} unreported)",
         f"- Rulings: {trace['rulings']}",
         "",
         "| metric | OFF p95 ms | ON p95 ms | d_p95 | bounds 5 % to 95 % "
@@ -1607,6 +1666,12 @@ def emit(verdict: dict) -> None:
         f"latency={gates['latency']} load1={gates['load1']} "
         f"step_bounds={verdict['delta_p95_bounds'][STEP]} "
         f"load1_bounds={verdict['delta_load1_bounds']}"
+    )
+    wal_index = verdict["source_wal_index_touched"]
+    say(
+        f"wal_index source_wal_index_touched={wal_index['total']} "
+        f"runs_reported={wal_index['runs_reported']} "
+        f"runs_unreported={wal_index['runs_unreported']}"
     )
     for reason in verdict["reasons"]:
         say(f"reason {reason}")

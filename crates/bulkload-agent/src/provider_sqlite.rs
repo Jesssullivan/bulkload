@@ -3,11 +3,12 @@
 //! This module never installs a snapshot over a live database.
 //! All tables, including unknown tables and recovery orphans, are preserved.
 
-use crate::counters::CountedSync as _;
+use crate::counters::{self, CountedSync as _, Counter};
 use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::io::Read as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::backup::{Backup, StepResult};
@@ -46,14 +47,20 @@ fn mapped_rollout_path(path: &Path, mapping: &PathMapping<'_>) -> std::path::Pat
 /// by concurrent writers. Each step copies at most 128 pages; lock contention
 /// returns immediately. The caller may retry with a *new* output path.
 ///
-/// The source is opened read-only using normal WAL-aware `SQLite` access, never
-/// immutable mode. The output must not exist. On failure an incomplete private
-/// output may remain; only a successful return authorizes its use as a snapshot.
-/// Neither failure nor success removes source data.
+/// The source is opened read-only using normal WAL-aware `SQLite` access. Its
+/// one write is the wal-index (`<db>-shm`), counted as
+/// `source_wal_index_touched` (S2, OI-1003-Q36); the main file and `-wal`
+/// stay byte-identical. A WAL-mode database with no `-wal` is the one
+/// exception to WAL-aware access: it is read with `immutable=1`, and refused
+/// as changed unless its main file kept its identity and no `-wal` appeared
+/// (`Footprint`). The output must not exist. On failure an incomplete
+/// private output may remain; only a successful return authorizes its use as
+/// a snapshot. Neither failure nor success removes source data.
 ///
 /// # Errors
 /// Refuses non-private output directories, existing outputs, exhausted step
-/// budgets, `SQLite` errors, and failed database or foreign-key integrity checks.
+/// budgets, `SQLite` errors, a quiescent source that changed during the read,
+/// and failed database or foreign-key integrity checks.
 pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     if max_steps == 0 {
         return Err(BulkloadRefusal::BudgetExceeded);
@@ -63,8 +70,51 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(BulkloadRefusal::Io(None));
     }
-    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let footprint = Footprint::observe(source);
+    let copied = copy_source(&footprint, source, output, max_steps);
+    // The source connection is closed: settle what the read left beside it,
+    // whether or not the copy succeeded.
+    let settled = footprint.settle();
+    let (file, destination) = copied?;
+    settled?;
+    // A WAL source must produce one portable database, without relying on
+    // destination sidecars. Changing the mode affects only the new snapshot.
+    let mode: String = destination
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
         .map_err(backup_refusal)?;
+    if mode != "delete" {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    let check: String = destination
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    if check != "ok" {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
+    let mut statement = destination
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    if statement
+        .query([])
+        .and_then(|mut rows| rows.next().map(|row| row.is_some()))
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?
+    {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
+    file.sync_file_counted()
+        .map_err(|_| BulkloadRefusal::Io(None))?;
+    Ok(())
+}
+
+/// Run the online backup of `source` into a new private `output`. The source
+/// connection is closed when this returns, on success and on refusal alike.
+fn copy_source(
+    footprint: &Footprint,
+    source: &Path,
+    output: &Path,
+    max_steps: u32,
+) -> Result<(fs::File, Connection)> {
+    let source = footprint.open(source).map_err(backup_refusal)?;
     source
         .busy_timeout(Duration::ZERO)
         .map_err(backup_refusal)?;
@@ -98,33 +148,186 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
     }
-    // A WAL source must produce one portable database, without relying on
-    // destination sidecars. Changing the mode affects only the new snapshot.
-    let mode: String = destination
-        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-        .map_err(backup_refusal)?;
-    if mode != "delete" {
-        return Err(BulkloadRefusal::SqliteStateChanged);
+    Ok((file, destination))
+}
+
+/// A file's identity and timestamps: what a write to it, or its replacement,
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Identity {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
     }
-    let check: String = destination
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
-    if check != "ok" {
-        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+}
+
+/// A wal-index as a plain read sees it: its identity and its bytes. The bytes
+/// are compared because a connection writes the wal-index through a shared
+/// mapping, which need not move its timestamps.
+#[derive(Debug, PartialEq, Eq)]
+struct WalIndex {
+    identity: Identity,
+    bytes: Vec<u8>,
+}
+
+impl WalIndex {
+    /// The wal-index at `path`, or `None` when there is none to observe.
+    fn observe(path: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path).ok()?;
+        let bytes = if metadata.is_file() {
+            fs::read(path).ok()?
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            identity: Identity::of(&metadata),
+            bytes,
+        })
     }
-    let mut statement = destination
-        .prepare("PRAGMA foreign_key_check")
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
-    if statement
-        .query([])
-        .and_then(|mut rows| rows.next().map(|row| row.is_some()))
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?
-    {
-        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+}
+
+/// What a snapshot's read leaves beside its source database (S2; OI-1003-Q16,
+/// OI-1003-Q36, P75).
+///
+/// - **WAL-aware read.** A read-only connection to a WAL-mode database maps
+///   its wal-index (`<db>-shm`) read-write. It creates the file when no live
+///   connection has, and rebuilds it from the `-wal` when none holds it. That
+///   is the one stated source write (OI-1003-Q36): [`Footprint::settle`]
+///   counts it as `source_wal_index_touched` when the file appeared or its
+///   identity or bytes changed. The main file and `-wal` are only read.
+/// - **Quiescent WAL database.** A WAL-mode database with no `-wal` holds all
+///   of its content in the main file: it was checkpointed and closed, or its
+///   writer has not read it yet. A WAL-aware open would create an empty
+///   `-wal` as well as the wal-index, a source write OI-1003-Q36 does not
+///   cover. It is read with `immutable=1` instead: no lock, no sidecar. A
+///   writer appending to the WAL leaves the main file alone until a
+///   checkpoint, so the read is refused as changed
+///   (`SQLITE_STATE_CHANGED`) unless, after it, the main file kept its
+///   identity and timestamps and no `-wal` appeared.
+///
+/// Observations are plain file reads, made only while this process holds no
+/// connection to the source: closing any descriptor of a file drops every
+/// POSIX lock the process holds on it, `SQLite`'s included. Sidecars sit
+/// beside the resolved path, as `SQLite` resolves symbolic links.
+struct Footprint {
+    database: PathBuf,
+    wal: PathBuf,
+    shm: PathBuf,
+    /// The main file's identity, for a quiescent WAL database.
+    quiescent: Option<Identity>,
+    /// The wal-index before the read, for a WAL-aware one.
+    before: Option<WalIndex>,
+}
+
+impl Footprint {
+    fn observe(source: &Path) -> Self {
+        let database = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let wal = sidecar(&database, "-wal");
+        let shm = sidecar(&database, "-shm");
+        let quiescent = quiescent(&database, &wal);
+        let before = if quiescent.is_some() {
+            None
+        } else {
+            WalIndex::observe(&shm)
+        };
+        Self {
+            database,
+            wal,
+            shm,
+            quiescent,
+            before,
+        }
     }
-    file.sync_file_counted()
-        .map_err(|_| BulkloadRefusal::Io(None))?;
-    Ok(())
+
+    /// The read-only source connection: immutable for a quiescent WAL
+    /// database, WAL-aware otherwise.
+    fn open(&self, source: &Path) -> rusqlite::Result<Connection> {
+        if self.quiescent.is_some() {
+            Connection::open_with_flags(
+                immutable_uri(&self.database),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        }
+    }
+
+    /// Count the wal-index a WAL-aware read created or touched, or refuse a
+    /// quiescent read whose database moved under it. Call it once the source
+    /// connection is closed.
+    fn settle(self) -> Result<()> {
+        if let Some(identity) = self.quiescent {
+            let kept = fs::metadata(&self.database)
+                .is_ok_and(|metadata| Identity::of(&metadata) == identity);
+            let no_wal = fs::symlink_metadata(&self.wal)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            return if kept && no_wal {
+                Ok(())
+            } else {
+                Err(BulkloadRefusal::SqliteStateChanged)
+            };
+        }
+        let after = WalIndex::observe(&self.shm);
+        if after.is_some() && after != self.before {
+            counters::bump(Counter::SourceWalIndexTouched);
+        }
+        Ok(())
+    }
+}
+
+/// `path` with `suffix` appended to its last component, as `SQLite` names
+/// its `-wal` and `-shm`.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The main file's identity when `database` is a WAL-mode database with no
+/// `-wal`: bytes 18 and 19 of its header, the write and read format
+/// versions, are 2 in WAL mode. The identity is taken before the header is
+/// read, so a change after it moves what [`Footprint::settle`] compares.
+fn quiescent(database: &Path, wal: &Path) -> Option<Identity> {
+    let identity = Identity::of(&fs::metadata(database).ok()?);
+    if !fs::symlink_metadata(wal).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+        return None;
+    }
+    let mut header = [0_u8; 20];
+    fs::File::open(database)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .ok()?;
+    (header.get(18..20) == Some(&[2, 2][..])).then_some(identity)
+}
+
+/// A `file:` URI naming `path` with `immutable=1`. Every byte outside the
+/// unreserved set and `/` is percent-encoded, so no path byte can end the
+/// path or add a parameter.
+fn immutable_uri(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut uri = String::from("file:");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
 }
 
 /// Accounting for an offline candidate. Preserved rows require explicit

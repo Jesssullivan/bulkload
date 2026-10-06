@@ -64,6 +64,17 @@
 //! `write_legacy_chunk`, `blake3_capture_file`, `blake3_store_read_verify`
 //! and `blake3_legacy_put` were removed for that reason).
 //!
+//! `source_wal_index_touched` counts the source wal-index files (`<db>-shm`)
+//! a provider `SQLite` snapshot created or touched (S2, OI-1003-Q36, which
+//! extends OI-1003-Q16). A backup-API read of a WAL-mode source maps the
+//! wal-index read-write: it creates the file when no live connection has, and
+//! rebuilds it when none holds it. A file counts once per snapshot when it
+//! appeared, or when its identity, size, timestamps or bytes differ after the
+//! read. The comparison sees what the read left behind: a live writer that
+//! changes the file during the read is counted too, and a rebuild that
+//! leaves the same bytes within one timestamp tick of the file's last change
+//! is not. The main database and its `-wal` are never written (P75).
+//!
 //! Not counted as flushes: syncs done by child processes. `git` children
 //! spawned by the Git carry verbs flush on their own, so the flush counters
 //! are a lower bound on the syncs a verb causes.
@@ -169,6 +180,9 @@ counters! {
     TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
+    // Source wal-index files (`<db>-shm`) a provider `SQLite` snapshot
+    // created or touched: S2's one stated source write (OI-1003-Q36).
+    SourceWalIndexTouched => "source_wal_index_touched",
 }
 
 const COUNT: usize = Counter::ALL.len();

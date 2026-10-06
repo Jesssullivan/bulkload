@@ -94,6 +94,20 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+- SQLite provider snapshots are S2's stated exceptions, both bounded and
+  counted:
+  - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
+    database, held only for the bounded read.
+  - **Write (OI-1003-Q36).** The source's wal-index. A WAL-aware read may
+    create or touch `<db>-shm`, SQLite's own coordination file, which holds
+    no user data. Every counters line reports it as
+    `source_wal_index_touched`, and S2 evidence records it. The main
+    database and its `-wal` stay byte-identical, and nothing else is
+    written (P75).
+  - A WAL-mode database with no `-wal` is read with `immutable=1`, because a
+    WAL-aware open would also create an empty `-wal`. That read creates no
+    sidecar and takes no lock. It is refused as changed unless the main
+    file kept its identity and no `-wal` appeared.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
