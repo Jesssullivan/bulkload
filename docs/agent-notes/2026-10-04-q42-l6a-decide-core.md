@@ -91,7 +91,8 @@ Shas:
    - the row counts per lane (v1 79, L6b 85, L8 199) and v1's policy is
      `Policy::V1`;
    - the label set of all 363 rows' outputs equals the Rust unions';
-   - every v1 row decides the reference's output, with 32 fixed-seed draws
+   - every v1 row (all 363 rows since the review round below) decides the
+     reference's output, with 32 fixed-seed draws
      of each "-" input per row;
    - totality and well-formedness over any inputs and policies, with depth
      and age drawn at the policy's edges (512 cases), plus the lazy-input
@@ -110,9 +111,7 @@ Shas:
        rows and totality;
      - a re-root ignoring the root's tips fails totality only (no v1 row
        re-roots).
-   - A scratch run of the pinned test over the 284 L6b and L8 rows passed
-     too. It is not committed: those lanes enable their rows when their
-     custody lands.
+   - The 284 L6b and L8 rows are compared since the review round below.
 5. **Grounding** (`docs/formal/catalogue/GitCarry.dhall`):
    - `ChainDepthBounded` cites `write_capture` (for `write_chained`),
      `decide` and `Rebase`, and drops the L6a pending symbol;
@@ -171,8 +170,10 @@ Shas:
   only; the depth is the estate's. P67's stages test is what makes that
   sound under `Policy::V1`. L6b and L8 must revisit it once the writer
   can be offered a base and a link together, or a root.
-- **L6b and L8** enable their rows in P67 when their custody lands. The
-  Rust core already matches those rows (scratch check above).
+- **L6b and L8**: P67 checks `decide` on their rows (review round below).
+  What the callers do with an L6b or L8 decision stays unchecked until
+  each lane lands its custody; today they refuse it
+  (`CONTRACT_SELF_INCONSISTENT`).
 - Carried from L4, untouched here: the `import_base` bare-IO finding, the
   content-name `DIGEST_MISMATCH` finding, Q46's window semantics.
 - **Coordinator**: distil these facts onto TIN-4543 and the SSOT ledger.
@@ -181,3 +182,85 @@ Shas:
   the lane's target dir) and the worktree's ignored `target/fault`
   (`just fault-harness` sets that target dir itself). Both are this lane's
   own and hold nothing durable.
+
+## Review round 1 (2026-10-05, same worktree and branch)
+
+The coordinator's dispatch carried two medium findings and seven low ones
+on `5a44dac`. Both mediums are fixed in `64ae349`. The lows are listed for
+the coordinator and were left unfixed, as the dispatch asked. Rulings:
+OI-1003-Q42, OI-1003-Q43, OI-1003-Q46, R-N13.
+
+- **P67 compares all 363 rows** (medium 1). The policy is a column of each
+  row, so the L6b and L8 rows need no custody to check `decide`. The v1
+  rows still pin `Policy::V1`. Scratch mutants that survived the old P67
+  and now fail the pinned test: window `>=` → `>`, the window counting
+  `age` not `age + 1`, a window that never ends, a window end labelled
+  `NoRebase`, fix 2 dropped from the offer, and a based bundle never
+  linkable under fix 2. A re-root that ignores the root's tips now fails
+  the pinned test too, not only totality.
+- **The staging is shared code** (medium 2). `decide.rs` gains
+  `decide_recorded` (the estate stage: the bound base read through a
+  callback only when `reads_prev_base`) and `decide_offered` (the writer
+  stage: the source's tips read through a callback only when
+  `reads_tips_held`). `estate::decide_capture` and
+  `shared::write_capture` call them, and P67's stages test calls them
+  instead of its own copy. Behaviour is unchanged.
+- **Estate test** `a_retained_based_bundle_bound_to_a_lost_base_is_never_a_reuse_hit`:
+  two worktrees of one repository capture twice (two reuse hits); then the
+  group's base bundle is lost and its base record removed, so the next
+  pass regenerates a retained base. Both items' retained based bundles
+  still name the lost base, so both refuse `RECEIPT_BINDING_INVALID` and
+  their records stay byte for byte. Scratch mutants: the estate stage never
+  reading the bound base fails stages and this test; `decide_capture`'s
+  read answered `Retained` fails this test; the writer never reading the
+  tips fails stages. The unmutated tree passes; each mutant was restored
+  and the diff compared byte for byte.
+- Docs: the P67 row of the property-test plan, the formal README (the
+  "pinned rows can" sentence, the stages paragraph, the "not proven"
+  bullet), and line 10 of `GitCarryCore.hs`'s header. These are comment and
+  prose edits only; `decide_rows.tsv` is unchanged.
+
+Validation (sting, scratch `/srv/scratch/jess/tmp/q42-l6a-fix1`, own
+`CARGO_TARGET_DIR` warmed from a copy of the lane's earlier target):
+
+- `cargo fmt --check` and `cargo clippy -p bulkload-agent --all-targets
+  -- -D warnings`: clean.
+- The first check-fast over `64ae349` (16:01Z to 16:08Z) failed in
+  `git_capture_counters`: its `estate-capture` verb runs under the CLI's
+  default `--min-free-percent 25`, its corpus sits in `TMPDIR` on
+  `/srv/scratch`, and that filesystem was at 24.7% free. The refusal was
+  `DESTINATION_SPACE_INSUFFICIENT` on space, not this change. The lane
+  removed its own 4.0G `target/debug/incremental` (27.3% free) and reran
+  with `CARGO_INCREMENTAL=0`.
+- The second check-fast over `64ae349` (16:09Z to 16:33Z,
+  `CARGO_INCREMENTAL=0`) passed: exit 0, every tier green, including
+  `git_capture_counters`, the fault harness, `resume-power-loss`, the repo
+  manifest and the CI contract tests.
+- Review round 1 close-out (2026-10-06): `/srv/scratch` had fallen to 22%
+  free again from other lanes' growth, so the lane removed its own 4.1G
+  round-0 scratch target (`/srv/scratch/jess/tmp/q42-l6a-decide/target`,
+  27% free after), committed this note, and reran check-fast over that
+  commit in the foreground. The branch is pushed only on its exit 0.
+
+Low findings, not fixed (for the coordinator):
+
+1. `decide_tests.rs` `staged()`: the stages property still composes the
+   two stage functions itself (the record read, the offer from the basis,
+   the depth and reuse of the result), not through `estate::decide_capture`,
+   `chain_offer` or `shared::write_capture`. Medium 2's fix shares the
+   stage functions; the composition stays a model.
+2. `shared.rs` `write_capture`, `Basis::Chain` arm: `tips` is filled only
+   when `reads_tips_held`; Chain implies it was read and non-empty only
+   because `Inputs::offered` sets `root_held = false`. Nothing asserts it.
+3. `docs/formal/README.md` roles table: "L6's fixed-seed property test"
+   should say L6a.
+4. `DRAWS_PER_ROW`: 32 random draws per "-" input, weaker than the
+   reference's whole-domain enumeration in `rowDecision`.
+5. The label test checks rows against the test's hand-written arrays, not
+   the Rust enums themselves.
+6. `GitCarry.dhall`: the bare `decide` code symbol also grounds on
+   transfer.rs's `fn decide`; the qualified `git_carry::decide::decide`
+   would not.
+7. `GitCarryCore.hs` header (about lines 35 to 49) still cites
+   `shared::write_chained` and `Retained::None`; `GitCarry.tla` line 9
+   still says "P67, lane L6".
