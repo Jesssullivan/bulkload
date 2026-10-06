@@ -180,3 +180,12 @@ comment say the same.
   - A failed link calibration (`complete: false`) is never acted on.
   - The serve wrapper needs Python 3.9 (`os.waitstatus_to_exitcode`); its
     comment says 3.8+.
+
+## Recheck and PR (coordinator, 2026-10-06)
+
+- **PR:** #193, opened by the recheck stage from `3dc5562`. Verdict CLEAN: the three medium findings are fixed in `72d934d` (warm resume gates a rep; gated mode refuses a destination load limit over 2.5; the destination disk budget and release of verified reps).
+- **Merge of main:** `5ed5c44` merges origin/main `8e23b1d` (signed, clean). The recheck stage's check-fast on it was still queued when the stage ended. This lane changes no Rust, so the coordinator ran the non-Rust gates and `test_gate_b.py` on the merged tree instead; the PR's CI is the full gate.
+- **Still for the operator:**
+  - ratify the draft protocol choices (the pre-W5 single-stream native arm, SQLite seats outside the comparable set, the 1% XOR delta, N/R/N/R/N order, the 2 GiB cap, no interrupted-resume phase);
+  - name a work root for a gated run. No sting volume holds 5 estate copies (about 21 GB) above the 25% floor today.
+- **No neo run** until gate (a) passes (OI-1003-Q66).
