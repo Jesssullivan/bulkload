@@ -206,12 +206,29 @@ as properties.
     improvement in #169 and is not part of the SLO.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
-  - Amendment 2026-10-06 (#169): the strict reading now holds in the model.
-    `R25_StrictNoDurableReread` passes in `MC_r25_unrowed_bytes` and
-    `MC_r25_strict_deep` (`docs/formal/`), with the capture record's adoption
-    (`crates/bulkload-agent/src/transfer/unrowed.rs`); the power-loss proof
-    `an_unrowed_output_is_adopted_without_source_reads` and P74 check it on
-    the code. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
+  - Amendment 2026-10-06 (#169): the strict reading now holds in the model,
+    within stated limits. `R25_StrictNoDurableReread` passes in
+    `MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main` (two
+    seats) and, across a lost source authority, `MC_r25_strict_unsealed` and
+    `MC_r25_strict_authority` (`docs/formal/`), with the capture record's
+    adoption (`crates/bulkload-agent/src/transfer/unrowed.rs`). The limits:
+    - Only a non-racy capture gets a record. A racy capture's unrowed output
+      is read again, as before.
+    - The record is an extended attribute. A file system without them, or an
+      existing output adopted against a manifest whose mode gives its owner
+      no write permission, keeps no record, and its unrowed bytes are read
+      again. Both are counted (`transfer_capture_records_unset`,
+      `transfer_unrowed_unproven`).
+    - The model assumes the record can be written; it does not model its
+      loss.
+    - The Haskell explorer agrees with TLC on the model with the adoption
+      (`MC_nv_core_adopt`, `MC_nv_ledger_adopt`). `MC_nv_core`'s count of
+      record is still the transfer before #169; moving it needs a ruling.
+
+    On the code, the power-loss proof
+    `an_unrowed_output_is_adopted_without_source_reads`, P74 and
+    `an_output_adopted_against_a_manifest_carries_its_capture_record` check
+    it. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
 
 ## Priority (OI-1003-Q4)
 
