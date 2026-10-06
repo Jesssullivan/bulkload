@@ -841,3 +841,16 @@ formal-nv:
 # S2 measured budget instrument (OI-1003-Q34)
 bench-s2-budget *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/s2_budget.py {{ args }}
+
+# `--work-root NEW --agent BIN --source-corpus DEST --source-work NEW
+# --source-repo CHECKOUT --remote-agent BIN [--ssh-config ABS]` pulls the sealed
+# estate corpus (#159) from the source over ssh: 3 B reps of N/R/N/R/N for the
+# initial copy and a 1 % delta, native `bulkload-agent pull` against `rclone
+# copy` over sftp, R-N81 on the source and a load bound on the destination, RSS
+# cap 2 GiB, JSON verdict and evidence draft; no wall-clock SLA. Refuses
+# NATIVE_REMOTE_ARM_MISSING (#47) when the agent has no pull/serve pair or W5
+# streams are asked for. `--dry-run` is a one-host loopback smoke (NOT a gate
+# sample); `--under-load` is informational. No neo run until gate (a) passes.
+# S1 gate (b) neo->sting pull harness (OI-1003-Q3, OI-1003-Q66)
+bench-gate-b *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/gate_b.py {{ args }}
