@@ -161,6 +161,27 @@ Receipts (CI toolchain, `nix develop .#default`):
   (the same four as on main); walk 2 passed.
 - `just check-fast` on the `615e373` tree, under the shared lock: exit 0.
 
+## Second recheck (2026-10-06, head `73305db`)
+
+A separate recheck stage read the diff since `b91d9d2` (the merge `8c03ac3`,
+the switch `615e373`, the note `73305db`). Verdict: clean; PR #194's body is
+updated in place and nothing is merged.
+
+- The medium finding (the two S3 files mirrored the helper, 25 guard findings
+  once main was merged) is fixed. `origin/main` is still `48bd697` and is an
+  ancestor of the branch.
+- Re-run on `73305db`: `cargo test -p bulkload-agent --test prop_seed_guard
+  --test s3_walk_resume --test s3_transfer_resume`: guard 6 passed,
+  `scanned=87 exempt_present=2 escapes=0`; transfer 12 passed, 4 ignored;
+  walk 2 passed. `cargo fmt --check` and `just contract-test` (24 tests) pass.
+- `615e373` changes only the config lines, the removed mirror and the module
+  docs in the two S3 files. The commits since `b91d9d2` are signed and carry
+  the rulings trailer.
+- check-fast was not run again: its exit 0 covers the `615e373` tree, and
+  the commits after it change only this note.
+- `tests/sqlite_wal_index.rs` is still not on `origin/main`; the conversion
+  below stays with the later lander.
+
 ## Landing order (one lane still to convert)
 
 `feat/s2-shm-counter-20261006` adds `tests/sqlite_wal_index.rs` with a
