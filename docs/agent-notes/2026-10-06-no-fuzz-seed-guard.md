@@ -15,6 +15,9 @@ OI-1003-Q14, OI-1003-Q60, R-N13 (this note).
 - `d1f42c9`: this note, round 1.
 - `81c5f4a`: merge of `origin/main` `2247ab8` (#190, the Bazel gates
   dropped). No conflict; main changed no Rust source.
+- `3828ddd`: merge of `origin/main` `8e23b1d` (#191, L6a).
+- `8c03ac3`: merge of `origin/main` `48bd697` (#192, the S3 properties).
+- `615e373`: the two S3 test files use the shared helper.
 
 ## What was wrong
 
@@ -124,48 +127,56 @@ against probe inputs in an untracked directory (deleted afterwards).
   L6a's P67 row kept below it), as `3828ddd`. check-fast on that tree:
   exit 0. PR #194 was opened from `3828ddd`.
 
-## Blocked after opening (2026-10-06)
+## #192 landed first: merged and switched (2026-10-06)
 
 #192 (`feat/s3-properties-20261006`) merged to main as `48bd697` after
-PR #194 was opened. Main now holds `tests/s3_transfer_resume.rs` (15
-findings) and `tests/s3_walk_resume.rs` (10) with the mirrored helper, so
-#194 merged with main fails
-`every_property_routes_through_the_shared_helper`. The branch still merges
-without a text conflict. #194 must not merge until those two files use the
-`#[path]` module (edits listed below). They are outside this lane's file
-list, so this lane did not change them.
+PR #194 was opened. It added `tests/s3_transfer_resume.rs` (15 findings) and
+`tests/s3_walk_resume.rs` (10), each with a mirrored helper, so #194 merged
+with main failed `every_property_routes_through_the_shared_helper`. The
+coordinator authorised this lane to edit the two files (their lane has
+merged).
 
-## Landing order (blocks two other lanes)
+- `8c03ac3`: merge of `origin/main` `48bd697`. No text conflict; the plan's
+  rows from both sides are kept. The guard is red on this commit alone.
+- `615e373`: both files compile `src/test_support.rs` as a `#[path]` module
+  and write each block as `#![proptest_config(test_support::prop_config(N))]`
+  with the case counts they had (walk: 16; transfer: 8, 4, 3, 6, 3, 4, 6, 4).
+  The local `CI_SEED`, `DEEP`, `fn prop_config` and the braced `test_runner`
+  import are gone. No strategy, assertion, `#[ignore]` or test name changed.
+- **Behaviour change in the deep tier.** The mirrors kept `CI_SEED` under
+  `BULKLOAD_PROPTEST_DEEP=1` on purpose. The shared helper uses
+  `RngSeed::Random` there, so the S3 properties now draw random seeds in the
+  deep tier, with twenty times the cases as before. CI is unchanged. The plan
+  rows for P18, P19, P21 and P23 and the two files' module docs now say this.
+  Whether the deep tier should keep a fixed seed for these properties is an
+  operator question; it would be a change to the helper, not a mirror.
+- `docs/agent-notes/2026-10-06-s3-props-p21-p23.md` (the other lane's note)
+  still describes the fixed-seed mirror. This lane did not edit it.
 
-The guard was sized against `origin/main` `b6ecd50`. Two concurrent lanes add
-integration tests that mirror the helper the way `git_estimate_dag.rs` used
-to. A mirror is seeded, so it follows the policy, but the guard refuses it.
-Each branch passes check-fast alone; main goes red on
-`every_property_routes_through_the_shared_helper` once this guard and either
-of them are both merged. Counts from a read-only scan of the sibling
-worktrees with this round's rules:
+Receipts (CI toolchain, `nix develop .#default`):
 
-| Lane | File | Findings |
-|---|---|---|
-| s3-props-p21-p23 | `tests/s3_transfer_resume.rs` | 15 |
-| s3-props-p21-p23 | `tests/s3_walk_resume.rs` | 10 |
-| s2-shm-157 | `tests/sqlite_wal_index.rs` | 13 |
+- `cargo test -p bulkload-agent --test s3_walk_resume --test
+  s3_transfer_resume --test prop_seed_guard`: guard 6 passed,
+  `scanned=87 exempt_present=2 escapes=0`; transfer 12 passed, 4 ignored
+  (the same four as on main); walk 2 passed.
+- `just check-fast` on the `615e373` tree, under the shared lock: exit 0.
 
-What each of those files needs before the second merge:
+## Landing order (one lane still to convert)
+
+`feat/s2-shm-counter-20261006` adds `tests/sqlite_wal_index.rs` with a
+mirrored helper (13 findings). It is not on `origin/main` (`48bd697`), so it
+is not converted here. Whichever of that branch and #194 lands second must
+merge main, convert the file and re-run check-fast:
 
 - delete the local `CI_SEED`, `DEEP` and `fn prop_config`, and the
   `use proptest::test_runner::{Config, RngSeed, ..};` line;
 - add `#[path = "../src/test_support.rs"] mod test_support;`;
-- write each block as `#![proptest_config(test_support::prop_config(N))]`;
-- in `sqlite_wal_index.rs`, import `use proptest::test_runner::TestRunner;`
-  and build the runner as `TestRunner::new(test_support::prop_config(12))`,
-  with no other use of the `TestRunner` name (a return type counts).
+- import `use proptest::test_runner::TestRunner;` and build the runner as
+  `TestRunner::new(test_support::prop_config(12))`, with no other use of the
+  `TestRunner` name (a return type counts).
 
-The exemption ceilings are not the way out for them. Either order works:
-they switch before merging, or this guard lands first and they merge main and
-switch. Re-run check-fast on the merged result before the second merge.
-This lane cannot write in their worktrees; the coordinator has to pass this
-on.
+The exemption ceilings are not the way out. This lane cannot write in that
+worktree; the coordinator has to pass this on.
 
 ## Open
 
