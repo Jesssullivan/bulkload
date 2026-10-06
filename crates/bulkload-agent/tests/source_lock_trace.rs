@@ -6,38 +6,50 @@
 //! `io::sys` calls. It sees no `flock`, no `fcntl` lock, no open of any mode,
 //! nothing a Git child does, and nothing `SQLite` does through its own VFS. So
 //! this file does not extend it. It observes the kernel instead, with no
-//! preload and no new crate:
+//! preload and no new crate, through four channels:
 //!
-//! - **`/proc/locks`**, sampled in a tight loop while a verb runs, lists every
-//!   `flock`, POSIX `fcntl` and OFD lock any process holds or waits for,
-//!   keyed by device and inode. A line on a source inode is a source lock.
-//! - **`/proc/self/fdinfo`**, sampled in the same loop, gives the access mode
-//!   of every descriptor the (in-process) verb has open. A descriptor on a
-//!   source path open for writing is a write-mode open.
+//! - **The lock table.** `/proc/locks`, sampled in a tight loop while a verb
+//!   runs, lists every `flock`, POSIX `fcntl` and OFD lock any process holds
+//!   or waits for, by device, inode and byte range. It does **not** list
+//!   Git's locks: Git locks by creating `*.lock` files.
+//! - **This process's descriptors.** `/proc/self/fdinfo`, sampled in the same
+//!   loop, gives the access mode of every descriptor the in-process verb has
+//!   open. It does not see a child's.
+//! - **A write watch.** An inotify watch on every source directory reports
+//!   every create, delete, rename, write, re-stamp and close of a write-mode
+//!   descriptor, by any process, for the whole verb (it is a queue, not a
+//!   sample). This is the channel that sees a Git child's `index.lock`, a
+//!   freshened object, and a child's write-mode open.
 //! - **A holder.** Sampling can miss a lock taken and dropped between two
-//!   samples. So a second run first takes an exclusive `flock` and an
+//!   samples. So the holder runs first take an exclusive `flock` and an
 //!   exclusive whole-file OFD write lock on every source file (and an
 //!   exclusive `flock` on every source directory), the way a live agent's
-//!   writer would, and makes the tree read-only. Any lock the verb then
-//!   tries conflicts: a blocking attempt waits (a `->` line in `/proc/locks`,
-//!   and a verb that does not finish), and a non-blocking one fails (a
-//!   refusal). Any write-mode open fails with `EACCES` (when not root).
-//! - **An `lstat` census** of the whole source (every field but access time)
-//!   is equal before and after.
+//!   writer would. Any `flock`/`fcntl` lock the verb then tries conflicts: a
+//!   blocking attempt waits (a `->` line, and a verb that does not finish),
+//!   and a non-blocking one fails (a refusal). The copy legs also make the
+//!   tree read-only, so a write-mode open fails with `EACCES` (when not
+//!   root).
 //!
-//! A sampler self-test proves both channels see a lock and a write-mode open
-//! of a few milliseconds on this kernel. The `SQLite` leg runs the backup API
-//! against a WAL database a separate writer process holds open, and counts
-//! the locks and write-mode opens that fall under the Q16/Q36 exception (a
-//! shared read lock on the database, any lock or open on its `-shm`); none
-//! may fall anywhere else.
+//! An **`lstat` census** of the whole source (every field but access time) is
+//! compared before and after each verb.
 //!
-//! What this cannot see: a non-blocking lock attempt whose failure the verb
-//! ignores, taken during the holder run (nothing is held, so nothing
-//! interrupts the source) and missed by sampling in the free run. Git
-//! children are covered for locks (`/proc/locks` is system-wide) but not for
-//! write-mode opens (their descriptors are in their own `/proc/<pid>`).
-//! Linux only: Darwin has neither `/proc/locks` nor `fdinfo`.
+//! The legs: an in-process `copy` (free and held), the `serve` verb as its
+//! own process (held), a v1 `export_repository` (held), an `estate::capture`
+//! of two repositories (held), and the `SQLite` backup against a writer
+//! process, idle and committing. Self-tests prove the lock table, the
+//! descriptor sample and the write watch each see what they claim on this
+//! kernel, and that the Git fixture's index is one an unhardened `git status`
+//! does rewrite.
+//!
+//! **Not covered here**, and so still open for S2's lock property:
+//! `estate::apply`, `git-carry-estimate`, `export_repository_with_policy`
+//! and the prerequisite and drift paths, `hydrate-state`, a real `pull` over
+//! ssh, and every verb on Darwin (no `/proc`, no inotify).
+//!
+//! What this cannot see: a non-blocking `flock`/`fcntl` attempt whose failure
+//! the verb ignores, made under the holder, and missed by sampling in the
+//! free run. A read-mode open by a child, and a lock on a file outside the
+//! watched trees.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -50,7 +62,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -59,7 +72,7 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use bulkload_agent::transfer::{copy, settle_racy_window};
+use bulkload_agent::transfer::{copy, receive, settle_racy_window};
 
 /// One test at a time: the samplers read process-wide tables.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -76,8 +89,25 @@ const DEADLINE: Duration = Duration::from_mins(2);
 const WAL_OPENED_READ_WRITE: bool = true;
 
 /// The environment variable that turns [`sqlite_writer_helper`] into the
-/// live writer.
+/// writer process.
 const WRITER_ENV: &str = "BULKLOAD_P77_WRITER_DB";
+
+/// With [`WRITER_ENV`]: the writer keeps committing until its stdin closes.
+const WRITER_LIVE_ENV: &str = "BULKLOAD_P77_WRITER_LIVE";
+
+/// The longest this file's snapshot may be seen holding the database's
+/// shared READ lock ("bounded in duration", OI-1003-Q16). The lock lives as
+/// long as the backup's connection, so this bounds the whole backup of the
+/// fixture (about 2 MiB) on a loaded host. It is this test's bound, not the
+/// product's: the product bound is bulkload#157's.
+const SQLITE_LOCK_BOUND: Duration = Duration::from_secs(30);
+
+/// The slowest commit the live writer may report while snapshots run.
+const COMMIT_BOUND: Duration = Duration::from_secs(10);
+
+/// How many snapshots the live leg tries before giving up on one that both
+/// succeeds and overlaps a commit.
+const LIVE_ATTEMPTS: usize = 20;
 
 // ------------------------------------------------------------- the fixture
 
@@ -331,6 +361,9 @@ struct LockLine {
     mode: String,
     pid: String,
     key: String,
+    /// The first locked byte, and the last (`None` for end of file).
+    start: u64,
+    end: Option<u64>,
 }
 
 fn read_locks() -> Vec<LockLine> {
@@ -347,12 +380,16 @@ fn read_locks() -> Vec<LockLine> {
             let mode = words.next()?.to_owned();
             let pid = words.next()?.to_owned();
             let key = words.next()?.to_owned();
+            let start = words.next()?.parse().ok()?;
+            let end = words.next()?.parse().ok();
             Some(LockLine {
                 blocked,
                 kind,
                 mode,
                 pid,
                 key,
+                start,
+                end,
             })
         })
         .collect()
@@ -365,9 +402,9 @@ struct WriteOpen {
     flags: u32,
 }
 
-/// Every descriptor of this process open for writing on a path beneath
-/// `root`, except `ignore`'s.
-fn write_opens(root: &Path, ignore: &BTreeSet<RawFd>) -> Vec<WriteOpen> {
+/// Every descriptor of this process open for writing on a path beneath one
+/// of `roots`, except `ignore`'s.
+fn write_opens(roots: &[PathBuf], ignore: &BTreeSet<RawFd>) -> Vec<WriteOpen> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/proc/self/fd") else {
         return out;
@@ -386,7 +423,7 @@ fn write_opens(root: &Path, ignore: &BTreeSet<RawFd>) -> Vec<WriteOpen> {
         let Ok(target) = fs::read_link(entry.path()) else {
             continue;
         };
-        if !target.starts_with(root) {
+        if !roots.iter().any(|root| target.starts_with(root)) {
             continue;
         }
         let Ok(info) = fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) else {
@@ -416,14 +453,23 @@ struct Observed {
     /// Write-mode descriptors on watched paths, with the number of samples
     /// that saw each.
     opens: BTreeMap<WriteOpen, u64>,
+    /// For each lock line, the longest run of consecutive samples that saw
+    /// it, as the time from the run's first sample to its last. The lock was
+    /// held at least that long, and at most two sample periods longer.
+    longest: BTreeMap<LockLine, Duration>,
     /// How long the sampler ran.
     elapsed: Duration,
 }
 
 impl Observed {
+    /// The mean time between samples.
+    fn period(&self) -> Duration {
+        self.elapsed / u32::try_from(self.samples.max(1)).unwrap_or(u32::MAX)
+    }
+
     /// The mean time between samples, in microseconds.
     fn period_us(&self) -> u128 {
-        self.elapsed.as_micros() / u128::from(self.samples.max(1))
+        self.period().as_micros()
     }
 }
 
@@ -460,9 +506,9 @@ struct Sampler {
 }
 
 impl Sampler {
-    /// Watch `keys` (lock keys) and paths beneath `root`, not reporting
+    /// Watch `keys` (lock keys) and paths beneath `roots`, not reporting
     /// `held`'s own locks and descriptors.
-    fn start(root: PathBuf, keys: BTreeSet<String>, held: Held) -> Self {
+    fn start(roots: Vec<PathBuf>, keys: BTreeSet<String>, held: Held) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let taken = Arc::new(AtomicU64::new(0));
@@ -471,16 +517,22 @@ impl Sampler {
         let thread = thread::spawn(move || {
             let mut observed = Observed::default();
             let started = std::time::Instant::now();
+            let mut runs: BTreeMap<LockLine, std::time::Instant> = BTreeMap::new();
             loop {
                 let last = stopping.load(Ordering::Acquire);
+                let now = std::time::Instant::now();
                 let seen: BTreeSet<LockLine> = read_locks()
                     .into_iter()
                     .filter(|line| keys.contains(&line.key) && !held.owns(line, &ours))
                     .collect();
+                runs.retain(|line, _| seen.contains(line));
                 for line in seen {
+                    let since = *runs.entry(line.clone()).or_insert(now);
+                    let longest = observed.longest.entry(line.clone()).or_default();
+                    *longest = (*longest).max(now.duration_since(since));
                     *observed.locks.entry(line).or_default() += 1;
                 }
-                for open in write_opens(&root, &held.descriptors) {
+                for open in write_opens(&roots, &held.descriptors) {
                     *observed.opens.entry(open).or_default() += 1;
                 }
                 observed.samples += 1;
@@ -513,11 +565,159 @@ impl Sampler {
     }
 }
 
+// --------------------------------------------------------------- the watch
+
+/// Every way a file or directory can be written, created, removed, renamed
+/// or re-stamped: the inotify events a reader never causes. A read
+/// (`IN_ACCESS`, `IN_OPEN`, `IN_CLOSE_NOWRITE`) is not watched.
+/// `IN_CLOSE_WRITE` fires when a descriptor that was open for writing is
+/// closed, whether or not it wrote: a write-mode open by any process.
+const WRITE_EVENTS: u32 = libc::IN_MODIFY
+    | libc::IN_ATTRIB
+    | libc::IN_CLOSE_WRITE
+    | libc::IN_CREATE
+    | libc::IN_DELETE
+    | libc::IN_DELETE_SELF
+    | libc::IN_MOVED_FROM
+    | libc::IN_MOVED_TO
+    | libc::IN_MOVE_SELF;
+
+/// One write event: the path it names and what happened to it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct WriteEvent {
+    path: PathBuf,
+    what: String,
+}
+
+/// An inotify watch on every directory of some trees, from `start` until it
+/// is drained. It sees every process, so it covers what `/proc/locks` cannot:
+/// Git takes its locks by creating `*.lock` files, which are never in the
+/// kernel's lock table, and a child's descriptors are not in this process's
+/// `fdinfo`.
+struct Watch {
+    fd: OwnedFd,
+    directories: BTreeMap<i32, PathBuf>,
+}
+
+impl Watch {
+    fn start(roots: &[&Path]) -> Self {
+        // SAFETY: `inotify_init1` takes flags only and returns a new
+        // descriptor or -1.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            raw >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a descriptor this call just created and nothing
+        // else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut directories = BTreeMap::new();
+        for root in roots {
+            for (relative, meta) in nodes(root) {
+                if !meta.is_dir() {
+                    continue;
+                }
+                let path = root.join(relative);
+                let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: `fd` is a live inotify descriptor and `name` is a
+                // NUL-terminated path that outlives the call.
+                let watch =
+                    unsafe { libc::inotify_add_watch(fd.as_raw_fd(), name.as_ptr(), WRITE_EVENTS) };
+                assert!(
+                    watch >= 0,
+                    "inotify_add_watch {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+                directories.insert(watch, path);
+            }
+        }
+        Self { fd, directories }
+    }
+
+    /// Every write event since the watch started (or was last drained).
+    fn drain(&self) -> Vec<WriteEvent> {
+        const HEADER: usize = 16;
+        let mut events = Vec::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            // SAFETY: `buffer` is writable for its whole length and outlives
+            // the call; `fd` is a live descriptor.
+            let read = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            let Ok(read) = usize::try_from(read) else {
+                // `EAGAIN`: the queue is empty.
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            let mut at = 0;
+            while at + HEADER <= read {
+                let field = |offset: usize| {
+                    let bytes: [u8; 4] = buffer[at + offset..at + offset + 4].try_into().unwrap();
+                    bytes
+                };
+                let watch = i32::from_ne_bytes(field(0));
+                let mask = u32::from_ne_bytes(field(4));
+                let length = usize::try_from(u32::from_ne_bytes(field(12))).unwrap();
+                let name = &buffer[at + HEADER..at + HEADER + length];
+                let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+                at += HEADER + length;
+                if mask & libc::IN_IGNORED != 0 {
+                    continue;
+                }
+                let mut path = self
+                    .directories
+                    .get(&watch)
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("<queue overflow>"));
+                if !name.is_empty() {
+                    path.push(std::ffi::OsStr::from_bytes(name));
+                }
+                events.push(WriteEvent {
+                    path,
+                    what: describe(mask),
+                });
+            }
+        }
+        events.sort();
+        events.dedup();
+        events
+    }
+}
+
+fn describe(mask: u32) -> String {
+    let names: Vec<&str> = [
+        (libc::IN_MODIFY, "modify"),
+        (libc::IN_ATTRIB, "attrib"),
+        (libc::IN_CLOSE_WRITE, "close-write"),
+        (libc::IN_CREATE, "create"),
+        (libc::IN_DELETE, "delete"),
+        (libc::IN_DELETE_SELF, "delete-self"),
+        (libc::IN_MOVED_FROM, "moved-from"),
+        (libc::IN_MOVED_TO, "moved-to"),
+        (libc::IN_MOVE_SELF, "move-self"),
+        (libc::IN_Q_OVERFLOW, "queue-overflow"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| mask & bit != 0)
+    .map(|(_, name)| name)
+    .collect();
+    names.join("+")
+}
+
 /// Run `verb` on its own thread. If it has not returned within
-/// [`DEADLINE`], drop `holder` (so a waiting lock is granted and the verb can
-/// finish) and report it blocked.
+/// [`DEADLINE`], drop `holders` (so a waiting lock is granted and the verb
+/// can finish) and report it blocked.
 fn within_deadline<T: Send + 'static>(
-    holder: Option<Holder>,
+    holders: Vec<Holder>,
     verb: impl FnOnce() -> T + Send + 'static,
 ) -> (T, bool) {
     let (done, finished) = mpsc::channel();
@@ -527,7 +727,7 @@ fn within_deadline<T: Send + 'static>(
         result
     });
     let blocked = finished.recv_timeout(DEADLINE).is_err();
-    drop(holder);
+    drop(holders);
     (worker.join().unwrap(), blocked)
 }
 
@@ -556,7 +756,7 @@ fn is_root() -> bool {
 // --------------------------------------------------------------- the tests
 
 /// The observation channels work on this kernel: a lock and a write-mode
-/// open of a few milliseconds are seen, and a holder's own lines and
+/// open held across one sample are seen, and a holder's own lines and
 /// descriptors are not reported.
 #[test]
 fn the_sampler_sees_a_brief_lock_and_a_write_open() {
@@ -567,7 +767,7 @@ fn the_sampler_sees_a_brief_lock_and_a_write_open() {
     populate(&source);
     let keys: BTreeSet<String> = lock_keys(&source).into_keys().collect();
     let holder = Holder::take(&source, &BTreeSet::from([PathBuf::from("b")]));
-    let sampler = Sampler::start(source.clone(), keys, holder.shape());
+    let sampler = Sampler::start(vec![source.clone()], keys, holder.shape());
     sampler.wait_samples(2);
     {
         let brief = File::open(source.join("b")).unwrap();
@@ -613,6 +813,88 @@ fn the_sampler_sees_a_brief_lock_and_a_write_open() {
     );
 }
 
+/// The write watch works on this kernel: a lock file created and removed, a
+/// write, a write-mode open that writes nothing, a re-stamp and a rename are
+/// each seen, in a nested directory too, and reading every file is not.
+#[test]
+fn the_watch_sees_every_kind_of_write_and_no_read() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("watch");
+    let source = scratch.path("source");
+    fs::create_dir(&source).unwrap();
+    populate(&source);
+    let watch = Watch::start(&[&source]);
+    for (relative, meta) in nodes(&source) {
+        if meta.is_file() {
+            fs::read(source.join(relative)).unwrap();
+        }
+    }
+    let listed = fs::read_dir(source.join("wide")).unwrap().count();
+    assert_eq!(listed, 24);
+    assert_eq!(watch.drain(), [], "reading the tree is not a write");
+
+    // Git's lock: an exclusive create, then a rename over the target.
+    let lock = source.join("nested/deeper/index.lock");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .unwrap();
+    fs::rename(&lock, source.join("nested/deeper/index")).unwrap();
+    let seen = watch.drain();
+    let saw = |events: &[WriteEvent], path: &Path, what: &str| {
+        events
+            .iter()
+            .any(|event| event.path == path && event.what.contains(what))
+    };
+    assert!(saw(&seen, &lock, "create"), "{seen:?}");
+    assert!(saw(&seen, &lock, "moved-from"), "{seen:?}");
+    assert!(
+        saw(&seen, &source.join("nested/deeper/index"), "moved-to"),
+        "{seen:?}"
+    );
+
+    // A write-mode open that writes nothing.
+    drop(
+        OpenOptions::new()
+            .append(true)
+            .open(source.join("b"))
+            .unwrap(),
+    );
+    let seen = watch.drain();
+    assert_eq!(
+        seen,
+        [WriteEvent {
+            path: source.join("b"),
+            what: "close-write".to_owned()
+        }]
+    );
+
+    // A re-stamp (what Git's object freshening does: the kernel reports a
+    // modification-time-only change as `modify` and a change of both times
+    // as `attrib`), a mode change, a write and a removal.
+    let stamped = File::open(source.join("a")).unwrap();
+    stamped
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    stamped
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(std::time::SystemTime::UNIX_EPOCH)
+                .set_modified(std::time::SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+    fs::set_permissions(source.join("empty"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(source.join("wide/f00"), b"changed").unwrap();
+    fs::remove_file(source.join("wide/f01")).unwrap();
+    let seen = watch.drain();
+    assert!(saw(&seen, &source.join("a"), "modify"), "{seen:?}");
+    assert!(saw(&seen, &source.join("a"), "attrib"), "{seen:?}");
+    assert!(saw(&seen, &source.join("empty"), "attrib"), "{seen:?}");
+    assert!(saw(&seen, &source.join("wide/f00"), "modify"), "{seen:?}");
+    assert!(saw(&seen, &source.join("wide/f01"), "delete"), "{seen:?}");
+}
+
 /// P77, free run: a `copy` takes no lock on any source inode and opens no
 /// source path for writing, and the source's `lstat` census is unchanged.
 #[test]
@@ -627,7 +909,8 @@ fn a_copy_takes_no_source_lock_and_opens_nothing_for_write() {
     settle_racy_window(&source).unwrap();
     let census = lstat_census(&source);
     let keys: BTreeSet<String> = lock_keys(&source).into_keys().collect();
-    let sampler = Sampler::start(source.clone(), keys, Held::default());
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(vec![source.clone()], keys, Held::default());
     let stats = copy(
         &source,
         &destination,
@@ -636,6 +919,7 @@ fn a_copy_takes_no_source_lock_and_opens_nothing_for_write() {
     )
     .unwrap();
     let observed = sampler.finish();
+    let written = watch.drain();
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     assert_carried(&source, &destination);
     assert!(observed.samples > 0);
@@ -649,6 +933,7 @@ fn a_copy_takes_no_source_lock_and_opens_nothing_for_write() {
         "write-mode opens of source paths during a copy: {:?}",
         observed.opens
     );
+    assert_eq!(written, [], "write events on the source during a copy");
     assert_eq!(lstat_census(&source), census, "the copy changed the source");
     eprintln!(
         "p77 copy free run: {} samples, mean period {} us",
@@ -674,15 +959,18 @@ fn a_copy_never_waits_on_or_fails_at_a_source_lock_holder() {
     settle_racy_window(&source).unwrap();
     let census = lstat_census(&source);
     let keys: BTreeSet<String> = lock_keys(&source).into_keys().collect();
-    let sampler = Sampler::start(source.clone(), keys, holder.shape());
-    let (stats, blocked) = {
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(vec![source.clone()], keys, holder.shape());
+    let ((stats, written), blocked) = {
         let (source, destination) = (source.clone(), destination.clone());
         let (source_state, destination_state) = (
             scratch.path("source-state"),
             scratch.path("destination-state"),
         );
-        within_deadline(Some(holder), move || {
-            copy(&source, &destination, &source_state, &destination_state)
+        within_deadline(vec![holder], move || {
+            let stats = copy(&source, &destination, &source_state, &destination_state);
+            // Before the holder's own descriptors close.
+            (stats, watch.drain())
         })
     };
     let observed = sampler.finish();
@@ -703,6 +991,7 @@ fn a_copy_never_waits_on_or_fails_at_a_source_lock_holder() {
         "write-mode opens of source paths during a copy: {:?}",
         observed.opens
     );
+    assert_eq!(written, [], "write events on the source during a copy");
     eprintln!(
         "p77 copy holder run: {} samples, mean period {} us, read-only enforced: {}",
         observed.samples,
@@ -711,6 +1000,98 @@ fn a_copy_never_waits_on_or_fails_at_a_source_lock_holder() {
     );
     assert_carried(&source, &destination);
     assert_eq!(lstat_census(&source), census, "the copy changed the source");
+}
+
+/// P77, serve leg: the source reader as the `serve` verb of the real binary,
+/// in its own process, the way `pull` starts it over ssh. With every source
+/// node held and the tree read-only, the served transfer finishes, no
+/// process takes or waits for a source lock, no process writes, creates or
+/// opens for writing anything in the source, and every byte arrives.
+#[test]
+fn a_served_source_in_its_own_process_takes_no_lock() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("serve-held");
+    let source = scratch.path("source");
+    let destination = scratch.path("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    populate(&source);
+    let holder = Holder::take(&source, &BTreeSet::new());
+    make_read_only(&source);
+    settle_racy_window(&source).unwrap();
+    let census = lstat_census(&source);
+    let keys: BTreeSet<String> = lock_keys(&source).into_keys().collect();
+
+    let stderr = scratch.path("serve.stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut output = child.stdin.take().unwrap();
+    let mut input = child.stdout.take().unwrap();
+
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(vec![source.clone()], keys, holder.shape());
+    let ((stats, written), blocked) = {
+        let (source, destination) = (source.clone(), destination.clone());
+        let (source_state, destination_state) = (
+            scratch.path("source-state"),
+            scratch.path("destination-state"),
+        );
+        within_deadline(vec![holder], move || {
+            let stats = receive(
+                &mut input,
+                &mut output,
+                &source,
+                &source_state,
+                &destination,
+                &destination_state,
+            );
+            // Closing its stdin ends the serve process.
+            drop(output);
+            (stats, watch.drain())
+        })
+    };
+    let observed = sampler.finish();
+    let served = child.wait().unwrap();
+    let said = fs::read_to_string(&stderr).unwrap_or_default();
+    assert!(
+        !blocked,
+        "the served transfer waited on a source lock: {:?}",
+        observed.locks
+    );
+    let stats = stats.unwrap_or_else(|refusal| panic!("receive refused: {refusal}; serve: {said}"));
+    assert!(served.success(), "serve failed: {said}");
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(
+        observed.locks.is_empty(),
+        "source lock attempts during a served transfer: {:?}",
+        observed.locks
+    );
+    assert!(
+        observed.opens.is_empty(),
+        "write-mode opens of source paths by the receiver: {:?}",
+        observed.opens
+    );
+    assert_eq!(
+        written,
+        [],
+        "write events on the source during a served transfer"
+    );
+    assert_carried(&source, &destination);
+    assert_eq!(
+        lstat_census(&source),
+        census,
+        "the served transfer changed the source"
+    );
+    eprintln!(
+        "p77 serve process holder run: {} samples, mean period {} us",
+        observed.samples,
+        observed.period_us()
+    );
 }
 
 /// A fixture Git child (test identity, no user configuration).
@@ -727,33 +1108,88 @@ fn fixture_git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
-/// P77, Git leg: with every node of a repository (worktree and `.git`)
-/// held under exclusive locks, a v1 capture of it finishes, no process
-/// (the agent or any Git child) takes or waits for a lock on any of its
-/// inodes, and the repository's `lstat` census is unchanged.
+/// A repository whose index Git would rewrite if it were allowed to: a
+/// commit, a staged change, a worktree change, an untracked file, and one
+/// tracked file re-stamped with the same bytes. The re-stamp makes its index
+/// entry stale, so an unhardened `git status` refreshes the index: it takes
+/// `.git/index.lock` and renames it over `.git/index`.
+fn stale_index_repository(repo: &Path) {
+    fs::create_dir(repo).unwrap();
+    fixture_git(repo, &["init", "--quiet", "--template=", "-b", "main"]);
+    populate(repo);
+    fixture_git(repo, &["add", "."]);
+    fixture_git(repo, &["commit", "--quiet", "-m", "one"]);
+    fs::write(repo.join("b"), b"staged\n").unwrap();
+    fixture_git(repo, &["add", "b"]);
+    fs::write(repo.join("b"), b"worktree\n").unwrap();
+    fs::write(repo.join("untracked"), b"untracked\n").unwrap();
+    settle_racy_window(repo).unwrap();
+    let same = fs::read(repo.join("wide/f00")).unwrap();
+    fs::write(repo.join("wide/f00"), same).unwrap();
+}
+
+/// The fixture is as stale as it claims: an ordinary `git status` rewrites
+/// the copy's index (seen by the watch), so a capture that leaves the
+/// original's alone is hardened, not lucky.
+#[test]
+fn the_git_fixture_makes_an_unhardened_status_rewrite_the_index() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("git-stale");
+    let repo = scratch.path("repo");
+    stale_index_repository(&repo);
+    settle_racy_window(&repo).unwrap();
+    let census = lstat_census(&repo);
+    let watch = Watch::start(&[&repo]);
+    fixture_git(&repo, &["--no-optional-locks", "status", "--porcelain"]);
+    assert_eq!(watch.drain(), [], "a hardened status wrote the repository");
+    assert_eq!(lstat_census(&repo), census);
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(&repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let written = watch.drain();
+    assert!(
+        written.iter().any(
+            |event| event.path == repo.join(".git/index.lock") && event.what.contains("create")
+        ),
+        "an unhardened status took no index.lock: {written:?}"
+    );
+    assert_ne!(
+        lstat_census(&repo),
+        census,
+        "an unhardened status left the census alone"
+    );
+}
+
+/// P77, Git leg: with every node of a repository (worktree and `.git`) held
+/// under exclusive locks, a v1 capture of it finishes, and no process (the
+/// agent or any Git child) writes, creates, renames, re-stamps or opens for
+/// writing anything in it. Git locks with `*.lock` files, which the kernel's
+/// lock table never lists, so the write watch and the `lstat` census carry
+/// this leg; the lock table and the holder add that no `flock` or `fcntl`
+/// lock is taken or waited for either.
 #[test]
 fn a_git_capture_never_waits_on_a_source_lock_holder() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = Scratch::new("git-held");
     let repo = scratch.path("repo");
-    fs::create_dir(&repo).unwrap();
-    fixture_git(&repo, &["init", "--quiet", "--template=", "-b", "main"]);
-    populate(&repo);
-    fixture_git(&repo, &["add", "."]);
-    fixture_git(&repo, &["commit", "--quiet", "-m", "one"]);
-    fs::write(repo.join("b"), b"staged\n").unwrap();
-    fixture_git(&repo, &["add", "b"]);
-    fs::write(repo.join("b"), b"worktree\n").unwrap();
-    fs::write(repo.join("untracked"), b"untracked\n").unwrap();
+    stale_index_repository(&repo);
     let holder = Holder::take(&repo, &BTreeSet::new());
     settle_racy_window(&repo).unwrap();
     let census = lstat_census(&repo);
     let keys: BTreeSet<String> = lock_keys(&repo).into_keys().collect();
-    let sampler = Sampler::start(repo.clone(), keys, holder.shape());
-    let (bundle, blocked) = {
+    let watch = Watch::start(&[&repo]);
+    let sampler = Sampler::start(vec![repo.clone()], keys, holder.shape());
+    let ((bundle, written), blocked) = {
         let (repo, capture) = (repo.clone(), scratch.path("capture"));
-        within_deadline(Some(holder), move || {
-            bulkload_agent::git_carry::export_repository(&repo, &capture)
+        within_deadline(vec![holder], move || {
+            let bundle = bulkload_agent::git_carry::export_repository(&repo, &capture);
+            (bundle, watch.drain())
         })
     };
     let observed = sampler.finish();
@@ -764,6 +1200,12 @@ fn a_git_capture_never_waits_on_a_source_lock_holder() {
     );
     let bundle = bundle.unwrap();
     assert!(bundle.is_file());
+    assert_eq!(
+        written,
+        [],
+        "write events in the repository during a capture (a `.lock` file is \
+         how Git locks)"
+    );
     assert!(
         observed.locks.is_empty(),
         "source lock attempts during a capture: {:?}",
@@ -786,17 +1228,150 @@ fn a_git_capture_never_waits_on_a_source_lock_holder() {
     );
 }
 
-/// The live writer for the `SQLite` leg, run as a separate process: with
+/// P77, estate leg: `estate::capture` of a plan of two repositories, each
+/// with a stale index, with every node of both held. The pass finishes, no
+/// process writes, creates, renames, re-stamps or opens for writing anything
+/// in either, no `flock` or `fcntl` lock is taken or waited for on either,
+/// and the estate's own exclusive lock (`estate.lock`) and the plan's lie
+/// outside both.
+#[test]
+// One linear scenario: two repositories, their holders, one pass.
+#[allow(clippy::too_many_lines)]
+fn an_estate_capture_never_locks_or_writes_its_sources() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("estate-held");
+    let repos = [scratch.path("first"), scratch.path("second")];
+    for repo in &repos {
+        stale_index_repository(repo);
+    }
+    let plan = scratch.path("plan.json");
+    let state = scratch.path("state");
+    let corpus = scratch.path("corpus");
+    for private in [&state, &corpus] {
+        fs::create_dir(private).unwrap();
+        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let items: Vec<bulkload_agent::estate::Item> = repos
+        .iter()
+        .enumerate()
+        .map(|(index, repo)| bulkload_agent::estate::Item {
+            source: repo.clone(),
+            repository: scratch.path(&format!("landed-{index}")),
+            workspace: None,
+        })
+        .collect();
+    bulkload_agent::estate::add_batch(&plan, &items).unwrap();
+
+    let holders: Vec<Holder> = repos
+        .iter()
+        .map(|repo| Holder::take(repo, &BTreeSet::new()))
+        .collect();
+    let mut held = Held::default();
+    let mut keys = BTreeSet::new();
+    let mut census = Vec::new();
+    for (repo, holder) in repos.iter().zip(&holders) {
+        settle_racy_window(repo).unwrap();
+        let shape = holder.shape();
+        held.keys.extend(shape.keys);
+        held.descriptors.extend(shape.descriptors);
+        keys.extend(lock_keys(repo).into_keys());
+        census.push(lstat_census(repo));
+    }
+    let watch = Watch::start(&[&repos[0], &repos[1]]);
+    let sampler = Sampler::start(repos.to_vec(), keys, held);
+    let receipts = Arc::new(Mutex::new(Vec::new()));
+    let ((captured, written), blocked) = {
+        let (plan, state) = (plan.clone(), state.clone());
+        let receipts = Arc::clone(&receipts);
+        within_deadline(holders, move || {
+            let captured = bulkload_agent::estate::capture(
+                &plan,
+                &state,
+                &corpus,
+                2,
+                &|receipt: &bulkload_agent::estate::Receipt| {
+                    receipts.lock().unwrap().push((
+                        receipt.source.clone(),
+                        receipt.outcome,
+                        receipt.reason.clone(),
+                    ));
+                    Ok(())
+                },
+            );
+            (captured, watch.drain())
+        })
+    };
+    let observed = sampler.finish();
+    assert!(
+        !blocked,
+        "the estate capture waited on a source lock: {:?}",
+        observed.locks
+    );
+    captured.unwrap();
+    let receipts = receipts.lock().unwrap().clone();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+    for (source, outcome, reason) in &receipts {
+        assert!(
+            reason.is_none(),
+            "{} was not captured: {outcome} {reason:?}",
+            source.display()
+        );
+    }
+    assert_eq!(
+        written,
+        [],
+        "write events in the sources during an estate capture"
+    );
+    assert!(
+        observed.locks.is_empty(),
+        "source lock attempts during an estate capture: {:?}",
+        observed.locks
+    );
+    assert!(
+        observed.opens.is_empty(),
+        "write-mode opens of source paths during an estate capture: {:?}",
+        observed.opens
+    );
+    for (repo, before) in repos.iter().zip(&census) {
+        assert_eq!(
+            &lstat_census(repo),
+            before,
+            "the estate capture changed {}",
+            repo.display()
+        );
+    }
+    // The estate's own exclusive locks are files of its state and its plan.
+    assert!(state.join("estate.lock").is_file());
+    assert!(plan.with_extension("lock").is_file());
+    eprintln!(
+        "p77 estate capture holder run: {} samples, mean period {} us, receipts {:?}",
+        observed.samples,
+        observed.period_us(),
+        receipts
+            .iter()
+            .map(|(_, outcome, _)| *outcome)
+            .collect::<Vec<_>>()
+    );
+}
+
+// ------------------------------------------------------------ the SQLite legs
+
+/// The live writer for the `SQLite` legs, run as a separate process: with
 /// [`WRITER_ENV`] set, it opens the database in WAL mode, commits rows that
 /// stay in the `-wal` (no checkpoint), prints a ready line, and holds the
-/// connection open until its stdin closes. Without it this test does
+/// connection open until its stdin closes. With [`WRITER_LIVE_ENV`] set as
+/// well it keeps committing one row every few milliseconds until then, with
+/// no busy timeout, and reports each commit, how many found the database
+/// busy, and its slowest commit. Without [`WRITER_ENV`] this test does
 /// nothing.
 #[test]
 fn sqlite_writer_helper() {
     let Some(db) = std::env::var_os(WRITER_ENV) else {
         return;
     };
+    let live = std::env::var_os(WRITER_LIVE_ENV).is_some();
     let connection = rusqlite::Connection::open(&db).unwrap();
+    connection.busy_timeout(Duration::ZERO).unwrap();
     let mode: String = connection
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .unwrap();
@@ -821,18 +1396,300 @@ fn sqlite_writer_helper() {
     }
     println!("p77-writer-ready");
     std::io::stdout().flush().unwrap();
-    let mut rest = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut rest);
+    let closed = Arc::new(AtomicBool::new(false));
+    let closing = Arc::clone(&closed);
+    let stdin = thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut rest);
+        closing.store(true, Ordering::Release);
+    });
+    let (mut commits, mut busy, mut slowest) = (0_u64, 0_u64, Duration::ZERO);
+    while live && !closed.load(Ordering::Acquire) {
+        let began = std::time::Instant::now();
+        match connection.execute(
+            "INSERT INTO rows(body) VALUES (?1)",
+            [noise(90_000 + commits, 256)],
+        ) {
+            Ok(_) => {
+                commits += 1;
+                slowest = slowest.max(began.elapsed());
+                println!("p77-writer-commits {commits}");
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                busy += 1;
+            }
+            Err(other) => panic!("the live writer failed: {other}"),
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    stdin.join().unwrap();
+    println!(
+        "p77-writer-done commits={commits} busy={busy} slowest_us={}",
+        slowest.as_micros()
+    );
+    std::io::stdout().flush().unwrap();
     drop(connection);
 }
 
+/// The writer process and what its stdout has said so far.
+struct Writer {
+    child: std::process::Child,
+    reader: thread::JoinHandle<()>,
+    commits: Arc<AtomicU64>,
+    done: Arc<Mutex<Option<String>>>,
+}
+
+/// What the writer reported when it ended.
+#[derive(Debug)]
+struct WriterReport {
+    commits: u64,
+    busy: u64,
+    slowest: Duration,
+}
+
+impl Writer {
+    /// Start the writer on `db` and wait until its rows are committed.
+    fn start(db: &Path, live: bool) -> Self {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sqlite_writer_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WRITER_ENV, db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if live {
+            command.env(WRITER_LIVE_ENV, "1");
+        }
+        let mut child = command.spawn().unwrap();
+        // libtest prints `test NAME ... ` before the test's own output, so a
+        // marker ends a line rather than being one. The reader drains the
+        // writer's stdout to its end, so the writer never blocks on it.
+        let (ready, became_ready) = mpsc::channel();
+        let commits = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(Mutex::new(None));
+        let stdout = child.stdout.take().unwrap();
+        let (counting, finishing) = (Arc::clone(&commits), Arc::clone(&done));
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.ends_with("p77-writer-ready") {
+                    let _ = ready.send(());
+                } else if let Some((_, count)) = line.split_once("p77-writer-commits ") {
+                    counting.store(count.trim().parse().unwrap_or(0), Ordering::Release);
+                } else if let Some((_, report)) = line.split_once("p77-writer-done ") {
+                    *finishing.lock().unwrap() = Some(report.to_owned());
+                }
+            }
+        });
+        let mut writer = Self {
+            child,
+            reader,
+            commits,
+            done,
+        };
+        if became_ready.recv_timeout(DEADLINE).is_err() {
+            // Closing its stdin ends the writer whatever state it is in.
+            drop(writer.child.stdin.take());
+            let _ = writer.child.wait();
+            panic!("the writer never became ready");
+        }
+        writer
+    }
+
+    fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Acquire)
+    }
+
+    /// Close the writer's stdin, wait for it, and return its report.
+    fn finish(mut self) -> WriterReport {
+        drop(self.child.stdin.take());
+        self.reader.join().unwrap();
+        assert!(self.child.wait().unwrap().success(), "the writer failed");
+        let report = self
+            .done
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the writer's report");
+        let field = |name: &str| -> u64 {
+            report
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(name))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {report:?}"))
+        };
+        WriterReport {
+            commits: field("commits="),
+            busy: field("busy="),
+            slowest: Duration::from_micros(field("slowest_us=")),
+        }
+    }
+}
+
+/// The lock keys of a database and its two sidecars.
+struct DatabaseKeys {
+    db: String,
+    wal: String,
+    shm: String,
+}
+
+/// What a snapshot's sampled locks and write-mode opens came to: how many
+/// samples saw each part of the Q16/Q36 exception, and everything outside
+/// it.
+#[derive(Debug, Default)]
+struct Accounting {
+    /// Samples that saw this process's shared READ lock on the database.
+    db_read: u64,
+    /// Samples that saw this process's READ locks on the `-shm`.
+    shm_read: u64,
+    /// Samples that saw this process's one-byte WRITE lock on a `-shm`
+    /// read-mark slot.
+    shm_mark: u64,
+    /// Samples that saw this process hold the `-shm` open for writing.
+    shm_open: u64,
+    /// Samples that saw this process hold the `-wal` open for writing
+    /// ([`WAL_OPENED_READ_WRITE`], bulkload#157).
+    wal_open: u64,
+    /// The longest this process was seen holding its database READ lock.
+    db_hold: Duration,
+    breaches: Vec<String>,
+}
+
+/// `SQLite`'s wal-index lock bytes in the `-shm`: 120 is the WRITE lock, 121
+/// the checkpoint lock, 122 the recovery lock, 123 to 127 the five read
+/// marks, and 128 the "dead man's switch" every connection holds shared.
+const SHM_WRITE_LOCK: u64 = 120;
+const SHM_READ_MARK_1: u64 = 124;
+const SHM_DMS: u64 = 128;
+
+/// Sort what the sampler saw of a snapshot into the exception and breaches.
+///
+/// The exception, exactly (OI-1003-Q16, OI-1003-Q36): this process's granted
+/// READ locks on the database; its granted READ locks on the `-shm`'s lock
+/// bytes; and its granted one-byte WRITE lock on a read-mark slot other than
+/// slot 0 (`SQLite` takes it for an instant to move a read mark; it excludes
+/// no writer, which never locks a read mark). Not in the exception: any
+/// WRITE lock on the `-shm`'s write, checkpoint or recovery byte or across
+/// several bytes; any lock on the `-wal`; any lock this process waits for;
+/// and any lock *another* process waits for on any of the three, which is
+/// the live writer being held up.
+fn account(
+    observed: &Observed,
+    keys: &DatabaseKeys,
+    paths: &BTreeMap<String, PathBuf>,
+    shm: &Path,
+    wal: &Path,
+) -> Accounting {
+    let ours = std::process::id().to_string();
+    let mut accounting = Accounting::default();
+    for (line, samples) in &observed.locks {
+        let on = paths.get(&line.key);
+        if line.blocked {
+            accounting
+                .breaches
+                .push(format!("a lock waited for on {on:?}: {line:?}"));
+            continue;
+        }
+        if line.pid != ours {
+            // The writer's own granted locks on its own database.
+            if line.key != keys.db && line.key != keys.wal && line.key != keys.shm {
+                accounting
+                    .breaches
+                    .push(format!("another process's lock on {on:?}: {line:?}"));
+            }
+            continue;
+        }
+        let end = line.end.unwrap_or(u64::MAX);
+        let on_lock_bytes = line.start >= SHM_WRITE_LOCK && end <= SHM_DMS;
+        if line.key == keys.db && line.mode == "READ" {
+            accounting.db_read += samples;
+            let held = observed.longest.get(line).copied().unwrap_or_default();
+            accounting.db_hold = accounting.db_hold.max(held);
+        } else if line.key == keys.shm && line.mode == "READ" && on_lock_bytes {
+            accounting.shm_read += samples;
+        } else if line.key == keys.shm
+            && line.mode == "WRITE"
+            && line.start == end
+            && (SHM_READ_MARK_1..SHM_DMS).contains(&line.start)
+        {
+            accounting.shm_mark += samples;
+        } else {
+            accounting
+                .breaches
+                .push(format!("outside the exception, on {on:?}: {line:?}"));
+        }
+    }
+    for (open, samples) in &observed.opens {
+        if open.path == shm {
+            accounting.shm_open += samples;
+        } else if open.path == wal && WAL_OPENED_READ_WRITE {
+            accounting.wal_open += samples;
+        } else {
+            accounting
+                .breaches
+                .push(format!("write-mode open {open:?}"));
+        }
+    }
+    accounting
+}
+
+/// The names in `directory`, sorted.
+fn listing(directory: &Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The lstat census of `directory` without the named entries.
+fn census_without(directory: &Path, without: &[&str]) -> Census {
+    let mut census = lstat_census(directory);
+    for name in without {
+        census.remove(Path::new(name));
+    }
+    census
+}
+
+/// This process's locks on any of `keys`, right now, without the holder's.
+fn our_locks(keys: &BTreeMap<String, PathBuf>, held: &Held) -> Vec<LockLine> {
+    let ours = std::process::id().to_string();
+    read_locks()
+        .into_iter()
+        .filter(|line| line.pid == ours && keys.contains_key(&line.key) && !held.owns(line, &ours))
+        .collect()
+}
+
 /// P77, `SQLite` leg (OI-1003-Q16, OI-1003-Q36): the backup API against a WAL
-/// database a separate writer holds open. This process's locks on source
-/// inodes fall only under the exception (a shared READ lock on the database;
-/// anything on its `-shm`), and so do its write-mode opens (the `-shm`
-/// only). Nothing else in the source directory is locked or opened for
-/// writing, the database and its `-wal` are byte-identical before and after,
-/// and the exception is counted.
+/// database a separate writer holds open.
+///
+/// - This process's source locks fall only under the exception as
+///   [`account`] states it, and the exception is observed, not assumed: the
+///   database READ lock and the `-shm` open are each seen at least once.
+/// - Nobody waits: not the snapshot, and not the writer on anything the
+///   snapshot holds.
+/// - The database READ lock is bounded: it is seen for at most
+///   [`SQLITE_LOCK_BOUND`], and it is gone when `snapshot` returns.
+/// - No other source write occurs (Q36): the directory's listing and the
+///   `lstat` census of everything but the `-shm` are unchanged, the write
+///   watch saw events on the `-shm` only, and the database, the `-wal` and
+///   the sibling file are byte-identical.
+///
+/// **Not met:** the acceptance criterion "no write-mode open but the
+/// `-shm`". The backup's read-only connection holds the `-wal` open
+/// `O_RDWR`, which no ruling grants. It is counted under
+/// [`WAL_OPENED_READ_WRITE`] and tracked on bulkload#157; this test does not
+/// pass that criterion, it records the breach.
 #[test]
 // One linear scenario: writer, holder, snapshot, then the accounting.
 #[allow(clippy::too_many_lines)]
@@ -841,40 +1698,10 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
     let scratch = Scratch::new("sqlite");
     let source = scratch.path("source");
     fs::create_dir(&source).unwrap();
-    fs::write(source.join("sibling"), noise(9, 8192)).unwrap();
+    let sibling = noise(9, 8192);
+    fs::write(source.join("sibling"), &sibling).unwrap();
     let db = source.join("state.db");
-
-    let mut writer = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "sqlite_writer_helper",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(WRITER_ENV, &db)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // libtest prints `test NAME ... ` before the test's own output, so the
-    // ready marker ends a line rather than being one. The reader drains the
-    // writer's stdout to its end, so the writer never blocks on it.
-    let (ready, became_ready) = mpsc::channel();
-    let stdout = writer.stdout.take().unwrap();
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if line.ends_with("p77-writer-ready") {
-                let _ = ready.send(());
-            }
-        }
-    });
-    if became_ready.recv_timeout(DEADLINE).is_err() {
-        // Closing its stdin ends the writer whatever state it is in.
-        drop(writer.stdin.take());
-        let _ = writer.wait();
-        panic!("the writer never became ready");
-    }
+    let writer = Writer::start(&db, false);
     let wal = source.join("state.db-wal");
     let shm = source.join("state.db-shm");
     assert!(
@@ -883,26 +1710,40 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
     );
     let db_bytes = fs::read(&db).unwrap();
     let wal_bytes = fs::read(&wal).unwrap();
+    let names = listing(&source);
+    let census = census_without(&source, &["state.db-shm"]);
 
-    let keys = lock_keys(&source);
+    let paths = lock_keys(&source);
     let key_of = |path: &Path| lock_key(&fs::symlink_metadata(path).unwrap());
-    let (db_key, wal_key, shm_key) = (key_of(&db), key_of(&wal), key_of(&shm));
+    let keys = DatabaseKeys {
+        db: key_of(&db),
+        wal: key_of(&wal),
+        shm: key_of(&shm),
+    };
     let skip: BTreeSet<PathBuf> = ["state.db", "state.db-wal", "state.db-shm"]
         .into_iter()
         .map(PathBuf::from)
         .collect();
     let holder = Holder::take(&source, &skip);
-    let watched: BTreeSet<String> = keys.keys().cloned().collect();
-    let sampler = Sampler::start(source, watched, holder.shape());
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(
+        vec![source.clone()],
+        paths.keys().cloned().collect(),
+        holder.shape(),
+    );
 
     let output_dir = scratch.path("snapshot");
     fs::create_dir(&output_dir).unwrap();
     fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let output = output_dir.join("state.db");
-    let (result, blocked) = {
-        let (db, output) = (db.clone(), output.clone());
-        within_deadline(Some(holder), move || {
-            bulkload_agent::provider_sqlite::snapshot(&db, &output, 10_000)
+    let ((result, written, left), blocked) = {
+        let (db, output, paths) = (db.clone(), output.clone(), paths.clone());
+        let held = holder.shape();
+        within_deadline(vec![holder], move || {
+            let result = bulkload_agent::provider_sqlite::snapshot(&db, &output, 10_000);
+            // Released on return: nothing of ours is left on the source.
+            let left = our_locks(&paths, &held);
+            (result, watch.drain(), left)
         })
     };
     let observed = sampler.finish();
@@ -911,50 +1752,81 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
     // write, not ours.
     let db_unchanged = fs::read(&db).unwrap() == db_bytes;
     let wal_unchanged = fs::read(&wal).unwrap() == wal_bytes;
-
-    drop(writer.stdin.take());
-    reader.join().unwrap();
-    assert!(writer.wait().unwrap().success(), "the writer failed");
+    let sibling_unchanged = fs::read(source.join("sibling")).unwrap() == sibling;
+    let names_after = listing(&source);
+    let census_after = census_without(&source, &["state.db-shm"]);
+    let report = writer.finish();
 
     assert!(!blocked, "the snapshot waited: {:?}", observed.locks);
     result.unwrap();
-    let ours = std::process::id().to_string();
-    let mut counted = BTreeMap::new();
-    let mut breaches = Vec::new();
-    for (line, samples) in &observed.locks {
-        if line.pid != ours {
-            // The writer's own locks, or a holder's waiter, never ours.
-            if line.key != db_key && line.key != wal_key && line.key != shm_key {
-                breaches.push(format!("{line:?} (another process, a non-database inode)"));
-            }
-            continue;
-        }
-        let allowed =
-            (line.key == db_key && line.mode == "READ" && !line.blocked) || line.key == shm_key;
-        if allowed {
-            let name = if line.key == db_key { "db-read" } else { "shm" };
-            *counted.entry(name).or_insert(0_u64) += samples;
-        } else {
-            breaches.push(format!("{line:?} on {:?}", keys.get(&line.key)));
-        }
-    }
-    let mut shm_opens = 0_u64;
-    let mut wal_opens = 0_u64;
-    for (open, samples) in &observed.opens {
-        if open.path == shm {
-            shm_opens += samples;
-        } else if open.path == wal && WAL_OPENED_READ_WRITE {
-            wal_opens += samples;
-        } else {
-            breaches.push(format!("write-mode open {open:?}"));
-        }
-    }
-    assert!(
-        breaches.is_empty(),
-        "source access outside the Q16/Q36 exception: {breaches:#?}"
+    let accounting = account(&observed, &keys, &paths, &shm, &wal);
+    eprintln!(
+        "p77 sqlite lock lines: {:#?}",
+        observed
+            .locks
+            .iter()
+            .map(|(line, samples)| format!(
+                "{samples}x {} {} {} pid={} {:?} {}..{:?}",
+                if line.blocked { "->" } else { "  " },
+                line.kind,
+                line.mode,
+                if line.pid == std::process::id().to_string() {
+                    "ours"
+                } else {
+                    "other"
+                },
+                paths.get(&line.key),
+                line.start,
+                line.end
+            ))
+            .collect::<Vec<_>>()
     );
+    assert!(
+        accounting.breaches.is_empty(),
+        "source access outside the Q16/Q36 exception: {:#?}",
+        accounting.breaches
+    );
+    // The exception was observed, so the leg did not pass by seeing nothing.
+    assert!(
+        accounting.db_read > 0,
+        "the sampler never saw the database READ lock: {accounting:?}"
+    );
+    assert!(
+        accounting.shm_read > 0 && accounting.shm_open > 0,
+        "the sampler never saw the -shm exception: {accounting:?}"
+    );
+    assert!(
+        accounting.db_hold + observed.period() * 2 <= SQLITE_LOCK_BOUND,
+        "the database READ lock was held for {:?}, over the bound {SQLITE_LOCK_BOUND:?}",
+        accounting.db_hold
+    );
+    assert_eq!(
+        left,
+        [],
+        "locks left on the source after the snapshot returned"
+    );
+    // Q36: no other source write. The `-wal`'s one tolerated event is the
+    // close of the read-write descriptor (bulkload#157); a write to it is
+    // not tolerated.
+    let wal_closed = WriteEvent {
+        path: wal,
+        what: "close-write".to_owned(),
+    };
+    let outside: Vec<&WriteEvent> = written
+        .iter()
+        .filter(|event| event.path != shm && !(WAL_OPENED_READ_WRITE && **event == wal_closed))
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&WriteEvent>::new(),
+        "write events outside the -shm"
+    );
+    assert_eq!(names_after, names, "the source directory's listing changed");
+    assert_eq!(census_after, census, "the source changed outside the -shm");
     assert!(db_unchanged, "the snapshot changed the database");
     assert!(wal_unchanged, "the snapshot changed the -wal");
+    assert!(sibling_unchanged, "the snapshot changed a sibling file");
+    assert_eq!((report.commits, report.busy), (0, 0), "{report:?}");
     let snapshot = rusqlite::Connection::open(&output).unwrap();
     let rows: i64 = snapshot
         .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
@@ -962,12 +1834,162 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
     assert_eq!(rows, 2000, "the snapshot holds the -wal's rows");
     eprintln!(
         "p77 sqlite exception (sample counts, Q16/Q36): {} samples, mean period {} us, \
-         db-read-lock={} shm-lock={} shm-write-open={} wal-write-open={} (#157)",
+         db-read-lock={} shm-read-lock={} shm-read-mark-write={} shm-write-open={} \
+         wal-write-open={} (#157, criterion NOT met), db-read-lock held {:?} \
+         (bound {SQLITE_LOCK_BOUND:?}), write events {:?}",
         observed.samples,
         observed.period_us(),
-        counted.get("db-read").copied().unwrap_or(0),
-        counted.get("shm").copied().unwrap_or(0),
-        shm_opens,
-        wal_opens
+        accounting.db_read,
+        accounting.shm_read,
+        accounting.shm_mark,
+        accounting.shm_open,
+        accounting.wal_open,
+        accounting.db_hold,
+        written
+            .iter()
+            .map(|event| event.what.as_str())
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+/// P77, `SQLite` leg with a live writer: the same backup while the writer
+/// process commits a row every few milliseconds with no busy timeout.
+///
+/// - The writer is never refused (`SQLITE_BUSY`) and never waits: no blocked
+///   lock line on the database, the `-wal` or the `-shm`, and its slowest
+///   commit is within [`COMMIT_BOUND`].
+/// - Its commits go on during the snapshot (the commit count moves).
+/// - This process's locks fall under the exception, as above.
+/// - The backup writes nothing: the database is byte-identical (the writer
+///   never checkpoints, so any change is the snapshot's), no file appears in
+///   the directory, and the write watch sees events only on the `-wal` and
+///   the `-shm`, which the writer itself is writing.
+///
+/// A snapshot that loses a race with a commit refuses with a typed value and
+/// is retried on a new output path, as the provider's contract says.
+#[test]
+// One linear scenario, as above.
+#[allow(clippy::too_many_lines)]
+fn a_sqlite_snapshot_does_not_hold_up_a_committing_writer() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("sqlite-live");
+    let source = scratch.path("source");
+    fs::create_dir(&source).unwrap();
+    let sibling = noise(9, 8192);
+    fs::write(source.join("sibling"), &sibling).unwrap();
+    let db = source.join("state.db");
+    let writer = Writer::start(&db, true);
+    let wal = source.join("state.db-wal");
+    let shm = source.join("state.db-shm");
+    let db_bytes = fs::read(&db).unwrap();
+    let names = listing(&source);
+    let census = census_without(&source, &["state.db-shm", "state.db-wal"]);
+
+    let paths = lock_keys(&source);
+    let key_of = |path: &Path| lock_key(&fs::symlink_metadata(path).unwrap());
+    let keys = DatabaseKeys {
+        db: key_of(&db),
+        wal: key_of(&wal),
+        shm: key_of(&shm),
+    };
+    let skip: BTreeSet<PathBuf> = ["state.db", "state.db-wal", "state.db-shm"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let holder = Holder::take(&source, &skip);
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(
+        vec![source.clone()],
+        paths.keys().cloned().collect(),
+        holder.shape(),
+    );
+
+    let output_dir = scratch.path("snapshot");
+    fs::create_dir(&output_dir).unwrap();
+    fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    // Until one snapshot both succeeds and overlaps a commit.
+    let mut attempts = Vec::new();
+    let mut overlapped = None;
+    for attempt in 0..LIVE_ATTEMPTS {
+        let output = output_dir.join(format!("state-{attempt}.db"));
+        let before = writer.commits();
+        let result = bulkload_agent::provider_sqlite::snapshot(&db, &output, 10_000);
+        let during = writer.commits() - before;
+        attempts.push(format!("{result:?} during {during} commits"));
+        if result.is_ok() && during > 0 {
+            overlapped = Some(output);
+            break;
+        }
+    }
+    let left = our_locks(&paths, &holder.shape());
+    let written = watch.drain();
+    drop(holder);
+    let observed = sampler.finish();
+    let db_unchanged = fs::read(&db).unwrap() == db_bytes;
+    let sibling_unchanged = fs::read(source.join("sibling")).unwrap() == sibling;
+    let names_after = listing(&source);
+    let census_after = census_without(&source, &["state.db-shm", "state.db-wal"]);
+    let report = writer.finish();
+
+    let output = overlapped
+        .unwrap_or_else(|| panic!("no snapshot overlapped a commit and succeeded: {attempts:#?}"));
+    let accounting = account(&observed, &keys, &paths, &shm, &wal);
+    assert!(
+        accounting.breaches.is_empty(),
+        "source access outside the Q16/Q36 exception, or the writer held up: {:#?}",
+        accounting.breaches
+    );
+    assert!(accounting.db_read > 0, "{accounting:?}");
+    assert_eq!(
+        left,
+        [],
+        "locks left on the source after the snapshots returned"
+    );
+    assert_eq!(
+        report.busy, 0,
+        "the writer found the database busy: {report:?}"
+    );
+    assert!(
+        report.slowest <= COMMIT_BOUND,
+        "a commit took {:?}, over the bound {COMMIT_BOUND:?}",
+        report.slowest
+    );
+    let outside: Vec<&WriteEvent> = written
+        .iter()
+        .filter(|event| event.path != shm && event.path != wal)
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&WriteEvent>::new(),
+        "write events outside the -wal and the -shm"
+    );
+    assert_eq!(names_after, names, "the source directory's listing changed");
+    assert_eq!(
+        census_after, census,
+        "the source changed outside the -wal and the -shm"
+    );
+    assert!(
+        db_unchanged,
+        "the database changed under a writer that never checkpoints"
+    );
+    assert!(sibling_unchanged, "the snapshot changed a sibling file");
+    let snapshot = rusqlite::Connection::open(&output).unwrap();
+    let rows: i64 = snapshot
+        .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
+        .unwrap();
+    assert!(rows >= 2000, "the snapshot holds {rows} rows");
+    eprintln!(
+        "p77 sqlite live writer: {} attempt(s) {attempts:?}; writer commits={} busy={} \
+         slowest commit {:?} (bound {COMMIT_BOUND:?}); db-read-lock={} shm-read-lock={} \
+         shm-read-mark-write={} over {} samples, mean period {} us",
+        attempts.len(),
+        report.commits,
+        report.busy,
+        report.slowest,
+        accounting.db_read,
+        accounting.shm_read,
+        accounting.shm_mark,
+        observed.samples,
+        observed.period_us()
     );
 }
