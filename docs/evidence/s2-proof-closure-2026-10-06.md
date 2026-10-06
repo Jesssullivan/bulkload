@@ -8,149 +8,265 @@ exception), OI-1003-Q60 (completion-bar audit), R-N13.
 **Scope.** This is lane 7 of the completion-bar audit. It adds two property
 tests, P76 and P77 in the
 [property-test plan](../plans/2026-10-03-property-test-plan.md). It is not
-S2's measured budget: that is #165 and is still open (see below). No
-production code was changed. Bypass sites are reported in
-[#188](https://github.com/Jesssullivan/bulkload/issues/188), and the one new
-SQLite finding is on
+S2's measured budget: that is #165 and is still open. No production code
+was changed. Bypass sites and the production work the tests point at are on
+[#188](https://github.com/Jesssullivan/bulkload/issues/188). The SQLite
+`-wal` finding is on
 [#157](https://github.com/Jesssullivan/bulkload/issues/157#issuecomment-6021861734).
 
-Measured on branch `feat/s2-proof-closure-20261006`, based on main
-`b6ecd50`, on sting (Linux, xfs scratch). The host was heavily shared:
-load1 was about 90 to 130 throughout. Tests were run with
-`cargo test -p bulkload-agent --test source_command_registry` and
-`--test source_lock_trace` inside `nix develop`, and the whole lane passed
-`just check-fast`.
+**This document was rewritten after a review round.** The first version
+claimed more than the tests proved. Section 1 says what each test proves
+now, section 2 gives the mutation evidence leg by leg, and section 3 lists
+what is **not** proved. S2's lock and write properties are not closed: see
+section 3.
 
-**check-fast receipt (commit `f3df6dc`).** It ran under the shared
-`.check-fast.lock` in `nix develop .#default` and exited 0, with 31
-`test result: ok` lines and 0 `FAILED`. Within it,
-`source_command_registry` reported 8 passed and `source_lock_trace`
-reported 6 passed.
+Measured on branch `feat/s2-proof-closure-20261006` on sting (Linux, xfs
+scratch), with main `2247ab8` merged in (`a7b7ccc`). The host was heavily
+shared. Tests ran inside `nix develop` with
+`cargo test -p bulkload-agent --test source_command_registry --test
+source_lock_trace -- --test-threads=1`.
 
-## 1. What is now proved, and how strongly
+## 1. What is proved, and how strongly
 
 ### P76 SOURCE-COMMAND-REGISTRY (`tests/source_command_registry.rs`)
 
-A source scan of `crates/bulkload-agent/src` removes comments, string and
-char literals, `tests.rs` files, modules declared behind `cfg(test)` and
-items behind `cfg(test)`. It then registers every `Command::new` that
-remains. Each site is named `module::fn(program)`, never by line.
+**The scan.** It reads every `crates/*/src` tree as text: the agent, the
+bench and the handoff tool. It drops comments, literals, items behind
+`#[cfg(test)]`, and files that a parent declares as a module behind that
+attribute. A file is never dropped for being named `tests.rs`. A
+`#[cfg(test)]` on an enum variant, a field, a statement or a parameter
+hides only that thing. The scan then finds every `Command` token followed
+by `::new`, under any path.
 
-- **Six non-test child builders exist.** One is the sanctioned
-  `git_carry::git("git")`. Four are allowlisted bypasses (bulkload#188):
-  - `git_carry::estimate::local_probe("bash")`;
-  - `git_carry::estimate::ssh_command("ssh")`;
-  - `main::pull_command("ssh")`;
-  - `provider_sqlite::hydrate::hydrate_one(program)`.
+**What the scan refuses outright**, because it could not name the child:
 
-  The allowlist has a ceiling of 4, may only shrink, and fails the test
-  when an entry goes stale.
-- **`git_carry::git` holds the WP1 (#145) contract, checked statically.**
-  - It uses `git_env::CLEARED`, `CONFIG` and `SET`, and adds
-    `--no-optional-locks` and `GIT_CEILING_DIRECTORIES`.
-  - `CONFIG` carries `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-    `gc.auto=0` and `maintenance.auto=false`.
-  - `SET` carries `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`,
-    `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
-    `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_NO_REPLACE_OBJECTS=1`.
-- **No non-test literal names a store-rewriting subcommand.** The checked
-  names are `gc`, `maintenance`, `repack`, `prune`, `prune-packed`,
-  `commit-graph`, `multi-pack-index` and `pack-refs`. Only `git_env` names
-  `GIT_OPTIONAL_LOCKS`.
-- **Every Git child of a real run carries the contract, checked
-  dynamically.** A `git` wrapper first on `PATH` recorded every Git child
-  that a real `git-export` and a real local `git-carry-estimate` started.
-  Each one carried the contract. `git version` is exempt from the `-c`
-  flags but still carries the environment.
-- **Limit.** The dynamic leg covers only the two verbs it runs. Children of
-  other verbs (`estate-capture`, `estate-apply`, `restore`) are covered
-  only by the static registry.
+- a renamed `Command` (`use .. as`, a `type` alias, an `impl .. for
+  Command`);
+- a child started without `Command`: `system`, `popen`, `fork`, `vfork`,
+  the `exec*` family, `posix_spawn*`, `clone`, the raw syscall numbers,
+  `CommandExt`, and `link_name`.
+
+**The registry.** There are 19 non-test children in the workspace:
+
+| Crate | Children | Standing |
+|---|---|---|
+| agent | `git_carry::git("git")` | The one sanctioned builder. |
+| agent | `git_carry::estimate::local_probe("bash")`, `git_carry::estimate::ssh_command("ssh")`, `main::pull_command("ssh")`, `provider_sqlite::hydrate::hydrate_one(program)` | Four bypasses, filed on #188. |
+| bench | `read("pmset")`, `rclone_copy(binary)`, `rclone_version(binary)` | Operator tool. Argued in the registry as never aimed at an estate source by the agent. |
+| handoff | ten functions, eleven children (the gpg probe builds two). Two are Git: `signing_key` (`config --get`) and `ls_remote` | Credential probes. The two Git children are **not** hardened; filed on #188. |
+
+- A site is named `crate::module[::inline module]::function(program)`.
+- Each id is **counted**. Every id occurs once, and the gpg probe twice. A
+  second child inside a registered function fails the test.
+- Each agent child and each Git child has its **text pinned**, from
+  `Command::new` to the spawn or the end of the builder function.
+- The **callers** of the two probe builders are pinned, so a second script
+  cannot ride `local_probe` or `ssh_command`.
+- The ids must be a subset of a **frozen list of 17**. An entry cannot be
+  swapped for a different child, and the list cannot grow.
+
+**The sanctioned builder's contract, checked statically.** `git_carry::git`
+uses `git_env::CLEARED`, `CONFIG` and `SET`, and adds `--no-optional-locks`
+and `GIT_CEILING_DIRECTORIES`. `CONFIG` carries `core.hooksPath=/dev/null`,
+`core.fsmonitor=false`, `gc.auto=0` and `maintenance.auto=false`. `SET`
+carries `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`,
+`GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=/dev/null` and `GIT_NO_REPLACE_OBJECTS=1`.
+
+**What callers do with the builder, checked statically.**
+
+- No agent code calls `env_clear` or `envs`.
+- No literal outside `git_env` assigns a Git configuration key, except
+  registered extras, and none of those touches a guarded key. The probe
+  script must repeat the table's own values.
+- The contract's variables, and the variables that inject configuration,
+  are named only in `git_env`, the probe builder and one registered
+  injector (`git_carry::nest_status`).
+- Every Git subcommand in the `git_carry` tree is a registered read or one
+  of 14 registered writers. Each writer has a ceiling, and the ceilings sum
+  to 46. A literal that holds a shell line, such as the probe script, is
+  read as shell, so a Git subcommand inside it is checked too.
+
+**This is a census, not a proof.** A text scan cannot tell a source
+repository from a capture's private one. That every writer is aimed at a
+private, scratch, envelope or destination repository was established by
+reading each call site, and by the dynamic leg for the verbs it runs. The
+real fix is two builder types, which is production work filed on #188.
+
+**The dynamic leg.** A `git` wrapper first on `PATH` records every Git
+child of a real `git-export`, a real local `git-carry-estimate` and a real
+`estate-capture`. One run recorded 345 children: 77 from the export, 36
+from the estimate and 232 from the estate capture. Of those, 232 were aimed
+at a protected repository. Every child carried the contract, none overrode
+a guarded key with a later `-c`, none carried injected configuration except
+`filter.*` keys, and every child aimed at a protected repository ran a
+read.
 
 ### P77 SOURCE-LOCK-TRACE (`tests/source_lock_trace.rs`, Linux only)
 
 The `io-trace` recorder cannot answer the lock question. It records only the
-agent's own mutating `io::sys` calls. It never sees an `flock`, an `fcntl`
-lock, an open of any mode, a Git child, or SQLite's VFS. P77 therefore
-watches the kernel instead, with no `LD_PRELOAD` and no new crate:
+agent's own mutating `io::sys` calls. P77 watches the kernel instead, with
+no `LD_PRELOAD` and no new crate, through four channels:
 
-- `/proc/locks` is sampled during the verb. It lists `flock`, POSIX and OFD
-  locks for every process, by device and inode.
-- `/proc/self/fdinfo` is sampled at the same time, to read the access mode
-  of each in-process descriptor.
-- A **holder** keeps an exclusive `flock` and a whole-file OFD write lock on
-  every source node, and the copy's tree is made read-only (the run was not
-  as root).
-- An **`lstat` census** of the source is compared before and after. It
-  covers every field except atime.
+- **The lock table.** `/proc/locks`, sampled while the verb runs. It lists
+  `flock`, POSIX and OFD locks for every process. **It does not list Git's
+  locks.** Git locks by creating `*.lock` files.
+- **This process's descriptors.** `/proc/self/fdinfo`, sampled in the same
+  loop. It does not see a child's descriptors.
+- **A write watch.** An inotify watch on every source directory. It is a
+  queue, not a sample, and it reports every create, delete, rename, write,
+  re-stamp and close of a write-mode descriptor, by any process. This is
+  the channel that sees a Git child's `index.lock`.
+- **A holder.** It keeps an exclusive `flock` and a whole-file OFD write
+  lock on every source node. A blocking lock attempt then waits until the
+  deadline. The copy legs also make the tree read-only.
 
-| Leg | Result |
+An `lstat` census of the source (every field but atime) is compared before
+and after each verb.
+
+| Leg | What it requires |
 |---|---|
-| Sampler self-test | A shared `flock` and a write-mode open, each held across one sample, are both seen. The holder's own lines and descriptors are not reported. |
-| `copy`, free run | 0 lock lines on source inodes and 0 write-mode source descriptors over 265 to 320 samples. The census is unchanged and all 30 files are carried byte-equal. |
-| `copy`, holder run | The copy neither waited (120 s deadline) nor refused. 0 non-holder lock lines, 0 write-mode opens, census unchanged, every byte carried. |
-| `git_carry::export_repository`, holder run, all Git children | No process took or waited for a lock on any inode of the repository (worktree and `.git`). 0 write-mode opens in-process, census unchanged. |
-| `provider_sqlite::snapshot`, WAL database held open by another writer process | This process's source locks were only READ on the db and locks on the `-shm`, as Q16/Q36 allow. Write-mode opens were on the `-shm` and also the **`-wal`** (see below). The db and `-wal` bytes were identical before and after. |
+| `copy`, free run | No lock line on a source inode, no write-mode source descriptor, census unchanged, every byte carried. |
+| `copy`, holder run | The copy neither waits (120 s deadline) nor refuses, with the tree read-only. |
+| `serve`, as its own process, holder run | The serving process takes and waits for no lock. |
+| `git_carry::export_repository` (v1), holder run | No write event in the repository from any process, no lock line, no in-process write-mode open, census unchanged. |
+| `estate::capture` of two repositories, holder run | The same, for both repositories. The estate's own lock and the plan's lie outside both. |
+| local `git-carry-estimate`, source and destination both held | The same, for both repositories. |
+| `provider_sqlite::snapshot`, idle WAL writer in another process | See below. |
+| `provider_sqlite::snapshot`, committing WAL writer | The writer's commits all succeed: none finds the database busy, and the slowest is under 10 s. |
 
-**Exception counts, from one run.** Each number counts samples that saw the
-item, not calls: `db-read-lock=18 shm-lock=18 shm-write-open=19
-wal-write-open=19`, out of 21 samples at a mean period of about 64 ms.
-Other runs gave 32/32/31/31 of 34 and 51/51/51/51 of 53.
+Both Git fixtures have a stale index. A self-test shows that an ordinary
+`git status` rewrites that index and that the watch sees it, so a clean leg
+means the children were hardened, not that the fixture was easy.
 
-**Sampling period.** Under this load the mean period was about 6 to 107 ms
-per sample, varying by run and leg. A free-run lock shorter than one period
-can be missed. The holder run does not depend on the period: any blocking
-lock attempt on a held node waits until the deadline.
+**For the Git legs, the lock evidence is the write watch and the census,
+not the lock table.** The lock table and the holder add only that no
+`flock` or `fcntl` lock is taken either.
 
-**New finding (#157).** The SQLite backup's read-only connection holds the
-source `-wal` open `O_RDWR`. Q16/Q36 name only a shared read lock on the
-database and the `-shm`. The bytes did not change. The test counts the open
-under `WAL_OPENED_READ_WRITE = true`, which cites #157. Any other
-write-mode open still fails it. This lane does not own the provider, so
-the fix or a Q36 amendment is left to #157.
+**The SQLite exception.** OI-1003-Q16 allows a shared read lock on the
+database that is bounded and counted. OI-1003-Q36 allows the `-shm`
+wal-index. The leg requires:
 
-### Mutation results (scratch edits, all reverted before commit)
+- this process's locks are only READ on the database, READ on the `-shm`
+  lock bytes, and a one-byte read-mark WRITE on the `-shm`;
+- the exception is observed, not assumed: the counts are greater than zero;
+- the database read lock is released on return and is held under a 30 s
+  test bound;
+- no process waits on any lock;
+- no other source write occurs: the directory listing, an `lstat` census
+  without the `-shm`, and the write watch all agree.
+
+One run gave `db-read-lock=68 shm-read-lock=102 shm-read-mark-write=0
+shm-write-open=67 wal-write-open=67` over 71 samples, with the database
+read lock seen held for 122 ms. Under a committing writer, two runs gave 51
+commits with the slowest at 998 ms, and 11 commits with the slowest at
+59 ms. Both had `busy=0`.
+
+**The `-wal` criterion is NOT met.** The backup's read-only connection
+holds the source `-wal` open `O_RDWR`. Q16 and Q36 do not name that. The
+bytes do not change, and the test tolerates it under
+`WAL_OPENED_READ_WRITE = true`. So the acceptance criterion "no write-mode
+open but the `-shm`" fails today, and the test records the failure rather
+than hiding it. It needs a provider fix or a Q36 amendment. Both belong to
+#157, which another lane owns.
+
+## 2. Mutation evidence, leg by leg
+
+Every mutant was applied to a **copy** of the tree under
+`/srv/cache/jess/s2-proof-closure-mut`, never to the lane worktree. Static
+mutants ran the 14 static registry tests. Controls before and after were
+green.
+
+### P76, static registry (16 mutants, all red)
+
+| Mutant | Caught as |
+|---|---|
+| `use std::process::Command as Cmd; Cmd::new("git")` | "`Command as ..` renames the type" |
+| A `#[cfg(test)]` enum variant placed before a production function that builds a Git child | the function's child is unregistered |
+| An ungated `tests.rs` module that builds a Git child | the child is unregistered |
+| `libc::system(..)` | a child started without `Command` |
+| A second `ssh` in `main::pull_command` | built 2 times, registered as 1 |
+| A second `bash` in `local_probe` | built 2 times, and the text changed |
+| A `program` variable shadowed inside `hydrate_one` | built 2 times, and the text changed |
+| A caller doing `env_clear`, a later `-c` on guarded keys, `update-index`, `reflog expire` and `fetch` | contract breaches |
+| A caller adding only `-c gc.auto=1` | contract breach |
+| A caller running only `reflog expire` | unregistered writer |
+| One more `update-ref` call | over the writer's ceiling |
+| A new caller of `local_probe` with its own script | callers changed |
+| A new Git child in `bulkload-handoff` | unregistered |
+| A new Git child in `bulkload-bench` | unregistered |
+| `GIT_OPTIONAL_LOCKS=1` inside the probe script | contract breach |
+| `g gc --auto` inside the probe script | contract breach |
+
+### P77 and the dynamic leg (library mutants)
 
 | Mutant | Edit | Result |
 |---|---|---|
-| M1 | Inside `git_carry::partial_clone`, add `Command::new("git").arg("status")`, never spawned | **Red.** `every_child_goes_through_the_source_safe_builder` names `git_carry::partial_clone("git")` at `git_carry.rs:174`. |
-| M2 | In `git_carry::git`, delete `command.arg("--no-optional-locks")` | **Red,** twice. `the_source_safe_builder_holds_the_s2_contract` fails ("lacks --no-optional-locks"), and `every_git_child_of_a_capture_and_an_estimate_is_hardened` fails (no leading `--no-optional-locks` on the export's children). |
-| M3 | In `transfer::open_source`, take a blocking `flock(LOCK_SH)` on every source file opened | **Red,** twice. The free run sees `FLOCK READ` lines on source inodes. The holder run's copy waits until the 120 s deadline. |
-| M4 | In `transfer::open_source`, take a non-blocking POSIX `F_SETLK` read lock and ignore failure | **Red** in the free run (`POSIX READ` lines, up to 58 samples per inode). **Green** in the holder run. This is the stated blind spot: under a holder the attempt fails, the failure is ignored, and nothing waits. |
+| G1 | Strip `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0` from the builder | P76 **red** (static contract and dynamic leg). P77 **green**: the v1 capture runs no index-refreshing subcommand on the source, so this mutant cannot change what Git does there. |
+| G2 | Add a hardened `git status` to `export_pass` | P77 **green**. This is the control for G3. |
+| G3 | G2 plus G1's strip | P77 Git leg **red**: the watch reports `.git/index.lock` created and renamed over `.git/index`. Estate leg **red**, but for a different reason: the capture refuses with `ContractSelfInconsistent` before the leg's own write assertion is reached. |
+| X1 | Add an unhardened `git status` to the probe script | P77 estimate leg **red**: the watch reports the destination's `index.lock`. |
+| X2 | The same status through the script's hardened `g` | P77 **green**. The control for X1. |
+| S1 | Open the source read-write and checkpoint | Both SQLite legs **red**: WRITE locks on the `-shm` outside the exception, and a write-mode open of the database. |
+| S2 | Create `state.db-journal` in the source directory | Both SQLite legs **red**, but only because the backup itself then fails (`SqliteBackupFailed`). This mutant does not exercise the listing check. S4 does. |
+| S3 | Hold `BEGIN IMMEDIATE` on a second connection | Both SQLite legs **red**: a WRITE lock on the `-shm` write-lock byte, and a write-mode open of the database. |
+| S4 | Create and delete a stray file in the source directory | Both SQLite legs **red**: the watch reports the create, the write and the delete. |
+| C1 | Blocking `flock(LOCK_SH)` in `transfer::open_source` | Copy free run, copy holder run and the serve leg all **red**. |
+| C2 | Non-blocking `F_SETLK` read lock, failure ignored | Copy free run **red** (POSIX READ lines). Copy holder run and serve leg **green**. This is the stated blind spot. |
+| E1 | Take the estate lock inside the first source | Estate leg **red**: the watch reports `estate.lock` created in the source. |
 
-## 2. What remains open
+## 3. What is not proved
 
-- **#165, the S2 measured budget (OI-1003-Q34).** This is the proof-grade
-  run of the reference agent workload on neo: at most +25 % p95 and
-  +2.0 load1, in a quiet window held by the coordinator. It has not run.
-  This lane did not run it, by its brief. Until it runs, S2's budget half
-  is unmeasured, and these property tests do not stand in for it.
-- **The load1-lag estimator ruling.** `s2_budget.py` decides d_load1 from a
-  lag-corrected level: the mean of the settled rows plus tau times their
-  slope (`docs/agent-notes/2026-10-04-s2-budget.md`, 7ad8861). The lane
-  brief reports that this estimator is awaiting an operator ruling. This
-  lane did not verify that state, and its tests do not touch the
-  estimator.
-- **FADV.** Architecture-review WP1 PR 5 called for `FADV_DONTNEED` /
-  `F_NOCACHE` after each consumed range on capture descriptors. That
-  limits source page-cache pressure, which bears on the budget and not on
-  the lock and write properties. It was scoped out of WP1, and no code does
-  it.
-- **The four bypass sites (#188).** The remote estimate probe runs at the
-  remote host's default priority. `local_probe` hand-copies a subset of
-  `git_env::CLEARED`. Neither a hydrate decompressor nor the pull ssh is a
-  typed SourceAccess kind.
-- **The `-wal` `O_RDWR` open (#157).** Described above.
+- **#165, the S2 measured budget (OI-1003-Q34).** The proof-grade run on
+  neo has not run. These property tests do not stand in for it.
+- **The `-wal` `O_RDWR` open (#157).** The criterion is not met. See above.
+- **A typed source/private Git builder (#188).** Until it exists, "no
+  writer is aimed at a source" is a census plus a dynamic check of three
+  verbs.
+- **Verbs with no P77 leg.** `estate::apply`, `git-carry-estimate` over
+  ssh, `export_repository_with_policy` and the prerequisite and drift
+  paths, `hydrate-state`, and a real `pull` over ssh. S2's lock property
+  stays open for each.
+- **Verbs outside the P76 dynamic leg.** `estate-apply`, `restore` and the
+  ssh estimate are covered by the static registry only.
+- **`git fetch` grandchildren.** Four `fetch` calls read a bundle file into
+  a private repository. Git starts its own helpers for a fetch, and the
+  `PATH` wrapper does not record them.
+- **`git_carry::nest_status`.** It injects `filter.*` configuration to
+  switch a nested repository's filter drivers off. The dynamic fixture has
+  no nested repository with a filter, so that path has not run under the
+  oracle.
+- **A non-blocking lock attempt whose failure is ignored.** Under the
+  holder it fails silently, and in the free run it is seen only if a sample
+  lands on it (mutant C2). The sampling period was 2 to 26 ms in these
+  runs. A lock shorter than one period can be missed.
+- **A read-mode open by a child**, and a lock on a file outside the watched
+  trees.
+- **What the scan cannot find.** A subcommand or configuration key
+  assembled at run time, a macro that assembles a spawn name, and a child
+  started by a dependency.
+- **The Git legs do not make the tree read-only**, and none runs while a
+  user's own `index.lock` exists.
 - **No-signals half of S2.** These tests do not scan for signal calls.
-  Under R-N92, lanes keep process-control words out of their commands, so
-  a text scan for them was not written. It stays covered by review and the
-  repo's pre-commit process-safety audit, not by a property test.
-- **Darwin.** P77 compiles to nothing on Darwin, which has neither
-  `/proc/locks` nor `fdinfo`. On neo the lock properties need another
-  channel, such as `lsof`-free `proc_pidinfo` or `fs_usage` under the
-  gated run.
-- **What P77 cannot see.**
-  - A non-blocking lock attempt whose failure is ignored, made under the
-    holder, and missed by sampling in the free run (M4).
-  - Write-mode opens by Git children. Their descriptors are in their own
-    `/proc/<pid>`, which this lane does not read, so they are left to the
-    `lstat` census.
+  Under R-N92 lanes keep process-control words out of their commands, so a
+  text scan for them was not written.
+- **Darwin.** P77 compiles to nothing there: no `/proc`, no inotify. neo
+  needs another channel.
+- **The load1-lag estimator ruling and FADV.** Neither was touched by this
+  lane. Both bear on the budget, not on the lock and write properties.
+
+## 4. Receipts
+
+- Tests at `a7b7ccc` (main `2247ab8` merged): `source_command_registry`
+  15 passed; `source_lock_trace` 11 passed, of which 10 are tests and one,
+  `sqlite_writer_helper`, is a helper that does nothing without its
+  environment variable.
+- Tests at `959ac6c` (adds the estimate leg): `source_lock_trace` 12
+  passed, 11 tests and the helper.
+- `cargo clippy -p bulkload-agent --all-targets -- -D warnings` was clean
+  at `959ac6c`, and at `a7b7ccc` with and without `--features io-trace`.
+  `cargo fmt --check` was clean.
+- `just check-fast` on the final head is reported in the lane's return and
+  on #188, not here: a commit cannot carry the receipt of its own check.
+  The first round's receipt was for `f3df6dc` on base `b6ecd50` and is
+  superseded.
