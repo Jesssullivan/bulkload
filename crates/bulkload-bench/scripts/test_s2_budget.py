@@ -49,6 +49,7 @@ def synth(
     evidence=False,
     busy=1.0,
     wal_index=0,
+    wal_created=0,
 ):
     """A deterministic trace: n evenly spaced samples per window. Latency
     cycles through 30 levels (1.00 to 1.97 x base), one cycle per 30 s
@@ -81,6 +82,7 @@ def synth(
                     "exit": exit_code,
                     "priority_observed": [seen] if seen else [],
                     "source_wal_index_touched": wal_index,
+                    "source_wal_created": wal_created,
                 }
             ]
         windows.append(record)
@@ -418,6 +420,50 @@ class OnRunTests(unittest.TestCase):
             log.write_text("counters verb=copy priority=background census_walks=0\n")
             self.assertIsNone(s2.wal_index_in(log))
             self.assertIsNone(s2.wal_index_in(Path(tmp) / "absent.log"))
+
+    def test_the_wal_created_counter_is_recorded(self) -> None:
+        verdict = s2.analyze(synth(evidence=True, wal_index=2, wal_created=1))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(
+            verdict["source_wal_created"],
+            {"total": 2, "runs_reported": 2, "runs_unreported": 0},
+        )
+        self.assertEqual(
+            verdict["source_wal_index_touched"],
+            {"total": 4, "runs_reported": 2, "runs_unreported": 0},
+        )
+        self.assertEqual(verdict["status"], "PASS")
+
+    def test_evidence_needs_a_reported_wal_created_counter(self) -> None:
+        self.assertEqual(s2.analyze(synth(wal_created=None))["status"], "PASS")
+        verdict = s2.analyze(synth(wal_created=None, evidence=True))
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn(
+            "did not report source_wal_created (OI-1003-Q72)", reasons(verdict)
+        )
+        self.assertNotIn("source_wal_index_touched", reasons(verdict))
+        self.assertEqual(
+            verdict["source_wal_created"],
+            {"total": 0, "runs_reported": 0, "runs_unreported": 2},
+        )
+
+    def test_the_wal_created_counter_is_summed_over_counters_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "r0001.log"
+            log.write_text(
+                "counters verb=snapshot priority=background "
+                "source_wal_index_touched=1 source_wal_created=1\n"
+                "note source_wal_created=9\n"
+                "counters verb=compose source_wal_index_touched=4 "
+                "source_wal_created=2 blake3_total_bytes=0\n"
+            )
+            self.assertEqual(s2.wal_created_in(log), 3)
+            self.assertEqual(s2.wal_index_in(log), 5)
+            # A build with the Q36 counter only: Q72's is unreported.
+            log.write_text("counters verb=snapshot source_wal_index_touched=1\n")
+            self.assertEqual(s2.wal_index_in(log), 1)
+            self.assertIsNone(s2.wal_created_in(log))
+            self.assertIsNone(s2.wal_created_in(Path(tmp) / "absent.log"))
 
     def test_an_idle_on_window_is_inconclusive(self) -> None:
         verdict = s2.analyze(synth(busy=0.5))
@@ -1002,7 +1048,7 @@ class LiveRunTests(unittest.TestCase):
                         "sh",
                         "-c",
                         'echo "counters priority=$1 priority_from=flag '
-                        'source_wal_index_touched=1"',
+                        'source_wal_index_touched=1 source_wal_created=1"',
                         "on",
                         "{priority}",
                     ]
@@ -1020,9 +1066,12 @@ class LiveRunTests(unittest.TestCase):
         for run in on["runs"]:
             self.assertEqual(run["priority_observed"], ["background"])
             self.assertEqual(run["source_wal_index_touched"], 1)
+            self.assertEqual(run["source_wal_created"], 1)
             self.assertEqual(run["argv"][-1], "background")
         self.assertEqual(trace["verdict"]["source_wal_index_touched"]["total"], 2)
         self.assertIn("wal-index files created or touched (OI-1003-Q36): 2", summary)
+        self.assertEqual(trace["verdict"]["source_wal_created"]["total"], 2)
+        self.assertIn("Empty source `-wal` files created (OI-1003-Q72): 2", summary)
         ops = {row["op"] for row in trace["latency"]}
         self.assertEqual(ops, {"jsonl", "sqlite", "git", "search", "step"})
         self.assertTrue(all(row["ok"] for row in trace["latency"]), trace["latency"])

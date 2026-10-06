@@ -94,49 +94,39 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
-- SQLite provider snapshots are S2's stated exceptions. Both are bounded.
-  Only the write is counted so far:
+- SQLite provider snapshots are S2's stated exceptions: one lock and two
+  writes. Every source is read through the backup API from a read-only,
+  WAL-aware connection; none is read `immutable=1`. All three are bounded.
+  The two writes are counted; the lock is not yet:
   - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
     database, held only for the bounded read. Q16 calls it "counted", but no
     counter for it exists yet (neither a lock count nor a lock time). That
-    is an open gap; `source_wal_index_touched` does not cover it.
-  - **Write (OI-1003-Q36).** The source's wal-index, `<db>-shm`: SQLite's
-    own coordination file, which holds no user data. A WAL-aware read opens
-    it read-write, maps it and takes `fcntl` locks on it. It creates or
-    rebuilds the file when no live connection holds it, and beside a live
-    writer it often leaves every byte as it was.
-    - `source_wal_index_touched` counts all of these: 1 for each WAL-aware
-      snapshot that leaves a `-shm` beside its source, whether or not the
-      file changed. So 0 means that no snapshot opened a source wal-index.
-    - Every counters line reports it, and S2 evidence records it.
-    - The main database and its `-wal` stay byte-identical, and nothing else
-      is written (P75).
-  - **Pending an operator decision: the immutable read.** This is
-    implemented on branch `feat/s2-shm-counter-20261006` (#157). No ruling
-    covers it, and it is not settled design.
-    - *What it is.* A WAL-mode database with no `-wal` is read through the
-      backup API from an `immutable=1` connection, because a WAL-aware open
-      would create an empty `-wal`, a source write Q36 does not cover.
-    - *What it changes.* The read creates no sidecar and takes no lock at
-      all, so Q16's shared read lock does not apply to it. That covers a
-      checkpointed, closed database and a live but idle one. It is refused
-      as changed (`SQLITE_STATE_CHANGED`) unless, after the read, the main
-      file kept its device, inode, size, mtime and ctime and no `-wal`
-      appeared.
-    - *Residual.* That check compares metadata, not content. A writer that
-      opens, writes, checkpoints and closes within the read, and within one
-      timestamp tick of the main file's previous write, leaving the size
-      the same, goes unseen, and a possibly torn snapshot is accepted. The
-      window is narrow and was not reproduced. Hashing the main file before
-      and after would close it at the cost of two more full reads.
-    - *Why a ruling is needed.* `docs/plans/2026-10-03-architecture-review.md`
-      section 4 item 8 says not to replace the backup API with a snapshot
-      plus `immutable=1`, because that changes consistency semantics. Item 7
-      says a SQLite lock carve-out needs a dated ruling. This read keeps the
-      backup API, but it does change the consistency semantics item 8 names.
-    - *The alternative.* A ruling that extends Q36 to an empty `-wal` created
-      where none existed. The source would then always be read WAL-aware
-      under the Q16 lock, and P75 would be relaxed to allow that file.
+    is an open gap; neither write counter covers it.
+  - **Write: the wal-index (OI-1003-Q36).** The source's `<db>-shm`:
+    SQLite's own coordination file, which holds no user data. A WAL-aware
+    read opens it read-write, maps it and takes `fcntl` locks on it. It
+    creates or rebuilds the file when no live connection holds it, and
+    beside a live writer it often leaves every byte as it was.
+    - `source_wal_index_touched` counts all of these: 1 for each snapshot
+      that leaves a `-shm` beside its source, whether or not the file
+      changed. So 0 means that no snapshot opened a source wal-index.
+  - **Write: the empty `-wal` (OI-1003-Q72, which extends Q36).** A
+    WAL-mode database with no `-wal` is one that was checkpointed and
+    closed, or one a writer has opened but not yet read. A WAL-aware open
+    of it creates a `-wal` of zero bytes. The exception is that file only:
+    allowed where no `-wal` existed, and empty.
+    - `source_wal_created` counts it: 1 for each snapshot that leaves a
+      `-wal` beside a source that had none. The file stays, so a second
+      snapshot of the same source adds 0.
+    - The read-only connection cannot append a frame, so the file it
+      creates is empty. A writer that arrives during the read and creates
+      the `-wal` itself is counted too: the counter is an upper bound and
+      never an undercount.
+  - Every counters line reports both counters, and S2 evidence
+    (`s2_budget.py`) records both.
+  - The main database file stays byte-identical with its timestamps
+    unchanged. A `-wal` that existed before the read stays byte-identical.
+    Nothing else beside the source is written (P75).
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated

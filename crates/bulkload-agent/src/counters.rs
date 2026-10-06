@@ -65,8 +65,8 @@
 //! and `blake3_legacy_put` were removed for that reason).
 //!
 //! `source_wal_index_touched` counts the provider `SQLite` snapshots that
-//! touched their source's wal-index (`<db>-shm`): S2's one stated source
-//! write (OI-1003-Q36, which extends OI-1003-Q16). A backup-API read of a
+//! touched their source's wal-index (`<db>-shm`): the first of S2's two stated
+//! source writes (OI-1003-Q36, which extends OI-1003-Q16). A backup-API read of a
 //! WAL-mode source is WAL-aware: it opens the wal-index read-write, maps it
 //! shared and takes `fcntl` locks on it. It creates the file when no live
 //! connection has, and rebuilds it when none holds it; beside a live writer
@@ -76,9 +76,20 @@
 //! snapshot opened a source wal-index. It is an upper bound in two corners,
 //! where `SQLite` never opens the `-shm` that is counted: a rollback-journal
 //! database with a stray `-shm` beside it, and a snapshot refused before its
-//! first read of the source. A WAL-mode source with no `-wal`
-//! is read without its wal-index and adds 0. The main database and its
-//! `-wal` are never written (P75).
+//! first read of the source.
+//!
+//! `source_wal_created` counts the provider `SQLite` snapshots that left a
+//! `-wal` beside a source that had none: S2's second stated source write
+//! (OI-1003-Q72, which extends OI-1003-Q36 to the empty `-wal`). A WAL-aware
+//! open of a WAL-mode database with no `-wal` (checkpointed and closed, or
+//! opened by a writer that has not read it yet) creates a zero-byte one.
+//! Each snapshot adds 1 when no `-wal` sat beside its source before the read
+//! and one does after it, so the same source adds 1 once and 0 on later
+//! snapshots while that file stays. The read-only connection cannot append a
+//! frame, so the file it creates is empty; a writer that arrives during the
+//! read and creates the `-wal` itself is counted too, which makes the counter
+//! an upper bound and never an undercount. The main database, and a `-wal`
+//! that existed before the read, are never written (P75).
 //!
 //! Not counted as flushes: syncs done by child processes. `git` children
 //! spawned by the Git carry verbs flush on their own, so the flush counters
@@ -186,9 +197,12 @@ counters! {
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
     // Provider `SQLite` snapshots whose WAL-aware read left a wal-index
-    // (`<db>-shm`) beside its source, changed or not: S2's one stated source
+    // (`<db>-shm`) beside its source, changed or not: a stated S2 source
     // write (OI-1003-Q36).
     SourceWalIndexTouched => "source_wal_index_touched",
+    // Provider `SQLite` snapshots that left a `-wal` beside a source that had
+    // none: the empty `-wal` a WAL-aware open creates (OI-1003-Q72).
+    SourceWalCreated => "source_wal_created",
 }
 
 const COUNT: usize = Counter::ALL.len();

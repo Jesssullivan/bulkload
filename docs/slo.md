@@ -179,8 +179,7 @@ as properties.
   counted and recorded in S2 evidence. The main database and its `-wal` must
   stay byte-identical, and a property test asserts that no other source
   write occurs.
-- **2026-10-06, S2 wal-index counter (OI-1003-Q36, #157; on branch
-  `feat/s2-shm-counter-20261006`, not merged).** The counter is
+- **2026-10-06, S2 wal-index counter (OI-1003-Q36, #157).** The counter is
   `source_wal_index_touched`, on every counters line and in S2 evidence
   (`s2_budget.py`). It adds 1 for each WAL-aware snapshot that leaves a
   `-shm` beside its source, whether or not the file's bytes changed: such a
@@ -213,6 +212,22 @@ as properties.
     improvement in #169 and is not part of the SLO.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
+
+## Amendment 2026-10-06: the empty `-wal` (OI-1003-Q72)
+
+- **2026-10-06, SQLite empty `-wal` (OI-1003-Q72, #157).** This extends
+  OI-1003-Q36 to the empty `-wal`. A read-only, WAL-aware snapshot of a
+  WAL-mode source that has no `-wal` may create an empty `-wal` beside it.
+  It is a counted S2 exception like the `-shm`:
+  - it is allowed only where no `-wal` existed, and the file is zero bytes;
+  - the main database file stays byte-identical;
+  - a `-wal` that existed before the read stays byte-identical;
+  - the counter is `source_wal_created`, on every counters line and in S2
+    evidence (`s2_budget.py`), beside `source_wal_index_touched`.
+
+  Every source read is the locked, WAL-aware backup-API read (OI-1003-Q16).
+  An unlocked `immutable=1` read of the source is not ratified and is not
+  used. P75 SQLITE-SHM-EXCEPTION asserts both exceptions.
 
 ## Priority (OI-1003-Q4)
 

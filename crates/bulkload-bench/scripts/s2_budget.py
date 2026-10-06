@@ -118,15 +118,16 @@ and no override differs from the recorded gate; `evidence_problems` says
 why not. So a verdict cannot be chosen after the fact and keep the label.
 Gated S2 runs are separate from the S1 gate (OI-1003-Q34).
 
-SQLite wal-index (OI-1003-Q36). A provider SQLite snapshot may create or
-touch its source's `<db>-shm`, S2's one stated source write; bulkload counts
-it as `source_wal_index_touched` on every counters line: 1 for each
-WAL-aware snapshot that leaves a `-shm` beside its source, whether or not
-the file's bytes changed. Each ON run records
-the sum over its counters lines (`source_wal_index_touched`, None when no
-line reports it), and the verdict records the total and how many runs
-reported it. In evidence mode an ON run that does not report the counter is
-INCONCLUSIVE, so evidence always carries it.
+SQLite sidecars (OI-1003-Q36, OI-1003-Q72). A provider SQLite snapshot has
+two stated source writes, and bulkload counts each on every counters line:
+- `source_wal_index_touched` (Q36): 1 for each WAL-aware snapshot that
+  leaves a `-shm` beside its source, whether or not the file's bytes changed;
+- `source_wal_created` (Q72): 1 for each snapshot that leaves a `-wal`
+  beside a source that had none. That file is empty.
+Each ON run records the sum of each counter over its counters lines (None
+when no line reports it), and the verdict records each total and how many
+runs reported it. In evidence mode an ON run that does not report both
+counters is INCONCLUSIVE, so evidence always carries them.
 
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
@@ -169,7 +170,10 @@ sys.path.insert(0, str(HERE))
 import r23_ab  # noqa: E402  (power_source: one R-N81 power probe for every bench)
 
 SCHEMA = "bulkload.s2-budget.v1"
-RULINGS = "OI-1003-Q34, OI-1003-Q36, OI-1003-Q5, OI-1003-Q9, R-N11, R-N81, R-N91, R-N13"
+RULINGS = (
+    "OI-1003-Q34, OI-1003-Q36, OI-1003-Q72, OI-1003-Q5, OI-1003-Q9, "
+    "R-N11, R-N81, R-N91, R-N13"
+)
 BUDGET_P95 = 0.25
 BUDGET_LOAD1 = 2.0
 # Both latency gates are computed and both must agree: PASS needs `step`
@@ -217,6 +221,15 @@ COUNTERS_PRIORITY = re.compile(r"(?:^|\s)priority=(\S+)")
 # OI-1003-Q36: the source wal-index files (`<db>-shm`) a provider SQLite
 # snapshot created or touched, from each `counters` line of an ON run.
 COUNTERS_WAL_INDEX = re.compile(r"(?:^|\s)source_wal_index_touched=(\d+)(?=\s|$)")
+# OI-1003-Q72: the empty `<db>-wal` files a provider SQLite snapshot created
+# beside a source that had none, from the same lines.
+COUNTERS_WAL_CREATED = re.compile(r"(?:^|\s)source_wal_created=(\d+)(?=\s|$)")
+# The S2 source-write exceptions an ON run must report in evidence mode:
+# run-record key (also the counter's name) -> the ruling that states it.
+SOURCE_WRITE_COUNTERS = {
+    "source_wal_index_touched": "OI-1003-Q36",
+    "source_wal_created": "OI-1003-Q72",
+}
 # The kernel's load1 model (Linux and Darwin alike): every 5 s,
 # load1 <- load1 * e + n * (1 - e), with e = exp(-5/60) and n the run queue.
 # Over the K updates in (t0, t1], sum(n) = sum(load1) + e/(1-e) (load1(t1) -
@@ -999,11 +1012,11 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     structural.append(
                         f"ON run {run['run']} did not report its priority class"
                     )
-                if run.get("source_wal_index_touched") is None and evidence:
-                    structural.append(
-                        f"ON run {run['run']} did not report "
-                        "source_wal_index_touched (OI-1003-Q36)"
-                    )
+                for counter, ruling in SOURCE_WRITE_COUNTERS.items():
+                    if run.get(counter) is None and evidence:
+                        structural.append(
+                            f"ON run {run['run']} did not report {counter} ({ruling})"
+                        )
             if w.get("run_cap_reached") and evidence:
                 structural.append(
                     f"ON window {w['index']} reached the run cap (--max-runs)"
@@ -1196,7 +1209,10 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
             for s in (OFF, ON)
         },
         "failed_operations": failed_ops,
-        "source_wal_index_touched": wal_index_summary(windows),
+        **{
+            counter: counter_summary(windows, counter)
+            for counter in SOURCE_WRITE_COUNTERS
+        },
         "windows": per_window,
     }
 
@@ -1295,10 +1311,9 @@ def priorities_in(log: Path) -> list[str]:
     return sorted(seen)
 
 
-def wal_index_in(log: Path) -> int | None:
-    """OI-1003-Q36: the source wal-index files an ON run's bulkload verbs
-    created or touched, summed over its `counters` lines; None when no
-    counters line reports the counter (a build that predates it)."""
+def counter_in(log: Path, pattern: re.Pattern) -> int | None:
+    """One counter summed over the `counters` lines of an ON run's log; None
+    when no counters line reports it (a build that predates it)."""
     try:
         text = log.read_text(errors="replace")
     except OSError:
@@ -1307,20 +1322,32 @@ def wal_index_in(log: Path) -> int | None:
         int(value)
         for line in text.splitlines()
         if line.startswith("counters")
-        for value in COUNTERS_WAL_INDEX.findall(line)
+        for value in pattern.findall(line)
     ]
     return sum(values) if values else None
 
 
-def wal_index_summary(windows: list[dict]) -> dict:
-    """The ON runs' wal-index counter (OI-1003-Q36): the total, and how many
-    runs reported it."""
+def wal_index_in(log: Path) -> int | None:
+    """OI-1003-Q36: the source wal-index files an ON run's bulkload verbs
+    created or touched."""
+    return counter_in(log, COUNTERS_WAL_INDEX)
+
+
+def wal_created_in(log: Path) -> int | None:
+    """OI-1003-Q72: the empty `-wal` files an ON run's bulkload verbs created
+    beside sources that had none."""
+    return counter_in(log, COUNTERS_WAL_CREATED)
+
+
+def counter_summary(windows: list[dict], counter: str) -> dict:
+    """One source-write counter over the ON runs (OI-1003-Q36, OI-1003-Q72):
+    the total, and how many runs reported it."""
     total = reported = unreported = 0
     for window in windows:
         if window["state"] != ON:
             continue
         for run in window.get("runs", []):
-            value = run.get("source_wal_index_touched")
+            value = run.get(counter)
             if value is None:
                 unreported += 1
             else:
@@ -1358,6 +1385,7 @@ def run_once(command, priority, run, runs_dir, origin) -> dict:
     record["log"] = str(log)
     record["priority_observed"] = priorities_in(log)
     record["source_wal_index_touched"] = wal_index_in(log)
+    record["source_wal_created"] = wal_created_in(log)
     return record
 
 
@@ -1516,7 +1544,8 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
                         "priority="
                         f"{','.join(run['priority_observed']) or 'unreported'} "
                         "source_wal_index_touched="
-                        f"{run['source_wal_index_touched']}"
+                        f"{run['source_wal_index_touched']} "
+                        f"source_wal_created={run['source_wal_created']}"
                     )
                     if run["exit"] != 0:
                         trace["cut_short"] = f"ON run {run['run']} failed"
@@ -1554,6 +1583,7 @@ def render_summary(trace: dict, verdict: dict) -> str:
     gate = verdict["gate"]
     response = verdict["load1_model"]["response_to_unit_add"]
     wal_index = verdict["source_wal_index_touched"]
+    wal_created = verdict["source_wal_created"]
 
     def pct(value: float | None) -> str:
         return "n/a" if value is None else f"{value:+.1%}"
@@ -1609,6 +1639,9 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"- Source wal-index files created or touched (OI-1003-Q36): "
         f"{wal_index['total']} over {wal_index['runs_reported']} reporting ON "
         f"runs ({wal_index['runs_unreported']} unreported)",
+        f"- Empty source `-wal` files created (OI-1003-Q72): "
+        f"{wal_created['total']} over {wal_created['runs_reported']} reporting "
+        f"ON runs ({wal_created['runs_unreported']} unreported)",
         f"- Rulings: {trace['rulings']}",
         "",
         "| metric | OFF p95 ms | ON p95 ms | d_p95 | bounds 5 % to 95 % "
@@ -1674,6 +1707,12 @@ def emit(verdict: dict) -> None:
         f"wal_index source_wal_index_touched={wal_index['total']} "
         f"runs_reported={wal_index['runs_reported']} "
         f"runs_unreported={wal_index['runs_unreported']}"
+    )
+    wal_created = verdict["source_wal_created"]
+    say(
+        f"wal_created source_wal_created={wal_created['total']} "
+        f"runs_reported={wal_created['runs_reported']} "
+        f"runs_unreported={wal_created['runs_unreported']}"
     )
     for reason in verdict["reasons"]:
         say(f"reason {reason}")
