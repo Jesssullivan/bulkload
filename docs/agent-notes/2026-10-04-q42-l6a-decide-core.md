@@ -288,3 +288,39 @@ Low findings, not fixed (for the coordinator):
 7. `GitCarryCore.hs` header (about lines 35 to 49) still cites
    `shared::write_chained` and `Retained::None`; `GitCarry.tla` line 9
    still says "P67, lane L6".
+
+## Recheck and ship (2026-10-06, same worktree and branch)
+
+Rulings: OI-1003-Q42, OI-1003-Q43, OI-1003-Q46, R-N13.
+
+- Verdict **CLEAN** at `77d4e17`. Read the diff `856e7b9..77d4e17` and the
+  callers it touches.
+  - Medium 1 is fixed: `p67_every_row_decides_what_the_reference_decides`
+    compares all 363 rows under each row's own policy.
+  - Medium 2 is fixed: `estate::decide_capture` calls `decide_recorded`,
+    `shared::write_capture` calls `decide_offered`, and P67's stages test
+    calls the same two functions. The estate test reaches the lazy
+    bound-base read through `capture`: without the read the third pass
+    would report two reuse hits, not two refusals.
+  - No new defect found. `decide_capture`'s new
+    `CONTRACT_SELF_INCONSISTENT` arm is unreachable (`reads_prev_base`
+    holds only for a held record, and a held record always has a retained
+    capture). `write_capture` reads the tips exactly when it did before.
+- The seven lows stay open, as listed above.
+- Check-fast was **not** run again in this stage. `/srv/scratch` was at
+  26% free, and a fresh target directory would have put it under the 25%
+  floor the estate tests need, for this lane and the others. The verdict
+  rests on the recorded exit 0 over `b40bdf3` (its log shows P67's 5 tests
+  and the estate test passing) and on `b40bdf3..77d4e17` changing only
+  this note.
+- The branch is 4 commits behind `origin/main` (`2247ab8`: CI and docs
+  only) and merges cleanly (`git merge-tree`). It was not merged here.
+- **PR #191** opened against `main`:
+  https://github.com/Jesssullivan/bulkload/pull/191. Not merged. Nothing
+  posted to Linear; the coordinator still owes the TIN-4543 and SSOT
+  ledger entries.
+- An earlier session's check-fast queued over `2b63b6e`
+  (`/srv/scratch/jess/tmp/q42-l6a-fix2/check-fast3.start`) has no exit
+  record. This stage did not look for it.
+- Scratch: `/srv/scratch/jess/tmp/q42-l6a-recheck` (the PR body and the
+  commit message), nothing durable.
