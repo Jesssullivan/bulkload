@@ -239,8 +239,31 @@ Validation (sting, scratch `/srv/scratch/jess/tmp/q42-l6a-fix1`, own
 - Review round 1 close-out (2026-10-06): `/srv/scratch` had fallen to 22%
   free again from other lanes' growth, so the lane removed its own 4.1G
   round-0 scratch target (`/srv/scratch/jess/tmp/q42-l6a-decide/target`,
-  27% free after), committed this note, and reran check-fast over that
-  commit in the foreground. The branch is pushed only on its exit 0.
+  27% free after) and committed this note as `b40bdf3`.
+- Check-fast over `b40bdf3`, first run (16:15Z to 16:47Z): **failed**, exit
+  101, on space again. `git_group_minimality` had 10 of 18 tests refuse
+  `DESTINATION_SPACE_INSUFFICIENT` from the `estate-capture` and
+  `estate-apply` verbs; nothing else failed. That session ended before a
+  rerun finished, with `64ae349` and `b40bdf3` unpushed.
+- Reattached session (2026-10-06, same worktree and branch, no code
+  change): `/srv/scratch` at 27.9% free. Check-fast over `b40bdf3`
+  (started 17:52Z, waited on the lanes' lock until about 18:23Z, last
+  output 18:35Z, `CARGO_INCREMENTAL=0`, `TMPDIR`
+  `/srv/scratch/jess/tmp/q42-l6a-fix2`): every tier green. 29 test results,
+  753 passed, 0 failed, 9 ignored: the lib suite 474 (P67's 5 and the new
+  estate test among them), `git_capture_counters` 1, `git_carry_v2` 65,
+  `git_group_minimality` 18, the fault harness 56, the power-loss proofs 9,
+  repo-manifest PASS and the CI contract's 22 tests OK. The exit status
+  itself was not recorded: the shell tool's 10-minute limit moved the run to
+  the background and the wrapper that writes the status did not outlive
+  it. The log ends with the last command of the last recipe
+  (`contract-test`) printing `OK`, and `just` stops at the first failure.
+- Because of that, check-fast is rerun over the commit that adds these
+  lines, with the status written from inside the locked command. The
+  branch is pushed only on its exit 0; the dispatch's report carries the
+  result.
+- The branch is 4 commits behind `origin/main` and was not merged with it:
+  the dispatch did not ask for a merge.
 
 Low findings, not fixed (for the coordinator):
 
