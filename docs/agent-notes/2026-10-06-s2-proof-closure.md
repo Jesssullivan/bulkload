@@ -2,8 +2,9 @@
 
 Rulings: OI-1003-Q5, OI-1003-Q9, OI-1003-Q16, OI-1003-Q36, OI-1003-Q60,
 R-N13. Branch `feat/s2-proof-closure-20261006`, worktree
-`bulkload.worktrees/s2-proof-closure-20261006`. Main `2247ab8` (#190) is
-merged in. No PR is opened, per the lane brief.
+`bulkload.worktrees/s2-proof-closure-20261006`. Main `48bd697` (#191, #192)
+is merged in. The recheck stage found no medium or high finding left and
+opens the pull request; see "Recheck stage" below.
 
 **State: S2's lock and write properties are NOT closed.** Two property
 tests exist and are red on mutation leg by leg. What they do not prove is
@@ -11,8 +12,8 @@ listed in the evidence doc, section 3, and under "Open" below.
 
 ## What was done
 
-Three sessions worked this lane: a builder, a fixer that was cut off
-mid-run, and the session that finished the fix round. No production code,
+Four sessions worked this lane: a builder, a fixer that was cut off
+mid-run, the session that finished the fix round, and a recheck stage. No production code,
 `Cargo.toml`, `justfile`, `flake.*` or `.github/` file was changed by the
 lane.
 
@@ -58,6 +59,31 @@ lane.
     because the leg's write assertion fires;
   - the journal-file mutant (S2) is red only because the backup fails.
 
+## Recheck stage
+
+- Merged main `48bd697` (#191 and #192) with a signed merge commit,
+  `c8c1783`. #191 adds `git_carry/decide.rs` and changes
+  `git_carry/shared.rs`, both inside the tree the registry pins. Both lane
+  tests passed on the merge with no registry entry changed.
+- Read the diff against main and ran 40 static mutants and two library
+  mutants of its own, on a copy under `/srv/cache`. 37 static mutants were
+  red, and every writer ceiling is tight. Three deliberate spellings pass
+  the scan: a macro that takes the type as an argument, an ungated
+  `#[path]` module that names a gated test file, and an `include!` of a
+  file that is not `.rs`. They are low: none is in the tree, and each is
+  plain in review. They are now listed in the evidence doc, section 3, and
+  in the test's header.
+- One test line changed: `the_bypass_list_only_shrinks` asserted that
+  `FROZEN` holds exactly 17 ids, which would have failed the lane that
+  removes a bypass, against the list's own comment. It now asserts at most
+  17. Nothing else in either test changed.
+- Disposition of the eight medium and high findings: five fixed (the scan,
+  the identity of an entry, the registry's scope, monotonicity, the P77
+  mutation evidence); three fixed as far as this lane can and the rest
+  deferred to filed issues. The typed source/private builder is on #188,
+  the `-wal` `O_RDWR` open is on #157, and the P77 verbs with no leg are
+  item 5 of the #188 comment.
+
 ## Gotchas found on the way
 
 - **`/proc/locks` is read one page per `read()`.** On a busy host a
@@ -97,6 +123,9 @@ lane.
 - `205bee0`, `0a93a8a`: the fix round's test changes.
 - `a7b7ccc`: merge of main `2247ab8`.
 - `959ac6c`: the local `git-carry-estimate` leg.
-- The commit that carries this note rewrites the evidence doc and the plan
-  rows. `just check-fast` ran on that head; its receipt is in the lane's
-  return and on #188, because a commit cannot carry its own receipt.
+- `ad80d52`: the evidence doc, the plan rows and this note after the fix
+  round. `just check-fast` exited 0 on that head; the receipt is on #188.
+- `c8c1783`: merge of main `48bd697`.
+- The commit that carries this section holds the recheck stage's edits.
+  `just check-fast` ran on that tree before the commit; its receipt is in
+  the pull request, because a commit cannot carry its own receipt.

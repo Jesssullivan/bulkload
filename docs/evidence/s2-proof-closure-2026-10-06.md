@@ -21,7 +21,9 @@ what is **not** proved. S2's lock and write properties are not closed: see
 section 3.
 
 Measured on branch `feat/s2-proof-closure-20261006` on sting (Linux, xfs
-scratch), with main `2247ab8` merged in (`a7b7ccc`). The host was heavily
+scratch), with main `2247ab8` merged in (`a7b7ccc`). The recheck stage then
+merged main `48bd697` (#191, #192) as `c8c1783` and reran both tests there;
+see sections 2 and 4. The host was heavily
 shared. Tests ran inside `nix develop` with
 `cargo test -p bulkload-agent --test source_command_registry --test
 source_lock_trace -- --test-threads=1`.
@@ -215,6 +217,34 @@ green.
 | C2 | Non-blocking `F_SETLK` read lock, failure ignored | Copy free run **red** (POSIX READ lines). Copy holder run and serve leg **green**. This is the stated blind spot. |
 | E1 | Take the estate lock inside the first source | Estate leg **red**: the watch reports `estate.lock` created in the source. |
 
+### Recheck stage (independent mutants, on `c8c1783`)
+
+The recheck stage wrote its own mutants, again on a copy under
+`/srv/cache/jess/s2-proof-closure-mut`. 40 static mutants ran the 14 static
+registry tests; controls before and after were green.
+
+- **37 red.** A module alias (`use std::process as p; p::Command::new`), a
+  function pointer (`Command::new` without a call), a grouped rename, seven
+  `#[cfg(test)]` placements in front of a production child (a `const` with a
+  struct literal, a grouped `use`, a `static` closure, stacked attributes, a
+  trait method declaration, a match arm, a `cfg(all(test, ..))` statement),
+  a new child in `main.rs`, in `bulkload-proto` and in `bulkload-handoff`,
+  `libc::fork`, `CommandExt::exec`, one more use of **each** of the 14
+  registered writers (every ceiling is tight), a `format!` on a guarded
+  key, an `alias.*` assignment, a contract variable set and removed by a
+  caller, a subcommand held in a `const`, a new `pub(crate)` builder, and
+  two writers' argument lists in `estate.rs`.
+- **3 green**, all deliberate spellings, now listed in section 3: a macro
+  that takes the type as an argument, an ungated `#[path]` module that names
+  a gated test file, and an `include!` of a file that is not `.rs`.
+
+Two library mutants ran both test files:
+
+| Mutant | Edit | Result |
+|---|---|---|
+| R1 | `update-ref refs/heads/sneak HEAD` on the source at the top of `export_pass` | P76 **red** three ways (the ceiling, the caller test, the dynamic leg). P77 Git leg and estate leg **red**. |
+| R2 | A write-mode reopen of each source file in `transfer::open_source`, closed at once, failure ignored | Copy free run **red**: the watch reports `close-write` on every file. Copy holder run and serve leg **green**: the tree is read-only there, the open fails, and a failed open leaves no event. The same class as C2. |
+
 ## 3. What is not proved
 
 - **#165, the S2 measured budget (OI-1003-Q34).** The proof-grade run on
@@ -244,7 +274,15 @@ green.
   trees.
 - **What the scan cannot find.** A subcommand or configuration key
   assembled at run time, a macro that assembles a spawn name, and a child
-  started by a dependency.
+  started by a dependency. Three deliberate spellings also pass (recheck
+  mutants): a macro that takes the type as an argument (`mk!(Command)`
+  expanding to `$t::new`), an ungated `#[path]` module that names a file
+  another module gates behind `#[cfg(test)]`, and an `include!` of a file
+  that is not `.rs`. The tree holds none of the three today: its two
+  `#[path]` attributes name the platform `io::sys` files, which are scanned.
+- **A write-mode open that fails and is ignored.** Under the holder the
+  copy and serve trees are read-only, so the open fails and leaves no event
+  (recheck mutant R2). The copy's free run sees it; `serve` has no free run.
 - **The Git legs do not make the tree read-only**, and none runs while a
   user's own `index.lock` exists.
 - **No-signals half of S2.** These tests do not scan for signal calls.
@@ -266,7 +304,13 @@ green.
 - `cargo clippy -p bulkload-agent --all-targets -- -D warnings` was clean
   at `959ac6c`, and at `a7b7ccc` with and without `--features io-trace`.
   `cargo fmt --check` was clean.
-- `just check-fast` on the final head is reported in the lane's return and
-  on #188, not here: a commit cannot carry the receipt of its own check.
-  The first round's receipt was for `f3df6dc` on base `b6ecd50` and is
-  superseded.
+- `just check-fast` at `ad80d52` (main `2247ab8` merged) exited 0; the
+  receipt is on #188. The first round's receipt was for `f3df6dc` on base
+  `b6ecd50` and is superseded.
+- Recheck stage, at `c8c1783` (main `48bd697` merged, which brings
+  `git_carry/decide.rs` and a changed `git_carry/shared.rs`):
+  `source_command_registry` 15 passed and `source_lock_trace` 12 passed,
+  with no registry entry changed.
+- `just check-fast` on the final head is reported in the pull request and
+  the agent note's follow-up, not here: a commit cannot carry the receipt of
+  its own check.

@@ -37,6 +37,11 @@
 //!   declared under another `link_name`, and a child started by a dependency
 //!   are **not** found. `link_name` itself is refused, and the dependency
 //!   wall is `dep_graph.rs`.
+//! - Three deliberate spellings are **not** found either (recheck mutants,
+//!   2026-10-06): a macro that takes the type as an argument
+//!   (`mk!(Command)` expanding to `$t::new`), an ungated `#[path]` module
+//!   that names a file another module gates behind `#[cfg(test)]`, and an
+//!   `include!` of a file that is not `.rs`.
 //!
 //! **What callers do with the sanctioned builder.** `git_carry::git` returns
 //! a `Command`, and a caller could undo the contract or run a writer on a
@@ -2598,7 +2603,7 @@ fn the_bypass_list_only_shrinks() {
     let ids: BTreeSet<&str> = BYPASSES.iter().map(|bypass| bypass.id).collect();
     assert_eq!(ids.len(), BYPASSES.len(), "duplicate bypass ids");
     let frozen: BTreeSet<&str> = FROZEN.iter().copied().collect();
-    assert_eq!(frozen.len(), 17, "FROZEN never grows (17 at P76)");
+    assert!(frozen.len() <= 17, "FROZEN never grows (17 at P76)");
     let added: Vec<&&str> = ids.difference(&frozen).collect();
     assert!(
         added.is_empty(),
