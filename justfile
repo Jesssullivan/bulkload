@@ -194,14 +194,15 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 #                   R-N58 resume counters, durability and the R-N88/R-N119
 #                   power-loss proofs, refusal taxonomy, R34 dependency wall,
 #                   R33 lint wall, CI contract). PR CI runs this tier through
-#                   its source, fault-harness and test gates.
+#                   its source and fault-harness gates (OI-1003-Q65).
 #   check-optional  optional tier: spike evidence, bench-script stubs, the
 #                   estate corpus self-test (OI-1003-Q19), the history secret
 #                   scan and the Nix/Bazel graph. On demand.
 #   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
 
 # The repository and CI contract tests, run directly instead of through
-# Bazel's //:tests (CI's `test` gate runs the same two files).
+# Bazel's //:tests (CI runs them through `ci-source` since OI-1003-Q65
+# dropped the Bazel `test` gate).
 contract-test:
     cd {{ root }} && python3 scripts/validate_repo_manifest.py --self-test tinyland.repo.json
     cd {{ root }} && python3 tests/test_ci_contract.py
@@ -237,7 +238,8 @@ check-local: check-source test-local
 
 # Toolchain-complete source gates for CI. The repo flake owns these linters and
 # scanners; the pinned GloriousFlywheel shell owns the front door and Bazel.
-ci-source: check-source secrets-scan-history
+# contract-test rides here since the Bazel `test` gate was dropped (OI-1003-Q65).
+ci-source: check-source secrets-scan-history contract-test
 
 # The CI `fault-harness` terminal gate (R-N122); the composite action execs it
 # inside the repo flake, like `ci-source`.
