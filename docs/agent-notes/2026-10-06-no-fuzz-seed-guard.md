@@ -3,7 +3,7 @@
 **Lane:** no-fuzz-seed-guard (workflow subagent, sting).
 **Branch:** `feat/seeded-proptests-20261006`, worktree
 `bulkload.worktrees/seed-guard-20261006`, based on `origin/main` `b6ecd50`.
-No PR opened (the coordinator opens it).
+PR: see "Recheck and ship" below.
 **Rulings:** OI-1003-Q7 (property tests with fixed seeds, no fuzzing),
 OI-1003-Q14, OI-1003-Q60, R-N13 (this note).
 
@@ -12,7 +12,9 @@ OI-1003-Q14, OI-1003-Q60, R-N13 (this note).
 - `2046563`: seed every proptest through `prop_config`; add the guard.
 - `9e36a98`: review round 1. The guard accepts only the helper call as the
   whole config; the plan bullet is reworded to match.
-- The commit that carries this note follows `9e36a98`.
+- `d1f42c9`: this note, round 1.
+- `81c5f4a`: merge of `origin/main` `2247ab8` (#190, the Bazel gates
+  dropped). No conflict; main changed no Rust source.
 
 ## What was wrong
 
@@ -93,6 +95,31 @@ way (still text based, one line at a time):
 - `just check-fast` on `9e36a98`'s tree (CI toolchain, `nix develop .#default`,
   under the shared check-fast lock, exit 0; it queued about 90 minutes behind the other lanes on the lock).
 
+## Recheck and ship (2026-10-06)
+
+A separate recheck stage read the diff since `2046563` and ran the guard
+against probe inputs in an untracked directory (deleted afterwards).
+
+- Refused, as intended: a struct update over the helper under a braced
+  import; `Config as C`; `Default::default()` as the config; a trailing
+  comment that spells the helper; a local generic `fn prop_config`;
+  `TestRunner::deterministic()`; a method call on the helper.
+- Still passes with no finding (low, in "Open" below): a renamed macro
+  (`use proptest::proptest as pt;` then `pt! { .. }` with no config) and a
+  raw-identifier mirror (`fn r#prop_config`).
+- Sibling branches, scanned with this guard:
+  - `feat/s3-properties-20261006`: `s3_transfer_resume.rs` 15,
+    `s3_walk_resume.rs` 10.
+  - `feat/s2-shm-counter-20261006`: `sqlite_wal_index.rs` 13.
+  - Trial merge with L5 (#189): `git_estimate_dag.rs` 0,
+    `git_estimate_shapes.rs` 0, `refusal_taxonomy.rs` 7 (its exempt count).
+  - Trial merge with L6a (#191): `decide_tests.rs` 0.
+  - `feat/ingest-token-20261003` (#136): `git_carry_v2.rs` 4 (its exempt
+    count).
+  - `feat/s2-proof-closure-20261006` and
+    `feat/wp3-pr3-outcome-ledger-20261006`: 0.
+- `just check-fast` on the `81c5f4a` tree (CI toolchain, shared lock): exit 0.
+
 ## Landing order (blocks two other lanes)
 
 The guard was sized against `origin/main` `b6ecd50`. Two concurrent lanes add
@@ -139,7 +166,7 @@ on.
     over two lines, a braced helper import, `TestRunner` as a type in a
     signature, a refused word in a trailing comment.
   - It does not see a config built through a macro or an alias that hides
-    every refused spelling, a block comment (`/* */`) that hides a pattern,
+    every refused spelling (a renamed `proptest!`, `fn r#prop_config`), a block comment (`/* */`) that hides a pattern,
     or code pulled in by `include!` from a non-`.rs` file.
 - Exemptions are pinned by count, not by content, and a missing exempt file
   is tolerated. The ceilings are literals in the guard's own file, so they
