@@ -62,6 +62,15 @@ stays native; `gate` passes only when every item is native-accounted or
 attested (#133). A ledger missing or naming another plan or SOURCE label,
 or listing an item twice, refuses.
 
+S4 (WP3 PR 3, 2026-10-06): outcome records are typed (`Outcome`,
+`Refusal{code, site, errno}`, strict postcard; legacy string records are
+mapped), and a typed refusal is `refused-pending-review` until
+`closure-dispose` records an accept, re-carry or abandon review for it (per
+item or as a standing policy); `closure-report --dispositions LEDGER` joins
+those reviews, and `gate` then also requires every typed refusal, native or
+attested, to be reviewed. A bare `IO` can be neither reviewed nor attested
+away.
+
 ## Live union
 
 Both hosts stay usable. Bulkload never signals sessions, never requires a

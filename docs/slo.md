@@ -207,6 +207,21 @@ as properties.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
 
+## Amendment 2026-10-06: S4 proof status (WP3 PR 3)
+
+- **S4 is provable on the estate ledger (OI-1003-Q1; a proof-status line, not a
+  new ruling).** Outcome records are a typed `Outcome` with
+  `Refusal{code, site, errno}`, persisted with postcard and decoded strictly;
+  legacy string records are mapped by a reader. Closure matches the enum. The
+  `gate` passes only when every planned item is accounted and every typed
+  refusal carries a disposition (accept, re-carry or abandon, with reviewer
+  and date, per item or as a standing policy) from the `closure-dispose`
+  ledger. A bare `IO` or `FRAME_CODEC` stays unaccounted: no disposition can
+  name it and no attestation can close it. Property P72 (codec round trip and
+  legacy mapping) and P73 (green iff every refusal is dispositioned and no
+  untyped IO exists) carry the proof. Transfer and SQLite provider outcomes
+  join this ledger in WP3 PR 4; until then S4 is proven for estate items only.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

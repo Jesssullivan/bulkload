@@ -179,6 +179,9 @@ pub struct Receipt {
     pub source: PathBuf,
     pub outcome: &'static str,
     pub reason: Option<String>,
+    /// The refusal of a `refused` receipt (WP3 PR 3): its outcome record is
+    /// typed from this value, not from `reason`.
+    pub refusal: Option<BulkloadRefusal>,
     /// One line per ref or seat that drifted under the capture this receipt
     /// names. Empty is the ordinary case, and always empty on apply: apply
     /// refuses a drifted capture (`CAPTURE_DRIFTED`). The durable statement is
@@ -449,7 +452,7 @@ fn filename(value: &str) -> bool {
     matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
 }
 
-fn id(item: &Item) -> Result<String> {
+pub(crate) fn id(item: &Item) -> Result<String> {
     let bytes = postcard::to_allocvec(item).map_err(|_| BulkloadRefusal::FrameCodec)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -1378,7 +1381,7 @@ fn execute(
     let refused = std::sync::atomic::AtomicBool::new(false);
     pool.install(|| {
         plan.items.par_iter().try_for_each(|item| {
-            let (done, reason) = match operation(item) {
+            let (done, reason, refusal) = match operation(item) {
                 Ok(done) => {
                     // The count rides in the layout-safe reason; the rows ride
                     // in the sidecar and the in-process receipt.
@@ -1391,11 +1394,15 @@ fn execute(
                     .flatten()
                     .collect();
                     let reason = (!counts.is_empty()).then(|| counts.join(" "));
-                    (done, reason)
+                    (done, reason, None)
                 }
                 Err(error) => {
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                    (Completion::clean("refused"), Some(error.to_string()))
+                    (
+                        Completion::clean("refused"),
+                        Some(error.to_string()),
+                        Some(error),
+                    )
                 }
             };
             receipt(&Receipt {
@@ -1403,6 +1410,7 @@ fn execute(
                 source: item.source.clone(),
                 outcome: done.outcome,
                 reason,
+                refusal,
                 drift: done.drift,
                 bytes_read: done.bytes_read,
                 reuse_unavailable: done.reuse_unavailable,
@@ -1417,10 +1425,24 @@ fn execute(
     }
 }
 
-fn emit(state: &Path, row: &Receipt, receipt: &impl Fn(&Receipt) -> Result<()>) -> Result<()> {
+// WP3 PR 3: the durable outcome is the typed record, its refusal recorded
+// at `site` (the verb).
+fn emit(
+    state: &Path,
+    site: &'static str,
+    row: &Receipt,
+    receipt: &impl Fn(&Receipt) -> Result<()>,
+) -> Result<()> {
+    let record = crate::outcome::OutcomeRecord::of_receipt(
+        row.source.clone(),
+        row.outcome,
+        row.refusal.as_ref(),
+        row.reason.clone(),
+        site,
+    )?;
     write(
         &state.join(format!("{}.outcome", row.item)),
-        &(&row.source, row.outcome, &row.reason),
+        &record.persisted(),
     )?;
     receipt(row)
 }
@@ -1583,7 +1605,9 @@ fn capture_in(
     }
     let mut outcome = Ok(());
     for level in levels.values().rev() {
-        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+        if let Err(error) = execute(level, jobs, &operation, &|row| {
+            emit(state, "estate::capture", row, receipt)
+        }) {
             outcome = Err(error);
         }
     }
@@ -1840,7 +1864,12 @@ pub fn repair_missing_index(
             {
                 write(&journal, &"refs-imported".to_owned())?;
             }
-            write(&outcome, &(&item.source, INDEX_REPAIRED, &None::<String>))?;
+            let record = crate::outcome::OutcomeRecord {
+                source: item.source,
+                outcome: crate::outcome::Outcome::IndexRepaired,
+                reason: None,
+            };
+            write(&outcome, &record.persisted())?;
             Ok(())
         }
         Err(refusal) => {
@@ -1848,10 +1877,15 @@ pub fn repair_missing_index(
                 .try_exists()
                 .refuse_at("estate::repair_missing_index")?
             {
-                write(
-                    &outcome,
-                    &(&item.source, "refused", &Some(refusal.to_string())),
-                )?;
+                let record = crate::outcome::OutcomeRecord {
+                    source: item.source,
+                    outcome: crate::outcome::Outcome::Refused(crate::outcome::Refusal::of(
+                        &refusal,
+                        "estate::repair_missing_index",
+                    )),
+                    reason: Some(refusal.to_string()),
+                };
+                write(&outcome, &record.persisted())?;
             }
             Err(refusal)
         }
@@ -1883,11 +1917,11 @@ pub struct LedgerEntry {
     pub source: PathBuf,
     /// The plan item restores a workspace (`workspace` is set).
     pub has_workspace: bool,
-    /// `(source, outcome, reason)` from the last state directory holding an
-    /// `{item}.outcome` record; `None` when none does.
-    pub record: Option<(PathBuf, String, Option<String>)>,
-    /// An `{item}.outcome` record exists but does not decode.
-    pub record_unreadable: bool,
+    /// The typed record from the last state directory holding an
+    /// `{item}.outcome` record (WP3 PR 3; a legacy record is mapped), or why
+    /// it proves nothing; `None` when no state directory holds one.
+    pub record:
+        Option<std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>>,
     /// The apply journal for the item's current capture, at its exact path
     /// `{item}-{blake3(SOURCE)}-{capture digest}.done`.
     pub journal: JournalState,
@@ -1926,7 +1960,7 @@ fn is_identity(value: &str) -> bool {
 /// # Errors
 /// Refuses a malformed plan or an unreadable state directory.
 pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> Result<Ledger> {
-    type Record = Option<(PathBuf, String, Option<String>)>;
+    type Record = std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>;
     let contents: Plan = read(plan)?;
     let mut records = std::collections::BTreeMap::<String, Record>::new();
     let mut journals = std::collections::BTreeSet::<String>::new();
@@ -1944,10 +1978,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
                 .strip_suffix(".outcome")
                 .filter(|item| is_identity(item))
             {
-                records.insert(
-                    item.to_owned(),
-                    read::<(PathBuf, String, Option<String>)>(&entry.path()).ok(),
-                );
+                records.insert(item.to_owned(), crate::outcome::read_record(&entry.path()));
             } else if name.strip_suffix(".done").is_some() {
                 journals.insert(name.to_owned());
             }
@@ -1990,8 +2021,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
-            record: record.cloned().flatten(),
-            record_unreadable: matches!(record, Some(None)),
+            record: record.cloned(),
             journal,
             capture,
             item: identity,
@@ -2198,7 +2228,9 @@ pub fn apply(
     }
     let mut outcome = Ok(());
     for level in levels.values() {
-        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+        if let Err(error) = execute(level, jobs, &operation, &|row| {
+            emit(state, "estate::apply", row, receipt)
+        }) {
             outcome = Err(error);
         }
     }
@@ -2952,13 +2984,13 @@ mod tests {
         );
         // The skipped seat cost nothing; everything else was read once.
         assert_eq!(*bytes_read, 65_536 + b"small untracked".len() as u64);
-        // The durable outcome still decodes as the existing tuple, unchanged.
+        // The durable outcome is the typed record (WP3 PR 3; it was the
+        // legacy string tuple, which the reader still maps).
         let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
-        let durable: (PathBuf, String, Option<String>) =
-            read(&state.join(format!("{item}.outcome"))).unwrap();
-        assert_eq!(durable.0, fs::canonicalize(&source).unwrap());
-        assert_eq!(durable.1, "captured-with-drift");
-        assert_eq!(durable.2.as_deref(), Some("drift=3"));
+        let durable = crate::outcome::read_record(&state.join(format!("{item}.outcome"))).unwrap();
+        assert_eq!(durable.source, fs::canonicalize(&source).unwrap());
+        assert_eq!(durable.outcome, crate::outcome::Outcome::CapturedWithDrift);
+        assert_eq!(durable.reason.as_deref(), Some("drift=3"));
         // The Capture record is the unchanged codec; the rows ride beside it.
         let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
         let sidecar: git_carry::CaptureDrift =
@@ -4793,7 +4825,7 @@ mod closure_lane_20261002 {
         // Every reservation was released.
         assert_eq!(*space.reserved.lock().unwrap(), 0);
         // The refused item's durable receipt carries the typed code, so the
-        // closure report counts it as refused.
+        // closure report counts it as a typed refusal pending review (S4).
         let read = ledger(&plan, &corpus, "neo", std::slice::from_ref(&state)).unwrap();
         let refused = read
             .entries
@@ -4802,7 +4834,7 @@ mod closure_lane_20261002 {
             .unwrap();
         assert_eq!(
             classify(refused),
-            Disposition::Refused("DESTINATION_SPACE_INSUFFICIENT".into())
+            Disposition::RefusedPendingReview("DESTINATION_SPACE_INSUFFICIENT".into())
         );
         // The next pass, with room, captures the refused item and reuses the
         // other.
@@ -4864,7 +4896,8 @@ mod closure_lane_20261002 {
             repaired
                 .record
                 .as_ref()
-                .map(|(_, outcome, _)| outcome.as_str()),
+                .and_then(|record| record.as_ref().ok())
+                .map(|record| record.outcome.name()),
             Some(INDEX_REPAIRED)
         );
         assert_eq!(
@@ -4905,7 +4938,7 @@ mod closure_lane_20261002 {
         );
         let refused = entry(std::slice::from_ref(&refused_state));
         assert!(
-            matches!(classify(&refused), Disposition::Refused(_)),
+            matches!(classify(&refused), Disposition::RefusedPendingReview(_)),
             "{refused:?}"
         );
         fs::remove_dir_all(root).unwrap();
