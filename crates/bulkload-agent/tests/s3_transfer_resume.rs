@@ -42,7 +42,23 @@
 //!   superseded (inequality 2 and convergence, blocked by WP0(d)).
 //!
 //! The green properties cover the rest of each domain: inequality 1 over
-//! in-place changes, and every clause over added seats.
+//! in-place changes, and every clause over added seats, where every drawn
+//! case adds at least one seat that shares chunks with a carried output, so
+//! inequality 2 is strictly below the added size in every case.
+//!
+//! A fourth test is ignored for a different reason: inequality 2 read
+//! strictly (a chunk absent once crosses once per run) is unstable on main
+//! when two seats added in one run carry the same absent chunk ([`Twins`]).
+//! The green properties allow that chunk once per seat, the per-file reading
+//! of the S3 evidence harness; which reading is the contract is unruled.
+//!
+//! **The #186 residue, green.** With refused `SQLite` seats present, what
+//! main does hold is asserted by properties of their own ([`Sniff::EveryRun`]):
+//! the refusal set is the fixture's on every run, the other seats converge
+//! and are reused, an unchanged rerun receives 0, and each run reads exactly
+//! [`SNIFF_BYTES`] of each refused seat beyond the expected reads, never the
+//! seat. Those properties state the residue, not the contract: when #186 is
+//! fixed they go red and are deleted, and the ignored ones lose `#[ignore]`.
 //!
 //! **Corpus.** Fixed seed and a small case count per property ([`prop_config`]);
 //! `BULKLOAD_PROPTEST_DEEP=1` runs twenty times the cases from the same
@@ -104,6 +120,39 @@ const CREDIT_WINDOW: usize = 16 * 1024 * 1024;
 
 /// The bytes a source capture reads before it refuses a `SQLite` header.
 const SNIFF_BYTES: u64 = 16;
+
+/// What a run may read of a refused `SQLite` seat after the first pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sniff {
+    /// The contract (R25, R-N58): a refused seat whose stat identity is
+    /// unchanged is not read again. Red on main with a refused seat, #186.
+    Once,
+    /// The #186 residue, what main does: every run reads exactly
+    /// [`SNIFF_BYTES`] of each refused seat, and not one byte more.
+    EveryRun,
+}
+
+impl Sniff {
+    /// The bytes one run after the first reads of `refused` refused seats.
+    const fn residue(self, refused: usize) -> u64 {
+        match self {
+            Self::Once => 0,
+            Self::EveryRun => SNIFF_BYTES * refused as u64,
+        }
+    }
+}
+
+/// How inequality 2 counts an absent chunk that several seats changed or
+/// added in one run all carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Twins {
+    /// The strict reading: a digest is absent once, so it crosses once per
+    /// run. Red on main when two seats of one run share an absent chunk.
+    Once,
+    /// What main does, and the per-file reading the S3 evidence harness
+    /// uses: the chunk may cross once for each seat that carries it.
+    PerSeat,
+}
 
 /// Directories a file may sit in; the empty prefix is the root.
 const DIRECTORIES: [&str; 3] = ["", "d0", "d0/e"];
@@ -412,8 +461,8 @@ enum CutAt {
 }
 
 /// One P23 case: files by (directory, length, seed), `refused` `SQLite`
-/// seats, and the cut.
-fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
+/// seats, the cut, and what a later run may read of a refused seat.
+fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: Sniff) {
     let fixture = Fixture::new();
     let mut corpus: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (index, (directory, length, seed)) in files.iter().enumerate() {
@@ -430,6 +479,7 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
     }
     let total: u64 = corpus.values().map(|content| size_of(content)).sum();
     let sniffed = SNIFF_BYTES * refused as u64;
+    let residue = sniff.residue(refused);
     fixture.settle();
 
     // The first session, cut or whole. No session reads a byte twice.
@@ -475,8 +525,9 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
         "completed"
     );
     assert_eq!(
-        resumed.source_bytes_read, unapplied,
-        "resume source_bytes_read"
+        resumed.source_bytes_read,
+        unapplied + residue,
+        "resume source_bytes_read (unapplied {unapplied}, #186 residue {residue})"
     );
     assert_eq!(
         counters.get(Counter::SourceFileRead),
@@ -496,8 +547,11 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
     let (rerun, counters) = fixture.run();
     assert_eq!(refusals(&rerun), sqlite_refusals(&sqlite));
     assert_eq!(rerun.reused, corpus.len() as u64);
-    assert_eq!(rerun.source_bytes_read, 0, "rerun source_bytes_read");
-    assert_eq!(counters.get(Counter::SourceFileRead), 0);
+    assert_eq!(
+        rerun.source_bytes_read, residue,
+        "rerun source_bytes_read (#186 residue {residue})"
+    );
+    assert_eq!(counters.get(Counter::SourceFileRead), residue);
     assert_eq!(rerun.bytes_received, 0, "rerun bytes_received");
 }
 
@@ -525,7 +579,7 @@ proptest! {
     #[test]
     fn p23_a_resume_after_any_cut_reads_only_the_unapplied_files(case in p23_case()) {
         let (files, cut) = case;
-        check_p23(&files, 0, cut);
+        check_p23(&files, 0, cut, Sniff::Once);
     }
 }
 
@@ -542,8 +596,40 @@ proptest! {
         refused in 1_usize..=2,
     ) {
         let (files, cut) = case;
-        check_p23(&files, refused, cut);
+        check_p23(&files, refused, cut, Sniff::Once);
     }
+}
+
+proptest! {
+    #![proptest_config(prop_config(3))]
+
+    /// P23 with the fixture's refused seats, the clauses that hold on main:
+    /// after any cut the refusal set is the fixture's on every run, the
+    /// other files are applied, resumed, reused and converge exactly as
+    /// without the refused seats, a further rerun receives nothing, and each
+    /// run reads exactly 16 bytes per refused seat beyond that (the #186
+    /// residue), never the seat itself.
+    #[test]
+    fn p23_issue_186_residue_a_refused_seat_costs_only_its_sniff_bytes(
+        case in p23_case(),
+        refused in 1_usize..=2,
+    ) {
+        let (files, cut) = case;
+        check_p23(&files, refused, cut, Sniff::EveryRun);
+    }
+}
+
+/// P23 PINNED, the #186 residue: two refused seats beside three files, cut
+/// after the first `End`. Each later run reads 32 bytes of the two 4112-byte
+/// seats and reports both refusals, once each.
+#[test]
+fn p23_pinned_issue_186_residue_two_refused_seats_across_a_cut() {
+    check_p23(
+        &[(0, 70_000, 31), (1, 4_096, 32), (2, 200_000, 33)],
+        2,
+        CutAt::Ends(1),
+        Sniff::EveryRun,
+    );
 }
 
 /// P23 PINNED: one file past the credit window, cut after the first `End`
@@ -558,6 +644,7 @@ fn p23_pinned_a_file_past_the_credit_window() {
         ],
         0,
         CutAt::Ends(1),
+        Sniff::Once,
     );
 }
 
@@ -593,6 +680,16 @@ enum Added {
     /// chunks are already held by the destination.
     CopyOf {
         file: usize,
+        tail: usize,
+        seed: u64,
+    },
+    /// `length` bytes of a carried file's first pass content from a fraction
+    /// of it, plus a fresh tail: the chunker resynchronises after the
+    /// slice's first cut point, so the chunks after it are already held.
+    SliceOf {
+        file: usize,
+        at: u16,
+        length: usize,
         tail: usize,
         seed: u64,
     },
@@ -641,19 +738,117 @@ fn apply_change(content: &[u8], change: Change) -> Vec<u8> {
     }
 }
 
-// One linear scenario (first pass, change, rerun, rerun again) reads best as
-// one function.
-#[allow(clippy::too_many_lines)]
-fn check_delta(case: &DeltaCase, clauses: Clauses) {
+/// A delta case worked out before anything touches a disk.
+struct DeltaModel {
+    /// The first pass: (relative path, content), in `DeltaCase::files` order.
+    first: Vec<(String, Vec<u8>)>,
+    /// What is written before the rerun: (relative path, new content), the
+    /// in-place changes and then the added seats.
+    writes: Vec<(String, Vec<u8>)>,
+    /// Σ size of the changed and added seats: the bound of inequality 1.
+    changed_bytes: u64,
+    /// Σ size of the distinct chunks of the changed and added seats that the
+    /// destination holds no verified copy of after the first pass: the bound
+    /// of inequality 2. A digest counts once across the whole run, however
+    /// many seats (or places in one seat) carry it.
+    absent_bytes: u64,
+    /// The absent chunks counted once per seat that carries them, less
+    /// `absent_bytes`: what the second and later seats of one run repeat.
+    /// 0 unless two seats of the run share an absent chunk.
+    twin_bytes: u64,
+}
+
+fn delta_model(case: &DeltaCase) -> DeltaModel {
+    let first: Vec<(String, Vec<u8>)> = case
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, (directory, length, seed))| {
+            (
+                file_rel(*directory, &format!("f{index}")),
+                noise(*seed, *length),
+            )
+        })
+        .collect();
+    // Everything the destination holds a verified copy of after pass one.
+    let held: HashSet<[u8; 32]> = first
+        .iter()
+        .flat_map(|(_, content)| chunks(content))
+        .map(|(digest, _)| digest)
+        .collect();
+    let mut writes = Vec::new();
+    for (index, change) in case.changes.iter().enumerate() {
+        if matches!(change, Change::Same) {
+            continue;
+        }
+        let (rel, content) = &first[index];
+        writes.push((rel.clone(), apply_change(content, *change)));
+    }
+    for (index, added) in case.added.iter().enumerate() {
+        let content = match *added {
+            Added::Fresh { length, seed } => noise(seed, length),
+            Added::CopyOf { file, tail, seed } => {
+                let mut content = first[file].1.clone();
+                content.extend(noise(seed, tail));
+                content
+            }
+            Added::SliceOf {
+                file,
+                at,
+                length,
+                tail,
+                seed,
+            } => {
+                let carried = &first[file].1;
+                let start = carried.len() * usize::from(at) / usize::from(u16::MAX);
+                let start = start.min(carried.len());
+                let end = (start + length).min(carried.len());
+                let mut content = carried[start..end].to_vec();
+                content.extend(noise(seed, tail));
+                content
+            }
+        };
+        writes.push((file_rel(index, &format!("added{index}")), content));
+    }
+    let changed_bytes = writes.iter().map(|(_, content)| size_of(content)).sum();
+    let mut absent: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    let mut per_seat = 0_u64;
+    for (_, content) in &writes {
+        let lacking: BTreeMap<[u8; 32], u64> = chunks(content)
+            .into_iter()
+            .filter(|(digest, _)| !held.contains(digest))
+            .collect();
+        per_seat += lacking.values().sum::<u64>();
+        absent.extend(lacking);
+    }
+    let absent_bytes = absent.values().sum();
+    DeltaModel {
+        first,
+        writes,
+        changed_bytes,
+        absent_bytes,
+        twin_bytes: per_seat - absent_bytes,
+    }
+}
+
+fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
     let fixture = Fixture::new();
+    let DeltaModel {
+        first: carried,
+        writes,
+        changed_bytes,
+        absent_bytes,
+        twin_bytes,
+    } = delta_model(case);
+    let residue = sniff.residue(case.refused);
+    let wire_bound = match twins {
+        Twins::Once => absent_bytes,
+        Twins::PerSeat => absent_bytes + twin_bytes,
+    };
     let mut corpus: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let mut names = Vec::new();
-    for (index, (directory, length, seed)) in case.files.iter().enumerate() {
-        let rel = file_rel(*directory, &format!("f{index}"));
-        let content = noise(*seed, *length);
+    for (rel, content) in carried {
         fixture.write(&rel, &content);
-        corpus.insert(rel.clone(), content);
-        names.push(rel);
+        corpus.insert(rel, content);
     }
     let sqlite: Vec<String> = (0..case.refused)
         .map(|index| format!("d0/db{index}.sqlite"))
@@ -665,46 +860,8 @@ fn check_delta(case: &DeltaCase, clauses: Clauses) {
     let (first, _) = fixture.run();
     assert_eq!(refusals(&first), sqlite_refusals(&sqlite), "first pass");
 
-    // Everything the destination holds a verified copy of after pass one.
-    let held: HashSet<[u8; 32]> = corpus
-        .values()
-        .flat_map(|content| chunks(content))
-        .map(|(digest, _)| digest)
-        .collect();
-
-    // The changes, and their two bounds.
-    let mut changed_bytes = 0_u64;
-    let mut absent_bytes = 0_u64;
-    let mut account = |content: &[u8]| {
-        changed_bytes += size_of(content);
-        absent_bytes += chunks(content)
-            .into_iter()
-            .filter(|(digest, _)| !held.contains(digest))
-            .map(|(_, size)| size)
-            .sum::<u64>();
-    };
-    for (index, change) in case.changes.iter().enumerate() {
-        if matches!(change, Change::Same) {
-            continue;
-        }
-        let rel = &names[index];
-        let content = apply_change(&corpus[rel], *change);
-        std::fs::write(fixture.source().join(rel), &content).unwrap();
-        account(&content);
-        corpus.insert(rel.clone(), content);
-    }
-    for (index, added) in case.added.iter().enumerate() {
-        let content = match *added {
-            Added::Fresh { length, seed } => noise(seed, length),
-            Added::CopyOf { file, tail, seed } => {
-                let mut content = noise(case.files[file].2, case.files[file].1);
-                content.extend(noise(seed, tail));
-                content
-            }
-        };
-        let rel = file_rel(index, &format!("added{index}"));
+    for (rel, content) in writes {
         fixture.write(&rel, &content);
-        account(&content);
         corpus.insert(rel, content);
     }
     // Settled: no seat is racy, so the bound of inequality 1 is the changed
@@ -713,7 +870,7 @@ fn check_delta(case: &DeltaCase, clauses: Clauses) {
 
     let (rerun, counters) = fixture.run();
     let context = format!(
-        "changed_bytes={changed_bytes} absent_bytes={absent_bytes} source_bytes_read={} bytes_received={} refusals={:?}",
+        "changed_bytes={changed_bytes} absent_bytes={absent_bytes} twin_bytes={twin_bytes} residue={residue} source_bytes_read={} bytes_received={} refusals={:?}",
         rerun.source_bytes_read,
         rerun.bytes_received,
         refusals(&rerun)
@@ -729,15 +886,24 @@ fn check_delta(case: &DeltaCase, clauses: Clauses) {
         "{context}"
     );
     assert!(
-        rerun.source_bytes_read <= changed_bytes,
+        rerun.source_bytes_read <= changed_bytes + residue,
         "inequality 1: {context}"
     );
+    if sniff == Sniff::EveryRun {
+        // The #186 residue is exact: the changed seats once, plus 16 bytes
+        // of each refused seat, never the seat.
+        assert_eq!(
+            rerun.source_bytes_read,
+            changed_bytes + residue,
+            "#186 residue: {context}"
+        );
+    }
     if clauses == Clauses::ReadsOnly {
         return;
     }
     assert!(
-        rerun.bytes_received <= absent_bytes,
-        "inequality 2: {context}"
+        rerun.bytes_received <= wire_bound,
+        "inequality 2 ({twins:?}): {context}"
     );
     assert_eq!(
         refusals(&rerun),
@@ -752,8 +918,11 @@ fn check_delta(case: &DeltaCase, clauses: Clauses) {
     }
     let (again, counters) = fixture.run();
     assert_eq!(refusals(&again), sqlite_refusals(&sqlite));
-    assert_eq!(again.source_bytes_read, 0, "unchanged estate reads 0");
-    assert_eq!(counters.get(Counter::SourceFileRead), 0);
+    assert_eq!(
+        again.source_bytes_read, residue,
+        "unchanged estate reads 0 (#186 residue {residue})"
+    );
+    assert_eq!(counters.get(Counter::SourceFileRead), residue);
     assert_eq!(again.bytes_received, 0, "unchanged estate receives 0");
 }
 
@@ -766,32 +935,93 @@ fn change() -> impl Strategy<Value = Change> {
     ]
 }
 
+/// The fresh tail of a copied or sliced seat: none, or up to a chunk or so.
+fn tail() -> impl Strategy<Value = usize> {
+    prop_oneof![Just(0_usize), 1_usize..70_000]
+}
+
+/// An added seat that takes its bytes from carried file `file`.
+fn sharing_seat(file: impl Strategy<Value = usize>) -> impl Strategy<Value = Added> {
+    (
+        file,
+        any::<bool>(),
+        any::<u16>(),
+        65_536_usize..262_144,
+        tail(),
+        any::<u64>(),
+    )
+        .prop_map(|(file, whole, at, length, tail, seed)| {
+            if whole {
+                Added::CopyOf { file, tail, seed }
+            } else {
+                Added::SliceOf {
+                    file,
+                    at,
+                    length,
+                    tail,
+                    seed,
+                }
+            }
+        })
+}
+
+/// Any added seat over `count` carried files.
+fn added_seat(count: usize) -> impl Strategy<Value = Added> {
+    prop_oneof![
+        (length(), any::<u64>()).prop_map(|(length, seed)| Added::Fresh { length, seed }),
+        sharing_seat(0..count),
+    ]
+}
+
+/// The lengths of the carried file a sharing case copies from: several CDC
+/// chunks (16 KiB minimum, 64 KiB average, 256 KiB maximum).
+const HOLDER_LENGTHS: std::ops::RangeInclusive<usize> = 196_608..=393_216;
+
 /// A delta case. `changes`: whether in-place changes are drawn; `refused`:
-/// the range of `SQLite` seats.
+/// the range of `SQLite` seats; `sharing`: carried file 0 is several chunks
+/// long and the first added seat copies or slices it, so the case reaches
+/// chunk sharing (the other added seats are free, and may copy it again).
 fn delta_case(
     changes: bool,
     refused: std::ops::RangeInclusive<usize>,
+    sharing: bool,
 ) -> impl Strategy<Value = DeltaCase> {
-    prop::collection::vec((0..DIRECTORIES.len(), length(), any::<u64>()), 1..=6).prop_flat_map(
-        move |files| {
+    let holder_length = if sharing {
+        HOLDER_LENGTHS.boxed()
+    } else {
+        length().boxed()
+    };
+    (
+        (0..DIRECTORIES.len(), holder_length, any::<u64>()),
+        prop::collection::vec((0..DIRECTORIES.len(), length(), any::<u64>()), 0..=5),
+    )
+        .prop_flat_map(move |(holder, others)| {
+            let mut files = vec![holder];
+            files.extend(others);
             let count = files.len();
             let change = if changes {
                 change().boxed()
             } else {
                 Just(Change::Same).boxed()
             };
+            let added = if sharing {
+                (
+                    sharing_seat(Just(0_usize)),
+                    prop::collection::vec(added_seat(count), 0..=2),
+                )
+                    .prop_map(|(shared, others)| {
+                        let mut added = vec![shared];
+                        added.extend(others);
+                        added
+                    })
+                    .boxed()
+            } else {
+                prop::collection::vec(added_seat(count), 0..=3).boxed()
+            };
             (
                 Just(files),
                 prop::collection::vec(change, count),
-                prop::collection::vec(
-                    prop_oneof![
-                        (length(), any::<u64>())
-                            .prop_map(|(length, seed)| Added::Fresh { length, seed }),
-                        (0..count, 0_usize..70_000, any::<u64>())
-                            .prop_map(|(file, tail, seed)| Added::CopyOf { file, tail, seed }),
-                    ],
-                    0..=3,
-                ),
+                added,
                 refused.clone(),
             )
                 .prop_map(|(files, changes, added, refused)| DeltaCase {
@@ -800,8 +1030,15 @@ fn delta_case(
                     added,
                     refused,
                 })
-        },
-    )
+        })
+}
+
+/// Whether a case reaches chunk sharing: the destination already holds some
+/// chunk of the changed and added seats, so the bound of inequality 2 is
+/// strictly below their size.
+fn shares_a_chunk(case: &DeltaCase) -> bool {
+    let model = delta_model(case);
+    model.absent_bytes < model.changed_bytes
 }
 
 proptest! {
@@ -811,15 +1048,35 @@ proptest! {
     /// seats, the rerun reads at most the changed seats' bytes, and its walk
     /// is metadata only.
     #[test]
-    fn p21_a_rerun_reads_at_most_the_changed_seats(case in delta_case(true, 0..=0)) {
-        check_delta(&case, Clauses::ReadsOnly);
+    fn p21_a_rerun_reads_at_most_the_changed_seats(case in delta_case(true, 0..=0, false)) {
+        check_delta(&case, Clauses::ReadsOnly, Sniff::Once, Twins::PerSeat);
     }
 
     /// P21 transfer leg, every clause, over added seats (no in-place change):
     /// both inequalities, convergence, and an unchanged rerun at 0 and 0.
+    /// Every case shares at least one chunk with a carried output, so
+    /// inequality 2 is never the trivial "at most the added size".
     #[test]
-    fn p21_added_seats_cross_as_absent_chunks_and_converge(case in delta_case(false, 0..=0)) {
-        check_delta(&case, Clauses::All);
+    fn p21_added_seats_cross_as_absent_chunks_and_converge(case in delta_case(false, 0..=0, true)) {
+        prop_assume!(shares_a_chunk(&case));
+        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+    }
+}
+
+proptest! {
+    #![proptest_config(prop_config(3))]
+
+    /// P21 transfer leg with refused `SQLite` seats, the clauses that hold
+    /// on main: both inequalities (inequality 1 with exactly 16 bytes per
+    /// refused seat on top, the #186 residue), the same refusal set on every
+    /// run, convergence of the other seats, and an unchanged rerun that
+    /// receives 0 and reads the residue alone.
+    #[test]
+    fn p21_issue_186_residue_a_refused_seat_costs_only_its_sniff_bytes(
+        case in delta_case(false, 1..=2, true),
+    ) {
+        prop_assume!(shares_a_chunk(&case));
+        check_delta(&case, Clauses::All, Sniff::EveryRun, Twins::PerSeat);
     }
 }
 
@@ -831,8 +1088,8 @@ proptest! {
     /// superseded, so it never converges.
     #[test]
     #[ignore = "red on main: #187 (changed seats are refused, not superseded; blocked by WP0(d))"]
-    fn p21_changed_seats_cross_as_absent_chunks_and_converge(case in delta_case(true, 0..=0)) {
-        check_delta(&case, Clauses::All);
+    fn p21_changed_seats_cross_as_absent_chunks_and_converge(case in delta_case(true, 0..=0, true)) {
+        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
     }
 
     /// P21 transfer leg, every clause, with refused `SQLite` seats: each is
@@ -840,37 +1097,104 @@ proptest! {
     /// seat, not 0.
     #[test]
     #[ignore = "red on main: #186 (a refused SQLite seat is re-read for its sniff bytes on every run)"]
-    fn p21_with_refused_seats_an_unchanged_rerun_reads_nothing(case in delta_case(false, 1..=2)) {
-        check_delta(&case, Clauses::All);
+    fn p21_with_refused_seats_an_unchanged_rerun_reads_nothing(case in delta_case(false, 1..=2, true)) {
+        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
     }
 }
 
 /// P21 PINNED: an added seat that copies a large carried file plus a tail
 /// shares most of its chunks with the destination, so inequality 2 bounds
-/// its wire bytes well below its size (the fixed-seed cases rarely draw a
-/// copy large enough to share a chunk).
+/// its wire bytes well below its size.
 #[test]
 fn p21_pinned_an_added_copy_crosses_as_little_more_than_its_tail() {
-    check_delta(
-        &DeltaCase {
-            files: vec![(0, 262_144, 21), (1, 200_000, 22)],
-            changes: vec![Change::Same, Change::Same],
-            added: vec![
-                Added::CopyOf {
-                    file: 0,
-                    tail: 40_000,
-                    seed: 23,
-                },
-                Added::CopyOf {
-                    file: 1,
-                    tail: 1,
-                    seed: 24,
-                },
-            ],
-            refused: 0,
-        },
-        Clauses::All,
+    let case = DeltaCase {
+        files: vec![(0, 262_144, 21), (1, 200_000, 22)],
+        changes: vec![Change::Same, Change::Same],
+        added: vec![
+            Added::CopyOf {
+                file: 0,
+                tail: 40_000,
+                seed: 23,
+            },
+            Added::CopyOf {
+                file: 1,
+                tail: 1,
+                seed: 24,
+            },
+        ],
+        refused: 0,
+    };
+    assert!(shares_a_chunk(&case));
+    check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+}
+
+/// The sharing shapes one run can mix: a holder in a nested directory is
+/// copied whole twice with no tail (nothing absent for either), its first
+/// 150 000 bytes are sliced out once with a tail, and two added seats carry
+/// the same fresh bytes.
+fn twins_case() -> DeltaCase {
+    DeltaCase {
+        files: vec![(2, 300_000, 41), (0, 9_106, 42)],
+        changes: vec![Change::Same, Change::Same],
+        added: vec![
+            Added::CopyOf {
+                file: 0,
+                tail: 0,
+                seed: 43,
+            },
+            Added::CopyOf {
+                file: 0,
+                tail: 0,
+                seed: 44,
+            },
+            Added::SliceOf {
+                file: 0,
+                at: 0,
+                length: 150_000,
+                tail: 5_000,
+                seed: 45,
+            },
+            Added::Fresh {
+                length: 200_000,
+                seed: 46,
+            },
+            Added::Fresh {
+                length: 200_000,
+                seed: 46,
+            },
+        ],
+        refused: 0,
+    }
+}
+
+/// P21 PINNED: two whole copies and a slice of one nested holder, and twin
+/// fresh seats, in one run. The copies put nothing on the wire; the twins'
+/// bytes are absent once and, on main, may cross once per seat.
+#[test]
+fn p21_pinned_copies_slices_and_twins_of_one_holder() {
+    let case = twins_case();
+    let model = delta_model(&case);
+    assert_eq!(model.twin_bytes, 200_000, "the twins share every chunk");
+    // The twins' bytes once, and less than the slice and its tail: the
+    // slice shares its leading chunks with the holder.
+    assert!(
+        model.absent_bytes < 200_000 + 150_000 + 5_000,
+        "absent {} of {} changed",
+        model.absent_bytes,
+        model.changed_bytes
     );
+    check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+}
+
+/// P21 PINNED, inequality 2 read strictly: a chunk two added seats of one
+/// run both carry is absent once, so it crosses once. On main that depends
+/// on whether the first twin is staged before the second is planned: of two
+/// runs of this row, one received the twins' 200 000 bytes once and one
+/// received them twice.
+#[test]
+#[ignore = "unstable on main: twin added seats may cross their shared absent chunks once per seat (no issue yet; needs a ruling on the reading of inequality 2)"]
+fn p21_pinned_twin_seats_cross_their_shared_chunks_once() {
+    check_delta(&twins_case(), Clauses::All, Sniff::Once, Twins::Once);
 }
 
 // ---------------------------------------------------------------------------
