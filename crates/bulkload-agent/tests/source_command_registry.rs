@@ -2134,6 +2134,30 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
                     ),
                 }
             }
+            // Outside the `git_carry` tree nothing builds a Git child, so
+            // an argument list that starts with a Git command is one handed
+            // to a helper: only a plain read is tolerated there.
+            if !in_git_carry && GIT_COMMANDS.contains(&literal) {
+                if let Position::Subcommand(rest) = position(file, span) {
+                    let spelled: Vec<String> = rest
+                        .iter()
+                        .map(|arg| match arg {
+                            Arg::Literal(text) => text.clone(),
+                            Arg::Expression => "<expr>".to_owned(),
+                            Arg::Many => "<many>".to_owned(),
+                        })
+                        .collect();
+                    if !READS.contains(&literal)
+                        || rest.contains(&Arg::Many)
+                        || read_form(literal, &spelled).is_err()
+                    {
+                        found.push(format!(
+                            "{at}: an argument list outside the git_carry tree starts \
+                             with `{literal}`, which is not a plain Git read"
+                        ));
+                    }
+                }
+            }
             if literal.contains(char::is_whitespace) {
                 for sub in shell_git_subcommands(literal) {
                     if GIT_COMMANDS.contains(&sub.as_str()) && !READS.contains(&sub.as_str()) {
@@ -2782,6 +2806,18 @@ fn each_way_of_undoing_the_contract_is_refused() {
         ("fn f(r: &Path) { git(r).args([\"gc\", \"--auto\"]); }", "\"gc\""),
         ("fn f(r: &Path) { git(r).arg(\"pack-refs\"); }", "pack-refs"),
         (
+            "fn f(r: &Path) { let sub = \"update-index\"; git(r).arg(sub); }",
+            "update-index",
+        ),
+        (
+            "fn f(r: &Path) { git(r).args([\"config\", \"core.worktree\"]).arg(r); }",
+            "\"config (writing form)\": 4 uses, ceiling 3",
+        ),
+        (
+            "fn f(r: &Path) { git(r).args([\"-C\", \"elsewhere\", \"checkout\", \".\"]); }",
+            "checkout",
+        ),
+        (
             "const S: &str = \"git -C \\\"$1\\\" update-index --refresh\";",
             "git update-index",
         ),
@@ -2798,13 +2834,25 @@ fn each_way_of_undoing_the_contract_is_refused() {
         with.push(synthetic("agent::git_carry::sneak", code));
         let found: Vec<String> = contract_breaches(&with, &tables)
             .into_iter()
-            .filter(|breach| breach.starts_with("agent::git_carry::sneak.rs"))
+            .filter(|breach| breach.contains("agent::git_carry::sneak.rs"))
             .collect();
         assert!(
             found.iter().any(|breach| breach.contains(expected)),
             "{code:?} was not refused as {expected:?}: {found:?}"
         );
     }
+    // A helper outside the tree handed a writer's argument list.
+    let mut with = agent_sources();
+    with.push(synthetic(
+        "agent::estate_sneak",
+        "fn f(r: &Path) { run_git(r, &[\"update-index\", \"--refresh\"]); run_git(r, &[\"rev-parse\", \"HEAD\"]); }",
+    ));
+    let found: Vec<String> = contract_breaches(&with, &tables)
+        .into_iter()
+        .filter(|breach| breach.starts_with("agent::estate_sneak.rs"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("update-index"), "{found:?}");
     assert!(contract_breaches(&sources, &tables).is_empty());
     assert_eq!(
         shell_git_subcommands("g() { git --no-optional-locks -c a.b=c \"$@\"; }\nif head=$(g --git-dir=\"$x\" rev-parse -q HEAD); then :; fi\nversion=$(git version) || exit 5"),
