@@ -2,17 +2,31 @@
 //!
 //! S4 counts a run complete only when every typed refusal carries an
 //! operator-reviewed disposition: accept, re-carry or abandon. This ledger
-//! holds those reviews. It is bound to one plan and one SOURCE label, like
-//! the attestation ledger (#133), and holds two kinds of row:
+//! holds those reviews. It is bound to one plan, by path **and by a digest
+//! of the plan's bytes**, and to one SOURCE label. A ledger written for one
+//! plan refuses for any other plan later placed at the same path. It holds
+//! two kinds of row:
 //!
-//! - an **item** row: one planned item's refusal with one code;
-//! - a **standing-policy** row: every refusal with one code, for any item.
+//! - an **item** row: one planned item's refusal with one code, bound to
+//!   the **refusal instance** it reviews ([`crate::closure::instance`]: the
+//!   item's current capture and its outcome record). A later refusal of the
+//!   same code for the same item, against another capture or with another
+//!   record, is a different instance: the old row no longer disposes it and
+//!   the report lists the row as stale.
+//! - a **standing-policy** row: every refusal with one code, for any item
+//!   of the bound plan, now or later. It is open-ended by design and names
+//!   no instance; the plan digest and the SOURCE label are its only bounds.
 //!
 //! Each row names its reviewer and date. Rows are only appended; for an
-//! (item, code) the latest item row wins, else the latest policy row for the
-//! code. A bare `IO` or `FRAME_CODEC` names no cause and can never be
-//! dispositioned: no row may name either, the writer refuses one, and a
-//! ledger holding one does not decode.
+//! (item, instance, code) the latest item row wins, else the latest policy
+//! row for the code. A bare `IO` or `FRAME_CODEC` names no cause and can
+//! never be dispositioned: no row may name either, the writer refuses one,
+//! and a ledger holding one does not decode.
+//!
+//! A row is written only for a code the taxonomy holds now. A row whose code
+//! has left the taxonomy since still decodes ([`Row::is_retired`]): it
+//! disposes nothing and the report lists it, and every other row of the
+//! ledger keeps working.
 //!
 //! The ledger is postcard after [`MAGIC`], decoded strictly. `closure-dispose`
 //! appends a row under an exclusive lock with the same durability order as
@@ -26,7 +40,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::counters::CountedSync as _;
-use crate::outcome::is_typed_code;
+use crate::outcome::{is_code_token, is_typed_code};
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 
@@ -38,6 +52,9 @@ pub const SCHEMA: &str = "bulkload.dispositions.v1";
 
 /// The largest disposition ledger read: 16 MiB, as for a plan.
 const LEDGER_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// The largest plan read for its digest: 16 MiB, the plan reader's own limit.
+const PLAN_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// The longest reviewer name.
 const REVIEWER_LIMIT: usize = 128;
@@ -81,10 +98,20 @@ impl Decision {
 /// What a row disposes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Scope {
-    /// One planned item's refusal, by item identity (64 lowercase hex).
-    Item(String),
-    /// A standing policy: every refusal with the row's code.
+    /// One planned item's refusal: the item identity and the refusal
+    /// instance the review was made against ([`crate::closure::instance`]),
+    /// each 64 lowercase hex.
+    Item { item: String, instance: String },
+    /// A standing policy: every refusal with the row's code, for any item of
+    /// the bound plan, now or later.
     Policy,
+}
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// One review.
@@ -112,25 +139,31 @@ impl TryFrom<RowFields> for Row {
     type Error = &'static str;
 
     fn try_from(fields: RowFields) -> std::result::Result<Self, Self::Error> {
-        Self::new(
+        // Read time: any well-formed code token but the two that never name
+        // a cause. A code retired since the row was written still decodes.
+        let code_ok =
+            is_code_token(&fields.code) && fields.code != "IO" && fields.code != "FRAME_CODEC";
+        Self::checked(
             fields.scope,
             &fields.code,
             fields.decision,
             &fields.reviewer,
             &fields.date,
+            code_ok,
         )
         .map_err(|_| "disposition row out of domain")
     }
 }
 
 impl Row {
-    /// A review row.
+    /// A review row to write.
     ///
     /// # Errors
-    /// `FIELD_DOMAIN_VIOLATION` when the code is not a typed refusal code
-    /// (a bare `IO` or `FRAME_CODEC` can never be dispositioned), the item is
-    /// not 64 lowercase hex, the reviewer is empty, over 128 bytes or holds a
-    /// control character, or the date is not a calendar `YYYY-MM-DD`.
+    /// `FIELD_DOMAIN_VIOLATION` when the code is not a typed refusal code the
+    /// taxonomy holds now (a bare `IO` or `FRAME_CODEC` can never be
+    /// dispositioned), the item or its instance is not 64 lowercase hex, the
+    /// reviewer is empty, over 128 bytes or holds a control character, or
+    /// the date is not a calendar `YYYY-MM-DD`.
     pub fn new(
         scope: Scope,
         code: &str,
@@ -138,19 +171,25 @@ impl Row {
         reviewer: &str,
         date: &str,
     ) -> Result<Self> {
+        Self::checked(scope, code, decision, reviewer, date, is_typed_code(code))
+    }
+
+    fn checked(
+        scope: Scope,
+        code: &str,
+        decision: Decision,
+        reviewer: &str,
+        date: &str,
+        code_ok: bool,
+    ) -> Result<Self> {
         let item_ok = match &scope {
-            Scope::Item(item) => {
-                item.len() == 64
-                    && item
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            }
+            Scope::Item { item, instance } => is_hex64(item) && is_hex64(instance),
             Scope::Policy => true,
         };
         let reviewer_ok = !reviewer.trim().is_empty()
             && reviewer.len() <= REVIEWER_LIMIT
             && !reviewer.chars().any(char::is_control);
-        if !(is_typed_code(code) && item_ok && reviewer_ok && is_date(date)) {
+        if !(code_ok && item_ok && reviewer_ok && is_date(date)) {
             return Err(BulkloadRefusal::FieldDomainViolation);
         }
         Ok(Self {
@@ -172,6 +211,31 @@ impl Row {
         &self.code
     }
 
+    /// Whether the row's code has left the taxonomy since it was written.
+    /// Such a row disposes nothing.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        !BulkloadRefusal::is_code(&self.code)
+    }
+
+    /// The item an item row names.
+    #[must_use]
+    pub fn item(&self) -> Option<&str> {
+        match &self.scope {
+            Scope::Item { item, .. } => Some(item),
+            Scope::Policy => None,
+        }
+    }
+
+    /// The refusal instance an item row was made against.
+    #[must_use]
+    pub fn instance(&self) -> Option<&str> {
+        match &self.scope {
+            Scope::Item { instance, .. } => Some(instance),
+            Scope::Policy => None,
+        }
+    }
+
     #[must_use]
     pub const fn decision(&self) -> Decision {
         self.decision
@@ -191,7 +255,7 @@ impl Row {
     #[must_use]
     pub const fn basis(&self) -> &'static str {
         match self.scope {
-            Scope::Item(_) => "item",
+            Scope::Item { .. } => "item",
             Scope::Policy => "policy",
         }
     }
@@ -228,8 +292,34 @@ fn is_date(date: &str) -> bool {
 #[derive(Serialize, Deserialize)]
 struct Body {
     plan: PathBuf,
+    plan_digest: String,
     source_label: String,
     rows: Vec<Row>,
+}
+
+/// The digest a ledger binds its plan by: blake3 of the plan file's bytes,
+/// lowercase hex. The file must be a plan the estate reader accepts.
+///
+/// # Errors
+/// The plan's read refusals (`IO` for a missing or symlinked file,
+/// `FIELD_DOMAIN_VIOLATION` over 16 MiB, `FRAME_CODEC` for bytes that are
+/// not a plan).
+pub fn plan_digest(plan: &Path) -> Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(plan)
+        .refuse_at("disposition::plan_digest")?;
+    let mut bytes = Vec::new();
+    file.take(PLAN_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .refuse_at("disposition::plan_digest")?;
+    if bytes.len() as u64 > PLAN_LIMIT {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    // The bytes must be a plan: a ledger is never bound to anything else.
+    crate::estate::inspect(plan)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// A disposition ledger bound to a plan and a SOURCE label.
@@ -239,6 +329,8 @@ pub struct Ledger {
     pub path: PathBuf,
     /// The plan it binds to, canonical when it was created.
     pub plan: PathBuf,
+    /// The digest of that plan's bytes ([`plan_digest`]).
+    pub plan_digest: String,
     /// The SOURCE label it binds to.
     pub source_label: String,
     /// Every review, in the order it was recorded.
@@ -246,33 +338,37 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// An empty ledger bound to `plan` and `source_label`.
+    /// An empty ledger bound to `plan` (its path made canonical when it
+    /// resolves), the plan content `plan_digest` names, and `source_label`.
     #[must_use]
-    pub fn new(plan: &Path, source_label: &str) -> Self {
+    pub fn bound(plan: &Path, plan_digest: &str, source_label: &str) -> Self {
         Self {
             path: PathBuf::new(),
             plan: std::fs::canonicalize(plan).unwrap_or_else(|_| plan.to_owned()),
+            plan_digest: plan_digest.to_owned(),
             source_label: source_label.to_owned(),
             rows: Vec::new(),
         }
     }
 
-    /// The review that disposes `item`'s refusal with `code`: the latest
-    /// item row for exactly that item and code, else the latest standing
-    /// policy row for the code. `None` for a bare `IO` or `FRAME_CODEC`,
-    /// whatever the ledger holds.
+    /// The review that disposes `item`'s refusal `instance` with `code`: the
+    /// latest item row for exactly that item, instance and code, else the
+    /// latest standing policy row for the code. `None` for a bare `IO` or
+    /// `FRAME_CODEC` and for a code the taxonomy no longer holds, whatever
+    /// the ledger holds.
     #[must_use]
-    pub fn review(&self, item: &str, code: &str) -> Option<&Row> {
+    pub fn review(&self, item: &str, instance: &str, code: &str) -> Option<&Row> {
         if !is_typed_code(code) {
             return None;
         }
-        let latest = |scope: &Scope| {
+        let latest = |matches: &dyn Fn(&Row) -> bool| {
             self.rows
                 .iter()
                 .rev()
-                .find(|row| row.code == code && row.scope == *scope)
+                .find(|row| row.code == code && matches(row))
         };
-        latest(&Scope::Item(item.to_owned())).or_else(|| latest(&Scope::Policy))
+        latest(&|row| row.item() == Some(item) && row.instance() == Some(instance))
+            .or_else(|| latest(&|row| row.scope == Scope::Policy))
     }
 
     /// The persisted bytes.
@@ -282,6 +378,7 @@ impl Ledger {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(&Body {
             plan: self.plan.clone(),
+            plan_digest: self.plan_digest.clone(),
             source_label: self.source_label.clone(),
             rows: self.rows.clone(),
         })
@@ -289,14 +386,21 @@ impl Ledger {
         Ok([MAGIC.as_slice(), &body].concat())
     }
 
-    /// Decode a ledger strictly and bind it to `plan` and `source_label`.
+    /// Decode a ledger strictly and bind it to `plan`, the plan content
+    /// `plan_digest` names, and `source_label`.
     ///
     /// # Errors
     /// `SCHEMA_MISMATCH` without the magic, `FIELD_DOMAIN_VIOLATION` when the
     /// body is not exactly one ledger or any row is out of domain (a row
-    /// naming `IO` among them), and `RECEIPT_BINDING_INVALID` for a ledger
-    /// bound to another plan or label.
-    pub fn decode(bytes: &[u8], plan: &Path, source_label: &str) -> Result<Self> {
+    /// naming `IO` among them; a row naming a retired code is in domain),
+    /// and `RECEIPT_BINDING_INVALID` for a ledger bound to another plan path,
+    /// other plan bytes or another label.
+    pub fn decode(
+        bytes: &[u8],
+        plan: &Path,
+        plan_digest: &str,
+        source_label: &str,
+    ) -> Result<Self> {
         let body = bytes
             .strip_prefix(&MAGIC)
             .ok_or(BulkloadRefusal::SchemaMismatch)?;
@@ -309,23 +413,33 @@ impl Ledger {
             (Ok(named), Ok(plan)) => named == plan,
             _ => body.plan == plan,
         };
-        if !same || body.source_label != source_label {
+        if !same
+            || !is_hex64(&body.plan_digest)
+            || body.plan_digest != plan_digest
+            || body.source_label != source_label
+        {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
         Ok(Self {
             path: PathBuf::new(),
             plan: body.plan,
+            plan_digest: body.plan_digest,
             source_label: body.source_label,
             rows: body.rows,
         })
     }
 
-    /// Read a ledger and bind it (no symlink is followed).
+    /// Read a ledger and bind it to the plan file at `plan` as it is now (no
+    /// symlink is followed).
     ///
     /// # Errors
-    /// As [`Ledger::decode`], `BUDGET_EXCEEDED` over 16 MiB, and the read's
-    /// refusal.
+    /// As [`Ledger::decode`] and [`plan_digest`], `BUDGET_EXCEEDED` over
+    /// 16 MiB, and the read's refusal.
     pub fn read(path: &Path, plan: &Path, source_label: &str) -> Result<Self> {
+        Self::read_bound(path, plan, &plan_digest(plan)?, source_label)
+    }
+
+    fn read_bound(path: &Path, plan: &Path, digest: &str, source_label: &str) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -338,15 +452,22 @@ impl Ledger {
         if bytes.len() as u64 > LEDGER_LIMIT {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
-        let mut ledger = Self::decode(&bytes, plan, source_label)?;
+        let mut ledger = Self::decode(&bytes, plan, digest, source_label)?;
         path.clone_into(&mut ledger.path);
         Ok(ledger)
     }
 }
 
-/// Append one review to the ledger at `path` (`closure-dispose`), creating
-/// it bound to `plan` and `source_label` when absent. An item row must name
-/// an item `plan` holds.
+/// Append one review to the ledger at `path` (`closure-dispose`).
+///
+/// The ledger is created bound to `plan` and `source_label` when absent. The
+/// plan is read for every row, item or policy: it must exist and be a plan,
+/// and its bytes are what the ledger binds to. An item row must name an item
+/// `plan` holds.
+///
+/// The caller proves an item row's refusal exists: `closure-dispose` builds
+/// the closure report and takes the row's instance from it
+/// ([`crate::closure::Report::reviewable`]).
 ///
 /// Durability: under an exclusive lock on `{path}.lock`, the whole ledger is
 /// written to `{path}.pending`, flushed, renamed over `path`, and the
@@ -357,10 +478,11 @@ impl Ledger {
 /// bound elsewhere; the plan's and the ledger's read refusals; `IO` when
 /// another writer holds the lock or a write fails.
 pub fn record(path: &Path, plan: &Path, source_label: &str, row: Row) -> Result<Ledger> {
-    if let Scope::Item(item) = &row.scope {
+    let digest = plan_digest(plan)?;
+    if let Some(item) = row.item() {
         let mut planned = false;
         for candidate in crate::estate::inspect(plan)? {
-            planned |= crate::estate::id(&candidate)? == *item;
+            planned |= crate::estate::id(&candidate)? == item;
         }
         if !planned {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
@@ -389,9 +511,9 @@ pub fn record(path: &Path, plan: &Path, source_label: &str, row: Row) -> Result<
         ));
     }
     let mut ledger = if path.try_exists().refuse_at("disposition::record")? {
-        Ledger::read(path, plan, source_label)?
+        Ledger::read_bound(path, plan, &digest, source_label)?
     } else {
-        Ledger::new(plan, source_label)
+        Ledger::bound(plan, &digest, source_label)
     };
     ledger.rows.push(row);
     let bytes = ledger.encode()?;
@@ -426,8 +548,15 @@ pub fn record(path: &Path, plan: &Path, source_label: &str, row: Row) -> Result<
 mod tests {
     use super::*;
 
-    fn item(c: char) -> String {
+    fn hex(c: char) -> String {
         c.to_string().repeat(64)
+    }
+
+    fn item(c: char) -> Scope {
+        Scope::Item {
+            item: hex(c),
+            instance: hex('1'),
+        }
     }
 
     #[test]
@@ -435,31 +564,25 @@ mod tests {
         let ok = |scope, code: &str, reviewer: &str, date: &str| {
             Row::new(scope, code, Decision::Accept, reviewer, date)
         };
-        assert!(ok(
-            Scope::Item(item('a')),
-            "GIT_NEST_STASHED",
-            "jess",
-            "2026-10-06"
-        )
-        .is_ok());
+        assert!(ok(item('a'), "GIT_NEST_STASHED", "jess", "2026-10-06").is_ok());
         assert!(ok(Scope::Policy, "CAPTURE_DRIFTED", "jess", "2028-02-29").is_ok());
+        let upper = Scope::Item {
+            item: "A".repeat(64),
+            instance: hex('1'),
+        };
+        let unbound = Scope::Item {
+            item: hex('a'),
+            instance: String::new(),
+        };
         for (scope, code, reviewer, date) in [
             (Scope::Policy, "IO", "jess", "2026-10-06"),
-            (Scope::Item(item('a')), "FRAME_CODEC", "jess", "2026-10-06"),
+            (item('a'), "FRAME_CODEC", "jess", "2026-10-06"),
             (Scope::Policy, "NOT_A_CODE", "jess", "2026-10-06"),
-            (
-                Scope::Item("A".repeat(64)),
-                "GIT_NEST_STASHED",
-                "jess",
-                "2026-10-06",
-            ),
-            (Scope::Item(item('a')), "GIT_NEST_STASHED", "", "2026-10-06"),
-            (
-                Scope::Item(item('a')),
-                "GIT_NEST_STASHED",
-                "a\nb",
-                "2026-10-06",
-            ),
+            (upper, "GIT_NEST_STASHED", "jess", "2026-10-06"),
+            // An item row names the refusal instance it reviews.
+            (unbound, "GIT_NEST_STASHED", "jess", "2026-10-06"),
+            (item('a'), "GIT_NEST_STASHED", "", "2026-10-06"),
+            (item('a'), "GIT_NEST_STASHED", "a\nb", "2026-10-06"),
             (Scope::Policy, "GIT_NEST_STASHED", "jess", "2026-02-29"),
             (Scope::Policy, "GIT_NEST_STASHED", "jess", "2026-13-01"),
             (Scope::Policy, "GIT_NEST_STASHED", "jess", "2026-1-01"),
@@ -478,33 +601,54 @@ mod tests {
     }
 
     #[test]
-    fn latest_item_row_then_policy_decides() {
-        let mut ledger = Ledger::new(Path::new("/plan"), "neo");
+    fn latest_item_row_for_the_instance_then_policy_decides() {
+        let mut ledger = Ledger::bound(Path::new("/plan"), &hex('d'), "neo");
         let row = |scope, code: &str, decision| {
             Row::new(scope, code, decision, "jess", "2026-10-06").unwrap()
         };
+        let other = Scope::Item {
+            item: hex('a'),
+            instance: hex('2'),
+        };
         ledger.rows = vec![
             row(Scope::Policy, "CAPTURE_DRIFTED", Decision::ReCarry),
-            row(Scope::Item(item('a')), "CAPTURE_DRIFTED", Decision::Accept),
-            row(Scope::Item(item('a')), "CAPTURE_DRIFTED", Decision::Abandon),
+            row(item('a'), "CAPTURE_DRIFTED", Decision::Accept),
+            row(item('a'), "CAPTURE_DRIFTED", Decision::Abandon),
+            row(other, "GIT_NEST_STASHED", Decision::Accept),
         ];
-        let decide = |item: &str, code| ledger.review(item, code).map(Row::decision);
+        let decide = |item: char, instance: char, code| {
+            ledger
+                .review(&hex(item), &hex(instance), code)
+                .map(|row| (row.decision(), row.basis()))
+        };
         assert_eq!(
-            decide(&item('a'), "CAPTURE_DRIFTED"),
-            Some(Decision::Abandon)
+            decide('a', '1', "CAPTURE_DRIFTED"),
+            Some((Decision::Abandon, "item"))
+        );
+        // The same item and code, another refusal instance: the item rows
+        // do not reach it; only the standing policy does.
+        assert_eq!(
+            decide('a', '2', "CAPTURE_DRIFTED"),
+            Some((Decision::ReCarry, "policy"))
         );
         assert_eq!(
-            decide(&item('b'), "CAPTURE_DRIFTED"),
-            Some(Decision::ReCarry)
+            decide('b', '1', "CAPTURE_DRIFTED"),
+            Some((Decision::ReCarry, "policy"))
         );
-        assert_eq!(decide(&item('a'), "GIT_NEST_STASHED"), None);
-        assert_eq!(decide(&item('a'), "IO"), None);
+        // No policy for this code: only the exact instance is disposed.
+        assert_eq!(
+            decide('a', '2', "GIT_NEST_STASHED"),
+            Some((Decision::Accept, "item"))
+        );
+        assert_eq!(decide('a', '1', "GIT_NEST_STASHED"), None);
+        assert_eq!(decide('a', '1', "IO"), None);
     }
 
     #[test]
     fn ledgers_decode_strictly_and_bind() {
         let plan = Path::new("/plan-that-does-not-exist");
-        let mut ledger = Ledger::new(plan, "neo");
+        let digest = hex('d');
+        let mut ledger = Ledger::bound(plan, &digest, "neo");
         ledger.rows.push(
             Row::new(
                 Scope::Policy,
@@ -515,28 +659,53 @@ mod tests {
             )
             .unwrap(),
         );
+        ledger.rows.push(
+            Row::new(
+                item('a'),
+                "GIT_NEST_STASHED",
+                Decision::ReCarry,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
         let bytes = ledger.encode().unwrap();
-        assert_eq!(Ledger::decode(&bytes, plan, "neo").unwrap(), ledger);
+        assert_eq!(
+            Ledger::decode(&bytes, plan, &digest, "neo").unwrap(),
+            ledger
+        );
         let mut longer = bytes.clone();
         longer.push(0);
         assert_eq!(
-            Ledger::decode(&longer, plan, "neo"),
+            Ledger::decode(&longer, plan, &digest, "neo"),
             Err(BulkloadRefusal::FieldDomainViolation)
         );
         assert_eq!(
-            Ledger::decode(&bytes[1..], plan, "neo"),
+            Ledger::decode(&bytes[1..], plan, &digest, "neo"),
             Err(BulkloadRefusal::SchemaMismatch)
         );
         assert_eq!(
-            Ledger::decode(&bytes, Path::new("/other"), "neo"),
+            Ledger::decode(&bytes, Path::new("/other"), &digest, "neo"),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        // The same path holding other plan bytes binds nothing.
+        assert_eq!(
+            Ledger::decode(&bytes, plan, &hex('e'), "neo"),
             Err(BulkloadRefusal::ReceiptBindingInvalid)
         );
         assert_eq!(
-            Ledger::decode(&bytes, plan, "sting"),
+            Ledger::decode(&bytes, plan, &digest, "sting"),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        // A ledger naming no plan digest binds nothing, whatever is asked.
+        let unbound = Ledger::bound(plan, "", "neo").encode().unwrap();
+        assert_eq!(
+            Ledger::decode(&unbound, plan, "", "neo"),
             Err(BulkloadRefusal::ReceiptBindingInvalid)
         );
         // A forged IO row (bypassing `Row::new`) refuses the whole ledger.
-        ledger.rows.push(Row {
+        let mut forged = ledger.clone();
+        forged.rows.push(Row {
             scope: Scope::Policy,
             code: "IO".into(),
             decision: Decision::Accept,
@@ -544,8 +713,140 @@ mod tests {
             date: "2026-10-06".into(),
         });
         assert_eq!(
-            Ledger::decode(&ledger.encode().unwrap(), plan, "neo"),
+            Ledger::decode(&forged.encode().unwrap(), plan, &digest, "neo"),
             Err(BulkloadRefusal::FieldDomainViolation)
+        );
+        // So does a row whose code is free text.
+        let mut forged = ledger.clone();
+        forged.rows.push(Row {
+            scope: Scope::Policy,
+            code: "disk went away".into(),
+            decision: Decision::Accept,
+            reviewer: "jess".into(),
+            date: "2026-10-06".into(),
+        });
+        assert_eq!(
+            Ledger::decode(&forged.encode().unwrap(), plan, &digest, "neo"),
+            Err(BulkloadRefusal::FieldDomainViolation)
+        );
+    }
+
+    // A code that leaves the taxonomy after a row was written (a later lane
+    // deletes the variant) fails closed for that row only: the ledger still
+    // decodes, every other review still works, and a writer cannot add one.
+    #[test]
+    fn a_retired_code_fails_closed_per_row_not_per_ledger() {
+        let plan = Path::new("/plan-that-does-not-exist");
+        let digest = hex('d');
+        let retired = "JOURNAL_RETIRED_FOR_THIS_TEST";
+        assert!(!BulkloadRefusal::is_code(retired));
+        assert_eq!(
+            Row::new(
+                Scope::Policy,
+                retired,
+                Decision::Accept,
+                "jess",
+                "2026-10-06"
+            ),
+            Err(BulkloadRefusal::FieldDomainViolation)
+        );
+        let mut ledger = Ledger::bound(plan, &digest, "neo");
+        for (scope, code) in [
+            (Scope::Policy, retired),
+            (item('a'), retired),
+            (item('a'), "GIT_NEST_STASHED"),
+        ] {
+            // As a binary that still held the code wrote it.
+            ledger.rows.push(Row {
+                scope,
+                code: code.into(),
+                decision: Decision::Accept,
+                reviewer: "jess".into(),
+                date: "2026-10-06".into(),
+            });
+        }
+        let read = Ledger::decode(&ledger.encode().unwrap(), plan, &digest, "neo").unwrap();
+        assert_eq!(read, ledger);
+        assert_eq!(
+            read.rows.iter().map(Row::is_retired).collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+        // The retired rows dispose nothing; the current one still does.
+        assert_eq!(read.review(&hex('a'), &hex('1'), retired), None);
+        assert!(read
+            .review(&hex('a'), &hex('1'), "GIT_NEST_STASHED")
+            .is_some());
+    }
+
+    fn plan_with(root: &Path, name: &str, source: &str) -> (PathBuf, String) {
+        let plan = root.join(name);
+        let source = root.join(source);
+        std::fs::create_dir_all(&source).unwrap();
+        crate::estate::add(&plan, &source, &root.join("repository"), None).unwrap();
+        let items = crate::estate::inspect(&plan).unwrap();
+        (plan, crate::estate::id(&items[0]).unwrap())
+    }
+
+    // The ledger binds the plan's bytes, and `record` reads the plan for
+    // every row: a policy row cannot be recorded against a path that holds
+    // no plan, and a ledger does not follow a path to another plan.
+    #[test]
+    fn a_ledger_is_bound_to_the_plan_bytes_not_only_its_path() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, first) = plan_with(root.path(), "plan", "s1");
+        let ledger = root.path().join("reviews");
+        let policy = || {
+            Row::new(
+                Scope::Policy,
+                "GIT_NEST_STASHED",
+                Decision::Accept,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap()
+        };
+        // No plan, or a file that is not a plan: nothing is created.
+        let missing = root.path().join("no-such-plan");
+        assert!(record(&root.path().join("l2"), &missing, "neo", policy()).is_err());
+        let junk = root.path().join("junk");
+        std::fs::write(&junk, b"not a plan").unwrap();
+        assert!(record(&root.path().join("l2"), &junk, "neo", policy()).is_err());
+        assert!(!root.path().join("l2").exists());
+
+        let recorded = record(&ledger, &plan, "neo", policy()).unwrap();
+        assert_eq!(recorded.plan_digest, plan_digest(&plan).unwrap());
+        assert_eq!(Ledger::read(&ledger, &plan, "neo").unwrap().rows.len(), 1);
+
+        // Another plan placed at the same path: the ledger binds nothing,
+        // for reading and for appending, and is left as it was.
+        let before = std::fs::read(&ledger).unwrap();
+        let (other, second) = plan_with(root.path(), "other-plan", "s2");
+        assert_ne!(first, second);
+        std::fs::rename(&other, &plan).unwrap();
+        assert_eq!(
+            Ledger::read(&ledger, &plan, "neo"),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert_eq!(
+            record(&ledger, &plan, "neo", policy()),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        // An item row for an item the plan does not hold binds nothing.
+        let foreign = Row::new(
+            Scope::Item {
+                item: first,
+                instance: hex('1'),
+            },
+            "GIT_NEST_STASHED",
+            Decision::Accept,
+            "jess",
+            "2026-10-06",
+        )
+        .unwrap();
+        assert_eq!(
+            record(&root.path().join("l3"), &plan, "neo", foreign),
+            Err(BulkloadRefusal::ReceiptBindingInvalid)
         );
     }
 }

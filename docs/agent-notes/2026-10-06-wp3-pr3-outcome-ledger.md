@@ -16,7 +16,9 @@ outcome strings.
   input must be consumed). A record without the magic is read as the legacy
   `(source, outcome, reason)` tuple and mapped; what cannot be mapped is an
   `Unreadable` value. Refusal codes are stored as their stable strings, so
-  deleting a refusal variant (lane L5) cannot shift a recorded code.
+  deleting a refusal variant (lane L5) cannot shift a recorded code. (What
+  a deleted code does to a record that names it is in the review round
+  below: it reads as `refusal-code-retired`.)
 - `crates/bulkload-agent/src/disposition.rs` (new): the disposition ledger
   (`bulkload.dispositions.v1`, postcard, strict, bound to plan and SOURCE
   label). Rows are accept / re-carry / abandon with reviewer and date, per
@@ -27,9 +29,8 @@ outcome strings.
   pending review. An attestation row cannot close an item whose own record
   is an untyped refusal (`native-refusal-untyped`); an attested `refused`
   row needs a review like a native one. The native `verdict` is unchanged.
-- `main.rs`: `closure-dispose LEDGER PLAN SOURCE ITEM|--policy CODE
-  accept|re-carry|abandon REVIEWER YYYY-MM-DD`, and
-  `closure-report --dispositions LEDGER`.
+- `main.rs`: `closure-dispose` and `closure-report --dispositions LEDGER`
+  (the `closure-dispose` arguments changed in the review round below).
 - `estate.rs` (lane L6a's file, minimal hunks): `Receipt.refusal`, `emit`
   writes the typed record with the verb as site, `repair_missing_index`
   writes typed records, `LedgerEntry.record` is
@@ -72,7 +73,63 @@ one file, tests run, file restored byte-identical):
 | attestation untyped check removed | both `p73::*`, `attestation_cannot_close_an_untyped_refusal` |
 | `is_typed_code` admits `IO` | both `p73::*`, 4 others |
 
-Unmutated: 25 of 25 in `outcome:: disposition:: closure::`.
+Unmutated: 25 of 25 in `outcome:: disposition:: closure::` (at `a0d78df`).
+
+## Review round 1 (2026-10-06)
+
+Seven medium/high review findings, fixed in the commit that carries this
+section, on top of the signed merge of `origin/main` `2247ab8` (#190) at
+`0591c2b`. Rulings as above.
+
+- **Bare `IO` attested away (high).** `attest()` decided "untyped" from the
+  unaccounted reason, and `classify()` returns `record-source-mismatch`
+  before it looks at the refusal, so a bare `IO` recorded under another
+  source could be attested. The check now reads the decoded record
+  (`AttestationRow::verdict(native)`): any `Refused` that is not typed, and
+  any `Unreadable::RefusalUntyped`, is rejected whatever the reason. P73
+  gained `BareIoElsewhere`.
+- **Reviews bound to the refusal instance (medium).** An item row is
+  `Scope::Item { item, instance }`; `closure::instance(entry)` is a blake3
+  digest of the item's current capture and its outcome record. `review()`
+  matches item, instance and code. `closure-dispose` now takes `CORPUS` and
+  the state directories (and `--attest`), builds the report, and refuses
+  `RECEIPT_BINDING_INVALID` unless the item holds that typed refusal now
+  (`Report::reviewable`). Stale rows are listed
+  (`refusal-instance-stale`). New arguments: `closure-dispose
+  [--attest LEDGER.json] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE
+  DECISION REVIEWER DATE [PRIVATE_STATE ...]`.
+- **Ledger bound to plan bytes (medium).** `Body.plan_digest` (blake3 of
+  the plan file); `decode` compares it; `record()` reads and validates the
+  plan for policy rows too. The path binding stays as well (#133 shape).
+- **Retired codes (two medium findings, one fix).** Write-time and
+  read-time validation are split. Writers (`Refusal::new`, `Row::new`)
+  need a current code. Readers accept any code token
+  (`outcome::is_code_token`). A record naming a retired code is
+  `Unaccounted("refusal-code-retired")` in both formats, not unreadable; a
+  review row naming one disposes nothing and is listed; the ledger still
+  decodes and appends. No closed list of retired codes is kept, so lane L5
+  needs no change here and nothing names its two codes.
+- **`design.md` (medium).** The "gate equals verdict" sentence is amended
+  with a dated S4 note, `refused-pending-review` is in the disposition
+  list, and `CLOSURE_UNACCOUNTED` is stated to cover pending review.
+- **Report schema (medium).** Bumped to `bulkload.closure.v2`, with the
+  changed and added fields listed in `design.md`. `refusal` is again
+  printed for typed refusals only (others print `recorded_refusal`), and a
+  legacy untyped refusal prints `"outcome":"refused"` again.
+
+Red on mutation (scratch run on sting, 2026-10-06, same method as above):
+
+| Mutant | Tests that turned red |
+| --- | --- |
+| attestation decides untyped from the reason string | both `p73::*`, `attestation_cannot_close_an_untyped_refusal_under_any_reason` |
+| `review()` ignores the instance | both `p73::*`, 3 example tests |
+| `decode` ignores the plan digest | `a_ledger_is_bound_to_the_plan_bytes_not_only_its_path`, `ledgers_decode_strictly_and_bind` |
+| review row decode requires a current code | `a_retired_code_fails_closed_per_row_not_per_ledger`, `a_retired_review_row_is_listed_and_the_rest_still_dispose` |
+| record decode requires a current code | `a_retired_code_still_decodes_and_is_not_typed` |
+| retired code classified as typed | `p73_closure_is_green_iff_every_refusal_is_dispositioned`, `attestation_cannot_close_an_untyped_refusal_under_any_reason` |
+
+Unmutated: 31 of 31 in `outcome:: disposition:: closure::`, 6 of 6 in
+`tests/space_closure_cli.rs`.
 
 ## Open
 
@@ -80,10 +137,27 @@ Unmutated: 25 of 25 in `outcome:: disposition:: closure::`.
   Until then S4 is proven for estate items only.
 - `estate.rs` is lane L6a's file; this branch touches it (listed above). A
   merge with L6a will need those hunks reconciled.
-- A legacy `refused` record whose code lane L5 deletes
-  (`GIT_DESTINATION_FILESYSTEM_UNSUPPORTED`, `JOURNAL_OWNERSHIP_CONFLICT`)
-  will read as `refusal-untyped` once the code leaves the taxonomy, which
-  is unaccounted and fails closed. Nothing here depends on either code.
+- A refusal whose code leaves the taxonomy (lane L5, PR #189, deletes
+  `GIT_DESTINATION_FILESYSTEM_UNSUPPORTED` and `JOURNAL_OWNERSHIP_CONFLICT`)
+  reads as `refusal-code-retired`: unaccounted, not reviewable, not
+  attestable, closed only by a verb recording a current outcome. A review
+  already written for it stops counting. The alternative (a closed list of
+  retired codes that stay reviewable) needs L5 to maintain the list and is
+  an operator decision.
+- A standing policy is open-ended in time (bounded by plan digest and
+  label). `docs/slo.md` says so and marks it as not yet a ruling.
+- A disposition ledger is bound to the plan's bytes, so `estate-add` on a
+  plan that already has reviews starts a new ledger.
+- The refusal instance has no time in it: the same capture and a
+  byte-identical record are one instance, so a re-run that refuses
+  identically keeps its review.
+- `docs/slo.md`: PR #189 inserts its amendment at the same place; a merge
+  with L5 will conflict there.
+- Low review findings, not fixed: "strict" decode accepts postcard's
+  overlong varints; P73 does not generate attested-`refused` rows,
+  `Unreadable::Codec`, `OutcomeUnknown` or no-record items; the writer's
+  outcome names are still string literals converted at run time;
+  `Refusal.site` is the verb, not the raise site.
 - A `re-carry` review counts as a disposition for the gate; nothing yet
   checks that the re-carry later happened.
 - Reviewer names are free text; nothing authenticates them.

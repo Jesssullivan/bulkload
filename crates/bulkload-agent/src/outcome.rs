@@ -21,6 +21,18 @@
 //! pins it; append new variants, never reorder. Refusal codes are carried as
 //! their stable strings ([`BulkloadRefusal::code`]), never as the refusal
 //! enum's index, so deleting a refusal variant cannot shift a recorded code.
+//!
+//! Write time and read time validate a code differently, because the
+//! taxonomy shrinks (WP3 PR 1 deleted nine codes; later lanes delete more):
+//!
+//! - a **writer** ([`Refusal::new`], [`Refusal::of`]) records only a code the
+//!   taxonomy holds now ([`BulkloadRefusal::CODES`]);
+//! - a **reader** accepts any well-formed code token ([`is_code_token`]). A
+//!   record naming a code that has since left the taxonomy still decodes, in
+//!   either format, as a refusal that [`Refusal::is_retired`]. Closure reads
+//!   it as unaccounted (`refusal-code-retired`): it is not typed, no review
+//!   or attestation closes it, and only a verb recording a current outcome
+//!   does. It never makes the record unreadable.
 
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -135,9 +147,11 @@ impl Outcome {
 
 /// A typed refusal as an outcome record carries it.
 ///
-/// `code` is one of [`BulkloadRefusal::CODES`]; `site` is the `module::path`
-/// that recorded it ([`crate::refuse::is_site`]); `errno` is the OS errno of
-/// a bare `IO` refusal and nothing else. A decoded record that breaks any of
+/// `code` is a well-formed code token ([`is_code_token`]): one of
+/// [`BulkloadRefusal::CODES`] when written, possibly a code retired since
+/// when read ([`Refusal::is_retired`]). `site` is the `module::path` that
+/// recorded it ([`crate::refuse::is_site`]); `errno` is the OS errno of a
+/// bare `IO` refusal and nothing else. A decoded record that breaks any of
 /// these refuses to decode.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "RefusalFields")]
@@ -160,18 +174,27 @@ impl TryFrom<RefusalFields> for Refusal {
     type Error = &'static str;
 
     fn try_from(fields: RefusalFields) -> Result<Self, Self::Error> {
-        Self::new(&fields.code, &fields.site, fields.errno).ok_or("refusal fields out of domain")
+        Self::decoded(&fields.code, &fields.site, fields.errno)
+            .ok_or("refusal fields out of domain")
     }
 }
 
 impl Refusal {
-    /// A refusal record, when `code` is a taxonomy code, `site` is a
-    /// `module::path`, and only an `IO` refusal names an errno.
+    /// A refusal record to write: `code` is a code the taxonomy holds now,
+    /// `site` is a `module::path`, and only an `IO` refusal names an errno.
     #[must_use]
     pub fn new(code: &str, site: &str, errno: Option<i32>) -> Option<Self> {
-        (BulkloadRefusal::is_code(code)
-            && crate::refuse::is_site(site)
-            && (errno.is_none() || code == "IO"))
+        BulkloadRefusal::is_code(code)
+            .then(|| Self::decoded(code, site, errno))
+            .flatten()
+    }
+
+    /// A refusal record as read: as [`Refusal::new`], but `code` is any
+    /// well-formed code token, so a code that has left the taxonomy since
+    /// the record was written still reads ([`Refusal::is_retired`]).
+    #[must_use]
+    pub(crate) fn decoded(code: &str, site: &str, errno: Option<i32>) -> Option<Self> {
+        (is_code_token(code) && crate::refuse::is_site(site) && (errno.is_none() || code == "IO"))
             .then(|| Self {
                 code: code.to_owned(),
                 site: site.to_owned(),
@@ -194,12 +217,14 @@ impl Refusal {
     }
 
     /// The refusal a legacy receipt reason names: the refusal's `Display`,
-    /// its code first. `None` when the reason names no code, or is not a
-    /// bare `IO`'s exact `Display` (`IO`, `IO (errno N)`).
+    /// its code first. `None` when the reason's first word is no code token
+    /// ([`is_code_token`]), or is not a bare `IO`'s exact `Display` (`IO`,
+    /// `IO (errno N)`). A code retired since the record was written maps
+    /// like any other ([`Refusal::is_retired`]).
     #[must_use]
     pub fn from_display(reason: &str) -> Option<Self> {
         let code = reason.split_whitespace().next()?;
-        if !BulkloadRefusal::is_code(code) {
+        if !is_code_token(code) {
             return None;
         }
         let errno = if code == "IO" {
@@ -216,7 +241,7 @@ impl Refusal {
         } else {
             None
         };
-        Self::new(code, LEGACY_SITE, errno)
+        Self::decoded(code, LEGACY_SITE, errno)
     }
 
     /// The stable refusal code.
@@ -237,16 +262,40 @@ impl Refusal {
         self.errno
     }
 
-    /// Whether the code names a cause. A bare `IO` or `FRAME_CODEC` does not:
-    /// it never closes an item and can never be dispositioned (S4).
+    /// Whether the code names a cause the taxonomy holds now. A bare `IO` or
+    /// `FRAME_CODEC` does not, and neither does a retired code: none of them
+    /// closes an item, and none can be dispositioned (S4).
     #[must_use]
     pub fn is_typed(&self) -> bool {
         is_typed_code(&self.code)
     }
+
+    /// Whether the code has left the taxonomy since the record was written.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        !BulkloadRefusal::is_code(&self.code)
+    }
 }
 
-/// Whether `code` is a taxonomy code that names a cause: not `IO`, not
-/// `FRAME_CODEC`, and not free text (S4: a bare IO never counts).
+/// The longest code token read. The longest code today is 38 bytes.
+const CODE_TOKEN_LIMIT: usize = 64;
+
+/// Whether `code` has the shape of a taxonomy code.
+///
+/// That is `[A-Z][A-Z0-9_]*`, at most 64 bytes. Every code the taxonomy holds
+/// or ever held has it; free text (`disk went away`) does not. Readers check
+/// this shape, not membership in today's [`BulkloadRefusal::CODES`].
+#[must_use]
+pub fn is_code_token(code: &str) -> bool {
+    let mut bytes = code.bytes();
+    code.len() <= CODE_TOKEN_LIMIT
+        && bytes.next().is_some_and(|first| first.is_ascii_uppercase())
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Whether `code` is a code the taxonomy holds now that names a cause: not
+/// `IO`, not `FRAME_CODEC`, not a retired code and not free text (S4: a bare
+/// IO never counts).
 #[must_use]
 pub fn is_typed_code(code: &str) -> bool {
     BulkloadRefusal::is_code(code) && code != "IO" && code != "FRAME_CODEC"
@@ -270,7 +319,7 @@ pub enum Unreadable {
     Codec,
     /// A legacy record names an outcome no writer produced.
     OutcomeUnknown,
-    /// A legacy `refused` record whose reason names no refusal code.
+    /// A legacy `refused` record whose reason names no code token at all.
     RefusalUntyped,
 }
 
@@ -712,6 +761,35 @@ mod tests {
         assert_eq!(record.encode().unwrap(), expected);
     }
 
+    /// Read time does not depend on today's taxonomy: a record naming a code
+    /// absent from `CODES` (one a later lane deleted) decodes in both
+    /// formats as a retired refusal. It is not typed, a writer cannot record
+    /// it, and it is never `outcome-record-unreadable`.
+    #[test]
+    fn a_retired_code_still_decodes_and_is_not_typed() {
+        let code = "JOURNAL_RETIRED_FOR_THIS_TEST";
+        assert!(!BulkloadRefusal::is_code(code));
+        assert!(Refusal::new(code, "estate::apply", None).is_none());
+        let retired = Refusal::decoded(code, "estate::apply", None).unwrap();
+        assert!(retired.is_retired() && !retired.is_typed());
+        let record = OutcomeRecord {
+            source: PathBuf::from("/s"),
+            outcome: Outcome::Refused(retired),
+            reason: Some(format!("{code} path=\"x\"")),
+        };
+        assert_eq!(decode(&record.encode().unwrap()), Ok(record.clone()));
+        let old = decode(&legacy("/s", REFUSED, record.reason.as_deref())).unwrap();
+        let refusal = old.outcome.refusal().unwrap();
+        assert_eq!((refusal.code(), refusal.site()), (code, LEGACY_SITE));
+        assert!(refusal.is_retired() && !refusal.is_typed());
+        // A current code is not retired, typed or not.
+        for current in ["IO", "FRAME_CODEC", "GIT_NEST_STASHED"] {
+            let refusal = Refusal::new(current, "estate::apply", None).unwrap();
+            assert!(!refusal.is_retired());
+            assert_eq!(refusal.is_typed(), current == "GIT_NEST_STASHED");
+        }
+    }
+
     #[test]
     fn refusal_fields_are_closed() {
         assert!(Refusal::new("IO", "estate::apply", Some(5)).is_some());
@@ -720,17 +798,37 @@ mod tests {
         assert!(Refusal::new("GIT_NEST_STASHED", "estate::apply", Some(5)).is_none());
         assert!(Refusal::new("NOT_A_CODE", "estate::apply", None).is_none());
         assert!(Refusal::new("IO", "Estate apply", None).is_none());
-        // A decoded refusal is checked the same way.
-        let forged = OutcomeRecord {
-            source: PathBuf::from("/s"),
-            outcome: Outcome::Refused(Refusal {
-                code: "NOT_A_CODE".into(),
-                site: "estate::apply".into(),
-                errno: None,
-            }),
-            reason: None,
-        };
-        assert_eq!(decode(&forged.encode().unwrap()), Err(Unreadable::Codec));
+        // A decoded refusal is checked for shape: free text for a code, a
+        // site that is no module path, or an errno off IO does not decode.
+        for (code, site, errno) in [
+            ("not a code", "estate::apply", None),
+            ("", "estate::apply", None),
+            ("lowercase", "estate::apply", None),
+            ("9LIVES", "estate::apply", None),
+            ("GIT_NEST_STASHED", "Estate apply", None),
+            ("GIT_NEST_STASHED", "estate::apply", Some(5)),
+            ("RETIRED_CODE", "estate::apply", Some(5)),
+        ] {
+            let forged = OutcomeRecord {
+                source: PathBuf::from("/s"),
+                outcome: Outcome::Refused(Refusal {
+                    code: code.into(),
+                    site: site.into(),
+                    errno,
+                }),
+                reason: None,
+            };
+            assert_eq!(
+                decode(&forged.encode().unwrap()),
+                Err(Unreadable::Codec),
+                "{code:?} {site:?} {errno:?}"
+            );
+        }
+        let long = "A".repeat(CODE_TOKEN_LIMIT + 1);
+        assert!(!is_code_token(&long) && is_code_token(&long[1..]));
+        for code in BulkloadRefusal::CODES {
+            assert!(is_code_token(code), "{code}");
+        }
         // A receipt's name and refusal must agree.
         assert_eq!(
             OutcomeRecord::of_receipt(PathBuf::new(), REFUSED, None, None, "estate::apply"),

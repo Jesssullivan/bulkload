@@ -58,15 +58,17 @@ SUBCOMMANDS:
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v1 JSON ledger: every planned
+                given. Prints a bulkload.closure.v2 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
-                is not typed), refused (a typed code a review disposes), or
-                referenced-only (no workspace planned, exact refs journal),
-                else unaccounted. Stale and foreign journals are listed.
-                `verdict` is always the native one. `gate` is S4: every item
-                accounted and every typed refusal reviewed; it exits nonzero
-                with CLOSURE_UNACCOUNTED when it fails.
+                is not typed, nor is a code retired from the taxonomy),
+                refused (a typed code a review disposes), or referenced-only
+                (no workspace planned, exact refs journal), else unaccounted.
+                Stale and foreign journals are listed. `verdict` is always
+                the native one. `gate` is S4: every item accounted and every
+                typed refusal reviewed, so it can fail while `verdict`
+                passes and `unaccounted` is 0; it exits nonzero with
+                CLOSURE_UNACCOUNTED when it fails.
                 Options, only before PLAN, each at most once:
                 --attest LEDGER.json: join a bulkload.closure-ledger.v1
                 attestation ledger for items closed by audit, not by a verb.
@@ -74,18 +76,30 @@ SUBCOMMANDS:
                 source_label). Its rows are reported in a separate attested
                 block and never override a native record or change
                 `verdict`; a row closes only a natively unaccounted item
-                whose own record is not an untyped refusal, with matching
-                source and current capture digest, typed refusal, basis other
-                than native-closure-report, and evidence.
+                whose own record is not an untyped or retired-code refusal,
+                with matching source and current capture digest, typed
+                refusal, basis other than native-closure-report, and
+                evidence.
                 --dispositions LEDGER: join the closure-dispose ledger bound
-                to this PLAN and SOURCE (S4)
-    closure-dispose LEDGER PLAN SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD
+                to this PLAN (its path and its bytes) and SOURCE (S4)
+    closure-dispose [--attest LEDGER.json] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
                 Record an operator review of a typed refusal (S4) in LEDGER,
-                created bound to PLAN and SOURCE when absent: for one planned
-                ITEM's refusal with CODE, or with --policy a standing policy
-                for every refusal with CODE. Rows are appended; the latest
-                item row wins, then the latest policy. IO and FRAME_CODEC
-                name no cause and refuse (FIELD_DOMAIN_VIOLATION)
+                created when absent and bound to PLAN (its path and a digest
+                of its bytes; PLAN must be a plan) and SOURCE. With ITEM: the
+                refusal with CODE that planned ITEM holds now, read as
+                closure-report reads it from CORPUS and each PRIVATE_STATE
+                (at least one; --attest joins an attestation ledger, so an
+                attested refusal can be reviewed). The row is bound to that
+                refusal instance (the item's current capture and outcome
+                record, printed as `instance`): it does not dispose a later
+                refusal against another capture or record, and an ITEM that
+                holds no such refusal refuses (RECEIPT_BINDING_INVALID). With
+                --policy: a standing policy for every refusal with CODE under
+                this PLAN and SOURCE, now or later; CORPUS and PRIVATE_STATE
+                are not read. Rows are appended; the latest item row for the
+                instance wins, then the latest policy. IO and FRAME_CODEC
+                name no cause and refuse (FIELD_DOMAIN_VIOLATION), as does a
+                CODE the taxonomy does not hold
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -418,37 +432,71 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
 }
 
 // S4 (WP3 PR 3): record one operator review of a typed refusal. Positional,
-// like estate-add; `--policy` stands in for ITEM. Prints the recorded row.
+// like estate-add; `--policy` stands in for ITEM. An item review is bound to
+// the refusal instance the report holds now, so the verb reads the same
+// inputs as closure-report. Prints the recorded row.
 fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::disposition::{self, Decision, Row, Scope};
     fn text(value: &std::ffi::OsString) -> Result<&str> {
         value.to_str().ok_or(BulkloadRefusal::PathNotPortable)
     }
-    let [ledger, plan, source, target, code, decision, reviewer, date] = args else {
+    let (attest, positional) = match args {
+        [flag, ledger, rest @ ..] if flag == "--attest" => (Some(PathBuf::from(ledger)), rest),
+        [flag] if flag == "--attest" => return Err(BulkloadRefusal::RequiredFieldMissing),
+        rest => (None, rest),
+    };
+    let [ledger, plan, corpus, source, target, code, decision, reviewer, date, states @ ..] =
+        positional
+    else {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     };
+    let (plan, source, code) = (Path::new(plan), text(source)?, text(code)?);
     let scope = match text(target)? {
+        // A standing policy names no instance: nothing else is read.
         "--policy" => Scope::Policy,
-        item => Scope::Item(item.to_owned()),
+        item => {
+            // Validate the row's own fields before reading any state.
+            if !bulkload_agent::outcome::is_typed_code(code) {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            if states.is_empty() {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
+            let estate = bulkload_agent::estate::ledger(plan, Path::new(corpus), source, &states)?;
+            let mut report = bulkload_agent::closure::Report::from_ledger(&estate);
+            if let Some(attest) = &attest {
+                report.attest(&bulkload_agent::closure::AttestationLedger::read(
+                    attest, plan, source,
+                )?)?;
+            }
+            // The item must hold this typed refusal now: no review is
+            // written ahead of the refusal it disposes.
+            let instance = report
+                .reviewable(item, code)
+                .ok_or(BulkloadRefusal::ReceiptBindingInvalid)?;
+            Scope::Item {
+                item: item.to_owned(),
+                instance: instance.to_owned(),
+            }
+        }
     };
     let row = Row::new(
         scope,
-        text(code)?,
+        code,
         Decision::parse(text(decision)?)?,
         text(reviewer)?,
         text(date)?,
     )?;
-    let recorded = disposition::record(Path::new(ledger), Path::new(plan), text(source)?, row)?;
+    let recorded = disposition::record(Path::new(ledger), plan, source, row)?;
     let mut stdout = std::io::stdout().lock();
     if let Some(row) = recorded.rows.last() {
         writeln!(
             stdout,
-            "disposition recorded scope={} item={} refusal={} decision={} reviewer={:?} date={} rows={}",
+            "disposition recorded scope={} item={} instance={} refusal={} decision={} reviewer={:?} date={} rows={}",
             row.basis(),
-            match row.scope() {
-                Scope::Item(item) => item.as_str(),
-                Scope::Policy => "-",
-            },
+            row.item().unwrap_or("-"),
+            row.instance().unwrap_or("-"),
             row.code(),
             row.decision().name(),
             row.reviewer(),

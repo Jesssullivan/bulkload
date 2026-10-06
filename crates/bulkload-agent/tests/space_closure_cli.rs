@@ -226,6 +226,7 @@ fn closure_report_attestation_is_bound_and_never_changes_the_verdict() {
 // records a review bound to the plan and SOURCE; a bare IO can never be
 // dispositioned.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn closure_dispose_records_a_review_that_closes_a_typed_refusal() {
     use bulkload_agent::outcome::{Outcome, OutcomeRecord, Refusal};
     let root = tempfile::tempdir().unwrap();
@@ -284,46 +285,71 @@ fn closure_dispose_records_a_review_that_closes_a_typed_refusal() {
         "{out}"
     );
 
-    let dispose = |target: &str, code: &str, label: &str| {
-        agent(&[
+    let dispose = |target: &str, code: &str, label: &str, states: &[&std::ffi::OsStr]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
             "closure-dispose".as_ref(),
             reviews.as_os_str(),
             plan.as_os_str(),
+            corpus.as_os_str(),
             label.as_ref(),
             target.as_ref(),
             code.as_ref(),
             "accept".as_ref(),
             "jess".as_ref(),
             "2026-10-06".as_ref(),
-        ])
+        ];
+        args.extend_from_slice(states);
+        agent(&args)
+    };
+    let here: &[&std::ffi::OsStr] = &[state.as_os_str()];
+    let refuses = |output: Output, code: &str| {
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(code), "{stderr}");
     };
     // A bare IO names no cause: no review can record it.
-    let io = dispose(&item, "IO", "neo");
-    assert!(!io.status.success());
-    assert!(String::from_utf8_lossy(&io.stderr).contains("FIELD_DOMAIN_VIOLATION"));
-    assert!(!reviews.exists());
+    refuses(dispose(&item, "IO", "neo", here), "FIELD_DOMAIN_VIOLATION");
     // An item the plan does not hold binds nothing.
-    let foreign = dispose(&"f".repeat(64), "GIT_NEST_STASHED", "neo");
-    assert!(String::from_utf8_lossy(&foreign.stderr).contains("RECEIPT_BINDING_INVALID"));
+    refuses(
+        dispose(&"f".repeat(64), "GIT_NEST_STASHED", "neo", here),
+        "RECEIPT_BINDING_INVALID",
+    );
+    // A review is not written ahead of its refusal: the item holds no
+    // refusal with this code, and an item review must read the state.
+    refuses(
+        dispose(&item, "CAPTURE_DRIFTED", "neo", here),
+        "RECEIPT_BINDING_INVALID",
+    );
+    refuses(
+        dispose(&item, "GIT_NEST_STASHED", "neo", &[]),
+        "REQUIRED_FIELD_MISSING",
+    );
+    assert!(!reviews.exists());
 
-    let recorded = dispose(&item, "GIT_NEST_STASHED", "neo");
+    let recorded = dispose(&item, "GIT_NEST_STASHED", "neo", here);
     assert!(
         recorded.status.success(),
         "{}",
         String::from_utf8_lossy(&recorded.stderr)
     );
+    let instance = {
+        let start = out.find("\"instance\":\"").unwrap() + 12;
+        out[start..start + 64].to_owned()
+    };
     assert!(String::from_utf8_lossy(&recorded.stdout).contains(&format!(
-        "disposition recorded scope=item item={item} refusal=GIT_NEST_STASHED decision=accept"
+        "disposition recorded scope=item item={item} instance={instance} refusal=GIT_NEST_STASHED decision=accept"
     )));
     // The ledger is bound to its SOURCE label.
-    let elsewhere = dispose("--policy", "GIT_NEST_STASHED", "sting");
-    assert!(String::from_utf8_lossy(&elsewhere.stderr).contains("RECEIPT_BINDING_INVALID"));
+    refuses(
+        dispose("--policy", "GIT_NEST_STASHED", "sting", &[]),
+        "RECEIPT_BINDING_INVALID",
+    );
 
     let closed = report(&["--dispositions".as_ref(), reviews.as_os_str()]);
     let out = String::from_utf8_lossy(&closed.stdout);
     assert!(closed.status.success(), "{out}");
     assert!(
-        out.contains("\"verdict\":\"pass\",\"gate\":\"pass\"")
+        out.contains("\"schema\":\"bulkload.closure.v2\",\"verdict\":\"pass\",\"gate\":\"pass\"")
             && out.contains("\"review\":{\"decision\":\"accept\",\"reviewer\":\"jess\",\"date\":\"2026-10-06\",\"basis\":\"item\"}"),
         "{out}"
     );
@@ -335,4 +361,120 @@ fn closure_dispose_records_a_review_that_closes_a_typed_refusal() {
         reviews.as_os_str(),
     ]);
     assert!(String::from_utf8_lossy(&twice.stderr).contains("FIELD_DOMAIN_VIOLATION"));
+
+    // The same item refuses the same code again, with another record (run 2
+    // of the verb): the run-1 review does not dispose it, the gate is red
+    // again, and the stale row is listed.
+    let again = OutcomeRecord {
+        reason: Some("GIT_NEST_STASHED path=\"later\"".into()),
+        ..record
+    };
+    std::fs::write(
+        state.join(format!("{item}.outcome")),
+        again.encode().unwrap(),
+    )
+    .unwrap();
+    let rerun = report(&["--dispositions".as_ref(), reviews.as_os_str()]);
+    let out = String::from_utf8_lossy(&rerun.stdout);
+    assert!(!rerun.status.success(), "{out}");
+    assert!(
+        out.contains("\"verdict\":\"pass\",\"gate\":\"fail\"")
+            && out.contains("\"disposition\":\"refused-pending-review\"")
+            && out.contains("\"reason\":\"refusal-instance-stale\""),
+        "{out}"
+    );
+    assert!(String::from_utf8_lossy(&rerun.stderr).contains("refused: CLOSURE_UNACCOUNTED"));
+}
+
+// The disposition ledger is bound to the plan's bytes, and closure-dispose
+// reads the plan for a standing policy too.
+#[test]
+fn closure_dispose_binds_the_plan_content_not_only_its_path() {
+    use bulkload_agent::outcome::{Outcome, OutcomeRecord, Refusal};
+    let root = tempfile::tempdir().unwrap();
+    let plan = root.path().join("plan");
+    let state = root.path().join("state");
+    let corpus = root.path().join("corpus");
+    let reviews = root.path().join("reviews");
+    std::fs::create_dir(&state).unwrap();
+    let add = |plan: &Path, source: &str| {
+        std::fs::create_dir(root.path().join(source)).unwrap();
+        assert!(agent(&[
+            "estate-add".as_ref(),
+            plan.as_os_str(),
+            root.path().join(source).as_os_str(),
+            root.path().join("repository").as_os_str(),
+        ])
+        .status
+        .success());
+    };
+    let policy = |ledger: &Path, plan: &Path| {
+        agent(&[
+            "closure-dispose".as_ref(),
+            ledger.as_os_str(),
+            plan.as_os_str(),
+            corpus.as_os_str(),
+            "neo".as_ref(),
+            "--policy".as_ref(),
+            "GIT_NEST_STASHED".as_ref(),
+            "accept".as_ref(),
+            "jess".as_ref(),
+            "2026-10-06".as_ref(),
+        ])
+    };
+    // A plan path that holds no plan: no ledger is created.
+    let none = policy(&root.path().join("l2"), &root.path().join("no-such-plan"));
+    assert!(!none.status.success());
+    assert!(!root.path().join("l2").exists());
+
+    add(&plan, "s1");
+    let recorded = policy(&reviews, &plan);
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+
+    // Another plan placed at the same path, whose item refuses the policy's
+    // code: the ledger written for the first plan binds nothing.
+    let other = root.path().join("other-plan");
+    add(&other, "s2");
+    std::fs::rename(&other, &plan).unwrap();
+    let report = |extra: &[&std::ffi::OsStr]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["closure-report".as_ref()];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            plan.as_os_str(),
+            corpus.as_os_str(),
+            "neo".as_ref(),
+            state.as_os_str(),
+        ]);
+        agent(&args)
+    };
+    let native = String::from_utf8_lossy(&report(&[]).stdout).into_owned();
+    let field = |name: &str| {
+        let start = native.find(&format!("\"{name}\":\"")).unwrap() + name.len() + 4;
+        native[start..start + native[start..].find('"').unwrap()].to_owned()
+    };
+    let record = OutcomeRecord {
+        source: field("source").into(),
+        outcome: Outcome::Refused(Refusal::new("GIT_NEST_STASHED", "estate::apply", None).unwrap()),
+        reason: Some("GIT_NEST_STASHED".into()),
+    };
+    std::fs::write(
+        state.join(format!("{}.outcome", field("item"))),
+        record.encode().unwrap(),
+    )
+    .unwrap();
+    let swapped = report(&["--dispositions".as_ref(), reviews.as_os_str()]);
+    assert!(!swapped.status.success());
+    assert!(swapped.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&swapped.stderr).contains("RECEIPT_BINDING_INVALID"));
+    let append = policy(&reviews, &plan);
+    assert!(String::from_utf8_lossy(&append.stderr).contains("RECEIPT_BINDING_INVALID"));
+    // Without the ledger the refusal is pending review, as it should be.
+    let pending = report(&[]);
+    assert!(
+        String::from_utf8_lossy(&pending.stdout).contains("\"verdict\":\"pass\",\"gate\":\"fail\"")
+    );
 }
