@@ -247,21 +247,22 @@ Validation (sting, scratch `/srv/scratch/jess/tmp/q42-l6a-fix1`, own
   rerun finished, with `64ae349` and `b40bdf3` unpushed.
 - Reattached session (2026-10-06, same worktree and branch, no code
   change): `/srv/scratch` at 27.9% free. Check-fast over `b40bdf3`
-  (started 17:52Z, waited on the lanes' lock until about 18:23Z, last
-  output 18:35Z, `CARGO_INCREMENTAL=0`, `TMPDIR`
-  `/srv/scratch/jess/tmp/q42-l6a-fix2`): every tier green. 29 test results,
-  753 passed, 0 failed, 9 ignored: the lib suite 474 (P67's 5 and the new
-  estate test among them), `git_capture_counters` 1, `git_carry_v2` 65,
-  `git_group_minimality` 18, the fault harness 56, the power-loss proofs 9,
-  repo-manifest PASS and the CI contract's 22 tests OK. The exit status
-  itself was not recorded: the shell tool's 10-minute limit moved the run to
-  the background and the wrapper that writes the status did not outlive
-  it. The log ends with the last command of the last recipe
-  (`contract-test`) printing `OK`, and `just` stops at the first failure.
-- Because of that, check-fast is rerun over the commit that adds these
-  lines, with the status written from inside the locked command. The
-  branch is pushed only on its exit 0; the dispatch's report carries the
-  result.
+  (the dispatch's `flock ... nice -n 10 nix develop .#default --command
+  just check-fast`, started 17:52Z, waited on the lanes' lock until about
+  18:23Z, `CARGO_INCREMENTAL=0`, `TMPDIR`
+  `/srv/scratch/jess/tmp/q42-l6a-fix2`): **passed, exit 0**, recorded at
+  19:38:52Z. 29 test results, 753 passed, 0 failed, 9 ignored: the lib
+  suite 474 (P67's 5 and the new estate test among them),
+  `git_capture_counters` 1, `git_carry_v2` 65, `git_group_minimality` 18,
+  the fault harness 56, the power-loss proofs 9, repo-manifest PASS and the
+  CI contract's 22 tests OK. The last test output was at 18:35Z; the
+  command returned an hour later, and the cause was not found. The shell
+  tool's 10-minute limit moved the run to the background without stopping
+  it, and the lane waited on its status file.
+- `2b63b6e` and the commit after it change only this note. A second
+  check-fast, queued over `2b63b6e` at 18:54Z, had not got the lanes' lock
+  by 20:05Z and was not waited for: it has no result. The push rests on the
+  exit 0 over `b40bdf3`.
 - The branch is 4 commits behind `origin/main` and was not merged with it:
   the dispatch did not ask for a merge.
 
