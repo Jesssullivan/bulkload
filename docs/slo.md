@@ -215,6 +215,13 @@ as properties.
   operator ratifies them: SQLite seats are left out of the comparable set, the
   delta is a 1 % XOR, the arms run N/R/N/R/N, and gate (a)'s 2 GiB RSS cap
   applies. No neo run happens until gate (a) passes.
+- Gate (b)'s rep rule is gate (a)'s rule with two unratified deviations. It
+  gates the warm resume (0 bytes received, 0 content bytes read), but:
+  - it runs no interrupted-resume phase, so `r25_interrupted_zero` is not
+    part of a gate (b) verdict (the harness never signals a process);
+  - its warm-resume reads are net of the 16-byte SQLite magic probes.
+- R-N81's load bound (load1 < 2.5) holds on both hosts in gated mode.
+  `--dest-load-limit` can only tighten it.
 
 ## Priority (OI-1003-Q4)
 

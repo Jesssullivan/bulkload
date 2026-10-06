@@ -61,8 +61,13 @@ A arm.
 
 1. **Host gate.**
    - The source must be on AC power with load1 < 2.5 (R-N81).
-   - The destination must have load1 < `--dest-load-limit` (default 2.5) and
-     must not be on battery.
+   - The destination must have load1 < 2.5 and must not be on battery. It is
+     the host that runs both arms and takes the timings, so R-N81's load
+     bound applies to it too.
+   - `--dest-load-limit` may only tighten the destination bound. Gated mode
+     refuses a value over 2.5 with `LOAD_LIMIT`, and each sample's `gated`
+     flag is computed against the fixed 2.5 on both hosts, whatever the flag
+     says.
    - Both hosts are checked again before every arm. A host that has not settled
      within `--arm-settle-seconds` aborts the sample.
 2. **Link calibration (#47).** `dd` of 64 MiB, once over one stream and once
@@ -74,8 +79,8 @@ A arm.
    SHA-256) and every directory. Symlink, mode and extra-entry differences are
    recorded as fidelity notes.
 4. **Warm resume.** The first native arm is pulled again with nothing changed.
-   R25 expects 0 bytes received and 0 content bytes read. This is recorded but
-   does not gate.
+   R25 expects 0 bytes received and 0 content bytes read. The rep fails
+   otherwise, as gate (a)'s `r25_warm_zero` does.
 
    Content bytes read are `source_bytes_read` minus the SQLite magic probes.
    The agent reads up to 16 bytes of every SQLite seat it refuses by magic,
@@ -94,6 +99,11 @@ A arm.
    - The source must still be on AC power.
    - Load1 on both hosts must fall under the limits within
      `--post-settle-seconds`.
+   - The harness waits out the racy window again after the restoring XOR, so
+     the next rep's first native arm records reuse keys for the restored
+     files.
+   - The rep's destinations are removed from the work root, unless
+     `--keep-destinations` is given. An aborted rep keeps its destinations.
 
 ## Verdict
 
@@ -101,6 +111,7 @@ A rep **passes** when all of these hold:
 
 - the native median beats the rclone median for the initial copy;
 - the native median beats the rclone median for the delta;
+- the warm resume received 0 bytes and read 0 content bytes (R25);
 - every native arm stays under 2 GiB of RSS, counting both the `pull` (wait4)
   and the source `serve`, which the wrapper reports;
 - every arm verified;
@@ -110,6 +121,49 @@ Gate (b) **passes** only when all 3 B reps pass (the OI-1002-Q30 shape).
 
 In under-load and dry-run modes, every rep is `informational`, so neither mode
 can produce a gate verdict.
+
+### Deviations from gate (a)'s rule (unratified)
+
+Gate (a)'s rule is `initial_win && delta_win && warm_zero && interrupted_zero
+&& rss_ok` (`enforce_verdict` in `crates/bulkload-bench/src/main.rs`). Gate
+(b)'s rule differs in two ways. Both are carried in every verdict
+(`deviations_from_gate_a`, and the `rule` string) until the operator rules.
+
+- **No interrupted resume.** Gate (a) stops a transfer after its payload
+  in-process and requires the resume to move and read nothing. Over ssh that
+  would mean stopping a running `pull`, and the harness never signals a
+  process. The phase is not run. Each rep verdict records
+  `r25_interrupted_zero: null` and `r25_interrupted_resume: "not-run: …"`, so
+  a gate (b) PASS does not claim it.
+- **Warm-resume reads are net of the SQLite probes.** Gate (a) requires raw
+  `source_bytes_read` = 0. Gate (b) requires `content_bytes_read` = 0, which
+  subtracts up to 16 bytes for every SQLite seat the agent refuses by magic.
+
+## Destination disk budget
+
+Every arm writes its own destination under `--work-root`, so one rep holds 5
+copies of the comparable set. The native arm also enforces the agent's default
+25 % free floor on every pull (`space.rs`, `DESTINATION_SPACE_INSUFFICIENT`);
+rclone does not.
+
+- **Preflight.** Before anything is copied on the source, the helper measures
+  the sealed corpus (lstat and a 16-byte read per file, no hashing). The
+  harness refuses with `DEST_SPACE`, exit 2, unless the work root's filesystem
+  stays at or above the 25 % floor after every destination it will hold at
+  once.
+- **Copies held at once.** 5 by default, because a rep's destinations are
+  released once the rep is verified. `--keep-destinations` keeps them all:
+  reps × 5, so 15 for a gated run. A dry run adds one for the working copy.
+- **Estimate.** Each copy is counted as the comparable bytes plus 4 KiB per
+  file and directory, and the sample as a whole adds 64 MiB for states and
+  logs.
+- **Scale.** The estate corpus is about 4.19 GB, so a gated run needs about
+  21 GB above the floor, or about 63 GB with `--keep-destinations`.
+- **Record.** The report's `destination.disk` holds the free ratio before the
+  sample, the ratio the budget leaves, the copies and the measured sizes.
+
+The source needs room for one working copy of the corpus. The harness does not
+check that.
 
 ## Native arm
 
@@ -193,6 +247,7 @@ No secret reaches the config, argv, logs or JSON:
 
 - **Gated (default).**
   - Needs `--coordinator-quiet` (R-N91).
+  - Refuses a `--dest-load-limit` over 2.5 (R-N81).
   - Runs 3 reps of N/R/N/R/N at scale `estate`.
   - Writes its evidence draft to `docs/evidence/s1-gate-b-<stamp>.md`.
 - **`--under-load`.**

@@ -225,6 +225,20 @@ class PreflightTests(unittest.TestCase):
                 "SCALE",
             )
 
+    def test_gated_refuses_a_raised_destination_load_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            quiet = ("--coordinator-quiet",)
+            for value in ("1000", "2.51", "0", "-1", "nan"):
+                raised = self.full(tmp, *quiet, "--dest-load-limit", value)
+                refusal = gb.preflight(raised, "gated")
+                self.assertEqual(refusal.code, "LOAD_LIMIT", value)
+                self.assertIn("R-N81", refusal.reason)
+            for value in ("2.5", "1.0"):
+                tight = self.full(tmp, *quiet, "--dest-load-limit", value)
+                self.assertIsNone(gb.preflight(tight, "gated"), value)
+            lifted = self.full(tmp, "--under-load", "--dest-load-limit", "1000")
+            self.assertIsNone(gb.preflight(lifted, "under-load"))
+
     def test_under_load_does_not_need_quiet_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(
@@ -292,6 +306,22 @@ class GatingTests(unittest.TestCase):
         )
         self.assertIn("destination on battery power", dest_battery)
 
+    def test_a_sample_is_gated_only_under_the_fixed_limit_on_both_hosts(self) -> None:
+        self.assertTrue(gb.sample_gated(conditions(1.0), conditions(2.49)))
+        self.assertFalse(gb.sample_gated(conditions(1.0), conditions(64.0)))
+        self.assertFalse(gb.sample_gated(conditions(1.0), conditions(2.5)))
+        self.assertFalse(gb.sample_gated(conditions(2.5), conditions(1.0)))
+        self.assertFalse(gb.sample_gated(conditions(1.0, "battery"), conditions(1.0)))
+        # The scenario from review: a raised limit lets await_ready through,
+        # but the samples it lets through are not gated, so no rep can pass.
+        self.assertEqual(
+            gb.host_problems(conditions(1.0), conditions(64.0), "gated", 1000.0), []
+        )
+        busy = rep_samples(10, 20, 1, 2)
+        for row in busy:
+            row["gated"] = gb.sample_gated(conditions(1.0), conditions(64.0))
+        self.assertEqual(gb.rep_verdict(busy, "gated")["status"], "informational")
+
     def test_under_load_keeps_only_power(self) -> None:
         self.assertEqual(
             gb.host_problems(conditions(9.0), conditions(9.0), "under-load", 2.5), []
@@ -350,6 +380,38 @@ class VerdictTests(unittest.TestCase):
             gb.rep_verdict(rep_samples(30, 20, 1, 2), "gated")["status"], "fail"
         )
 
+    def test_a_warm_resume_that_moves_or_reads_bytes_fails_the_rep(self) -> None:
+        for field in ("bytes_received", "content_bytes_read"):
+            samples = rep_samples(10, 20, 1, 2)
+            warm = next(s for s in samples if s["phase"] == "warm-resume")
+            warm[field] = 10**9
+            v = gb.rep_verdict(samples, "gated")
+            self.assertFalse(v["r25_warm_zero"], field)
+            self.assertEqual(v["status"], "fail", field)
+        missing = [s for s in rep_samples(10, 20, 1, 2) if s["phase"] != "warm-resume"]
+        self.assertEqual(gb.rep_verdict(missing, "gated")["status"], "fail")
+        report = report_with(["pass"] * 3)
+        for rep in report["reps"]:
+            warm = next(s for s in rep["samples"] if s["phase"] == "warm-resume")
+            warm["bytes_received"] = warm["content_bytes_read"] = 10**9
+            rep["verdict"] = gb.rep_verdict(rep["samples"], "gated")
+        self.assertEqual(gb.gate_rollup(report)["verdict"], "FAIL")
+
+    def test_the_missing_interrupted_resume_is_stated_not_passed(self) -> None:
+        v = gb.rep_verdict(rep_samples(10, 20, 1, 2), "gated")
+        self.assertIsNone(v["r25_interrupted_zero"])
+        self.assertTrue(v["r25_interrupted_resume"].startswith("not-run"))
+        rollup = gb.gate_rollup(report_with(["pass"] * 3))
+        self.assertIn("warm resume", rollup["rule"])
+        self.assertIn("no interrupted-resume phase", rollup["rule"])
+        self.assertIn("Unratified deviation from gate (a)", rollup["rule"])
+        self.assertEqual(rollup["deviations_from_gate_a"], list(gb.DEVIATIONS))
+        report = report_with(["pass"] * 3)
+        report["gate"] = rollup
+        text = gb.evidence(report)
+        self.assertIn("Deviations from gate (a)", text)
+        self.assertIn("Interrupted resume: not-run", text)
+
     def test_rss_cap_and_verification_decide_too(self) -> None:
         heavy = gb.rep_verdict(rep_samples(10, 20, 1, 2, rss=3 << 30), "gated")
         self.assertEqual(heavy["status"], "fail")
@@ -396,6 +458,118 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(gb.link_fraction(4_000_000, 2000.0, link), 0.5)
         self.assertIsNone(gb.link_fraction(1, 0.0, link))
         self.assertIsNone(gb.link_fraction(1, 1.0, {}))
+
+
+class DiskBudgetTests(unittest.TestCase):
+    GIB = 1 << 30
+
+    def test_floor_matches_the_agents_default(self) -> None:
+        source = (REPO / "crates/bulkload-agent/src/space.rs").read_text()
+        found = re.search(r"DEFAULT_MIN_FREE_PERCENT: u8 = (\d+);", source)
+        self.assertEqual(int(found.group(1)), gb.AGENT_MIN_FREE_PERCENT)
+
+    def test_copies_held_at_once(self) -> None:
+        self.assertEqual(gb.destination_copies("gated", 3, 3, False), 5)
+        self.assertEqual(gb.destination_copies("gated", 3, 3, True), 15)
+        self.assertEqual(gb.destination_copies("dry-run", 1, 3, False), 6)
+
+    def test_exactly_at_the_floor_passes_and_one_byte_under_refuses(self) -> None:
+        # space.rs: 100 GiB filesystem, 40 GiB available, 25 % floor = 25 GiB.
+        slack = gb.BUDGET_SLACK_BYTES
+        fits = gb.disk_budget(100 * self.GIB, 40 * self.GIB, 5, 3 * self.GIB, 0)
+        self.assertEqual(fits["need_bytes"], 15 * self.GIB + slack)
+        self.assertFalse(fits["ok"])
+        room = 40 * self.GIB + slack
+        self.assertTrue(gb.disk_budget(100 * self.GIB, room, 5, 3 * self.GIB, 0)["ok"])
+        self.assertFalse(
+            gb.disk_budget(100 * self.GIB, room - 1, 5, 3 * self.GIB, 0)["ok"]
+        )
+        entries = gb.disk_budget(100 * self.GIB, room, 5, 3 * self.GIB, 1)
+        self.assertEqual(entries["per_copy_bytes"], 3 * self.GIB + gb.BUDGET_BLOCK)
+        self.assertFalse(entries["ok"])
+
+    def test_the_reviewed_volumes_are_refused(self) -> None:
+        # /srv/cache at 20.6 % free: under the floor before a byte is written.
+        low = gb.disk_budget(1000 * self.GIB, 206 * self.GIB, 6, 10_000_000, 60)
+        self.assertFalse(low["ok"])
+        self.assertEqual(low["free_ratio"], 0.206)
+        # 15 kept copies of a 4.19 GB set on a volume with 22 GiB available.
+        kept = gb.disk_budget(78 * self.GIB, 22 * self.GIB, 15, 4_190_000_000, 0)
+        self.assertFalse(kept["ok"])
+        self.assertLess(kept["free_ratio_after"], 0)
+        refusal = gb.budget_refusal(kept, Path("/w"))
+        self.assertEqual(refusal.code, "DEST_SPACE")
+        self.assertIn("25 % free floor", refusal.reason)
+        self.assertIsNone(gb.budget_refusal({"ok": True}, Path("/w")))
+        self.assertFalse(gb.disk_budget(0, 0, 1, 1, 1)["ok"])
+
+    def test_volume_space_reads_this_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            total, available = gb.volume_space(Path(tmp))
+        self.assertGreater(total, 0)
+        self.assertLessEqual(available, total)
+
+    def test_release_removes_only_the_reps_own_arm_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rep_dir = Path(tmp) / "reps" / "rep0"
+            order = gb.arm_order(3)
+            for seq, arm in enumerate(order):
+                (rep_dir / f"{seq}-{arm}" / "destination" / "d").mkdir(parents=True)
+                (rep_dir / f"{seq}-{arm}" / "destination" / "d" / "f").write_bytes(b"x")
+            outside = Path(tmp) / "outside"
+            outside.write_bytes(b"keep")
+            (rep_dir / "0-native" / "destination" / "link").symlink_to(outside)
+            (rep_dir / "note").write_text("kept")
+            rep: dict[str, object] = {"index": 0}
+            gb.release_destinations(rep_dir, order, rep)
+            self.assertTrue(rep["destinations_released"])
+            self.assertEqual([p.name for p in rep_dir.iterdir()], ["note"])
+            self.assertEqual(outside.read_bytes(), b"keep")
+            again: dict[str, object] = {"index": 0}
+            with self.assertRaises(gb.Abort) as raised:
+                gb.release_destinations(rep_dir, order, again)
+            self.assertFalse(again["destinations_released"])
+            self.assertIs(raised.exception.rep, again)
+
+    def test_main_refuses_before_the_source_copy_when_the_volume_is_short(
+        self,
+    ) -> None:
+        if not any(
+            os.path.isfile(p)
+            for p in (
+                "/usr/libexec/openssh/sftp-server",
+                "/usr/lib/openssh/sftp-server",
+                "/usr/libexec/sftp-server",
+            )
+        ) and not gb.shutil.which("sftp-server"):
+            self.skipTest("no local sftp-server for the loopback")
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = executable(
+                Path(tmp) / "agent", f"#!/bin/sh\ncat <<'EOF'\n{AGENT_USAGE}\nEOF\n"
+            )
+            work = Path(tmp) / "work"
+            out = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out),
+                mock.patch.object(
+                    gb, "volume_space", return_value=(1000 * self.GIB, 206 * self.GIB)
+                ),
+            ):
+                code = gb.main(
+                    ["--dry-run", "--work-root", str(work), "--agent", str(agent)]
+                )
+            self.assertEqual(code, 2, out.getvalue())
+            self.assertIn("refused code=DEST_SPACE", out.getvalue())
+            report = json.loads((work / "gate-b.json").read_text())
+            self.assertEqual(report["refusal"]["code"], "DEST_SPACE")
+            disk = report["destination"]["disk"]
+            self.assertEqual((disk["free_ratio"], disk["ok"]), (0.206, False))
+            self.assertEqual(disk["copies"], 6)
+            self.assertGreater(disk["measured"]["comparable_bytes"], 0)
+            self.assertEqual(disk["measured"]["excluded"], 3)
+            # Refused before `prepare`: no working copy was made.
+            self.assertFalse((work / "source").exists())
+            self.assertEqual(report["schema_problems"], [])
 
 
 class SchemaTests(unittest.TestCase):
@@ -697,6 +871,30 @@ class HelperTests(unittest.TestCase):
                 gb.HELPER["op_manifest"]({"root": str(root)})["digest"], out["digest"]
             )
 
+    def test_measure_agrees_with_the_manifest_without_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sealed = Path(tmp) / "sealed"
+            self.tree(sealed / "corpus")
+            measured = gb.HELPER["op_measure"]({"corpus": str(sealed)})
+            out = gb.HELPER["op_manifest"]({"root": str(sealed / "corpus")})
+            self.assertEqual(
+                measured["comparable_bytes"],
+                gb.comparable_bytes(out["rows"], out["exclusions"]),
+            )
+            self.assertEqual(
+                measured,
+                {
+                    "comparable_files": 1,
+                    "comparable_bytes": 5000,
+                    "directories": 2,
+                    "others": 1,
+                    "excluded": 3,
+                    "excluded_bytes": 116 + 0 + 8,
+                },
+            )
+            with self.assertRaises(RuntimeError):
+                gb.HELPER["op_measure"]({"corpus": str(sealed / "absent")})
+
     def test_xor_refuses_a_target_outside_the_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "c"
@@ -794,8 +992,15 @@ class LoopbackSmoke(unittest.TestCase):
                     ]
                 )  # fmt: skip
             report = json.loads((work / "gate-b.json").read_text())
+            if (report.get("refusal") or {}).get("code") == "DEST_SPACE":
+                # The temporary directory's volume is under the agent's floor:
+                # the native arm would refuse every file. Set TMPDIR elsewhere.
+                self.skipTest(report["reason"])
             self.assertEqual(code, 0, report.get("reason"))
             self.assertEqual(report["status"], "dry-run-complete-not-a-gate-sample")
+            self.assertTrue(report["destination"]["disk"]["ok"])
+            self.assertTrue(report["reps"][0]["destinations_released"])
+            self.assertFalse(list((work / "reps" / "rep0").iterdir()))
             self.assertEqual(report["schema_problems"], [])
             self.assertEqual(report["workload"]["excluded"], 3)
             samples = report["reps"][0]["samples"]

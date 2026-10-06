@@ -32,8 +32,11 @@ refuse exactly that set and nothing else, or the sample aborts. SQLite is
 carried by `snapshot`, never by a byte mover; it is not part of gate (b).
 
 One rep (3 B reps in gated mode; one revision, so no A arm):
-  1. Both hosts gated: the source on AC power with load1 < 2.5 (R-N81), the
-     destination with load1 < --dest-load-limit and not on battery.
+  1. Both hosts gated (R-N81): the source on AC power with load1 < 2.5, the
+     destination with load1 < 2.5 and not on battery. --dest-load-limit may
+     only tighten the destination bound: gated mode refuses a value over 2.5
+     (LOAD_LIMIT), and every sample's `gated` flag is computed against the
+     fixed 2.5 on both hosts.
   2. Link calibration: `dd` of --calibrate-mib MiB from /dev/zero over one
      stream and over --calibrate-streams streams (#47: each rep records link
      throughput just before it). Every arm reports its share of the ceiling.
@@ -42,7 +45,9 @@ One rep (3 B reps in gated mode; one revision, so no A arm):
      hosts are checked again. After every arm the destination is hashed and
      must hold every comparable regular file and directory.
   4. Warm resume: the first native arm is pulled again unchanged; R25 wants
-     0 bytes received and 0 source bytes read (recorded, not gated).
+     0 bytes received and 0 content bytes read, and the rep fails otherwise
+     (gate (a)'s r25_warm_zero). Content bytes are source_bytes_read minus
+     the SQLite magic probes (see DEVIATIONS).
   5. 1 % delta: the helper XORs 0xa5 over 1 % of the comparable regular-file
      bytes (whole files in a seeded path-hash order, the last one a prefix),
      the harness waits out the racy window (2 s, R-N76), removes those files
@@ -51,11 +56,26 @@ One rep (3 B reps in gated mode; one revision, so no A arm):
      destinations. The helper then XORs again, which restores the bytes, and
      the copy must hash to the initial manifest.
   6. After the rep: AC power on the source, and load1 on both hosts must fall
-     under the limits within --post-settle-seconds.
+     under the limits within --post-settle-seconds. The rep's destinations
+     are then released (removed from the work root) unless
+     --keep-destinations is given.
 A rep passes iff the native median beats the rclone median for the initial
-copy and for the delta, every native arm's RSS (the pull, and the serve as
-the source-side wrapper reports it) stays under 2 GiB, every arm verified and
-every sample was gated. Gate (b) passes iff all 3 B reps pass.
+copy and for the delta, the warm resume received 0 bytes and read 0 content
+bytes, every native arm's RSS (the pull, and the serve as the source-side
+wrapper reports it) stays under 2 GiB, every arm verified and every sample
+was gated. Gate (b) passes iff all 3 B reps pass. Gate (a) also gates an
+interrupted resume; this harness has no such phase (it would have to stop a
+pull part-way, and it never signals a process), and says so in every verdict
+(DEVIATIONS, r25_interrupted_resume = "not-run").
+
+Destination disk budget: before anything is copied on the source, the helper
+measures the sealed corpus (lstat and a 16-byte read per file) and the
+harness refuses with DEST_SPACE (exit 2) unless the work root's filesystem
+keeps the agent's default free floor (25 %, space.rs) after every destination
+it will hold at once: 5 copies of the comparable set when reps are released,
+reps x 5 with --keep-destinations. The native arm enforces that floor on
+every pull (DESTINATION_SPACE_INSUFFICIENT); rclone does not. The report
+records the free ratio and the budget.
 
 Native arm: `bulkload-agent pull HOST SOURCE DEST SOURCE_STATE DEST_STATE
 REMOTE_EXECUTABLE [SSH_CONFIG]`, one `ssh -T` stream (the pre-W5 engine).
@@ -133,6 +153,27 @@ LOAD_LIMIT = ab.LOAD_LIMIT
 GATE_B_REPS = 3
 NATIVE_SAMPLES = 3  # N/R/N/R/N, as the bench's --reps 3
 RSS_CAP_BYTES = 2 << 30
+# The agent's default destination floor (space.rs DEFAULT_MIN_FREE_PERCENT):
+# pull refuses DESTINATION_SPACE_INSUFFICIENT when a write would leave less.
+# The harness runs pull with that default, so its budget uses the same floor.
+AGENT_MIN_FREE_PERCENT = 25
+# Budget estimate per destination entry (block rounding) and for the whole
+# sample (states, logs, rclone.conf): an estimate, stated in the report.
+BUDGET_BLOCK = 4096
+BUDGET_SLACK_BYTES = 64 * (1 << 20)
+INTERRUPTED_NOT_RUN = (
+    "not-run: gate (b) has no interrupted-resume phase; stopping a pull"
+    " part-way would need the harness to signal a process, which it never does"
+)
+# Where the gate (b) rep rule differs from gate (a)'s enforce_verdict
+# (crates/bulkload-bench/src/main.rs). Unratified; carried in every verdict.
+DEVIATIONS = (
+    "no interrupted-resume phase: gate (a) also requires r25_interrupted_zero;"
+    " gate (b) records r25_interrupted_resume=not-run and does not gate it",
+    "r25_warm_zero is 0 bytes received and 0 content bytes read, where content"
+    " bytes are source_bytes_read minus the SQLite magic probes (up to 16 bytes"
+    " per refused SQLite seat); gate (a) requires raw source_bytes_read = 0",
+)
 MIB = 1 << 20
 SETTLE_S = ec.RACY_SETTLE_NS / 1e9
 DELTA_SEED = "bulkload-s1-gate-b-delta-v1"
@@ -404,6 +445,33 @@ def op_prepare(args):
     return {"corpus": corpus, "wrapper": wrapper, "states": os.path.join(work, "states")}
 
 
+def op_measure(args):
+    # Read-only: sizes by lstat and a 16-byte head per regular file, no hashing.
+    root = os.path.join(args["corpus"], "corpus")
+    if not os.path.isdir(root):
+        raise RuntimeError("sealed corpus/ is missing")
+    out = {"comparable_files": 0, "comparable_bytes": 0, "directories": 0,
+           "others": 0, "excluded": 0, "excluded_bytes": 0}
+    for dirpath, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(dirpath, name)
+            info = os.lstat(path)
+            if stat.S_ISDIR(info.st_mode):
+                out["directories"] += 1
+            elif stat.S_ISREG(info.st_mode):
+                with open(path, "rb") as handle:
+                    head = handle.read(16)
+                if exclusion(name, head):
+                    out["excluded"] += 1
+                    out["excluded_bytes"] += info.st_size
+                else:
+                    out["comparable_files"] += 1
+                    out["comparable_bytes"] += info.st_size
+            else:
+                out["others"] += 1
+    return out
+
+
 def op_manifest(args):
     if not os.path.isdir(args["root"]):
         raise RuntimeError("manifest root is not a directory")
@@ -439,7 +507,7 @@ def op_xor(args):
 
 
 OPS = {"conditions": op_conditions, "probe": op_probe, "prepare": op_prepare,
-       "manifest": op_manifest, "xor": op_xor}
+       "measure": op_measure, "manifest": op_manifest, "xor": op_xor}
 
 
 def main(op, args):
@@ -1015,6 +1083,67 @@ def link_fraction(
     return round(workload_bytes / (elapsed_ms / 1000) / ceiling, 4)
 
 
+# ------------------------------------------------------------ disk budget
+
+
+def destination_copies(mode: str, reps: int, native_samples: int, keep: bool) -> int:
+    """How many copies of the comparable set the work root holds at once."""
+    arms = len(arm_order(native_samples))
+    copies = arms * (reps if keep else 1)
+    # A dry run also keeps the source working copy under the work root.
+    return copies + (1 if mode == "dry-run" else 0)
+
+
+def disk_budget(
+    total: int,
+    available: int,
+    copies: int,
+    comparable: int,
+    entries: int,
+    floor_percent: int = AGENT_MIN_FREE_PERCENT,
+) -> dict[str, object]:
+    """The agent's space.rs check, for every destination held at once.
+
+    `after / total >= floor / 100` in integers, as space::check; exactly at the
+    floor passes. `need` is an estimate: content bytes plus one block per entry
+    per copy, plus a fixed slack for states and logs.
+    """
+    per_copy = comparable + BUDGET_BLOCK * entries
+    need = copies * per_copy + BUDGET_SLACK_BYTES
+    after = available - need
+    ok = total > 0 and after >= 0 and after * 100 >= total * floor_percent
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "free_ratio": round(available / total, 4) if total > 0 else None,
+        "floor_percent": floor_percent,
+        "copies": copies,
+        "per_copy_bytes": per_copy,
+        "need_bytes": need,
+        "free_ratio_after": round(after / total, 4) if total > 0 else None,
+        "ok": ok,
+    }
+
+
+def volume_space(path: Path) -> tuple[int, int]:
+    """(total, available to this user) of the filesystem holding `path`."""
+    stats = os.statvfs(path)
+    return stats.f_blocks * stats.f_frsize, stats.f_bavail * stats.f_frsize
+
+
+def budget_refusal(budget: dict[str, object], work: Path) -> Refusal | None:
+    if budget["ok"]:
+        return None
+    return Refusal(
+        "DEST_SPACE",
+        f"work root {work} cannot hold {budget['copies']} destination copies"
+        f" ({budget['need_bytes']} bytes) and keep the agent's"
+        f" {budget['floor_percent']} % free floor: {budget['available_bytes']} of"
+        f" {budget['total_bytes']} bytes available (free ratio"
+        f" {budget['free_ratio']}, {budget['free_ratio_after']} after)",
+    )
+
+
 # --------------------------------------------------------------- gating
 
 
@@ -1041,6 +1170,14 @@ def host_problems(
         if float(dest.get("load1", 99)) >= dest_limit:
             problems.append(f"destination load1={dest.get('load1')} >= {dest_limit}")
     return problems
+
+
+def sample_gated(source: dict[str, object], dest: dict[str, object]) -> bool:
+    """R-N81 on both hosts, against the fixed LOAD_LIMIT.
+
+    A raised --dest-load-limit can never make a sample gated.
+    """
+    return not host_problems(source, dest, "gated", LOAD_LIMIT)
 
 
 def dest_conditions() -> dict[str, object]:
@@ -1088,7 +1225,16 @@ def rep_verdict(samples: list[dict[str, object]], mode: str) -> dict[str, object
         len([s for s in timed if s["arm"] == "native"]) > 0
         and len([s for s in timed if s["arm"] == "rclone"]) > 0
     )
-    passed = complete and wins("initial") and wins("delta") and rss_ok and verified
+    # Gate (a)'s rule (enforce_verdict) less its interrupted-resume term, which
+    # gate (b) cannot run; `verified` is gate (b)'s own addition.
+    passed = (
+        complete
+        and wins("initial")
+        and wins("delta")
+        and warm_zero
+        and rss_ok
+        and verified
+    )
     if mode != "gated" or not all_gated:
         status = "informational"
     else:
@@ -1101,6 +1247,8 @@ def rep_verdict(samples: list[dict[str, object]], mode: str) -> dict[str, object
         "all_verified": verified,
         "all_gated": all_gated,
         "r25_warm_zero": warm_zero,
+        "r25_interrupted_zero": None,
+        "r25_interrupted_resume": INTERRUPTED_NOT_RUN,
         "medians": medians,
     }
 
@@ -1147,10 +1295,14 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
             " reported"
             if mode == "under-load"
             else "B passes gate (b) iff every B rep passes: native beats rclone on"
-            " the initial copy and the 1 % delta (medians), native RSS < 2 GiB,"
-            " every arm verified, every sample gated (OI-1002-Q30, OI-1003-Q3);"
-            " no wall-clock SLA"
+            " the initial copy and the 1 % delta (medians), the warm resume"
+            " receives 0 bytes and reads 0 content bytes (R25), native RSS < 2 GiB,"
+            " every arm verified, every sample gated at load1 < 2.5 on both hosts"
+            " (OI-1002-Q30, OI-1003-Q3, R-N81); no wall-clock SLA. Unratified"
+            " deviation from gate (a): no interrupted-resume phase is run or"
+            " gated, and warm-resume reads are net of the SQLite magic probes"
         ),
+        "deviations_from_gate_a": list(DEVIATIONS),
         "b_reps": len(statuses),
         "b_reps_pass": passed,
         "b_statuses": statuses,
@@ -1313,7 +1465,7 @@ def run_arm(
         "workload_bytes": workload_bytes,
         "max_rss_bytes": run["max_rss_bytes"],
         "conditions_before": {"source": source, "destination": dest},
-        "gated": not host_problems(source, dest, "gated", ctx.args.dest_load_limit),
+        "gated": sample_gated(source, dest),
         "link_fraction": link_fraction(workload_bytes, run["elapsed_ms"], link),
     }
     problems: list[str] = []
@@ -1449,6 +1601,10 @@ def run_rep(ctx: Context, index: int) -> dict[str, object]:
         raise Abort(
             f"rep{index}: the working copy did not restore after the delta", rep
         )
+    # The restoring XOR rewrote the delta files. Now that the warm resume
+    # gates, the next rep's first native arm must not capture them inside the
+    # racy window (R-N76), or it records no reuse key and re-reads them.
+    time.sleep(SETTLE_S)
     after_source, after_dest = post_settle(ctx)
     rep["conditions_after"] = {"source": after_source, "destination": after_dest}
     rep["verdict"] = rep_verdict(samples, ctx.mode)
@@ -1458,7 +1614,31 @@ def run_rep(ctx: Context, index: int) -> dict[str, object]:
     if problems:
         rep["aborted"] = True
         raise Abort(f"rep{index} post-check failed: {'; '.join(problems)}", rep)
+    if not ctx.args.keep_destinations:
+        release_destinations(rep_dir, order, rep)
     return rep
+
+
+def release_destinations(
+    rep_dir: Path, order: list[str], rep: dict[str, object]
+) -> None:
+    """A verified rep's own destinations leave the work root (disk budget).
+
+    Only directories this run created under its new work root, by their exact
+    names; an aborted rep keeps its destinations for diagnosis.
+    """
+    try:
+        for seq, arm in enumerate(order):
+            shutil.rmtree(rep_dir / f"{seq}-{arm}")
+    except OSError as error:
+        rep["destinations_released"] = False
+        rep["aborted"] = True
+        raise Abort(
+            f"rep{rep['index']}: could not release its destinations:"
+            f" {type(error).__name__}: {error}",
+            rep,
+        ) from error
+    rep["destinations_released"] = True
 
 
 def restore_source(ctx: Context, rep: dict[str, object]) -> None:
@@ -1493,6 +1673,18 @@ def post_settle(ctx: Context) -> tuple[dict, dict]:
 
 def fmt(value: object, digits: int = 3) -> str:
     return ab.fmt(value, digits)
+
+
+def disk_line(disk: object) -> str:
+    if not isinstance(disk, dict):
+        return "not measured (refused or aborted before the budget check)."
+    return (
+        f"free ratio {disk.get('free_ratio')} before the sample,"
+        f" {disk.get('free_ratio_after')} after {disk.get('copies')} destination"
+        f" copies ({fmt(disk.get('need_bytes'))} bytes, estimate); agent floor"
+        f" {disk.get('floor_percent')} %; destinations"
+        f" {'kept' if disk.get('keep_destinations') else 'released after each rep'}."
+    )
 
 
 def evidence(report: dict[str, object]) -> str:
@@ -1546,7 +1738,8 @@ def evidence(report: dict[str, object]) -> str:
         f" `{src.get('priority')}`.",
         f"- Destination: `{dst.get('node')}` ({dst.get('system')}); work root"
         f" `{dst.get('work_root')}`; agent sha256 `{str(dst.get('agent_sha256'))[:16]}`;"
-        f" load limit {dst.get('load_limit')}.",
+        f" load limit {dst.get('load_limit')} (samples are gated at {LOAD_LIMIT}).",
+        f"- Destination disk: {disk_line(dst.get('disk'))}",
         f"- Corpus: `{work.get('corpus_format')}` scale `{work.get('scale')}`, identity"
         f" `{work.get('identity')}` (recorded: {work.get('identity_recorded')}).",
         f"- Comparable set: {fmt(work.get('comparable_files'))} regular files,"
@@ -1605,6 +1798,11 @@ def evidence(report: dict[str, object]) -> str:
         "## What the native arm lacks against W5 (#47)",
         "",
         *[f"- {item}" for item in report["w5_missing"]],
+        "",
+        "## Deviations from gate (a)'s rule (unratified)",
+        "",
+        *[f"- {item}" for item in gate.get("deviations_from_gate_a", DEVIATIONS)],
+        f"- Interrupted resume: {INTERRUPTED_NOT_RUN}.",
         "",
         "## Notes",
         "",
@@ -1700,6 +1898,12 @@ def preflight(args: argparse.Namespace, mode: str) -> Refusal | None:
             return Refusal("SHAPE", f"gated mode runs {GATE_B_REPS} reps of N/R/N/R/N")
         if args.scale != "estate":
             return Refusal("SCALE", "gated mode runs the estate corpus at scale estate")
+        if not 0 < args.dest_load_limit <= LOAD_LIMIT:
+            return Refusal(
+                "LOAD_LIMIT",
+                f"gated mode holds the destination to load1 < {LOAD_LIMIT} (R-N81):"
+                f" --dest-load-limit {args.dest_load_limit} may only tighten it",
+            )
     return None
 
 
@@ -1766,7 +1970,17 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", default=ec.DEFAULT_SEED)
     p.add_argument("--reps", type=int, default=GATE_B_REPS)
     p.add_argument("--native-samples", type=int, default=NATIVE_SAMPLES)
-    p.add_argument("--dest-load-limit", type=float, default=LOAD_LIMIT)
+    p.add_argument(
+        "--dest-load-limit",
+        type=float,
+        default=LOAD_LIMIT,
+        help=f"destination load1 bound; gated mode refuses a value over {LOAD_LIMIT}",
+    )
+    p.add_argument(
+        "--keep-destinations",
+        action="store_true",
+        help="keep every rep's destinations (budget: reps x arms copies)",
+    )
     p.add_argument("--calibrate-mib", type=int, default=64)
     p.add_argument("--calibrate-streams", type=int, default=4)
     p.add_argument("--settle-seconds", type=int, default=900)
@@ -1941,6 +2155,23 @@ def main(argv: list[str] | None = None) -> int:
                     report,
                     work,
                 )
+        # Before anything is copied on the source: will the destinations fit?
+        measured = transport.helper("measure", {"corpus": args.source_corpus})
+        copies = destination_copies(
+            mode, args.reps, args.native_samples, args.keep_destinations
+        )
+        budget = disk_budget(
+            *volume_space(work),
+            copies,
+            int(measured["comparable_bytes"]),
+            int(measured["comparable_files"]) + int(measured["directories"]),
+        )
+        budget["measured"] = measured
+        budget["keep_destinations"] = bool(args.keep_destinations)
+        report["destination"]["disk"] = budget
+        refusal = budget_refusal(budget, work)
+        if refusal:
+            return refuse(refusal, report, work)
         flags = ["--priority=normal"] if args.source_priority == "normal" else []
         prepared = transport.helper(
             "prepare",
@@ -1957,6 +2188,16 @@ def main(argv: list[str] | None = None) -> int:
     except Abort as abort:
         return refuse(Refusal("SOURCE", str(abort)), report, work)
     rows, exclusions = manifest["rows"], manifest["exclusions"]
+    if comparable_bytes(rows, exclusions) != int(measured["comparable_bytes"]):
+        return refuse(
+            Refusal(
+                "SOURCE",
+                "the working copy's comparable bytes differ from the measured"
+                " corpus, so the disk budget does not describe this sample",
+            ),
+            report,
+            work,
+        )
     plan = delta_plan(rows, exclusions)
     by_reason: dict[str, int] = {}
     for why in exclusions.values():
