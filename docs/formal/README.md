@@ -680,8 +680,9 @@ Runtime on sting at a load average near 45: the build takes about 26 s;
 without a build, `MC_nv_core` takes 17 s. A whole `just formal-nv` run,
 with its 14 TLC runs, took about 50 s at a load average between 20 and
 30. Those are 2026-10-04 timings, before GitCarry's rows and #169's four
-mutation rows joined the recipe (18 BulkloadTransfer TLC runs now); not
-re-timed.
+mutation rows joined the recipe (18 BulkloadTransfer TLC runs now). On
+2026-10-06 a whole run over both modules took 244 s at a load average near
+20.
 
 ## N-version core (OI-1003-Q32)
 
