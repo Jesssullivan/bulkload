@@ -260,6 +260,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   with `index-pack --fix-thin`, reading every base from the source object
   store: `read_source_capture_reuse_bytes` counts those bases beside the
   bundle, and the fetch's storage reads join the readback counter.
+  Since Q42 L6a (OI-1003-Q43) these choices are one pure, total function,
+  `git_carry::decide::decide`, which P67 pins to the Haskell reference's rows.
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
