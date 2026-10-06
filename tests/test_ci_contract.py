@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "6b3df5845e5f33c4d6acdabcd912898846d69695930373ff14bca7f8152f61f2"
+WORKFLOW_SHA256 = "2f3d115f5011c6be4c6181924ab8ebeb05ef8381f5b80d1d30ba10cc12f75c10"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -45,6 +45,11 @@ BOOTSTRAP_IMPL_LINE = (
 BAZEL_VERSION_SHA256 = (
     "4fa9948d0ae7007cbd1cc05768bc3e7cc6ec46ad0ea84c87df79e7a0c48d76b4"
 )
+# OI-1003-Q65 took the Bazel graph out of PR CI, so nothing on a PR loads
+# MODULE.bazel any more. Pinning its digest keeps a bzlmod or rules_python
+# change a reviewed contract edit instead of a silent main-only breakage.
+MODULE_BAZEL_SHA256 = "8182bbe9cf04ddb0743bd1e68a9653a851b8dbf104234ab367bc1386899c26e3"
+CONTRACT_TEST_TARGET = "ci_contract_test"
 FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf"
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
 EXPECTED_SHA_EXPRESSION = (
@@ -87,6 +92,13 @@ UPLOAD_EXPRESSION = (
 )
 MATRIX_GATE_EXPRESSION = "${{ matrix.gate }}"
 TERMINAL_GATES = ("source", "build", "test", "fault-harness")
+# The gates the CI workflow matrix runs. OI-1003-Q65 (2026-10-06) dropped the
+# Bazel `build` and `test` gates from the matrix: they duplicated the compile
+# that `source` and `fault-harness` already run. The composite action still
+# validates all four TERMINAL_GATES paths; only the workflow stops selecting
+# the Bazel two.
+WORKFLOW_GATES = ("source", "fault-harness")
+WORKFLOW_GATE_MATRIX = "        gate: [" + ", ".join(WORKFLOW_GATES) + "]"
 TERMINAL_CONSUMERS = {
     "source": "Run repository-owned source gates",
     "build": "Build the Bulkload documentation through the public Flywheel action",
@@ -219,7 +231,7 @@ PINNED_JUST_RECIPES = {
         (),
     ),
     "ci-source": (
-        "ci-source: check-source secrets-scan-history",
+        "ci-source: check-source secrets-scan-history contract-test",
         (),
     ),
     "ci-fault-harness": (
@@ -341,6 +353,38 @@ def sha256(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+def bazel_target_data(build: str, target: str) -> tuple[str, ...]:
+    """The literal `data` list of one BUILD.bazel py_test target."""
+    target_match = re.search(
+        r'^py_test\(\n    name = "'
+        + re.escape(target)
+        + r'",\n(?P<body>(?:    .*\n)*?)\)$',
+        build,
+        re.M,
+    )
+    if target_match is None:
+        raise ContractError(f"BUILD.bazel has no py_test {target}")
+    data_match = re.search(
+        r'^    data = \[\n(?P<items>(?:        "[^"\n]+",\n)*)    \],$',
+        target_match.group("body"),
+        re.M,
+    )
+    if data_match is None:
+        raise ContractError(f"{target} must declare one literal data list")
+    return tuple(re.findall(r'"([^"\n]+)"', data_match.group("items")))
+
+
+def workspace_reads(source: str) -> set[str]:
+    """Workspace paths a test source reads through `root / <path>`."""
+    reads = set(re.findall(r'\broot / "([^"\n]+)"', source))
+    for name in re.findall(r"\broot / ([A-Z][A-Z0-9_]*)\b", source):
+        value = globals().get(name)
+        if not isinstance(value, str):
+            raise ContractError(f"workspace read {name} is not a path constant")
+        reads.add(value)
+    return reads
+
+
 def find_workspace() -> Path:
     candidates = [Path.cwd(), Path(__file__).resolve()]
     runfiles = os.environ.get("RUNFILES_DIR")
@@ -414,7 +458,7 @@ def validate_job_routing(workflow: str) -> None:
         "    strategy:\n"
         "      fail-fast: false\n"
         "      matrix:\n"
-        "        gate: [source, build, test, fault-harness]\n"
+        f"{WORKFLOW_GATE_MATRIX}\n"
     )
     if workflow.count(matrix) != 1:
         raise ContractError("terminal gate matrix must be one exact literal inventory")
@@ -435,13 +479,15 @@ def validate_job_routing(workflow: str) -> None:
         workflow,
     ):
         raise ContractError("CI workflow must not suppress a job or step failure")
-    # The single job-level cap applies to every matrix gate (R-N122).
+    # The single job-level cap applies to every matrix gate (R-N122). It was 15
+    # minutes until OI-1003-Q71 raised it to 25: the source gate ran 432-690 s on
+    # a quiet host and was cancelled at 900 s twice under shared-runner load.
     timeouts = re.findall(
         r"(?mi)^\s*(?:timeout-minutes|\"timeout-minutes\"|'timeout-minutes')\s*:.*$",
         workflow,
     )
-    if timeouts != ["    timeout-minutes: 15"]:
-        raise ContractError("every terminal gate must keep the audited 15-minute cap")
+    if timeouts != ["    timeout-minutes: 25"]:
+        raise ContractError("every terminal gate must keep the audited 25-minute cap")
 
     declarations = [
         line
@@ -2322,7 +2368,7 @@ class CiContractTest(unittest.TestCase):
     def test_workflow_triggers_cap_and_failure_suppression_mutations_fail_closed(
         self,
     ) -> None:
-        cap = "    timeout-minutes: 15\n"
+        cap = "    timeout-minutes: 25\n"
         queue = "  merge_group:\n    types: [checks_requested]\n"
         variants = [
             self.workflow.replace(queue, "", 1),
@@ -2394,15 +2440,18 @@ class CiContractTest(unittest.TestCase):
 
     def test_matrix_terminal_and_injection_mutations_fail_closed(self) -> None:
         workflow_variants = [
+            self.workflow.replace(WORKFLOW_GATE_MATRIX, "        gate: [source]", 1),
             self.workflow.replace(
+                WORKFLOW_GATE_MATRIX, "        gate: [fault-harness, source]", 1
+            ),
+            # The Bazel gates stay out of the matrix (OI-1003-Q65).
+            self.workflow.replace(
+                WORKFLOW_GATE_MATRIX,
                 "        gate: [source, build, test, fault-harness]",
-                "        gate: [source, build, test]",
                 1,
             ),
             self.workflow.replace(
-                "        gate: [source, build, test, fault-harness]",
-                "        gate: [build, source, test, fault-harness]",
-                1,
+                WORKFLOW_GATE_MATRIX, "        gate: [source, test, fault-harness]", 1
             ),
             self.workflow.replace("      fail-fast: false", "      fail-fast: true", 1),
             self.workflow.replace(
@@ -3524,6 +3573,39 @@ class CiContractTest(unittest.TestCase):
         self.assertNotRegex(self.bazelrc, r"(?:grpc|grpcs|http|https)://")
         self.assertIn(
             "try-import %workspace%/.bazelrc.flywheel", self.workspace_bazelrc
+        )
+
+    def test_bazel_data_lists_every_workspace_read(self) -> None:
+        # OI-1003-Q65 dropped the Bazel `test` gate, so PR CI runs this file
+        # through `contract-test`, outside the //:tests sandbox, where a
+        # missing `data` entry is invisible. Keep the declared inputs whole so
+        # `just test`, `just test-local` and `just ci` do not break on main.
+        source = Path(__file__).read_text(encoding="utf-8")
+        reads = workspace_reads(source)
+        self.assertIn("MODULE.bazel", reads)
+        self.assertIn(LOCAL_ACTION_PATH, reads)
+        data = bazel_target_data(self.build, CONTRACT_TEST_TARGET)
+        self.assertEqual(len(data), len(set(data)))
+        self.assertEqual(sorted(reads - set(data)), [])
+        dropped = bazel_target_data(
+            self.build.replace('        "MODULE.bazel",\n', "", 1),
+            CONTRACT_TEST_TARGET,
+        )
+        self.assertNotIn("MODULE.bazel", dropped)
+        with self.assertRaises(ContractError):
+            bazel_target_data(self.build, "missing_contract_test")
+        with self.assertRaises(ContractError):
+            bazel_target_data(
+                self.build.replace("    data = [\n", "    data = glob([\n", 1),
+                CONTRACT_TEST_TARGET,
+            )
+
+    def test_bazel_module_digest_is_pinned(self) -> None:
+        module = (self.root / "MODULE.bazel").read_text(encoding="utf-8")
+        self.assertEqual(sha256(module), MODULE_BAZEL_SHA256)
+        self.assertNotEqual(
+            sha256(module.replace('version = "2.2.0"', 'version = "2.2.1"', 1)),
+            MODULE_BAZEL_SHA256,
         )
 
     def test_bazelrc_authority_mutations_fail_closed(self) -> None:
