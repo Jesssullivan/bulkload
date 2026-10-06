@@ -911,12 +911,11 @@ let invariants
           , "chain_links"
           , "ExportOptions"
           , "export_pass"
-          , "write_chained"
+          , "write_capture"
+          , "decide"
+          , "Rebase"
           ]
-        , pending =
-          [ pending "git_carry::decide::decide" Lane.L6a
-          , pending "the Q46 re-root window" Lane.L8
-          ]
+        , pending = [ pending "the Q46 re-root window" Lane.L8 ]
         , ptest = [ Id.P67, Id.P71 ]
         }
       , { tla = P.PrereqsSatisfiedByEarlierLinks
@@ -940,8 +939,14 @@ let invariants
       , { tla = P.BrokenLinkNeverReuseHit
         , slo = [ S.S3, S.S4 ]
         , ruling = [ "OI-1003-Q15", "R-N72" ]
-        , codeSymbol = [ "retained_capture", "chain_links", "LinkBinding" ]
-        , pending = [ pending "git_carry::decide::decide" Lane.L6a ]
+        , codeSymbol =
+          [ "retained_capture"
+          , "chain_links"
+          , "LinkBinding"
+          , "decide"
+          , "Inputs"
+          ]
+        , pending = [] : List T.PendingSymbol
         , ptest = [ Id.P42, Id.P67 ]
         }
       , { tla = P.BaseNotReplacedWhileDepended

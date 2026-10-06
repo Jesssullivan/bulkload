@@ -119,6 +119,10 @@ against probe inputs in an untracked directory (deleted afterwards).
   - `feat/s2-proof-closure-20261006` and
     `feat/wp3-pr3-outcome-ledger-20261006`: 0.
 - `just check-fast` on the `81c5f4a` tree (CI toolchain, shared lock): exit 0.
+- #191 (L6a) merged while that check ran. Main `8e23b1d` was merged in a
+  second time; the one conflict was the plan's P66 row (this lane's row kept,
+  L6a's P67 row kept below it). check-fast was run again on that tree; the
+  PR records the result.
 
 ## Landing order (blocks two other lanes)
 
@@ -159,8 +163,9 @@ on.
   - migrate `refusal_taxonomy.rs` onto the helper (its seed
     `0x5733_7265_6675_7365` becomes `CI_SEED`) and drop its entry;
   - lower `EXEMPT_CEILING` and `FINDINGS_CEILING` to match.
-- The plan's P66 row edit conflicts with L5 (rewrites P59 and P66) and L6a
-  (adds P67 below P66). Whoever merges second resolves it by hand.
+- The plan's P66 row edit conflicts with L5 (rewrites P59 and P66). Whoever
+  merges second resolves it by hand. The L6a conflict (P67 below P66) is
+  resolved on this branch.
 - The guard is text based and reads one line at a time.
   - It refuses valid helper-routed code in another layout: a config split
     over two lines, a braced helper import, `TestRunner` as a type in a
