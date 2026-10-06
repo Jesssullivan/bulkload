@@ -19,10 +19,11 @@
 (*     common repository and so a plan base (estate::capture_groups,       *)
 (*     prepare_base, shared-{group}.base).                                 *)
 (*   - Capture passes under estate.lock, one item at a time: the decision  *)
-(*     (prepare_base, retained_capture, chainable, chain_offer, the        *)
-(*     ExportOptions match in git_carry::export_pass), then publish_bundle,*)
-(*     the dependency sidecars ({bundle}.base, {bundle}.prior) and the     *)
-(*     {item}.capture record, each a separate durable step.                *)
+(*     (git_carry::decide on what prepare_base, retained_capture and       *)
+(*     chainable read; chain_offer and shared::write_capture act on it),   *)
+(*     then publish_bundle, the dependency sidecars ({bundle}.base,        *)
+(*     {bundle}.prior) and the {item}.capture record, each a separate      *)
+(*     durable step.                                                       *)
 (*   - Content names. A bundle's CORPUS name is its content               *)
 (*     ({identity}-{digest}.bundle, shared-{digest}.bundle), so a          *)
 (*     re-export of the same content lands on the same name: publish_      *)
@@ -100,10 +101,11 @@
 (*                          chainable, chain_links (LinkBinding::Custody),*)
 (*                          chain_offer; A/git_carry.rs ExportOptions,    *)
 (*                          export_pass; A/git_carry/shared.rs            *)
-(*                          write_chained, write_bundle, requires_base;   *)
+(*                          write_capture, write_bundle, requires_base;   *)
 (*                          A/git_carry/chain.rs CHAIN_DEPTH_LIMIT,       *)
-(*                          source_held_tips; DecideCore: decide (L6,     *)
-(*                          pending; hs/GitCarryCore.hs is the reference) *)
+(*                          source_held_tips; DecideCore:                 *)
+(*                          A/git_carry/decide.rs decide (L6a; the        *)
+(*                          reference is hs/GitCarryCore.hs's)            *)
 (*   Publish                A/estate.rs publish_bundle                    *)
 (*   Sidecars               A/estate.rs publish_prior, publish_sidecars,  *)
 (*                          capture_item's {bundle}.base write            *)
@@ -323,7 +325,8 @@ Intact(i) ==
 
 -----------------------------------------------------------------------------
 (* The decision core: DecideCore(Inputs(i)) is hs/GitCarryCore.hs's       *)
-(* decide (the Rust decide.rs is lane L6), on the inputs the code reads.  *)
+(* decide, as is A/git_carry/decide.rs's (lane L6a, P67), on the inputs   *)
+(* the code reads.                                                        *)
 
 Inputs(i) ==
     LET h == rec[i]
@@ -390,8 +393,9 @@ HitPath(inp) ==
     /\ inp.retained = "Held" /\ inp.keyEqual /\ ~inp.drifted /\ inp.settled
     /\ ChainOK(inp)
 
-\* chainable, chain_offer and the export_pass match, under Q46's re-root
-\* policy (RootWindow > 0) and fix 2 (ChainUnderBase).
+\* v1's chainable, chain_offer and export_pass match (git_carry::decide's
+\* extend since L6a), under Q46's re-root policy (RootWindow > 0) and fix 2
+\* (ChainUnderBase).
 Extend(inp) ==
     LET reuse == IF inp.passStart THEN "BlobReuse" ELSE "PassStartUnrecorded"
         linkable == CASE inp.shape = "Chained" -> inp.chainIntact
