@@ -210,7 +210,7 @@ Each item has the subsuming property and why no coverage is lost. "Pre:" is the 
 |---|---|---|
 | source (`ci-source` → `check-source`) | fmt; clippy workspace `-D warnings` (**R33**); clippy agent `io-trace` (keeps `cfg(not(fault-injection))` lint coverage); `cargo test -p bulkload-agent --lib --features io-trace io::tests::traced io::crash_check`; `io-partial-write-alone` (**P5 proof**); `cargo test --workspace` (incl. **R34 dep wall**, every property at its CI case count with a fixed seed); history secret scan | Only the io-trace test filter is narrowed. `PROPTEST_*` comes from the shared helper, not the env, so CI cannot be widened by accident. |
 | fault-harness | clippy `fault-injection,io-trace`; `fault_harness` (29 + 10 crash rows, 1 P29 table instead of 8 live-writer runs); `power_loss` (+ the P34 sibling); `resume-power-loss` (**R-N88 / R-N119**) | 4 copy runs fewer. Phase 2 (PR15) builds one `fault-injection,io-trace` union in `target/fault`, so the agent compiles once instead of twice. Pre: prove the recorder is inert while detached in crash children, and update the pins. |
-| build / test (Bazel) | unchanged | |
+| build / test (Bazel) | dropped from the PR matrix by OI-1003-Q65 (2026-10-06; see D6) | |
 
 ### Local only (`just`, never PR gates)
 
@@ -308,4 +308,4 @@ Lines (estimate):
 - **D3.** CI proptest seed. **Fixed seed plus constant cases (bounded corpus)**, or random per run.
 - **D4.** `#[ignore]` defect repros. **Keep until fixed**, or move to issues and delete.
 - **D5.** Q14 wording. Confirm OI-1003-Q14 says what the task states. The charter on #137 lists only Q1–Q13.
-- **D6.** Dropping the `build` / `test` matrix gates (a workflow digest change). Still open from #81. **Out of scope for this series.**
+- **D6.** Dropping the `build` / `test` matrix gates (a workflow digest change). **Ruled by OI-1003-Q65 (2026-10-06): dropped.** The workflow matrix is `[source, fault-harness]` and `WORKFLOW_SHA256` was re-pinned; the composite action and the guard are unchanged. `ci-source` now runs `contract-test`, so CI still runs the two contract tests the Bazel `test` gate ran. Residual gap: no PR loads the Bazel graph (bzlmod and `rules_python` resolution, the `//:bulkload` globs, the `//:tests` sandbox); `just test-local`, `just check` and `just ci` still do, off the PR path. Cheap guards instead: `MODULE.bazel` is digest-pinned (`MODULE.bazel` joins `ci_contract_test` data) and the contract test checks that its `data` list covers every file it reads (lane `ci-drop-bazel`, `docs/agent-notes/2026-10-06-ci-drop-bazel.md`).
