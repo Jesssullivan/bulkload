@@ -7,6 +7,12 @@ run until gate (a) passes), R-N81, R-N13.
 - **Worktree:** `bulkload.worktrees/gate-b-harness-20261006`. This session
   was its only writer.
 - **PR:** none opened (by dispatch). Pushed to `origin`.
+- **Commit:** `024ec1f` (signed) carries the harness, tests, recipe, protocol
+  note and SLO pointer.
+- **Validation:** `just check-fast` exited 0 on that tree (2026-10-06 15:50
+  EDT, inside `nix develop`, after about 1 h 50 min queued on the lane lock).
+  origin/main then stood 6 CI commits ahead (`2247ab8`, PR #190); the branch
+  is not merged with it yet, and a trial merge is clean.
 - **Protocol:** [2026-10-06-s1-gate-b-protocol.md](../plans/2026-10-06-s1-gate-b-protocol.md).
 
 ## Done
