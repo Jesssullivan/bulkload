@@ -206,6 +206,12 @@ as properties.
     improvement in #169 and is not part of the SLO.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
+  - Amendment 2026-10-06 (#169): the strict reading now holds in the model.
+    `R25_StrictNoDurableReread` passes in `MC_r25_unrowed_bytes` and
+    `MC_r25_strict_deep` (`docs/formal/`), with the capture record's adoption
+    (`crates/bulkload-agent/src/transfer/unrowed.rs`); the power-loss proof
+    `an_unrowed_output_is_adopted_without_source_reads` and P74 check it on
+    the code. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
 
 ## Priority (OI-1003-Q4)
 

@@ -127,6 +127,13 @@ pub struct TransferStats {
     /// Directories created by the plain `mkdirat` fallback, on a filesystem
     /// without a no-replace rename (R-N119), by relative path.
     pub directories_fallback: Vec<Vec<u8>>,
+    /// Outputs a crash left durable with no row, adopted from their capture
+    /// record without a source read (#169; `transfer_unrowed_adopted`).
+    pub unrowed_adopted: u64,
+    /// Existing outputs with no matching row that no capture record proved,
+    /// each asked for by manifest as before (#169;
+    /// `transfer_unrowed_unproven`).
+    pub unrowed_unproven: u64,
 }
 
 impl TransferStats {
@@ -1965,6 +1972,9 @@ struct Inbound<'a, W> {
     target: &'a mut Destination,
     store: &'a Store,
     authority: Vec<u8>,
+    /// The source store's authority from `Start`, which keys capture records
+    /// (#169, [`unrowed::record_key`]).
+    source_authority: Vec<u8>,
     committer: &'a Committer<PublishSink>,
     session: SessionChunks,
     stats: TransferStats,
@@ -2038,7 +2048,7 @@ pub fn receive<R: Read, W: Write>(
     };
     let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
-        authority,
+        &authority,
         target.path().as_os_str().as_bytes(),
         target_meta.dev(),
         target_meta.ino(),
@@ -2055,6 +2065,7 @@ pub fn receive<R: Read, W: Write>(
         target: &mut target,
         store: &store,
         authority: output_authority,
+        source_authority: authority,
         committer: &committer,
         session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
         stats: TransferStats::default(),
@@ -2176,6 +2187,9 @@ impl<W: Write> Inbound<'_, W> {
                         self.stats.reused += 1;
                         return Ok(Decision::Reuse);
                     }
+                    if self.adopt_unrowed(&row, &key)? {
+                        return Ok(Decision::Reuse);
+                    }
                 }
                 // A manifest first only when something here could fill it:
                 // an existing output to adopt, or chunks held by published
@@ -2224,6 +2238,43 @@ impl<W: Write> Inbound<'_, W> {
         write_control(self.output, &Control::Decide { entry, decision })?;
         fault_point!(ReceiveAfterDecide);
         Ok(())
+    }
+
+    /// R25's strict reading (#169): an existing output with no matching row
+    /// whose capture record proves it is this entry's capture is queued for
+    /// its row as an adopted publication, and the entry is answered `Reuse`,
+    /// so the source reads nothing. Its commit outcome reaches the session's
+    /// report like any output's. See [`unrowed`].
+    fn adopt_unrowed(&mut self, row: &RowSchema, key: &[u8]) -> Result<bool> {
+        let record_key = unrowed::record_key(&self.source_authority, row)?;
+        let verdict = match self.target.existing(row) {
+            Ok(Some((file, parent))) => match unrowed::prove(&file, row, &record_key) {
+                unrowed::Verdict::Proven(identity, hints) => {
+                    self.committer.submit(Publication::Adopted {
+                        record: OutputRecord {
+                            key: key.to_vec(),
+                            rel_path: row.rel_path.clone(),
+                            identity,
+                            racy: false,
+                            hints,
+                        },
+                        file,
+                        parent,
+                    })?;
+                    self.stats.unrowed_adopted += 1;
+                    counters::bump(Counter::TransferUnrowedAdopted);
+                    return Ok(true);
+                }
+                verdict => verdict,
+            },
+            Ok(None) => unrowed::Verdict::Other,
+            Err(_) => unrowed::Verdict::Unproven,
+        };
+        if matches!(verdict, unrowed::Verdict::Unproven) {
+            self.stats.unrowed_unproven += 1;
+            counters::bump(Counter::TransferUnrowedUnproven);
+        }
+        Ok(false)
     }
 
     /// Reserve an entry's bytes against the destination's free-space floor
@@ -2584,7 +2635,7 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
-        self.publish(staged, &row, (key, racy), hints)
+        self.publish(staged, &row, (key, racy, root), hints)
     }
 
     fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
@@ -2596,6 +2647,7 @@ impl<W: Write> Inbound<'_, W> {
             failure,
             ..
         } = filling;
+        let root = manifest.root;
         match plan {
             Plan::Refuse(refusal) => Err(refusal),
             Plan::Adopt(file, parent) => {
@@ -2609,7 +2661,7 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
-                self.publish(staging.staged, &row, (key, racy), staging.hints)
+                self.publish(staging.staged, &row, (key, racy, root), staging.hints)
             }
         }
     }
@@ -2638,15 +2690,33 @@ impl<W: Write> Inbound<'_, W> {
         })
     }
 
-    /// Apply the final mode and queue a fully written staged file for its
-    /// group commit, which seals it, renames it and seals its directory.
+    /// Write the capture record of a non-racy capture (#169), apply the
+    /// final mode, and queue a fully written staged file for its group
+    /// commit, which seals it (record included), renames it and seals its
+    /// directory. The record goes first: a read-only mode would refuse it.
     fn publish(
         &mut self,
         staged: StagedFile,
         row: &RowSchema,
-        (key, racy): (Vec<u8>, bool),
+        (key, racy, root): (Vec<u8>, bool, [u8; 32]),
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
+        if !racy {
+            match unrowed::record_key(&self.source_authority, row) {
+                Ok(record_key) => unrowed::write_record(
+                    staged.file(),
+                    &unrowed::CaptureRecord {
+                        key: record_key,
+                        root,
+                        size: row.size,
+                    },
+                ),
+                Err(refusal) => {
+                    let _ = staged.discard();
+                    return Err(refusal);
+                }
+            }
+        }
         if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
             .refuse_at("transfer::publish")
         {
@@ -3001,3 +3071,4 @@ fn path(bytes: Vec<u8>) -> PathBuf {
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod unrowed;

@@ -74,10 +74,17 @@
 (*     (LedgerSink::commit, Committer::submit); README, "Not proven".     *)
 (*   - "Held" means a committed destination row (HeldPhys). Bytes that    *)
 (*     are durable at the final path with no row (a crash before          *)
-(*     commit_outputs, a failed group whose files were renamed) are read  *)
-(*     again; R25_StrictNoDurableReread, under TrackStrictHeld, makes     *)
-(*     that gap visible (MC_r25_unrowed_bytes). Salvaged temporaries are  *)
-(*     folded away (see above) and not covered by it.                     *)
+(*     commit_outputs, a failed group whose files were renamed) were read *)
+(*     again before #169; R25_StrictNoDurableReread, under                *)
+(*     TrackStrictHeld, makes that gap visible (MC_r25_unrowed_no_adopt). *)
+(*     Under AdoptUnrowed (the code since #169) each such output carries  *)
+(*     its capture record and is adopted on resume without a read         *)
+(*     (MC_r25_unrowed_bytes, MC_r25_strict_deep). The record is a field  *)
+(*     of the file (rec): the key it was captured under and the bytes it  *)
+(*     names; the output's hash check is equality of versions. Losing the *)
+(*     record (no extended attributes) only costs today's re-read, so it  *)
+(*     is not modelled. Salvaged temporaries are folded away (see above)  *)
+(*     and not covered by it.                                             *)
 (*   - A seal (file or directory) is durable at once. On Darwin a seal is *)
 (*     F_BARRIERFSYNC, an ordering barrier, and the group's full flush or  *)
 (*     the store commit's fullfsync is the durability point. That only     *)
@@ -97,7 +104,8 @@
 (*   A = crates/bulkload-agent/src                                         *)
 (*   Walk            A/transfer.rs walk_source, Outbound::offer;           *)
 (*                   A/walk.rs Walker                                      *)
-(*   RecvEntry       A/transfer.rs Inbound::entry, Inbound::admit;         *)
+(*   RecvEntry       A/transfer.rs Inbound::entry, Inbound::admit,         *)
+(*                   Inbound::adopt_unrowed; A/transfer/unrowed.rs prove; *)
 (*                   A/materialize.rs Destination::identity;               *)
 (*                   A/transfer_store.rs Store::output_matches            *)
 (*   RecvDecide      A/transfer.rs Outbound::decide, run_job,              *)
@@ -112,6 +120,8 @@
 (*   SealTemp        A/materialize.rs StagedFile::seal;                    *)
 (*                   A/io/durable.rs seal_file                             *)
 (*   Publish         A/materialize.rs StagedFile::publish                  *)
+(*                   (the capture record from A/transfer.rs publish,       *)
+(*                   A/transfer/unrowed.rs write_record)                   *)
 (*                   (io::publish_noreplace), PublishSink::commit          *)
 (*   DirSeal         A/materialize.rs TouchedDevices::seal;                *)
 (*                   A/io/durable.rs seal_dir                              *)
@@ -120,7 +130,8 @@
 (*   Commit          A/transfer_store.rs StorePublisher::commit_outputs;   *)
 (*                   A/io/durable.rs configure_sqlite, Committer           *)
 (*   CommitFail      A/materialize.rs space_refusal (#100)                 *)
-(*   AnswerHeld      A/transfer.rs Inbound::answer_held, settle_held, end  *)
+(*   AnswerHeld      A/transfer.rs Inbound::answer_held, settle_held, end, *)
+(*                   finish_receive (an adopted unrowed output's outcome)  *)
 (*   RecvHeld        A/transfer.rs Outbound::handle (Event::Held)          *)
 (*   LedgerCommit    A/transfer_store.rs LedgerSink::publish,              *)
 (*                   StorePublisher::commit_captures                       *)
@@ -168,8 +179,11 @@ CONSTANTS
     StoreRootSealed,     \* the source state root's directory entry is sealed
                          \* before the store's first commit returns (an
                          \* assumption the code does not meet yet; README)
-    TrackStrictHeld      \* ghost: mark bulkload's own durable outputs from
+    TrackStrictHeld,     \* ghost: mark bulkload's own durable outputs from
                          \* non-racy captures, for R25_StrictNoDurableReread
+    AdoptUnrowed         \* #169: each non-racy staged file carries its capture
+                         \* record, and a resume adopts a durable unrowed
+                         \* output whose record proves it (the code since #169)
 
 Mutations == {"none", "held_before_commit", "commit_before_fsync",
               "commit_before_dirseal", "adopt_without_seal",
@@ -178,7 +192,8 @@ Mutations == {"none", "held_before_commit", "commit_before_fsync",
               "src_ledger_carries_r25", "record_racy", "source_write",
               "git_optional_locks", "pause_writer", "unbounded_backup",
               "supersede_unchecked", "sweep_displaced", "double_read",
-              "untyped_space", "done_before_sync", "skip_output_row"}
+              "untyped_space", "done_before_sync", "skip_output_row",
+              "adopt_unkeyed", "adopt_unverified"}
 
 ASSUME /\ IsFiniteSet(Seats) /\ Seats # {}
        /\ MaxRuns \in Nat /\ MaxCrashes \in Nat /\ MaxEdits \in Nat
@@ -186,6 +201,7 @@ ASSUME /\ IsFiniteSet(Seats) /\ Seats # {}
        /\ SpaceRefusals \in BOOLEAN /\ RelaxedSourceLedger \in BOOLEAN
        /\ RelaxedAuthority \in BOOLEAN
        /\ StoreRootSealed \in BOOLEAN /\ TrackStrictHeld \in BOOLEAN
+       /\ AdoptUnrowed \in BOOLEAN
        /\ SupersedeMode \in {"off", "check_rename", "exchange"}
        /\ EstateReads \in BOOLEAN /\ MaxBackupSteps \in Nat
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
@@ -197,10 +213,14 @@ FirstForeignId == 50 \* bulkload's own output identities are run numbers
 KeyBase == 10        \* row key = authority epoch * KeyBase + stat version
 ASSUME MaxEdits < KeyBase
 
+\* A file's capture record (#169, only under AdoptUnrowed): the row key the
+\* capture was made under and the bytes it names. Key 0 is no record.
+NoRecord == [key |-> 0, data |-> 0]
+
 \* A file at a destination path. cl (ghost, only under TrackStrictHeld):
-\* bulkload published it from a non-racy capture.
+\* bulkload published it from a non-racy capture. rec: its capture record.
 NoFile == [pres |-> FALSE, id |-> 0, data |-> 0, dd |-> TRUE, nd |-> TRUE,
-           cl |-> FALSE]
+           cl |-> FALSE, rec |-> NoRecord]
 NoTmp  == [st |-> "none", data |-> 0]
 NoCap  == [data |-> 0, racy |-> FALSE, rec |-> FALSE, led |-> FALSE]
 NoRec  == [key |-> 0, data |-> 0, racy |-> FALSE, id |-> 0, kind |-> "none"]
@@ -338,9 +358,13 @@ DoRead(s, kind) ==
     /\ srcOps' = srcOps \cup {"read"} \cup MutOps
 
 \* The output a publish of seat s's staged capture creates in this run.
+\* Its capture record: A/transfer.rs publish writes one on a non-racy
+\* capture's staged file before its seal (A/transfer/unrowed.rs write_record).
 NewOut(s, d, sealed) ==
     [pres |-> TRUE, id |-> run, data |-> d, dd |-> sealed, nd |-> FALSE,
-     cl |-> TrackStrictHeld /\ ~dRec[s].racy]
+     cl |-> TrackStrictHeld /\ ~dRec[s].racy,
+     rec |-> IF AdoptUnrowed /\ ~dRec[s].racy
+             THEN [key |-> dRec[s].key, data |-> d] ELSE NoRecord]
 
 Durable(f) == IF f.pres THEN [f EXCEPT !.dd = TRUE, !.nd = TRUE] ELSE f
 
@@ -474,31 +498,52 @@ Walk(s) ==
 (* Destination: decide one entry.                                          *)
 (* A/transfer.rs Inbound::entry: Reuse iff the output at the path has the  *)
 (* identity this store recorded under the row key (Destination::identity, *)
-(* Store::output_matches). Otherwise WantManifest when an output exists;   *)
-(* for an absent output Send, or WantManifest when published outputs or    *)
-(* salvaged temporaries could fill chunks (free choice here). The space    *)
-(* preflight (Inbound::admit) may refuse DESTINATION_SPACE_INSUFFICIENT.   *)
+(* Store::output_matches). #169 (AdoptUnrowed): otherwise an existing      *)
+(* output whose capture record names this row key and whose own bytes     *)
+(* hash to the record's root is adopted, also answered Reuse              *)
+(* (Inbound::adopt_unrowed, A/transfer/unrowed.rs prove): it is queued as  *)
+(* an adopted publication, sealed before its row commits, and the source   *)
+(* reads nothing. Mutations adopt_unkeyed / adopt_unverified skip the key  *)
+(* or the hash check. Otherwise WantManifest when an output exists; for an *)
+(* absent output Send, or WantManifest when published outputs or salvaged  *)
+(* temporaries could fill chunks (free choice here). The space preflight   *)
+(* (Inbound::admit) may refuse DESTINATION_SPACE_INSUFFICIENT.             *)
 RecvEntry(s) ==
     /\ sess = "on" /\ dEnt[s] = "none" /\ msg[s].t = "entry"
     /\ LET k == msg[s].v
            reuse == /\ RowMatches(s, k)
                     /\ Mutation \notin {"reread_durable", "reread_ignore_ledger"}
                     /\ (Mutation = "src_ledger_carries_r25" => msg[s].b)
+           adopt == /\ AdoptUnrowed
+                    /\ out[s].pres /\ out[s].rec.key # 0
+                    /\ (out[s].rec.key = k \/ Mutation = "adopt_unkeyed")
+                    /\ (out[s].data = out[s].rec.data \/ Mutation = "adopt_unverified")
            choices == IF reuse THEN {"reuse"}
+                      ELSE IF adopt THEN {"adopt_unrowed"}
                       ELSE (IF out[s].pres THEN {"manifest"} ELSE {"send", "manifest"})
                            \cup (IF SpaceRefusals THEN {"refuse"} ELSE {})
        IN \E d \in choices :
-            /\ msg' = [msg EXCEPT ![s] = Msg("decide", 0, FALSE, d)]
+            /\ msg' = [msg EXCEPT ![s] = Msg("decide", 0, FALSE,
+                                             IF d = "adopt_unrowed" THEN "reuse" ELSE d)]
             /\ dKey' = [dKey EXCEPT ![s] = k]
             /\ dEnt' = [dEnt EXCEPT ![s] =
                           CASE d = "send" -> "streaming"
                             [] d = "manifest" -> "await_manifest"
+                            [] d = "adopt_unrowed" -> "adopt_queued"
                             [] OTHER -> "done"]
             /\ outc' = [outc EXCEPT ![s] =
                           CASE d = "reuse" -> "applied"
                             [] d = "refuse" -> "DESTINATION_SPACE_INSUFFICIENT"
                             [] OTHER -> "pending"]
-    /\ UNCHANGED <<srcVars, authVars, sVars, dPlan, dPub, dRec, tmp, out, outPrev, disp,
+            /\ IF d = "adopt_unrowed"
+               THEN /\ dPub' = [dPub EXCEPT ![s] = "adopt_wait"]
+                    /\ dRec' = [dRec EXCEPT ![s] =
+                                  [key |-> k,
+                                   data |-> IF Mutation = "adopt_unverified"
+                                            THEN out[s].rec.data ELSE out[s].data,
+                                   racy |-> FALSE, id |-> out[s].id, kind |-> "adopt"]]
+               ELSE UNCHANGED <<dPub, dRec>>
+    /\ UNCHANGED <<srcVars, authVars, sVars, dPlan, tmp, out, outPrev, disp,
                    dstRows, runVars, estVars, reads, srcOps, rc, runReads,
                    heldAtStart, changedRun, committedRun, everCommitted,
                    clobbered>>
@@ -811,15 +856,27 @@ CommitFail ==
 (* A/transfer.rs Inbound::answer_held / settle_held: Held{true} only once   *)
 (* the output's group commit has returned; Held{false} for a failure.      *)
 (* Mutation held_before_commit answers as soon as the output is queued.    *)
+(* #169: an adopted unrowed output was answered Reuse, so no Held is sent; *)
+(* its group's outcome reaches the session report (finish_receive):        *)
+(* completed, or its typed refusal.                                        *)
 AnswerHeld(s) ==
-    /\ sess = "on" /\ dEnt[s] = "queued" /\ msg[s] = NoMsg
-    /\ \/ /\ dPub[s] = "committed"
+    /\ sess = "on" /\ dEnt[s] \in {"queued", "adopt_queued"} /\ msg[s] = NoMsg
+    /\ \/ /\ dEnt[s] = "adopt_queued"
+          /\ dPub[s] \in {"committed", "failed_space"}
+          /\ UNCHANGED msg
+          /\ outc' = [outc EXCEPT ![s] =
+                        CASE dPub[s] = "committed" -> "applied"
+                          [] Mutation = "untyped_space" -> "IO"
+                          [] OTHER -> "DESTINATION_SPACE_INSUFFICIENT"]
+       \/ /\ dEnt[s] = "queued"
+          /\ dPub[s] = "committed"
           /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, TRUE, "none")]
           \* applied; "applied_racy" marks a racy capture (no row kept), a
           \* ghost distinction the closure report does not make.
           /\ outc' = [outc EXCEPT ![s] = IF dRec[s].racy THEN "applied_racy"
                                          ELSE "applied"]
-       \/ /\ dPub[s] \in {"failed_occupied", "failed_space"}
+       \/ /\ dEnt[s] = "queued"
+          /\ dPub[s] \in {"failed_occupied", "failed_space"}
           /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, FALSE, "none")]
           \* materialize.rs space_refusal types ENOSPC (#100); Mutation
           \* untyped_space leaves it a bare IO, which closes nothing (S4).
@@ -827,7 +884,7 @@ AnswerHeld(s) ==
                         CASE dPub[s] = "failed_space" /\ Mutation = "untyped_space" -> "IO"
                           [] dPub[s] = "failed_space" -> "DESTINATION_SPACE_INSUFFICIENT"
                           [] OTHER -> "GIT_DESTINATION_OCCUPIED"]
-       \/ /\ Mutation = "held_before_commit"
+       \/ /\ dEnt[s] = "queued" /\ Mutation = "held_before_commit"
           /\ dPub[s] \in {"staged", "sealed", "renamed", "ready", "adopt_wait"}
           /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, TRUE, "none")]
           /\ outc' = [outc EXCEPT ![s] = "applied"]
@@ -987,13 +1044,17 @@ DstUnchanged == <<srcVars, authVars, sVars, msg, dEnt, dKey, dPlan, dPub, dRec, 
 \* A third party writes the destination path: a copy of the source's bytes
 \* or other bytes, under a new identity. Its data is not yet durable; the
 \* rename that put it there is (namespace operations in one directory are
-\* ordered, so an earlier pending rename there is durable too).
+\* ordered, so an earlier pending rename there is durable too). Under
+\* AdoptUnrowed it may instead rewrite an existing file in place, which keeps
+\* the file's capture record (an extended attribute) over other bytes.
 ForeignWrite(s) ==
     /\ foreign < MaxForeign
-    /\ \E d \in {FOREIGN, edits[s]} :
+    /\ \E d \in {FOREIGN, edits[s]},
+         rec \in IF AdoptUnrowed /\ out[s].pres THEN {NoRecord, out[s].rec}
+                 ELSE {NoRecord} :
          out' = [out EXCEPT ![s] = [pres |-> TRUE, id |-> FirstForeignId + foreign + 1,
                                     data |-> d, dd |-> FALSE, nd |-> TRUE,
-                                    cl |-> FALSE]]
+                                    cl |-> FALSE, rec |-> rec]]
     /\ disp' = [disp EXCEPT ![s] = Durable(disp[s])]
     /\ outPrev' = [outPrev EXCEPT ![s] = NoFile]
     /\ foreign' = foreign + 1
@@ -1165,11 +1226,14 @@ R25_NoDurableReread == \A r \in reads : ~r.held
 (* MC_neg_reread_ignore_ledger and MC_neg_reread_exchange show it can fail. *)
 R25_NoCommittedCaptureReread == \A r \in reads : ~r.committed
 
-(* NOT a code-shape invariant: R25 under the strict reading of "held       *)
-(* durably" (OI-1002-Q33), where bulkload's own durable output from a      *)
-(* non-racy capture counts as held with or without a row. Meaningful only  *)
-(* under TrackStrictHeld; the code fails it (MC_r25_unrowed_bytes), which  *)
-(* is the gap between R25_NoDurableReread and the strict reading.          *)
+(* R25 under the strict reading of "held durably" (OI-1002-Q33), where     *)
+(* bulkload's own durable output from a non-racy capture counts as held    *)
+(* with or without a row. Meaningful only under TrackStrictHeld. The code  *)
+(* before #169 fails it (MC_r25_unrowed_no_adopt), the gap between         *)
+(* R25_NoDurableReread and the strict reading; with the capture record's   *)
+(* adoption (AdoptUnrowed, #169) it holds (MC_r25_unrowed_bytes,           *)
+(* MC_r25_strict_deep). OI-1003-Q40 keeps R25_NoDurableReread the SLO's    *)
+(* obligation.                                                             *)
 R25_StrictNoDurableReread == \A r \in reads : ~r.strict
 
 (* A seat is read at most once a session (P23).                            *)

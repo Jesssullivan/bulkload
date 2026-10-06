@@ -8,10 +8,10 @@
 //!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
 //!   `readdir`, `geteuid`, `flock`, `setsockopt`, `setpriority`/`getpriority`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//!   `renameatx_np(RENAME_EXCL)`, and the background `IOPOL_THROTTLE` policy
-//!   and `QoS` class;
-//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)` and
-//!   the idle `ioprio_set` class;
+//!   `renameatx_np(RENAME_EXCL)`, `fsetxattr`/`fgetxattr` (Darwin's
+//!   signature), and the background `IOPOL_THROTTLE` policy and `QoS` class;
+//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)`,
+//!   `fsetxattr`/`fgetxattr` and the idle `ioprio_set` class;
 //! - `buf.rs`: the aligned slab allocation.
 //!
 //! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
@@ -40,6 +40,7 @@
 //! | `sys::rename_noreplace_at` | as `rename_exclusive_at` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
 //! | `sys::create_excl_at`, `sys::mkdirat`, `sys::symlinkat` | | | `Create`, `Mkdir`, `Symlink` |
 //! | `sys::pwrite_all`, `sys::fchmod`, `sys::unlinkat`, `sys::linkat` | | | `Write`, `SetMode`, `Unlink`, `Link` |
+//! | `sys::set_capture_record` | `fsetxattr` | `fsetxattr` | `SetCaptureRecord` |
 //!
 //! The stores add an `Event::Commit` when a `SQLite` commit returns, naming
 //! the records it made durable.

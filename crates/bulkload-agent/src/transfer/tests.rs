@@ -537,6 +537,19 @@ fn rows_from_before_the_racy_guard_are_read_again_once() {
             .forget_racy_guard()
             .unwrap();
     }
+    // Such stores' outputs predate the capture record too (#169): rewrite
+    // each as a fresh file with the same bytes and mode and no record.
+    for index in 0..FILES {
+        let output = corpus
+            .base
+            .join("destination")
+            .join(format!("file-{index}"));
+        let fresh = corpus.base.join("destination").join("fresh");
+        std::fs::write(&fresh, std::fs::read(&output).unwrap()).unwrap();
+        std::fs::set_permissions(&fresh, std::fs::metadata(&output).unwrap().permissions())
+            .unwrap();
+        std::fs::rename(&fresh, &output).unwrap();
+    }
     let upgraded = corpus.run().unwrap();
     assert!(upgraded.refusals.is_empty(), "{:?}", upgraded.refusals);
     assert_eq!(upgraded.reused, 0);
@@ -1515,8 +1528,10 @@ impl<W: Write> Write for HeldLog<W> {
 /// #100 (R25, R-N86, R-N88): a destination group commit that fails (here
 /// its store commit, with `ENOSPC`) answers every entry of the group
 /// `Held{false}`. No ledger row and no output row commits, the session ends
-/// with the typed space refusal for each entry instead of hanging, and the
-/// next run reads each file exactly once.
+/// with the typed space refusal for each entry instead of hanging. The
+/// group's files were published before its store commit failed, so the next
+/// run adopts each one from its capture record without a source read
+/// (#169), and commits its row.
 #[test]
 fn a_failed_group_commit_answers_held_false_and_records_nothing() {
     const FILES: usize = 3;
@@ -1591,8 +1606,11 @@ fn a_failed_group_commit_answers_held_false_and_records_nothing() {
     let resumed = corpus.run().unwrap();
     assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
     assert_eq!(resumed.completed, FILES as u64);
-    assert_eq!(resumed.source_bytes_read, (FILES * SIZE) as u64);
-    assert_eq!(rows(&corpus), (FILES as u64, FILES as u64));
+    assert_eq!(
+        (resumed.source_bytes_read, resumed.unrowed_adopted),
+        (0, FILES as u64)
+    );
+    assert_eq!(rows(&corpus), (0, FILES as u64));
     let warm = corpus.run().unwrap();
     assert_eq!((warm.reused, warm.source_bytes_read), (FILES as u64, 0));
     for index in 0..FILES {
@@ -1816,4 +1834,254 @@ proptest::proptest! {
             );
         }
     }
+}
+
+// ---- #169 (R25 strict, OI-1003-Q40): P74 R25-STRICT-ADOPT ------------------
+
+/// Fixed seeds of P74 (no fuzzing): each one generates a corpus and its
+/// crash points.
+const P74_SEEDS: [u64; 12] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+
+/// What a crash and the time before the resume left at one unrowed output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unrowed {
+    /// Durable at the final path with its bytes and its capture record.
+    Intact,
+    /// Removed by a third party: the resume reads it again.
+    Deleted,
+    /// Rewritten in place at the same size by a third party: its record no
+    /// longer proves it, so the resume reads it and refuses it as occupied.
+    Tampered,
+}
+
+/// One generated P74 case: the corpus, the crash point (files before it
+/// carried and rowed, files from it published by a group whose row commit
+/// never lands), and each unrowed output's fate.
+#[derive(Debug)]
+struct P74Case {
+    sizes: Vec<usize>,
+    crash: usize,
+    fates: Vec<Unrowed>,
+}
+
+fn p74_case(seed: u64) -> P74Case {
+    const SIZES: [usize; 5] = [0, 1, 4_096, 70_000, 300_000];
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        usize::try_from(state % bound as u64).unwrap()
+    };
+    let files = 1 + next(6);
+    let sizes: Vec<usize> = (0..files).map(|_| SIZES[next(5)]).collect();
+    let crash = next(files);
+    let fates = sizes[crash..]
+        .iter()
+        .map(|size| match next(4) {
+            0 => Unrowed::Deleted,
+            1 if *size > 0 => Unrowed::Tampered,
+            _ => Unrowed::Intact,
+        })
+        .collect();
+    P74Case {
+        sizes,
+        crash,
+        fates,
+    }
+}
+
+/// P74 R25-STRICT-ADOPT (#169, OI-1003-Q40, R-N58), over generated crash
+/// points: files before the crash point are carried and rowed; files from it
+/// are published by a group whose row commit never lands (the store commit
+/// fails after the files were sealed, renamed and their directory sealed:
+/// `MC_r25_unrowed_bytes`'s state). Every capture is non-racy (the capture
+/// clock is pinned past every stamp). The resume then reads exactly the
+/// deleted and tampered outputs' seats: each intact unrowed output is
+/// adopted from its capture record with 0 source bytes, no wire bytes, and
+/// its row committed, so the next run reuses it.
+#[test]
+fn p74_unrowed_outputs_are_adopted_without_source_reads() {
+    for seed in P74_SEEDS {
+        p74_check(seed, &p74_case(seed));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn p74_check(seed: u64, case: &P74Case) {
+    let corpus = Corpus::new();
+    let name = |index: usize| format!("p74-{index}");
+    let source = corpus.base.join("source");
+    let destination = corpus.base.join("destination");
+    let content = |index: usize| noise(seed * 1_000 + index as u64, case.sizes[index]);
+    for index in 0..case.sizes.len() {
+        std::fs::write(source.join(name(index)), content(index)).unwrap();
+    }
+    let latest = (0..case.sizes.len())
+        .map(|index| stamp_ns(&source.join(name(index))))
+        .max()
+        .unwrap();
+    let _clock = PinnedClock::at(&corpus, latest + 60 * RACY_GRANULARITY_NS);
+    // Before the crash point: carried and rowed. The rest is hidden.
+    let hidden = corpus.base.join("hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    for index in case.crash..case.sizes.len() {
+        std::fs::rename(source.join(name(index)), hidden.join(name(index))).unwrap();
+    }
+    let carried = corpus.run().unwrap();
+    assert!(carried.refusals.is_empty(), "seed {seed}: {carried:?}");
+    for index in case.crash..case.sizes.len() {
+        std::fs::rename(hidden.join(name(index)), source.join(name(index))).unwrap();
+    }
+    // From the crash point: published, sealed, renamed; no row commits.
+    let store_root = destination_store_root(&corpus);
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let crashed = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    let crashed = crashed.unwrap();
+    assert_eq!(
+        crashed.refusals.len(),
+        case.sizes.len() - case.crash,
+        "seed {seed}: {crashed:?}"
+    );
+    let (mut want_read, mut want_adopted, mut want_tampered) = (0_u64, 0_u64, 0_u64);
+    for (offset, fate) in case.fates.iter().enumerate() {
+        let index = case.crash + offset;
+        let output = destination.join(name(index));
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            content(index),
+            "seed {seed}: the crashed run published {index}"
+        );
+        match fate {
+            Unrowed::Intact => want_adopted += 1,
+            Unrowed::Deleted => {
+                std::fs::remove_file(&output).unwrap();
+                want_read += case.sizes[index] as u64;
+            }
+            Unrowed::Tampered => {
+                let mut bytes = content(index);
+                bytes[0] ^= 0xff;
+                let mode = std::fs::metadata(&output).unwrap().permissions();
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(&output, &bytes).unwrap();
+                std::fs::set_permissions(&output, mode).unwrap();
+                want_read += case.sizes[index] as u64;
+                want_tampered += 1;
+            }
+        }
+    }
+
+    let resumed = corpus.run().unwrap();
+    assert_eq!(
+        resumed.source_bytes_read, want_read,
+        "seed {seed} {case:?}: only deleted and tampered seats are read: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.unrowed_adopted, want_adopted,
+        "seed {seed}: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.unrowed_unproven, want_tampered,
+        "seed {seed}: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.reused, case.crash as u64,
+        "seed {seed}: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.refusals.len() as u64,
+        want_tampered,
+        "seed {seed}: {resumed:?}"
+    );
+    assert!(
+        resumed
+            .refusals
+            .iter()
+            .all(|(_, code)| code == "GIT_DESTINATION_OCCUPIED"),
+        "seed {seed}: {resumed:?}"
+    );
+    for (offset, fate) in case.fates.iter().enumerate() {
+        let index = case.crash + offset;
+        if *fate != Unrowed::Tampered {
+            assert_eq!(
+                std::fs::read(destination.join(name(index))).unwrap(),
+                content(index),
+                "seed {seed}: {index}"
+            );
+        }
+    }
+    // The adopted rows committed: a warm run reads only what stays refused.
+    let warm = corpus.run().unwrap();
+    assert_eq!(warm.unrowed_adopted, 0, "seed {seed}: {warm:?}");
+    let tampered_bytes: u64 = case
+        .fates
+        .iter()
+        .enumerate()
+        .filter(|(_, fate)| **fate == Unrowed::Tampered)
+        .map(|(offset, _)| case.sizes[case.crash + offset] as u64)
+        .sum();
+    assert_eq!(
+        warm.source_bytes_read, tampered_bytes,
+        "seed {seed}: {warm:?}"
+    );
+    assert_eq!(
+        warm.reused,
+        case.sizes.len() as u64 - want_tampered,
+        "seed {seed}: {warm:?}"
+    );
+}
+
+/// P74's generator covers every fate and both sides of the crash point
+/// across its fixed seeds, so the property is not vacuous.
+#[test]
+fn p74_seeds_cover_every_fate() {
+    let cases: Vec<P74Case> = P74_SEEDS.iter().map(|seed| p74_case(*seed)).collect();
+    for fate in [Unrowed::Intact, Unrowed::Deleted, Unrowed::Tampered] {
+        assert!(
+            cases.iter().any(|case| case.fates.contains(&fate)),
+            "{fate:?} never generated"
+        );
+    }
+    assert!(cases.iter().any(|case| case.crash > 0));
+    assert!(cases
+        .iter()
+        .any(|case| case.sizes[case.crash..].contains(&300_000)));
+}
+
+/// #169: a racy capture writes no capture record (#86: its stat identity
+/// cannot vouch for its bytes), so its unrowed output is not adopted; the
+/// resume reads it once, as before, and counts it unproven.
+#[test]
+fn a_racy_unrowed_output_is_read_again_and_counted() {
+    const SIZE: usize = 90_000;
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    std::fs::write(&seat, noise(169, SIZE)).unwrap();
+    let store_root = destination_store_root(&corpus);
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 500_000_000);
+    crate::transfer_store::fail_output_commits(&store_root, true);
+    let crashed = corpus.run();
+    crate::transfer_store::fail_output_commits(&store_root, false);
+    assert_eq!(crashed.unwrap().refusals.len(), 1);
+    drop(clock);
+    let output = std::fs::File::open(corpus.base.join("destination/seat")).unwrap();
+    assert_eq!(
+        unrowed::read_record(&output),
+        None,
+        "a racy capture has no record"
+    );
+    let _clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 60 * RACY_GRANULARITY_NS);
+    let resumed = corpus.run().unwrap();
+    assert!(resumed.refusals.is_empty(), "{resumed:?}");
+    assert_eq!(
+        (
+            resumed.source_bytes_read,
+            resumed.unrowed_adopted,
+            resumed.unrowed_unproven
+        ),
+        (SIZE as u64, 0, 1)
+    );
+    let warm = corpus.run().unwrap();
+    assert_eq!((warm.reused, warm.source_bytes_read), (1, 0));
 }

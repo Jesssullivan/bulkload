@@ -66,6 +66,8 @@ pub enum Event {
     },
     /// Permission bits set with `fchmod`.
     SetMode { node: NodeId, mode: u32 },
+    /// The capture record (#169) set with `fsetxattr`: metadata, like a mode.
+    SetCaptureRecord { node: NodeId, record: Vec<u8> },
     /// A sync call on `node`.
     Sync { node: NodeId, kind: SyncKind },
     /// A new symbolic link `name` in `dir` holding `target` literally.

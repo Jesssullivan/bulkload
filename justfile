@@ -100,11 +100,13 @@ fault-harness:
     cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss
     cd {{ root }} && {{ just_executable() }} resume-power-loss
 
-# Directory resume power-loss proofs (#74 review B1 and round 2 N1), lib tests
-# that need `io-trace`. A name filter that matches nothing still reports `0
-# passed`, so this recipe fails unless both proofs ran: on a cargo failure, on
-# anything but one `2 passed; 0 failed` result, or when either proof is not
-# among the passing tests (#74 round 2 N2, R-N122).
+# Resume power-loss proofs, lib tests that need `io-trace`: the directory
+# resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
+# unrowed output from its capture record with 0 source bytes read (#169,
+# R-N58). A name filter that matches nothing still reports `0 passed`, so this
+# recipe fails unless all three proofs ran: on a cargo failure, on anything
+# but one `3 passed; 0 failed` result, or when a proof is not among the
+# passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -117,12 +119,12 @@ resume-power-loss:
         exit "$status"
     fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
-    passed=$(grep -c '^test result: ok\. 2 passed; 0 failed;' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 3 passed; 0 failed;' <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
-        echo "resume-power-loss: expected exactly one '2 passed; 0 failed' result" >&2
+        echo "resume-power-loss: expected exactly one '3 passed; 0 failed' result" >&2
         exit 1
     fi
-    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit; do
+    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do
         if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
             echo "resume-power-loss: $proof was not among the passing tests" >&2
             exit 1

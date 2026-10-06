@@ -230,6 +230,10 @@ let constantLines =
               , pad = "    "
               , value = showBool c.TrackStrictHeld
               }
+            , { name = "AdoptUnrowed"
+              , pad = "       "
+              , value = showBool c.AdoptUnrowed
+              }
             ]
 
 let defaults
@@ -254,6 +258,12 @@ let defaults
           -}
           True
       , TrackStrictHeld = False
+      , AdoptUnrowed =
+          {- The code since #169: each non-racy staged file carries its
+             capture record, and a resume adopts a durable unrowed output
+             the record proves, without a source read.
+          -}
+          True
       }
 
 {- Every fault on: a third-party write or delete, a failed group commit
@@ -268,7 +278,12 @@ let main =
       defaults
       // { Seats = [ Seat.a, Seat.b ], MaxRuns = 2, MaxCrashes = 1, MaxEdits = 1 }
 
--- One seat, one run, no faults: the base of most mutation configs.
+{- One seat, one run, no faults: the base of most mutation configs. The
+   transfer before #169 (AdoptUnrowed off): no mutation of that era involves
+   the capture record, the N-version explorer does not model it (its domain
+   needs AdoptUnrowed off), and the finding rows keep their counterexamples.
+   The #169 rows set it explicitly.
+-}
 let one =
       defaults
       // { Seats = [ Seat.a ]
@@ -279,6 +294,7 @@ let one =
          , MaxCommitFails = 0
          , SpaceRefusals = False
          , BudgetSeconds = 300
+         , AdoptUnrowed = False
          }
 
 {- The constants first drafted for MC_main: two seats, three runs, every
@@ -303,6 +319,11 @@ let nvCore =
          , SpaceRefusals = False
          , SupersedeMode = Mode.off
          , EstateReads = False
+         , AdoptUnrowed =
+             {- hs/Explorer.hs models the transfer before #169; its counts of
+                record are this bound's without the capture record.
+             -}
+             False
          }
 
 {- The N-version core's second row: the same bound plus one third-party write
@@ -362,6 +383,8 @@ let verdict
           , unbounded_backup = P.S2_BackupLockBounded
           , supersede_unchecked = P.NoClobber
           , sweep_displaced = P.NoClobber
+          , adopt_unkeyed = P.ReuseSound
+          , adopt_unverified = P.RecordImpliesBytes
           }
           m
 
@@ -401,6 +424,19 @@ let pass =
       \(never : List A) ->
         T.Expect.pass
           { invariants = safety, properties = [] : List P, never }
+
+-- A pass row that also checks R25's strict reading (#169).
+let passStrict =
+      \(never : List A) ->
+        T.Expect.pass
+          { invariants = safety # [ P.R25_StrictNoDurableReread ]
+          , properties = [] : List P
+          , never
+          }
+
+-- #169's bound for R25's strict reading: one crash between runs.
+let strictOne =
+      one // { MaxRuns = 2, MaxCrashes = 1, TrackStrictHeld = True }
 
 let core = "On the N-version core (OI-1003-Q32)."
 
@@ -591,6 +627,36 @@ let positives =
               ]
               (defaults // { MaxCrashes = 0, MaxEdits = 0, SpaceRefusals = True })
         //  { spec = T.Specification.LiveSpec }
+      , -- R25's strict reading (#169, OI-1003-Q40).
+        row
+          "MC_r25_unrowed_bytes"
+          (passStrict ([ A.CommitFail ] # noEdit # noForeign # wp0dOff # estateOff))
+          [ "#169 (OI-1003-Q40): R25 under the strict reading of \"held durably\""
+          , "(OI-1002-Q33). A crash after the file seal and the rename but before"
+          , "commit_outputs leaves bulkload's own bytes durable at the final path"
+          , "with no row. Each non-racy staged file now carries its capture record,"
+          , "and the resume adopts such an output from it (RecvEntry, Reuse) without"
+          , "a source read: R25_StrictNoDurableReread holds with every safety"
+          , "invariant. MC_r25_unrowed_no_adopt is the same bound without it."
+          ]
+          (strictOne // { AdoptUnrowed = True })
+      , row
+          "MC_r25_strict_deep"
+          (passStrict (wp0dOff # estateOff))
+          [ "#169, depth: R25's strict reading with the capture record's adoption"
+          , "through three runs, two crashes, a source edit and every destination"
+          , "fault: a third-party write (in place, keeping the record, or new), a"
+          , "failed group commit (published, no row: adopted next run) and the"
+          , "space refusal. MC_main_deep's bound with TrackStrictHeld."
+          ]
+          (     defaults
+            //  { Seats = [ Seat.a ]
+                , MaxRuns = 3
+                , MaxCrashes = 2
+                , TrackStrictHeld = True
+                }
+            //  faults
+          )
       , -- The drafted constants: simulation only, never model-checked.
             row
               "MC_main_sim"
@@ -665,17 +731,17 @@ let findings =
           ]
           (one // { MaxRuns = 2, MaxCrashes = 1, StoreRootSealed = False })
       , row
-          "MC_r25_unrowed_bytes"
+          "MC_r25_unrowed_no_adopt"
           (T.Expect.fail P.R25_StrictNoDurableReread)
-          [ "CODE FINDING (expected to fail): R25 under the strict reading of"
-          , "\"held durably\" (OI-1002-Q33). A crash after the file seal and the"
-          , "rename but before commit_outputs can leave bulkload's own bytes"
-          , "durable at the final path with no row; the next run reads the seat"
-          , "again."
-          , "R25_NoDurableReread does not see it (no row). No ruling yet says"
-          , "whether such bytes count as held."
+          [ "FINDING (expected to fail): the transfer before #169, without the"
+          , "capture record. A crash after the file seal and the rename but before"
+          , "commit_outputs leaves bulkload's own bytes durable at the final path"
+          , "with no row; the next run reads the seat again. R25_NoDurableReread"
+          , "does not see it (no row), and OI-1003-Q40 keeps that committed-row"
+          , "reading as the SLO's obligation. MC_r25_unrowed_bytes is the same"
+          , "bound with the adoption, and passes."
           ]
-          (one // { MaxRuns = 2, MaxCrashes = 1, TrackStrictHeld = True })
+          strictOne
       , row
           "MC_wp0d_check_rename"
           (T.Expect.fail P.NoClobber)
@@ -854,6 +920,31 @@ let primary =
           , tail = [ "temporary." ]
           }
         }
+      , adopt_unkeyed =
+        { mutation = M.adopt_unkeyed
+        , constants = strictOne // { MaxEdits = 1, AdoptUnrowed = True }
+        , comment =
+          { head =
+              "#169: an unrowed output is adopted without checking that its capture"
+          , tail =
+            [ "record names this entry's row key, so a seat edited since that"
+            , "capture is answered from stale bytes."
+            ]
+          }
+        }
+      , adopt_unverified =
+        { mutation = M.adopt_unverified
+        , constants =
+            one // { MaxRuns = 2, MaxForeign = 1, MaxCommitFails = 1, AdoptUnrowed = True }
+        , comment =
+          { head =
+              "#169: an unrowed output is adopted without hashing its bytes against"
+          , tail =
+            [ "its capture record, so a third party's in-place rewrite of a failed"
+            , "group's output is recorded as the capture."
+            ]
+          }
+        }
       }
 
 let primaryOf
@@ -945,6 +1036,8 @@ let negRows
       , primaryOf M.unbounded_backup
       , primaryOf M.supersede_unchecked
       , primaryOf M.sweep_displaced
+      , primaryOf M.adopt_unkeyed
+      , primaryOf M.adopt_unverified
       ]
 
 {- Every mutation label has exactly one primary row in negRows, and the
@@ -1277,7 +1370,8 @@ let _ =
 
 {- The constants hs/Explorer.hs models: no failed group commit, no space
    refusal, a strict source ledger and store, no superseding publish, no
-   estate reads, a sealed state root and no strict-held ghost. Seats, runs,
+   estate reads, a sealed state root, no strict-held ghost and no capture
+   record (#169: the explorer models the transfer before it). Seats, runs,
    crashes, edits and third-party writes are its bound flags.
 -}
 let explorerModels =
@@ -1290,6 +1384,7 @@ let explorerModels =
         &&  c.EstateReads == False
         &&  c.StoreRootSealed
         &&  c.TrackStrictHeld == False
+        &&  c.AdoptUnrowed == False
 
 {- Every mutation row inside the explorer's domain, with its bound as the
    explorer's flags. formal-nv runs each one on the explorer, which must

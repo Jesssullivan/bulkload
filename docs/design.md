@@ -306,6 +306,13 @@ replaced inodes, journal gaps and lost source authority invalidate reuse, and
 correctness takes precedence over a zero-reread claim. Every run reports
 bytes read, bytes sent, flushes, memory and wall time.
 
+Since #169 an output whose bytes are durable but whose row never committed
+(a crash between publish and row commit, or a failed group) is adopted on
+resume from its capture record, an extended attribute written on the staged
+file before its seal, by hashing the destination's own bytes: 0 source bytes
+read. What the record cannot prove is read again and counted
+(`transfer_unrowed_unproven`).
+
 ## M2 gates (current)
 
 The acceptance criteria for each M2 workstream as they stand today. Rulings

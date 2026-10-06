@@ -23,13 +23,15 @@ MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,Chec
 MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
 MC_s2	pass	all	CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,RenameReplace,VerifyDisp	-
 MC_live	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_unrowed_bytes	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_strict_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003
 MC_reach_ledger_manifest	reach	Witness_LedgerManifest	*	-
 MC_reach_ledger_chunks	reach	Witness_LedgerChunkRead	*	-
 MC_reach_wp0g_lost_row	reach	Witness_LostRowRead	*	-
 MC_wp0g_authority	fail	R25_NoDurableReread	*	-
 MC_store_root_unsealed	fail	R25_NoDurableReread	*	-
-MC_r25_unrowed_bytes	fail	R25_StrictNoDurableReread	*	-
+MC_r25_unrowed_no_adopt	fail	R25_StrictNoDurableReread	*	-
 MC_wp0d_check_rename	fail	NoClobber	*	-
 MC_neg_live_unfair	fail	RunsClose	*	-
 MC_neg_held_before_commit	fail	HeldAfterCommit	*	-
@@ -55,3 +57,5 @@ MC_neg_git_optional_locks	fail	S2_TypedSourceAccess	*	-
 MC_neg_unbounded_backup	fail	S2_BackupLockBounded	*	-
 MC_neg_supersede_unchecked	fail	NoClobber	*	-
 MC_neg_sweep_displaced	fail	NoClobber	*	-
+MC_neg_adopt_unkeyed	fail	ReuseSound	*	-
+MC_neg_adopt_unverified	fail	RecordImpliesBytes	*	-

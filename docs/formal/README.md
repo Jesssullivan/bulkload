@@ -181,23 +181,25 @@ generated counts and diameter equalled the table's ([Results
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
 | `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 4,785 | 15,753 | 9 | 8s | 589 |
-| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 869,296 | 2,825,196 | 51 | 117s | 1882 |
-| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 334,296 | 1,310,981 | 49 | 34s | 1742 |
-| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 181,785 | 504,315 | 52 | 22s | 1742 |
+| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 962,725 | 3,079,640 | 51 | 343s | 1887 |
+| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 431,705 | 1,673,110 | 49 | 183s | 1764 |
+| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 213,359 | 589,413 | 52 | 83s | 1709 |
 | `MC_nv_core` | {a} R3 C2 E1 sym budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 7s | 550 |
 | `MC_nv_ledger` | {a} R3 C2 E1 F1 sym budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 25s | 1632 |
-| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 496,830 | 1,430,743 | 74 | 64s | 1805 |
-| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 419,020 | 1,651,581 | 49 | 51s | 1712 |
-| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 70,086 | 186,977 | 51 | 8s | 1069 |
-| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 61,956 | 236,660 | 39 | 7s | 902 |
+| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 611,509 | 1,736,642 | 74 | 165s | 1842 |
+| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 545,184 | 2,131,897 | 49 | 74s | 1781 |
+| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 84,391 | 220,210 | 52 | 18s | 1249 |
+| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,296 | 243,534 | 39 | 19s | 831 |
 | `MC_live` | {a,b} R2 C0 E0 space sym budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 7s | 803 |
-| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space sym budget 600 s | simulate | **SIMULATION** | – | 1,147,363 | – | – | 36s | 1559 |
-| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 37,243 | 118,518 | 19 | 6s | 806 |
-| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,297 | 167,699 | 21 | 7s | 809 |
-| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 52,882 | 184,715 | 19 | 11s | 1297 |
+| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space sym budget 600 s | simulate | **SIMULATION** | – | 1,144,805 | – | – | 136s | 1554 |
+| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 36,763 | 117,233 | 19 | 31s | 764 |
+| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,821 | 168,972 | 21 | 43s | 788 |
+| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 60,191 | 203,887 | 19 | 56s | 1210 |
 | `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 771 | 1,436 | 18 | 3s | 333 |
 | `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 766 | 1,423 | 19 | 2s | 316 |
-| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 339 | 706 | 19 | 3s | 269 |
+| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held adopt budget 300 s | pass | **PASS** | – | 446 | 972 | 30 | 18s | 293 |
+| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held adopt budget 600 s | pass | **PASS** | – | 431,705 | 1,673,110 | 49 | 202s | 1770 |
+| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 436 | 952 | 30 | 16s | 344 |
 | `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,146 | 11,771 | 27 | 3s | 508 |
 | `MC_neg_live_unfair` | {a} R1 C0 E0 sym budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 2s | 285 |
 | `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 276 | 669 | 7 | 3s | 263 |
@@ -223,6 +225,8 @@ generated counts and diameter equalled the table's ([Results
 | `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 356 | 904 | 10 | 2s | 299 |
 | `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 267 | 420 | 12 | 2s | 288 |
 | `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 37,428 | 94,195 | 28 | 7s | 734 |
+| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 strict-held adopt mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,633 | 3,732 | 16 | 12s | 362 |
+| `MC_neg_adopt_unverified` | {a} R2 C0 E0 F1 X1 adopt mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,068 | 1,810 | 22 | 8s | 328 |
 
 Reading the table:
 
@@ -230,7 +234,8 @@ Reading the table:
   `F` third-party writes, `X` failed group commits; `space` the space
   refusal; `relaxed` relaxed ledger rows, `relaxed-auth` a relaxed
   store-creation commit; `unsealed-root` `StoreRootSealed = FALSE` (the code
-  today); `strict-held` `TrackStrictHeld`; `exchange` or `check_rename` the
+  today); `strict-held` `TrackStrictHeld`; `adopt` `AdoptUnrowed` (#169; shown on
+  the rows that set it apart from the default); `exchange` or `check_rename` the
   WP0(d) design; `estate` estate capture's typed reads; `mut=` the mutation;
   `sym` `SYMMETRY` over seats; `budget` the `WithinBudget` seconds.
 - **Distinct** is counted under symmetry where `sym` is shown. For
@@ -245,6 +250,15 @@ Reading the table:
 - **Violated** lists every property the log reports violated. A FAIL or
   REACHED row shows exactly its named property, never `TypeOK` and never a
   deadlock.
+- **Counts that moved on 2026-10-06 (#169).** `AdoptUnrowed` is on by
+  default (the code since #169), so the positive and reach rows outside the
+  N-version core grew: an output's capture record splits states, and a
+  third-party write may now rewrite an output in place. `MC_nv_core` and
+  `MC_nv_ledger` keep it off and still count 15,834 and 142,450. Rows
+  re-run on sting under a load average near 100 to 120 (`tla-check`, all
+  BulkloadTransfer rows matched); wall times are from that run. Fail rows
+  stop where their first violation is found, so their counts drifted and
+  are not updated here except the #169 rows.
 - **Counts that moved on 2026-10-04.** `MC_wp0g` has a new bound.
   `MC_wp0g_deep` grew from 354,580 to 419,020 distinct, because the ghost
   `ledgerLost` splits states that differ only in which rows a crash dropped;
@@ -480,7 +494,10 @@ actions and invariants inside its domain.
   `SilentRewrite`, `Tick`, `ForeignWrite`, `ForeignDelete`, the three
   crashes and `Terminated`. The other 10 are absent: `CommitFail`, WP0(d)'s
   four and estate capture's five. So are the space refusal, relaxed
-  stores, an unsealed state root and the strict-held ghost. Inside the
+  stores, an unsealed state root, the strict-held ghost and #169's capture
+  record (`AdoptUnrowed`): the explorer models the transfer before #169,
+  and the catalogue keeps `AdoptUnrowed = FALSE` on every row in its
+  domain, so its counts of record stand. Inside the
   domain, `NoClobber` and `S2_BackupLockBounded` hold by construction, in
   the spec as well as in the explorer: only absent actions set the state
   they read (`clobbered`, and the SQLite backup's lock and steps). The
@@ -646,6 +663,9 @@ copies reported the same count with 1 and 4 workers. This revision's spec
 changes leave it unchanged. The new ghost `ledgerLost` stays empty under a
 strict ledger. Unless `TrackStrictHeld` is set, the new field of an output
 record is always FALSE, and the new field of a read record equals `held`.
+Unless `AdoptUnrowed` is set (#169), an output's capture record is always
+`NoRecord` and no entry is adopted unrowed, so `MC_nv_core` still counts
+15,834 (re-checked 2026-10-06).
 
 The mutations `held_before_commit`, `commit_before_fsync` and
 `src_ledger_carries_r25` run on the same core as separate fail configs.
@@ -924,11 +944,11 @@ that test the same claim on the real code. SLOs are
 
 `TypeOK` is a sanity check. `WithinBudget` is the wall-clock bound.
 
-Not code-shape invariants, never checked by a pass row, and not frozen:
+Not frozen, and not the SLO's obligation (OI-1003-Q40):
 
 | Property | What it is for |
 |---|---|
-| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The code fails it (`MC_r25_unrowed_bytes`), which shows the gap between `R25_NoDurableReread` and the strict reading. |
+| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`); with the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`; [R25's strict reading](#r25s-strict-reading-169)). |
 | `Witness_LedgerManifest`, `Witness_LedgerChunkRead`, `Witness_LostRowRead` | Reachability witnesses ([Coverage](#coverage)): each says a scenario never happens, and its reach row must violate it. |
 
 docs/slo.md states R25's model obligation as "no committed capture is
@@ -954,8 +974,9 @@ Each negative config sets `Mutation` to break exactly one rule, and it must
 fail on the one property named in `configs.tsv`, with `TypeOK` checked
 alongside. Rows marked (core) run on `MC_nv_core`'s constants. The others use
 the smallest bound that reaches the break. `just formal-nv` also runs every
-row inside the Haskell explorer's domain, 17 of the 23, on the explorer
-([Hybrid roles](#hybrid-roles-oi-1003-q32)).
+row inside the Haskell explorer's domain, 17 of the 25, on the explorer
+([Hybrid roles](#hybrid-roles-oi-1003-q32)). The two #169 rows set
+`AdoptUnrowed`, which is outside that domain.
 
 | Mutation | What it breaks (the code it would undo) | Property that must fail |
 |---|---|---|
@@ -978,6 +999,8 @@ row inside the Haskell explorer's domain, 17 of the 23, on the explorer
 | `unbounded_backup` | the backup steps past `max_steps` (`provider_sqlite::snapshot`) | `S2_BackupLockBounded` |
 | `supersede_unchecked` | WP0(d) exchange without the identity check | `NoClobber` |
 | `sweep_displaced` | WP0(d) recovery deletes a displaced foreign file | `NoClobber` |
+| `adopt_unkeyed` | #169 adoption without the record's row-key check (`unrowed::prove`) | `ReuseSound` |
+| `adopt_unverified` | #169 adoption without hashing the output against its record (`unrowed::prove`) | `RecordImpliesBytes` |
 
 What the mutations showed:
 
@@ -1045,11 +1068,58 @@ The model proves the protocol, within its bounds. It does not prove:
   - a failed group whose files were already renamed;
   - a sealed salvaged temporary, which the model folds away.
 
-  `MC_r25_unrowed_bytes` makes this visible under the strict reading. Its
-  13-state counterexample: run 1 seals and publishes seat `a`. The
-  destination then loses power before the directory seal and the commit,
-  and the rename survives, so the bytes are durable at the final path with
-  no row. Run 2 reads `a` again.
+  `MC_r25_unrowed_no_adopt` (named `MC_r25_unrowed_bytes` before #169)
+  makes this visible under the strict reading. Its counterexample: run 1
+  seals and publishes seat `a`. The destination then loses power before
+  the directory seal and the commit, and the rename survives, so the bytes
+  are durable at the final path with no row. Run 2 reads `a` again. Since
+  #169 the code closes the first two cases with the capture record
+  ([R25's strict reading](#r25s-strict-reading-169)); a sealed salvaged
+  temporary is still folded away, and a record the file system could not
+  keep costs the counted re-read.
+
+## R25's strict reading (#169)
+
+OI-1003-Q40 keeps `R25_NoDurableReread` (a committed row proves the bytes
+held) as the SLO's obligation. #169 closes the strict gap in code, and the
+model follows it under the constant `AdoptUnrowed` (the code since #169):
+
+- **The capture record.** `A/transfer.rs publish` writes, on each non-racy
+  capture's staged file before its seal, an extended attribute naming the
+  capture: a digest of the source-side row key, the manifest root and the
+  size (`A/transfer/unrowed.rs write_record`). The group's file seal makes
+  it durable with the data. In the model it is the file's `rec` field, set
+  by `NewOut` at `Publish`.
+- **Adoption** (`RecvEntry`). An entry with no matching row whose existing
+  output's record names the entry's row key, and whose own bytes chunk and
+  hash to the recorded root, is answered `Reuse` and queued as an adopted
+  publication (`Inbound::adopt_unrowed`, `A/transfer/unrowed.rs prove`):
+  `SealAdopted` seals it before `Commit` records its row, and `AnswerHeld`
+  settles its outcome without a `Held` (the source was answered `Reuse`).
+  The source reads nothing.
+- **A third party** may rewrite an output in place, which keeps the record
+  over other bytes (`ForeignWrite`'s in-place choice); the hash check then
+  refuses the adoption.
+- **What is counted.** A record the file system cannot keep, a racy
+  capture's missing record and a failed hash check fall back to the
+  manifest path (a source read), counted as `transfer_unrowed_unproven` on
+  the counters line; not modelled, since each only costs that read.
+
+| Config | Expect | Verdict | Violated | Distinct | Generated | Depth |
+|---|---|---|---|---:|---:|---:|
+| `MC_r25_unrowed_bytes` (strict-held, `AdoptUnrowed`) | pass | **PASS** | – | 446 | 972 | 30 |
+| `MC_r25_unrowed_no_adopt` (the same bound before #169) | fail | **FAIL** | `R25_StrictNoDurableReread` | 436 | 952 | 30 |
+| `MC_r25_strict_deep` ({a} R3 C2 E1 F1 X1 space, strict-held) | pass | **PASS** | – | 431,705 | 1,673,110 | 49 |
+| `MC_neg_adopt_unkeyed` (no row-key check) | fail | **FAIL** | `ReuseSound` | 1,633 | 3,732 | 16 |
+| `MC_neg_adopt_unverified` (no hash check) | fail | **FAIL** | `RecordImpliesBytes` | 1,068 | 1,810 | 22 |
+
+Fail rows' counts are where the search stopped. Every other row keeps its
+expectation; the positive rows other than the N-version core now model the
+code since #169 (`AdoptUnrowed = TRUE` by default), so their counts moved
+(Results). The Rust proofs of the same claim: the power-loss trace
+`materialize::adoption_power_loss::an_unrowed_output_is_adopted_without_source_reads`
+(`just resume-power-loss`) and P74 R25-STRICT-ADOPT
+(`transfer::tests::p74_unrowed_outputs_are_adopted_without_source_reads`).
 
 ## Code and design disagreements
 
@@ -1079,9 +1149,11 @@ The model follows the code where the code and docs/design.md differ:
     count as held.
   - #154 implemented that ruling and closed #124 on 2026-10-04.
 
-  Under the strict reading the code re-reads durable bytes that have no row
-  (`MC_r25_unrowed_bytes`; [Not proven here](#not-proven-here)). Until a
-  ruling settles it, every R25 result here is for the narrowed reading.
+  Under the strict reading the code before #169 re-read durable bytes that
+  have no row (`MC_r25_unrowed_no_adopt`; [Not proven here](#not-proven-here)).
+  OI-1003-Q40 (2026-10-04) made the committed-row reading the SLO's
+  obligation. Since #169 the strict reading also holds in the model
+  (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`).
 - **PR #154 merged on 2026-10-04** (`4a7b86b`, after the code this model
   describes; `fix(transfer): bounded salvage …; distrust pre-racy-guard
   rows`). It implements OI-1003-Q24 (salvage bounds: 1024 temporaries and
@@ -1547,8 +1619,11 @@ GitCarry.tla's names (the module, its properties, mutations, constants and
 configs) are new and not frozen; freezing them needs a ruling.
 
 The names this revision adds are not frozen: `R25_StrictNoDurableReread`,
-the `Witness_` invariants, the constants `StoreRootSealed` and
-`TrackStrictHeld`, the ghost `ledgerLost`, and the configs `MC_nv_ledger`,
-`MC_reach_*`, `MC_store_root_unsealed`, `MC_r25_unrowed_bytes`,
+the `Witness_` invariants, the constants `StoreRootSealed`,
+`TrackStrictHeld` and `AdoptUnrowed` (#169), the mutations `adopt_unkeyed`
+and `adopt_unverified` (#169), the ghost `ledgerLost`, and the configs
+`MC_nv_ledger`, `MC_reach_*`, `MC_store_root_unsealed`,
+`MC_r25_unrowed_bytes`, `MC_r25_unrowed_no_adopt`, `MC_r25_strict_deep`,
+`MC_neg_adopt_unkeyed`, `MC_neg_adopt_unverified`,
 `MC_neg_reread_ignore_ledger` and `MC_neg_reread_exchange`. Freezing
 `MC_nv_ledger` as the second N-version row needs a ruling.

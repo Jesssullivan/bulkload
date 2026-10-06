@@ -44,6 +44,8 @@ let Mutation =
       | unbounded_backup
       | supersede_unchecked
       | sweep_displaced
+      | adopt_unkeyed
+      | adopt_unverified
       >
 
 {- Model properties a config can name: the frozen safety invariants, the
@@ -139,6 +141,7 @@ let Constants =
       , BudgetSeconds : Natural
       , StoreRootSealed : Bool
       , TrackStrictHeld : Bool
+      , AdoptUnrowed : Bool
       }
 
 {- What a row expects, and only what that expectation needs:
@@ -207,7 +210,9 @@ let InvariantRow =
      is the sanity check. Every pass row checks all of them, and every one
      but TypeOK must have a fail row and a traceability row.
    - budget: the wall-clock bound (WithinBudget), checked by every config.
-   - finding: checked only by a finding row (R25's strict reading).
+   - finding: R25's strict reading, beside the safety invariants: checked
+     by its finding row (the code before #169) and by the pass rows that
+     model #169's capture-record adoption.
    - temporal: a temporal property, checked under PROPERTY.
 -}
 let PropertyClass = < safety | budget | finding | temporal >
@@ -374,6 +379,8 @@ let mutationIndex =
           , unbounded_backup = 16
           , supersede_unchecked = 17
           , sweep_displaced = 18
+          , adopt_unkeyed = 19
+          , adopt_unverified = 20
           }
           m
 
