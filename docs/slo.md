@@ -179,11 +179,13 @@ as properties.
   counted and recorded in S2 evidence. The main database and its `-wal` must
   stay byte-identical, and a property test asserts that no other source
   write occurs.
-- **2026-10-06, S2 wal-index implemented (OI-1003-Q36, #157).** The counter
-  is `source_wal_index_touched`, on every counters line and in S2 evidence
-  (`s2_budget.py`). P75 SQLITE-SHM-EXCEPTION is the property. A WAL-mode
-  source with no `-wal` is read with `immutable=1`, because a WAL-aware open
-  would also create an empty `-wal`, a write Q36 does not cover.
+- **2026-10-06, S2 wal-index counter (OI-1003-Q36, #157; on branch
+  `feat/s2-shm-counter-20261006`, not merged).** The counter is
+  `source_wal_index_touched`, on every counters line and in S2 evidence
+  (`s2_budget.py`). It adds 1 for each WAL-aware snapshot that leaves a
+  `-shm` beside its source, whether or not the file's bytes changed: such a
+  read always opens the wal-index read-write, maps it and locks it. P75
+  SQLITE-SHM-EXCEPTION is the property.
 
 ## Amendments 2026-10-04: WP0(g) adopted, and the R25 reading (OI-1003-Q37, Q40)
 

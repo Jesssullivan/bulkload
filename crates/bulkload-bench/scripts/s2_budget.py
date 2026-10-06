@@ -120,7 +120,9 @@ Gated S2 runs are separate from the S1 gate (OI-1003-Q34).
 
 SQLite wal-index (OI-1003-Q36). A provider SQLite snapshot may create or
 touch its source's `<db>-shm`, S2's one stated source write; bulkload counts
-it as `source_wal_index_touched` on every counters line. Each ON run records
+it as `source_wal_index_touched` on every counters line: 1 for each
+WAL-aware snapshot that leaves a `-shm` beside its source, whether or not
+the file's bytes changed. Each ON run records
 the sum over its counters lines (`source_wal_index_touched`, None when no
 line reports it), and the verdict records the total and how many runs
 reported it. In evidence mode an ON run that does not report the counter is

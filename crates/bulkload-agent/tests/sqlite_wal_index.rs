@@ -6,6 +6,11 @@
 //! byte-identical, the effect is counted (`source_wal_index_touched`) and
 //! recorded in S2 evidence, and no other source write occurs.
 //!
+//! "Touch" is read widely. A WAL-aware connection opens the wal-index
+//! read-write, maps it shared and takes `fcntl` locks on it even when it
+//! leaves every byte as it was, so the counter is 1 for every WAL-aware
+//! snapshot that leaves a `-shm` beside its source, changed or not.
+//!
 //! Over generated WAL-mode source databases (page size, committed rows,
 //! frames still in the `-wal`), in five shapes that cover a wal-index present
 //! or absent and a live writer present or absent:
@@ -18,20 +23,24 @@
 //! | `CrashedNoShm` | no, and the wal-index is gone | no | yes, with any frames |
 //! | `CleanClosed` | no: checkpointed and closed | no | no |
 //!
-//! [`check`] asserts on every case that `provider_sqlite::snapshot`:
+//! [`check`] snapshots every case twice in a row ([`ROUNDS`]) and asserts on
+//! each round that `provider_sqlite::snapshot`:
 //! - succeeds and captures exactly the committed rows;
 //! - leaves every entry of the source directory other than `<db>-shm` as it
 //!   was: the main file and `-wal` byte-identical with the same identity,
 //!   size, mode and timestamps (mtime and ctime), and no entry created or
 //!   removed;
-//! - adds to `source_wal_index_touched` exactly the number of `-shm` files it
-//!   created or touched (0 or 1): one that appeared, or one whose identity,
-//!   size, timestamps or bytes changed. `CrashedNoShm` creates it, and the
-//!   quiescent shapes (`LiveIdleNoShm`, `CleanClosed`) are read with
-//!   `immutable=1` and touch nothing;
-//! - takes no lock that outlives its bounded shared read: right after it
-//!   returns, a writer commits with a zero busy timeout (the live writer
-//!   itself where there is one).
+//! - adds to `source_wal_index_touched` the value the shape fixes, an oracle
+//!   that does not share the implementation's observation: 1 for the three
+//!   shapes with a `-wal` (`LiveWithShm`, `CrashedWithShm`, `CrashedNoShm`),
+//!   whose read is WAL-aware, on the first snapshot and again on the second,
+//!   whether or not the `-shm` bytes moved; 0 for the quiescent shapes
+//!   (`LiveIdleNoShm`, `CleanClosed`), which leave no `-shm` at all;
+//! - leaves a `-shm` beside the source exactly when it counted one.
+//!
+//! After the last round it takes no lock that outlives its bounded shared
+//! read: a writer commits with a zero busy timeout (the live writer itself
+//! where there is one).
 //!
 //! The live writer is a child process (this test binary re-run as
 //! [`p75_writer_child`]) so that its POSIX locks are its own: the snapshot's
@@ -45,8 +54,9 @@
 //! is process scope, so every snapshot in this binary runs inside the one
 //! test that reads it; [`the_counters_line_reports_the_wal_index`] runs the
 //! `snapshot` verb as its own process and reads its `counters` line. Each
-//! case prints a `p75 shape=<shape> ... source_wal_index_touched=<n>` line
-//! (`--nocapture`).
+//! round prints a `p75 shape=<shape> round=<n> ...
+//! source_wal_index_touched=<n> shm=<created|changed|same|absent>` line
+//! (`--nocapture`); `same` is a counted read that left the bytes alone.
 
 #![allow(
     clippy::unwrap_used,
@@ -472,7 +482,11 @@ fn captured(output: &Path) -> Vec<Vec<u8>> {
     rows
 }
 
-/// Snapshot one generated source and assert P75 on it.
+/// Consecutive snapshots of one source. The second pins the counter for a
+/// read that finds the wal-index already as it needs it.
+const ROUNDS: usize = 2;
+
+/// Snapshot one generated source [`ROUNDS`] times and assert P75 on each.
 fn check(case: &Case) {
     let root = tempfile::Builder::new()
         .prefix("bulkload-p75-")
@@ -480,64 +494,77 @@ fn check(case: &Case) {
         .unwrap();
     let source = build(root.path(), case);
     let out = private_dir(&root.path().join("out"));
-    let output = out.join("snapshot.sqlite");
     let shm_name = sidecar(Path::new(source.database.file_name().unwrap()), "-shm");
-
-    let before = scan(&source.dir);
-    let counted = Counters::snapshot();
-    let outcome = snapshot(&source.database, &output, 10_000);
-    let touched = Counters::snapshot()
-        .since(counted)
-        .get(Counter::SourceWalIndexTouched);
-    let after = scan(&source.dir);
-
     let shape = case.shape;
-    assert!(outcome.is_ok(), "{shape:?}: {outcome:?}");
     let expected: Vec<Vec<u8>> = case.base.iter().chain(&case.pending).cloned().collect();
-    assert!(captured(&output) == expected, "{shape:?}: captured rows");
+    // Fixed by the shape, not observed: a source with a `-wal` is read
+    // WAL-aware, which opens, maps and locks the wal-index every time.
+    let counted_reads = u64::from(shape.wal());
 
-    // No source write but the wal-index.
-    for name in before.keys().chain(after.keys()) {
-        if name.as_os_str() == shm_name.as_os_str() {
-            continue;
-        }
+    let mut before = scan(&source.dir);
+    for round in 0..ROUNDS {
+        let output = out.join(format!("snapshot-{round}.sqlite"));
+        let counted = Counters::snapshot();
+        let outcome = snapshot(&source.database, &output, 10_000);
+        let touched = Counters::snapshot()
+            .since(counted)
+            .get(Counter::SourceWalIndexTouched);
+        let after = scan(&source.dir);
+
+        assert!(outcome.is_ok(), "{shape:?} round {round}: {outcome:?}");
         assert!(
-            before.get(name) == after.get(name),
-            "{shape:?}: {} changed: {:?} -> {:?}",
-            name.display(),
-            before
-                .get(name)
-                .map(|entry| (entry.size, entry.mtime, entry.ctime)),
-            after
-                .get(name)
-                .map(|entry| (entry.size, entry.mtime, entry.ctime)),
+            captured(&output) == expected,
+            "{shape:?} round {round}: captured rows"
         );
-    }
 
-    // The counter is the wal-index files created or touched.
-    let shm = (
-        before.get(shm_name.as_os_str()),
-        after.get(shm_name.as_os_str()),
-    );
-    let observed = u64::from(match shm {
-        (None, Some(_)) => true,
-        (Some(old), Some(new)) => old != new,
-        (_, None) => false,
-    });
-    assert_eq!(touched, observed, "{shape:?}: source_wal_index_touched");
-    println!(
-        "p75 shape={shape:?} page_size={} base={} pending={} source_wal_index_touched={touched}",
-        case.page_size,
-        case.base.len(),
-        case.pending.len()
-    );
-    match shape {
-        Shape::CrashedNoShm => assert_eq!(touched, 1, "{shape:?} creates the wal-index"),
-        Shape::LiveIdleNoShm | Shape::CleanClosed => {
-            assert_eq!(touched, 0, "{shape:?} is read immutable");
-            assert!(shm.1.is_none(), "{shape:?} creates no wal-index");
+        // No source write but the wal-index.
+        for name in before.keys().chain(after.keys()) {
+            if name.as_os_str() == shm_name.as_os_str() {
+                continue;
+            }
+            assert!(
+                before.get(name) == after.get(name),
+                "{shape:?} round {round}: {} changed: {:?} -> {:?}",
+                name.display(),
+                before
+                    .get(name)
+                    .map(|entry| (entry.size, entry.mtime, entry.ctime)),
+                after
+                    .get(name)
+                    .map(|entry| (entry.size, entry.mtime, entry.ctime)),
+            );
         }
-        Shape::LiveWithShm | Shape::CrashedWithShm => {}
+
+        // The counter is every WAL-aware read that left a wal-index.
+        let shm = match (
+            before.get(shm_name.as_os_str()),
+            after.get(shm_name.as_os_str()),
+        ) {
+            (None, Some(_)) => "created",
+            (Some(old), Some(new)) if old != new => "changed",
+            (Some(_), Some(_)) => "same",
+            (_, None) => "absent",
+        };
+        println!(
+            "p75 shape={shape:?} round={round} page_size={} base={} pending={} \
+             source_wal_index_touched={touched} shm={shm}",
+            case.page_size,
+            case.base.len(),
+            case.pending.len()
+        );
+        assert_eq!(
+            touched, counted_reads,
+            "{shape:?} round {round}: source_wal_index_touched (shm {shm})"
+        );
+        assert_eq!(
+            shm != "absent",
+            counted_reads == 1,
+            "{shape:?} round {round}: a `-shm` sits beside the source exactly when one is counted"
+        );
+        if round == 0 && shape == Shape::CrashedNoShm {
+            assert_eq!(shm, "created", "{shape:?} creates the wal-index");
+        }
+        before = after;
     }
 
     // No lock outlives the read: a writer commits at once.

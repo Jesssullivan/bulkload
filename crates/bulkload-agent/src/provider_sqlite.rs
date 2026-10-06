@@ -48,20 +48,49 @@ fn mapped_rollout_path(path: &Path, mapping: &PathMapping<'_>) -> std::path::Pat
 /// returns immediately. The caller may retry with a *new* output path.
 ///
 /// The source is opened read-only using normal WAL-aware `SQLite` access. Its
-/// one write is the wal-index (`<db>-shm`), counted as
-/// `source_wal_index_touched` (S2, OI-1003-Q36); the main file and `-wal`
-/// stay byte-identical. A WAL-mode database with no `-wal` is the one
-/// exception to WAL-aware access: it is read with `immutable=1`, and refused
-/// as changed unless its main file kept its identity and no `-wal` appeared
-/// (`Footprint`). The output must not exist. On failure an incomplete
-/// private output may remain; only a successful return authorizes its use as
-/// a snapshot. Neither failure nor success removes source data.
+/// one write is the wal-index (`<db>-shm`), which the connection opens
+/// read-write, maps and locks. Every such read that leaves a `-shm` beside
+/// the source is counted as `source_wal_index_touched` (S2, OI-1003-Q36),
+/// whether or not the file's bytes moved; the main file and `-wal` stay
+/// byte-identical.
+///
+/// **Pending an operator decision (no ruling yet).** A WAL-mode database with
+/// no `-wal` is the one exception to WAL-aware access: it is read through the
+/// backup API from an `immutable=1` connection, because a WAL-aware open
+/// would create an empty `-wal`, a source write OI-1003-Q36 does not cover.
+/// That read takes no lock at all, so OI-1003-Q16's shared read lock does not
+/// protect it. It is refused as changed unless, after the read, the main
+/// file kept its device, inode, size, mtime and ctime and no `-wal` appeared
+/// (`Footprint`).
+///
+/// *Residual of that check.* It compares metadata, not content. A writer
+/// that opens, writes, checkpoints and closes entirely within the read, and
+/// within one timestamp tick of the main file's previous write, leaving its
+/// size the same, moves nothing the check compares. Such a snapshot may be
+/// torn and is still accepted unless `quick_check` happens to catch it. The
+/// window is narrow and was not reproduced; it is open, not closed.
+///
+/// The output must not exist. On failure an incomplete private output may
+/// remain; only a successful return authorizes its use as a snapshot.
+/// Neither failure nor success removes source data.
 ///
 /// # Errors
 /// Refuses non-private output directories, existing outputs, exhausted step
 /// budgets, `SQLite` errors, a quiescent source that changed during the read,
 /// and failed database or foreign-key integrity checks.
 pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
+    snapshot_then(source, output, max_steps, || {})
+}
+
+/// [`snapshot`], with `after_read` run once the source connection is closed
+/// and before the footprint is settled. Tests use it to act on the source
+/// during a read; the product passes a no-op.
+fn snapshot_then(
+    source: &Path,
+    output: &Path,
+    max_steps: u32,
+    after_read: impl FnOnce(),
+) -> Result<()> {
     if max_steps == 0 {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
@@ -72,6 +101,7 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     }
     let footprint = Footprint::observe(source);
     let copied = copy_source(&footprint, source, output, max_steps);
+    after_read();
     // The source connection is closed: settle what the read left beside it,
     // whether or not the copy succeeded.
     let settled = footprint.settle();
@@ -174,62 +204,42 @@ impl Identity {
     }
 }
 
-/// A wal-index as a plain read sees it: its identity and its bytes. The bytes
-/// are compared because a connection writes the wal-index through a shared
-/// mapping, which need not move its timestamps.
-#[derive(Debug, PartialEq, Eq)]
-struct WalIndex {
-    identity: Identity,
-    bytes: Vec<u8>,
-}
-
-impl WalIndex {
-    /// The wal-index at `path`, or `None` when there is none to observe.
-    fn observe(path: &Path) -> Option<Self> {
-        let metadata = fs::symlink_metadata(path).ok()?;
-        let bytes = if metadata.is_file() {
-            fs::read(path).ok()?
-        } else {
-            Vec::new()
-        };
-        Some(Self {
-            identity: Identity::of(&metadata),
-            bytes,
-        })
-    }
-}
-
 /// What a snapshot's read leaves beside its source database (S2; OI-1003-Q16,
 /// OI-1003-Q36, P75).
 ///
-/// - **WAL-aware read.** A read-only connection to a WAL-mode database maps
-///   its wal-index (`<db>-shm`) read-write. It creates the file when no live
-///   connection has, and rebuilds it from the `-wal` when none holds it. That
-///   is the one stated source write (OI-1003-Q36): [`Footprint::settle`]
-///   counts it as `source_wal_index_touched` when the file appeared or its
-///   identity or bytes changed. The main file and `-wal` are only read.
-/// - **Quiescent WAL database.** A WAL-mode database with no `-wal` holds all
-///   of its content in the main file: it was checkpointed and closed, or its
-///   writer has not read it yet. A WAL-aware open would create an empty
-///   `-wal` as well as the wal-index, a source write OI-1003-Q36 does not
-///   cover. It is read with `immutable=1` instead: no lock, no sidecar. A
-///   writer appending to the WAL leaves the main file alone until a
-///   checkpoint, so the read is refused as changed
+/// - **WAL-aware read.** A read-only connection to a WAL-mode database opens
+///   its wal-index (`<db>-shm`) read-write, maps it shared and takes `fcntl`
+///   locks on it. It creates the file when no live connection has, and
+///   rebuilds it from the `-wal` when none holds it; beside a live writer it
+///   often leaves every byte as it was. That is the one stated source write
+///   (OI-1003-Q36), and [`Footprint::settle`] counts each such read as
+///   `source_wal_index_touched` when a `-shm` sits beside the source after
+///   it, changed or not. Comparing the file before and after would report 0
+///   for most reads beside a live writer, which reads as "not touched" when
+///   the file was opened, mapped and locked. The main file and `-wal` are
+///   only read.
+/// - **Quiescent WAL database (pending an operator decision).** A WAL-mode
+///   database with no `-wal` holds all of its content in the main file: it
+///   was checkpointed and closed, or its writer has not read it yet. A
+///   WAL-aware open would create an empty `-wal` as well as the wal-index, a
+///   source write OI-1003-Q36 does not cover. It is read with `immutable=1`
+///   instead: no lock, no sidecar. A writer appending to the WAL leaves the
+///   main file alone until a checkpoint, so the read is refused as changed
 ///   (`SQLITE_STATE_CHANGED`) unless, after it, the main file kept its
-///   identity and timestamps and no `-wal` appeared.
+///   identity and timestamps and no `-wal` appeared. That check is metadata
+///   only; [`snapshot`] states what it cannot see.
 ///
-/// Observations are plain file reads, made only while this process holds no
-/// connection to the source: closing any descriptor of a file drops every
-/// POSIX lock the process holds on it, `SQLite`'s included. Sidecars sit
-/// beside the resolved path, as `SQLite` resolves symbolic links.
+/// The main file's header is a plain file read, made only while this process
+/// holds no connection to the source: closing any descriptor of a file drops
+/// every POSIX lock the process holds on it, `SQLite`'s included. The
+/// sidecars are only `lstat`ed. They sit beside the resolved path, as
+/// `SQLite` resolves symbolic links.
 struct Footprint {
     database: PathBuf,
     wal: PathBuf,
     shm: PathBuf,
     /// The main file's identity, for a quiescent WAL database.
     quiescent: Option<Identity>,
-    /// The wal-index before the read, for a WAL-aware one.
-    before: Option<WalIndex>,
 }
 
 impl Footprint {
@@ -238,17 +248,11 @@ impl Footprint {
         let wal = sidecar(&database, "-wal");
         let shm = sidecar(&database, "-shm");
         let quiescent = quiescent(&database, &wal);
-        let before = if quiescent.is_some() {
-            None
-        } else {
-            WalIndex::observe(&shm)
-        };
         Self {
             database,
             wal,
             shm,
             quiescent,
-            before,
         }
     }
 
@@ -265,9 +269,9 @@ impl Footprint {
         }
     }
 
-    /// Count the wal-index a WAL-aware read created or touched, or refuse a
-    /// quiescent read whose database moved under it. Call it once the source
-    /// connection is closed.
+    /// Count a WAL-aware read that left a wal-index beside its source, or
+    /// refuse a quiescent read whose database moved under it. Call it once
+    /// the source connection is closed.
     fn settle(self) -> Result<()> {
         if let Some(identity) = self.quiescent {
             let kept = fs::metadata(&self.database)
@@ -280,8 +284,11 @@ impl Footprint {
                 Err(BulkloadRefusal::SqliteStateChanged)
             };
         }
-        let after = WalIndex::observe(&self.shm);
-        if after.is_some() && after != self.before {
+        // The read was WAL-aware. With a `-shm` beside the source, `SQLite`
+        // opened it read-write, mapped it and locked it, whatever its bytes
+        // are now. Without one there was no wal-index to touch (a
+        // rollback-journal database).
+        if fs::symlink_metadata(&self.shm).is_ok() {
             counters::bump(Counter::SourceWalIndexTouched);
         }
         Ok(())
@@ -1089,6 +1096,209 @@ mod tests {
             fs::remove_file(file)?;
         }
         fs::remove_dir(dir)?;
+        Ok(())
+    }
+
+    /// A private directory holding a checkpointed, closed WAL-mode database:
+    /// no `-wal`, no `-shm`. Its main file's mtime is set far in the past, so
+    /// that any later write moves it whatever the timestamp granularity.
+    fn quiescent_fixture() -> std::result::Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bulkload-footprint-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let database = dir.join("state.sqlite");
+        let connection = Connection::open(&database)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+             INSERT INTO t(payload) VALUES (x'0102');",
+        )?;
+        connection.close().map_err(|(_, error)| error)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&database)?
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000))?;
+        assert!(!sidecar(&database, "-wal").exists());
+        assert!(!sidecar(&database, "-shm").exists());
+        Ok((dir, database))
+    }
+
+    /// One committed row from a writer that then checkpoints and closes, as
+    /// a provider that opens per transaction does. It leaves no sidecar.
+    fn write_checkpoint_close(database: &Path) -> rusqlite::Result<()> {
+        let writer = Connection::open(database)?;
+        writer.execute("INSERT INTO t(payload) VALUES (x'03')", [])?;
+        writer.close().map_err(|(_, error)| error)
+    }
+
+    #[test]
+    fn a_quiescent_read_of_a_still_database_settles(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        assert!(footprint.quiescent.is_some());
+        assert!(matches!(footprint.settle(), Ok(())));
+        // The whole snapshot, with nothing acting on the source.
+        assert!(matches!(
+            snapshot(&database, &dir.join("still.sqlite"), 100),
+            Ok(())
+        ));
+        assert!(!sidecar(&database, "-wal").exists());
+        assert!(!sidecar(&database, "-shm").exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_wal_database_with_no_wal_is_quiescent(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (dir, database) = quiescent_fixture()?;
+        // A `-wal` beside it: read WAL-aware.
+        let writer = Connection::open(&database)?;
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO t(payload) VALUES (x'04');")?;
+        assert!(sidecar(&database, "-wal").exists());
+        assert!(Footprint::observe(&database).quiescent.is_none());
+        writer.close().map_err(|(_, error)| error)?;
+        // A rollback-journal database: read as before.
+        let rollback = dir.join("rollback.sqlite");
+        let connection = Connection::open(&rollback)?;
+        connection.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);")?;
+        connection.close().map_err(|(_, error)| error)?;
+        assert!(Footprint::observe(&rollback).quiescent.is_none());
+        // No database at all.
+        assert!(Footprint::observe(&dir.join("absent.sqlite"))
+            .quiescent
+            .is_none());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_quiescent_read_is_refused_when_a_wal_appeared(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // A bare `-wal` file.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        fs::write(sidecar(&database, "-wal"), b"")?;
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        fs::remove_dir_all(dir)?;
+
+        // A writer that commits and stays open: its frames are in the
+        // `-wal`, and the main file has not moved.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        let identity = footprint.quiescent;
+        let writer = Connection::open(&database)?;
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO t(payload) VALUES (x'03');")?;
+        assert!(sidecar(&database, "-wal").exists());
+        assert_eq!(
+            identity,
+            Some(Identity::of(&fs::metadata(&database)?)),
+            "the `-wal` alone is what refuses this read"
+        );
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        writer.close().map_err(|(_, error)| error)?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_quiescent_read_is_refused_when_the_main_file_moved(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Rewritten in place with the same bytes: only its timestamps move.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        let bytes = fs::read(&database)?;
+        fs::write(&database, &bytes)?;
+        assert_eq!(fs::read(&database)?, bytes);
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        fs::remove_dir_all(dir)?;
+
+        // Replaced by a copy with the same bytes and mtime: another inode.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        let copy = dir.join("copy.sqlite");
+        fs::copy(&database, &copy)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&copy)?
+            .set_modified(fs::metadata(&database)?.modified()?)?;
+        fs::rename(&copy, &database)?;
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        fs::remove_dir_all(dir)?;
+
+        // Removed.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        fs::remove_file(&database)?;
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        fs::remove_dir_all(dir)?;
+
+        // A writer that commits, checkpoints and closes: no sidecar is left,
+        // and the checkpoint wrote the main file.
+        let (dir, database) = quiescent_fixture()?;
+        let footprint = Footprint::observe(&database);
+        write_checkpoint_close(&database)?;
+        assert!(!sidecar(&database, "-wal").exists());
+        assert!(matches!(
+            footprint.settle(),
+            Err(BulkloadRefusal::SqliteStateChanged)
+        ));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_refuses_a_quiescent_source_written_during_its_read(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // The writer checkpoints and closes before the read is settled.
+        let (dir, database) = quiescent_fixture()?;
+        let mut wrote = None;
+        let outcome = snapshot_then(&database, &dir.join("torn.sqlite"), 100, || {
+            wrote = Some(write_checkpoint_close(&database));
+        });
+        assert!(matches!(wrote, Some(Ok(()))));
+        assert!(matches!(outcome, Err(BulkloadRefusal::SqliteStateChanged)));
+        fs::remove_dir_all(dir)?;
+
+        // The writer commits and is still open when the read is settled.
+        let (dir, database) = quiescent_fixture()?;
+        let mut writer = None;
+        let outcome = snapshot_then(&database, &dir.join("stale.sqlite"), 100, || {
+            writer = Connection::open(&database).ok().filter(|writer| {
+                writer
+                    .execute_batch(
+                        "PRAGMA wal_autocheckpoint=0; INSERT INTO t(payload) VALUES (x'03');",
+                    )
+                    .is_ok()
+            });
+        });
+        assert!(writer.is_some());
+        assert!(matches!(outcome, Err(BulkloadRefusal::SqliteStateChanged)));
+        drop(writer);
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
