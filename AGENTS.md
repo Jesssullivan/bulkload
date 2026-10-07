@@ -190,5 +190,15 @@ are mandatory and never move to the optional tier.
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.
 CI note (R-N122): the W7 fault harness (`just fault-harness`) runs as its own
-`fault-harness` terminal gate, parallel to `source`, `build` and `test`.
+`fault-harness` terminal gate, parallel to `source`. PR CI runs exactly
+those two gates: OI-1003-Q65 (2026-10-06) dropped the Bazel `build` and
+`test` gates. They built the docs filegroup `//:bulkload` and ran the two
+Python contract tests (`//:tests`); neither compiled Rust. `ci-source` now
+runs those tests directly (`contract-test`). Residual gap: no PR loads the
+Bazel graph (bzlmod and `rules_python` resolution, the `//:bulkload` globs,
+the `//:tests` sandbox). `just test-local` (in `check-optional`) runs only
+`//:tests`; `just check` and `just ci` run both targets; none is a PR gate.
+The contract test pins `MODULE.bazel` and checks that `ci_contract_test`
+data lists every file it reads. Changing the workflow updates
+`WORKFLOW_SHA256` in `tests/test_ci_contract.py`.
 Stage explicit paths.

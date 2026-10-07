@@ -20,6 +20,15 @@ use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
 pub mod chain;
+pub mod decide;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod decide_tests;
 pub mod estimate;
 mod raw_tree;
 mod ref_table;
@@ -1628,12 +1637,10 @@ fn export_pass(
     }
     mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    // A plan base wins; otherwise a retained capture's source-held tips are
-    // the prerequisites (WP2); otherwise the bundle is self-contained.
-    let (pack, chained) = match (options.prerequisite, options.chain) {
-        (None, Some(prior)) => shared::write_chained(&private, &bundle, repo, prior)?,
-        (base, _) => (shared::write_bundle(&private, &bundle, base)?, false),
-    };
+    // The decision core decides what the bundle depends on (OI-1003-Q43),
+    // from the offer (a plan base, a link to chain on) and this pass's source.
+    let offer = shared::Offer::of(options.prerequisite, options.chain, repo);
+    let (pack, chained) = shared::write_capture(&private, &bundle, offer, shared::HEADER_CAP)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
     mid_pass::fire(repo, mid_pass::Stage::AfterPass);
@@ -2269,8 +2276,11 @@ pub struct ExportOptions<'a> {
     pub planned: &'a [PathBuf],
     /// A retained capture bundle of this checkout whose source-held tips
     /// become this bundle's prerequisites, so only what is new since it is
-    /// packed (WP2, see [`chain`]). Ignored when `prerequisite` is set. The
-    /// caller owns the chain's custody and depth bound.
+    /// packed (WP2, see [`chain`]). Whether they do is the decision core's
+    /// ([`decide::decide`]): under v1's policy a plan base (`prerequisite`)
+    /// wins, and a shallow source, or one that holds none of its tips, gets
+    /// a self-contained bundle. The caller owns the chain's custody and
+    /// depth bound.
     pub chain: Option<&'a Path>,
 }
 
