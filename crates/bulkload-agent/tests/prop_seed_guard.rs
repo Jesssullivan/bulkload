@@ -45,7 +45,10 @@
 //! through a macro or an alias that hides every spelling above.
 //!
 //! Two files are never scanned: the helper itself and this guard, whose test
-//! inputs spell the patterns it refuses.
+//! inputs spell the patterns it refuses. The helper is held another way
+//! (OI-1003-Q78): its tier is a parameter, so the guard asks it for both
+//! tiers and requires the fixed seed in each, and its source may name a seed
+//! on exactly one line, the fixed one (`helper_findings`).
 //!
 //! [`EXEMPT`] names the files that still escape, each with its exact finding
 //! count. The list only shrinks: a file that is fixed must leave it (or lower
@@ -387,18 +390,106 @@ fn the_exemption_list_only_shrinks() {
     }
 }
 
+/// The seed is fixed in every tier (OI-1003-Q78): the deep tier only
+/// multiplies the case count. The PR gate never sets the deep switch, so
+/// both tiers are asked for by name here; a helper whose deep tier draws a
+/// random seed fails in the PR gate, not only under `just props-deep`.
 #[test]
-fn the_helper_fixes_the_seed_and_persists_nothing() {
+fn the_helper_fixes_the_seed_in_both_tiers_and_persists_nothing() {
+    let fixed = proptest::test_runner::RngSeed::Fixed(test_support::CI_SEED);
+    for (deep, cases) in [(false, 7), (true, 140)] {
+        let config = test_support::prop_config_for(7, deep);
+        assert!(config.failure_persistence.is_none(), "deep={deep}");
+        assert_eq!(config.rng_seed, fixed, "deep={deep}");
+        assert_eq!(config.cases, cases, "deep={deep}");
+    }
+    // What properties call: the same configuration, in this process's tier.
     let config = test_support::prop_config(7);
     assert!(config.failure_persistence.is_none());
-    let deep = std::env::var_os(test_support::DEEP).is_some_and(|value| value == "1");
-    if deep {
-        assert_eq!(config.cases, 140);
-    } else {
-        assert_eq!(config.cases, 7);
-        assert_eq!(
-            config.rng_seed,
-            proptest::test_runner::RngSeed::Fixed(test_support::CI_SEED)
+    assert_eq!(config.rng_seed, fixed);
+    assert_eq!(config.cases, if test_support::deep() { 140 } else { 7 });
+}
+
+/// The one line of the helper that may name a seed.
+const HELPER_SEED: &str = "rng_seed: RngSeed::Fixed(CI_SEED),";
+
+/// What is wrong with the helper's own source. The workspace scan skips the
+/// helper, so this reads it: one config literal, whose seed line is
+/// [`HELPER_SEED`] and whose persistence is off, no second seed anywhere and
+/// no random one. Comment lines are skipped, as in the scan.
+fn helper_findings(text: &str) -> Vec<&'static str> {
+    let code: Vec<&str> = text
+        .lines()
+        .filter(|line| !is_comment(line))
+        .map(str::trim)
+        .collect();
+    let holding = |word: &str| -> Vec<&str> {
+        code.iter()
+            .copied()
+            .filter(|line| line.contains(word))
+            .collect()
+    };
+    let mut found = Vec::new();
+    if holding("rng_seed") != [HELPER_SEED] || holding("RngSeed::") != [HELPER_SEED] {
+        found.push("the helper names a seed other than its one fixed seed");
+    }
+    if code.iter().any(|line| !words(line, "Random").is_empty()) {
+        found.push("the helper names a random seed");
+    }
+    if holding("failure_persistence") != ["failure_persistence: None,"] {
+        found.push("the helper does not turn persistence off exactly once");
+    }
+    let literals = code
+        .iter()
+        .filter(|line| line.ends_with("Config {") && !line.contains("fn "))
+        .count();
+    if literals != 1 || holding("Config::default()") != ["..Config::default()"] {
+        found.push("the helper builds more than one config");
+    }
+    found
+}
+
+#[test]
+fn the_helper_source_names_one_fixed_seed() {
+    let text = fs::read_to_string(workspace_root().join(HELPER)).unwrap();
+    assert_eq!(helper_findings(&text), Vec::<&str>::new(), "{HELPER}");
+}
+
+/// Mutants of the helper, each refused by [`helper_findings`]. The first is
+/// the helper as it was before OI-1003-Q78: a random seed in the deep tier.
+#[test]
+fn the_guard_refuses_a_helper_that_is_not_fixed_everywhere() {
+    let helper = fs::read_to_string(workspace_root().join(HELPER)).unwrap();
+    let seed = format!("        {HELPER_SEED}\n");
+    assert_eq!(helper.matches(&seed).count(), 1, "{HELPER}");
+    let mutants = [
+        helper.replace(
+            &seed,
+            "        rng_seed: if deep {\n            RngSeed::Random\n        } else {\n            \
+             RngSeed::Fixed(CI_SEED)\n        },\n",
+        ),
+        helper.replace(&seed, ""),
+        helper.replace(&seed, "        rng_seed: RngSeed::Fixed(0),\n"),
+        helper.replace(&seed, "        rng_seed: seed(deep),\n"),
+        helper.replace(
+            "        failure_persistence: None,\n",
+            "        failure_persistence: persistence(),\n",
+        ),
+        helper.replace(
+            "    prop_config_for(cases, deep())\n",
+            "    Config {\n        cases,\n        ..Config::default()\n    }\n",
+        ),
+        helper.replace(
+            "    prop_config_for(cases, deep())\n",
+            "    Config::default()\n",
+        ),
+        format!("{helper}use proptest::test_runner::RngSeed::Random;\n"),
+    ];
+    for mutant in mutants {
+        assert_ne!(mutant, helper);
+        assert!(
+            !helper_findings(&mutant).is_empty(),
+            "the guard missed this helper:\n{mutant}"
         );
     }
 }
@@ -445,6 +536,9 @@ fn the_guard_refuses_each_escape() {
         "let mut runner = TestRunner::new_with_rng(test_support::prop_config(4), rng);\n",
         "let runner: TestRunner = Default::default();\n",
         "let mut runner = TestRunner::new(prop_config(4));\n",
+        // The helper's tier parameter is the guard's, not a property's.
+        "#![proptest_config(test_support::prop_config_for(4, true))]\n",
+        "let mut runner = TestRunner::new(test_support::prop_config_for(4, false));\n",
     ];
     for text in refused {
         assert!(!findings(text).is_empty(), "the guard missed:\n{text}");

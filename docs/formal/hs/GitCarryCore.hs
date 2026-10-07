@@ -81,6 +81,7 @@ brackets):
   --damage-base BOOL         [DamageBase]
   --damage-rewrites BOOL     [DamageRewrites]
   --base-missing-typed BOOL  [BaseMissingTyped]
+  --reuse-manifest BOOL      [ReuseManifest] (default false)
   --mutation NAME            one deliberate rule break (default none)
   --check all|NAME[,NAME...] the invariants to check (default all)
   --name NAME                the row name reported
@@ -531,6 +532,7 @@ data Mutation
   | SkipFlattenVerify
   | HitIgnoresChainM
   | RerootPreMismatch
+  | ReuseAfterRecord
   deriving (Eq, Enum, Bounded)
 
 mutationName :: Mutation -> String
@@ -542,6 +544,7 @@ mutationName m = case m of
   SkipFlattenVerify -> "skip_flatten_verify"
   HitIgnoresChainM -> "hit_ignores_chain"
   RerootPreMismatch -> "reroot_pre_mismatch"
+  ReuseAfterRecord -> "reuse_after_record"
 
 data Config = Config
   { cPreset :: String
@@ -555,6 +558,9 @@ data Config = Config
   , cDamageBase :: Bool
   , cDamageRewrites :: Bool
   , cBaseMissingTyped :: Bool
+  , cReuseManifest :: Bool
+  -- ^ Lane L7: a pass publishes {bundle}.reuse before its record. Off in
+  -- every preset, as in the TLC configs they mirror.
   , cMutation :: Maybe Mutation
   }
 
@@ -566,13 +572,13 @@ data Config = Config
 -- MC_gc_fix2_deep (fix 2 over two links under the plan base).
 preset :: String -> Maybe Config
 preset name = case name of
-  "gc_core" -> Just (Config name 1 (Policy 2 0 False) False 3 1 1 1 False True False Nothing)
-  "gc_q46" -> Just (Config name 1 (Policy 2 4 False) True 4 1 1 1 False True False Nothing)
-  "gc_grouped" -> Just (Config name 2 (Policy 2 0 False) False 2 0 1 1 True True True Nothing)
-  "gc_fix2" -> Just (Config name 2 (Policy 1 3 True) True 2 0 1 1 True True True Nothing)
-  "gc_reroot" -> Just (Config name 1 (Policy 1 4 False) True 4 1 1 1 False True False Nothing)
-  "gc_reroot_extended" -> Just (Config name 1 (Policy 2 5 False) True 4 1 1 1 False True False Nothing)
-  "gc_fix2_deep" -> Just (Config name 2 (Policy 2 3 True) True 2 0 1 1 True True True Nothing)
+  "gc_core" -> Just (Config name 1 (Policy 2 0 False) False 3 1 1 1 False True False False Nothing)
+  "gc_q46" -> Just (Config name 1 (Policy 2 4 False) True 4 1 1 1 False True False False Nothing)
+  "gc_grouped" -> Just (Config name 2 (Policy 2 0 False) False 2 0 1 1 True True True False Nothing)
+  "gc_fix2" -> Just (Config name 2 (Policy 1 3 True) True 2 0 1 1 True True True False Nothing)
+  "gc_reroot" -> Just (Config name 1 (Policy 1 4 False) True 4 1 1 1 False True False False Nothing)
+  "gc_reroot_extended" -> Just (Config name 1 (Policy 2 5 False) True 4 1 1 1 False True False False Nothing)
+  "gc_fix2_deep" -> Just (Config name 2 (Policy 2 3 True) True 2 0 1 1 True True True False Nothing)
   _ -> Nothing
 
 presetNames :: [String]
@@ -618,7 +624,7 @@ noSide = Side 0 0 0 0
 data Phys = Staged | POk | PMissing | PReplaced | PCollected
   deriving (Eq, Ord)
 
-data CapSt = CIdle | CBaseRec | CDecide | CPublish | CSidecars | CRecord
+data CapSt = CIdle | CBaseRec | CDecide | CPublish | CSidecars | CReuse | CRecord
   deriving (Eq, Ord)
 
 data Cap = Cap {capSt :: !CapSt, capItem :: !Int, capB :: !Int, capPlan :: !Side}
@@ -631,6 +637,8 @@ data St = St
   , sMeta :: !(M.Map Int Meta)
   , sCorpus :: !(M.Map Int Phys)
   , sSidecar :: !(M.Map Int Side)
+  , sManifest :: !(S.Set Int)
+  -- ^ The bundles whose {bundle}.reuse manifest exists (lane L7).
   , sRec :: !(M.Map Int Int)
   , sBaseRec :: !Int
   , sCap :: !Cap
@@ -654,7 +662,7 @@ isGrouped :: Config -> Bool
 isGrouped cfg = cItems cfg > 1
 
 initial :: Config -> St
-initial cfg = St 0 0 M.empty M.empty M.empty (M.fromList [(i, 0) | i <- items cfg]) 0 idleCap 0 0
+initial cfg = St 0 0 M.empty M.empty M.empty S.empty (M.fromList [(i, 0) | i <- items cfg]) 0 idleCap 0 0
 
 nIds :: St -> Int
 nIds = M.size . sMeta
@@ -908,6 +916,7 @@ successors cfg st =
     ++ concat [capture cfg st i | i <- items cfg]
     ++ publish cfg st
     ++ sidecars cfg st
+    ++ reuseSidecar cfg st
     ++ record cfg st
     ++ gc cfg st
     ++ advance cfg st
@@ -982,6 +991,14 @@ capture cfg st i
       (capSt c == CIdle && not (isGrouped cfg && baseNeeded cfg st))
         || (capSt c == CDecide && capItem c == i)
 
+-- | GitCarry.tla's BeforeRecord: the step after a bundle's dependency
+-- sidecars is its reuse manifest (lane L7), then its record;
+-- reuse_after_record writes the record first.
+beforeRecord :: Config -> CapSt
+beforeRecord cfg
+  | cReuseManifest cfg && not (mut cfg ReuseAfterRecord) = CReuse
+  | otherwise = CRecord
+
 -- | Publish: a name rewritten in place refuses DIGEST_MISMATCH; the pass
 -- ends with no record.
 publish :: Config -> St -> [Step]
@@ -998,7 +1015,7 @@ publish cfg st
                       { capSt =
                           if declaresPrereqs st (capB c) && not (mut cfg SidecarAfterRecord)
                             then CSidecars
-                            else CRecord
+                            else beforeRecord cfg
                       }
                 }
         )
@@ -1015,7 +1032,7 @@ sidecars cfg st
       [ ( "Sidecars"
         , st
             { sSidecar = M.insert b written (sSidecar st)
-            , sCap = if mut cfg SidecarAfterRecord then idleCap else c {capSt = CRecord}
+            , sCap = if mut cfg SidecarAfterRecord then idleCap else c {capSt = beforeRecord cfg}
             }
         )
       ]
@@ -1027,6 +1044,22 @@ sidecars cfg st
     keep = scPrior plan == 0 || (hasPrior st b && chainWalk cfg st b True /= Nothing)
     written = if keep then (sideOf st b) {scBase = scBase plan} else plan
 
+-- | ReuseSidecar (lane L7): publish_reuse writes the bundle's manifest
+-- before its record.
+reuseSidecar :: Config -> St -> [Step]
+reuseSidecar cfg st
+  | capSt c == CReuse =
+      [ ( "ReuseSidecar"
+        , st
+            { sManifest = S.insert (capB c) (sManifest st)
+            , sCap = if mut cfg ReuseAfterRecord then idleCap else c {capSt = CRecord}
+            }
+        )
+      ]
+  | otherwise = []
+  where
+    c = sCap st
+
 record :: Config -> St -> [Step]
 record cfg st
   | capSt c == CRecord =
@@ -1036,7 +1069,10 @@ record cfg st
             , sCap =
                 if mut cfg SidecarAfterRecord && declaresPrereqs st (capB c)
                   then c {capSt = CSidecars}
-                  else idleCap
+                  else
+                    if mut cfg ReuseAfterRecord && cReuseManifest cfg
+                      then c {capSt = CReuse}
+                      else idleCap
             }
         )
       ]
@@ -1062,6 +1098,7 @@ gc cfg st
         , st
             { sCorpus = M.insert b PCollected (sCorpus st)
             , sSidecar = M.insert b noSide (sSidecar st)
+            , sManifest = S.delete b (sManifest st)
             }
         )
       | b <- garbage cfg st
@@ -1109,6 +1146,7 @@ invariants =
   , ("BaseNotReplacedWhileDepended", baseNotReplaced)
   , ("GCNeverDeletesDepended", gcNeverDeletesDepended)
   , ("SidecarsBeforeRecord", sidecarsBeforeRecord)
+  , ("ReuseManifestBeforeRecord", reuseManifestBeforeRecord)
   , ("RestoreOrRecapture", restoreOrRecapture)
   ]
 
@@ -1123,6 +1161,7 @@ typeOK cfg st =
     && and [mVer m <= cCommits cfg && mGen m <= cRewrites cfg && maybe True tipOk (mPre m) | m <- M.elems (sMeta st)]
     && and [inRange (scPrior s) && inRange (scBase s) && scPDepth s >= 0 && scAge s >= 0 | s <- M.elems (sSidecar st)]
     && S.size (S.fromList (M.elems (sMeta st))) == nIds st
+    && all (\b -> b >= 1 && b <= nIds st) (S.toList (sManifest st))
     && all inRange (M.elems (sRec st))
     && inRange (sBaseRec st)
     && inRange (capB (sCap st))
@@ -1168,6 +1207,11 @@ sidecarsBeforeRecord _ st =
     | h <- M.elems (sRec st)
     , h /= 0
     ]
+
+-- | Lane L7: a record names a bundle whose reuse manifest exists.
+reuseManifestBeforeRecord :: Config -> St -> Bool
+reuseManifestBeforeRecord cfg st =
+  not (cReuseManifest cfg) || and [h `S.member` sManifest st | h <- M.elems (sRec st), h /= 0]
 
 restoreOrRecapture :: Config -> St -> Bool
 restoreOrRecapture cfg st =
@@ -1272,6 +1316,7 @@ capStName c = case c of
   CDecide -> "decide"
   CPublish -> "publish"
   CSidecars -> "sidecars"
+  CReuse -> "reuse"
   CRecord -> "record"
 
 stateJ :: St -> J
@@ -1281,6 +1326,7 @@ stateJ st =
     , ("meta", JA (map metaJ (M.elems (sMeta st))))
     , ("corpus", JA (map (JS . physName) (M.elems (sCorpus st))))
     , ("sidecar", JA (map sideJ (M.elems (sSidecar st))))
+    , ("manifest", JA (map JN (S.toList (sManifest st))))
     , ("rec", JO [(itemName i, JN b) | (i, b) <- M.toList (sRec st)])
     , ("baseRec", JN (sBaseRec st))
     , ("cap", JO [("st", JS (capStName (capSt c))), ("item", JS (itemName (capItem c))), ("b", JN (capB c)), ("plan", sideJ (capPlan c))])
@@ -1322,6 +1368,7 @@ boundName cfg =
     , "db=" ++ showBool (cDamageBase cfg)
     , "dr=" ++ showBool (cDamageRewrites cfg)
     , "bmt=" ++ showBool (cBaseMissingTyped cfg)
+    , "rm=" ++ showBool (cReuseManifest cfg)
     ]
   where
     p = cPolicy cfg
@@ -1357,7 +1404,7 @@ counterexample cfg name checked f =
 usage :: String -> IO a
 usage err = do
   hPutStrLn stderr ("GitCarryCore: " ++ err)
-  hPutStrLn stderr ("usage: GitCarryCore rows [--check FILE] | schema | explore [--preset " ++ intercalate "|" presetNames ++ "] [--items N] [--depth-limit N] [--root-window N] [--chain-under-base BOOL] [--gc BOOL] [--commits N] [--rewrites N] [--crashes N] [--damage N] [--damage-base BOOL] [--damage-rewrites BOOL] [--base-missing-typed BOOL] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]")
+  hPutStrLn stderr ("usage: GitCarryCore rows [--check FILE] | schema | explore [--preset " ++ intercalate "|" presetNames ++ "] [--items N] [--depth-limit N] [--root-window N] [--chain-under-base BOOL] [--gc BOOL] [--commits N] [--rewrites N] [--crashes N] [--damage N] [--damage-base BOOL] [--damage-rewrites BOOL] [--base-missing-typed BOOL] [--reuse-manifest BOOL] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]")
   exitWith (ExitFailure 2)
 
 splitOn :: Char -> String -> [String]
@@ -1404,6 +1451,7 @@ parseExplore = go (Opts "gc_core" [] Nothing "all" Nothing Nothing)
     go o ("--damage-base" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cDamageBase = b})) rest
     go o ("--damage-rewrites" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cDamageRewrites = b})) rest
     go o ("--base-missing-typed" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cBaseMissingTyped = b})) rest
+    go o ("--reuse-manifest" : v : rest) = go (set o (\c -> bool v >>= \b -> Right c {cReuseManifest = b})) rest
     go o ("--mutation" : v : rest) = go o {oMutation = if v == "none" then Nothing else Just v} rest
     go o ("--check" : v : rest) = go o {oCheck = v} rest
     go o ("--name" : v : rest) = go o {oName = Just v} rest

@@ -271,17 +271,22 @@ fn build(root: &Path, shape: &Shape) -> PathBuf {
 // presented as having started 10 s later than it did, as if every seat had
 // then been still for a while: unchanged seats are not racy, so the pass
 // emits them by object name (fast-import's `M <oid>`, often a blob only the
-// source holds) without the test sleeping.
-fn captured(source: &Path, capture: &Path, prior: Option<&Export>) -> Export {
+// source holds) without the test sleeping. `listed` offers the prior pass's
+// reuse manifest, as estate-capture does since Q42 lane L7 (the pass then
+// looks its blobs up in the source store, and fetches the bundle only on a
+// miss); without it the pass fetches the bundle, as for a capture retained
+// from before.
+fn captured(source: &Path, capture: &Path, prior: Option<(&Export, bool)>) -> Export {
     let options = ExportOptions {
         prerequisite: None,
         policy: CapturePolicy::default(),
-        reuse: prior.map(|prior| RetainedCapture {
+        reuse: prior.map(|(prior, listed)| RetainedCapture {
             bundle: &prior.bundle,
             started_ns: prior.started_ns + 10_000_000_000,
+            manifest: prior.manifest.as_deref().filter(|_| listed),
         }),
         planned: &[],
-        chain: prior.map(|prior| prior.bundle.as_path()),
+        chain: prior.map(|(prior, _)| prior.bundle.as_path()),
     };
     match export_repository_with_custody(source, capture, &options).unwrap() {
         Exported::Captured(export) => {
@@ -383,10 +388,10 @@ proptest::proptest! {
         // A worktree-only change, so the next passes are changed captures.
         fs::write(source.join("written-between-passes"), b"new seat").unwrap();
         let before = lstat_census(&source);
-        let second = captured(&source, &root.join("capture-2"), Some(&first));
+        let second = captured(&source, &root.join("capture-2"), Some((&first, true)));
         let changed = moved(&before, &lstat_census(&source));
         proptest::prop_assert!(changed.is_empty(), "second capture:\n{}", changed.join("\n"));
-        let third = captured(&source, &root.join("capture-3"), Some(&second));
+        let third = captured(&source, &root.join("capture-3"), Some((&second, false)));
         let changed = moved(&before, &lstat_census(&source));
         proptest::prop_assert!(changed.is_empty(), "third capture:\n{}", changed.join("\n"));
         // R25 still holds across the split stores: each incremental pass read
@@ -558,7 +563,7 @@ fn s4_a_bare_repository_is_carried_as_ref_custody() {
     );
     backdate(&mirror.join("objects"));
     let before = lstat_census(&mirror);
-    let second = captured(&mirror, &root.join("capture-2"), Some(&first));
+    let second = captured(&mirror, &root.join("capture-2"), Some((&first, true)));
     let changed = moved(&before, &lstat_census(&mirror));
     assert!(changed.is_empty(), "{}", changed.join("\n"));
     let repository = carried(&root, &[&first.bundle, &second.bundle]);

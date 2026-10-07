@@ -275,7 +275,7 @@ mod traced {
     use crate::io::trace::recorder::Recorder;
     use crate::io::trace::{Event, SyncKind};
 
-    /// Set only by `just rust-check`'s isolated partial-write step.
+    /// Set only by `just fault-harness`'s isolated partial-write step.
     const PARTIAL_WRITE_ALONE: &str = "BULKLOAD_IO_PARTIAL_WRITE_ALONE";
 
     #[test]
@@ -519,12 +519,12 @@ mod traced {
     /// makes the kernel accept 10 000 bytes of a 20 000-byte write and then
     /// fail with `EFBIG`. The limit is process-wide, so this test is ignored
     /// in the normal run, and it acts only when `PARTIAL_WRITE_ALONE` is
-    /// set, which only `just rust-check`'s isolated step (`--exact
+    /// set, which only `just fault-harness`'s isolated step (`--exact
     /// --test-threads=1`) sets. A `--include-ignored` run beside the other
     /// write tests therefore does nothing instead of failing them with
     /// spurious `EFBIG`.
     #[test]
-    #[ignore = "sets the process-wide RLIMIT_FSIZE; just rust-check runs it alone"]
+    #[ignore = "sets the process-wide RLIMIT_FSIZE; just fault-harness runs it alone"]
     fn partial_write_prefix_is_traced() {
         const LIMIT: u64 = 10_000;
         if std::env::var_os(PARTIAL_WRITE_ALONE).is_none() {

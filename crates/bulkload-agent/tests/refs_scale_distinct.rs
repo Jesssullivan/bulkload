@@ -21,8 +21,13 @@
 //!   import would have cost several hundred seconds.
 //! - **Exact import**: every source ref under the import's namespace at its
 //!   commit, the chained pass imported on top in its own namespace.
-//! - **Deep tier** (`BULKLOAD_PROPTEST_DEEP=1`, local): 110,000 distinct
-//!   commits. The self-contained header fits (about 12.2 MB); the chained
+//! - **PR gate** (OI-1003-Q81): 16,384 distinct commits, every law above.
+//!   The quadratic fetch would cost about 169 s of CPU there against a
+//!   budget of 61 s, so the row still fails on it.
+//! - **Deep tier** (`BULKLOAD_PROPTEST_DEEP=1`, `just props-deep`, never a
+//!   PR gate): 32,768 distinct commits, the PR gate's row until OI-1003-Q81
+//!   moved it here for its cost (87 to 112 s of wall), and 110,000. At
+//!   110,000 the self-contained header fits (about 12.2 MB); the chained
 //!   pass's thin header would not (about 18.2 MB), so that pass is written
 //!   self-contained instead of refused, and imports exactly.
 //!
@@ -49,15 +54,21 @@ use bulkload_agent::git_carry::{
     export_repository, export_repository_with_drift, shared, ExportOptions,
 };
 
-/// `test_support::DEEP`, mirrored: the switch for the deep local tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
+/// The library's `test_support`, compiled here from its source (the library
+/// module is `#[cfg(test)] pub(crate)`), so the deep switch is the helper's
+/// own and cannot drift from it. This file draws no property, so the rest of
+/// the helper is unused here.
+#[path = "../src/test_support.rs"]
+#[allow(dead_code)]
+mod test_support;
+
 /// The import's CPU budget per distinct object (a debug build). These rows
 /// measured 0.53 to 0.95 ms per distinct object on sting at load 3 to 22:
 /// 17.4 to 21.2 s self-contained and 24.8 to 31.2 s thin at 32,768
 /// distinct, 61.1 s at 110,000 (3.4x the objects, 3.5x the CPU). So this
 /// allows 2.6x and more. The quadratic fetch (about 0.63 us x D^2) exceeds
-/// the budget from about 8,000 distinct objects, and at this row's 32,768
-/// cost about 670 s against 102 s.
+/// the budget from about 8,000 distinct objects: at the PR gate's 16,384 it
+/// cost about 169 s against 61 s, and at 32,768 about 670 s against 102 s.
 const CPU_PER_DISTINCT: Duration = Duration::from_micros(2_500);
 /// The import's fixed CPU budget: process start, verify, the walk's setup.
 const CPU_FIXED: Duration = Duration::from_secs(20);
@@ -424,21 +435,47 @@ fn distinct_row(name: &str, refs: usize) -> bool {
     export.chained
 }
 
-/// The CI row: 32,768 refs, each at its own commit. The chained pass stays
-/// thin (about 5.4 MB of header, under the cap).
-#[test]
-fn distinct_heavy_32768_refs_import_linearly_and_chain_thin() {
-    assert!(distinct_row("ci", 32_768), "the chained pass fits thin");
+/// Whether this run is the deep tier; a skipped deep row says so.
+fn deep(row: &str) -> bool {
+    let deep = test_support::deep();
+    if !deep {
+        eprintln!(
+            "REFS-SCALE-DISTINCT row={row} skipped: set {}=1",
+            test_support::DEEP
+        );
+    }
+    deep
 }
 
-/// The deep row (`BULKLOAD_PROPTEST_DEEP=1`): 110,000 distinct commits. The
+/// The PR-gate row: 16,384 refs, each at its own commit. The chained pass
+/// stays thin (about 2.7 MB of header, under the cap), and the import's CPU
+/// budget still fails the quadratic fetch (about 169 s against 61 s).
+#[test]
+fn distinct_heavy_16384_refs_import_linearly_and_chain_thin() {
+    assert!(distinct_row("ci", 16_384), "the chained pass fits thin");
+}
+
+/// A deep row (`BULKLOAD_PROPTEST_DEEP=1`): 32,768 refs, each at its own
+/// commit, the PR gate's row before OI-1003-Q81. The chained pass stays thin
+/// (about 5.4 MB of header, under the cap).
+#[test]
+fn distinct_heavy_32768_refs_import_linearly_and_chain_thin() {
+    if !deep("deep-32768") {
+        return;
+    }
+    assert!(
+        distinct_row("deep-32768", 32_768),
+        "the chained pass fits thin"
+    );
+}
+
+/// A deep row (`BULKLOAD_PROPTEST_DEEP=1`): 110,000 distinct commits. The
 /// chained pass's thin header would be over the cap, so it is written
 /// self-contained, and imports exactly; before, it refused
 /// `GIT_INVENTORY_OVER_CAP` on every pass.
 #[test]
 fn distinct_heavy_110000_refs_chain_falls_back_self_contained() {
-    if std::env::var_os(DEEP).is_none_or(|value| value != "1") {
-        eprintln!("REFS-SCALE-DISTINCT row=deep skipped: set {DEEP}=1");
+    if !deep("deep") {
         return;
     }
     assert!(
