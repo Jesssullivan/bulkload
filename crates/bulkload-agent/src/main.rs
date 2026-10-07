@@ -33,11 +33,12 @@ SUBCOMMANDS:
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
-                Read-only: report what git carry v2 would move from SOURCE_REPO
-                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes);
-                missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
-                partial or differently-shallow DEST (R-N75); a refused pair
-                prints refused=CODE and the verb exits nonzero. A child's
+                Read-only: report what a negotiated thin-pack carry would move
+                from SOURCE_REPO to DEST (a local path or HOST:PATH over
+                ssh -T -oBatchMode=yes); missing_thin_pack_bytes is the gate
+                metric (R-N74). Refuses a partial or differently-shallow DEST
+                (R-N75); a refused pair prints refused=CODE and the verb exits
+                nonzero. A child's
                 stderr is never printed (R-N121): only stderr_class=, plus
                 stderr_keyed_blake3= and stderr_file= when --state-dir keeps
                 the raw bytes in DIR/stderr/<digest>.log (mode 0600). DIR

@@ -195,6 +195,25 @@ deletes v2 if v1 is chosen. Measured with `git show 4a10bb8:<path> | wc -l`:
 | `m1-spike` feature and its `[[test]]` | 10 | `crates/bulkload-agent/Cargo.toml` lines 22 to 25 and 40 to 45, plus two `check-optional` lines in the justfile |
 | **Total** | **about 12,225** | |
 
+**Executed 2026-10-05 (Q42 lane L5; OI-1003-Q44, OI-1003-Q54, OI-1003-Q56).**
+The deletion ran from origin/main `40adca8`, which tag `carry-v2-final` marks.
+At that commit the files measured as follows:
+- the eight carry_v2 files: 4,885 lines;
+- `tests/git_carry_v2.rs`: 4,235;
+- `tests/git_m1_spike.rs`: 2,612;
+- `tests/fault_harness/git_ingest.rs`: 416.
+
+Beyond the table, the deletion also took:
+- `io::sys::rename_noreplace_at` and its directory test (carry_v2 was its only
+  caller);
+- the v2-only refusals `GIT_DESTINATION_FILESYSTEM_UNSUPPORTED` and
+  `JOURNAL_OWNERSHIP_CONFLICT`.
+
+The `frame.rs` row did not run: the reserved W6 frames stay, and
+`WIRE_SCHEMA` and `wire_id` stay at v5 until WP3's v6 cut. `estimate.rs`
+stays as the note below says. Nothing in it depended on carry_v2, so
+`git-carry-estimate` still gives the v2 projection column.
+
 Not in the inventory: `src/git_carry/estimate.rs` (3,376 lines) and its
 `stderr_store`. `git-carry-estimate` is a read-only product verb, and it is
 the tool that produced the v2 column above. Keeping it is what lets the
