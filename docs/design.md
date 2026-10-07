@@ -312,7 +312,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   `.prior`) whose own `.base` sidecar is gone has lost its base: it refuses
   `RECEIPT_BINDING_INVALID` while its key holds and is never a chain link,
   matching apply, which refuses it `SEALED_OBJECT_MISSING`.
-- Restore cost under fix 2 is not flat in the group (#148, open). Capture
+- Restore cost under fix 2 is not flat in the group (#147, open). Capture
   bytes are flat in the pass count; restore is not. Apply flattens every
   chained item on its own: it copies the head, every link and the plan base
   beside the corpus and writes one self-contained bundle holding them all,

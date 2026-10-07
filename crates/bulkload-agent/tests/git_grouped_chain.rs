@@ -37,7 +37,7 @@
 //! `estate-apply` runs with a fresh state directory, and every item is
 //! compared byte for byte.
 //!
-//! **The restore side is not flat, and is pinned (#148).** Clause 4 bounds
+//! **The restore side is not flat, and is pinned (#147).** Clause 4 bounds
 //! what a capture writes. A restore of a chained item flattens its chain:
 //! it copies the head, every link and the plan base beside the corpus and
 //! writes one self-contained bundle that holds them all, so an apply stages
@@ -424,7 +424,7 @@ fn table(name: &str, layout: Layout) {
                  base={base}",
                 read.copied, read.chained, read.chain_max
             );
-            // The restore side is NOT flat in the group (#148). Every
+            // The restore side is NOT flat in the group (#147). Every
             // chained item's flatten copies the plan base and writes it
             // again inside that item's flat bundle, so an apply stages the
             // base twice per chained item, where a delta on the base alone
