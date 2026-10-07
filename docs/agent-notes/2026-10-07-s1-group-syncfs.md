@@ -71,7 +71,8 @@ counter pair is `flush_fs_count` / `flush_fs_ns`.
 - **Merge is held** for the adversarial review when reviewers return (after
   Oct 12, Q112).
 - An informational re-measure on mbp-13, then a gated sample.
-- The rclone-plus-sync equal-durability arm of Q107 (the harness half).
+- The rclone-plus-sync equal-durability arm of Q107 (the harness half) is
+  its own PR, #209, merging on green under Q110.
 - Cost on a busy shared file system: `syncfs` flushes unrelated dirty data
   too. Unmeasured; the rig is quiet by construction.
 - **Kernel floor (OI-1003-Q113, ruled 2026-10-07).** Linux before 5.8 does
