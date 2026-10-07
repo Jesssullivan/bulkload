@@ -27,10 +27,10 @@
 //! identity unchanged is the racy case (P19), not this property's.
 //!
 //! **Corpus.** CI runs a fixed seed and 16 cases
-//! (`test_support::prop_config`). The deep local tier
-//! (`BULKLOAD_PROPTEST_DEEP=1`) switches to random seeds and twenty times
-//! the cases; nothing writes a failure-persistence file, so a failing deep
-//! seed is pinned as an explicit test row. The helper is `#[cfg(test)]
+//! (`test_support::prop_config`). The deep tier
+//! (`BULKLOAD_PROPTEST_DEEP=1`) runs twenty times the cases from the same
+//! fixed seed (OI-1003-Q78); nothing writes a failure-persistence file, so a
+//! failing deep shape is pinned as an explicit test row. The helper is `#[cfg(test)]
 //! pub(crate)` in the library, out of an integration test's reach, so this
 //! file compiles the same source file as a local module (`#[path]`) instead
 //! of mirroring it. `tests/prop_seed_guard.rs` holds every property to that
