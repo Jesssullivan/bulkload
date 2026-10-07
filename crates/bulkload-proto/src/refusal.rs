@@ -175,6 +175,12 @@ pub enum BulkloadRefusal {
     /// The `SQLite` online backup (open, step or finish) failed (WP3).
     /// Carries `SQLite`'s extended result code when `SQLite` reported one.
     SqliteBackupFailed(Option<i32>),
+    /// A provider verb that reads a source database was run with effective
+    /// uid 0 (S2, OI-1003-Q76). Opened as root, `SQLite` re-applies the
+    /// database's ownership to its `-wal` (`fchown`), which moves the
+    /// `-wal`'s ctime: a source metadata write no ruling admits. The verb
+    /// refuses before it opens anything; run it as the database's owner.
+    SqliteSourceAsRoot,
 
     // ---- journal -----------------------------------------------------------
     /// An existing journal belongs to a different transaction.
@@ -266,6 +272,7 @@ impl BulkloadRefusal {
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
+            Self::SqliteSourceAsRoot => "SQLITE_SOURCE_AS_ROOT",
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
@@ -327,6 +334,7 @@ impl BulkloadRefusal {
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
         "SQLITE_BACKUP_FAILED",
+        "SQLITE_SOURCE_AS_ROOT",
         "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
@@ -533,6 +541,7 @@ mod tests {
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
             BulkloadRefusal::SqliteBackupFailed(None),
+            BulkloadRefusal::SqliteSourceAsRoot,
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,

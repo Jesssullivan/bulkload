@@ -156,6 +156,10 @@ BOUNDARIES:
     File manifests allow 131072 chunks and frames at most 8 MiB; oversized files refuse.
     Git-native divergent union is not supplied by copy/pull.
     compose commands write offline candidates, never install live databases.
+    snapshot, compose, compose-state, hydrate-state and apply-state-candidate
+    refuse SQLITE_SOURCE_AS_ROOT when run as root (OI-1003-Q76): opened by
+    root, SQLite re-applies ownership to a database's -wal and -shm, a source
+    metadata write. Run them as the database's owner.
     Capture omits a fixed rebuildable set (target, node_modules, .venv, ...) at
     any depth when Git tracks nothing beneath it, records each omitted root and
     its size as custody, and carries every other untracked and ignored file.
