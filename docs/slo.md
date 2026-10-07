@@ -586,6 +586,127 @@ open.
 - Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md),
   sections 3 and 5.
 
+## Amendment 2026-10-07 (fourth): S3 inequalities 1 and 2 on the file transfer (#186, #187)
+
+This records what the code now does under the rulings above (OI-1003-Q6,
+Q10, Q18). It changes no number and no ruling.
+
+- **Inequality 1 holds with refused seats (#186).** A seat refused for its
+  `SQLite` header is sniffed (16 bytes) once per stat identity, and its
+  refusal is remembered in the source ledger; an unchanged refused seat is
+  refused again, with the same code, without being opened. Sniff bytes are
+  counted as `source_sniff_bytes`, apart from content (`source_bytes_read`,
+  `read_source_file_bytes`). So the unchanged-estate clause reads 0 content
+  bytes and 0 sniff bytes. The limits:
+  - a seat that was racy when it was sniffed is not remembered, and is
+    sniffed again until it is not (as a racy capture is read again, #86);
+  - the source ledger's rows may be lost under WP0(g); a lost row costs one
+    more sniff.
+- **Inequality 2 and convergence hold for changed seats (#187, WP0(d)).** A
+  changed seat whose output this store wrote, untouched since, is
+  superseded by the exchange design of `docs/formal` (`MC_wp0d_exchange`),
+  filled from the old output's own chunks, so the wire carries only the
+  absent ones. The limits:
+  - only an output with a committed row is this store's own: a reuse row,
+    or an ownership row (its path and identity, no seat), which an output
+    published from a racy capture, or exchanged into place by a publish
+    whose row never committed, has in its stead (review fix below). Any
+    other file is refused `DESTINATION_OCCUPIED`, as before;
+  - a file system without an atomic exchange cannot supersede: a changed
+    seat there is refused `DESTINATION_EXCHANGE_UNSUPPORTED` before it is
+    staged, and does not converge. Whether such destinations need a
+    fallback is unruled;
+  - a seat past the source's retention budget (512 MiB) is streamed whole,
+    as an added seat of that size is (#77);
+  - an output this session supersedes stays readable for later seats of the
+    session through a bounded set of descriptors; past the bound, a chunk
+    only that output held is sent again.
+- **Proof.** `tests/s3_transfer_resume.rs`: P21 and P23 with refused seats
+  and P21 over in-place changes, which were ignored and red, are green and
+  unweakened; the power-loss and crash-resume harnesses hold the old output
+  with its old row or the new output with its new row in every state
+  (`tests/power_loss.rs`, `tests/fault_harness.rs`).
+- **Refusal code.** A transfer's occupied destination path is
+  `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
+  alone.
+- **Gate (b)'s second deviation is gone.** The 2026-10-06 amendment lets
+  gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
+  `source_bytes_read` no longer holds them, so the raw counter is 0 on a
+  warm resume, as gate (a) requires, and nothing is left to net out.
+  `gate_b.py` no longer subtracts them (`content_bytes_read` is the raw
+  counter, and the deviation is out of `deviations_from_gate_a`); gate (b)
+  now has one unratified deviation, the missing interrupted-resume phase.
+- **Review fixes (2026-10-07, same change).** What the review of #186 and
+  #187 found, and what the code does now. None of this is ruled; each is
+  listed for the operator in the lane's note.
+  - *A seat standing refused is not read on every run.* A seat the
+    destination refuses `DESTINATION_OCCUPIED` (or
+    `DESTINATION_EXCHANGE_UNSUPPORTED`) was read in full by every unchanged
+    run to rebuild its manifest, the defect class of #186. The destination
+    now remembers the refusal under the seat's row key and the identity of
+    the file at the path, and refuses the entry when it is offered: 0
+    source bytes. So the unchanged-estate clause reads 0 content bytes with
+    such seats in the corpus too. The limits: a racy capture, or a file at
+    the path that was not settled when it was read, is not remembered and
+    is read again (as #86); a lost record costs one more read.
+  - *An actively written file converges.* An output published from a racy
+    capture has an ownership row, so a seat that changes again before a
+    settled run adopts it is superseded, not refused on every run.
+  - *An interrupted supersede keeps its ownership.* A superseding publish
+    whose exchange took effect and whose row never committed leaves the new
+    file with an ownership row, written by the next sweep from the
+    publish's record, so a seat that changes once more still converges.
+  - *The model does not hold these records yet*
+    (`docs/formal/README.md`, "What the #187 review added to the code and
+    not to the model").
+
+## Amendment 2026-10-07 (fifth): the superseding publish is ruled and modelled (OI-1003-Q100, Q101, Q102)
+
+Operator rulings of 2026-10-07 on #187 and its review. They supersede three
+statements of the amendment above: "Whether such destinations need a
+fallback is unruled", "None of this is ruled", and "The model does not hold
+these records yet". That amendment's text is left as written.
+
+- **OI-1003-Q100: no atomic exchange, no superseding publish.** A
+  destination file system without the atomic exchange of two names refuses
+  a superseding seat up front with `DESTINATION_EXCHANGE_UNSUPPORTED`, as
+  built: before anything is staged or asked of the source, and with no
+  fallback. The old output keeps its row; the refusal is typed (S4) and
+  remembered, so an unchanged rerun reads 0 source bytes. Such a seat does
+  not converge on that destination, by ruling.
+- **OI-1003-Q101: a racy publish is owned, never reused.** An output
+  published or adopted from a racy capture gets an ownership row and no
+  reuse row, as built. The ownership row lets a later change of the seat
+  supersede the output; it never answers `Reuse`, so a racy output is
+  never a reuse source (R25, #86).
+- **OI-1003-Q102: model first, then merge.** The TLA+ model covers what
+  #187 adds before it lands. `docs/formal/BulkloadTransfer.tla` now holds
+  the intent of a superseding publish and its sweep, the ownership row,
+  the remembered refusal and Q100's refusal, with five invariants checked
+  by TLC on every row that has the superseding publish on: `NoClobber`
+  (a destination file is replaced or removed only when its identity is one
+  this store recorded), `SupersedeAtomic` (after any crash, the old output
+  with its old rows or the new output with a row of its own, never mixed),
+  `OwnershipNeverReuse`, `RememberedRefusalSound` and
+  `ExchangeRefusedUpFront`. `R25_NoDurableReread` and
+  `R25_StrictNoDurableReread` hold with the superseding publish on. Seven
+  mutations each fail on their named property
+  (`docs/formal/README.md`, "#187's records in the model"). The Haskell
+  explorer does not have these records; they are pinned outside its
+  domain, and its four counts of record did not move.
+- **S3 status.** With #186 and #187 on main, WP0(c)'s inequality 1 (source
+  bytes read ≤ sizes of changed or racy seats, with refused seats in the
+  corpus) and inequality 2 (wire bytes ≤ absent chunks, for changed seats)
+  both hold on the file transfer, within the limits the amendment above
+  lists and Q100's. Evidence: P21 and P23 with refused seats and P21 over
+  in-place changes (`tests/s3_transfer_resume.rs`), P78, the power-loss
+  and crash-resume harnesses, and the model rows above. Still open under
+  S3: the twins reading of inequality 2
+  (`p21_pinned_twin_seats_cross_their_shared_chunks_once`, ignored and
+  unruled), gate (b)'s missing interrupted-resume phase, and the model
+  rows that do not yet combine the superseding publish with the relaxed
+  source ledger, a lost source authority, estate reads or liveness.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

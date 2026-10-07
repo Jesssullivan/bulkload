@@ -19,7 +19,11 @@ The transfer model (`BulkloadTransfer.tla`) covers:
 - the source store's authority, which is part of every row key;
 - crashes of either host or both, and the rerun that follows;
 - S2's typed source access;
-- the WP0(d) and WP0(g) rulings.
+- the WP0(d) and WP0(g) rulings;
+- the destination store's records of the superseding publish (#187,
+  OI-1003-Q100 to Q102): the intent and its sweep, the ownership row, the
+  remembered refusal, and the refusal where there is no atomic exchange
+  ([#187's records](#187s-records-in-the-model-oi-1003-q102)).
 
 It models the code at **adb9c66** (`origin/main` after #145). Every code
 symbol cited below was checked with `git grep` at adb9c66 and again at
@@ -70,7 +74,7 @@ How the recipe runs:
     committed `configs.tsv` and `MC_*.cfg` byte for byte, with no file
     missing or extra;
   - **grounding**: every operator the catalogue names (properties,
-    witnesses, the 37 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init`,
+    witnesses, the 38 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init`,
     `Next`) is defined in `BulkloadTransfer.tla`; the catalogue's
     constants are exactly the spec's `CONSTANTS`, and its mutations exactly
     the spec's `Mutations` set (`"none"` aside), each checked in both
@@ -145,16 +149,53 @@ on purpose:
 
 ## Results
 
-**The table below is one run: `just tla-check` over every BulkloadTransfer
-row on host sting (32 cores, Linux 6.12, TLC 2.19), 2026-10-06 18:27 to
-18:37 EDT, at a load average near 20, over the spec, catalogue and configs
-of commit `8714c61` (the #169 review revision). All 54 rows matched their
-expectation: 17 PASS, 3 REACHED, 32 FAIL, 1 SIMULATION, 1 INCONCLUSIVE (the
-budget self-test), 0 ABORTED, 0 WRONG. Every pass row's never-enabled
-actions equalled its `never` column. Total wall time 558 s; peak RSS
-2,003 MiB.** GitCarry.tla's rows were not part of that run; this revision
-does not touch them. The runs described next are the history before #169;
-their counts are no longer the table's.
+**The table below is one run: `just tla-check` over both modules on host
+sting (32 cores, Linux 6.12, TLC 2.19), 2026-10-07 08:41 to 09:01 EDT for
+BulkloadTransfer's rows, at a load average near 30 from other lanes, over
+the spec, catalogue and configs of the #187 model extension (OI-1003-Q102;
+the commit that adds `BeginSupersede` and `MC_supersede_noexchange`;
+nothing under `docs/formal` but this README and a comment in
+`hs/Explorer.hs` changed between the run and that commit). All 70 rows
+matched their expectation: 22 PASS, 8 REACHED, 38 FAIL, 1 SIMULATION,
+1 INCONCLUSIVE (the budget self-test), 0 ABORTED, 0 WRONG. Every pass
+row's never-enabled actions equalled its `never` column. No row needed a
+second run. The rows' wall times sum to 1,155 s; peak RSS 2,127 MiB.**
+
+The whole recipe ran once more after the merge of main `8006085` (#202,
+which changed the justfile and nothing under `docs/formal`), 2026-10-07
+09:52 to 10:10 EDT for BulkloadTransfer's rows, at a load average near 17.
+All 70 rows matched again, with no row run twice, and every pass row's
+distinct and generated counts and diameter equalled the table's. Fail and
+reach rows stop at their first violation with 3 workers, so their counts
+differed a little, as they do between any two runs.
+
+What moved against the run before it (56 rows, 2026-10-06 23:38 to 23:54
+EDT, the #186/#187 revision, 881 s, peak RSS 1,976 MiB; superseded):
+
+- **No row without the superseding publish moved.** Every pass row with
+  `SupersedeMode = "off"` has the same distinct and generated counts and
+  diameter as before: the extension's variables keep their initial values
+  there. Their `never` columns gained `BeginSupersede`.
+- **The three exchange pass rows grew**, because the intent, the ownership
+  row and the remembered refusal split states: `MC_wp0d_exchange` from
+  88,569 to 146,058 distinct, `MC_supersede_main` from 1,072,654 to
+  1,664,264, `MC_supersede_deep` from 506,397 to 792,260.
+- **14 rows are new**: three pass rows (`MC_supersede_strict_main`,
+  `MC_supersede_strict_deep`, `MC_supersede_noexchange`), five reach rows
+  and six mutation rows ([#187's
+  records](#187s-records-in-the-model-oi-1003-q102)).
+- **The seeded simulation checked 1,144,601 states**, against 1,144,513
+  before. `Next` gained a disjunct, and TLC's simulator appears to draw
+  over the disjuncts, so the same seed walks other behaviours. That
+  reading is not verified; the row's verdict is SIMULATION either way.
+
+GitCarry.tla and its configs are untouched; its rows ran after these and
+are not re-tabled here ([Results (GitCarry)](#results-gitcarry)).
+
+The 2026-10-06 run of record (54 rows over `8714c61`, the #169 review
+revision, 18:27 to 18:37 EDT, 558 s, peak RSS 2,003 MiB) is superseded
+too. The runs described next are the history before #169; their counts are
+no longer the table's.
 
 The first run of record: one full `just tla-check` on host sting (32 cores,
 Linux 6.12, TLC 2.19 on OpenJDK 8), 2026-10-04 01:30–01:38 EDT, at a load
@@ -191,60 +232,76 @@ generated counts and diameter equalled the table's ([Results
 
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
-| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 41,908 | 145,351 | 14 | 6s | 886 |
-| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 80s | 1958 |
-| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 35s | 1790 |
-| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 18s | 1770 |
-| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 3s | 589 |
-| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 14s | 1663 |
-| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 5s | 577 |
-| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 19s | 1754 |
-| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 54s | 1874 |
-| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 49s | 1804 |
-| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 88,569 | 232,148 | 51 | 9s | 1278 |
-| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 7s | 827 |
-| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 6s | 794 |
-| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 1s | 304 |
-| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 37s | 1774 |
-| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 88s | 2003 |
-| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 2s | 343 |
-| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 2s | 335 |
-| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,513 | – | – | 36s | 1565 |
-| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 40,567 | 128,925 | 19 | 6s | 815 |
-| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,459 | 168,087 | 21 | 7s | 847 |
-| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 60,731 | 206,214 | 19 | 10s | 1312 |
-| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 661 | 1,219 | 17 | 2s | 288 |
-| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 700 | 1,299 | 18 | 2s | 277 |
-| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 302 | 624 | 17 | 1s | 270 |
-| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,892 | 13,202 | 27 | 3s | 482 |
-| `MC_neg_live_unfair` | {a} R1 C0 E0 budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 2s | 244 |
-| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 267 | 647 | 7 | 1s | 270 |
-| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 832 | 2,289 | 10 | 2s | 316 |
-| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 85 | 122 | 16 | 2s | 246 |
-| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 291 | 459 | 12 | 2s | 269 |
-| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 34 | 47 | 10 | 1s | 214 |
-| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 2s | 251 |
-| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 348 | 720 | 19 | 1s | 271 |
-| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 337 | 697 | 19 | 2s | 273 |
-| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 338 | 701 | 19 | 2s | 282 |
-| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 1s | 258 |
-| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 121 | 164 | 29 | 1s | 273 |
-| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 17 | 2s | 260 |
-| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 21 | 26 | 8 | 2s | 205 |
-| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,841 | 9,912 | 15 | 3s | 467 |
-| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 320 | 485 | 13 | 2s | 282 |
-| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 447 | 684 | 15 | 2s | 288 |
-| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 96 | 124 | 15 | 1s | 258 |
-| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 221 |
-| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 1s | 218 |
-| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 2s | 220 |
-| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 337 | 861 | 9 | 1s | 276 |
-| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 287 | 446 | 12 | 2s | 266 |
-| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 47,969 | 117,886 | 28 | 6s | 761 |
-| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,787 | 4,059 | 16 | 2s | 392 |
-| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,669 | 4,163 | 15 | 2s | 411 |
-| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 29 | 1s | 257 |
-| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 2s | 326 |
+| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 22,324 | 76,224 | 12 | 7s | 623 |
+| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 106s | 1946 |
+| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 35s | 1840 |
+| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 25s | 1804 |
+| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 4s | 586 |
+| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 14s | 1656 |
+| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 3s | 616 |
+| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 20s | 1755 |
+| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 68s | 1872 |
+| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 46s | 1807 |
+| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 146,058 | 366,446 | 55 | 15s | 1667 |
+| `MC_supersede_main` | {a,b} R2 C1 E1 exchange sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 183s | 2101 |
+| `MC_supersede_deep` | {a} R3 C2 E1 F1 X1 space exchange budget 600 s | pass | **PASS** | – | 792,260 | 2,970,789 | 55 | 61s | 1864 |
+| `MC_supersede_strict_main` | {a,b} R2 C1 E1 exchange strict-held sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 174s | 2127 |
+| `MC_supersede_strict_deep` | {a} R3 C2 E1 F1 X1 space exchange strict-held budget 600 s | pass | **PASS** | – | 797,105 | 2,985,041 | 55 | 73s | 1861 |
+| `MC_supersede_noexchange` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | pass | **PASS** | – | 105,398 | 263,597 | 49 | 12s | 1263 |
+| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 10s | 1008 |
+| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 9s | 823 |
+| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 3s | 311 |
+| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 45s | 1802 |
+| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 86s | 1990 |
+| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 2s | 350 |
+| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 3s | 341 |
+| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,601 | – | – | 40s | 1541 |
+| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 36,495 | 116,393 | 19 | 5s | 796 |
+| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,636 | 168,503 | 21 | 6s | 849 |
+| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 63,665 | 218,723 | 19 | 9s | 1319 |
+| `MC_reach_exchange_refused` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | reach | **REACHED** | `Witness_ExchangeRefused` | 17,985 | 46,305 | 19 | 3s | 603 |
+| `MC_reach_remembered_refusal` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_RememberedRefusal` | 5,113 | 14,437 | 13 | 3s | 483 |
+| `MC_reach_ownership_superseded` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_OwnershipSuperseded` | 22,099 | 56,068 | 20 | 4s | 590 |
+| `MC_reach_sweep_ownership` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepOwnership` | 54,094 | 125,879 | 27 | 5s | 833 |
+| `MC_reach_sweep_restore` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepRestore` | 42,615 | 101,143 | 25 | 5s | 836 |
+| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 755 | 1,416 | 18 | 2s | 314 |
+| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 663 | 1,221 | 17 | 2s | 291 |
+| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 319 | 658 | 18 | 2s | 299 |
+| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 7,094 | 13,627 | 27 | 3s | 471 |
+| `MC_neg_live_unfair` | {a} R1 C0 E0 budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 2s | 278 |
+| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 241 | 572 | 7 | 1s | 299 |
+| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 774 | 2,063 | 9 | 2s | 329 |
+| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 86 | 129 | 17 | 2s | 276 |
+| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 269 | 418 | 12 | 1s | 282 |
+| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 40 | 55 | 12 | 2s | 240 |
+| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 1s | 270 |
+| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 367 | 756 | 21 | 2s | 301 |
+| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 409 | 861 | 24 | 1s | 303 |
+| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 363 | 748 | 20 | 1s | 309 |
+| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 2s | 294 |
+| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 133 | 180 | 33 | 1s | 297 |
+| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 18 | 2s | 282 |
+| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 27 | 33 | 8 | 1s | 245 |
+| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,836 | 9,912 | 15 | 3s | 469 |
+| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 307 | 465 | 12 | 1s | 291 |
+| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 447 | 683 | 15 | 3s | 293 |
+| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 98 | 128 | 15 | 2s | 272 |
+| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 214 |
+| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 1s | 234 |
+| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 1s | 243 |
+| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 339 | 866 | 9 | 2s | 313 |
+| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 339 | 541 | 13 | 2s | 294 |
+| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 54,209 | 125,952 | 27 | 6s | 832 |
+| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,591 | 3,637 | 15 | 2s | 402 |
+| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,752 | 4,446 | 15 | 2s | 426 |
+| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 30 | 1s | 288 |
+| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 2s | 337 |
+| `MC_neg_owned_ignores_identity` | {a} R2 C0 E0 F1 exchange mut=owned_ignores_identity budget 300 s | fail | **FAIL** | `NoClobber` | 987 | 1,556 | 26 | 1s | 364 |
+| `MC_neg_sweep_drops_ownership` | {a} R3 C1 E1 exchange mut=sweep_drops_ownership budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 5,120 | 10,438 | 26 | 3s | 510 |
+| `MC_neg_exchange_before_intent` | {a} R2 C1 E1 exchange mut=exchange_before_intent budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 3,727 | 8,427 | 26 | 2s | 486 |
+| `MC_neg_own_is_reuse` | {a} R2 C0 E0 exchange mut=own_is_reuse budget 300 s | fail | **FAIL** | `OwnershipNeverReuse` | 90 | 120 | 21 | 1s | 283 |
+| `MC_neg_refusal_unbound` | {a} R2 C0 E0 F2 exchange mut=refusal_unbound budget 300 s | fail | **FAIL** | `RememberedRefusalSound` | 1,231 | 2,899 | 17 | 2s | 368 |
+| `MC_neg_late_exchange_refusal` | {a} R2 C0 E1 exchange no-exchange mut=late_exchange_refusal budget 300 s | fail | **FAIL** | `ExchangeRefusedUpFront` | 779 | 1,175 | 22 | 2s | 372 |
 
 Reading the table:
 
@@ -257,7 +314,11 @@ Reading the table:
   transfer before #169, with no capture record. Every row without that tag
   has `AdoptUnrowed = TRUE`, the code since #169 ([the seven rows that
   keep it off](#rows-that-model-the-transfer-before-169)); `exchange` or
-  `check_rename` the WP0(d) design; `estate` estate capture's typed reads; `mut=` the mutation;
+  `check_rename` the WP0(d) design (`exchange` is the code since #187; a
+  row with neither models [the transfer before
+  #187](#rows-that-model-the-transfer-before-187)); `no-exchange`
+  `ExchangeSupported = FALSE`, a destination with no atomic exchange
+  (OI-1003-Q100); `estate` estate capture's typed reads; `mut=` the mutation;
   `sym` `SYMMETRY` over seats; `budget` the `WithinBudget` seconds.
 - **Distinct** is counted under symmetry where `sym` is shown. For
   `MC_main_sim` it is the number of states the simulation checked, not a
@@ -271,6 +332,17 @@ Reading the table:
 - **Violated** lists every property the log reports violated. A FAIL or
   REACHED row shows exactly its named property, never `TypeOK` and never a
   deadlock.
+- **Counts on 2026-10-07 (the #187 model extension, OI-1003-Q102).** Listed
+  above the table. `MC_supersede_strict_main` counts exactly what
+  `MC_supersede_main` does (1,664,264): with the superseding publish on,
+  an output this store owns is superseded, never adopted against a
+  manifest, so the strict ghost never differs from what the capture
+  record already says. `MC_supersede_strict_deep` differs (797,105 against
+  792,260) through the third-party write. Fail and reach rows stop at
+  their first violation, so their counts are that run's.
+- **Counts on 2026-10-07, earlier (#186, #187).** No pass row's count
+  moved; `MC_supersede_main` (then 1,072,654) and `MC_supersede_deep`
+  (then 506,397) were new.
 - **Counts that moved on 2026-10-06 (#169 and its review).** Every row
   but seven now runs with `AdoptUnrowed = TRUE` (the code since #169), so
   every count outside those seven moved: an output's capture record splits
@@ -296,8 +368,12 @@ Bounds:
   relaxed-only loss and consults the ledger (WP0(g) verdict).
 - Depth comes from one seat with three runs and two crashes (`MC_main_deep`,
   `MC_wp0g_deep`, `MC_nv_core`, `MC_nv_ledger`).
-- No config needed reducing: every positive finishes in under 120 s at
-  a load near 30 (`MC_main`, the slowest), far inside its 600 s budget.
+- The superseding publish (the code since #187) has both: `MC_supersede_main`
+  at `MC_main`'s bound and `MC_supersede_deep` at `MC_main_deep`'s, each
+  again under the strict-held ghost.
+- No config needed reducing: every positive finishes in about 185 s or less
+  at a load near 30 (`MC_supersede_main`, the slowest, 183 s), inside
+  its 600 s budget.
 - The constants first drafted for `MC_main` (two seats, three runs, every
   fault) appear only as `MC_main_sim`: a seeded simulation (`-simulate
   num=3000 -depth 120 -seed 20261003`), recorded as SIMULATION and never as
@@ -306,8 +382,8 @@ Bounds:
 ## Coverage
 
 Coverage is TLC's `-coverage` report, the last one in each log. An action is
-*never enabled* in a config when it generated no state at all. `Next` has 37
-actions (38 coverage entries with `Init`).
+*never enabled* in a config when it generated no state at all. `Next` has 38
+actions (39 coverage entries with `Init`).
 
 **Coverage is enforced.** Each pass row's `never` column in `configs.tsv` is
 the exact set of actions its report must show never enabled. `tla-check`
@@ -328,6 +404,9 @@ violation, and a simulation only samples.
 | `MC_wp0g` | `Edit`, `SilentRewrite`, `RecvRefused`, `CommitFail` | WP0(d), estate |
 | `MC_wp0g_deep` | – | WP0(d), estate |
 | `MC_wp0d_exchange` | `CommitFail`, `CheckOwn`, `RenameReplace` | estate |
+| `MC_supersede_main`, `MC_supersede_strict_main` | `ForeignWrite`, `ForeignDelete`, `CommitFail`, `CheckOwn`, `RenameReplace` | estate |
+| `MC_supersede_deep`, `MC_supersede_strict_deep` | `CheckOwn`, `RenameReplace` | estate |
+| `MC_supersede_noexchange` | `CommitFail`, `CheckOwn`, `RenameReplace`, `BeginSupersede`, `Exchange`, `VerifyDisp` | estate |
 | `MC_s2` | `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d) |
 | `MC_live` | `Edit`, `SilentRewrite`, `RecvRefused`, `CrashSrc`, `CrashDst`, `CrashBoth`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 | `MC_r25_unrowed_bytes`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
@@ -339,24 +418,29 @@ enabled in another config:
 
 | Never enabled | Why it is off | Enabled in |
 |---|---|---|
-| WP0(d): `Exchange`, `VerifyDisp` | `SupersedeMode = "off"`: the code has no superseding publish, and these model WP0(d)'s exchange design | `MC_wp0d_exchange`, `MC_neg_sweep_displaced` |
+| WP0(d): `BeginSupersede`, `Exchange`, `VerifyDisp` | `SupersedeMode = "off"`: the row models the transfer without superseding publish, the code before #187 ([those rows](#rows-that-model-the-transfer-before-187)). In `MC_supersede_noexchange` they are off because `ExchangeSupported = FALSE`: with no atomic exchange nothing is ever superseded (OI-1003-Q100) | `MC_wp0d_exchange`, `MC_supersede_main`, `MC_supersede_deep`, `MC_supersede_strict_main`, `MC_supersede_strict_deep`, `MC_neg_sweep_displaced` |
 | WP0(d): `CheckOwn`, `RenameReplace` | `SupersedeMode` is not `"check_rename"`; these model WP0(d)'s rejected check-then-rename design | `MC_wp0d_check_rename`: its counterexample takes `CheckOwn` at state 25 and `RenameReplace` at state 27 |
 | estate: `GitRead`, `BackupBegin`, `BackupStepLock`, `BackupStepUnlock`, `BackupEnd` | `EstateReads = FALSE`: estate capture's typed reads do not depend on the transfer, so S2 is checked on its own | `MC_s2` |
-| `ForeignWrite`, `ForeignDelete` | `MaxForeign = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_nv_ledger`, `MC_wp0g`, `MC_wp0g_deep`, `MC_wp0d_exchange` |
-| `CommitFail` | `MaxCommitFails = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_wp0g_deep` |
+| `ForeignWrite`, `ForeignDelete` | `MaxForeign = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_nv_ledger`, `MC_wp0g`, `MC_wp0g_deep`, `MC_wp0d_exchange`, `MC_supersede_deep`, `MC_supersede_strict_deep`, `MC_supersede_noexchange` |
+| `CommitFail` | `MaxCommitFails = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_wp0g_deep`, `MC_supersede_deep`, `MC_supersede_strict_deep` |
 | `Edit`, `SilentRewrite`, `RecvRefused` | `MaxEdits = 0`: a refusal needs a changed source | every config with `E1` |
 | `CrashSrc`, `CrashDst`, `CrashBoth` | `MaxCrashes = 0` | every config with `C1` or `C2` |
 
 **Branches, not only actions.** Action-level coverage can hide a dead branch
-inside an action. Three reach rows prove that the branches R25 and WP0(g)
-depend on are reachable. Each runs at the bound of a pass row, so that pass
-row's complete search explores the branch:
+inside an action. Eight reach rows prove that the branches R25, WP0(g) and
+#187's records depend on are reachable. Each runs at the bound of a pass
+row, so that pass row's complete search explores the branch:
 
 | Reach row | Witness | Branch | At the bound of |
 |---|---|---|---|
 | `MC_reach_ledger_manifest` | `Witness_LedgerManifest` | `RecvDecide`: a manifest served from the source ledger, with no read | `MC_nv_ledger` |
 | `MC_reach_ledger_chunks` | `Witness_LedgerChunkRead` | `RecvNeed`: a ledger manifest's chunks re-read (pread) to fill an absent output | `MC_nv_ledger` |
 | `MC_reach_wp0g_lost_row` | `Witness_LostRowRead` | WP0(g): a row a relaxed ledger lost, then a later run's ledger miss and read | `MC_wp0g` |
+| `MC_reach_exchange_refused` | `Witness_ExchangeRefused` | `RecvManifest`, `RecvEnd`: a changed seat's own output refused `DESTINATION_EXCHANGE_UNSUPPORTED` (OI-1003-Q100) | `MC_supersede_noexchange` |
+| `MC_reach_remembered_refusal` | `Witness_RememberedRefusal` | `RecvEntry`: an entry refused from its remembered refusal, with no source read | `MC_wp0d_exchange` |
+| `MC_reach_ownership_superseded` | `Witness_OwnershipSuperseded` | `BeginSupersede`: a superseding publish of an output owned by its ownership row alone, a racy publish whose seat changed again (OI-1003-Q101) | `MC_wp0d_exchange` |
+| `MC_reach_sweep_ownership` | `Witness_SweepOwnership` | `StartRun`'s sweep: an interrupted supersede whose staged file is at the leaf gets the ownership row | `MC_wp0d_exchange` |
+| `MC_reach_sweep_restore` | `Witness_SweepRestore` | `StartRun`'s sweep: an interrupted supersede whose exchange did not take effect gets its rows back | `MC_wp0d_exchange` |
 
 A witness invariant is used instead of line counts from the coverage report,
 whose line numbers move with every spec edit. Neither ledger branch is
@@ -468,13 +552,15 @@ What `tla-render` and `tla-check` add in the shell:
   `just tla-render --check` runs this check alone.
 - **Grounding, per module** (`T.Module`; GitCarry's numbers are in
   [GitCarry](#results-gitcarry)). For BulkloadTransfer.tla: every operator
-  the catalogue names (22 properties, 3
-  witnesses, 37 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init` and
-  `Next`: 67 names) is defined in the spec. The catalogue's 17 constants
-  are exactly the spec's `CONSTANTS`, and its 23 mutations exactly the
+  the catalogue names (26 properties, 8
+  witnesses, 38 actions, `Spec`, `LiveSpec`, `SeatSymmetry`, `Init` and
+  `Next`: 77 names) is defined in the spec. The catalogue's 18 constants
+  are exactly the spec's `CONSTANTS`, and its 29 mutations exactly the
   spec's `Mutations` set without `"none"`: a rule break added to the spec
   with no catalogue entry fails, as does a catalogue entry the spec lacks.
-  All 19 distinct code symbols are found as whole words on lines that are
+  All 31 distinct code symbols (the frozen invariants' and, since
+  2026-10-07, those of `supersedeInvariants`, the traceability rows of
+  #187's four properties) are found as whole words on lines that are
   not comments, in the Rust sources under `crates/` outside `tests/` (the
   module's `symbolMatch` is `code`: its symbols include enum variants,
   fields and parameters, which have no item definition). GitCarry.tla's
@@ -519,9 +605,18 @@ actions and invariants inside its domain.
   in `MC_nv_ledger`: `StartRun`, the 13 per-seat protocol actions,
   `Commit`, `LedgerCommit`, `SendSourceDone`, `Finish`, `Edit`,
   `SilentRewrite`, `Tick`, `ForeignWrite`, `ForeignDelete`, the three
-  crashes and `Terminated`. The other 10 are absent: `CommitFail`, WP0(d)'s
-  four and estate capture's five. So are the space refusal, relaxed
-  stores and an unsealed state root. Since the #169 review it models the
+  crashes and `Terminated`. The other 11 are absent: `CommitFail`, WP0(d)'s
+  five and estate capture's five. So are the space refusal, relaxed
+  stores and an unsealed state root. **#187's records are pinned outside
+  it (2026-10-07, OI-1003-Q102).** The intent, the ownership row, the
+  remembered refusal, the sweep of intents and the refusal without an
+  exchange exist in the spec only under `SupersedeMode = "exchange"`,
+  which the explorer does not have; `explorerModels` also requires
+  `ExchangeSupported`. With `SupersedeMode = "off"` each new variable
+  holds its initial value in every reachable state, so the four presets'
+  counts did not move and the explorer needed no new state
+  (`hs/Explorer.hs`'s header says the same). Their four properties and six
+  mutations are TLC's alone, as WP0(d)'s were already. Since the #169 review it models the
   capture record and its adoption (`--adopt`, TLC's `AdoptUnrowed`: the
   file's `rec` field, `RecvEntry`'s adoption, the manifest adoption's
   record in `RecvEnd`, `AnswerHeld`'s settle of an adopted entry and
@@ -542,7 +637,7 @@ actions and invariants inside its domain.
   them, as TLC's `Seats`, `MaxRuns`, `MaxCrashes`, `MaxEdits` and
   `MaxForeign`; `--adopt` and `--strict-held` turn on `AdoptUnrowed` and
   `TrackStrictHeld`. It supports the 18 mutations that need no absent
-  action, and refuses the other 5 at the command line.
+  action, and refuses the other 11 at the command line.
 - **What `formal-nv` checks.** The presets must reach TLC's distinct-state
   counts of record, with no invariant violated and no deadlock. The
   mutation rows come from the catalogue, not from the recipe. The
@@ -555,7 +650,10 @@ actions and invariants inside its domain.
   `MC_neg_record_racy_ledger`. Every one of them runs with `AdoptUnrowed`
   on (the code since #169). Outside the domain are
   `MC_neg_reread_exchange`, `untyped_space`, `git_optional_locks`,
-  `unbounded_backup`, `supersede_unchecked` and `sweep_displaced`. For
+  `unbounded_backup`, `supersede_unchecked`, `sweep_displaced` and the
+  six rows of #187's records (`owned_ignores_identity`,
+  `sweep_drops_ownership`, `exchange_before_intent`, `own_is_reuse`,
+  `refusal_unbound`, `late_exchange_refusal`). For
   each row:
   - The explorer runs at the row's bound, with `TypeOK` and the named
     property checked as the row's TLC config does, and must violate
@@ -911,18 +1009,19 @@ tail. Corruption itself is outside the model and not proven here.
 
 ## WP0(d): exchange versus check-then-rename (OI-1003-Q18)
 
-The code has no superseding publish yet. A changed seat whose output exists
-is adopted only if its bytes verify, and otherwise refuses
-`GIT_DESTINATION_OCCUPIED`. `SupersedeMode = "off"` models that. Two designs
-are checked against `NoClobber`: bulkload replaces or removes a destination
-file only when its identity is one this store recorded.
+Before #187 the code had no superseding publish: a changed seat whose output
+existed was adopted only if its bytes verified, and otherwise refused
+(`DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` before #187).
+`SupersedeMode = "off"` models that transfer. Two designs were checked
+against `NoClobber`: bulkload replaces or removes a destination file only
+when its identity is one this store recorded.
 
 - **`check_rename` fails** (`MC_wp0d_check_rename`, `NoClobber` and only
   it, with a 27-state counterexample). Comparing the output's `(dev, ino, stat)` with the
   store's row, then renaming over it, leaves a window. A third-party write
   that lands in between is clobbered. No fsync ordering closes that window.
 - **`exchange` passes** (`MC_wp0d_exchange`). This is `RENAME_EXCHANGE`
-  (`renameat2`; `renamex_np(RENAME_SWAP)` on Darwin) of the sealed new file
+  (`renameat2`; `renameatx_np(RENAME_SWAP)` on Darwin) of the sealed new file
   with the output. The design then checks the *displaced* file's identity:
   - this store's own file is removed;
   - a foreign file is exchanged back;
@@ -932,9 +1031,45 @@ file only when its identity is one this store recorded.
   `MC_neg_supersede_unchecked` and `MC_neg_sweep_displaced` show that the
   identity check and the recovery rule are each load-bearing.
 
-WP5 PR 3 should implement the exchange shape. Where a filesystem has no
-exchange, the publish should refuse and keep no-clobber. Its `crash_check`
-traces should cover the displaced-name window.
+**The code since #187 is the exchange design** (2026-10-07;
+`crates/bulkload-agent/src/materialize.rs`, "Superseding publish"). Six
+pass rows check it: `MC_wp0d_exchange`, `MC_supersede_main` (`MC_main`'s
+bound), `MC_supersede_deep` (`MC_main_deep`'s, with a failed group commit,
+the space refusal and a third-party write), the same two bounds under
+R25's strict reading (`MC_supersede_strict_main`,
+`MC_supersede_strict_deep`), and `MC_supersede_noexchange`, a destination
+with no atomic exchange. All pass every safety invariant and the four
+properties of [#187's records](#187s-records-in-the-model-oi-1003-q102).
+
+How the model stands to the code since the 2026-10-07 extension
+(OI-1003-Q102: model first, then merge):
+
+- **The intent is modelled.** `BeginSupersede` is `begin_supersedes`: one
+  store commit writes the intent and moves the path's rows (reuse rows and
+  ownership row) out of the store into it, before the exchange. `Exchange`
+  trades the two names, `VerifyDisp` checks the displaced file against the
+  identity the intent recorded, and `Commit` settles the intent beside the
+  new row. `StartRun` sweeps an intent a crash or a failed group left
+  (`Destination::settle_supersedes`). Before the extension the model kept
+  the old rows in the store across the exchange and read ownership from
+  them; that shape is now the mutation `exchange_before_intent`'s.
+- **A touched seat.** An owned output whose bytes already equal the
+  manifest's is adopted in place by the code; the model exchanges it for an
+  equal file. `MC_neg_reread_exchange`'s counterexample rests on that
+  abstraction: the code would adopt, and read nothing. On a destination
+  with no exchange the model follows the code: equal bytes are adopted,
+  other bytes refused.
+- **What the model does not see.** The identity check on the displaced file
+  compares the inode, size and mtime, not the ctime: the exchange itself
+  moves it. A third party that rewrites the output in place and puts its
+  mtime back between the publish's last look and its exchange is not seen
+  (`materialize.rs`, "One limit"). The model's identity is a version that
+  any write moves, and it folds the publish's last look into the exchange,
+  so every third-party change after the intent is answered by
+  `VerifyDisp`. The syscall ordering inside the group (the seal between an
+  exchange back and its unlink, the barrier model on Darwin) is
+  `crash_check`'s to prove, on hand-written and real traces
+  (`io/crash_check/tests.rs`, `tests/power_loss.rs`).
 
 ## Abstraction map
 
@@ -962,7 +1097,13 @@ Code at adb9c66, re-checked at `origin/main` 6268175. `A` is
 | `GitRead` | `A/git_carry.rs` `git`, the `git_env` table |
 | `BackupBegin`, `BackupStepLock`, `BackupStepUnlock`, `BackupEnd` | `A/provider_sqlite.rs` `snapshot` |
 | Messages, refusal codes | `P/frame.rs` `Control`, `Decision`; `P/refusal.rs` `BulkloadRefusal::code` |
-| `CheckOwn`, `RenameReplace`, `Exchange`, `VerifyDisp` | WP0(d) candidate designs; no code yet |
+| `RecvManifest`'s plan for an owned output (WP0(d), the code since #187; OI-1003-Q100) | `A/transfer.rs` `plan_file`; `A/materialize.rs` `owned_output`, `Destination::exchange_supported`; `A/transfer_store.rs` `Store::output_rows`, `owner_key` |
+| `BeginSupersede` | `A/materialize.rs` `PublishSink::supersede`, `StagedFile::prepare_supersede`; `A/transfer_store.rs` `begin_supersedes` |
+| `Exchange`, `VerifyDisp` | `A/materialize.rs` `StagedFile::exchange`, `is_owned`, `is_staged`; `A/io/mod.rs` `exchange` |
+| `Commit`'s settle of an intent; a racy output's ownership row (OI-1003-Q101) | `A/transfer_store.rs` `commit_outputs`, `settle_in`, `row_in`, `own_in`, `owner_key` |
+| `StartRun`'s sweep of unsettled intents | `A/materialize.rs` `Destination::settle_supersedes` (ahead of `Destination::sweep`), `published`; `A/transfer_store.rs` `supersede_intents`, `settle_supersede` |
+| `RecvEntry`'s remembered refusal; `RecvEnd`'s record of one | `A/transfer.rs` `Inbound::remembered_refusal`, `Inbound::remember_refusal`, `verify_settled`; `A/transfer_store.rs` `Store::refused_output`, `Store::remember_refused_output` |
+| `CheckOwn`, `RenameReplace` | WP0(d)'s rejected check-then-rename design; no code |
 | `Edit`, `SilentRewrite`, `Tick`, `ForeignWrite`, `ForeignDelete` | The environment: live source writers, the 2 s racy allowance, third parties at the destination |
 
 What the abstractions are:
@@ -999,7 +1140,7 @@ that test the same claim on the real code. SLOs are
 | Model property | Statement | SLO | Rulings | Property tests |
 |---|---|---|---|---|
 | `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20 | P23, P21, P19, P24, P33 |
-| `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the code today)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
+| `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the transfer before #187)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
 | `ReadOnce` | A seat is read at most once per session. | S1, S3 | R-N58 | P23 |
 | `S3_ReadsOnlyChanged` | A run reads only seats not held when it began (changed, racy, never carried, or lost at the destination) or changed during it. | S3 | OI-1003-Q18 (WP0(c), inequality 1) | P21, P23 |
 | `S3_UnchangedReadsZero` | An unchanged source whose every seat is held reads 0 content bytes. | S3 | OI-1003-Q6, R-N58 | P21, P32 |
@@ -1010,7 +1151,7 @@ that test the same claim on the real code. SLOs are
 | `DoneAfterLedger` | `SourceDone` follows the ledger's last commit. | Durability | wire v5 (design.md) | P4, P23 |
 | `ReuseSound` | Held under the seat's current identity means held with its current bytes (the racy rule). | S3, S5 | #86, R-N76 | P19 |
 | `LedgerSound` | A ledger manifest under the current key is the seat's current content. | S3, S5 | #86, R-N58 | P17, P19 |
-| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26 |
+| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded: in a reuse row, in the path's ownership row, or in a row an unsettled intent holds (`RecordedIds`). The ghost is set by every step that unnames a file: `RenameReplace`, `VerifyDisp`'s removal of a displaced file, and the sweep's. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26, P78 |
 | `S2_TypedSourceAccess` | Every source access is a stat, a content read, an allowlisted git read or the SQLite backup. No write, lock, lease or signal. | S2 | OI-1003-Q5, OI-1003-Q16 (WP0(b)) | P34 |
 | `S2_BackupLockBounded` | The backup's lock is only ever shared, held only inside one step of a counted backup, and taken at most `max_steps` times. | S2 (its stated exception) | OI-1003-Q16 | P34; no dedicated test yet |
 | `ClosureAccounted` | A finished session leaves every seat applied or with a typed refusal. A bare `IO` closes nothing. | S4 | OI-1003-Q1, #100 | P61 |
@@ -1024,7 +1165,11 @@ Not frozen, and not the SLO's obligation (OI-1003-Q40):
 |---|---|
 | `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, published or adopted and sealed, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`), and so does a manifest adoption that writes no record (`MC_neg_adopt_unrecorded`). With the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant, within [stated limits](#r25s-strict-reading-169) (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority`). |
 | `AdoptOnlyUnrowed` | #169's adoption is for outputs with no row: an entry queued as an unrowed adoption never has a committed row for its key and its output's identity. A rowed output is answered `Reuse` from its row. Checked by every pass row with `AdoptUnrowed` on; `MC_neg_reuse_ignores_row` fails it. It exists because a regression of `Store::output_matches` would otherwise be invisible: the adoption takes over, hashes and re-rows every output on every run, and reads 0 source bytes, so no R25 or S3 property fires. Rust: `transfer::tests::a_clean_rerun_reuses_rowed_outputs_and_adopts_none`. |
-| `Witness_LedgerManifest`, `Witness_LedgerChunkRead`, `Witness_LostRowRead` | Reachability witnesses ([Coverage](#coverage)): each says a scenario never happens, and its reach row must violate it. |
+| `SupersedeAtomic` | #187, OI-1003-Q18, OI-1003-Q102: a superseding publish is atomic across any crash. Once it is settled (no intent recorded, no stage of its group pending), while the new file is at the leaf this store holds a row for it (its reuse row, or the ownership row the sweep gives it) and none for the old output; while the old output is at the leaf this store still holds a row for it and none for the new file. Never one file beside the other's rows. A leaf a third party wrote since is neither file. Checked by every pass row with `SupersedeMode = "exchange"`; `MC_neg_sweep_drops_ownership` and `MC_neg_exchange_before_intent` fail it. Rust: P78, `tests/power_loss.rs` (the superseding rerun), `tests/fault_harness.rs` (the `SUPERSEDING` rows). |
+| `OwnershipNeverReuse` | OI-1003-Q101, R25, #86: `Reuse` is answered only from a reuse row for the entry's key and the output's identity. An ownership row (a racy publish, an interrupted supersede) names no seat and is never a reuse source. `MC_neg_own_is_reuse` fails it. Rust: `transfer_store::tests::a_racy_output_has_an_ownership_row_and_no_reuse_row`, P19. |
+| `RememberedRefusalSound` | #187 review: a remembered refusal is answered only while it is still the right answer: for an unchanged seat, the path holds a file whose bytes are not the seat's. Stated on the files, not on the record. `MC_neg_refusal_unbound` fails it. Rust: `transfer::tests::an_occupied_seat_is_read_once_and_then_refused_from_its_record`, P21, P74. |
+| `ExchangeRefusedUpFront` | OI-1003-Q100: on a destination with no atomic exchange nothing is ever staged to supersede an output, no intent is recorded and nothing is displaced. Trivial unless `ExchangeSupported = FALSE` (`MC_supersede_noexchange`); `MC_neg_late_exchange_refusal` fails it. Rust: `transfer::tests::a_changed_seat_without_an_exchange_is_refused_before_anything_is_staged`. |
+| `Witness_LedgerManifest`, `Witness_LedgerChunkRead`, `Witness_LostRowRead`, `Witness_ExchangeRefused`, `Witness_RememberedRefusal`, `Witness_OwnershipSuperseded`, `Witness_SweepOwnership`, `Witness_SweepRestore` | Reachability witnesses ([Coverage](#coverage)): each says a scenario never happens, and its reach row must violate it. |
 
 docs/slo.md states R25's model obligation as "no committed capture is
 re-read". That wording is `R25_NoCommittedCaptureReread`, which is weaker
@@ -1049,7 +1194,7 @@ Each negative config sets `Mutation` to break exactly one rule, and it must
 fail on the one property named in `configs.tsv`, with `TypeOK` checked
 alongside. Rows marked (core) run on `MC_nv_core`'s constants. The others use
 the smallest bound that reaches the break. `just formal-nv` also runs every
-row inside the Haskell explorer's domain, 21 of the 27, on the explorer
+row inside the Haskell explorer's domain, 21 of the 33, on the explorer
 ([Hybrid roles](#hybrid-roles-oi-1003-q32)). Every mutation row runs with
 `AdoptUnrowed = TRUE`: each break must be caught with #169's adoption in
 place ([what the review found](#what-the-169-review-changed)).
@@ -1073,12 +1218,18 @@ place ([what the review found](#what-the-169-review-changed)).
 | `pause_writer` | a capture interrupts a source writer | `S2_TypedSourceAccess` |
 | `git_optional_locks` | git without the optional-locks guard (`git_env`) | `S2_TypedSourceAccess` |
 | `unbounded_backup` | the backup steps past `max_steps` (`provider_sqlite::snapshot`) | `S2_BackupLockBounded` |
-| `supersede_unchecked` | WP0(d) exchange without the identity check | `NoClobber` |
-| `sweep_displaced` | WP0(d) recovery deletes a displaced foreign file | `NoClobber` |
+| `supersede_unchecked` | WP0(d) exchange without the identity check (`owned_output` at the plan, `is_owned` on the displaced file) | `NoClobber` |
+| `sweep_displaced` | WP0(d) recovery deletes a displaced foreign file (the sweep without `Destination::settle_supersedes`) | `NoClobber` |
 | `adopt_unkeyed` | #169 adoption without the record's row-key check (`unrowed::prove`) | `ReuseSound` |
 | `adopt_unverified` | #169 adoption without hashing the output against its record (`unrowed::prove`) | `RecordImpliesBytes` |
 | `reuse_ignores_row` | `Reuse` ignores the output's row (`Store::output_matches` always false), so the adoption takes every rowed output | `AdoptOnlyUnrowed` |
 | `adopt_unrecorded` | an output adopted against a manifest gets no capture record (`Inbound::adopt`, `unrowed::refresh`) | `R25_StrictNoDurableReread` |
+| `owned_ignores_identity` | #187: any file at a path that has an ownership row is superseded, whatever its identity (`owned_output` without the identity comparison). A third party's file that replaced a racy publish is exchanged away and removed | `NoClobber` |
+| `sweep_drops_ownership` | #187: the sweep deletes the intent of an interrupted supersede whose staged file is at the leaf without recording its ownership (`settle_supersede` with no owned identity) | `SupersedeAtomic` |
+| `exchange_before_intent` | #187: the exchange runs ahead of the intent's commit (`begin_supersedes` after `io::exchange`). A crash between the two leaves the new output beside the old output's rows | `SupersedeAtomic` |
+| `own_is_reuse` | OI-1003-Q101: an output the path's ownership row names is answered `Reuse` (`output_matches` reading `owned_outputs`), so a racy publish becomes a reuse source | `OwnershipNeverReuse` |
+| `refusal_unbound` | #187 review: a remembered refusal is answered by its row key alone, without the identity of the file now at the path (`refused_output`) | `RememberedRefusalSound` |
+| `late_exchange_refusal` | OI-1003-Q100: no exchange probe at the plan, so a changed seat is staged and its chunks asked of the source before it is refused (the code before the #187 review) | `ExchangeRefusedUpFront` |
 
 What the mutations showed:
 
@@ -1294,6 +1445,124 @@ code since #169:
 | `MC_store_root_unsealed` | The finding that a lost source store re-keys every row and re-reads held bytes. With the record it no longer does for outputs that carry one (`MC_r25_strict_unsealed` passes `R25_NoDurableReread` at this bound); an output without a record is still re-read. |
 | `MC_wp0g_authority` | The same for a relaxed creation commit (`MC_r25_strict_authority`). WP0(g)'s condition stands: it was ratified on this row (OI-1003-Q37), and a record is not guaranteed. |
 
+### Rows that model the transfer before #187
+
+Every row whose constants are not tagged `exchange` or `check_rename` keeps
+`SupersedeMode = "off"`: the transfer without superseding publish, which
+was the code until #187 (2026-10-07). In that transfer a changed seat whose
+output exists is adopted if its bytes verify and refused otherwise. The
+rows were not moved, for three reasons:
+
+- **Their verdicts still hold for the code** wherever no output is
+  superseded: a first pass, an unchanged rerun, a crash and its resume, a
+  lost source store. Those are the behaviours R25, the Held ordering, the
+  ledger properties and S2 are about. An `off` row says nothing about a
+  changed seat's replacement.
+- **Their counts are of record.** `MC_nv_core`, `MC_nv_ledger` and their
+  `_adopt` rows are frozen names whose distinct-state counts the Haskell
+  explorer must reproduce, and the explorer has no WP0(d) action ([N-version
+  core](#n-version-core-oi-1003-q32)). Moving them needs a ruling, as for
+  #169.
+- **The superseding publish is checked on rows of its own**, at the two
+  main bounds: `MC_supersede_main` and `MC_supersede_deep`, with
+  `MC_wp0d_exchange`, `MC_supersede_noexchange`, the two strict rows and
+  the mutation rows of [#187's
+  records](#187s-records-in-the-model-oi-1003-q102).
+
+What is not yet checked with the superseding publish on: the relaxed source
+ledger (`MC_wp0g`, `MC_wp0g_deep`), a lost source authority, estate reads
+(`MC_s2`) and liveness (`MC_live`). None of those properties reads
+`SupersedeMode`, but no row combines them. R25's strict reading is checked
+with it since 2026-10-07 (`MC_supersede_strict_main`,
+`MC_supersede_strict_deep`).
+
+### #187's records in the model (OI-1003-Q102)
+
+OI-1003-Q102 (2026-10-07): model first, then merge. The review of #187
+added three records to the destination store and one refusal; until this
+revision none was in the model, and this section replaces the gap note
+that said so. They exist only under `SupersedeMode = "exchange"`, the code
+since #187. With it off every new variable keeps its initial value, so no
+other row's state graph moved ([Results](#results)).
+
+State:
+
+| Variable | Table | What it holds |
+|---|---|---|
+| `intent` | `supersedes` | Per seat, the intent of a superseding publish not yet settled: the staged file's identity, the identity this store recorded for the output it replaces, and the path's rows, moved out of the store when the intent commits. |
+| `dOwn` | `owned_outputs` | Per seat, the identity in the path's ownership row: this store's own output with no reuse row. Written for an output published or adopted from a racy capture (OI-1003-Q101), and by the sweep for an interrupted supersede whose staged file is at the leaf. |
+| `dRefused` | `refused_outputs` | Remembered refusals: the entry under a row key was refused, with a code, for the file of a given identity at its path. |
+| `ExchangeSupported` (constant) | the probe, `Destination::exchange_supported` | OI-1003-Q100: whether the destination has the atomic exchange. `FALSE` refuses a superseding seat `DESTINATION_EXCHANGE_UNSUPPORTED` before anything is staged. There is no fallback. |
+| `lastSup`, `reuseBad`, `wrongRefusal` | (ghosts) | The two files of a seat's last superseding publish, for `SupersedeAtomic`; and the two flags `OwnershipNeverReuse` and `RememberedRefusalSound` read. |
+
+Actions, each with the code it models (the spec's comments and its code
+map say the same):
+
+| Action or branch | What it does | Code |
+|---|---|---|
+| `RecvEntry`, the remembered refusal | After the reuse row and ahead of the capture record: an entry whose row key and whose file at the path are those of a remembered refusal is refused with the same code; the source reads nothing. | `Inbound::entry`, `Inbound::remembered_refusal`, `Store::refused_output` |
+| `RecvManifest`, the plan | An output is this store's own when its identity is in a reuse row or the ownership row. Owned: superseded; or, with no exchange, adopted when its bytes are the manifest's and planned for refusal otherwise, with nothing staged and no chunk asked for. | `plan_file`, `owned_output`, `Store::output_rows`, `Destination::exchange_supported` (`Plan::NoExchange`) |
+| `RecvEnd`, the refusals | `DESTINATION_EXCHANGE_UNSUPPORTED` for the plan above; `DESTINATION_OCCUPIED` for a file that does not verify. Either is remembered when the capture was not racy. | `Inbound::end`, `end_filling`, `Inbound::remember_refusal`, `verify_settled`, `Store::remember_refused_output` |
+| `BeginSupersede` | The leaf must still hold the owned output, or the entry is refused. One commit writes the intent and moves the path's rows into it. | `StagedFile::prepare_supersede`, `PublishSink::supersede`, `begin_supersedes` |
+| `Exchange` | The staged name and the leaf trade files atomically. A leaf that vanished exchanges nothing, and the intent is settled without its rows. | `StagedFile::exchange`, `io::exchange` |
+| `VerifyDisp` | The displaced file is removed when it has the identity the intent recorded; any other file is exchanged back, or kept aside with its intent. | `StagedFile::exchange` (`is_owned`, `Exchanged::Done`, `Restored`, `Stranded`) |
+| `Commit` | Settles each superseding publish of the group beside its new row. A racy output gets the ownership row and no reuse row. | `commit_outputs`, `settle_in`, `row_in`, `own_in` |
+| `CommitFail` | A failed group settles nothing: the intent stays for the sweep. | `PublishSink::commit`, `space_refusal` |
+| `StartRun`, the sweep | For each unsettled intent: rows back when the old output is still at the leaf; the ownership row when the staged file is; a displaced owned output removed; a displaced file of anyone else exchanged back, or kept aside with its intent. | `Destination::settle_supersedes`, `published`, `supersede_intents`, `settle_supersede` |
+
+The invariants, stated precisely in the spec and in [the property
+table](#properties-slos-rulings-and-tests):
+
+- **`NoClobber`**: a destination file is replaced or removed only when its
+  identity is one this store recorded, in a reuse row, the ownership row,
+  or a row an unsettled intent holds.
+- **`SupersedeAtomic`**: after any crash, the old output with its old rows
+  or the new output with a row of its own, never mixed.
+- **`OwnershipNeverReuse`**: ownership never implies reuse; a racy output
+  is never a reuse source (R25, #86).
+- **`RememberedRefusalSound`**: a remembered refusal is answered only
+  while the path still holds other bytes than the unchanged seat's.
+- **`ExchangeRefusedUpFront`**: with no atomic exchange, nothing is staged,
+  recorded or displaced for a superseding seat (OI-1003-Q100).
+- **`R25_NoDurableReread`** and **`R25_StrictNoDurableReread`** hold with
+  the superseding publish on: every exchange pass row checks the first,
+  and `MC_supersede_strict_main` and `MC_supersede_strict_deep` the second
+  under `TrackStrictHeld`.
+
+Seven mutations fail on their named property: the six [new
+ones](#mutations) and `supersede_unchecked` (the supersede without the
+ownership check, `NoClobber`), which now runs through the intent. Five
+reach rows show the new branches are explored ([Coverage](#coverage)).
+
+What the model still does not hold, or abstracts:
+
+- **One intent per seat.** The code keys an intent by its staged name, so
+  a path whose displaced file is kept aside could be superseded again.
+  Here a seat with a kept-aside file is never superseded again.
+- **`begin_supersedes` never fails**, and commits per seat, not per group.
+  A full disk under it is `CommitFail`'s case only for the group commit.
+- **The publish's last look** at the output is folded into `Exchange`.
+  That is a superset of the code's behaviours: every third-party change
+  after the intent is treated as landing in the window the look cannot
+  close.
+- **Stamps and clocks.** The intent's size and mtime stamp of the staged
+  file, the ctime an exchange moves, and the destination's racy window for
+  a remembered refusal (`verify_settled`) are not modelled: any write
+  moves a model identity. So a refusal remembered from a racy capture, or
+  against an unsettled file, cannot be shown wrong here; the Rust tests
+  hold those two guards (`a_racy_capture_is_sent_but_never_recorded`,
+  `an_occupied_seat_is_read_once_and_then_refused_from_its_record`).
+- **Ownership by path.** `OwnIds` ignores the source authority that keys
+  the code's rows. A recreated source store finds no owned output in the
+  code until a run has adopted it; the model would supersede it. No
+  exchange row loses the authority.
+- **The exchange probe** is one constant, not an answer per device and
+  session, and a refusal for a missing exchange is never re-probed.
+- **Chunks of a superseded output** (`materialize::Displaced`) are not
+  modelled: chunks are abstracted.
+- **The explorer** does not have these records ([its
+  domain](#the-explorer)).
+
 ## Code and design disagreements
 
 The model follows the code where the code and docs/design.md differ:
@@ -1301,8 +1570,17 @@ The model follows the code where the code and docs/design.md differ:
 - **WantManifest.** design.md says it is chosen when the output exists or
   published outputs hold chunks. `Inbound::entry` also chooses it when the
   sweep salvaged any temporary (`self.target.salvaged() > 0`).
-- **Superseding publish (WP0(d)).** It is ratified but not implemented.
-  `SupersedeMode = "off"` models the code.
+- **Superseding publish (WP0(d)).** Implemented by #187 (2026-10-07) as the
+  exchange design. `SupersedeMode = "exchange"` models the code, its
+  intent, ownership row and remembered refusal included ([#187's
+  records](#187s-records-in-the-model-oi-1003-q102));
+  `"off"` models the transfer before it ([WP0(d)](#wp0d-exchange-versus-check-then-rename-oi-1003-q18),
+  [the rows that keep it off](#rows-that-model-the-transfer-before-187)).
+- **A refused seat's sniff (#186).** The model has no content-based source
+  refusal: `SQLITE_STATE_CHANGED` is not in `TypedCodes`, and a refused
+  seat's 16 sniffed bytes are not in `reads`. So that the source remembers
+  such a refusal and does not sniff an unchanged seat again is not a model
+  property; P21 and P23 with refused seats check it on the code.
 - **WP0(g).** It is ratified conditionally and not implemented: both stores
   run `synchronous=FULL`, `fullfsync=ON` (`configure_sqlite`). The verdict
   above sets the condition.
@@ -1904,6 +2182,17 @@ renaming one is a breaking change to the proof package and needs a ruling.
 
 GitCarry.tla's names (the module, its properties, mutations, constants and
 configs) are new and not frozen; freezing them needs a ruling.
+
+The names of #187's records (2026-10-07, OI-1003-Q102) are not frozen
+either: the properties `SupersedeAtomic`, `OwnershipNeverReuse`,
+`RememberedRefusalSound` and `ExchangeRefusedUpFront`, the action
+`BeginSupersede`, the constant `ExchangeSupported`, the mutations
+`owned_ignores_identity`, `sweep_drops_ownership`,
+`exchange_before_intent`, `own_is_reuse`, `refusal_unbound` and
+`late_exchange_refusal`, and the configs `MC_supersede_*`,
+`MC_reach_exchange_refused`, `MC_reach_remembered_refusal`,
+`MC_reach_ownership_superseded`, `MC_reach_sweep_ownership`,
+`MC_reach_sweep_restore` and the six `MC_neg_` rows of those mutations.
 
 The names this revision adds are not frozen: `R25_StrictNoDurableReread`,
 `AdoptOnlyUnrowed` (#169), the `Witness_` invariants, the constants

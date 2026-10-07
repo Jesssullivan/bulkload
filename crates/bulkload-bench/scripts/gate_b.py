@@ -46,8 +46,9 @@ One rep (3 B reps in gated mode; one revision, so no A arm):
      must hold every comparable regular file and directory.
   4. Warm resume: the first native arm is pulled again unchanged; R25 wants
      0 bytes received and 0 content bytes read, and the rep fails otherwise
-     (gate (a)'s r25_warm_zero). Content bytes are source_bytes_read minus
-     the SQLite magic probes (see DEVIATIONS).
+     (gate (a)'s r25_warm_zero). Content bytes are the raw source_bytes_read:
+     since #186 the agent counts the 16-byte SQLite header sniff of a refused
+     seat apart (source_sniff_bytes, on the serve counters line).
   5. 1 % delta: the helper XORs 0xa5 over 1 % of the comparable regular-file
      bytes (whole files in a seeded path-hash order, the last one a prefix),
      the harness waits out the racy window (2 s, R-N76), removes those files
@@ -170,9 +171,6 @@ INTERRUPTED_NOT_RUN = (
 DEVIATIONS = (
     "no interrupted-resume phase: gate (a) also requires r25_interrupted_zero;"
     " gate (b) records r25_interrupted_resume=not-run and does not gate it",
-    "r25_warm_zero is 0 bytes received and 0 content bytes read, where content"
-    " bytes are source_bytes_read minus the SQLite magic probes (up to 16 bytes"
-    " per refused SQLite seat); gate (a) requires raw source_bytes_read = 0",
 )
 MIB = 1 << 20
 SETTLE_S = ec.RACY_SETTLE_NS / 1e9
@@ -1035,25 +1033,18 @@ def delta_plan(
     return plan
 
 
-def probe_bytes(rows: list[list[object]], exclusions: dict[str, str]) -> int:
-    """Bytes the agent reads to recognise SQLite seats it then refuses.
+def content_bytes_read(source_bytes_read: object) -> int | None:
+    """The R25 content reads: the raw source_bytes_read, as gate (a) takes it.
 
-    capture_file reads up to 16 bytes of every regular seat not refused by name
-    before it checks the SQLite magic, so each magic-refused seat costs
-    min(size, 16) source bytes on every pass, unchanged or not.
+    Until #186 the agent counted the 16-byte header sniff of every SQLite seat
+    it refuses by magic in source_bytes_read, on every pass, and this netted
+    it out. The agent now counts the sniff apart (source_sniff_bytes) and
+    sniffs an unchanged refused seat once, so nothing is netted out: doing so
+    would report negative content bytes.
     """
-    return sum(
-        min(int(r[3]), 16)
-        for r in rows
-        if r[1] == "f" and exclusions.get(str(r[0])) == "sqlite-magic"
-    )
-
-
-def content_bytes_read(source_bytes_read: object, probes: int) -> int | None:
-    """source_bytes_read minus the SQLite magic probes: the R25 content reads."""
     if not isinstance(source_bytes_read, int):
         return None
-    return source_bytes_read - probes
+    return source_bytes_read
 
 
 def changed_paths(before: list[list[object]], after: list[list[object]]) -> set[str]:
@@ -1300,7 +1291,7 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
             " every arm verified, every sample gated at load1 < 2.5 on both hosts"
             " (OI-1002-Q30, OI-1003-Q3, R-N81); no wall-clock SLA. Unratified"
             " deviation from gate (a): no interrupted-resume phase is run or"
-            " gated, and warm-resume reads are net of the SQLite magic probes"
+            " gated"
         ),
         "deviations_from_gate_a": list(DEVIATIONS),
         "b_reps": len(statuses),
@@ -1391,7 +1382,6 @@ class Context:
     plan: list[list[object]]
     rclone: str
     rclone_conf: Path
-    probe_bytes: int
     excludes: Path
     env: dict[str, str]
     native_env: dict[str, str]
@@ -1482,7 +1472,7 @@ def run_arm(
                 "reused": transfer.get("reused"),
                 "refusals_expected": len(parsed["refusals"]),
                 "content_bytes_read": content_bytes_read(
-                    transfer.get("source_bytes_read"), ctx.probe_bytes
+                    transfer.get("source_bytes_read")
                 ),
                 "serve_max_rss_bytes": serve_rss,
                 "source_priority": parsed["serve"].get("priority"),
@@ -2215,7 +2205,6 @@ def main(argv: list[str] | None = None) -> int:
             "delta_files": len(plan),
             "delta_bytes": sum(int(p[1]) for p in plan),
             "delta_seed": DELTA_SEED,
-            "sqlite_probe_bytes": probe_bytes(rows, exclusions),
         }
     )
     excludes = work / "rclone-excludes.txt"
@@ -2259,7 +2248,6 @@ def main(argv: list[str] | None = None) -> int:
         plan=plan,
         rclone=rclone,
         rclone_conf=conf,
-        probe_bytes=probe_bytes(rows, exclusions),
         excludes=excludes,
         env=env,
         native_env=native_env,

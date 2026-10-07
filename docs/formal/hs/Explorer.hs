@@ -39,11 +39,26 @@ of states as TLC with one worker.
 
 Out of the domain, and absent: the failed group commit (CommitFail), the
 space refusal, a relaxed source ledger or store, an unsealed state root,
-WP0(d)'s superseding publish (CheckOwn, RenameReplace, Exchange,
-VerifyDisp, the displaced file) and estate capture's typed reads (GitRead,
-Backup*); so an adopted unrowed output's group never fails here
+WP0(d)'s superseding publish (CheckOwn, RenameReplace, BeginSupersede,
+Exchange, VerifyDisp, the displaced file) and estate capture's typed reads
+(GitRead, Backup*); so an adopted unrowed output's group never fails here
 (AnswerHeld's failed_space outcome). The mutations that need them are
-refused at the command line. In the domain, NoClobber and
+refused at the command line.
+
+Pinned outside, 2026-10-07 (OI-1003-Q100..Q102): the destination records
+of #187 and its review exist in the spec only under SupersedeMode
+"exchange", which this explorer does not have. So the intent (intent,
+lastSup), the ownership row (dOwn), the remembered refusal (dRefused,
+RecvEntry's "remembered" choice, RecvEnd's record of one), the sweep of
+intents in StartRun, the refusal on a destination with no atomic exchange
+(ExchangeSupported, the catalogue's explorerModels pins it TRUE) and the
+ghosts reuseBad and wrongRefusal are all absent here: with SupersedeMode
+"off" each holds its initial value in every reachable state, so the
+presets' counts are the spec's. Their properties (SupersedeAtomic,
+OwnershipNeverReuse, RememberedRefusalSound, ExchangeRefusedUpFront) and
+mutations (owned_ignores_identity, sweep_drops_ownership,
+exchange_before_intent, own_is_reuse, refusal_unbound,
+late_exchange_refusal) are TLC's alone. In the domain, NoClobber and
 S2_BackupLockBounded hold by construction, here and in the spec: only
 absent actions set the state they read.
 
@@ -1295,7 +1310,7 @@ kindName k = case k of
 refusalName :: Refusal -> String
 refusalName r = case r of
   SourceChanged -> "SOURCE_CHANGED_AFTER_SNAPSHOT"
-  GitOccupied -> "GIT_DESTINATION_OCCUPIED"
+  GitOccupied -> "DESTINATION_OCCUPIED"
 
 codeName :: Code -> String
 codeName c = case c of
