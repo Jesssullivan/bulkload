@@ -120,15 +120,19 @@ Docs-only diff, so `check-fast` was replaced, as dispatched, by
 `nix develop .#default --command just repo-manifest-validate python-lint
 shell-lint workflow-lint contract-test`, with
 `CARGO_TARGET_DIR=/srv/cache/jess/cargo-target/whitepaper-refresh` and
-`TMPDIR=/dev/shm/whitepaper-tmp`. The result is in the PR body and the
-lane's structured result. Every relative link in both whitepaper files was
+`TMPDIR=/dev/shm/whitepaper-tmp`. It exited 0 on the tree of `8b13fa8`
+(2026-10-07): `repo-manifest: PASS` twice, ruff clean, shellcheck and
+actionlint silent, and `tests/test_ci_contract.py` ran 24 tests, OK. No Rust
+was built or tested, because no Rust changed. Every relative link in both whitepaper files was
 checked to resolve.
 
 ## Shas
 
 - `316d304`: merge of `origin/main` `a80c63b`.
-- The refresh commit and this note's commit follow it on the branch; the PR
-  body carries the final head.
+- `8b13fa8`: the refreshed whitepaper, the bibliography and this note
+  (signed).
+- The commit after `8b13fa8` records these shas in this note; the PR body
+  carries the final head.
 
 ## Workstreams (restated per AGENTS.md; reported from `gh`, not verified)
 
