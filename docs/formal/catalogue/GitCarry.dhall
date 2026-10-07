@@ -303,9 +303,11 @@ let defaults
           -}
           True
       , BaseMissingTyped =
-          {- The code today refuses a missing plan base with a bare IO
-             (MC_gc_base_missing_untyped). Configs without a base cannot
-             reach it.
+          {- False is the code before lane L6b, which refused a missing
+             plan base with a bare IO (#181). The code now refuses it
+             SEALED_OBJECT_MISSING (estate::stage_base, chain::flatten), so
+             every config with a base sets True; configs without a base
+             cannot reach it.
           -}
           False
       , Mutation = None M
@@ -323,8 +325,8 @@ let core = defaults
 -}
 let q46 = defaults // { RootWindow = 4, GCOn = True, MaxCommits = 4 }
 
-{- Two items on one plan base, the code today (preset gc_grouped): damage
-   may reach the base. The positive assumes the base refusal is typed.
+{- Two items on one plan base, v1's policy (preset gc_grouped): damage may
+   reach the base, and apply refuses a missing base by name.
 -}
 let grouped =
           defaults
@@ -335,8 +337,8 @@ let grouped =
           , BaseMissingTyped = True
           }
 
-{- L6b's fix 2 with Q46's re-root and GC, on two items: a chain kept under
-   the plan base, re-rooted on a based root.
+{- L6b's fix 2 (the code's policy) with Q46's re-root and GC (lane L8), on
+   two items: a chain kept under the plan base, re-rooted on a based root.
 -}
 let fix2 =
           grouped
@@ -491,19 +493,20 @@ let positives =
       , row
           "MC_gc_grouped"
           (pass [ A.GC, A.Rewrite ])
-          [ "Two items on one plan base, the code today: damage may reach the"
-          , "base, and prepare_base must refuse rather than replace it. Assumes"
-          , "apply refuses a missing base by name (MC_gc_base_missing_untyped)."
-          , "Explorer preset gc_grouped."
+          [ "Two items on one plan base, v1's policy (no chain under the base):"
+          , "damage may reach the base, and prepare_base must refuse rather than"
+          , "replace it. Apply refuses a missing base by name"
+          , "(MC_gc_base_missing_untyped). Explorer preset gc_grouped."
           ]
           grouped
       , row
           "MC_gc_fix2"
           (pass [ A.Rewrite ])
-          [ "Lane L6b's fix 2 with Q46 (no code yet): two items whose chains"
-          , "stay under the plan base (BaseAndChain), re-rooted on a based root"
-          , "at depth limit 1, a 3-capture window and CORPUS GC; damage may reach"
-          , "the base. Explorer preset gc_fix2."
+          [ "Lane L6b's fix 2 (the code's policy) with Q46 (lane L8, no code"
+          , "yet): two items whose chains stay under the plan base"
+          , "(BaseAndChain), re-rooted on a based root at depth limit 1, a"
+          , "3-capture window and CORPUS GC; damage may reach the base."
+          , "Explorer preset gc_fix2."
           ]
           fix2
       , row
@@ -528,10 +531,11 @@ let positives =
       , row
           "MC_gc_fix2_deep"
           (pass [ A.Rewrite ])
-          [ "Lane L6b's fix 2 over two links (no code yet): two items, depth"
-          , "limit 2 and a 3-capture window, so a restore imports the plan base"
-          , "and flattens a chain of two links under it; CORPUS GC and every"
-          , "fault, damage reaching the base. Explorer preset gc_fix2_deep."
+          [ "Lane L6b's fix 2 (the code's policy) over two links: two items,"
+          , "depth limit 2 and a 3-capture window (Q46, lane L8, no code yet),"
+          , "so a restore imports the plan base and flattens a chain of two"
+          , "links under it; CORPUS GC and every fault, damage reaching the"
+          , "base. Explorer preset gc_fix2_deep."
           , "MC_gc_reach_based_chain shows such a restore is reached."
           ]
           fix2Deep
@@ -587,17 +591,19 @@ let witnesses =
 let findings =
       [ row
           "MC_gc_base_missing_untyped"
-          (T.GcExpect.fail P.RestoreOrRecapture)
-          [ "CODE FINDING (expected to fail): two items on one plan base, the"
-          , "base deleted. estate::import_base stages it with stage_bundle, whose"
-          , "canonicalize fails ENOENT: a bare IO, where apply_item maps the same"
-          , "ENOENT for the head bundle to SEALED_OBJECT_MISSING. A bare IO never"
-          , "counts (S4)."
+          (pass [ A.Advance, A.Crash, A.GC, A.Rewrite ])
+          [ "CODE FINDING, FIXED by lane L6b (#181; expected to pass): two items"
+          , "on one plan base, the base deleted. Before L6b estate::import_base"
+          , "staged it with stage_bundle, whose canonicalize fails ENOENT: a bare"
+          , "IO, which never counts (S4), and this row failed RestoreOrRecapture."
+          , "estate::stage_base and chain::flatten now refuse a missing base"
+          , "SEALED_OBJECT_MISSING, as apply_item does for the head bundle. The"
+          , "row keeps its name and its bound."
           ]
           (     grouped
             //  { MaxCommits = 0
                 , MaxCrashes = 0
-                , BaseMissingTyped = False
+                , BaseMissingTyped = True
                 , BudgetSeconds = 300
                 }
           )
@@ -927,10 +933,12 @@ let invariants
           , "verify_bundle"
           , "source_held_tips"
           , "write_bundle"
+          , "write_capture"
+          , "chain_links"
+          , "bind_base"
           ]
         , pending =
-          [ pending "chain::flatten imports a base before the oldest link" Lane.L6b
-          , pending
+          [ pending
               "a re-root's header prerequisites and .prior, from one chain path"
               Lane.L8
           ]
@@ -952,9 +960,9 @@ let invariants
       , { tla = P.BaseNotReplacedWhileDepended
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q15", "R-N72" ]
-        , codeSymbol = [ "prepare_base", "retained_base", "requires_base" ]
-        , pending =
-          [ pending "prepare_base's never-replace assertion" Lane.L6b ]
+        , codeSymbol =
+          [ "prepare_base", "retained_base", "requires_base", "write_new" ]
+        , pending = [] : List T.PendingSymbol
         , ptest = [ Id.P68 ]
         }
       , { tla = P.GCNeverDeletesDepended
@@ -981,7 +989,13 @@ let invariants
         , slo = [ S.S4, S.S5 ]
         , ruling = [ "OI-1003-Q1", "OI-1003-Q46", "R-N72" ]
         , codeSymbol =
-          [ "apply_item", "import_base", "stage_bundle", "retained_capture" ]
+          [ "apply_item"
+          , "import_base"
+          , "stage_base"
+          , "stage_bundle"
+          , "retained_capture"
+          , "bound_base"
+          ]
         , pending = [ pending "STATE and CORPUS GC" Lane.L8 ]
         , ptest = [ Id.P68, Id.P69, Id.P71 ]
         }
