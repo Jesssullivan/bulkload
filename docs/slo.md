@@ -291,6 +291,52 @@ as properties.
   record naming a code that has left the taxonomy stays unaccounted
   (`refusal-code-retired`); no disposition or attestation closes it.
 
+## Amendment 2026-10-07: S3 inequalities 1 and 2 on the file transfer (#186, #187)
+
+This records what the code now does under the rulings above (OI-1003-Q6,
+Q10, Q18). It changes no number and no ruling.
+
+- **Inequality 1 holds with refused seats (#186).** A seat refused for its
+  `SQLite` header is sniffed (16 bytes) once per stat identity, and its
+  refusal is remembered in the source ledger; an unchanged refused seat is
+  refused again, with the same code, without being opened. Sniff bytes are
+  counted as `source_sniff_bytes`, apart from content (`source_bytes_read`,
+  `read_source_file_bytes`). So the unchanged-estate clause reads 0 content
+  bytes and 0 sniff bytes. The limits:
+  - a seat that was racy when it was sniffed is not remembered, and is
+    sniffed again until it is not (as a racy capture is read again, #86);
+  - the source ledger's rows may be lost under WP0(g); a lost row costs one
+    more sniff.
+- **Inequality 2 and convergence hold for changed seats (#187, WP0(d)).** A
+  changed seat whose output this store wrote, untouched since, is
+  superseded by the exchange design of `docs/formal` (`MC_wp0d_exchange`),
+  filled from the old output's own chunks, so the wire carries only the
+  absent ones. The limits:
+  - only an output with a committed row is this store's own. One published
+    from a racy capture, or left unrowed by a crash and not adoptable
+    (#169's limits), is refused `DESTINATION_OCCUPIED` when its seat has
+    changed again, as any file the store does not own is;
+  - a file system without an atomic exchange refuses the replacement;
+  - a seat past the source's retention budget (512 MiB) is streamed whole,
+    as an added seat of that size is (#77);
+  - an output this session supersedes stays readable for later seats of the
+    session through a bounded set of descriptors; past the bound, a chunk
+    only that output held is sent again.
+- **Proof.** `tests/s3_transfer_resume.rs`: P21 and P23 with refused seats
+  and P21 over in-place changes, which were ignored and red, are green and
+  unweakened; the power-loss and crash-resume harnesses hold the old output
+  with its old row or the new output with its new row in every state
+  (`tests/power_loss.rs`, `tests/fault_harness.rs`).
+- **Refusal code.** A transfer's occupied destination path is
+  `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
+  alone.
+- **Gate (b)'s second deviation is moot.** The 2026-10-06 amendment lets
+  gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
+  `source_bytes_read` no longer holds them, so the raw counter is 0 on a
+  warm resume, as gate (a) requires, and nothing is left to net out. The
+  harness still subtracts them (`gate_b.py`); it must stop before a gated
+  run, or it will report negative content bytes.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

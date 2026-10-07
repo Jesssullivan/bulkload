@@ -187,6 +187,15 @@ pub enum BulkloadRefusal {
     /// less free space than the configured floor (`--min-free-percent`,
     /// default 25%), or with no room at all (OI-1001-Q2).
     DestinationSpaceInsufficient,
+    /// A transfer's regular-file destination path holds something this
+    /// store cannot replace: a file it has no row for, or one changed since
+    /// its row was written; a node of another kind; a file that appeared
+    /// while the output was staged; or its own output on a file system with
+    /// no atomic exchange. Nothing is replaced: a rerun supersedes only an
+    /// output whose identity is this store's own row (no-clobber, WP0(d),
+    /// OI-1003-Q18, #187). The Git carry's occupied destinations keep
+    /// `GIT_DESTINATION_OCCUPIED`.
+    DestinationOccupied,
     /// A salvaged destination temporary that a refused entry staged chunks
     /// from could not be kept for the next run: the session's salvage bound
     /// (by count and bytes) was already reached, so it was removed and its
@@ -269,6 +278,7 @@ impl BulkloadRefusal {
             Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
+            Self::DestinationOccupied => "DESTINATION_OCCUPIED",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
@@ -330,6 +340,7 @@ impl BulkloadRefusal {
         "JOURNAL_OWNERSHIP_CONFLICT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
+        "DESTINATION_OCCUPIED",
         "SALVAGE_BOUND_EXCEEDED",
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
@@ -536,6 +547,7 @@ mod tests {
             BulkloadRefusal::JournalOwnershipConflict,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
+            BulkloadRefusal::DestinationOccupied,
             BulkloadRefusal::SalvageBoundExceeded,
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,

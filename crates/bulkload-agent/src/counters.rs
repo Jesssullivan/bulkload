@@ -101,6 +101,11 @@ macro_rules! counters {
 counters! {
     // Bytes read, by stage.
     SourceFileRead => "read_source_file_bytes",
+    // Header bytes read from a source file only to refuse it (a SQLite or
+    // WAL magic, #186): never content, so never part of
+    // `read_source_file_bytes` or a transfer's `source_bytes_read`. A
+    // refused seat whose stat identity is unchanged is not sniffed again.
+    SourceSniff => "source_sniff_bytes",
     // Retained capture bundles a Git capture fetched to reuse their blobs
     // (logical: the bundle's length per fetch, plus the delta bases a thin
     // bundle's fetch read from the source object store to complete it).
@@ -156,6 +161,9 @@ counters! {
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
+    // A superseding publish's record, written before its exchange, and a
+    // record a crash left, settled by the next sweep (WP0(d), #187).
+    SqliteSupersede => "sqlite_supersede_commits",
     SqliteCommitNs => "sqlite_commit_ns",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
@@ -175,6 +183,14 @@ counters! {
     TransferUnrowedAdopted => "transfer_unrowed_adopted",
     TransferUnrowedUnproven => "transfer_unrowed_unproven",
     TransferCaptureRecordsUnset => "transfer_capture_records_unset",
+    // Refused seats answered from the source ledger's record of their
+    // refusal, without opening the file (#186, R25).
+    TransferRefusedSeatsRemembered => "transfer_refused_seats_remembered",
+    // Outputs of this store replaced by a changed seat's new bytes (WP0(d),
+    // #187), and exchanges undone because the displaced file was not this
+    // store's own.
+    OutputsSuperseded => "outputs_superseded",
+    SupersedeRestored => "supersede_restored",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
 }
@@ -404,6 +420,7 @@ impl Counters {
             Counter::SqliteRecordCapture,
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,
+            Counter::SqliteSupersede,
         ])
     }
 

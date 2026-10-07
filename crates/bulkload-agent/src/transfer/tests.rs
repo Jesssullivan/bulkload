@@ -637,6 +637,255 @@ fn a_file_past_the_retention_budget_is_read_once() {
     );
 }
 
+/// #187 (WP0(d), OI-1003-Q18): a changed seat whose output this store wrote
+/// is superseded. The new file is filled from the old output's own chunks,
+/// so only the absent ones cross the wire; the old row is dropped with the
+/// new one committed; and the run after it reads nothing.
+#[test]
+fn a_changed_seat_supersedes_its_own_output_and_fills_from_it() {
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    let mut bytes = noise(187, 800_000);
+    std::fs::write(&seat, &bytes).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    assert_eq!(rows(&corpus), (1, 1));
+    let before = std::fs::metadata(corpus.base.join("destination/seat")).unwrap();
+
+    bytes.extend(noise(188, 10));
+    std::fs::write(&seat, &bytes).unwrap();
+    let rerun = corpus.run().unwrap();
+    assert!(rerun.refusals.is_empty(), "{:?}", rerun.refusals);
+    assert_eq!((rerun.reused, rerun.completed), (0, 1));
+    assert_eq!(rerun.source_bytes_read, bytes.len() as u64, "read once");
+    assert!(
+        rerun.bytes_received < 300_000,
+        "only the changed tail crosses: {}",
+        rerun.bytes_received
+    );
+    let after = std::fs::metadata(corpus.base.join("destination/seat")).unwrap();
+    assert_ne!(after.ino(), before.ino(), "a new file took the path");
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/seat")).unwrap(),
+        bytes
+    );
+    assert_eq!(rows(&corpus).1, 1, "the old output row is dropped");
+    assert_eq!(
+        std::fs::read_dir(corpus.base.join("destination"))
+            .unwrap()
+            .count(),
+        1,
+        "the displaced output is removed"
+    );
+
+    let warm = corpus.run().unwrap();
+    assert!(warm.refusals.is_empty());
+    assert_eq!((warm.reused, warm.source_bytes_read), (1, 0));
+    assert_eq!(warm.bytes_received, 0);
+}
+
+/// WP0(c), inequality 2, across a supersede: a chunk hint names an output
+/// by path, and a superseded output's path holds its new bytes. A seat
+/// planned afterwards that carries the old output's chunks (a file moved
+/// out of the changed one) still fills them here, from the output the
+/// publish displaced, and asks the source for none; without that output it
+/// would ask for every one.
+#[test]
+fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    let old = noise(201, 700_000);
+    std::fs::write(source.join("moved-from"), &old).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    // The old output, as its superseding publish holds it open.
+    let displaced =
+        Arc::new(std::fs::File::open(corpus.base.join("destination/moved-from")).unwrap());
+    std::fs::write(source.join("moved-from"), noise(202, 650_000)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    assert_ne!(
+        std::fs::read(corpus.base.join("destination/moved-from")).unwrap(),
+        old,
+        "the output was superseded"
+    );
+
+    // A seat with the old bytes, planned after that supersede.
+    std::fs::write(source.join("moved-to"), &old).unwrap();
+    let row = walk(
+        &WalkOptions::new(std::fs::canonicalize(&source).unwrap()),
+        &mut NullCache,
+    )
+    .unwrap()
+    .rows
+    .into_iter()
+    .find(|row| row.rel_path == b"moved-to")
+    .unwrap();
+    let manifest = Manifest::new(
+        crate::hash::chunk_boundaries(&old)
+            .into_iter()
+            .map(|(offset, length)| ChunkSpec {
+                digest: crate::hash::hash_bytes(&old[offset..offset + length]),
+                size: length as u64,
+            })
+            .collect(),
+    );
+    assert!(manifest.chunks.len() > 3, "several chunks");
+    let store = Store::open(&corpus.base.join("destination-state")).unwrap();
+    let target = Destination::open(&corpus.base.join("destination"), &store).unwrap();
+    let session = SessionChunks::with_capacity(4);
+    let salvage = Salvage::default();
+    let missing = |displaced: &SharedDisplaced| {
+        let plan = plan_file(
+            &ReceiveContext {
+                target: &target,
+                store: &store,
+                authority: b"",
+                displaced,
+                session: &session,
+                salvage: &salvage,
+            },
+            &row,
+            &manifest,
+            &mut Vec::new(),
+        );
+        let Plan::Write(staging) = plan else {
+            panic!("the path is free, so the plan stages a file");
+        };
+        staging.staged.discard().unwrap();
+        staging.missing.len()
+    };
+    assert_eq!(
+        missing(&Displaced::shared(4)),
+        manifest.chunks.len(),
+        "the path alone no longer holds the old chunks"
+    );
+    let held = Displaced::shared(4);
+    held.lock()
+        .unwrap()
+        .insert(b"moved-from".to_vec(), displaced);
+    assert_eq!(
+        missing(&held),
+        0,
+        "every chunk is filled from the old output"
+    );
+
+    // Bounded: the oldest descriptor goes first.
+    let bounded = Displaced::shared(2);
+    for name in [b"a", b"b", b"c"] {
+        let file = Arc::new(std::fs::File::open(source.join("moved-to")).unwrap());
+        bounded.lock().unwrap().insert(name.to_vec(), file);
+    }
+    let kept = |name: &[u8]| bounded.lock().unwrap().get(name).is_some();
+    assert!(!kept(b"a"));
+    assert!(kept(b"b") && kept(b"c"));
+}
+
+/// A seat that was only touched (a new stat identity, the same bytes) has
+/// nothing to replace: its output is verified where it is and adopted, the
+/// same inode under a new row.
+#[test]
+fn a_touched_seat_with_the_same_bytes_is_adopted_not_superseded() {
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/seat");
+    let bytes = noise(189, 300_000);
+    std::fs::write(&seat, &bytes).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let before = std::fs::metadata(corpus.base.join("destination/seat")).unwrap();
+    std::fs::write(&seat, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&seat)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(90))
+        .unwrap();
+    let rerun = corpus.run().unwrap();
+    assert!(rerun.refusals.is_empty(), "{:?}", rerun.refusals);
+    assert_eq!(rerun.bytes_received, 0);
+    let after = std::fs::metadata(corpus.base.join("destination/seat")).unwrap();
+    assert_eq!(after.ino(), before.ino(), "the output is adopted in place");
+    let warm = corpus.run().unwrap();
+    assert_eq!((warm.reused, warm.source_bytes_read), (1, 0));
+}
+
+/// #187 on the streamed path (#77 review F1): a changed seat past the
+/// retention budget is streamed in place of its manifest. Its staged copy
+/// supersedes this store's own output; beside it, a file the store has no
+/// row for is refused and kept.
+#[test]
+fn a_streamed_changed_seat_supersedes_only_its_own_output() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    let destination = corpus.base.join("destination");
+    std::fs::write(source.join("ours"), noise(41, 2 << 20)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+
+    let ours = noise(42, 2 << 20);
+    std::fs::write(source.join("ours"), &ours).unwrap();
+    std::fs::write(source.join("theirs"), noise(43, 2 << 20)).unwrap();
+    let theirs = noise(44, 2 << 20);
+    std::fs::write(destination.join("theirs"), &theirs).unwrap();
+    let root = std::fs::canonicalize(&source).unwrap();
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap()
+        .push((root.clone(), 1 << 20));
+    let rerun = corpus.run();
+    RETAIN_OVERRIDE
+        .lock()
+        .unwrap()
+        .retain(|(other, _)| *other != root);
+    let rerun = rerun.unwrap();
+    assert_eq!(
+        rerun.refusals,
+        [(b"theirs".to_vec(), "DESTINATION_OCCUPIED".to_owned())]
+    );
+    assert_eq!(rerun.source_bytes_read, 2 * (2 << 20), "each read once");
+    assert_eq!(std::fs::read(destination.join("ours")).unwrap(), ours);
+    assert_eq!(std::fs::read(destination.join("theirs")).unwrap(), theirs);
+    assert_eq!(
+        std::fs::read_dir(&destination).unwrap().count(),
+        2,
+        "no staged or displaced file is left"
+    );
+}
+
+/// #186: a refusal is remembered only when the seat's stat identity vouches
+/// for the header that was sniffed. A seat sniffed inside its own timestamp
+/// tick is refused, but not remembered: it is sniffed again until the clock
+/// is past the tick, and then once.
+#[test]
+fn a_racy_sniff_is_refused_but_not_remembered() {
+    let corpus = Corpus::new();
+    let seat = corpus.base.join("source/state.db");
+    std::fs::write(&seat, b"SQLite format 3\0provider state").unwrap();
+    let refused = [(b"state.db".to_vec(), "SQLITE_STATE_CHANGED".to_owned())];
+    let remembered = || {
+        Store::open(&corpus.base.join("source-state"))
+            .unwrap()
+            .refused_seats()
+            .unwrap()
+    };
+
+    let clock = PinnedClock::at(&corpus, stamp_ns(&seat) + 500_000_000);
+    for _ in 0..2 {
+        let racy = corpus.run().unwrap();
+        assert_eq!(racy.refusals, refused);
+        assert_eq!(racy.source_bytes_read, 0, "a sniff is never content");
+        assert_eq!(remembered(), 0, "a racy sniff is not remembered");
+    }
+    drop(clock);
+
+    for _ in 0..2 {
+        let settled = corpus.run().unwrap();
+        assert_eq!(settled.refusals, refused);
+        assert_eq!(settled.source_bytes_read, 0);
+        assert_eq!(remembered(), 1);
+    }
+
+    // A changed seat has another row key: sniffed and remembered anew.
+    std::fs::write(&seat, b"SQLite format 3\0other provider state").unwrap();
+    assert_eq!(corpus.run().unwrap().refusals, refused);
+    assert_eq!(remembered(), 2);
+}
+
 /// #77 review F4: a stream may not carry more chunks than any manifest can.
 #[test]
 fn a_stream_past_the_chunk_bound_ends_the_session() {
@@ -785,7 +1034,8 @@ fn a_large_file_round_trips_and_resumes_without_reads() {
 
 /// A fresh destination is streamed: every file is read once and sent whole
 /// (`Send`), with no cross-file deduplication. A resume reuses every output
-/// and reads only the refused file's header again.
+/// and refuses the refused file again from its remembered refusal, reading
+/// nothing (#186): its header was sniffed once, and never as content.
 #[test]
 fn parallel_entries_resume_and_continue_after_a_refused_file() {
     let corpus = Corpus::new();
@@ -805,7 +1055,7 @@ fn parallel_entries_resume_and_continue_after_a_refused_file() {
     let first = corpus.run().unwrap();
     assert_eq!(first.completed, 70);
     assert_eq!(first.refusals.len(), 1);
-    assert_eq!(first.source_bytes_read, 70 * 65_536 + 16);
+    assert_eq!(first.source_bytes_read, 70 * 65_536);
     assert_eq!(first.bytes_received, 70 * 65_536);
     for index in 0..70 {
         assert_eq!(
@@ -821,8 +1071,8 @@ fn parallel_entries_resume_and_continue_after_a_refused_file() {
     }
     let second = corpus.run().unwrap();
     assert_eq!(second.reused, 70);
-    assert_eq!(second.refusals.len(), 1);
-    assert_eq!(second.source_bytes_read, 16);
+    assert_eq!(second.refusals, first.refusals);
+    assert_eq!(second.source_bytes_read, 0);
     assert_eq!(second.bytes_received, 0);
 }
 
@@ -1291,7 +1541,7 @@ fn a_source_read_never_follows_a_swapped_directory() {
         retain: Arc::new(AtomicU64::new(0)),
     };
     let mut bytes_read = 0;
-    let refused = capture_file(&work, &row, &mut bytes_read, |_, _, _, _| {
+    let refused = capture_file(&work, &row, &mut bytes_read, &mut None, |_, _, _, _| {
         panic!("no chunk may be read through the symlink")
     })
     .unwrap_err();
@@ -1427,9 +1677,10 @@ fn rows(corpus: &Corpus) -> (u64, u64) {
 /// moving, so a ledger or output row for it could describe old content and
 /// answer the next run with `Reuse`. Such a capture is sent but never
 /// recorded on either side. A same-size rewrite with its mtime restored is
-/// then never answered from a row: it is read again and, since outputs are
-/// never replaced, surfaces as a typed conflict. Once the clock is past the
-/// tick, the capture is recorded and a warm run reads nothing.
+/// then never answered from a row: it is read again and, since no row makes
+/// the racy capture's output this store's own to supersede (WP0(d)),
+/// surfaces as a typed conflict. Once the clock is past the tick, the
+/// capture is recorded and a warm run reads nothing.
 #[test]
 fn a_racy_capture_is_sent_but_never_recorded() {
     const SIZE: usize = 300_000;
@@ -1465,7 +1716,7 @@ fn a_racy_capture_is_sent_but_never_recorded() {
     assert_eq!(second.source_bytes_read, SIZE as u64);
     assert_eq!(
         second.refusals,
-        [(b"seat".to_vec(), "GIT_DESTINATION_OCCUPIED".to_owned())]
+        [(b"seat".to_vec(), "DESTINATION_OCCUPIED".to_owned())]
     );
     assert_eq!(rows(&corpus), (0, 0));
 
@@ -1998,7 +2249,7 @@ fn p74_check(seed: u64, case: &P74Case) {
         resumed
             .refusals
             .iter()
-            .all(|(_, code)| code == "GIT_DESTINATION_OCCUPIED"),
+            .all(|(_, code)| code == "DESTINATION_OCCUPIED"),
         "seed {seed}: {resumed:?}"
     );
     for (offset, fate) in case.fates.iter().enumerate() {

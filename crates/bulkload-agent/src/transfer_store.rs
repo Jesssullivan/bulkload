@@ -215,17 +215,64 @@ impl Manifest {
     }
 }
 
-/// One capture for the source ledger committer. Only a capture that passed
-/// its final stat check is ever submitted (R-N86).
+/// One record for the source ledger committer: a completed capture, or a
+/// seat's refusal to remember (#186).
 pub(crate) struct LedgerItem {
-    /// The entry the capture belongs to, for crash receipts.
+    /// The entry the record belongs to, for crash receipts.
     #[cfg_attr(
         not(feature = "fault-injection"),
         allow(dead_code, reason = "read only by fault-injection crash receipts")
     )]
     pub entry: u64,
     pub key: Vec<u8>,
-    pub manifest: Manifest,
+    pub record: LedgerRecord,
+}
+
+/// What a [`LedgerItem`] records under its row key.
+pub(crate) enum LedgerRecord {
+    /// A capture's manifest. Only a capture that passed its final stat check
+    /// is ever submitted (R-N86).
+    Capture(Manifest),
+    /// The seat was refused for what its header holds (#186).
+    Refused(RefusedSeat),
+}
+
+/// Why the source refused a seat for its content (#186, R25).
+///
+/// It is remembered under the seat's row key (its path and stat identity),
+/// so that a rerun refuses the seat again without opening the file. Only a
+/// refusal that depends on nothing but the seat's bytes is remembered, and
+/// only when the seat was not racy when it was sniffed: its stat identity
+/// then vouches for those bytes, exactly as it does for a capture (#86).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusedSeat {
+    /// The file starts with a `SQLite` database or WAL magic: provider state,
+    /// which only the `SQLite` backup path carries.
+    SqliteHeader,
+}
+
+impl RefusedSeat {
+    /// The stored form. Never reuse a retired value.
+    const fn tag(self) -> i64 {
+        match self {
+            Self::SqliteHeader => 1,
+        }
+    }
+
+    const fn from_tag(tag: i64) -> Option<Self> {
+        match tag {
+            1 => Some(Self::SqliteHeader),
+            _ => None,
+        }
+    }
+
+    /// The refusal this record stands for, with the code the sniff gave.
+    #[must_use]
+    pub const fn refusal(self) -> BulkloadRefusal {
+        match self {
+            Self::SqliteHeader => BulkloadRefusal::SqliteStateChanged,
+        }
+    }
 }
 
 /// A published destination output, ready for its group commit.
@@ -256,6 +303,82 @@ pub(crate) struct ChunkHintRow {
     pub path: Vec<u8>,
     pub offset: u64,
     pub size: u64,
+}
+
+/// An output row as stored: its row key and its encoded stat identity.
+pub(crate) type OutputRow = (Vec<u8>, Vec<u8>);
+
+/// A superseding publish in flight (WP0(d), OI-1003-Q18, #187): this store
+/// is about to exchange the staged file `temp` with its own output `leaf`,
+/// both directly inside the destination directory `dir`.
+///
+/// The record commits before the exchange, in the transaction that moves the
+/// output's rows out of `outputs` and into it, so from then until it is
+/// settled no row vouches for the path, whichever file a power loss leaves
+/// there, and the record alone says what each of the two names may hold:
+///
+/// - `staged`, the new file, at `temp` (the exchange did not take effect) or
+///   at `leaf` (it did);
+/// - `owned`, the output this store's rows named, at `leaf` or, displaced,
+///   at `temp`;
+/// - anything else at `temp` is a file this store does not own, displaced
+///   by the exchange: it is exchanged back, never removed.
+///
+/// Settling deletes the record: with the new output's row, in its group's
+/// commit; or, when the exchange did not happen and the output is still
+/// exactly `owned`, with `rows` put back, so the old output has its old row
+/// again. The next session's sweep settles what a crash left
+/// (`materialize::Destination::sweep`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SupersedeIntent {
+    /// The destination-relative directory holding both names; empty for the
+    /// destination root.
+    pub dir: Vec<u8>,
+    /// The staged file's temporary leaf name.
+    pub temp: Vec<u8>,
+    /// The output's leaf name.
+    pub leaf: Vec<u8>,
+    /// Device and inode of the staged file.
+    pub staged: (u64, u64),
+    /// The identity this store's row recorded for the output it replaces.
+    pub owned: StatIdentity,
+    /// The output rows moved out of `outputs` when this record committed.
+    pub rows: Vec<OutputRow>,
+}
+
+impl SupersedeIntent {
+    /// The output's destination-relative path.
+    #[cfg_attr(
+        not(feature = "io-trace"),
+        allow(dead_code, reason = "read only by the R-N88 trace's commit records")
+    )]
+    #[must_use]
+    pub fn rel_path(&self) -> Vec<u8> {
+        join_rel(&self.dir, &self.leaf)
+    }
+
+    /// The temporary's destination-relative path.
+    #[must_use]
+    pub fn temp_path(&self) -> Vec<u8> {
+        join_rel(&self.dir, &self.temp)
+    }
+}
+
+fn join_rel(dir: &[u8], leaf: &[u8]) -> Vec<u8> {
+    let mut path = dir.to_vec();
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(leaf);
+    path
+}
+
+/// How a superseding publish ended, for the commit that settles its record.
+pub(crate) struct SupersedeSettle<'a> {
+    pub intent: &'a SupersedeIntent,
+    /// The exchange did not happen and the output is still this store's
+    /// own: its rows go back into `outputs`.
+    pub restore: bool,
 }
 
 struct Exclusive(fs::File);
@@ -403,7 +526,9 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS directories (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS output_hints (digest BLOB NOT NULL, path BLOB NOT NULL, offset INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (digest, path));
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS refused_seats (key BLOB PRIMARY KEY, kind INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS supersedes (dir BLOB NOT NULL, temp BLOB NOT NULL, intent BLOB NOT NULL, PRIMARY KEY (dir, temp));",
             )
             .and_then(|()| {
                 conn.execute(
@@ -421,6 +546,10 @@ impl Store {
                 }
                 invalidated = conn.execute("DELETE FROM captures", [])?;
                 invalidated = invalidated.saturating_add(conn.execute("DELETE FROM outputs", [])?);
+                // A remembered refusal (#186) is trusted on the same terms.
+                // The table is younger than the guard, so this deletes
+                // nothing a guarded engine wrote; it is not counted.
+                conn.execute("DELETE FROM refused_seats", [])?;
                 conn.execute(
                     "INSERT INTO settings VALUES (?1, ?2)",
                     (RACY_GUARD_SETTING, b"#86".as_slice()),
@@ -547,6 +676,29 @@ impl Store {
             .filter(Manifest::is_consistent))
     }
 
+    /// The remembered refusal of the seat under a row key, if any (#186):
+    /// the source answers it without opening the file. A row this engine
+    /// does not know (a later engine's kind) is a miss, and the seat is
+    /// sniffed again.
+    ///
+    /// # Errors
+    /// Refuses database errors.
+    pub fn refused_seat(&self, key: &[u8]) -> Result<Option<RefusedSeat>> {
+        if !self.rows_trusted {
+            return Ok(None);
+        }
+        let kind: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM refused_seats WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        Ok(kind.and_then(RefusedSeat::from_tag))
+    }
+
     /// Record one `Event::Commit` for this store (R-N88): a commit returned
     /// and made `records` durable. Called only after success.
     #[cfg(feature = "io-trace")]
@@ -576,6 +728,17 @@ impl Store {
                 .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
         };
         Ok((count("captures")?, count("outputs")?))
+    }
+
+    /// How many refusals the store remembers (#186).
+    #[cfg(test)]
+    pub(crate) fn refused_seats(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM refused_seats", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(sqlite_error)
+            .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
     }
 
     /// Drop the racy-guard marker, as a store written before #86 lacks it.
@@ -629,6 +792,98 @@ impl Store {
             .optional()
             .map_err(sqlite_error)?;
         Ok(found == Some(identity_bytes(identity)?))
+    }
+
+    /// The output rows this store holds for one destination path under
+    /// `authority`, whatever source stat identity each was recorded from
+    /// (WP0(d), #187): the row keys of a path share the prefix
+    /// [`path_prefix`], so this is one range read of the primary key.
+    ///
+    /// A file at that path is this store's own, untouched since, exactly
+    /// when its current identity equals one of these rows' identities.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub(crate) fn output_rows(&self, authority: &[u8], rel_path: &[u8]) -> Result<Vec<OutputRow>> {
+        if !self.rows_trusted {
+            return Ok(Vec::new());
+        }
+        let prefix = path_prefix(authority, rel_path)?;
+        let Some(end) = prefix_end(&prefix) else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT key, identity FROM outputs WHERE key >= ?1 AND key < ?2")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map((&prefix, &end), |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row.map_err(sqlite_error)?);
+        }
+        Ok(found)
+    }
+
+    /// The superseding publishes recorded for names directly inside the
+    /// destination directory `dir` and not yet settled (WP0(d), #187). A
+    /// record this engine cannot decode exactly is refused, never skipped:
+    /// skipping it would let the sweep treat a displaced file as a
+    /// temporary.
+    ///
+    /// # Errors
+    /// Refuses database failures and undecodable records
+    /// ([`BulkloadRefusal::SchemaMismatch`]).
+    pub(crate) fn supersede_intents(&self, dir: &[u8]) -> Result<Vec<SupersedeIntent>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT intent FROM supersedes WHERE dir = ?1 ORDER BY temp")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([dir], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(sqlite_error)?;
+        let mut found = Vec::new();
+        for row in rows {
+            match postcard::take_from_bytes::<SupersedeIntent>(&row.map_err(sqlite_error)?) {
+                Ok((intent, [])) if intent.dir == dir => found.push(intent),
+                _ => return Err(BulkloadRefusal::SchemaMismatch),
+            }
+        }
+        Ok(found)
+    }
+
+    /// Settle one superseding publish a crash left recorded, in a
+    /// transaction of its own: with `restore`, its rows go back into
+    /// `outputs` (the output is still this store's own, untouched); either
+    /// way the record is deleted.
+    ///
+    /// # Errors
+    /// Refuses database failures; nothing is settled then.
+    pub(crate) fn settle_supersede(&self, intent: &SupersedeIntent, restore: bool) -> Result<()> {
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
+        let started = Instant::now();
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sqlite_error)?;
+        let settled = settle_in(&self.conn, &SupersedeSettle { intent, restore })
+            .and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        if settled.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        counters::sqlite_commit(Counter::SqliteSupersede, started, &settled);
+        settled?;
+        #[cfg(feature = "io-trace")]
+        self.trace_commit(|| {
+            vec![crate::io::trace::CommitRecord::SupersedeSettled {
+                rel_path: intent.rel_path(),
+                restored: restore,
+            }]
+        });
+        Ok(())
     }
 
     /// Whether any output hint is recorded: whether a manifest could be
@@ -838,9 +1093,20 @@ impl StorePublisher {
     /// Commit one group of published outputs and their chunk hints in a single
     /// transaction. Callers seal every file and directory first.
     ///
+    /// The same transaction settles the group's superseding publishes
+    /// (`settled`, WP0(d), #187): each one's record is deleted, with the new
+    /// output's row among `outputs` when it replaced the old one, or with
+    /// the old output's rows put back when the exchange did not happen. So a
+    /// replaced output's old rows are gone, and its new row present, in one
+    /// commit.
+    ///
     /// # Errors
     /// Refuses serialization or database failures; nothing is committed then.
-    pub(crate) fn commit_outputs(&self, outputs: &[OutputRecord]) -> Result<()> {
+    pub(crate) fn commit_outputs(
+        &self,
+        outputs: &[OutputRecord],
+        settled: &[SupersedeSettle<'_>],
+    ) -> Result<()> {
         // The trace's serial lock is taken before SQLite's write lock, the
         // order every traced store write uses (#74 review, D5).
         #[cfg(feature = "io-trace")]
@@ -888,6 +1154,9 @@ impl StorePublisher {
                         .map_err(sqlite_error)?;
                 }
             }
+            for settle in settled {
+                settle_in(&self.store.conn, settle)?;
+            }
             Ok(())
         })();
         if let Err(error) = staged {
@@ -922,6 +1191,12 @@ impl StorePublisher {
                     .map(|output| crate::io::trace::CommitRecord::Output {
                         rel_path: output.rel_path.clone(),
                     })
+                    .chain(settled.iter().map(|settle| {
+                        crate::io::trace::CommitRecord::SupersedeSettled {
+                            rel_path: settle.intent.rel_path(),
+                            restored: settle.restore,
+                        }
+                    }))
                     .collect()
             });
         }
@@ -939,7 +1214,81 @@ impl StorePublisher {
         Ok(())
     }
 
-    /// Commit completed captures to the ledger in one transaction.
+    /// Record a group's superseding publishes before any of their exchanges
+    /// (WP0(d), #187), in one transaction: each output's rows leave
+    /// `outputs` and its [`SupersedeIntent`] is written. From here until the
+    /// record is settled no row vouches for the path, so no crash state
+    /// holds a row beside a file it does not describe.
+    ///
+    /// # Errors
+    /// Refuses serialization or database failures; nothing is recorded then.
+    pub(crate) fn begin_supersedes(&self, intents: &[SupersedeIntent]) -> Result<()> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
+        self.store
+            .conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sqlite_error)?;
+        let started = Instant::now();
+        let recorded = (|| -> Result<()> {
+            for intent in intents {
+                for (key, _) in &intent.rows {
+                    self.store
+                        .conn
+                        .execute("DELETE FROM outputs WHERE key = ?1", [key])
+                        .map_err(sqlite_error)?;
+                }
+                self.store
+                    .conn
+                    .execute(
+                        "INSERT OR REPLACE INTO supersedes (dir, temp, intent) VALUES (?1, ?2, ?3)",
+                        (
+                            &intent.dir,
+                            &intent.temp,
+                            postcard::to_stdvec(intent)
+                                .refuse_at("transfer_store::begin_supersedes")?,
+                        ),
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            #[cfg(test)]
+            output_commit_fault(self.store.root())?;
+            self.store
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(sqlite_error)
+        })();
+        if recorded.is_err() {
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+        }
+        counters::sqlite_commit(Counter::SqliteSupersede, started, &recorded);
+        recorded?;
+        #[cfg(feature = "io-trace")]
+        self.store.trace_commit(|| {
+            intents
+                .iter()
+                .map(|intent| crate::io::trace::CommitRecord::SupersedeBegun {
+                    rel_path: intent.rel_path(),
+                    temp_path: intent.temp_path(),
+                    staged: crate::io::NodeId {
+                        dev: intent.staged.0,
+                        ino: intent.staged.1,
+                    },
+                    owned: crate::io::NodeId {
+                        dev: intent.owned.dev,
+                        ino: intent.owned.ino,
+                    },
+                })
+                .collect()
+        });
+        Ok(())
+    }
+
+    /// Commit completed captures, and refusals to remember (#186), to the
+    /// ledger in one transaction.
     fn commit_captures(&self, captures: &[LedgerItem]) -> Result<()> {
         if captures.is_empty() {
             return Ok(());
@@ -953,18 +1302,23 @@ impl StorePublisher {
             .map_err(sqlite_error)?;
         let persisted = (|| -> Result<()> {
             for capture in captures {
-                self.store
-                    .conn
-                    .execute(
+                match &capture.record {
+                    LedgerRecord::Capture(manifest) => self.store.conn.execute(
                         "INSERT INTO captures VALUES (?1, ?2)
                          ON CONFLICT(key) DO UPDATE SET manifest=excluded.manifest",
                         (
                             &capture.key,
-                            postcard::to_stdvec(&capture.manifest)
+                            postcard::to_stdvec(manifest)
                                 .refuse_at("transfer_store::commit_captures")?,
                         ),
-                    )
-                    .map_err(sqlite_error)?;
+                    ),
+                    LedgerRecord::Refused(refused) => self.store.conn.execute(
+                        "INSERT INTO refused_seats VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET kind=excluded.kind",
+                        (&capture.key, refused.tag()),
+                    ),
+                }
+                .map_err(sqlite_error)?;
             }
             publication_fault!(self, AfterManifestInsert, PublishSourceAfterManifestInsert);
             Ok(())
@@ -1003,8 +1357,13 @@ impl StorePublisher {
             self.store.trace_commit(|| {
                 captures
                     .iter()
-                    .map(|capture| crate::io::trace::CommitRecord::Capture {
-                        key: capture.key.clone(),
+                    .map(|capture| match capture.record {
+                        LedgerRecord::Capture(_) => crate::io::trace::CommitRecord::Capture {
+                            key: capture.key.clone(),
+                        },
+                        LedgerRecord::Refused(_) => crate::io::trace::CommitRecord::RefusedSeat {
+                            key: capture.key.clone(),
+                        },
                     })
                     .collect()
             });
@@ -1023,8 +1382,9 @@ impl StorePublisher {
 }
 
 /// Group-commit sink for a source store's digest-only ledger (R-N58). A
-/// group is a set of completed captures committed in one transaction; there
-/// are no chunk bytes to write or seal first.
+/// group is a set of completed captures and remembered refusals (#186)
+/// committed in one transaction; there are no chunk bytes to write or seal
+/// first.
 pub(crate) struct LedgerSink {
     publisher: StorePublisher,
     failed: Option<BulkloadRefusal>,
@@ -1052,9 +1412,11 @@ impl LedgerSink {
             crate::fault::note_group(&ids, 0)
         };
         for item in items {
-            if !item.manifest.is_consistent()
-                || item
-                    .manifest
+            let LedgerRecord::Capture(manifest) = &item.record else {
+                continue;
+            };
+            if !manifest.is_consistent()
+                || manifest
                     .chunks
                     .iter()
                     .any(|chunk| chunk.size > u64::from(crate::hash::CDC_MAX_BYTES))
@@ -1100,6 +1462,51 @@ pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
     postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
 }
 
+/// The prefix every row key of one destination path shares under
+/// `authority`: a row key is the postcard encoding of `(authority, row)`,
+/// and a row's first field is its relative path, so the key starts with the
+/// encoding of `(authority, rel_path)` (WP0(d), #187;
+/// `tests::a_paths_rows_share_one_key_prefix` holds this to [`row_key`]).
+///
+/// # Errors
+/// Refuses serialization failure.
+pub(crate) fn path_prefix(authority: &[u8], rel_path: &[u8]) -> Result<Vec<u8>> {
+    postcard::to_stdvec(&(authority, rel_path)).refuse_at("transfer_store::path_prefix")
+}
+
+/// The least byte string greater than every string that starts with
+/// `prefix`; `None` when there is none (a prefix of only `0xff` bytes).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if let Some(next) = last.checked_add(1) {
+            end.push(next);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Settle one superseding publish inside the caller's transaction.
+fn settle_in(conn: &rusqlite::Connection, settle: &SupersedeSettle<'_>) -> Result<()> {
+    if settle.restore {
+        for (key, identity) in &settle.intent.rows {
+            // A row a later group already wrote under the key wins.
+            conn.execute(
+                "INSERT OR IGNORE INTO outputs VALUES (?1, ?2)",
+                (key, identity),
+            )
+            .map_err(sqlite_error)?;
+        }
+    }
+    conn.execute(
+        "DELETE FROM supersedes WHERE dir = ?1 AND temp = ?2",
+        (&settle.intent.dir, &settle.intent.temp),
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 /// Whether the store carries the [`RACY_GUARD_SETTING`] marker (#125).
 fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     conn.query_row(
@@ -1109,7 +1516,7 @@ fn racy_guarded(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     )
 }
 
-fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
+pub(crate) fn identity_bytes(identity: &StatIdentity) -> Result<Vec<u8>> {
     postcard::to_stdvec(&(
         identity.dev,
         identity.ino,
@@ -1329,7 +1736,7 @@ mod tests {
         LedgerItem {
             entry: 7,
             key: key.to_vec(),
-            manifest: manifest(data),
+            record: LedgerRecord::Capture(manifest(data)),
         }
     }
 
@@ -1397,8 +1804,213 @@ mod tests {
                 "directories",
                 "output_hints",
                 "outputs",
-                "settings"
+                "refused_seats",
+                "settings",
+                "supersedes"
             ]
+        );
+        Ok(())
+    }
+
+    /// #186: a refusal is remembered under its row key, read back as the
+    /// same refusal, replaced in place, and missed under any other key. A
+    /// kind this engine does not know is a miss, and so is every row of a
+    /// store without the racy-guard marker.
+    #[test]
+    fn a_refused_seat_is_remembered_under_its_row_key() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let sink = ledger_sink(&state)?;
+        sink.publish(&[
+            LedgerItem {
+                entry: 3,
+                key: b"refused".to_vec(),
+                record: LedgerRecord::Refused(RefusedSeat::SqliteHeader),
+            },
+            item(b"capture", b"carried"),
+        ])?;
+        sink.publish(&[LedgerItem {
+            entry: 4,
+            key: b"refused".to_vec(),
+            record: LedgerRecord::Refused(RefusedSeat::SqliteHeader),
+        }])?;
+        drop(sink);
+        let store = Store::open(&state)?;
+        assert_eq!(
+            store.refused_seat(b"refused")?,
+            Some(RefusedSeat::SqliteHeader)
+        );
+        assert_eq!(
+            store.refused_seat(b"refused")?.map(RefusedSeat::refusal),
+            Some(BulkloadRefusal::SqliteStateChanged)
+        );
+        assert_eq!(store.refused_seat(b"capture")?, None);
+        assert_eq!(store.refused_seat(b"other")?, None);
+        assert_eq!(store.capture(b"refused")?, None);
+        assert_eq!(
+            Store::open_reader(&state)?.refused_seat(b"refused")?,
+            Some(RefusedSeat::SqliteHeader)
+        );
+        store
+            .conn
+            .execute("UPDATE refused_seats SET kind = 99", [])
+            .map_err(sqlite_error)?;
+        assert_eq!(store.refused_seat(b"refused")?, None, "an unknown kind");
+        store
+            .conn
+            .execute("UPDATE refused_seats SET kind = 1", [])
+            .map_err(sqlite_error)?;
+        store.forget_racy_guard()?;
+        assert_eq!(Store::open_reader(&state)?.refused_seat(b"refused")?, None);
+        drop(store);
+        assert_eq!(Store::open(&state)?.refused_seat(b"refused")?, None);
+        Ok(())
+    }
+
+    fn seat_row(rel_path: &[u8], ino: u64) -> RowSchema {
+        RowSchema {
+            rel_path: rel_path.to_vec(),
+            kind: bulkload_proto::FileKind::Regular,
+            dev: 1,
+            ino,
+            size: 9,
+            mtime_ns: 1_000,
+            ctime_ns: 2_000,
+            mode: 0o100_644,
+            nlink: 1,
+            link_target: None,
+            blake3: None,
+        }
+    }
+
+    /// WP0(d), #187: every row key of one destination path starts with
+    /// [`path_prefix`], whatever the seat's stat identity, and no key of
+    /// another path or authority does. `output_rows` depends on it.
+    #[test]
+    fn a_paths_rows_share_one_key_prefix() -> Result<()> {
+        let prefix = path_prefix(b"authority", b"dir/seat")?;
+        for ino in [1, 2, u64::MAX] {
+            assert!(row_key(b"authority", &seat_row(b"dir/seat", ino))?.starts_with(&prefix));
+        }
+        for (authority, rel_path) in [
+            (b"authority".as_slice(), b"dir/seat2".as_slice()),
+            (b"authority", b"dir/sea"),
+            (b"authority", b"dir"),
+            (b"authority", b"dir/seat/below"),
+            (b"authorit", b"ydir/seat"),
+            (b"other", b"dir/seat"),
+        ] {
+            assert!(
+                !row_key(authority, &seat_row(rel_path, 1))?.starts_with(&prefix),
+                "{authority:?} {rel_path:?}"
+            );
+        }
+        assert_eq!(prefix_end(&[1, 2, 3]), Some(vec![1, 2, 4]));
+        assert_eq!(prefix_end(&[1, 0xff, 0xff]), Some(vec![2]));
+        assert_eq!(prefix_end(&[0xff, 0xff]), None);
+        assert_eq!(prefix_end(&[]), None);
+        Ok(())
+    }
+
+    /// WP0(d), #187: a superseding publish's intent takes its output's rows
+    /// out of the store in the commit that records it, and is settled
+    /// either by putting them back or by the new output's row, in one
+    /// commit. A path's rows are read without its neighbours'.
+    #[test]
+    fn a_superseding_publish_moves_rows_out_and_is_settled_in_one_commit() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let identity = |ino| StatIdentity {
+            dev: 1,
+            ino,
+            size: 9,
+            mtime_ns: 1_000,
+            ctime_ns: 2_000,
+        };
+        let record = |rel_path: &[u8], ino| -> Result<OutputRecord> {
+            Ok(OutputRecord {
+                key: row_key(b"authority", &seat_row(rel_path, ino))?,
+                rel_path: rel_path.to_vec(),
+                identity: identity(ino),
+                racy: false,
+                hints: Vec::new(),
+            })
+        };
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(
+            &[
+                record(b"dir/seat", 1)?,
+                record(b"dir/seat", 2)?,
+                record(b"dir/seat2", 3)?,
+                record(b"dir", 4)?,
+            ],
+            &[],
+        )?;
+        let store = Store::open(&state)?;
+        let rows = store.output_rows(b"authority", b"dir/seat")?;
+        assert_eq!(rows.len(), 2, "both rows of the path, and no neighbour's");
+        assert!(store.output_rows(b"other", b"dir/seat")?.is_empty());
+        assert_eq!(store.output_rows(b"authority", b"dir/seat2")?.len(), 1);
+
+        let intent = SupersedeIntent {
+            dir: b"dir".to_vec(),
+            temp: b".bulkload-0123456789abcdef-1-1".to_vec(),
+            leaf: b"seat".to_vec(),
+            staged: (1, 9),
+            owned: identity(2),
+            rows: rows.clone(),
+        };
+        assert_eq!(intent.rel_path(), b"dir/seat");
+        assert_eq!(intent.temp_path(), b"dir/.bulkload-0123456789abcdef-1-1");
+        publisher.begin_supersedes(std::slice::from_ref(&intent))?;
+        assert!(store.output_rows(b"authority", b"dir/seat")?.is_empty());
+        for (key, _) in &rows {
+            assert!(!store.output_matches(key, &identity(1))?);
+            assert!(!store.output_matches(key, &identity(2))?);
+        }
+        assert_eq!(store.output_rows(b"authority", b"dir/seat2")?.len(), 1);
+        assert_eq!(
+            store.supersede_intents(b"dir")?,
+            std::slice::from_ref(&intent)
+        );
+        assert!(store.supersede_intents(b"")?.is_empty());
+        assert!(store.supersede_intents(b"dir/seat")?.is_empty());
+
+        // The exchange did not happen: the old output has its old rows again.
+        store.settle_supersede(&intent, true)?;
+        assert_eq!(store.output_rows(b"authority", b"dir/seat")?, rows);
+        assert!(store.supersede_intents(b"dir")?.is_empty());
+
+        // It happened: the new row and the settled intent are one commit.
+        publisher.begin_supersedes(std::slice::from_ref(&intent))?;
+        publisher.commit_outputs(
+            &[record(b"dir/seat", 9)?],
+            &[SupersedeSettle {
+                intent: &intent,
+                restore: false,
+            }],
+        )?;
+        let after: Vec<Vec<u8>> = store
+            .output_rows(b"authority", b"dir/seat")?
+            .into_iter()
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(
+            after,
+            [identity_bytes(&identity(9))?],
+            "the old rows are dropped"
+        );
+        assert!(store.supersede_intents(b"dir")?.is_empty());
+
+        // A record this engine cannot decode is refused, never skipped.
+        publisher.begin_supersedes(std::slice::from_ref(&intent))?;
+        store
+            .conn
+            .execute("UPDATE supersedes SET intent = x'00'", [])
+            .map_err(sqlite_error)?;
+        assert_eq!(
+            store.supersede_intents(b"dir"),
+            Err(BulkloadRefusal::SchemaMismatch)
         );
         Ok(())
     }
@@ -1626,7 +2238,7 @@ mod tests {
         ledger_sink(&state)?.publish(&[LedgerItem {
             entry: 1,
             key: b"capture".to_vec(),
-            manifest: manifest.clone(),
+            record: LedgerRecord::Capture(manifest.clone()),
         }])?;
         let captured = Store::open(&state)?
             .capture(b"capture")?
@@ -1652,7 +2264,7 @@ mod tests {
             sink.publish(&[LedgerItem {
                 entry: 0,
                 key: b"bad".to_vec(),
-                manifest: outdated,
+                record: LedgerRecord::Capture(outdated),
             }]),
             Err(BulkloadRefusal::DigestMismatch)
         );
@@ -1669,7 +2281,9 @@ mod tests {
         let root = TestRoot::new()?;
         let state = root.0.join("state");
         let mut bad = item(b"bad", b"bad");
-        bad.manifest.root = [0; 32];
+        if let LedgerRecord::Capture(manifest) = &mut bad.record {
+            manifest.root = [0; 32];
+        }
         let committer = Committer::spawn(ledger_sink(&state)?)?;
         committer.submit(bad)?;
         assert_eq!(committer.sync(), Err(BulkloadRefusal::DigestMismatch));
@@ -1742,13 +2356,16 @@ mod tests {
             offset: 5,
             size: 7,
         };
-        publisher.commit_outputs(&[OutputRecord {
-            key: b"key".to_vec(),
-            rel_path: b"nested/output".to_vec(),
-            identity,
-            racy: false,
-            hints: vec![hint],
-        }])?;
+        publisher.commit_outputs(
+            &[OutputRecord {
+                key: b"key".to_vec(),
+                rel_path: b"nested/output".to_vec(),
+                identity,
+                racy: false,
+                hints: vec![hint],
+            }],
+            &[],
+        )?;
         drop(publisher);
         let reopened = Store::open(&state)?;
         assert!(reopened.output_matches(b"key", &identity)?);
@@ -1790,9 +2407,9 @@ mod tests {
                 size: 6,
             }],
         };
-        publisher.commit_outputs(&[record(false)])?;
+        publisher.commit_outputs(&[record(false)], &[])?;
         assert!(publisher.store().output_matches(b"key", &identity)?);
-        publisher.commit_outputs(&[record(true)])?;
+        publisher.commit_outputs(&[record(true)], &[])?;
         assert!(!publisher.store().output_matches(b"key", &identity)?);
         assert_eq!(publisher.store().row_counts()?, (0, 0));
         assert_eq!(publisher.store().output_chunks(&[5; 32])?.len(), 1);
@@ -1851,7 +2468,7 @@ mod tests {
             }],
         };
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
-        publisher.commit_outputs(&[record(b"old")])?;
+        publisher.commit_outputs(&[record(b"old")], &[])?;
         publisher
             .store()
             .record_capture(b"old", &manifest(b"old"))?;
@@ -1875,7 +2492,7 @@ mod tests {
         drop(upgraded);
 
         let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
-        publisher.commit_outputs(&[record(b"new")])?;
+        publisher.commit_outputs(&[record(b"new")], &[])?;
         publisher
             .store()
             .record_capture(b"new", &manifest(b"new"))?;
@@ -1913,8 +2530,8 @@ mod tests {
                 size: 3,
             }],
         };
-        publisher.commit_outputs(&[record(b"a", 0), record(b"b", 10)])?;
-        publisher.commit_outputs(&[record(b"c", 20)])?;
+        publisher.commit_outputs(&[record(b"a", 0), record(b"b", 10)], &[])?;
+        publisher.commit_outputs(&[record(b"c", 20)], &[])?;
         let paths = |found: Vec<ChunkHintRow>| -> Vec<Vec<u8>> {
             found.into_iter().map(|row| row.path).collect()
         };
@@ -1922,7 +2539,7 @@ mod tests {
             paths(publisher.store().output_chunks(&[9; 32])?),
             [b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]
         );
-        publisher.commit_outputs(&[record(b"a", 30)])?;
+        publisher.commit_outputs(&[record(b"a", 30)], &[])?;
         let found = publisher.store().output_chunks(&[9; 32])?;
         assert_eq!(
             found.first().map(|row| (row.path.clone(), row.offset)),

@@ -468,8 +468,8 @@ miss (#87).
   verifies every chunk against its digest, writes it at its offset, and checks
   coverage and the root before the output is queued for its group commit.
 - **WantManifest.** Chosen only when the destination could fill chunks
-  itself: the output path already exists (adopt or refuse), or published
-  outputs hold chunks (resume, incremental). The source sends `Manifest`, from
+  itself: the output path already exists (adopt, supersede or refuse; see
+  Durability), or published outputs hold chunks (resume, incremental). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
   destination fills what it can from verified local chunks and asks for the
   rest by index (`NeedChunks`); the source sends only those, then `End`. A
@@ -494,6 +494,16 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
+- **Refused seats (#186).** A seat is refused for its content when its
+  first 16 bytes are a `SQLite` database or WAL magic
+  (`SQLITE_STATE_CHANGED`): provider state, which only the `SQLite` backup
+  path carries. Those bytes are a sniff, counted as `source_sniff_bytes` and
+  never as content (`source_bytes_read`, `read_source_file_bytes`). The
+  source ledger remembers the refusal under the seat's row key, when the
+  seat was not racy and its stat identity did not move across the sniff, so
+  a later run refuses the unchanged seat with the same code without opening
+  it (R25); a seat whose stat identity moved is sniffed again. The refusal
+  is reported on every run (S4).
 - **Rows from before the racy guard.** A store created by this engine
   carries a `racy_guard` marker from its first commit. A store without it was
   written before #86, so none of its ledger or output rows is proven
@@ -593,8 +603,9 @@ through it rather than through `finish`.
 ## Durability
 
 A record is never committed before the bytes it describes are durable on the
-destination. Existing destination files are never overwritten; publication is
-no-replace. A directory the engine creates is made under a tagged temporary
+destination. Existing destination files are never overwritten in place, and
+publication is no-replace, with one ruled exception (superseding publish,
+below). A directory the engine creates is made under a tagged temporary
 name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
 (R-N78, R-N102).
@@ -607,6 +618,26 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+Superseding publish (WP0(d), OI-1003-Q18, #187). A changed seat's new bytes
+replace the output at its path only when that output is this store's own,
+untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store
+committed for the path. Any other file there is refused
+`DESTINATION_OCCUPIED` and left as it is. The replacement is the exchange
+design the formal model checks (`MC_wp0d_exchange`): the group's commit seals
+the staged file, records an intent that takes the output's rows out of the
+store, trades the staged name and the leaf in one `RENAME_EXCHANGE`
+(`RENAME_SWAP` on Darwin), checks the displaced file, removes it when it is
+the old output or exchanges it back when it is anyone else's, seals the
+directory, and commits the new row with the intent settled. A power loss
+leaves the old output or the new one, whole, and never a row beside other
+bytes; the next sweep gives an old output still in place its rows back,
+removes a displaced old output, and exchanges a displaced file of anyone
+else back (or keeps it aside and reports it). A file system without an
+atomic exchange refuses and keeps the old output with its row. The new file
+is filled from the old output's own chunks, so only absent chunks cross the
+wire (WP0(c), inequality 2). An output published from a racy capture has no
+row, so it is not this store's own to supersede until a later run adopts it.
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

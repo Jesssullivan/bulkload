@@ -22,8 +22,9 @@
 (*     preflight refusal (OI-1001-Q2).                                     *)
 (*   - S2 typed source access (WP0(b)), including the SQLite backup API's  *)
 (*     shared read lock as the one bounded, counted exception.             *)
-(*   - WP0(d) superseding publish as two candidate designs (not yet in     *)
-(*     code), and WP0(g) relaxed source-ledger durability.                 *)
+(*   - WP0(d) superseding publish as two designs: exchange (the code       *)
+(*     since #187) and check-then-rename (rejected), and WP0(g) relaxed    *)
+(*     source-ledger durability.                                           *)
 (*   - The source store's authority: a random value in the source          *)
 (*     store's settings table, created with the schema by Store::open and  *)
 (*     part of every row key on both sides. A relaxed source store can     *)
@@ -157,9 +158,19 @@
 (*                   busy_timeout zero, backup.step(128) at most max_steps *)
 (*                   times; each step holds the shared read lock only     *)
 (*                   while it runs)                                        *)
-(*   CheckOwn, RenameReplace, Exchange, VerifyDisp (and the restore of a   *)
-(*   displaced foreign file in StartRun): WP0(d) candidate designs; no     *)
-(*   code yet.                                                             *)
+(*   Exchange        A/transfer.rs plan_file (owned_output: the plan);     *)
+(*                   A/materialize.rs PublishSink::supersede,              *)
+(*                   StagedFile::prepare_supersede, StagedFile::exchange   *)
+(*                   (io::exchange: RENAME_EXCHANGE / RENAME_SWAP);        *)
+(*                   A/transfer_store.rs begin_supersedes, output_rows     *)
+(*   VerifyDisp      A/materialize.rs StagedFile::exchange (is_owned on    *)
+(*                   the displaced file; the exchange back and its seal)   *)
+(*   StartRun's restore of a displaced foreign file:                       *)
+(*                   A/materialize.rs Destination::settle_supersedes;      *)
+(*                   A/transfer_store.rs supersede_intents,                *)
+(*                   settle_supersede                                      *)
+(*   CheckOwn, RenameReplace: WP0(d)'s rejected check-then-rename design;  *)
+(*                   no code (MC_wp0d_check_rename is why).                *)
 (*                                                                         *)
 (* NEGATIVE CONFIGS set Mutation to break exactly one rule; each MUST      *)
 (* produce a counterexample (see README.md). REACH CONFIGS check one       *)
@@ -178,7 +189,8 @@ CONSTANTS
     RelaxedSourceLedger, \* WP0(g): source ledger synchronous=NORMAL, fullfsync=OFF
     RelaxedAuthority,    \* WP0(g): the store-creation commit (schema and
                          \* authority) is relaxed too, not only the ledger rows
-    SupersedeMode,       \* "off" (code today) | "check_rename" | "exchange"
+    SupersedeMode,       \* "off" (before #187) | "check_rename" (rejected)
+                         \* | "exchange" (the code since #187)
     EstateReads,         \* model estate capture's typed reads (git, SQLite)
     MaxBackupSteps,      \* bound on SQLite backup steps under the shared lock
     Mutation,            \* "none", or one deliberate rule break
@@ -242,7 +254,7 @@ NoRec  == [key |-> 0, data |-> 0, racy |-> FALSE, id |-> 0, kind |-> "none"]
 Msg(t, v, b, c) == [t |-> t, v |-> v, b |-> b, c |-> c]
 NoMsg  == Msg("none", 0, FALSE, "none")
 
-TypedCodes == {"SOURCE_CHANGED_AFTER_SNAPSHOT", "GIT_DESTINATION_OCCUPIED",
+TypedCodes == {"SOURCE_CHANGED_AFTER_SNAPSHOT", "DESTINATION_OCCUPIED",
                "DESTINATION_SPACE_INSUFFICIENT"}
 
 (* WP0(b): every source access is one of these kinds. *)
@@ -423,9 +435,10 @@ Init ==
 (* A/transfer.rs receive: Store::open, the exclusive publisher, sweep_root *)
 (* (orphaned temporaries are salvaged for chunks and removed at finish),  *)
 (* then Open; serve answers Start. WP0(d) exchange design: a file an       *)
-(* interrupted exchange displaced is restored when it is not this store's *)
-(* own (Mutation sweep_displaced: the sweep removes it like any tagged     *)
-(* temporary, which is what today's sweep would do).                       *)
+(* interrupted exchange displaced is restored when it is not this store's  *)
+(* own (A/materialize.rs Destination::settle_supersedes, which runs        *)
+(* before the sweep; Mutation sweep_displaced: the sweep removes it like   *)
+(* any tagged temporary, which is what the sweep before #187 would do).    *)
 
 RestoredOut(s) ==
     IF /\ disp[s].pres /\ disp[s].id \notin OwnIds(s)
@@ -681,7 +694,7 @@ RecvNeed(s) ==
 (* A/transfer.rs Inbound::end, end_streaming, end_filling: a written or    *)
 (* superseding output is staged and queued for its group commit (publish); *)
 (* an adopted one is verified byte for byte (verify_existing) and queued,  *)
-(* or refused GIT_DESTINATION_OCCUPIED with Held{false} at once. #169: a   *)
+(* or refused DESTINATION_OCCUPIED with Held{false} at once. #169: a       *)
 (* verified output of a non-racy capture gets that capture's record before *)
 (* it is queued (Inbound::adopt, A/transfer/unrowed.rs refresh), as a      *)
 (* staged file does in NewOut, so an adoption whose row never commits is   *)
@@ -717,7 +730,7 @@ RecvEnd(s) ==
          [] OTHER ->
               /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, FALSE, "none")]
               /\ dEnt' = [dEnt EXCEPT ![s] = "done"]
-              /\ outc' = [outc EXCEPT ![s] = "GIT_DESTINATION_OCCUPIED"]
+              /\ outc' = [outc EXCEPT ![s] = "DESTINATION_OCCUPIED"]
               /\ UNCHANGED <<tmp, dPub, dRec, out>>
     /\ UNCHANGED <<srcVars, authVars, sVars, dKey, dPlan, outPrev, disp, dstRows,
                    runVars, estVars, reads, srcOps, rc, runReads, heldAtStart,
@@ -753,7 +766,7 @@ SealTemp(s) ==
     /\ UNCHANGED <<PipeUnchanged, dRec, out, outPrev, disp, cfails, clobbered>>
 
 (* A/materialize.rs StagedFile::publish: io::publish_noreplace; an        *)
-(* occupied leaf refuses GIT_DESTINATION_OCCUPIED and the temporary goes.  *)
+(* occupied leaf refuses DESTINATION_OCCUPIED and the temporary goes.      *)
 (* Mutation commit_before_fsync renames a temporary that was never sealed. *)
 Publish(s) ==
     /\ dRec[s].kind = "write"
@@ -816,10 +829,22 @@ RenameReplace(s) ==
     /\ dPub' = [dPub EXCEPT ![s] = "renamed"]
     /\ UNCHANGED <<PipeUnchanged, disp, cfails>>
 
-(* WP0(d) design "exchange": RENAME_EXCHANGE (renameat2 / renamex_np        *)
-(* RENAME_SWAP) puts the new file in place and the old one under a         *)
-(* displaced name; the displaced identity is then checked against this     *)
-(* store's rows, and a foreign file is swapped back.                       *)
+(* WP0(d) design "exchange", the code since #187: RENAME_EXCHANGE          *)
+(* (renameat2 / renameatx_np RENAME_SWAP) puts the new file in place and   *)
+(* the old one under a displaced name; the displaced identity is then      *)
+(* checked against this store's rows, and a foreign file is swapped        *)
+(* back. In the code a store commit comes first (begin_supersedes): it     *)
+(* records the intent and moves the output's rows out of the outputs       *)
+(* table into it, and the intent, not the rows, then says which identity   *)
+(* is this store's own (VerifyDisp, and StartRun's restore). An intent     *)
+(* whose exchange did not take effect is settled by putting the rows       *)
+(* back. Here the rows simply stay: a row binds only an output with its    *)
+(* identity (RowMatches), and the seat's stat version has moved past the   *)
+(* old row's, so no property reads the difference. The code also drops     *)
+(* the old rows when the new row commits; here they stay as OwnIds of a    *)
+(* file that no longer exists. An owned output whose bytes already equal   *)
+(* the manifest's is adopted in place by the code (plan_file), where       *)
+(* this model exchanges it for an equal file.                              *)
 Exchange(s) ==
     /\ SupersedeMode = "exchange" /\ dRec[s].kind = "supersede"
     /\ dPub[s] = "sealed"
@@ -922,7 +947,7 @@ AnswerHeld(s) ==
           /\ outc' = [outc EXCEPT ![s] =
                         CASE dPub[s] = "failed_space" /\ Mutation = "untyped_space" -> "IO"
                           [] dPub[s] = "failed_space" -> "DESTINATION_SPACE_INSUFFICIENT"
-                          [] OTHER -> "GIT_DESTINATION_OCCUPIED"]
+                          [] OTHER -> "DESTINATION_OCCUPIED"]
        \/ /\ dEnt[s] = "queued" /\ Mutation = "held_before_commit"
           /\ dPub[s] \in {"staged", "sealed", "renamed", "ready", "adopt_wait"}
           /\ msg' = [msg EXCEPT ![s] = Msg("held", 0, TRUE, "none")]
@@ -1260,7 +1285,8 @@ R25_NoDurableReread == \A r \in reads : ~r.held
 
 (* docs/slo.md wording: no committed capture is re-read (a source ledger   *)
 (* row whose destination output is still the one the destination holds).   *)
-(* Vacuous while SupersedeMode = "off" (the code today): the source reads  *)
+(* Vacuous while SupersedeMode = "off" (the transfer before #187): the     *)
+(* source reads                                                            *)
 (* with its ledger row present only to serve chunks for an absent output.  *)
 (* MC_neg_reread_ignore_ledger and MC_neg_reread_exchange show it can fail. *)
 R25_NoCommittedCaptureReread == \A r \in reads : ~r.committed

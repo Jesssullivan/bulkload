@@ -189,6 +189,47 @@ pub fn rename_exclusive_at(
     Ok(())
 }
 
+/// `renameatx_np(RENAME_SWAP)` within one directory: `a` and `b`, both of
+/// which must exist, atomically trade the files they name (WP0(d), #187).
+/// Nothing is replaced or removed. A file system without it reports
+/// `ENOTSUP` or `EINVAL` ([`super::rename_unsupported`]).
+///
+/// # Errors
+/// Returns the rename failure; a missing name is `ENOENT`.
+pub fn exchange(directory: impl AsFd, a: &CStr, b: &CStr) -> io::Result<()> {
+    trace_serial!();
+    let directory = directory.as_fd();
+    #[cfg(any(test, feature = "fault-injection"))]
+    if super::sys_posix::rename_forced_unsupported() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // SAFETY: the descriptor is live for the call and both names are
+    // NUL-terminated and outlive it.
+    let exchanged = unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            a.as_ptr(),
+            directory.as_raw_fd(),
+            b.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if exchanged != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    trace_event!(
+        "renameatx_np",
+        Ok(super::trace::Event::Exchange {
+            dir: fstat(directory)?.node,
+            a: a.to_bytes().to_vec(),
+            a_node: fstatat_nofollow(directory, a)?.node,
+            b: b.to_bytes().to_vec(),
+            b_node: fstatat_nofollow(directory, b)?.node,
+        })
+    );
+    Ok(())
+}
+
 // <sys/resource.h>: the disk IO policy calls libc does not bind.
 extern "C" {
     fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;

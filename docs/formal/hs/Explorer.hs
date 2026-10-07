@@ -1295,7 +1295,7 @@ kindName k = case k of
 refusalName :: Refusal -> String
 refusalName r = case r of
   SourceChanged -> "SOURCE_CHANGED_AFTER_SNAPSHOT"
-  GitOccupied -> "GIT_DESTINATION_OCCUPIED"
+  GitOccupied -> "DESTINATION_OCCUPIED"
 
 codeName :: Code -> String
 codeName c = case c of

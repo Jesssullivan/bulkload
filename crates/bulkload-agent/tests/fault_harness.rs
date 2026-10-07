@@ -29,6 +29,25 @@
 //! - the resume converges with only the fixture's own refusal, and the final
 //!   destination is byte-identical to the source.
 //!
+//! # Superseding reruns (WP0(d), OI-1003-Q18, #187)
+//!
+//! A `SUPERSEDING` scenario first copies the fixture cleanly, changes a
+//! third of its small files on the source (grown, rewritten at their size,
+//! shrunk), and arms the fault point in the rerun that supersedes their
+//! outputs. Its crash state must hold, for every path, the old output with
+//! its old row or the new output with its new row:
+//!
+//! - every final name holds the whole old content or the whole new one;
+//! - every output row names a file with exactly its recorded identity, and
+//!   a row recorded from the seat as it is now names the new bytes, a row
+//!   recorded from the seat as it was names the old ones;
+//! - `.bulkload-*` temporaries are the only extra names.
+//!
+//! The resume then converges with no refusal and no temporary left, reads
+//! at most the changed files (WP0(c), inequality 1), and a further run reads
+//! and receives nothing. `supersede.after_exchange` must leave a displaced
+//! old output under a temporary name, which the resume's sweep removes.
+//!
 //! # What this harness cannot see
 //!
 //! `_exit` models a **process crash only**. The kernel page cache survives
@@ -118,7 +137,6 @@ const SMALL_FILES: usize = 48;
 /// More than the fixture's entries: every directory and file of [`populate`].
 const ENTRIES: usize = SMALL_FILES + 8;
 const REFUSED: &str = "refused.db";
-const REFUSED_PREFIX_BYTES: u64 = 16;
 const TEMP_PREFIX: &[u8] = b".bulkload-";
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -191,6 +209,9 @@ fn large_content() -> &'static [u8] {
 #[derive(Clone, Copy)]
 struct Fixture {
     refused: bool,
+    /// The fault is armed in a rerun over changed seats, after a clean first
+    /// copy (see "Superseding reruns").
+    superseding: bool,
 }
 
 /// The transfer.rs shapes: many small distinct files (half in a nested
@@ -718,7 +739,214 @@ fn adoptable<'a>(
 }
 
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
-    crash_resume_with(point, nth, fixture, &[], |_| {});
+    if fixture.superseding {
+        crash_resume_superseding(point, nth);
+    } else {
+        crash_resume_with(point, nth, fixture, &[], |_| {});
+    }
+}
+
+/// The small files a superseding scenario changes after its first copy, by
+/// index: a third of them, in both directories.
+const fn changes_in_place(index: usize) -> bool {
+    index % 4 == 1 || index % 8 == 2
+}
+
+/// Change a third of the small files on the source: grown, rewritten at
+/// their size, or shrunk. Returns each changed path's old content digest.
+fn change_seats(source: &Path) -> BTreeMap<Vec<u8>, [u8; 32]> {
+    let mut old = BTreeMap::new();
+    for index in (0..SMALL_FILES).filter(|index| changes_in_place(*index)) {
+        let parent = if index % 2 == 0 { "" } else { "nested/" };
+        let rel = format!("{parent}small-{index:03}");
+        let path = source.join(&rel);
+        let mut content = fs::read(&path).unwrap();
+        old.insert(rel.into_bytes(), *blake3::hash(&content).as_bytes());
+        match index % 3 {
+            0 => content.extend(noise(index as u64 + 1_000, 5_000)),
+            1 => content = noise(index as u64 + 2_000, content.len()),
+            _ => content.truncate(content.len() / 2),
+        }
+        fs::write(&path, content).unwrap();
+    }
+    bulkload_agent::transfer::settle_racy_window(source).unwrap();
+    old
+}
+
+/// "The old output with its old row or the new output with its new row":
+/// every final name holds the whole old or the whole new content, and every
+/// output row names a file with its recorded identity whose bytes are the
+/// ones the row was recorded from. Returns the number of temporaries.
+fn assert_old_or_new(label: &str, scratch: &Scratch, old: &BTreeMap<Vec<u8>, [u8; 32]>) -> usize {
+    let source = tree(&scratch.source());
+    let mut temporaries = 0;
+    for (path, metadata) in tree(&scratch.destination()) {
+        if is_temporary(&path) {
+            assert!(metadata.is_file(), "{label}: a temporary that is no file");
+            temporaries += 1;
+            continue;
+        }
+        let expected = source
+            .get(&path)
+            .unwrap_or_else(|| panic!("{label}: unexpected leaf {:?}", relative(&path)));
+        if !metadata.is_file() {
+            assert_eq!(metadata.is_dir(), expected.is_dir(), "{label}: kind");
+            continue;
+        }
+        let held = digest(&scratch.destination().join(relative(&path)));
+        assert!(
+            held == digest(&scratch.source().join(relative(&path)))
+                || old.get(&path) == Some(&held),
+            "{label}: {:?} holds neither its old output nor its new one",
+            relative(&path)
+        );
+    }
+    let inspect = scratch.base.join("inspect");
+    for (row, identity) in committed(&scratch.destination_state(), &inspect, "outputs") {
+        let rel = relative(&row.rel_path);
+        let target = scratch.destination().join(rel);
+        let metadata = fs::symlink_metadata(&target)
+            .unwrap_or_else(|error| panic!("{label}: a row names {target:?}: {error}"));
+        let recorded: (u64, u64, u64, i128, i128) = postcard::from_bytes(&identity).unwrap();
+        let observed = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.size(),
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+            i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
+        );
+        assert_eq!(
+            observed, recorded,
+            "{label}: a row sits beside a file it does not describe: {target:?}"
+        );
+        // The row was recorded from the seat as it is now, or as it was.
+        let seat = fs::metadata(scratch.source().join(rel)).unwrap();
+        let from_now = row.size == seat.size()
+            && row.mtime_ns
+                == i128::from(seat.mtime()) * 1_000_000_000 + i128::from(seat.mtime_nsec());
+        let held = digest(&target);
+        if from_now {
+            assert_eq!(
+                held,
+                digest(&scratch.source().join(rel)),
+                "{label}: the new row of {target:?} sits beside other bytes"
+            );
+        } else {
+            assert_eq!(
+                Some(&held),
+                old.get(&row.rel_path),
+                "{label}: the old row of {target:?} sits beside other bytes"
+            );
+        }
+    }
+    temporaries
+}
+
+/// One superseding scenario (module docs): a clean first copy, a third of
+/// the small files changed, the fault armed in the rerun, then a resume.
+fn crash_resume_superseding(point: Point, nth: u64) {
+    let label = format!("{}:{nth} superseding", point.name());
+    let scratch = Scratch::new(&format!("{}-superseding", point.name().replace('.', "-")));
+    populate(&scratch.source(), NO_REFUSAL);
+    let first = scratch.run();
+    assert!(first.refusals.is_empty(), "{label}: {:?}", first.refusals);
+    let old = change_seats(&scratch.source());
+    let changed: u64 = old
+        .keys()
+        .map(|path| {
+            fs::metadata(scratch.source().join(relative(path)))
+                .unwrap()
+                .len()
+        })
+        .sum();
+
+    let spec = format!("{}:{nth}", point.name());
+    let group = crash_child(&scratch, point, &spec, nth > 1, &[]);
+    let crash_temporaries = assert_old_or_new(&label, &scratch, &old);
+    if matches!(
+        point,
+        Point::SupersedeAfterIntent
+            | Point::SupersedeAfterExchange
+            | Point::MaterializeAfterTempSeal
+    ) {
+        assert!(
+            crash_temporaries >= 1,
+            "{label}: this crash must leave a staged or a displaced file"
+        );
+    }
+    if point == Point::SupersedeAfterExchange {
+        let displaced = tree(&scratch.destination())
+            .into_keys()
+            .filter(|path| is_temporary(path))
+            .filter(|path| {
+                old.values()
+                    .any(|held| *held == digest(&scratch.destination().join(relative(path))))
+            })
+            .count();
+        assert!(displaced >= 1, "{label}: an old output must be displaced");
+    }
+
+    let files = source_files(&scratch);
+    let resumed = scratch.run();
+    assert!(
+        resumed.refusals.is_empty(),
+        "{label}: {:?}",
+        resumed.refusals
+    );
+    assert!(
+        resumed.source_bytes_read <= changed,
+        "{label}: inequality 1: read {} of {changed} changed bytes",
+        resumed.source_bytes_read
+    );
+    assert!(
+        resumed.reused >= (files.len() - old.len()) as u64,
+        "{label}: every unchanged file is reused: {resumed:?}"
+    );
+    assert_eq!(
+        resumed.completed + resumed.reused,
+        files.len() as u64,
+        "{label}: every carried file accounted for"
+    );
+    // Converged: every row is a new row beside the new bytes (a changed
+    // seat's old capture stays in the source ledger, so I1's per-path
+    // manifest check does not apply here), and every leaf is the source's.
+    let after = crash_state(&scratch);
+    assert_eq!(
+        assert_old_or_new(&format!("{label} resumed"), &scratch, &BTreeMap::new()),
+        0,
+        "{label}: a temporary survived the resume"
+    );
+    assert_eq!(assert_i2(&format!("{label} resumed"), &scratch), 0);
+    assert_complete(&label, &scratch, NO_REFUSAL, &files, &after);
+    assert_eq!(
+        resumed.temporaries_removed, crash_temporaries as u64,
+        "{label}: the sweep must remove exactly the crash's temporaries"
+    );
+    assert!(
+        resumed.temporaries_left.is_empty(),
+        "{label}: nothing here is ambiguous, yet {:?} was left",
+        resumed.temporaries_left
+    );
+
+    let again = scratch.run();
+    assert!(again.refusals.is_empty(), "{label}: {:?}", again.refusals);
+    assert_eq!(again.source_bytes_read, 0, "{label}: a further run reads 0");
+    assert_eq!(again.bytes_received, 0, "{label}: a further run receives 0");
+    assert_eq!(again.reused, files.len() as u64, "{label}: all reused");
+    println!(
+        "{label}: changed={} temporaries_at_crash={crash_temporaries} resume_completed={} \
+         resume_reused={} resume_unrowed_adopted={} resume_source_bytes={} \
+         resume_bytes_received={}{}",
+        old.len(),
+        resumed.completed,
+        resumed.reused,
+        resumed.unrowed_adopted,
+        resumed.source_bytes_read,
+        resumed.bytes_received,
+        group
+            .map(|group| format!(" crash_{group}"))
+            .unwrap_or_default(),
+    );
 }
 
 /// [`crash_resume`] with extra environment for the crash child, and a check
@@ -751,12 +979,6 @@ fn crash_resume_with(
         })
         .map(|(_, size)| *size)
         .sum();
-    let refused_read = if fixture.refused {
-        REFUSED_PREFIX_BYTES
-    } else {
-        0
-    };
-
     let resumed = scratch.run();
 
     // Convergence: the resume refuses exactly what a clean run refuses.
@@ -776,10 +998,10 @@ fn crash_resume_with(
         resumed.refusals
     );
     // I3: committed and adopted files cost 0 source bytes; the rest are read
-    // exactly once.
+    // exactly once. The refused file's header is never content (#186): a
+    // sniff is counted as `source_sniff_bytes`, at most once per run.
     assert_eq!(
-        resumed.source_bytes_read,
-        uncommitted + refused_read,
+        resumed.source_bytes_read, uncommitted,
         "{label} I3: resume read {} source bytes; uncommitted files hold {uncommitted}",
         resumed.source_bytes_read
     );
@@ -882,8 +1104,18 @@ fn crash_child_entry() {
     eprintln!("fault point not reached; copy returned {outcome:?}");
 }
 
-const WITH_REFUSAL: Fixture = Fixture { refused: true };
-const NO_REFUSAL: Fixture = Fixture { refused: false };
+const WITH_REFUSAL: Fixture = Fixture {
+    refused: true,
+    superseding: false,
+};
+const NO_REFUSAL: Fixture = Fixture {
+    refused: false,
+    superseding: false,
+};
+const SUPERSEDING: Fixture = Fixture {
+    refused: false,
+    superseding: true,
+};
 
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {$(
@@ -927,6 +1159,18 @@ scenarios! {
     receive_after_decide_mid => ReceiveAfterDecide: 30, WITH_REFUSAL;
     receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
     receive_after_end_mid => ReceiveAfterEnd: 25, WITH_REFUSAL;
+    // WP0(d), #187: the fault is armed in a rerun that supersedes this
+    // store's own outputs of changed seats (module docs).
+    supersede_after_intent_first => SupersedeAfterIntent: 1, SUPERSEDING;
+    supersede_after_intent_mid => SupersedeAfterIntent: 5, SUPERSEDING;
+    supersede_after_exchange_first => SupersedeAfterExchange: 1, SUPERSEDING;
+    supersede_after_exchange_mid => SupersedeAfterExchange: 7, SUPERSEDING;
+    superseding_after_temp_seal_mid => MaterializeAfterTempSeal: 4, SUPERSEDING;
+    superseding_after_dir_seal_first => PublishDestinationAfterDirSeal: 1, SUPERSEDING;
+    superseding_after_dir_seal_mid => PublishDestinationAfterDirSeal: 6, SUPERSEDING;
+    superseding_before_commit_mid => PublishDestinationBeforeCommit: 3, SUPERSEDING;
+    superseding_after_commit_mid => PublishDestinationAfterCommit: 9, SUPERSEDING;
+    superseding_receive_after_end_mid => ReceiveAfterEnd: 8, SUPERSEDING;
 }
 
 #[test]

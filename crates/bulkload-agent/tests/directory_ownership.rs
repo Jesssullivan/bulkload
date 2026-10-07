@@ -111,7 +111,7 @@ fn foreign_nonempty_private_directory_is_refused_and_untouched() {
     let mut resumed = Destination::open(&destination, &store).unwrap();
     assert!(matches!(
         resumed.directory(&row, &store, b"authority"),
-        Err(BulkloadRefusal::GitDestinationOccupied)
+        Err(BulkloadRefusal::DestinationOccupied)
     ));
     resumed.finish_directories(&store).unwrap();
     assert_eq!(mode(&foreign), 0o700, "foreign private directory widened");
@@ -165,7 +165,7 @@ fn stale_record_is_cleared_and_never_adopts_later() {
     let mut later = Destination::open(&destination, &store).unwrap();
     assert!(matches!(
         later.directory(&row, &store, b"authority"),
-        Err(BulkloadRefusal::GitDestinationOccupied)
+        Err(BulkloadRefusal::DestinationOccupied)
     ));
     later.finish_directories(&store).unwrap();
     assert_eq!(mode(&foreign), 0o700, "a user's later chmod was reverted");
@@ -190,7 +190,7 @@ fn mode_change_between_crash_and_resume_fails_closed() {
     let mut resumed = Destination::open(&destination, &store).unwrap();
     assert!(matches!(
         resumed.directory(&changed, &store, b"authority"),
-        Err(BulkloadRefusal::GitDestinationOccupied)
+        Err(BulkloadRefusal::DestinationOccupied)
     ));
     assert_eq!(mode(&destination.join("nested")), 0o700);
     assert_eq!(store.directory_record(&key(&row)).unwrap(), None);

@@ -534,14 +534,16 @@ let budgetSelftest =
       //  { symmetry = True }
 
 let positives =
-      [ -- The code as it is today.
+      [ -- The transfer without superseding publish: the code before #187
+        -- (README.md, "Rows that model the transfer before #187").
             row
               "MC_main"
               (passAdopt (noForeign # [ A.CommitFail ] # wp0dOff # estateOff))
-              [ "Main config, breadth: the code as it is today (strict source ledger,"
-              , "no superseding publish), with the state root assumed sealed. Two"
-              , "seats, two runs, one crash of either host or both, one source edit"
-              , "per seat; destination faults off."
+              [ "Main config, breadth: a strict source ledger and no superseding"
+              , "publish (the transfer before #187; MC_supersede_main is this bound"
+              , "with it), with the state root assumed sealed. Two seats, two runs,"
+              , "one crash of either host or both, one source edit per seat;"
+              , "destination faults off."
               ]
               main
         //  { symmetry = True }
@@ -634,11 +636,11 @@ let positives =
                 }
             //  faults
           )
-      , -- WP0(d) candidate designs (no code yet).
+      , -- WP0(d) superseding publish, the exchange design: the code since #187.
         row
           "MC_wp0d_exchange"
           (passAdopt ([ A.CommitFail ] # checkRename # estateOff))
-          [ "WP0(d) superseding publish, exchange design (no code yet):"
+          [ "WP0(d) superseding publish, exchange design (the code since #187):"
           , "RENAME_EXCHANGE, then the displaced identity is checked against this"
           , "store's rows and a foreign file is swapped back; recovery restores a"
           , "displaced foreign file. One seat, three runs, one crash, one edit,"
@@ -650,6 +652,31 @@ let positives =
                 , MaxForeign = 1
                 , SupersedeMode = Mode.exchange
                 }
+          )
+      ,     row
+              "MC_supersede_main"
+              (passAdopt (noForeign # [ A.CommitFail ] # checkRename # estateOff))
+              [ "The code since #187, breadth: MC_main's bound with the superseding"
+              , "publish (exchange design). Two seats, two runs, one crash of either"
+              , "host or both, one source edit per seat; destination faults off."
+              ]
+              (main // { SupersedeMode = Mode.exchange })
+        //  { symmetry = True }
+      , row
+          "MC_supersede_deep"
+          (passAdopt (checkRename # estateOff))
+          [ "The code since #187, depth: MC_main_deep's bound with the superseding"
+          , "publish. One seat through three runs and two crashes, with a source"
+          , "edit and every destination fault: a third-party write or delete, a"
+          , "failed group commit and the space refusal."
+          ]
+          (     defaults
+            //  { Seats = [ Seat.a ]
+                , MaxRuns = 3
+                , MaxCrashes = 2
+                , SupersedeMode = Mode.exchange
+                }
+            //  faults
           )
       , -- S2.
         row
@@ -1444,8 +1471,9 @@ let invariants
       , { tla = P.NoClobber
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q18", "R-N119" ]
-        , codeSymbol = [ "publish_noreplace" ]
-        , ptest = [ "P7", "P8", "P26" ]
+        , codeSymbol =
+          [ "publish_noreplace", "owned_output", "settle_supersedes" ]
+        , ptest = [ "P7", "P8", "P26", "P75" ]
         }
       , { tla = P.S2_TypedSourceAccess
         , slo = [ S.S2 ]

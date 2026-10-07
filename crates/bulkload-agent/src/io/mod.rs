@@ -8,9 +8,10 @@
 //!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
 //!   `readdir`, `geteuid`, `flock`, `setsockopt`, `setpriority`/`getpriority`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//!   `renameatx_np(RENAME_EXCL)`, `fsetxattr`/`fgetxattr` (Darwin's
+//!   `renameatx_np(RENAME_EXCL)` and `(RENAME_SWAP)`, `fsetxattr`/`fgetxattr` (Darwin's
 //!   signature), and the background `IOPOL_THROTTLE` policy and `QoS` class;
-//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)`,
+//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)` and
+//!   `(RENAME_EXCHANGE)`,
 //!   `fsetxattr`/`fgetxattr` and the idle `ioprio_set` class;
 //! - `buf.rs`: the aligned slab allocation.
 //!
@@ -37,6 +38,7 @@
 //! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Sync(Barrier)` / `Sync(Fsync)` |
 //! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `Sync(FullFlush)` / `Sync(Fsync)` |
 //! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
+//! | `sys::exchange` | `renameatx_np(RENAME_SWAP)` | `renameat2(RENAME_EXCHANGE)`, no fallback | `Exchange` |
 //! | `sys::rename_noreplace_at` | as `rename_exclusive_at` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
 //! | `sys::create_excl_at`, `sys::mkdirat`, `sys::symlinkat` | | | `Create`, `Mkdir`, `Symlink` |
 //! | `sys::pwrite_all`, `sys::fchmod`, `sys::unlinkat`, `sys::linkat` | | | `Write`, `SetMode`, `Unlink`, `Link` |
@@ -324,6 +326,20 @@ pub fn rename_unsupported(error: &std::io::Error) -> bool {
         || error.raw_os_error().is_some_and(|code| {
             [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
         })
+}
+
+/// Atomically trade the files two existing names of `directory` hold
+/// (`renameat2(RENAME_EXCHANGE)`; `renameatx_np(RENAME_SWAP)` on Darwin):
+/// the one call a superseding publish replaces an output with (WP0(d),
+/// #187). Nothing is replaced or removed by it, so the displaced file can be
+/// checked, and put back, afterwards. There is no fallback: a file system
+/// without it reports an error [`rename_unsupported`] recognizes, and the
+/// publish refuses.
+///
+/// # Errors
+/// Returns the rename failure.
+pub fn exchange(directory: &std::fs::File, a: &CStr, b: &CStr) -> std::io::Result<()> {
+    sys::exchange(directory, a, b)
 }
 
 /// Publish `from` as `to` inside `directory` without replacing an existing `to`.

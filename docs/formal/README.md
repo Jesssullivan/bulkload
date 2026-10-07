@@ -145,16 +145,28 @@ on purpose:
 
 ## Results
 
-**The table below is one run: `just tla-check` over every BulkloadTransfer
-row on host sting (32 cores, Linux 6.12, TLC 2.19), 2026-10-06 18:27 to
-18:37 EDT, at a load average near 20, over the spec, catalogue and configs
-of commit `8714c61` (the #169 review revision). All 54 rows matched their
-expectation: 17 PASS, 3 REACHED, 32 FAIL, 1 SIMULATION, 1 INCONCLUSIVE (the
-budget self-test), 0 ABORTED, 0 WRONG. Every pass row's never-enabled
-actions equalled its `never` column. Total wall time 558 s; peak RSS
-2,003 MiB.** GitCarry.tla's rows were not part of that run; this revision
-does not touch them. The runs described next are the history before #169;
-their counts are no longer the table's.
+**The table below is one run: `just tla-check` over both modules on host
+sting (32 cores, Linux 6.12, TLC 2.19), 2026-10-06 23:38 to 23:54 EDT for
+BulkloadTransfer's rows, at a load average near 30 from other lanes and
+this lane's own test runs, over the spec, catalogue and configs of the
+#186/#187 revision (2026-10-07; the commit that adds `MC_supersede_main`
+and `MC_supersede_deep`; nothing under `docs/formal` but this README changed
+between the run and that commit). All 56 rows matched their expectation:
+19 PASS, 3 REACHED, 32 FAIL, 1 SIMULATION, 1 INCONCLUSIVE (the budget
+self-test), 0 ABORTED, 0 WRONG. Every pass row's never-enabled actions
+equalled its `never` column. The rows' wall times sum to 881 s; peak RSS
+1,976 MiB.** Every pass row that was in the 2026-10-06 table has the same
+distinct and generated counts and diameter, and the seeded simulation
+checked the same number of states: this revision changes the spec's
+comments and one refusal label (`DESTINATION_OCCUPIED`), and no action.
+GitCarry.tla and its configs are untouched; its rows ran after these and
+are not re-tabled here ([Results (GitCarry)](#results-gitcarry)). The two new rows are the
+superseding publish at the main bounds ([WP0(d)](#wp0d-exchange-versus-check-then-rename-oi-1003-q18)).
+
+The 2026-10-06 run of record (54 rows over `8714c61`, the #169 review
+revision, 18:27 to 18:37 EDT, 558 s, peak RSS 2,003 MiB) is superseded by
+it. The runs described next are the history before #169; their counts are
+no longer the table's.
 
 The first run of record: one full `just tla-check` on host sting (32 cores,
 Linux 6.12, TLC 2.19 on OpenJDK 8), 2026-10-04 01:30–01:38 EDT, at a load
@@ -191,60 +203,62 @@ generated counts and diameter equalled the table's ([Results
 
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
-| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 41,908 | 145,351 | 14 | 6s | 886 |
-| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 80s | 1958 |
-| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 35s | 1790 |
-| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 18s | 1770 |
-| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 3s | 589 |
-| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 14s | 1663 |
-| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 5s | 577 |
-| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 19s | 1754 |
-| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 54s | 1874 |
-| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 49s | 1804 |
-| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 88,569 | 232,148 | 51 | 9s | 1278 |
-| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 7s | 827 |
-| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 6s | 794 |
-| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 1s | 304 |
-| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 37s | 1774 |
-| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 88s | 2003 |
-| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 2s | 343 |
-| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 2s | 335 |
-| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,513 | – | – | 36s | 1565 |
-| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 40,567 | 128,925 | 19 | 6s | 815 |
-| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,459 | 168,087 | 21 | 7s | 847 |
-| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 60,731 | 206,214 | 19 | 10s | 1312 |
-| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 661 | 1,219 | 17 | 2s | 288 |
-| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 700 | 1,299 | 18 | 2s | 277 |
-| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 302 | 624 | 17 | 1s | 270 |
-| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,892 | 13,202 | 27 | 3s | 482 |
-| `MC_neg_live_unfair` | {a} R1 C0 E0 budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 2s | 244 |
-| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 267 | 647 | 7 | 1s | 270 |
-| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 832 | 2,289 | 10 | 2s | 316 |
-| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 85 | 122 | 16 | 2s | 246 |
-| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 291 | 459 | 12 | 2s | 269 |
-| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 34 | 47 | 10 | 1s | 214 |
-| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 2s | 251 |
-| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 348 | 720 | 19 | 1s | 271 |
-| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 337 | 697 | 19 | 2s | 273 |
-| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 338 | 701 | 19 | 2s | 282 |
-| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 1s | 258 |
-| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 121 | 164 | 29 | 1s | 273 |
-| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 17 | 2s | 260 |
-| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 21 | 26 | 8 | 2s | 205 |
-| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,841 | 9,912 | 15 | 3s | 467 |
-| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 320 | 485 | 13 | 2s | 282 |
-| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 447 | 684 | 15 | 2s | 288 |
-| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 96 | 124 | 15 | 1s | 258 |
-| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 221 |
-| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 1s | 218 |
-| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 2s | 220 |
-| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 337 | 861 | 9 | 1s | 276 |
-| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 287 | 446 | 12 | 2s | 266 |
-| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 47,969 | 117,886 | 28 | 6s | 761 |
-| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,787 | 4,059 | 16 | 2s | 392 |
-| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,669 | 4,163 | 15 | 2s | 411 |
-| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 29 | 1s | 257 |
-| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 2s | 326 |
+| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 28,935 | 100,639 | 13 | 6s | 853 |
+| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 89s | 1926 |
+| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 42s | 1805 |
+| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 27s | 1765 |
+| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 7s | 580 |
+| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 18s | 1651 |
+| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 6s | 556 |
+| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 24s | 1783 |
+| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 59s | 1859 |
+| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 48s | 1805 |
+| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 88,569 | 232,148 | 51 | 14s | 1221 |
+| `MC_supersede_main` | {a,b} R2 C1 E1 exchange sym budget 600 s | pass | **PASS** | – | 1,072,654 | 3,406,652 | 57 | 121s | 1968 |
+| `MC_supersede_deep` | {a} R3 C2 E1 F1 X1 space exchange budget 600 s | pass | **PASS** | – | 506,397 | 1,955,141 | 51 | 45s | 1776 |
+| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 8s | 813 |
+| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 8s | 781 |
+| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 2s | 289 |
+| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 49s | 1780 |
+| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 117s | 1976 |
+| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 6s | 361 |
+| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 2s | 301 |
+| `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,513 | – | – | 42s | 1550 |
+| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 35,768 | 114,297 | 19 | 8s | 778 |
+| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 51,931 | 162,436 | 21 | 12s | 822 |
+| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 61,437 | 209,689 | 19 | 15s | 1311 |
+| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 641 | 1,176 | 17 | 4s | 311 |
+| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 624 | 1,152 | 17 | 3s | 284 |
+| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 311 | 646 | 18 | 2s | 299 |
+| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,881 | 13,186 | 27 | 3s | 456 |
+| `MC_neg_live_unfair` | {a} R1 C0 E0 budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 4s | 329 |
+| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 133 | 282 | 7 | 4s | 312 |
+| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 604 | 1,590 | 9 | 3s | 343 |
+| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 78 | 107 | 15 | 3s | 251 |
+| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 331 | 529 | 13 | 3s | 334 |
+| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 20 | 26 | 7 | 3s | 198 |
+| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 4s | 285 |
+| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 337 | 700 | 19 | 5s | 333 |
+| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 341 | 712 | 19 | 3s | 292 |
+| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 458 | 999 | 30 | 4s | 354 |
+| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 8s | 300 |
+| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 121 | 164 | 29 | 5s | 285 |
+| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 17 | 2s | 259 |
+| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 30 | 37 | 8 | 2s | 211 |
+| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,701 | 9,529 | 15 | 4s | 455 |
+| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 311 | 470 | 12 | 4s | 313 |
+| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 456 | 695 | 15 | 2s | 292 |
+| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 97 | 126 | 16 | 3s | 265 |
+| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 205 |
+| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 207 |
+| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 2s | 210 |
+| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 349 | 883 | 10 | 2s | 285 |
+| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 266 | 413 | 12 | 2s | 279 |
+| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 48,022 | 117,985 | 28 | 6s | 805 |
+| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,656 | 3,802 | 15 | 3s | 390 |
+| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,665 | 4,134 | 15 | 3s | 409 |
+| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 29 | 3s | 284 |
+| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 3s | 332 |
 
 Reading the table:
 
@@ -257,7 +271,9 @@ Reading the table:
   transfer before #169, with no capture record. Every row without that tag
   has `AdoptUnrowed = TRUE`, the code since #169 ([the seven rows that
   keep it off](#rows-that-model-the-transfer-before-169)); `exchange` or
-  `check_rename` the WP0(d) design; `estate` estate capture's typed reads; `mut=` the mutation;
+  `check_rename` the WP0(d) design (`exchange` is the code since #187; a
+  row with neither models [the transfer before
+  #187](#rows-that-model-the-transfer-before-187)); `estate` estate capture's typed reads; `mut=` the mutation;
   `sym` `SYMMETRY` over seats; `budget` the `WithinBudget` seconds.
 - **Distinct** is counted under symmetry where `sym` is shown. For
   `MC_main_sim` it is the number of states the simulation checked, not a
@@ -271,6 +287,11 @@ Reading the table:
 - **Violated** lists every property the log reports violated. A FAIL or
   REACHED row shows exactly its named property, never `TypeOK` and never a
   deadlock.
+- **Counts on 2026-10-07 (#186, #187).** No pass row's count moved. The two
+  new rows are `MC_supersede_main` (1,072,654 distinct against `MC_main`'s
+  963,314: the exchange and its displaced file split states) and
+  `MC_supersede_deep` (506,397 against `MC_main_deep`'s 457,464). Fail and
+  reach rows stop at their first violation, so their counts are that run's.
 - **Counts that moved on 2026-10-06 (#169 and its review).** Every row
   but seven now runs with `AdoptUnrowed = TRUE` (the code since #169), so
   every count outside those seven moved: an output's capture record splits
@@ -296,8 +317,11 @@ Bounds:
   relaxed-only loss and consults the ledger (WP0(g) verdict).
 - Depth comes from one seat with three runs and two crashes (`MC_main_deep`,
   `MC_wp0g_deep`, `MC_nv_core`, `MC_nv_ledger`).
-- No config needed reducing: every positive finishes in under 120 s at
-  a load near 30 (`MC_main`, the slowest), far inside its 600 s budget.
+- The superseding publish (the code since #187) has both: `MC_supersede_main`
+  at `MC_main`'s bound and `MC_supersede_deep` at `MC_main_deep`'s.
+- No config needed reducing: every positive finishes in about 120 s or less
+  at a load near 30 (`MC_supersede_main`, the slowest, 121 s), far inside
+  its 600 s budget.
 - The constants first drafted for `MC_main` (two seats, three runs, every
   fault) appear only as `MC_main_sim`: a seeded simulation (`-simulate
   num=3000 -depth 120 -seed 20261003`), recorded as SIMULATION and never as
@@ -328,6 +352,8 @@ violation, and a simulation only samples.
 | `MC_wp0g` | `Edit`, `SilentRewrite`, `RecvRefused`, `CommitFail` | WP0(d), estate |
 | `MC_wp0g_deep` | – | WP0(d), estate |
 | `MC_wp0d_exchange` | `CommitFail`, `CheckOwn`, `RenameReplace` | estate |
+| `MC_supersede_main` | `ForeignWrite`, `ForeignDelete`, `CommitFail`, `CheckOwn`, `RenameReplace` | estate |
+| `MC_supersede_deep` | `CheckOwn`, `RenameReplace` | estate |
 | `MC_s2` | `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d) |
 | `MC_live` | `Edit`, `SilentRewrite`, `RecvRefused`, `CrashSrc`, `CrashDst`, `CrashBoth`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 | `MC_r25_unrowed_bytes`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
@@ -339,11 +365,11 @@ enabled in another config:
 
 | Never enabled | Why it is off | Enabled in |
 |---|---|---|
-| WP0(d): `Exchange`, `VerifyDisp` | `SupersedeMode = "off"`: the code has no superseding publish, and these model WP0(d)'s exchange design | `MC_wp0d_exchange`, `MC_neg_sweep_displaced` |
+| WP0(d): `Exchange`, `VerifyDisp` | `SupersedeMode = "off"`: the row models the transfer without superseding publish, the code before #187 ([those rows](#rows-that-model-the-transfer-before-187)) | `MC_wp0d_exchange`, `MC_supersede_main`, `MC_supersede_deep`, `MC_neg_sweep_displaced` |
 | WP0(d): `CheckOwn`, `RenameReplace` | `SupersedeMode` is not `"check_rename"`; these model WP0(d)'s rejected check-then-rename design | `MC_wp0d_check_rename`: its counterexample takes `CheckOwn` at state 25 and `RenameReplace` at state 27 |
 | estate: `GitRead`, `BackupBegin`, `BackupStepLock`, `BackupStepUnlock`, `BackupEnd` | `EstateReads = FALSE`: estate capture's typed reads do not depend on the transfer, so S2 is checked on its own | `MC_s2` |
-| `ForeignWrite`, `ForeignDelete` | `MaxForeign = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_nv_ledger`, `MC_wp0g`, `MC_wp0g_deep`, `MC_wp0d_exchange` |
-| `CommitFail` | `MaxCommitFails = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_wp0g_deep` |
+| `ForeignWrite`, `ForeignDelete` | `MaxForeign = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_nv_ledger`, `MC_wp0g`, `MC_wp0g_deep`, `MC_wp0d_exchange`, `MC_supersede_deep` |
+| `CommitFail` | `MaxCommitFails = 0` | `MC_main_deep`, `MC_dest_faults`, `MC_wp0g_deep`, `MC_supersede_deep` |
 | `Edit`, `SilentRewrite`, `RecvRefused` | `MaxEdits = 0`: a refusal needs a changed source | every config with `E1` |
 | `CrashSrc`, `CrashDst`, `CrashBoth` | `MaxCrashes = 0` | every config with `C1` or `C2` |
 
@@ -911,18 +937,19 @@ tail. Corruption itself is outside the model and not proven here.
 
 ## WP0(d): exchange versus check-then-rename (OI-1003-Q18)
 
-The code has no superseding publish yet. A changed seat whose output exists
-is adopted only if its bytes verify, and otherwise refuses
-`GIT_DESTINATION_OCCUPIED`. `SupersedeMode = "off"` models that. Two designs
-are checked against `NoClobber`: bulkload replaces or removes a destination
-file only when its identity is one this store recorded.
+Before #187 the code had no superseding publish: a changed seat whose output
+existed was adopted only if its bytes verified, and otherwise refused
+(`DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` before #187).
+`SupersedeMode = "off"` models that transfer. Two designs were checked
+against `NoClobber`: bulkload replaces or removes a destination file only
+when its identity is one this store recorded.
 
 - **`check_rename` fails** (`MC_wp0d_check_rename`, `NoClobber` and only
   it, with a 27-state counterexample). Comparing the output's `(dev, ino, stat)` with the
   store's row, then renaming over it, leaves a window. A third-party write
   that lands in between is clobbered. No fsync ordering closes that window.
 - **`exchange` passes** (`MC_wp0d_exchange`). This is `RENAME_EXCHANGE`
-  (`renameat2`; `renamex_np(RENAME_SWAP)` on Darwin) of the sealed new file
+  (`renameat2`; `renameatx_np(RENAME_SWAP)` on Darwin) of the sealed new file
   with the output. The design then checks the *displaced* file's identity:
   - this store's own file is removed;
   - a foreign file is exchanged back;
@@ -932,9 +959,49 @@ file only when its identity is one this store recorded.
   `MC_neg_supersede_unchecked` and `MC_neg_sweep_displaced` show that the
   identity check and the recovery rule are each load-bearing.
 
-WP5 PR 3 should implement the exchange shape. Where a filesystem has no
-exchange, the publish should refuse and keep no-clobber. Its `crash_check`
-traces should cover the displaced-name window.
+**The code since #187 is the exchange design** (2026-10-07;
+`crates/bulkload-agent/src/materialize.rs`, "Superseding publish"). Two rows
+check it at the main bounds: `MC_supersede_main` (`MC_main`'s bound) and
+`MC_supersede_deep` (`MC_main_deep`'s, with a failed group commit, the space
+refusal and a third-party write), beside `MC_wp0d_exchange`. All three pass
+every safety invariant. Where a file system has no exchange, the publish
+refuses and keeps no-clobber.
+
+How the code refines the model's two actions:
+
+- **An intent record comes first.** `Exchange` here reads this store's rows
+  (`OwnIds`) to tell its own file from another's, at `VerifyDisp` and at
+  `StartRun`'s restore. The code cannot leave the old row in the store across
+  the exchange: its crash harness (`tests/fault_harness.rs`, I1) requires
+  that every row name a file with its recorded identity. So one store commit
+  before the exchange (`begin_supersedes`) writes an intent that holds the
+  staged file's inode and the owned identity, and moves the output's rows
+  into it. The intent is what `VerifyDisp` and the restore read. It is
+  settled with the new row's commit, or, when the exchange did not take
+  effect, by putting the rows back (`settle_supersede`,
+  `Destination::settle_supersedes`).
+- **No property reads the difference.** A row binds only an output with its
+  identity (`RowMatches`, `HeldPhys`), and by the time a seat is superseded
+  its stat version has moved past the old row's, so the old row vouches for
+  nothing in either shape. The model also keeps the old rows after the new
+  row commits, as `OwnIds` of a file that no longer exists; the code drops
+  them in that commit.
+- **A touched seat.** An owned output whose bytes already equal the
+  manifest's is adopted in place by the code; the model exchanges it for an
+  equal file.
+- **What the model does not see.** The identity check on the displaced file
+  compares the inode, size and mtime, not the ctime: the exchange itself
+  moves it. A third party that rewrites the output in place and puts its
+  mtime back between the publish's last look and its exchange is not seen
+  (`materialize.rs`, "One limit"). The model's identity is a version that
+  any write moves. The ordering inside the group (the intent's commit, the
+  exchange, the seal between an exchange back and its unlink) is
+  `crash_check`'s to prove, on hand-written and real traces
+  (`io/crash_check/tests.rs`, `tests/power_loss.rs`).
+- **Ownership is a committed row.** An output published from a racy capture
+  has no row (`Recorded`), in the model and in the code, so neither
+  supersedes it: its changed seat is refused `DESTINATION_OCCUPIED` until a
+  run adopts the output.
 
 ## Abstraction map
 
@@ -962,7 +1029,9 @@ Code at adb9c66, re-checked at `origin/main` 6268175. `A` is
 | `GitRead` | `A/git_carry.rs` `git`, the `git_env` table |
 | `BackupBegin`, `BackupStepLock`, `BackupStepUnlock`, `BackupEnd` | `A/provider_sqlite.rs` `snapshot` |
 | Messages, refusal codes | `P/frame.rs` `Control`, `Decision`; `P/refusal.rs` `BulkloadRefusal::code` |
-| `CheckOwn`, `RenameReplace`, `Exchange`, `VerifyDisp` | WP0(d) candidate designs; no code yet |
+| `Exchange`, `VerifyDisp` (WP0(d), the code since #187) | `A/transfer.rs` `plan_file` (`owned_output`); `A/materialize.rs` `PublishSink::supersede`, `StagedFile::prepare_supersede`, `StagedFile::exchange`, `is_owned`; `A/io/mod.rs` `exchange`; `A/transfer_store.rs` `begin_supersedes`, `output_rows` |
+| `StartRun`'s restore of a displaced foreign file | `A/materialize.rs` `Destination::settle_supersedes` (ahead of `Destination::sweep`); `A/transfer_store.rs` `supersede_intents`, `settle_supersede` |
+| `CheckOwn`, `RenameReplace` | WP0(d)'s rejected check-then-rename design; no code |
 | `Edit`, `SilentRewrite`, `Tick`, `ForeignWrite`, `ForeignDelete` | The environment: live source writers, the 2 s racy allowance, third parties at the destination |
 
 What the abstractions are:
@@ -999,7 +1068,7 @@ that test the same claim on the real code. SLOs are
 | Model property | Statement | SLO | Rulings | Property tests |
 |---|---|---|---|---|
 | `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20 | P23, P21, P19, P24, P33 |
-| `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the code today)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
+| `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the transfer before #187)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
 | `ReadOnce` | A seat is read at most once per session. | S1, S3 | R-N58 | P23 |
 | `S3_ReadsOnlyChanged` | A run reads only seats not held when it began (changed, racy, never carried, or lost at the destination) or changed during it. | S3 | OI-1003-Q18 (WP0(c), inequality 1) | P21, P23 |
 | `S3_UnchangedReadsZero` | An unchanged source whose every seat is held reads 0 content bytes. | S3 | OI-1003-Q6, R-N58 | P21, P32 |
@@ -1010,7 +1079,7 @@ that test the same claim on the real code. SLOs are
 | `DoneAfterLedger` | `SourceDone` follows the ledger's last commit. | Durability | wire v5 (design.md) | P4, P23 |
 | `ReuseSound` | Held under the seat's current identity means held with its current bytes (the racy rule). | S3, S5 | #86, R-N76 | P19 |
 | `LedgerSound` | A ledger manifest under the current key is the seat's current content. | S3, S5 | #86, R-N58 | P17, P19 |
-| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26 |
+| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26, P75 |
 | `S2_TypedSourceAccess` | Every source access is a stat, a content read, an allowlisted git read or the SQLite backup. No write, lock, lease or signal. | S2 | OI-1003-Q5, OI-1003-Q16 (WP0(b)) | P34 |
 | `S2_BackupLockBounded` | The backup's lock is only ever shared, held only inside one step of a counted backup, and taken at most `max_steps` times. | S2 (its stated exception) | OI-1003-Q16 | P34; no dedicated test yet |
 | `ClosureAccounted` | A finished session leaves every seat applied or with a typed refusal. A bare `IO` closes nothing. | S4 | OI-1003-Q1, #100 | P61 |
@@ -1073,8 +1142,8 @@ place ([what the review found](#what-the-169-review-changed)).
 | `pause_writer` | a capture interrupts a source writer | `S2_TypedSourceAccess` |
 | `git_optional_locks` | git without the optional-locks guard (`git_env`) | `S2_TypedSourceAccess` |
 | `unbounded_backup` | the backup steps past `max_steps` (`provider_sqlite::snapshot`) | `S2_BackupLockBounded` |
-| `supersede_unchecked` | WP0(d) exchange without the identity check | `NoClobber` |
-| `sweep_displaced` | WP0(d) recovery deletes a displaced foreign file | `NoClobber` |
+| `supersede_unchecked` | WP0(d) exchange without the identity check (`owned_output` at the plan, `is_owned` on the displaced file) | `NoClobber` |
+| `sweep_displaced` | WP0(d) recovery deletes a displaced foreign file (the sweep without `Destination::settle_supersedes`) | `NoClobber` |
 | `adopt_unkeyed` | #169 adoption without the record's row-key check (`unrowed::prove`) | `ReuseSound` |
 | `adopt_unverified` | #169 adoption without hashing the output against its record (`unrowed::prove`) | `RecordImpliesBytes` |
 | `reuse_ignores_row` | `Reuse` ignores the output's row (`Store::output_matches` always false), so the adoption takes every rowed output | `AdoptOnlyUnrowed` |
@@ -1293,6 +1362,34 @@ code since #169:
 | `MC_store_root_unsealed` | The finding that a lost source store re-keys every row and re-reads held bytes. With the record it no longer does for outputs that carry one (`MC_r25_strict_unsealed` passes `R25_NoDurableReread` at this bound); an output without a record is still re-read. |
 | `MC_wp0g_authority` | The same for a relaxed creation commit (`MC_r25_strict_authority`). WP0(g)'s condition stands: it was ratified on this row (OI-1003-Q37), and a record is not guaranteed. |
 
+### Rows that model the transfer before #187
+
+Every row whose constants are not tagged `exchange` or `check_rename` keeps
+`SupersedeMode = "off"`: the transfer without superseding publish, which
+was the code until #187 (2026-10-07). In that transfer a changed seat whose
+output exists is adopted if its bytes verify and refused otherwise. The
+rows were not moved, for three reasons:
+
+- **Their verdicts still hold for the code** wherever no output is
+  superseded: a first pass, an unchanged rerun, a crash and its resume, a
+  lost source store. Those are the behaviours R25, the Held ordering, the
+  ledger properties and S2 are about. An `off` row says nothing about a
+  changed seat's replacement.
+- **Their counts are of record.** `MC_nv_core`, `MC_nv_ledger` and their
+  `_adopt` rows are frozen names whose distinct-state counts the Haskell
+  explorer must reproduce, and the explorer has no WP0(d) action ([N-version
+  core](#n-version-core-oi-1003-q32)). Moving them needs a ruling, as for
+  #169.
+- **The superseding publish is checked on rows of its own**, at the two
+  main bounds: `MC_supersede_main` and `MC_supersede_deep`, with
+  `MC_wp0d_exchange`, `MC_neg_supersede_unchecked` and
+  `MC_neg_sweep_displaced`.
+
+What is not yet checked with the superseding publish on: the relaxed source
+ledger (`MC_wp0g`, `MC_wp0g_deep`), the strict-held ghost
+(`MC_r25_strict_*`), estate reads (`MC_s2`) and liveness (`MC_live`). None
+of those properties reads `SupersedeMode`, but no row combines them.
+
 ## Code and design disagreements
 
 The model follows the code where the code and docs/design.md differ:
@@ -1300,8 +1397,15 @@ The model follows the code where the code and docs/design.md differ:
 - **WantManifest.** design.md says it is chosen when the output exists or
   published outputs hold chunks. `Inbound::entry` also chooses it when the
   sweep salvaged any temporary (`self.target.salvaged() > 0`).
-- **Superseding publish (WP0(d)).** It is ratified but not implemented.
-  `SupersedeMode = "off"` models the code.
+- **Superseding publish (WP0(d)).** Implemented by #187 (2026-10-07) as the
+  exchange design. `SupersedeMode = "exchange"` models the code;
+  `"off"` models the transfer before it ([WP0(d)](#wp0d-exchange-versus-check-then-rename-oi-1003-q18),
+  [the rows that keep it off](#rows-that-model-the-transfer-before-187)).
+- **A refused seat's sniff (#186).** The model has no content-based source
+  refusal: `SQLITE_STATE_CHANGED` is not in `TypedCodes`, and a refused
+  seat's 16 sniffed bytes are not in `reads`. So that the source remembers
+  such a refusal and does not sniff an unchanged seat again is not a model
+  property; P21 and P23 with refused seats check it on the code.
 - **WP0(g).** It is ratified conditionally and not implemented: both stores
   run `synchronous=FULL`, `fullfsync=ON` (`configure_sqlite`). The verdict
   above sets the condition.

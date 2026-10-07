@@ -15,8 +15,9 @@
 //! The trace is a sequence of *operations*. A mutation is a write (class
 //! data), an `fchmod` or the capture record's `fsetxattr` (class meta, #169),
 //! or a directory-entry change: create,
-//! mkdir, link, rename, unlink (class namespace; its objects are the one or
-//! two directories it changes). A sync operation names one object and a
+//! mkdir, link, rename, exchange, unlink (class namespace; its objects are
+//! the one or two directories it changes). An exchange (`RENAME_EXCHANGE`,
+//! WP0(d)) is one mutation: both names trade files, or neither does. A sync operation names one object and a
 //! [`SyncKind`]. A crash after operation `c` keeps some subset `P` of the
 //! mutations issued before `c`, and applies exactly those, in trace order, to
 //! the pre-trace image. `P` is legal when all of these hold:
@@ -401,6 +402,19 @@ impl Image {
             Change::Unlink { dir, name } => {
                 self.dir_mut(*dir)?.remove(name);
             }
+            Change::Exchange {
+                dir,
+                a,
+                a_node,
+                b,
+                b_node,
+            } => {
+                // One atomic directory operation: both names take the files
+                // the trace saw them hold afterwards, or neither does.
+                let entries = self.dir_mut(*dir)?;
+                entries.insert(a.clone(), *a_node);
+                entries.insert(b.clone(), *b_node);
+            }
         }
         Ok(())
     }
@@ -443,6 +457,13 @@ enum Change {
     Unlink {
         dir: NodeId,
         name: Vec<u8>,
+    },
+    Exchange {
+        dir: NodeId,
+        a: Vec<u8>,
+        a_node: NodeId,
+        b: Vec<u8>,
+        b_node: NodeId,
     },
 }
 
@@ -623,6 +644,7 @@ fn describe(event: &Event) -> String {
         Event::Link { name: n, .. } => format!("link {}", name(n)),
         Event::Rename { from, to, .. } => format!("rename {} -> {}", name(from), name(to)),
         Event::Unlink { name: n, .. } => format!("unlink {}", name(n)),
+        Event::Exchange { a, b, .. } => format!("exchange {} <-> {}", name(a), name(b)),
         Event::Symlink { name: n, .. } => format!("symlink {}", name(n)),
         Event::Commit { records, .. } => format!("commit {} records", records.len()),
         Event::Untraced { call, .. } => format!("untraced {call}"),
@@ -669,6 +691,7 @@ fn touches_only(event: &Event, known: &HashSet<NodeId>) -> bool {
         Event::Mkdir { dir, .. }
         | Event::Link { dir, .. }
         | Event::Unlink { dir, .. }
+        | Event::Exchange { dir, .. }
         | Event::Symlink { dir, .. } => known(dir),
         Event::Write { node, .. }
         | Event::SetMode { node, .. }
@@ -886,6 +909,23 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
                     name: name.clone(),
                 },
             ),
+            Event::Exchange {
+                dir,
+                a,
+                a_node,
+                b,
+                b_node,
+            } => push(
+                Class::Namespace,
+                vec![*dir],
+                Change::Exchange {
+                    dir: *dir,
+                    a: a.clone(),
+                    a_node: *a_node,
+                    b: b.clone(),
+                    b_node: *b_node,
+                },
+            ),
             Event::Untraced { call, error } => {
                 return Err(other(format!(
                 "trace event {index} ({call}) was not recorded: {error}; refusing a partial trace"
@@ -1093,6 +1133,7 @@ impl Plan {
                 Change::Write { .. }
                 | Change::Mode { .. }
                 | Change::Record { .. }
+                | Change::Exchange { .. }
                 | Change::Unlink { .. } => None,
             };
             for dir in objects.iter().copied().chain(moved) {
