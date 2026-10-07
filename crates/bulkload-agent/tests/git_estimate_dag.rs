@@ -48,12 +48,13 @@
 //! A rename over a have moves an unchanged subtree to a path the have lacks,
 //! the shape where `pack.useSparse` would pack it again.
 //!
-//! **Corpus.** CI runs a fixed seed and 12 cases ([`prop_config`]), plus a
-//! PINNED table of shapes the generator reaches rarely.
+//! **Corpus.** CI runs a fixed seed and 12 cases (`test_support::prop_config`),
+//! plus a PINNED table of shapes the generator reaches rarely.
 //! `BULKLOAD_PROPTEST_DEEP=1` switches to random seeds and twenty times the
-//! cases, as `test_support::prop_config` does. That helper is
-//! `#[cfg(test)] pub(crate)`, out of an integration test's reach, so this file
-//! mirrors it (same seed, same switch) instead of widening the library API.
+//! cases. The helper is `#[cfg(test)] pub(crate)` in the library, out of an
+//! integration test's reach, so this file compiles the same source file as a
+//! local module (`#[path]`) instead of mirroring it or widening the library
+//! API. `tests/prop_seed_guard.rs` holds every property to that helper.
 //!
 //! Every test builds its repositories under the system temp dir, runs the
 //! real `git` on `PATH`, and removes them afterwards. Measurements print as
@@ -75,39 +76,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bulkload_agent::git_carry::estimate::{estimate, Destination, Tally, ThinPack};
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngSeed};
 
 // ---------------------------------------------------------------------------
 // Corpus configuration
 // ---------------------------------------------------------------------------
 
-/// `test_support::CI_SEED`, mirrored: every CI run draws the same cases.
-const CI_SEED: u64 = 0x0B01_C0AD_2026_1003;
-
-/// `test_support::DEEP`, mirrored: the switch for the deep local tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
-
-/// `test_support::prop_config`, mirrored for an integration test: `cases`
-/// fixed-seed cases in CI; random seeds and twenty times the cases under
-/// `BULKLOAD_PROPTEST_DEEP=1`. Nothing persists between runs; a failing deep
-/// run prints its seed, which is pinned as a PINNED row.
-fn prop_config(cases: u32) -> Config {
-    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
-    Config {
-        cases: if deep {
-            cases.saturating_mul(20)
-        } else {
-            cases
-        },
-        rng_seed: if deep {
-            RngSeed::Random
-        } else {
-            RngSeed::Fixed(CI_SEED)
-        },
-        failure_persistence: None,
-        ..Config::default()
-    }
-}
+/// The shared helper itself (OI-1003-Q7): the same source file as the
+/// library's `test_support`, so the seed and the deep switch cannot drift.
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 // ---------------------------------------------------------------------------
 // Fixture plumbing
@@ -1112,7 +1089,7 @@ fn pinned_dags_equal_upload_pack() {
 }
 
 proptest! {
-    #![proptest_config(prop_config(12))]
+    #![proptest_config(test_support::prop_config(12))]
 
     /// On random DAGs, with random source tips, held commits (named or not
     /// by any source ref) and a destination-only tip, the estimate equals

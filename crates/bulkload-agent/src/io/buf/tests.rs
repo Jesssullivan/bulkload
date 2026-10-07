@@ -114,10 +114,8 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: if cfg!(miri) { 8 } else { 256 },
-        ..ProptestConfig::default()
-    })]
+    // P1: the shared fixed-seed corpus (OI-1003-Q7); 8 cases under Miri.
+    #![proptest_config(crate::test_support::prop_config(if cfg!(miri) { 8 } else { 256 }))]
 
     /// Model check: the pool never lends more than its capacity, never lends
     /// one slab twice, every slab is aligned and sized, a fresh slab is
