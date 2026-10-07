@@ -75,7 +75,7 @@ use crate::materialize::{
 };
 use crate::transfer_store::{
     row_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
-    PublisherSide, RefusedSeat, Store,
+    PublisherSide, RefusedOutput, RefusedSeat, Store,
 };
 use crate::walk::{WalkItem, Walker};
 use crate::{BulkloadRefusal, Result, RowSchema};
@@ -676,6 +676,40 @@ fn set_capture_clock(root: &Path, clock: Option<i128>) {
 /// Test-only capture clocks by canonical source root.
 #[cfg(test)]
 static CAPTURE_CLOCK: Mutex<Vec<(PathBuf, i128)>> = Mutex::new(Vec::new());
+
+/// A test hook run on a capture thread.
+#[cfg(test)]
+type CaptureHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Test-only hooks by canonical source root, run between a refused seat's
+/// header sniff and the stat that decides whether its refusal may be
+/// remembered (#186): where a writer can still move the seat.
+#[cfg(test)]
+static AFTER_SNIFF: Mutex<Vec<(PathBuf, CaptureHook)>> = Mutex::new(Vec::new());
+
+/// Set (or, with `None`, clear) the after-sniff hook of a canonical source
+/// root.
+#[cfg(test)]
+fn set_after_sniff(root: &Path, hook: Option<CaptureHook>) {
+    let mut hooks = AFTER_SNIFF.lock().unwrap_or_else(PoisonError::into_inner);
+    hooks.retain(|(hooked_root, _)| hooked_root != root);
+    if let Some(hook) = hook {
+        hooks.push((root.to_path_buf(), hook));
+    }
+}
+
+#[cfg(test)]
+fn after_sniff(root: &Path) {
+    let hook = AFTER_SNIFF
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(hooked_root, _)| hooked_root == root)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// What every capture thread shares.
 struct SourceWork<'a> {
@@ -1655,6 +1689,8 @@ fn capture_file(
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
     {
         counters::add_len(Counter::SourceSniff, prefix.len());
+        #[cfg(test)]
+        after_sniff(work.root);
         let unmoved = file
             .metadata()
             .is_ok_and(|after| StatIdentity::from_metadata(&after) == expected);
@@ -2285,6 +2321,15 @@ impl<W: Write> Inbound<'_, W> {
                         self.stats.reused += 1;
                         return Ok(Decision::Reuse);
                     }
+                    // Refused before for what the path holds, and neither
+                    // the seat nor that file has moved since: the same
+                    // answer, and the source reads nothing for it (R25).
+                    // Asked ahead of the capture record: a file that did
+                    // not verify against this seat cannot prove it either,
+                    // and proving hashes the whole output.
+                    if let Some(refused) = self.remembered_refusal(&row, &key, identity)? {
+                        return Err(refused.refusal());
+                    }
                     if self.adopt_unrowed(&row, &key)? {
                         return Ok(Decision::Reuse);
                     }
@@ -2373,6 +2418,43 @@ impl<W: Write> Inbound<'_, W> {
             counters::bump(Counter::TransferUnrowedUnproven);
         }
         Ok(false)
+    }
+
+    /// The destination's remembered refusal of this entry ([`RefusedOutput`]),
+    /// when the file at its path still has the identity it was refused
+    /// with. A refusal for a missing exchange stands only while the file
+    /// system still has none (probed once a session).
+    fn remembered_refusal(
+        &self,
+        row: &RowSchema,
+        key: &[u8],
+        identity: &StatIdentity,
+    ) -> Result<Option<RefusedOutput>> {
+        let Some(refused) = self.store.refused_output(key, identity)? else {
+            return Ok(None);
+        };
+        if refused == RefusedOutput::ExchangeUnsupported && self.target.exchange_supported(row)? {
+            return Ok(None);
+        }
+        counters::bump(Counter::TransferRefusedOutputsRemembered);
+        Ok(Some(refused))
+    }
+
+    /// Remember that this entry was refused for what its path holds, so an
+    /// unchanged rerun refuses it when it is offered ([`RefusedOutput`]).
+    /// Only for a capture that was not racy and a file that was `settled`
+    /// when it was read ([`verify_settled`]). Best effort: a record that
+    /// cannot be written costs one more source read, never the session.
+    fn remember_refusal(
+        &self,
+        key: &[u8],
+        settled: Option<StatIdentity>,
+        racy: bool,
+        refused: RefusedOutput,
+    ) {
+        if let (false, Some(identity)) = (racy, settled) {
+            let _ = self.store.remember_refused_output(key, &identity, refused);
+        }
     }
 
     /// Reserve an entry's bytes against the destination's free-space floor
@@ -2492,7 +2574,7 @@ impl<W: Write> Inbound<'_, W> {
                 self.open += 1;
                 staging.missing.clone()
             }
-            Plan::Refuse(_) | Plan::Adopt(..) => Vec::new(),
+            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => Vec::new(),
         };
         write_control(
             self.output,
@@ -2713,14 +2795,25 @@ impl<W: Write> Inbound<'_, W> {
                     root,
                     chunks: specs,
                 };
-                match verify_existing(&file, &row, &manifest) {
+                let (verified, settled) =
+                    verify_settled(self.target.path(), &file, &row, &manifest);
+                match verified {
                     Ok(identity) => Ok(Some((file, parent, identity))),
                     Err(BulkloadRefusal::DestinationOccupied) => {
                         supersede = owned_output(self.store, &self.authority, &row, &file)?;
-                        if supersede.is_some() {
+                        if supersede.is_none() {
+                            self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                            Err(BulkloadRefusal::DestinationOccupied)
+                        } else if self.target.exchange_supported(&row)? {
                             Ok(None)
                         } else {
-                            Err(BulkloadRefusal::DestinationOccupied)
+                            self.remember_refusal(
+                                &key,
+                                settled,
+                                racy,
+                                RefusedOutput::ExchangeUnsupported,
+                            );
+                            Err(BulkloadRefusal::DestinationExchangeUnsupported)
                         }
                     }
                     Err(refusal) => Err(refusal),
@@ -2775,11 +2868,21 @@ impl<W: Write> Inbound<'_, W> {
                     file.metadata()
                         .is_ok_and(|found| StatIdentity::from_metadata(&found) == *identity)
                 });
-                let identity = match unmoved {
-                    Some(identity) => identity,
-                    None => verify_existing(&file, &row, &manifest)?,
+                let identity = if let Some(identity) = unmoved {
+                    identity
+                } else {
+                    let (verified, settled) =
+                        verify_settled(self.target.path(), &file, &row, &manifest);
+                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
+                        self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                    }
+                    verified?
                 };
                 self.adopt(file, parent, &row, (key, racy, root), identity)
+            }
+            Plan::NoExchange(settled) => {
+                self.remember_refusal(&key, settled, racy, RefusedOutput::ExchangeUnsupported);
+                Err(BulkloadRefusal::DestinationExchangeUnsupported)
             }
             Plan::Write(staging) => {
                 self.open -= 1;
@@ -2962,7 +3065,49 @@ enum Plan {
     /// them (an output of this store, WP0(d)); otherwise they are verified
     /// then.
     Adopt(std::fs::File, Arc<std::fs::File>, Option<StatIdentity>),
+    /// This store's own output holds other bytes than the manifest's, on a
+    /// file system with no atomic exchange to supersede it with: refused
+    /// `DESTINATION_EXCHANGE_UNSUPPORTED` once the entry ends, with nothing
+    /// staged and no chunk asked for. The identity is the output's, when
+    /// the refusal may be remembered ([`verify_settled`]).
+    NoExchange(Option<StatIdentity>),
     Write(Staging),
+}
+
+/// [`verify_existing`], and, when the output holds other bytes than the
+/// manifest's (`DESTINATION_OCCUPIED`), the identity that answer may be
+/// remembered under ([`RefusedOutput`]): the output's, when it was the same
+/// before and after it was read and was not stamped within
+/// [`RACY_GRANULARITY_NS`] of the read, so that the identity vouches for
+/// the bytes that were read, as a seat's does for a capture (#86). `root`
+/// is the destination root, whose clock the stamps are judged against.
+fn verify_settled(
+    root: &Path,
+    file: &std::fs::File,
+    row: &RowSchema,
+    manifest: &Manifest,
+) -> (Result<StatIdentity>, Option<StatIdentity>) {
+    let started_ns = capture_clock(root);
+    let before = file
+        .metadata()
+        .ok()
+        .map(|found| StatIdentity::from_metadata(&found));
+    let verified = verify_existing(file, row, manifest);
+    if !matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
+        return (verified, None);
+    }
+    let settled = before.filter(|before| {
+        let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
+        let now_ns = capture_clock(root);
+        before.mtime_ns < window
+            && before.ctime_ns < window
+            && before.mtime_ns <= now_ns
+            && before.ctime_ns <= now_ns
+            && file
+                .metadata()
+                .is_ok_and(|after| StatIdentity::from_metadata(&after) == *before)
+    });
+    (verified, settled)
 }
 
 struct Staging {
@@ -2986,8 +3131,10 @@ struct Staging {
 /// written, and that no longer holds the manifest's bytes (the seat
 /// changed) is superseded (WP0(d), OI-1003-Q18, #187): the new file is
 /// staged beside it and filled like any other, the old output's own chunks
-/// included through its hints, and its group commit exchanges the two. Any
-/// other existing output is adopted if its bytes verify when the entry
+/// included through its hints, and its group commit exchanges the two. On
+/// a file system with no atomic exchange it is refused
+/// `DESTINATION_EXCHANGE_UNSUPPORTED` instead, before anything is staged.
+/// Any other existing output is adopted if its bytes verify when the entry
 /// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
 /// replaced.
 fn plan_file(
@@ -3029,12 +3176,26 @@ fn plan_file(
     let supersede = match context.target.existing(row) {
         Ok(Some((file, parent))) => {
             match owned_output(context.store, context.authority, row, &file) {
-                Ok(Some(owned)) => match verify_existing(&file, row, manifest) {
-                    // The seat was touched, not changed: nothing to replace.
-                    Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
-                    Err(BulkloadRefusal::DestinationOccupied) => Some(Box::new(owned)),
-                    Err(refusal) => return Plan::Refuse(refusal),
-                },
+                Ok(Some(owned)) => {
+                    let (verified, settled) =
+                        verify_settled(context.target.path(), &file, row, manifest);
+                    match verified {
+                        // The seat was touched, not changed: nothing to
+                        // replace.
+                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
+                        // Changed. Without an atomic exchange the output
+                        // cannot be superseded: say so now, before a byte
+                        // is staged or asked of the source.
+                        Err(BulkloadRefusal::DestinationOccupied) => {
+                            match context.target.exchange_supported(row) {
+                                Ok(true) => Some(Box::new(owned)),
+                                Ok(false) => return Plan::NoExchange(settled),
+                                Err(refusal) => return Plan::Refuse(refusal),
+                            }
+                        }
+                        Err(refusal) => return Plan::Refuse(refusal),
+                    }
+                }
                 Ok(None) => return Plan::Adopt(file, parent, None),
                 Err(refusal) => return Plan::Refuse(refusal),
             }

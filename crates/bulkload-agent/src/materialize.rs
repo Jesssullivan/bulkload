@@ -225,6 +225,9 @@ pub struct Destination {
     /// The most recent staged file's parent, shared by its siblings so each
     /// directory costs one descriptor rather than one per file.
     last_parent: std::cell::RefCell<Option<(Vec<u8>, Arc<File>)>>,
+    /// Whether each device probed so far offers the atomic exchange a
+    /// superseding publish needs ([`Destination::exchange_supported`]).
+    exchange: std::cell::RefCell<std::collections::HashMap<u64, bool>>,
     directories: Vec<OwnedDirectory>,
     /// Devices holding a directory entry sealed by barrier only, awaiting a
     /// full flush, each with one descriptor on it.
@@ -287,6 +290,7 @@ impl Destination {
                 .refuse_at("materialize::open")?
                 .dev(),
             last_parent: std::cell::RefCell::new(None),
+            exchange: std::cell::RefCell::new(std::collections::HashMap::new()),
             directories: Vec::new(),
             unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
@@ -742,8 +746,12 @@ impl Destination {
     ///   rows go back (the old output with its old row); the staged file is
     ///   then this store's orphan, for the sweep;
     /// - the staged name holds the owned output, displaced: the exchange
-    ///   took effect, so it is removed, and the new file at the leaf is
-    ///   adopted like any unrowed output (#169);
+    ///   took effect, so it is removed. The new file at the leaf, when it
+    ///   is still the file this store staged, gets an ownership row
+    ///   (`transfer_store::owner_key`): it is adopted like any unrowed
+    ///   output (#169) while its seat is unchanged, and superseded once the
+    ///   seat has changed again. The same holds when the staged name is
+    ///   already gone;
     /// - the staged name holds any other file: one this store does not own,
     ///   displaced. While the leaf still holds the staged file the two are
     ///   exchanged back, the directory sealed, and the staged file removed.
@@ -768,17 +776,22 @@ impl Destination {
             let at_temp = stat_at(directory, &temp)?;
             let at_leaf = stat_at(directory, &leaf)?;
             let intact = at_leaf.is_some_and(|found| is_owned(&found, &intent.owned, true));
+            // The exchange took effect and the new file's row did not
+            // commit: the leaf holds the file this store staged. The record
+            // proves it, so the file keeps an ownership row and is adopted
+            // (#169) or, once its seat has changed again, superseded.
+            let own = at_leaf.and_then(|found| published(&found, &intent));
             match at_temp {
-                None => store.settle_supersede(&intent, intact)?,
+                None => store.settle_supersede(&intent, intact, own)?,
                 Some(found) if is_staged(&found, &intent) => {
-                    store.settle_supersede(&intent, intact)?;
+                    store.settle_supersede(&intent, intact, None)?;
                 }
                 Some(found) if is_owned(&found, &intent.owned, false) => {
                     crate::io::sys::unlinkat(directory, &temp, false)
                         .refuse_at("materialize::settle_supersedes")?;
                     self.swept.removed += 1;
                     *removed = true;
-                    store.settle_supersede(&intent, false)?;
+                    store.settle_supersede(&intent, false, own)?;
                 }
                 Some(_) => {
                     // Sealed between the exchange back and the unlink, so no
@@ -793,7 +806,7 @@ impl Destination {
                         self.swept.removed += 1;
                         *removed = true;
                         counters::bump(Counter::SupersedeRestored);
-                        store.settle_supersede(&intent, false)?;
+                        store.settle_supersede(&intent, false, None)?;
                     } else {
                         self.swept.left.push(intent.temp_path());
                         aside.insert(intent.temp);
@@ -912,6 +925,51 @@ impl Destination {
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the file system holding `row`'s parent directory offers the
+    /// atomic exchange of two names, the one call a superseding publish
+    /// replaces an output with (WP0(d), #187). A file system the first
+    /// publish reaches through its link fallback (NFS, SMB, exFAT) may have
+    /// none; a changed seat there is refused before anything is staged or
+    /// asked of the source, not at its group commit.
+    ///
+    /// Probed once per device and session: two empty temporaries of this
+    /// store are created in the directory, exchanged and removed. A crash
+    /// between leaves them for the sweep, as any temporary.
+    ///
+    /// # Errors
+    /// Refuses an unsafe ancestor or a probe that failed for any other
+    /// reason than a missing exchange.
+    pub(crate) fn exchange_supported(&self, row: &RowSchema) -> Result<bool> {
+        let (parent, _) = self.shared_parent(&row.rel_path)?;
+        let device = parent
+            .metadata()
+            .refuse_at("materialize::exchange_supported")?
+            .dev();
+        if let Some(known) = self.exchange.borrow().get(&device) {
+            return Ok(*known);
+        }
+        let first = self.temporary(None)?;
+        let second = self.temporary(None)?;
+        crate::io::sys::create_excl_at(parent.as_fd(), &first, 0o600)
+            .refuse_at("materialize::exchange_supported")?;
+        if let Err(error) = crate::io::sys::create_excl_at(parent.as_fd(), &second, 0o600) {
+            let _ = unlink(&parent, &first);
+            return Err(crate::refuse::io(&error, "materialize::exchange_supported"));
+        }
+        let exchanged = crate::io::exchange(&parent, &first, &second);
+        for name in [&first, &second] {
+            let _ = unlink(&parent, name);
+        }
+        let supported = match exchanged {
+            Ok(()) => true,
+            Err(error) if crate::io::rename_unsupported(&error) => false,
+            Err(error) => return Err(crate::refuse::io(&error, "materialize::exchange_supported")),
+        };
+        counters::bump(Counter::ExchangeProbes);
+        self.exchange.borrow_mut().insert(device, supported);
+        Ok(supported)
     }
 
     /// Create a private temporary file (`O_EXCL`, mode 0600) beside `row`'s
@@ -1082,10 +1140,15 @@ impl StagedFile {
                 .file
                 .metadata()
                 .refuse_at("materialize::prepare_supersede")?;
-            Ok((old, (staged.dev(), staged.ino())))
+            let stamp = StatIdentity::from_metadata(&staged);
+            Ok((
+                old,
+                (staged.dev(), staged.ino()),
+                (stamp.size, stamp.mtime_ns),
+            ))
         });
         match prepared {
-            Ok((old, staged)) => Ok(PendingSupersede {
+            Ok((old, staged, stamp)) => Ok(PendingSupersede {
                 old: Arc::new(old),
                 intent: SupersedeIntent {
                     dir: rel_path
@@ -1097,6 +1160,7 @@ impl StagedFile {
                     temp: self.temporary.as_bytes().to_vec(),
                     leaf: self.leaf.as_bytes().to_vec(),
                     staged,
+                    stamp,
                     owned: owned.identity,
                     rows: owned.rows,
                 },
@@ -1139,10 +1203,12 @@ impl StagedFile {
                 .flatten()
                 .is_some_and(|found| is_owned(&found, &intent.owned, true));
             return Exchanged::Undone {
-                // No atomic exchange here: the output stays as it is.
-                refusal: if crate::io::rename_unsupported(&error)
-                    || error.raw_os_error() == Some(libc::ENOENT)
-                {
+                // No atomic exchange here: the output stays as it is. The
+                // plan's probe refuses such a seat before it is staged;
+                // this is the same answer for a directory it did not cover.
+                refusal: if crate::io::rename_unsupported(&error) {
+                    BulkloadRefusal::DestinationExchangeUnsupported
+                } else if error.raw_os_error() == Some(libc::ENOENT) {
                     BulkloadRefusal::DestinationOccupied
                 } else {
                     crate::refuse::io(&error, "materialize::exchange")
@@ -1258,7 +1324,8 @@ enum Exchanged {
     /// file's identity for its row, and the directory to seal.
     Done(StatIdentity, Arc<File>),
     /// The new file is at the leaf but its identity could not be read: no
-    /// row is written, and the next run adopts it as an unrowed output.
+    /// row is written and its intent stays, so the next sweep gives it an
+    /// ownership row.
     Unrecorded(BulkloadRefusal, Arc<File>),
     /// Nothing was exchanged, and the temporary is gone. With `restore` the
     /// leaf is still exactly the owned output, so its rows go back.
@@ -1285,8 +1352,11 @@ pub(crate) struct OwnedOutput {
 /// Whether the existing output `file` at `row`'s path is this store's own,
 /// untouched since its row was written (WP0(d), OI-1003-Q18): its
 /// `(dev, ino, size, mtime, ctime)` equals a row this store committed for
-/// that path under `authority`. Bulkload wrote or verified it, and nothing
-/// has touched it since. Returns what a superseding publish needs, or `None`
+/// that path under `authority`: a seat's reuse row, or the path's
+/// ownership row (`transfer_store::owner_key`), which an output published
+/// from a racy capture, or exchanged into place without its row, has in
+/// its stead. Bulkload wrote or verified it, and nothing has touched it
+/// since. Returns what a superseding publish needs, or `None`
 /// for any other file: that one is never replaced.
 ///
 /// # Errors
@@ -1322,6 +1392,22 @@ const fn is_owned(found: &crate::io::Stat, owned: &StatIdentity, exact: bool) ->
 /// Whether `found` is the staged file an intent names.
 fn is_staged(found: &crate::io::Stat, intent: &SupersedeIntent) -> bool {
     found.is_file() && (found.node.dev, found.node.ino) == intent.staged
+}
+
+/// The identity of the file an intent's staged file is now, when `found`
+/// (the leaf) is that file and has not been written since it was staged:
+/// its inode, and the size and mtime the intent recorded before the
+/// exchange, which moves only its ctime. Such a file is this store's own.
+fn published(found: &crate::io::Stat, intent: &SupersedeIntent) -> Option<StatIdentity> {
+    (is_staged(found, intent) && (found.size, found.mtime_ns) == intent.stamp).then_some(
+        StatIdentity {
+            dev: found.node.dev,
+            ino: found.node.ino,
+            size: found.size,
+            mtime_ns: found.mtime_ns,
+            ctime_ns: found.ctime_ns,
+        },
+    )
 }
 
 /// Test hooks run on the committer thread between a superseding publish's
@@ -1547,10 +1633,11 @@ impl PublishSink {
                     });
                     settled.push((intent, false));
                 }
+                // Its intent stays: the next sweep finds the staged file at
+                // the leaf and gives it its ownership row.
                 Exchanged::Unrecorded(refusal, parent) => {
                     touched.directory(parent);
                     self.outcomes.push((record.rel_path, Err(refusal)));
-                    settled.push((intent, false));
                 }
                 Exchanged::Undone { refusal, restore } => {
                     self.outcomes.push((record.rel_path, Err(refusal)));
@@ -1718,10 +1805,7 @@ impl crate::io::durable::GroupSink for PublishSink {
             );
             let settled: Vec<SupersedeSettle<'_>> = settled
                 .iter()
-                .map(|(intent, restore)| SupersedeSettle {
-                    intent,
-                    restore: *restore,
-                })
+                .map(|(intent, restore)| SupersedeSettle::of(intent, *restore))
                 .collect();
             self.publisher.commit_outputs(&records, &settled)
         });

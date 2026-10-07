@@ -1390,6 +1390,33 @@ ledger (`MC_wp0g`, `MC_wp0g_deep`), the strict-held ghost
 (`MC_r25_strict_*`), estate reads (`MC_s2`) and liveness (`MC_live`). None
 of those properties reads `SupersedeMode`, but no row combines them.
 
+### What the #187 review added to the code and not to the model
+
+The review of #187 (2026-10-07) added three records to the destination
+store. None is in `BulkloadTransfer.tla`, the catalogue or the explorer, so
+no row above checks them; the Rust tests named here are their only proof
+until the model gains them.
+
+- **The ownership row.** An output with no reuse row is still this store's
+  own to supersede when the store holds an ownership row for its path with
+  its identity: one published from a racy capture (#86), or exchanged into
+  place by a superseding publish whose row never committed, which the next
+  sweep settles from the publish's record. The model's `NoClobber` is
+  stated over reuse rows only; an ownership row is a second way for
+  `CheckOwn` to hold, and needs a row kind (`transfer_store::owner_key`;
+  `materialize/supersede_tests.rs`, `transfer::tests::
+  a_seat_changed_again_after_an_unrecorded_supersede_still_converges`,
+  `a_racy_capture_is_sent_but_never_recorded`).
+- **The remembered refusal of an output.** The destination answers
+  `Refuse` when an entry is offered, without a manifest, from a record of
+  an earlier refusal bound to the seat's row key and the identity of the
+  file at the path. `RecvEntry` has no such branch
+  (`Store::refused_output`; `transfer::tests::
+  an_occupied_seat_is_read_once_and_then_refused_from_its_record`).
+- **A destination without an atomic exchange.** The model's `Exchange`
+  always succeeds; the code probes for it and refuses a changed seat
+  `DESTINATION_EXCHANGE_UNSUPPORTED` before staging.
+
 ## Code and design disagreements
 
 The model follows the code where the code and docs/design.md differ:

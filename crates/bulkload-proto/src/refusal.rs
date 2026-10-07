@@ -190,12 +190,17 @@ pub enum BulkloadRefusal {
     /// A transfer's regular-file destination path holds something this
     /// store cannot replace: a file it has no row for, or one changed since
     /// its row was written; a node of another kind; a file that appeared
-    /// while the output was staged; or its own output on a file system with
-    /// no atomic exchange. Nothing is replaced: a rerun supersedes only an
-    /// output whose identity is this store's own row (no-clobber, WP0(d),
-    /// OI-1003-Q18, #187). The Git carry's occupied destinations keep
-    /// `GIT_DESTINATION_OCCUPIED`.
+    /// while the output was staged. Nothing is replaced: a rerun supersedes
+    /// only an output whose identity is this store's own row (no-clobber,
+    /// WP0(d), OI-1003-Q18, #187). The Git carry's occupied destinations
+    /// keep `GIT_DESTINATION_OCCUPIED`.
     DestinationOccupied,
+    /// A changed seat's output is this store's own, but its file system has
+    /// no atomic exchange of two names (`renameat2(RENAME_EXCHANGE)`,
+    /// `renameatx_np(RENAME_SWAP)`), the one call a superseding publish
+    /// replaces an output with (WP0(d), #187). The old output and its row
+    /// are kept; nothing is staged or asked of the source for it.
+    DestinationExchangeUnsupported,
     /// A salvaged destination temporary that a refused entry staged chunks
     /// from could not be kept for the next run: the session's salvage bound
     /// (by count and bytes) was already reached, so it was removed and its
@@ -279,6 +284,7 @@ impl BulkloadRefusal {
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
+            Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
@@ -341,6 +347,7 @@ impl BulkloadRefusal {
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
         "DESTINATION_OCCUPIED",
+        "DESTINATION_EXCHANGE_UNSUPPORTED",
         "SALVAGE_BOUND_EXCEEDED",
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
@@ -548,6 +555,7 @@ mod tests {
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::DestinationOccupied,
+            BulkloadRefusal::DestinationExchangeUnsupported,
             BulkloadRefusal::SalvageBoundExceeded,
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,

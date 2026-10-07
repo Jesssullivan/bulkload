@@ -88,6 +88,39 @@ fn output_commit_fault(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Destination store roots whose output group commits alone fail: a
+/// superseding publish's intent still commits, so its exchange happens and
+/// the commit of the new output's row is what fails.
+#[cfg(test)]
+static FAIL_GROUP_COMMITS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: while `on`, every `commit_outputs` of the store at `root`
+/// (canonical) fails with `ENOSPC` before `COMMIT`, and rolls back;
+/// `begin_supersedes` is left alone (compare [`fail_output_commits`]).
+#[cfg(test)]
+pub(crate) fn fail_group_commits(root: &Path, on: bool) {
+    let mut roots = FAIL_GROUP_COMMITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    roots.retain(|failing| failing != root);
+    if on {
+        roots.push(root.to_path_buf());
+    }
+}
+
+#[cfg(test)]
+fn group_commit_fault(root: &Path) -> Result<()> {
+    let failing = FAIL_GROUP_COMMITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|failing| failing == root);
+    if failing {
+        return Err(BulkloadRefusal::Io(Some(libc::ENOSPC)));
+    }
+    output_commit_fault(root)
+}
+
 // A publication crash point is named per store: the source ledger committer
 // and the destination output committer hit `publish.source.*` and
 // `publish.destination.*` respectively, and the crash receipt records the
@@ -275,6 +308,54 @@ impl RefusedSeat {
     }
 }
 
+/// Why the destination refused a seat's entry for what its path holds
+/// (#187 review, R25).
+///
+/// It is remembered in the destination store under the entry's row key (the
+/// seat's path and stat identity) together with the stat identity of the
+/// file found at the path. While both are unchanged the answer cannot
+/// change, so a rerun refuses the entry when it is offered, with the same
+/// code, and the source reads nothing for it. It is remembered only when
+/// the capture was not racy (#86) and the file at the path was settled: the
+/// same before and after it was read, and not stamped within
+/// [`crate::transfer::RACY_GRANULARITY_NS`] of that read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusedOutput {
+    /// The path holds a file this store does not own, with other bytes
+    /// than the seat's.
+    Occupied,
+    /// The path holds this store's own output with other bytes than the
+    /// seat's, on a file system with no atomic exchange.
+    ExchangeUnsupported,
+}
+
+impl RefusedOutput {
+    /// The stored form. Never reuse a retired value.
+    const fn tag(self) -> i64 {
+        match self {
+            Self::Occupied => 1,
+            Self::ExchangeUnsupported => 2,
+        }
+    }
+
+    const fn from_tag(tag: i64) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Occupied),
+            2 => Some(Self::ExchangeUnsupported),
+            _ => None,
+        }
+    }
+
+    /// The refusal this record stands for.
+    #[must_use]
+    pub const fn refusal(self) -> BulkloadRefusal {
+        match self {
+            Self::Occupied => BulkloadRefusal::DestinationOccupied,
+            Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
+        }
+    }
+}
+
 /// A published destination output, ready for its group commit.
 pub(crate) struct OutputRecord {
     pub key: Vec<u8>,
@@ -283,7 +364,9 @@ pub(crate) struct OutputRecord {
     /// The source seat was racy when captured (#86): its stat identity
     /// cannot vouch for these bytes, so no output row is kept under `key`
     /// and the next run asks for a manifest instead of reusing it. Its
-    /// chunk hints are still recorded; they are re-verified on use.
+    /// chunk hints are still recorded; they are re-verified on use. The
+    /// output still gets an ownership row ([`owner_key`]): this store
+    /// published it, so a later change of its seat supersedes it.
     pub racy: bool,
     /// First occurrence of each distinct chunk in this output.
     pub hints: Vec<ChunkHint>,
@@ -340,6 +423,11 @@ pub(crate) struct SupersedeIntent {
     pub leaf: Vec<u8>,
     /// Device and inode of the staged file.
     pub staged: (u64, u64),
+    /// Size and mtime of the staged file, sealed, before the exchange. The
+    /// exchange moves neither, so a file at the leaf with `staged`'s inode
+    /// and this stamp is the file this store staged, not written since
+    /// (its ctime the exchange itself moved).
+    pub stamp: (u64, i128),
     /// The identity this store's row recorded for the output it replaces.
     pub owned: StatIdentity,
     /// The output rows moved out of `outputs` when this record committed.
@@ -379,6 +467,24 @@ pub(crate) struct SupersedeSettle<'a> {
     /// The exchange did not happen and the output is still this store's
     /// own: its rows go back into `outputs`.
     pub restore: bool,
+    /// The exchange happened but the new file's row did not commit with it
+    /// (a crash, or a failed group commit): the leaf holds the file this
+    /// store staged, with this identity now. It gets an ownership row
+    /// ([`owner_key`]), so it is still this store's own: adopted if its
+    /// seat is unchanged, superseded if the seat changed again.
+    pub owned: Option<StatIdentity>,
+}
+
+impl<'a> SupersedeSettle<'a> {
+    /// A publish settled by its own group: its record goes, and with
+    /// `restore` the old output's rows come back.
+    pub(crate) const fn of(intent: &'a SupersedeIntent, restore: bool) -> Self {
+        Self {
+            intent,
+            restore,
+            owned: None,
+        }
+    }
 }
 
 struct Exclusive(fs::File);
@@ -528,7 +634,9 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS output_hints (digest BLOB NOT NULL, path BLOB NOT NULL, offset INTEGER NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (digest, path));
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS refused_seats (key BLOB PRIMARY KEY, kind INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS supersedes (dir BLOB NOT NULL, temp BLOB NOT NULL, intent BLOB NOT NULL, PRIMARY KEY (dir, temp));",
+                CREATE TABLE IF NOT EXISTS supersedes (dir BLOB NOT NULL, temp BLOB NOT NULL, intent BLOB NOT NULL, PRIMARY KEY (dir, temp));
+                CREATE TABLE IF NOT EXISTS refused_outputs (key BLOB PRIMARY KEY, kind INTEGER NOT NULL, identity BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);",
             )
             .and_then(|()| {
                 conn.execute(
@@ -550,6 +658,8 @@ impl Store {
                 // The table is younger than the guard, so this deletes
                 // nothing a guarded engine wrote; it is not counted.
                 conn.execute("DELETE FROM refused_seats", [])?;
+                conn.execute("DELETE FROM refused_outputs", [])?;
+                conn.execute("DELETE FROM owned_outputs", [])?;
                 conn.execute(
                     "INSERT INTO settings VALUES (?1, ?2)",
                     (RACY_GUARD_SETTING, b"#86".as_slice()),
@@ -699,6 +809,65 @@ impl Store {
         Ok(kind.and_then(RefusedSeat::from_tag))
     }
 
+    /// The destination's remembered refusal of the entry under a row key,
+    /// if the file at its path still has the identity it was refused with
+    /// (see [`RefusedOutput`]). A row this engine does not know is a miss.
+    ///
+    /// # Errors
+    /// Refuses database errors.
+    pub fn refused_output(
+        &self,
+        key: &[u8],
+        identity: &StatIdentity,
+    ) -> Result<Option<RefusedOutput>> {
+        if !self.rows_trusted {
+            return Ok(None);
+        }
+        let found: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT kind, identity FROM refused_outputs WHERE key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let current = identity_bytes(identity)?;
+        Ok(found
+            .filter(|(_, held)| *held == current)
+            .and_then(|(kind, _)| RefusedOutput::from_tag(kind)))
+    }
+
+    /// Remember the destination's refusal of the entry under a row key,
+    /// bound to the identity of the file at its path (see
+    /// [`RefusedOutput`]). The record claims nothing about any file's
+    /// bytes being durable; losing it costs one more source read.
+    ///
+    /// # Errors
+    /// Refuses serialization or database failures.
+    pub fn remember_refused_output(
+        &self,
+        key: &[u8],
+        identity: &StatIdentity,
+        refused: RefusedOutput,
+    ) -> Result<()> {
+        let identity = identity_bytes(identity)?;
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
+        let started = Instant::now();
+        let recorded = self
+            .conn
+            .execute(
+                "INSERT INTO refused_outputs VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET kind=excluded.kind, identity=excluded.identity",
+                (key, refused.tag(), identity),
+            )
+            .map_err(sqlite_error);
+        counters::sqlite_commit(Counter::SqliteRefusedOutput, started, &recorded);
+        recorded?;
+        Ok(())
+    }
+
     /// Record one `Event::Commit` for this store (R-N88): a commit returned
     /// and made `records` durable. Called only after success.
     #[cfg(feature = "io-trace")]
@@ -728,6 +897,17 @@ impl Store {
                 .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
         };
         Ok((count("captures")?, count("outputs")?))
+    }
+
+    /// How many rows `table` holds.
+    #[cfg(test)]
+    pub(crate) fn conn_count(&self, table: &str) -> Result<u64> {
+        self.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(sqlite_error)
+            .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
     }
 
     /// How many refusals the store remembers (#186).
@@ -797,7 +977,9 @@ impl Store {
     /// The output rows this store holds for one destination path under
     /// `authority`, whatever source stat identity each was recorded from
     /// (WP0(d), #187): the row keys of a path share the prefix
-    /// [`path_prefix`], so this is one range read of the primary key.
+    /// [`path_prefix`], so this is one range read of the primary key. The
+    /// path's ownership row ([`owner_key`]) comes last, under the bare
+    /// prefix.
     ///
     /// A file at that path is this store's own, untouched since, exactly
     /// when its current identity equals one of these rows' identities.
@@ -825,6 +1007,17 @@ impl Store {
         for row in rows {
             found.push(row.map_err(sqlite_error)?);
         }
+        // The path's ownership row, if any, under the bare prefix.
+        let owned: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT identity FROM owned_outputs WHERE key = ?1",
+                [&prefix],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        found.extend(owned.map(|identity| (prefix, identity)));
         Ok(found)
     }
 
@@ -857,20 +1050,33 @@ impl Store {
 
     /// Settle one superseding publish a crash left recorded, in a
     /// transaction of its own: with `restore`, its rows go back into
-    /// `outputs` (the output is still this store's own, untouched); either
-    /// way the record is deleted.
+    /// `outputs` (the output is still this store's own, untouched); with
+    /// `owned`, the staged file at the leaf gets an ownership row (see
+    /// [`SupersedeSettle::owned`]); either way the record is deleted.
     ///
     /// # Errors
     /// Refuses database failures; nothing is settled then.
-    pub(crate) fn settle_supersede(&self, intent: &SupersedeIntent, restore: bool) -> Result<()> {
+    pub(crate) fn settle_supersede(
+        &self,
+        intent: &SupersedeIntent,
+        restore: bool,
+        owned: Option<StatIdentity>,
+    ) -> Result<()> {
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(sqlite_error)?;
-        let settled = settle_in(&self.conn, &SupersedeSettle { intent, restore })
-            .and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        let settled = settle_in(
+            &self.conn,
+            &SupersedeSettle {
+                intent,
+                restore,
+                owned,
+            },
+        )
+        .and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
         if settled.is_err() {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
@@ -1117,23 +1323,7 @@ impl StorePublisher {
             .map_err(sqlite_error)?;
         let staged = (|| -> Result<()> {
             for output in outputs {
-                if output.racy {
-                    // Never a reuse key (#86): drop any row an earlier
-                    // capture left under it, too.
-                    self.store
-                        .conn
-                        .execute("DELETE FROM outputs WHERE key = ?1", [&output.key])
-                        .map_err(sqlite_error)?;
-                } else {
-                    self.store
-                        .conn
-                        .execute(
-                            "INSERT INTO outputs VALUES (?1, ?2)
-                             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                            (&output.key, identity_bytes(&output.identity)?),
-                        )
-                        .map_err(sqlite_error)?;
-                }
+                row_in(&self.store.conn, output)?;
                 for hint in &output.hints {
                     // REPLACE gives the row a new rowid, so the newest
                     // writer of a digest is tried first.
@@ -1170,7 +1360,7 @@ impl StorePublisher {
         );
         let started = Instant::now();
         #[cfg(test)]
-        let committed = output_commit_fault(self.store.root()).and_then(|()| {
+        let committed = group_commit_fault(self.store.root()).and_then(|()| {
             self.store
                 .conn
                 .execute_batch("COMMIT")
@@ -1236,10 +1426,14 @@ impl StorePublisher {
         let recorded = (|| -> Result<()> {
             for intent in intents {
                 for (key, _) in &intent.rows {
-                    self.store
-                        .conn
-                        .execute("DELETE FROM outputs WHERE key = ?1", [key])
-                        .map_err(sqlite_error)?;
+                    // A reuse row or the path's ownership row: either way
+                    // it leaves with the intent.
+                    for table in ["outputs", "owned_outputs"] {
+                        self.store
+                            .conn
+                            .execute(&format!("DELETE FROM {table} WHERE key = ?1"), [key])
+                            .map_err(sqlite_error)?;
+                    }
                 }
                 self.store
                     .conn
@@ -1474,6 +1668,61 @@ pub(crate) fn path_prefix(authority: &[u8], rel_path: &[u8]) -> Result<Vec<u8>> 
     postcard::to_stdvec(&(authority, rel_path)).refuse_at("transfer_store::path_prefix")
 }
 
+/// The key of a path's ownership row, from any row key of that path: the
+/// path's bare prefix ([`path_prefix`]). `None` for bytes that are not a row
+/// key.
+///
+/// An ownership row is an `owned_outputs` row under that key. It records
+/// the identity of a file this store published at the path, and nothing
+/// about any source seat. It lives apart from `outputs`, whose every row is
+/// a reuse key, so it is never one ([`Store::output_matches`]); the path's
+/// read ([`Store::output_rows`]) returns it beside the reuse rows, told
+/// apart by its key: a row key is always longer than its prefix (a row has
+/// more fields than its path). It is written where an output has no reuse
+/// row: published from a racy capture (#86), or exchanged into place by a
+/// superseding publish whose row did not commit (#187).
+pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
+    let (_, rest) = postcard::take_from_bytes::<&[u8]>(row_key).ok()?;
+    let (_, rest) = postcard::take_from_bytes::<&[u8]>(rest).ok()?;
+    row_key.get(..row_key.len().checked_sub(rest.len())?)
+}
+
+/// Write an output's row inside the caller's transaction: its reuse row
+/// under its key, or, for a racy capture's output, its path's ownership row
+/// alone.
+fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
+    if output.racy {
+        // Never a reuse key (#86): drop any row an earlier capture left
+        // under it, too.
+        conn.execute("DELETE FROM outputs WHERE key = ?1", [&output.key])
+            .map_err(sqlite_error)?;
+        // Still this store's own output (#187): an ownership row names no
+        // seat, so it is never a reuse key.
+        if let Some(owner) = owner_key(&output.key) {
+            own_in(conn, owner, &output.identity)?;
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO outputs VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+        (&output.key, identity_bytes(&output.identity)?),
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+/// Write a path's ownership row inside the caller's transaction.
+fn own_in(conn: &rusqlite::Connection, owner: &[u8], identity: &StatIdentity) -> Result<()> {
+    conn.execute(
+        "INSERT INTO owned_outputs VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+        (owner, identity_bytes(identity)?),
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 /// The least byte string greater than every string that starts with
 /// `prefix`; `None` when there is none (a prefix of only `0xff` bytes).
 fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -1491,12 +1740,28 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 fn settle_in(conn: &rusqlite::Connection, settle: &SupersedeSettle<'_>) -> Result<()> {
     if settle.restore {
         for (key, identity) in &settle.intent.rows {
-            // A row a later group already wrote under the key wins.
+            // A row a later group already wrote under the key wins. A key
+            // that is its own bare prefix is the path's ownership row.
+            let table = if owner_key(key) == Some(key.as_slice()) {
+                "owned_outputs"
+            } else {
+                "outputs"
+            };
             conn.execute(
-                "INSERT OR IGNORE INTO outputs VALUES (?1, ?2)",
+                &format!("INSERT OR IGNORE INTO {table} VALUES (?1, ?2)"),
                 (key, identity),
             )
             .map_err(sqlite_error)?;
+        }
+    }
+    if let Some(identity) = &settle.owned {
+        if let Some(owner) = settle
+            .intent
+            .rows
+            .first()
+            .and_then(|(key, _)| owner_key(key))
+        {
+            own_in(conn, owner, identity)?;
         }
     }
     conn.execute(
@@ -1804,6 +2069,8 @@ mod tests {
                 "directories",
                 "output_hints",
                 "outputs",
+                "owned_outputs",
+                "refused_outputs",
                 "refused_seats",
                 "settings",
                 "supersedes"
@@ -1957,6 +2224,7 @@ mod tests {
             temp: b".bulkload-0123456789abcdef-1-1".to_vec(),
             leaf: b"seat".to_vec(),
             staged: (1, 9),
+            stamp: (9, 1_000),
             owned: identity(2),
             rows: rows.clone(),
         };
@@ -1977,7 +2245,7 @@ mod tests {
         assert!(store.supersede_intents(b"dir/seat")?.is_empty());
 
         // The exchange did not happen: the old output has its old rows again.
-        store.settle_supersede(&intent, true)?;
+        store.settle_supersede(&intent, true, None)?;
         assert_eq!(store.output_rows(b"authority", b"dir/seat")?, rows);
         assert!(store.supersede_intents(b"dir")?.is_empty());
 
@@ -1988,6 +2256,7 @@ mod tests {
             &[SupersedeSettle {
                 intent: &intent,
                 restore: false,
+                owned: None,
             }],
         )?;
         let after: Vec<Vec<u8>> = store
@@ -2012,6 +2281,65 @@ mod tests {
             store.supersede_intents(b"dir"),
             Err(BulkloadRefusal::SchemaMismatch)
         );
+        Ok(())
+    }
+
+    /// #187 review: a superseding publish whose exchange happened and whose
+    /// new row never committed (a crash) is settled by the sweep with an
+    /// ownership row for the staged file at the leaf. The path's range read
+    /// finds that row; it is never a reuse key.
+    #[test]
+    fn an_unrecorded_supersede_is_settled_with_an_ownership_row() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let identity = |ino| StatIdentity {
+            dev: 1,
+            ino,
+            size: 9,
+            mtime_ns: 1_000,
+            ctime_ns: 2_000,
+        };
+        let record = |rel_path: &[u8], ino| -> Result<OutputRecord> {
+            Ok(OutputRecord {
+                key: row_key(b"authority", &seat_row(rel_path, ino))?,
+                rel_path: rel_path.to_vec(),
+                identity: identity(ino),
+                racy: false,
+                hints: Vec::new(),
+            })
+        };
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(&[record(b"dir/seat", 1)?, record(b"dir/seat2", 3)?], &[])?;
+        let store = Store::open(&state)?;
+        let intent = SupersedeIntent {
+            dir: b"dir".to_vec(),
+            temp: b".bulkload-0123456789abcdef-1-1".to_vec(),
+            leaf: b"seat".to_vec(),
+            staged: (1, 7),
+            stamp: (9, 1_000),
+            owned: identity(1),
+            rows: store.output_rows(b"authority", b"dir/seat")?,
+        };
+        publisher.begin_supersedes(std::slice::from_ref(&intent))?;
+        store.settle_supersede(&intent, false, Some(identity(7)))?;
+        let owner = path_prefix(b"authority", b"dir/seat")?;
+        assert_eq!(
+            store.output_rows(b"authority", b"dir/seat")?,
+            [(owner.clone(), identity_bytes(&identity(7))?)],
+            "the old rows are dropped; the ownership row stands"
+        );
+        for ino in [1, 2, 7, 9] {
+            let key = row_key(b"authority", &seat_row(b"dir/seat", ino))?;
+            assert_eq!(owner_key(&key), Some(owner.as_slice()));
+            assert!(
+                !store.output_matches(&key, &identity(7))?,
+                "never a reuse key"
+            );
+        }
+        assert_eq!(store.output_rows(b"authority", b"dir/seat2")?.len(), 1);
+        assert!(store.supersede_intents(b"dir")?.is_empty());
+        assert_eq!(owner_key(b"key"), None);
+        assert_eq!(owner_key(&[]), None);
         Ok(())
     }
 
@@ -2413,6 +2741,109 @@ mod tests {
         assert!(!publisher.store().output_matches(b"key", &identity)?);
         assert_eq!(publisher.store().row_counts()?, (0, 0));
         assert_eq!(publisher.store().output_chunks(&[5; 32])?.len(), 1);
+        Ok(())
+    }
+
+    /// #187 review: an output published from a racy capture keeps no reuse
+    /// row, but it gets an ownership row under its path's bare prefix, so
+    /// it is this store's own when its seat changes again.
+    #[test]
+    fn a_racy_output_has_an_ownership_row_and_no_reuse_row() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        let identity = StatIdentity {
+            dev: 1,
+            ino: 5,
+            size: 9,
+            mtime_ns: 1_000,
+            ctime_ns: 2_000,
+        };
+        let key = row_key(b"authority", &seat_row(b"dir/seat", 5))?;
+        let record = |racy: bool| OutputRecord {
+            key: key.clone(),
+            rel_path: b"dir/seat".to_vec(),
+            identity,
+            racy,
+            hints: Vec::new(),
+        };
+        publisher.commit_outputs(&[record(true)], &[])?;
+        let store = publisher.store();
+        assert!(!store.output_matches(&key, &identity)?);
+        assert_eq!(
+            store.output_rows(b"authority", b"dir/seat")?,
+            [(
+                path_prefix(b"authority", b"dir/seat")?,
+                identity_bytes(&identity)?
+            )]
+        );
+        // A settled capture of the same output adds its reuse row.
+        publisher.commit_outputs(&[record(false)], &[])?;
+        assert!(store.output_matches(&key, &identity)?);
+        assert_eq!(store.output_rows(b"authority", b"dir/seat")?.len(), 2);
+        Ok(())
+    }
+
+    /// #187 review: the destination's refusal of an entry is answered from
+    /// its record only while the file at the path keeps the identity it was
+    /// refused with; a store that trusts none of its rows trusts none of
+    /// these.
+    #[test]
+    fn a_refused_output_is_remembered_under_its_row_key_and_file_identity() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let store = Store::open(&state)?;
+        let identity = |ctime_ns| StatIdentity {
+            dev: 1,
+            ino: 5,
+            size: 9,
+            mtime_ns: 1_000,
+            ctime_ns,
+        };
+        assert_eq!(store.refused_output(b"seat", &identity(1))?, None);
+        let before = counters::Counters::snapshot();
+        store.remember_refused_output(b"seat", &identity(1), RefusedOutput::Occupied)?;
+        assert_eq!(
+            counters::Counters::snapshot()
+                .since(before)
+                .get(Counter::SqliteRefusedOutput),
+            1
+        );
+        assert_eq!(
+            store.refused_output(b"seat", &identity(1))?,
+            Some(RefusedOutput::Occupied)
+        );
+        assert_eq!(store.refused_output(b"seat", &identity(2))?, None);
+        assert_eq!(store.refused_output(b"other", &identity(1))?, None);
+        store.remember_refused_output(b"seat", &identity(2), RefusedOutput::ExchangeUnsupported)?;
+        assert_eq!(store.refused_output(b"seat", &identity(1))?, None);
+        assert_eq!(
+            store.refused_output(b"seat", &identity(2))?,
+            Some(RefusedOutput::ExchangeUnsupported)
+        );
+        assert_eq!(
+            RefusedOutput::Occupied.refusal(),
+            BulkloadRefusal::DestinationOccupied
+        );
+        assert_eq!(
+            RefusedOutput::ExchangeUnsupported.refusal(),
+            BulkloadRefusal::DestinationExchangeUnsupported
+        );
+        // A kind this engine does not know is a miss.
+        store
+            .conn
+            .execute("UPDATE refused_outputs SET kind = 99", [])
+            .map_err(sqlite_error)?;
+        assert_eq!(store.refused_output(b"seat", &identity(2))?, None);
+        store
+            .conn
+            .execute("UPDATE refused_outputs SET kind = 1", [])
+            .map_err(sqlite_error)?;
+        store.forget_racy_guard()?;
+        assert_eq!(
+            Store::open_reader(&state)?.refused_output(b"seat", &identity(2))?,
+            None
+        );
         Ok(())
     }
 

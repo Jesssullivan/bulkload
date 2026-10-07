@@ -10,7 +10,8 @@
 //! - a file system without an exchange refuses and keeps the old output
 //!   with its old row;
 //! - what a crash leaves is settled by the next sweep: the old output still
-//!   in place gets its rows back, this store's displaced output is removed,
+//!   in place gets its rows back, this store's displaced output is removed
+//!   and the staged file at the leaf keeps an ownership row,
 //!   and a displaced file of anyone else is exchanged back, or kept aside
 //!   and reported when the leaf no longer holds the staged file.
 
@@ -27,6 +28,7 @@ const AUTHORITY: &[u8] = b"authority";
 const OLD: &[u8] = b"the old output's bytes";
 const NEW: &[u8] = b"the changed seat's new bytes, longer";
 const FOREIGN: &[u8] = b"someone else's file";
+const NEWER: &[u8] = b"the seat changed again before the next run";
 
 struct Fixture {
     base: PathBuf,
@@ -350,8 +352,11 @@ fn an_output_rewritten_before_the_exchange_is_put_back() {
     assert_eq!(fixture.rows(), 0);
 }
 
-/// Without an atomic exchange the publish refuses, and the old output keeps
-/// its old row: no-clobber holds, and nothing is lost.
+/// Without an atomic exchange the publish refuses, under its own code, and
+/// the old output keeps its old row: no-clobber holds, and nothing is lost.
+/// The plan's probe answers the same question before anything is staged
+/// (`transfer::tests::a_changed_seat_without_an_exchange_…`); this is the
+/// group commit's own answer.
 #[test]
 fn a_file_system_without_an_exchange_keeps_the_old_output_and_its_row() {
     let fixture = Fixture::published();
@@ -361,7 +366,10 @@ fn a_file_system_without_an_exchange_keeps_the_old_output_and_its_row() {
     crate::io::force_rename_unsupported(false);
     assert_eq!(
         report,
-        [(b"file".to_vec(), Err(BulkloadRefusal::DestinationOccupied))]
+        [(
+            b"file".to_vec(),
+            Err(BulkloadRefusal::DestinationExchangeUnsupported)
+        )]
     );
     assert_eq!(std::fs::read(fixture.leaf()).unwrap(), OLD);
     assert_eq!(fixture.names(), ["file"]);
@@ -422,11 +430,15 @@ fn a_crash_before_the_exchange_leaves_the_old_output_with_its_old_row() {
 }
 
 /// Crash after the exchange, before the displaced output is removed: the
-/// sweep removes this store's own displaced output and writes no row; the
-/// new file is adopted like any unrowed output.
+/// sweep removes this store's own displaced output and drops its rows. The
+/// new file at the leaf is the one the record says this store staged, so it
+/// gets an ownership row and no reuse row: adopted like any unrowed output
+/// while its seat is unchanged, and still this store's own to supersede
+/// when the seat changes again before a run adopts it (#187 review).
 #[test]
-fn a_crash_after_the_exchange_leaves_the_new_output_and_no_stale_row() {
+fn a_crash_after_the_exchange_leaves_the_new_output_owned_with_no_stale_row() {
     let fixture = Fixture::published();
+    let old = fixture.store().output_rows(AUTHORITY, b"file").unwrap();
     let temporary = fixture.interrupted(true, || ());
     assert_eq!(std::fs::read(&temporary).unwrap(), OLD);
     assert_eq!(std::fs::read(fixture.leaf()).unwrap(), NEW);
@@ -437,8 +449,72 @@ fn a_crash_after_the_exchange_leaves_the_new_output_and_no_stale_row() {
     assert_eq!(fixture.names(), ["file"]);
     assert_eq!(swept.removed, 1);
     assert_eq!(salvaged, 0);
-    assert_eq!(fixture.rows(), 0);
     assert_eq!(fixture.intents(), 0);
+    let rows = fixture.store().output_rows(AUTHORITY, b"file").unwrap();
+    let found = StatIdentity::from_metadata(&std::fs::metadata(fixture.leaf()).unwrap());
+    assert_eq!(
+        rows,
+        [(
+            crate::transfer_store::path_prefix(AUTHORITY, b"file").unwrap(),
+            crate::transfer_store::identity_bytes(&found).unwrap()
+        )],
+        "the path's ownership row alone"
+    );
+    for (key, _) in &old {
+        assert!(!fixture.store().output_matches(key, &found).unwrap());
+    }
+    let store = fixture.store();
+    let reuse_key = row_key(AUTHORITY, &fixture.seat(NEW)).unwrap();
+    assert!(
+        !store.output_matches(&reuse_key, &found).unwrap(),
+        "an ownership row is never a reuse key"
+    );
+
+    // The seat changes once more before any run adopted the new file: it
+    // is this store's own, so it is superseded, not refused for ever.
+    let row = fixture.seat(NEWER);
+    let owned = fixture.owned(AUTHORITY, &row).unwrap();
+    let target = fixture.target();
+    let staged = Fixture::staged(&target, &row, NEWER);
+    let mut sink = fixture.sink();
+    sink.commit(vec![Publication::Superseding {
+        staged,
+        record: Fixture::record(&row),
+        owned,
+    }]);
+    assert_eq!(sink.finish(), [(b"file".to_vec(), Ok(()))]);
+    assert_eq!(std::fs::read(fixture.leaf()).unwrap(), NEWER);
+    assert_eq!(fixture.names(), ["file"]);
+    assert_eq!(
+        fixture.rows(),
+        1,
+        "the ownership row left with the old file"
+    );
+    assert_eq!(fixture.intents(), 0);
+}
+
+/// The record proves only the file this store staged. One written since
+/// the exchange (another size or mtime) gets no ownership row: it is
+/// adopted if its bytes verify, and never replaced.
+#[test]
+fn a_new_output_written_after_the_exchange_is_not_owned_by_the_sweep() {
+    let fixture = Fixture::published();
+    let temporary = fixture.interrupted(true, || ());
+    assert_eq!(std::fs::read(&temporary).unwrap(), OLD);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.leaf())
+        .unwrap()
+        .write_all(b" and a third party's line")
+        .unwrap();
+
+    let (swept, _) = fixture.sweep();
+
+    assert_eq!(swept.removed, 1, "this store's displaced output");
+    assert!(std::fs::read(fixture.leaf()).unwrap().starts_with(NEW));
+    assert_eq!(fixture.rows(), 0, "no row vouches for a file written since");
+    assert_eq!(fixture.intents(), 0);
+    assert!(fixture.owned(AUTHORITY, &fixture.seat(NEW)).is_none());
 }
 
 /// `MC_neg_sweep_displaced`: a crash between the exchange and the check of
@@ -499,12 +575,22 @@ fn an_intent_with_no_temporary_restores_the_old_row_or_none() {
     );
     assert_eq!(fixture.intents(), 0);
 
-    // The exchange and the unlink both kept: the new file, and no row.
+    // The exchange and the unlink both kept: the new file, with its
+    // ownership row and no other.
     let fixture = Fixture::published();
     let temporary = fixture.interrupted(true, || ());
     std::fs::remove_file(&temporary).unwrap();
     fixture.sweep();
     assert_eq!(std::fs::read(fixture.leaf()).unwrap(), NEW);
-    assert_eq!(fixture.rows(), 0);
+    assert_eq!(
+        fixture.store().output_rows(AUTHORITY, b"file").unwrap(),
+        [(
+            crate::transfer_store::path_prefix(AUTHORITY, b"file").unwrap(),
+            crate::transfer_store::identity_bytes(&StatIdentity::from_metadata(
+                &std::fs::metadata(fixture.leaf()).unwrap()
+            ))
+            .unwrap()
+        )]
+    );
     assert_eq!(fixture.intents(), 0);
 }

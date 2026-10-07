@@ -1055,6 +1055,24 @@ fn superseding_report(
     .unwrap()
 }
 
+/// An exchange of a superseding publish: one of its two names is an output.
+/// The plan's probe for the exchange (`Destination::exchange_supported`,
+/// once per device) trades two empty temporaries of the store ahead of any
+/// intent; it names no output and is not one of these.
+fn superseding_exchange(event: &Event) -> bool {
+    use bulkload_agent::materialize::temporary_name;
+    matches!(event, Event::Exchange { a, b, .. }
+        if temporary_name(a).is_none() || temporary_name(b).is_none())
+}
+
+/// The probe's exchanges in a trace: both names are temporaries.
+fn probe_exchanges(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::Exchange { .. }) && !superseding_exchange(event))
+        .count()
+}
+
 fn begins(event: &Event) -> bool {
     matches!(event, Event::Commit { records, .. }
         if records.iter().any(|record| matches!(record, CommitRecord::SupersedeBegun { .. })))
@@ -1084,10 +1102,11 @@ fn every_power_loss_state_of_a_superseding_rerun_holds_the_old_or_the_new_output
     let exchanges: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter(|(_, event)| matches!(event, Event::Exchange { .. }))
+        .filter(|(_, event)| superseding_exchange(event))
         .map(|(index, _)| index)
         .collect();
     assert_eq!(exchanges.len(), 2, "both changed outputs are exchanged");
+    assert_eq!(probe_exchanges(&events), 1, "one probe for the device");
     let begun = events.iter().position(begins).unwrap();
     assert!(
         begun < exchanges[0],
@@ -1183,10 +1202,11 @@ fn a_file_a_superseding_publish_displaced_survives_every_power_loss_state() {
     let exchanges: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter(|(_, event)| matches!(event, Event::Exchange { .. }))
+        .filter(|(_, event)| superseding_exchange(event))
         .map(|(index, _)| index)
         .collect();
     assert_eq!(exchanges.len(), 2, "the exchange, and the exchange back");
+    assert_eq!(probe_exchanges(&events), 1, "one probe for the device");
 
     let old = before.files[b"b".as_slice()].as_slice();
     let new = after.files[b"b".as_slice()].as_slice();

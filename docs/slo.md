@@ -312,11 +312,15 @@ Q10, Q18). It changes no number and no ruling.
   superseded by the exchange design of `docs/formal` (`MC_wp0d_exchange`),
   filled from the old output's own chunks, so the wire carries only the
   absent ones. The limits:
-  - only an output with a committed row is this store's own. One published
-    from a racy capture, or left unrowed by a crash and not adoptable
-    (#169's limits), is refused `DESTINATION_OCCUPIED` when its seat has
-    changed again, as any file the store does not own is;
-  - a file system without an atomic exchange refuses the replacement;
+  - only an output with a committed row is this store's own: a reuse row,
+    or an ownership row (its path and identity, no seat), which an output
+    published from a racy capture, or exchanged into place by a publish
+    whose row never committed, has in its stead (review fix below). Any
+    other file is refused `DESTINATION_OCCUPIED`, as before;
+  - a file system without an atomic exchange cannot supersede: a changed
+    seat there is refused `DESTINATION_EXCHANGE_UNSUPPORTED` before it is
+    staged, and does not converge. Whether such destinations need a
+    fallback is unruled;
   - a seat past the source's retention budget (512 MiB) is streamed whole,
     as an added seat of that size is (#77);
   - an output this session supersedes stays readable for later seats of the
@@ -330,12 +334,36 @@ Q10, Q18). It changes no number and no ruling.
 - **Refusal code.** A transfer's occupied destination path is
   `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
   alone.
-- **Gate (b)'s second deviation is moot.** The 2026-10-06 amendment lets
+- **Gate (b)'s second deviation is gone.** The 2026-10-06 amendment lets
   gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
   `source_bytes_read` no longer holds them, so the raw counter is 0 on a
-  warm resume, as gate (a) requires, and nothing is left to net out. The
-  harness still subtracts them (`gate_b.py`); it must stop before a gated
-  run, or it will report negative content bytes.
+  warm resume, as gate (a) requires, and nothing is left to net out.
+  `gate_b.py` no longer subtracts them (`content_bytes_read` is the raw
+  counter, and the deviation is out of `deviations_from_gate_a`); gate (b)
+  now has one unratified deviation, the missing interrupted-resume phase.
+- **Review fixes (2026-10-07, same change).** What the review of #186 and
+  #187 found, and what the code does now. None of this is ruled; each is
+  listed for the operator in the lane's note.
+  - *A seat standing refused is not read on every run.* A seat the
+    destination refuses `DESTINATION_OCCUPIED` (or
+    `DESTINATION_EXCHANGE_UNSUPPORTED`) was read in full by every unchanged
+    run to rebuild its manifest, the defect class of #186. The destination
+    now remembers the refusal under the seat's row key and the identity of
+    the file at the path, and refuses the entry when it is offered: 0
+    source bytes. So the unchanged-estate clause reads 0 content bytes with
+    such seats in the corpus too. The limits: a racy capture, or a file at
+    the path that was not settled when it was read, is not remembered and
+    is read again (as #86); a lost record costs one more read.
+  - *An actively written file converges.* An output published from a racy
+    capture has an ownership row, so a seat that changes again before a
+    settled run adopts it is superseded, not refused on every run.
+  - *An interrupted supersede keeps its ownership.* A superseding publish
+    whose exchange took effect and whose row never committed leaves the new
+    file with an ownership row, written by the next sweep from the
+    publish's record, so a seat that changes once more still converges.
+  - *The model does not hold these records yet*
+    (`docs/formal/README.md`, "What the #187 review added to the code and
+    not to the model").
 
 ## Priority (OI-1003-Q4)
 

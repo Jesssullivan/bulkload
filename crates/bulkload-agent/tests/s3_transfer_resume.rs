@@ -46,7 +46,11 @@
 //! published is superseded, so every clause of P21 holds over in-place
 //! changes too: both inequalities, convergence, and a rerun at 0 and 0. A
 //! pinned row shows the limit of that: a destination file this store does
-//! not own is refused `DESTINATION_OCCUPIED` and left as it is.
+//! not own is refused `DESTINATION_OCCUPIED` and left as it is. Such a seat
+//! is read once: the destination remembers the refusal against the file it
+//! found, and an unchanged rerun reads 0 bytes for it. An output published
+//! from a racy capture is this store's own too (an ownership row, no reuse
+//! row), so an actively written seat is superseded, not refused.
 //!
 //! One test is ignored, for another reason: inequality 2 read strictly (a
 //! chunk absent once crosses once per run) is unstable when two seats added
@@ -518,6 +522,11 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
     let resume_sniff = counters.get(Counter::SourceSniff);
     if matches!(cut, CutAt::Never | CutAt::SourceDone) {
         assert_eq!(resume_sniff, 0, "a remembered refusal reads nothing");
+        assert_eq!(
+            counters.get(Counter::TransferRefusedSeatsRemembered),
+            refused as u64,
+            "each refusal of a completed session is answered from its record"
+        );
     } else {
         assert!(
             resume_sniff <= sniffed && resume_sniff.is_multiple_of(SNIFF_BYTES),
@@ -613,6 +622,18 @@ fn p23_pinned_two_refused_seats_across_a_cut_are_not_sniffed_again() {
         2,
         CutAt::Ends(1),
     );
+}
+
+/// P23 PINNED (#186, review): a corpus of refused seats only. Nothing is
+/// ever published, so the destination holds no chunk to fill a manifest
+/// from and answers every entry `Send`, not `WantManifest`: the one path on
+/// which a remembered refusal is consulted ahead of a streamed capture.
+/// Every other refused-seat row has carried files, so its reruns ask for
+/// manifests. The rerun sniffs nothing and answers both from their records.
+#[test]
+fn p23_pinned_only_refused_seats_are_answered_from_their_records() {
+    check_p23(&[], 2, CutAt::Never);
+    check_p23(&[], 1, CutAt::SourceDone);
 }
 
 /// P23 PINNED: one file past the credit window, cut after the first `End`
@@ -1261,13 +1282,41 @@ fn p21_pinned_a_changed_seat_never_supersedes_a_file_this_store_does_not_own() {
     assert_eq!(names, ["f0", "f1", "f2"]);
 
     // The refusals stand on every run, and the superseded seat is reused.
-    let (again, counters) = fixture.run();
-    assert_eq!(refusals(&again), [occupied("f0"), occupied("f1")]);
-    assert_eq!(again.reused, 1);
-    assert_eq!(again.bytes_received, 0);
-    assert_eq!(counters.get(Counter::OutputsSuperseded), 0);
+    // A refused seat is not read again (#187 review, R25): the destination
+    // remembers each refusal under the seat's row key and the identity of
+    // the file it found, and refuses the entry when it is offered.
+    for _ in 0..2 {
+        let (again, counters) = fixture.run();
+        assert_eq!(refusals(&again), [occupied("f0"), occupied("f1")]);
+        assert_eq!(again.reused, 1);
+        assert_eq!(again.bytes_received, 0);
+        assert_eq!(
+            again.source_bytes_read, 0,
+            "an unchanged seat standing refused is not opened"
+        );
+        assert_eq!(counters.get(Counter::SourceFileRead), 0);
+        assert_eq!(
+            counters.get(Counter::TransferRefusedOutputsRemembered),
+            2,
+            "each refusal is answered from the destination's record"
+        );
+        assert_eq!(counters.get(Counter::OutputsSuperseded), 0);
+        assert!(fixture.holds("f0", &theirs));
+        assert!(fixture.holds("f1", &rewritten));
+    }
+
+    // The other writer's file changes: the record no longer answers, the
+    // seat is read once more, and the new refusal is remembered.
+    let theirs = noise(82, 23_456);
+    std::fs::write(fixture.destination().join("f0"), &theirs).unwrap();
+    settle_racy_window(&fixture.destination()).unwrap();
+    let (moved, _) = fixture.run();
+    assert_eq!(refusals(&moved), [occupied("f0"), occupied("f1")]);
+    assert_eq!(moved.source_bytes_read, size_of(&second[0]));
+    let (after, _) = fixture.run();
+    assert_eq!(refusals(&after), [occupied("f0"), occupied("f1")]);
+    assert_eq!(after.source_bytes_read, 0);
     assert!(fixture.holds("f0", &theirs));
-    assert!(fixture.holds("f1", &rewritten));
 }
 
 /// P21 PINNED (WP0(c) inequality 2, across a supersede): a file is replaced
@@ -1679,6 +1728,119 @@ fn racy_attempt(files: &[(usize, u64)], racy: &[(usize, u64)], how: Racy) -> boo
     );
     assert_eq!(fourth.bytes_received, 0);
     true
+}
+
+/// Stamp a source seat an hour ahead of the clock: racy on every run (#86).
+fn stamp_ahead(fixture: &Fixture, rel: &str) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join(rel))
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_hours(1))
+        .unwrap();
+}
+
+/// P19 PINNED (#187 review): an output published from a racy capture is
+/// this store's own. It has no reuse row (#86), so it is read again on
+/// every run until its seat settles; but when the seat changes again
+/// first, as an actively written file does, the output is superseded: it
+/// is not refused `DESTINATION_OCCUPIED` for ever.
+#[test]
+fn p19_pinned_a_racy_publish_is_superseded_when_its_seat_changes_again() {
+    let fixture = Fixture::new();
+    fixture.write("settled", &noise(190, 30_000));
+    fixture.settle();
+    let (first, _) = fixture.run();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+
+    let written = noise(191, 60_000);
+    let (racy, counters) = fixture.run_after(|| {
+        fixture.write("live", &written);
+        stamp_ahead(&fixture, "live");
+    });
+    assert!(racy.refusals.is_empty(), "{:?}", racy.refusals);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 1);
+    assert!(fixture.holds("live", &written));
+
+    // Written again before any settled run adopted the output.
+    let appended = noise(192, 70_000);
+    let (changed, counters) = fixture.run_after(|| {
+        fixture.write("live", &appended);
+        stamp_ahead(&fixture, "live");
+    });
+    assert!(
+        changed.refusals.is_empty(),
+        "a racy publish's output is this store's own: {:?}",
+        changed.refusals
+    );
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 1);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 1);
+    assert_eq!(changed.source_bytes_read, size_of(&appended));
+    assert!(fixture.holds("live", &appended));
+
+    // Unchanged and still racy: read again (no reuse row), adopted in
+    // place, replaced by nothing and refused by nothing.
+    let (again, counters) = fixture.run();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(again.source_bytes_read, size_of(&appended));
+    assert_eq!(again.bytes_received, 0);
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 0);
+
+    // Settled at last: read once more, recorded, and then reused.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join("live"))
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+    fixture.settle();
+    let (settled, counters) = fixture.run();
+    assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
+    assert_eq!(settled.source_bytes_read, size_of(&appended));
+    assert_eq!(settled.bytes_received, 0);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 0);
+    let (warm, _) = fixture.run();
+    assert_eq!((warm.reused, warm.source_bytes_read), (2, 0));
+    assert!(fixture.holds("live", &appended));
+}
+
+/// P19 PINNED (#186, review): a refused seat that is racy when it is
+/// sniffed is refused, never as content, and not remembered: every run
+/// sniffs it again, 16 bytes, until it has settled; then it is sniffed once
+/// more, remembered, and not opened again.
+#[test]
+fn p19_pinned_a_racy_refused_seat_is_sniffed_on_every_run_until_it_settles() {
+    let fixture = Fixture::new();
+    let sqlite = ["db0.sqlite".to_owned()];
+    fixture.write(&sqlite[0], &sqlite_seat(0));
+    stamp_ahead(&fixture, &sqlite[0]);
+    for _ in 0..2 {
+        let (racy, counters) = fixture.run();
+        assert_eq!(refusals(&racy), sqlite_refusals(&sqlite));
+        assert_eq!(racy.source_bytes_read, 0, "a sniff is never content");
+        assert_eq!(counters.get(Counter::SourceFileRead), 0);
+        assert_eq!(
+            counters.get(Counter::SourceSniff),
+            SNIFF_BYTES,
+            "a racy refused seat is sniffed again"
+        );
+        assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 0);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join(&sqlite[0]))
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+    fixture.settle();
+    let (settled, counters) = fixture.run();
+    assert_eq!(refusals(&settled), sqlite_refusals(&sqlite));
+    assert_eq!(counters.get(Counter::SourceSniff), SNIFF_BYTES);
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 0);
+    let (rerun, counters) = fixture.run();
+    assert_eq!(refusals(&rerun), sqlite_refusals(&sqlite));
+    assert_eq!(counters.get(Counter::SourceSniff), 0);
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 1);
 }
 
 /// A P19 case: settled files and racy seats by (length, seed), and how the

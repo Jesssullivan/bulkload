@@ -164,6 +164,9 @@ counters! {
     // A superseding publish's record, written before its exchange, and a
     // record a crash left, settled by the next sweep (WP0(d), #187).
     SqliteSupersede => "sqlite_supersede_commits",
+    // A destination's refusal of an entry for what its path holds,
+    // remembered so a rerun refuses it without a source read (#187 review).
+    SqliteRefusedOutput => "sqlite_refused_output_commits",
     SqliteCommitNs => "sqlite_commit_ns",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
@@ -186,11 +189,19 @@ counters! {
     // Refused seats answered from the source ledger's record of their
     // refusal, without opening the file (#186, R25).
     TransferRefusedSeatsRemembered => "transfer_refused_seats_remembered",
+    // Entries the destination refused when they were offered, from its
+    // record of an earlier refusal of the same seat against the same file
+    // at the path: the source reads nothing for them (#187 review, R25).
+    TransferRefusedOutputsRemembered => "transfer_refused_outputs_remembered",
     // Outputs of this store replaced by a changed seat's new bytes (WP0(d),
     // #187), and exchanges undone because the displaced file was not this
     // store's own.
     OutputsSuperseded => "outputs_superseded",
     SupersedeRestored => "supersede_restored",
+    // Probes of a destination device for the atomic exchange a superseding
+    // publish needs: one per device and session, at the first changed seat
+    // found there (#187 review).
+    ExchangeProbes => "exchange_probes",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
 }
@@ -421,6 +432,7 @@ impl Counters {
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,
             Counter::SqliteSupersede,
+            Counter::SqliteRefusedOutput,
         ])
     }
 

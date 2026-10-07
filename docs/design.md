@@ -633,11 +633,46 @@ directory, and commits the new row with the intent settled. A power loss
 leaves the old output or the new one, whole, and never a row beside other
 bytes; the next sweep gives an old output still in place its rows back,
 removes a displaced old output, and exchanges a displaced file of anyone
-else back (or keeps it aside and reports it). A file system without an
-atomic exchange refuses and keeps the old output with its row. The new file
-is filled from the old output's own chunks, so only absent chunks cross the
-wire (WP0(c), inequality 2). An output published from a racy capture has no
-row, so it is not this store's own to supersede until a later run adopts it.
+else back (or keeps it aside and reports it). The new file is filled from
+the old output's own chunks, so only absent chunks cross the wire (WP0(c),
+inequality 2).
+
+What "this store's own" covers (#187 review, 2026-10-07). An output has a
+reuse row under its seat's row key, which answers `Reuse`, or an ownership
+row under its path alone, which names no seat and answers nothing but "this
+store published the file with this identity here". An ownership row is
+written where there is no reuse row:
+
+- for an output published or adopted from a racy capture (#86). It is read
+  again on every run until its seat settles, and when the seat changes
+  first, as an actively written file does, it is superseded;
+- by the sweep, for a superseding publish whose exchange took effect and
+  whose row never committed (a crash, or a failed group commit). The
+  publish's record names the staged file by inode, size and mtime; when the
+  leaf holds exactly that file it is this store's own. It is adopted from
+  its capture record (#169) while its seat is unchanged, and superseded
+  when the seat has changed again. A file written since gets no row.
+
+A file system without an atomic exchange (one the first publish reaches
+through its link fallback: NFS, SMB, exFAT) cannot supersede. The first
+changed seat on a device probes for the exchange (two empty temporaries,
+once per device and session). Without it the seat is refused
+`DESTINATION_EXCHANGE_UNSUPPORTED` as soon as its manifest shows the output
+holds other bytes: nothing is staged, no chunk is asked of the source, and
+the old output keeps its row. Such a seat does not converge there.
+
+Refusals the destination remembers (#187 review, R25). A seat refused
+`DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
+manifest was read is not read again while nothing has changed. The
+destination store records the refusal under the entry's row key (the
+seat's path and stat identity) with the stat identity of the file at the
+path, and answers `Decision::Refuse` with the same code when the entry is
+offered again and that file still has that identity, so the source opens
+nothing. It is recorded only when the capture was not racy and the file
+was settled: the same before and after it was read, and not stamped within
+the racy window of the read. A changed seat, a changed file, or a file
+system that has gained the exchange makes the record a miss. The record
+is a memo about no durable bytes; losing it costs one more source read.
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

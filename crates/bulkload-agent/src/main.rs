@@ -153,7 +153,10 @@ BOUNDARIES:
     copy/pull require an existing destination directory.
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
-    file is preserved and refused DESTINATION_OCCUPIED. They refuse live
+    file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
+    unchanged rerun does not read its seat again. On a file system with no
+    atomic exchange a changed seat is refused
+    DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. They refuse live
     SQLite files, sniffing each once (source_sniff_bytes on the counters
     line) and remembering the refusal.
     They enumerate the source each run; completed content is resumable.
