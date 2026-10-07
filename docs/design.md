@@ -767,8 +767,9 @@ makes the new entries durable; and only then commits its records. No rename
 precedes the first `syncfs`, so no power loss can keep a name whose data it
 lost. `syncfs` is at least as strong as the per-file and per-directory
 flushes it replaces; it also flushes whatever else is dirty on that file
-system, which is why a single-file group keeps the per-file path. Darwin is
-unchanged.
+system, which is why a single-file group keeps the per-file path. A kernel
+older than Linux 5.8, whose `syncfs` does not report write-back errors, keeps
+the per-file path too (OI-1003-Q113). Darwin is unchanged.
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

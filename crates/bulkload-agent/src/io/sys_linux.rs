@@ -166,6 +166,21 @@ pub fn start_writeback(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
+/// The running kernel's release string (`uname -r`), if it can be read.
+#[must_use]
+pub fn kernel_release() -> Option<String> {
+    // SAFETY: `utsname` is plain old data; all-zero bytes are a valid value.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a writable `utsname` that outlives the call.
+    if unsafe { libc::uname(&raw mut name) } != 0 {
+        return None;
+    }
+    // SAFETY: on success `release` holds a NUL-terminated string within the
+    // array, which lives as long as `name`.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    release.to_str().ok().map(str::to_owned)
+}
+
 /// `fsync` on a directory descriptor, making its entries durable.
 ///
 /// # Errors

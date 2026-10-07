@@ -104,11 +104,50 @@ pub fn durability() -> Durability {
 /// flushes whatever else is dirty on that file system.
 pub const BATCH_MIN_FILES: usize = 2;
 
-/// Whether a group of `files` outputs is sealed device-wide (Linux, group
-/// mode, at least [`BATCH_MIN_FILES`]).
+/// The first Linux release whose `syncfs` reports write-back errors.
+///
+/// From 5.8 a write-back error of any file of the file system is reported
+/// (errseq on the superblock). Before it, a failed write could go unreported
+/// by a group's device seal, so an older kernel keeps the per-file seals
+/// (OI-1003-Q113).
+pub const SYNCFS_REPORTS_ERRORS_SINCE: (u32, u32) = (5, 8);
+
+/// Whether a group of `files` outputs is sealed device-wide (Linux 5.8 or
+/// later, group mode, at least [`BATCH_MIN_FILES`]).
 #[must_use]
 pub fn batched(files: usize) -> bool {
-    cfg!(target_os = "linux") && durability() == Durability::Group && files >= BATCH_MIN_FILES
+    cfg!(target_os = "linux")
+        && durability() == Durability::Group
+        && files >= BATCH_MIN_FILES
+        && syncfs_reports_errors()
+}
+
+/// Whether this kernel's `syncfs` reports write-back errors, read once. An
+/// unreadable release counts as too old.
+fn syncfs_reports_errors() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static REPORTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *REPORTS.get_or_init(|| {
+            super::sys::kernel_release()
+                .as_deref()
+                .and_then(release_version)
+                .is_some_and(|version| version >= SYNCFS_REPORTS_ERRORS_SINCE)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// `(major, minor)` of a kernel release string such as `6.12.0-211.el10`.
+#[must_use]
+pub fn release_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Start write-back of a fully written output as it is queued for its group.
@@ -522,6 +561,24 @@ fn run<S: GroupSink>(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// OI-1003-Q113: a release is read as `(major, minor)`, and only 5.8 or
+    /// later seals a group device-wide.
+    #[test]
+    fn the_syncfs_floor_reads_the_release_major_and_minor() {
+        assert_eq!(
+            release_version("6.12.0-211.51.1.el10_2.x86_64"),
+            Some((6, 12))
+        );
+        assert_eq!(release_version("5.8.0"), Some((5, 8)));
+        assert_eq!(release_version("5.7.19-arch1"), Some((5, 7)));
+        assert_eq!(release_version("4.19"), Some((4, 19)));
+        assert_eq!(release_version("garbage"), None);
+        assert_eq!(release_version("6"), None);
+        assert!(release_version("5.7.19").is_some_and(|v| v < SYNCFS_REPORTS_ERRORS_SINCE));
+        assert!(release_version("5.8.0").is_some_and(|v| v >= SYNCFS_REPORTS_ERRORS_SINCE));
+        assert!(release_version("5.10.1").is_some_and(|v| v >= SYNCFS_REPORTS_ERRORS_SINCE));
+    }
 
     struct Recorder(Arc<Mutex<Vec<Vec<u64>>>>);
 

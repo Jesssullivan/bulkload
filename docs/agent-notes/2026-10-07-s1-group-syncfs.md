@@ -74,7 +74,12 @@ counter pair is `flush_fs_count` / `flush_fs_ns`.
 - The rclone-plus-sync equal-durability arm of Q107 (the harness half).
 - Cost on a busy shared file system: `syncfs` flushes unrelated dirty data
   too. Unmeasured; the rig is quiet by construction.
-- Linux before 5.8 does not report write-back errors from `syncfs`. No kernel
-  floor is enforced; it needs a ruling if one is wanted.
+- **Kernel floor (OI-1003-Q113, ruled 2026-10-07).** Linux before 5.8 does
+  not report write-back errors from `syncfs`. The kernel release is read
+  once (`uname`), and below 5.8, or when it cannot be read, every group keeps
+  the per-file seals. There is no refusal and no flag.
+- **Two pins** moved with the new power-loss proof: `just resume-power-loss`
+  now expects 4 passing proofs, and `tests/test_ci_contract.py` pins the
+  recipe.
 
 Rulings: OI-1003-Q107, OI-1003-Q112, OI-1003-Q110, R-N13.

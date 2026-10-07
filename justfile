@@ -185,7 +185,7 @@ fault-harness:
 # unrowed output from its capture record with 0 source bytes read (#169,
 # R-N58). A name filter that matches nothing still reports `0 passed`, so this
 # recipe fails unless all three proofs ran: on a cargo failure, on anything
-# but one `3 passed; 0 failed` result, or when a proof is not among the
+# but one `4 passed; 0 failed` result, or when a proof is not among the
 # passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
@@ -199,12 +199,12 @@ resume-power-loss:
         exit "$status"
     fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
-    passed=$(grep -c '^test result: ok\. 3 passed; 0 failed;' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 4 passed; 0 failed;' <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
-        echo "resume-power-loss: expected exactly one '3 passed; 0 failed' result" >&2
+        echo "resume-power-loss: expected exactly one '4 passed; 0 failed' result" >&2
         exit 1
     fi
-    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do
+    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_batched_group_names_no_output_before_its_data_is_durable; do
         if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
             echo "resume-power-loss: $proof was not among the passing tests" >&2
             exit 1
