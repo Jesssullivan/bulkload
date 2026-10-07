@@ -60,6 +60,7 @@ echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes
 echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1"
 echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10"
 echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=$power load1=1.00 gated=$gated"
+echo "rclone_sync sequence=1 phase=initial sync_ms=30.000 timed=false"
 if [ "$only" = 1 ]; then
   echo "verdict status=diagnostic-only reason=single-arm-run"
   exit 0
@@ -70,6 +71,7 @@ if [ "$gated" = false ]; then
   echo "verdict status=informational reason=r-n81-preflight ungated_samples=2 r25_warm_zero=true r25_interrupted_zero=true native_rss_below_2gib=true"
   exit 0
 fi
+echo "rclone_synced phase=initial native_ms=100.000 rclone_synced_ms=110.000 native_wins=true informational=true"
 echo "median phase=initial native_ms=100.000 rclone_ms=80.000 native_wins=false"
 echo "median phase=delta native_ms=10.000 rclone_ms=20.000 native_wins=true"
 echo "verdict status=${STUB_VERDICT:-fail} r23_initial_win=false"
@@ -133,6 +135,13 @@ class ParseTests(unittest.TestCase):
         self.assertAlmostEqual(summary["files_per_s_median"], 100.0)
         self.assertEqual(summary["bytes_received_median"], 900)
         self.assertTrue(summary["all_gated"])
+        # S1 at equal durability (OI-1003-Q107): informational, beside the
+        # unchanged medians the verdict reads.
+        self.assertEqual(
+            summary["bench_rclone_synced"],
+            {"initial": {"native_ms": 100.0, "rclone_synced_ms": 110.0}},
+        )
+        self.assertEqual(summary["bench_medians"]["initial"]["rclone_ms"], 80.0)
 
 
 MAINS_ON = {"name": "ADP1", "type": "Mains", "online": "1"}
@@ -468,6 +477,8 @@ class HarnessTests(unittest.TestCase):
         md = next((self.tmp / "work").glob("r23-dryrun-*Z.md")).read_text()
         self.assertIn(ab.NOT_GATE, md)
         self.assertIn("## Per-rep bench verdicts", md)
+        # The stub prints no rclone_synced rows ungated, so no table.
+        self.assertNotIn("## Equal durability", md)
 
     def test_dry_run_refuses_docs_evidence(self) -> None:
         target = self.tmp / "docs" / "evidence" / "x.md"
@@ -1512,6 +1523,9 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("try 1.75", md)
         self.assertIn("**not the flake-pinned build**", md)
         self.assertIn("not a verdict of record", md)
+        # The equal-durability medians ride beside the verdict (OI-1003-Q107).
+        self.assertIn("## Equal durability (informational, OI-1003-Q107)", md)
+        self.assertIn("| 100.000 | 110.000 |", md)
         # With no A control as well, both tokens are in the verdict.
         self.setUp()
         argv = [*self.no_a(), "--rclone", str(self.other)]
