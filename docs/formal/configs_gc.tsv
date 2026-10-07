@@ -24,7 +24,7 @@ MC_gc_live	pass	all	BaseRecord,StartBase	-
 MC_gc_reach_reroot_extended	reach	Witness_RerootExtended	*	-
 MC_gc_reach_second_reroot	reach	Witness_SecondReroot	*	-
 MC_gc_reach_based_chain	reach	Witness_BasedChainRestored	*	-
-MC_gc_base_missing_untyped	fail	RestoreOrRecapture	*	-
+MC_gc_base_missing_untyped	pass	all	Advance,Crash,GC,Rewrite	-
 MC_gc_live_rewritten	fail	ChainRecovery	*	-
 MC_gc_neg_live_unfair	fail	ChainRecovery	*	-
 MC_gc_neg_chain_ignores_depth	fail	ChainDepthBounded	*	-
