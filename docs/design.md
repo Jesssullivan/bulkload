@@ -400,7 +400,10 @@ writers never pause for a capture. What moved is recorded, never absorbed:
     holds: dirty content (untracked, ignored or uncommitted) that has not
     moved since. The pass counts the seats (`reuse_dirty_misses`) and
     fetches the bundle, exactly as before. A seat that did move is read
-    again and is never a miss.
+    again and is never a miss. A checkout that keeps one such file still
+    therefore fetches its retained bundle on every changed capture: for
+    it, lane L7 changed nothing. The seat is not read again instead,
+    because its identity has not moved (R25).
   - **No manifest:** a capture from before lane L7, a shallow one, or one
     whose list is over 256 MiB. Its bundle is fetched, as before; old STATE
     and CORPUS need no migration.

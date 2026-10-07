@@ -9,7 +9,8 @@ Rulings: OI-1003-Q42, OI-1003-Q45, OI-1003-Q94, R-N13. Validation under
 OI-1003-Q85. The lane ran in two sessions: the first wrote the tests, the
 fix, the mutants and the model; the second re-read the work, ran
 `formal-nv`, wrote the formal README and this note, merged main and ran
-`check-fast`.
+`check-fast`. A third session answered the review (see "Review round"
+below).
 
 ## Commits
 
@@ -19,7 +20,9 @@ fix, the mutants and the model; the second re-read the work, ran
 | `90789b9` | The fix: `git_carry.rs`, `estate.rs`, `counters.rs`, `fault.rs`, the P70 fault scenarios, the moved pin |
 | `2168935` | `GitCarry.tla`, the catalogue and its rendering, `GitCarryCore.hs`, the formal README, `design.md`, the property plan, the decision packet, the verb's help text |
 | `5d62e1e` | Merge of `origin/main` `600c765` (#164: the whitepaper and two agent notes; no conflict) |
-| the commit after it | This note |
+| `bde91f8` | This note, as first written |
+| `test(git-carry): the manifest path's seat rule, and P69's unimproved miss (Q42 L7)` | Review round: the lib test and the seventh P69 row. Its sha is in the branch log and the lane's return receipt: a note cannot name the commit that carries it, and nothing is committed before `check-fast` ends |
+| `docs(q42-l7): target 4 is partly done; a miss costs what it did (Q42 L7)` | Review round: the decision packet, the property plan row, `design.md` and this note |
 
 All are signed. No force-push, no rebase.
 
@@ -104,11 +107,65 @@ a hit) are unchanged.
 - **check-fast** ran on this branch's head before the push; its result is
   in the lane's return receipt, since this note is part of what it checks.
 
+## Review round (third session)
+
+Three medium findings; all three were right about the claim.
+
+- **The racy guard had no test on the manifest path.** Added the lib test
+  `a_same_size_rewrite_in_the_capture_tick_is_never_reused_from_a_manifest`.
+  It calls `manifest_blobs` on a clean checkout, so no case can fall back
+  to the bundle path and its own guard, with the same four injected clocks
+  as the bundle test (racy tick, tick + 1, settled, future stamp), then a
+  settled seat whose mtime, size or mode moved, then `reusable_blobs` end
+  to end with no pack read into the private repository.
+  Scratch mutants of `manifest_blobs`, in
+  `/srv/cache/jess/q42-l7-manifest-reuse-mut` (never the lane worktree),
+  filter `in_the_capture_tick`:
+  - without `!racy(..)`: the new test fails ("a racy seat is never reused
+    from a manifest"); the two older racy tests pass, as the reviewer found;
+  - without `seat_equivalent(..)`: the new test fails ("mtime moved");
+  - without the `mode_of` comparison: nothing fails. It is an equivalent
+    mutant: `seat_equivalent` already compares `mode`, and `mode_of` is a
+    function of `kind` and `mode`. The comparison is kept because
+    `retained_blobs` has it too.
+- **Target 4 was recorded Done on the best case only.** The decision
+  packet now says partly done: done for a checkout with no stationary
+  dirty seat, unchanged otherwise, not measured on the estate. P69 has a
+  seventh row,
+  `p69_history_heavy_with_an_unchanged_dirty_seat_still_fetches_its_whole_bundle`,
+  which pins the unimproved cost as P68 pins its re-base cost: one 4 KiB
+  untracked file beside the 64 MiB history gives `reuse_dirty_misses=1`,
+  `read_source_capture_reuse_bytes` = the whole 36,369,739 B bundle and
+  `source_bytes_read` = the 9 B the change moved. Measured this session:
+  1,700 ms of CPU for that row against 320 ms for the clean history-heavy
+  row (thin median 297 ms, hit 53 ms).
+- **The code fix the review offered was not taken.** It was: on a miss,
+  drop the missed seats and read them from the worktree. That reads a seat
+  whose stat identity has not moved, which S3 forbids as written ("a rerun
+  reads 0 content bytes for unchanged seats", R25 / R-N58, `docs/slo.md`),
+  and every P69 row pins `source_bytes_read` to what the change moved. It
+  is sound and it is cheaper; it needs a ruling, not a lane's judgement.
+  The review's alternative (re-word the target, pin the cost) is what
+  landed.
+
 ## Open
 
-- Not re-measured on the estate corpus. The 179 MB and 13.8 s figures are
+- **Ruling wanted:** may a stationary dirty seat whose blob only the
+  retained bundle holds be read again from the worktree when its bytes are
+  fewer than the bundle's? Today R25 says no and the pass fetches the
+  bundle. Until that is ruled, or the dirty blobs are held somewhere
+  cheaper, target 4 stays partly done.
+- Not measured on the estate corpus. The 179 MB and 13.8 s figures are
   the decision packet's; this lane's numbers are P69's fixture (a 36 MB
-  whole-history bundle).
+  whole-history bundle). The measurement that closes target 4 is the
+  history-heavy item's `reuse_dirty_misses` and CPU on a changed capture.
+- Review findings left alone, by instruction (low): the lost
+  `retained-unreadable` signal on the no-miss path; the CPU ratio as a
+  timing flake in `check-fast`; `design.md`'s "No manifest" bullet saying
+  a shallow capture's bundle is fetched (it is not: `offered_reuse`
+  answers `Shallow` first); the `for-each-ref` assertion removed from
+  `apply_and_compare` inside the fix commit `90789b9`, unmentioned until
+  now; P70 restoring only after convergence; and the prune race below.
 - A changed capture still costs more than a hit (four censuses and an
   export). That is WP7's, not this lane's.
 - A dirty seat that does not move is a miss on every pass, so such an item
@@ -116,10 +173,11 @@ a hit) are unchanged.
   (`reuse_dirty_misses`), not removed. Removing it needs the dirty blobs
   held somewhere cheaper than the bundle; no ruling asks for that yet.
 - A blob the source held at the presence check can be pruned by the source
-  before the pack is written. I expect the pass to end as any pass does
+  before the pack is written. I expected the pass to end as any pass does
   when the source's object store is rewritten under it (the
-  `ObjectStoreRewritten` drift custody), but no test in this lane drives
-  that race, so it is unverified.
+  `ObjectStoreRewritten` drift custody). The review doubts that for a
+  loose-only prune, which does not change `objects/pack`, and I have not
+  checked. No test drives the race; it is unverified either way.
 - The model checks the manifest's order only. What a manifest lists and
   what a pass reuses from it are P69's and P70's (Rust), as the formal
   README says.
