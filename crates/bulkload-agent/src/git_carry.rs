@@ -9298,6 +9298,101 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // The same guard on the manifest path (Q42 lane L7), which every changed
+    // capture since L7 takes. The checkout is clean, so every listed blob is
+    // in the source store and nothing can fall back to the bundle path above
+    // and its own guard: `manifest_blobs` is called directly, and each case
+    // must answer `Held`. The seat rule there is the whole of what keeps a
+    // same-size rewrite in the capture tick from being emitted by name.
+    #[test]
+    fn a_same_size_rewrite_in_the_capture_tick_is_never_reused_from_a_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-manifest-racy-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        committed_repository(&source, b"tracked bytes at census");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        let manifest = first.manifest.clone().unwrap();
+        let listed = manifest
+            .iter()
+            .find(|seat| seat.row.rel_path == b"tracked")
+            .unwrap();
+        let held = held_census(&root.join("first/repository.git"));
+        let tracked = held.iter().find(|row| row.rel_path == b"tracked").unwrap();
+        assert_eq!(&listed.row, tracked);
+        let stamp = tracked.mtime_ns.max(tracked.ctime_ns);
+        fs::write(source.join("tracked"), b"TRACKED BYTES AT CENSUS").unwrap();
+        let second = root.join("second");
+        fs::create_dir(&second).unwrap();
+        let private = prepare_private(&source, &second).unwrap();
+        let reuse_of = |seats: &[crate::RowSchema], started_ns: i128, now_ns: i128| {
+            let retained = RetainedCapture {
+                bundle: &first.bundle,
+                started_ns,
+                manifest: Some(&manifest),
+            };
+            // `Held`, or the case fell back or mismatched: neither can
+            // happen to a clean checkout's own manifest.
+            match manifest_blobs(&private, &manifest, &retained, seats, now_ns).unwrap() {
+                Listed::Held(reuse) => Some(reuse),
+                Listed::Missed | Listed::Mismatch => None,
+            }
+            .unwrap()
+        };
+        let reuse_at = |started_ns: i128, now_ns: i128| reuse_of(&held, started_ns, now_ns);
+        let later = stamp + 60 * RACY_GRANULARITY_NS;
+        // Stamped in the tick the retained pass started in: racy.
+        assert!(
+            !reuse_at(stamp, later).contains_key(b"tracked".as_slice()),
+            "a racy seat is never reused from a manifest"
+        );
+        assert!(!reuse_at(stamp + RACY_GRANULARITY_NS, later).contains_key(b"tracked".as_slice()));
+        // Settled: reused by name, the blob the retained capture listed.
+        assert_eq!(
+            reuse_at(later, later).get(b"tracked".as_slice()),
+            Some(&listed.object)
+        );
+        // A stamp later than this pass's own clock fails closed.
+        assert!(!reuse_at(later, stamp - 1).contains_key(b"tracked".as_slice()));
+        // A settled seat whose identity moved is read again, whichever part
+        // of the identity moved.
+        let moved = |change: fn(&mut crate::RowSchema)| {
+            let mut seats = held.clone();
+            change(
+                seats
+                    .iter_mut()
+                    .find(|row| row.rel_path == b"tracked")
+                    .unwrap(),
+            );
+            reuse_of(&seats, later, later).contains_key(b"tracked".as_slice())
+        };
+        assert!(!moved(|row| row.mtime_ns += 1), "mtime moved");
+        assert!(!moved(|row| row.size += 1), "size moved");
+        assert!(!moved(|row| row.mode ^= 0o100), "mode moved");
+        // The whole path, as a pass calls it: the same answers, no bundle
+        // read into the private repository and no reuse ref left behind.
+        let whole = |started_ns: i128, now_ns: i128| {
+            let retained = RetainedCapture {
+                bundle: &first.bundle,
+                started_ns,
+                manifest: Some(&manifest),
+            };
+            reusable_blobs(&private, &retained, &held, now_ns)
+                .unwrap()
+                .unwrap()
+                .contains_key(b"tracked".as_slice())
+        };
+        assert!(!whole(stamp, later));
+        assert!(whole(later, later));
+        assert!(pack_files(&private.join("objects/pack"))
+            .unwrap()
+            .is_empty());
+        assert!(!refs(&private).unwrap().contains(REUSE_NAMESPACE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // R-N72 (TIN-4540) finding 4: a retained capture that cannot be decoded
     // costs only the optimization. Its refs/carry-reuse/* refs are deleted
     // before the pass continues, so `bundle create --all` never carries them.

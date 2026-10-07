@@ -10,6 +10,15 @@
 //! moved since), and every miss is counted. A retained capture without a
 //! manifest (anything captured before lane L7) is fetched as before.
 //!
+//! **What the law does not cover.** A miss costs what every changed capture
+//! cost before lane L7: the whole retained bundle, however large. Untracked,
+//! ignored and uncommitted content is carried, and its blobs are in no
+//! source object store, so a checkout that keeps one such file still is a
+//! miss on every changed capture. Reading the seat again instead would be
+//! cheaper and is not allowed: S3 (R25) reads 0 content bytes for a seat
+//! whose identity has not moved. The history-heavy dirty row pins that
+//! unimproved cost, as P68 pins its re-base cost.
+//!
 //! **CPU.** The decision packet measured the fetch at 13.8 s of CPU for a
 //! 5-object change against a 179 MB retained bundle, and 0.45 s for the same
 //! capture one round later, against a 39 KB retained bundle
@@ -382,8 +391,14 @@ fn change(estate: &Estate, row: &Row, round: u32) -> u64 {
 }
 
 fn row(row: &Row) {
+    row_over(row, &noise(HISTORY, 7));
+}
+
+/// One row over a repository whose history is `history`: the retained
+/// bundle's length.
+fn row_over(row: &Row, history: &[u8]) -> u64 {
     let name = row.name;
-    let estate = estate(name, &noise(HISTORY, 7), row.dirt != Dirt::Clean);
+    let estate = estate(name, history, row.dirt != Dirt::Clean);
     settle();
     let first = capture(&estate);
     assert_eq!(first.counters["read_source_capture_reuse_bytes"], 0);
@@ -458,6 +473,7 @@ fn row(row: &Row) {
     assert_ne!(head, retained, "{name}: the pass did not recapture");
     assert!(manifest_of(&head).exists(), "{name}: no manifest published");
     apply_and_compare(&estate);
+    retained_len
 }
 
 #[test]
@@ -595,4 +611,25 @@ fn p69_history_heavy_reuse_costs_no_more_cpu_than_a_thin_rerun() {
         heavy.cpu
     );
     apply_and_compare(&estate);
+}
+
+/// The cost lane L7 did not remove. One untracked file that does not move
+/// beside the whole history: its blob is in no source object store, so the
+/// changed capture counts one miss and fetches the whole retained bundle,
+/// as every changed capture did before the lane. It still reads only what
+/// the change moved (R25), which is why the seat is not read again instead.
+#[test]
+fn p69_history_heavy_with_an_unchanged_dirty_seat_still_fetches_its_whole_bundle() {
+    let retained = row_over(
+        &Row {
+            name: "history_heavy_dirty_kept",
+            dirt: Dirt::UntrackedKept,
+            change: Change::Commit,
+            legacy: false,
+            reads: Reads::Bundle { misses: 1 },
+        },
+        &hex_noise(HEAVY, 7),
+    );
+    // The bundle the pass fetched holds the whole history, not a delta.
+    assert!(retained >= (HEAVY / 4) as u64, "{retained}");
 }
