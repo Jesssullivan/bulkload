@@ -22,7 +22,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 use bulkload_agent::counters::Counters;
-use bulkload_agent::durable::Durability;
+use bulkload_agent::durable::{Durability, LedgerSync};
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::priority::PriorityClass;
 use bulkload_agent::refuse::RefuseAt as _;
@@ -75,6 +75,18 @@ struct Cli {
     /// rclone child inherits it too; the header records it.
     #[arg(long, default_value = "background", value_parser = parse_priority)]
     priority: PriorityClass,
+    /// How the native arm's SOURCE ledger commits its rows (WP0(g),
+    /// OI-1003-Q37): `relaxed` (the default, as the agent runs) or `full`,
+    /// for A/B comparison. Every sample's counters say which ran:
+    /// `source_ledger_relaxed_commits` is 0 under `full`.
+    #[arg(long, default_value = "relaxed", value_parser = parse_ledger_sync)]
+    source_ledger_sync: LedgerSync,
+}
+
+fn parse_ledger_sync(value: &str) -> Result<LedgerSync, String> {
+    value
+        .parse()
+        .map_err(|_| format!("expected relaxed or full, got {value:?}"))
 }
 
 fn parse_priority(value: &str) -> Result<PriorityClass, String> {
@@ -997,6 +1009,7 @@ fn run(cli: &Cli) -> io::Result<()> {
         bulkload_agent::priority::enter_background().map_err(io::Error::other)?;
     }
     bulkload_agent::durable::set_durability(cli.durability);
+    bulkload_agent::durable::set_ledger_sync(cli.source_ledger_sync);
     let _ = bulkload_agent::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
     let mut fixture = seed_fixture(&sealed_source, &work)?;
@@ -1119,6 +1132,7 @@ mod tests {
             durability: Durability::Group,
             informational: true,
             priority: PriorityClass::Normal,
+            source_ledger_sync: LedgerSync::Relaxed,
         };
         run(&cli)?;
         // A repeated invocation cannot accidentally reuse another run's state.

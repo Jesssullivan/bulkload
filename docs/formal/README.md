@@ -211,8 +211,9 @@ generated counts and diameter equalled the table's ([Results
 | `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 18s | 1651 |
 | `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 6s | 556 |
 | `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 24s | 1783 |
-| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 59s | 1859 |
-| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 48s | 1805 |
+| `MC_wp0g` (2026-10-07, with the counted commit failure) | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 945,031 | 2,586,810 | 75 | 76s | 1908 |
+| `MC_wp0g_deep` (2026-10-07) | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 711,661 | 2,776,377 | 49 | 52s | 1832 |
+| `MC_wp0g_strict` (2026-10-07) | {a} R3 C2 E1 F1 X1 space relaxed strict-held budget 600 s | pass | **PASS** | – | 717,633 | 2,794,980 | 49 | 51s | 1833 |
 | `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 88,569 | 232,148 | 51 | 14s | 1221 |
 | `MC_supersede_main` | {a,b} R2 C1 E1 exchange sym budget 600 s | pass | **PASS** | – | 1,072,654 | 3,406,652 | 57 | 121s | 1968 |
 | `MC_supersede_deep` | {a} R3 C2 E1 F1 X1 space exchange budget 600 s | pass | **PASS** | – | 506,397 | 1,955,141 | 51 | 45s | 1776 |
@@ -222,12 +223,13 @@ generated counts and diameter equalled the table's ([Results
 | `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 49s | 1780 |
 | `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 117s | 1976 |
 | `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 6s | 361 |
-| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 2s | 301 |
+| `MC_r25_strict_authority` (2026-10-07) | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,188 | 2,303 | 30 | 2s | 361 |
 | `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,513 | – | – | 42s | 1550 |
 | `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 35,768 | 114,297 | 19 | 8s | 778 |
 | `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 51,931 | 162,436 | 21 | 12s | 822 |
-| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 61,437 | 209,689 | 19 | 15s | 1311 |
-| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 641 | 1,176 | 17 | 4s | 311 |
+| `MC_reach_wp0g_lost_row` (2026-10-07) | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 65,936 | 224,719 | 19 | 13s | 1299 |
+| `MC_reach_wp0g_failed_commit` (2026-10-07) | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_FailedRowRead` | 263,432 | 790,086 | 29 | 28s | 1778 |
+| `MC_wp0g_authority` (2026-10-07) | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 742 | 1,377 | 17 | 1s | 287 |
 | `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 624 | 1,152 | 17 | 3s | 284 |
 | `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 311 | 646 | 18 | 2s | 299 |
 | `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,881 | 13,186 | 27 | 3s | 456 |
@@ -374,7 +376,7 @@ enabled in another config:
 | `CrashSrc`, `CrashDst`, `CrashBoth` | `MaxCrashes = 0` | every config with `C1` or `C2` |
 
 **Branches, not only actions.** Action-level coverage can hide a dead branch
-inside an action. Three reach rows prove that the branches R25 and WP0(g)
+inside an action. Four reach rows prove that the branches R25 and WP0(g)
 depend on are reachable. Each runs at the bound of a pass row, so that pass
 row's complete search explores the branch:
 
@@ -382,7 +384,8 @@ row's complete search explores the branch:
 |---|---|---|---|
 | `MC_reach_ledger_manifest` | `Witness_LedgerManifest` | `RecvDecide`: a manifest served from the source ledger, with no read | `MC_nv_ledger` |
 | `MC_reach_ledger_chunks` | `Witness_LedgerChunkRead` | `RecvNeed`: a ledger manifest's chunks re-read (pread) to fill an absent output | `MC_nv_ledger` |
-| `MC_reach_wp0g_lost_row` | `Witness_LostRowRead` | WP0(g): a row a relaxed ledger lost, then a later run's ledger miss and read | `MC_wp0g` |
+| `MC_reach_wp0g_lost_row` | `Witness_LostRowRead` | WP0(g): a row a relaxed ledger lost to a power loss, then a later run's ledger miss and read | `MC_wp0g` |
+| `MC_reach_wp0g_failed_commit` | `Witness_FailedRowRead` | WP0(g), #163: `LedgerCommit`'s failing branch (counted, not fatal), then with no crash a later run's ledger miss and read | `MC_wp0g` |
 
 A witness invariant is used instead of line counts from the coverage report,
 whose line numbers move with every spec edit. Neither ledger branch is
@@ -800,9 +803,8 @@ that never quiesces, or under unbounded crashes, is not claimed.
 
 **Q20 holds for the ledger's row commits, on one condition: the source
 store's creation must be durable before `Start`. That means both the commit
-that creates its authority and its state root's directory entry. The model
-also assumes a ledger commit never fails, which the code does not honour yet
-(the conditions below).**
+that creates its authority and its state root's directory entry. Built
+2026-10-07 on these conditions ([WP0(g) as built](#wp0g-as-built-2026-10-07)).**
 
 **1. Relaxed ledger rows are safe** (`MC_wp0g`, `MC_wp0g_deep` pass, and
 `MC_reach_wp0g_lost_row` shows `MC_wp0g` explores the relaxed-only path).
@@ -934,6 +936,49 @@ loss may also reorder writes. That is why the code must treat a corrupt or
 absent ledger as empty, and keep `checkpoint_fullfsync=ON` so that a
 checkpoint stays a full barrier and the WAL's frame checksums discard a torn
 tail. Corruption itself is outside the model and not proven here.
+
+### WP0(g) as built (2026-10-07)
+
+OI-1003-Q104 ruled WP0(g) built. `RelaxedSourceLedger = TRUE` is the code's
+`LedgerSync::Relaxed`, the default. The conditions above, and where the
+code meets each:
+
+| Condition | Code | Model | Test |
+|---|---|---|---|
+| Only the ledger's row commits are relaxed, and only on the source | `relax_ledger_rows` (`A/io/durable.rs`): `synchronous=NORMAL`, `fullfsync=OFF`, read back; called by `StorePublisher::relax_ledger_rows`, which refuses a destination publisher, from `LedgerSink::with_sync`, which `serve` calls on its second connection | `RelaxedSourceLedger`: `SrcLoss` may drop any subset of `srcLedger` | `only_a_source_ledgers_row_commits_are_relaxed` |
+| The creation commit (schema and authority) is FULL | `Store::open` runs `configure_sqlite` (unchanged) and commits before a publisher exists; `serve` opens the store, and sends `Start`, on that connection | `RelaxedAuthority = FALSE`; `MC_wp0g_authority` fails `R25_NoDurableReread` with it `TRUE` | P79 (the authority after every loss), `stores_commit_through_wal_with_full_flushes` |
+| After #161 (sealed state root) | `Store::open` seals the root and its parent (#166, on main) | `StoreRootSealed = TRUE`; `MC_store_root_unsealed` fails without it | `tests/power_loss.rs` (#166's) |
+| A corrupt or absent ledger is empty | `ledger_read` (`A/transfer.rs`): a failed ledger read is a miss, counted `source_ledger_unreadable` | the empty subset | `an_unreadable_relaxed_ledger_reads_as_a_miss` |
+| Never a new authority because rows are gone | `Store::open` inserts the authority once (`INSERT OR IGNORE`) | `SrcLoss` leaves `srcAuth` unless the store itself is lost | P79, `every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats` |
+| A failed ledger commit is counted, never fatal (#163) | `LedgerSink::publish`: `source_ledger_commit_failed`, `source_ledger_rows_dropped`, `Ok` | `LedgerCommit`'s second branch (`ledgerLost`, `by = "commit_failed"`) | `a_failed_relaxed_ledger_commit_is_counted_not_fatal` |
+| The destination is untouched | no change to `configure_sqlite`, `commit_outputs`, `PublishSink`, `materialize.rs` or `Inbound::answer_held` | `HeldAfterCommit`, `RecordImpliesBytes`, every mutation row: unchanged expectations | the existing power-loss and fault harnesses, unchanged |
+
+**Which R25 reading holds with the relaxation.** Both, each within its
+stated limits:
+
+- The committed-row reading (`R25_NoDurableReread`, the SLO's obligation,
+  OI-1003-Q40) holds in `MC_wp0g` and `MC_wp0g_deep`, now with the counted
+  commit failure as well as the power loss.
+- The strict reading (`R25_StrictNoDurableReread`, #169) holds in
+  `MC_wp0g_strict`: `MC_wp0g_deep`'s bound with `TrackStrictHeld`. Its
+  limits are #169's ([R25's strict reading](#r25s-strict-reading-169)): a
+  non-racy capture whose record could be written.
+
+So a lost ledger row, whichever way it was lost, costs a read only of a
+seat the destination does not hold: no row there, and no durable unrowed
+bytes with a capture record. On the code, P79 and the power-loss test
+check the committed-row reading on the real store: every seat the
+destination holds is answered `Reuse` and reads 0 bytes whatever the
+ledger lost, and a lost row costs its seat's bytes once, only at a seat a
+third party removed.
+
+**What the model still abstracts.** The loss is any subset of the
+committed rows. `SQLite` in WAL mode loses commits newest first (a suffix),
+which P79 and the power-loss test check on the real WAL: cut, torn and
+garbled tails. Torn pages inside a checkpointed database are outside both
+(`checkpoint_fullfsync` stays ON, and `relax_ledger_rows` reads it back).
+The refusal rows of the ledger (#186) are not in the model; a lost one
+costs one more 16-byte sniff.
 
 ## WP0(d): exchange versus check-then-rename (OI-1003-Q18)
 
@@ -1067,7 +1112,7 @@ that test the same claim on the real code. SLOs are
 
 | Model property | Statement | SLO | Rulings | Property tests |
 |---|---|---|---|---|
-| `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20 | P23, P21, P19, P24, P33 |
+| `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20, OI-1003-Q37 | P23, P21, P19, P24, P33, P79 |
 | `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the transfer before #187)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
 | `ReadOnce` | A seat is read at most once per session. | S1, S3 | R-N58 | P23 |
 | `S3_ReadsOnlyChanged` | A run reads only seats not held when it began (changed, racy, never carried, or lost at the destination) or changed during it. | S3 | OI-1003-Q18 (WP0(c), inequality 1) | P21, P23 |
@@ -1205,13 +1250,15 @@ The model proves the protocol, within its bounds. It does not prove:
 - **Larger bounds.** The checked bounds are small (the small-scope
   hypothesis). The drafted two-seat, three-run, every-fault constants were
   only simulated (`MC_main_sim`), never model-checked.
-- **A failing source ledger commit.** `LedgerCommit` never fails. In the code
-  the first failed ledger group (a full or failing source state disk) is
-  sticky, and the session fails before `SourceDone` (`LedgerSink::commit`,
-  `Committer::submit`, `serve`). So `RunsClose`, `AllRunsFinish`,
-  `ClosureAccounted` and WP0(g)'s "losing a source row costs at most a
-  re-read" do not cover it. In the code today a lost ledger write costs the
-  whole session (WP0(g) conditions).
+- **A failing strict ledger commit.** Under `RelaxedSourceLedger`
+  `LedgerCommit` may fail: the group's rows are dropped and the session goes
+  on, as `LedgerSync::Relaxed` does in the code since 2026-10-07 (#163;
+  `MC_reach_wp0g_failed_commit`). A strict ledger's commit never fails in
+  the model. In the code (`LedgerSync::Full`, `--source-ledger-sync=full`)
+  its first failed group is sticky and the session fails before
+  `SourceDone` (`LedgerSink::commit`, `Committer::submit`, `serve`), so
+  `RunsClose`, `AllRunsFinish` and `ClosureAccounted` do not cover that
+  mode's failure.
 - **Losing a store's state root.** The positive configs assume each store's
   state root and database file are durable once its first commit returns
   (`StoreRootSealed = TRUE`; the code does not seal the parent yet). Losing
@@ -1434,9 +1481,9 @@ The model follows the code where the code and docs/design.md differ:
   seat's 16 sniffed bytes are not in `reads`. So that the source remembers
   such a refusal and does not sniff an unchanged seat again is not a model
   property; P21 and P23 with refused seats check it on the code.
-- **WP0(g).** It is ratified conditionally and not implemented: both stores
-  run `synchronous=FULL`, `fullfsync=ON` (`configure_sqlite`). The verdict
-  above sets the condition.
+- **WP0(g).** Built 2026-10-07 (OI-1003-Q104) as ratified
+  ([WP0(g) as built](#wp0g-as-built-2026-10-07)): the source ledger's row
+  commits are relaxed by default, and nothing else is.
 - **"Sealed".** design.md calls a file sealed by `F_BARRIERFSYNC` on Darwin,
   which is a barrier, not a flush. See the seal abstraction above.
 - **The state root is never sealed** (`MC_store_root_unsealed`).
@@ -1471,9 +1518,10 @@ The model follows the code where the code and docs/design.md differ:
     which `StartRun` omits.
   - `SALVAGE_BOUND_EXCEEDED` is a new typed refusal, missing from
     `TypedCodes`.
-- **A failed ledger commit fails the session.** slo.md's WP0(g) says "losing
-  a source row costs at most a re-read". In the code a failed ledger commit
-  fails the whole session ([Not proven here](#not-proven-here)).
+- **A failed ledger commit fails the session, in the strict mode only.**
+  Under `LedgerSync::Relaxed`, the default, it is counted and the session
+  goes on (#163). `--source-ledger-sync=full` keeps the behaviour before
+  WP0(g) ([Not proven here](#not-proven-here)).
 - **R25's model obligation in slo.md** is worded as
   `R25_NoCommittedCaptureReread`, which is vacuous in code shape
   ([Properties](#properties-slos-rulings-and-tests)).

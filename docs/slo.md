@@ -425,6 +425,60 @@ Q10, Q18). It changes no number and no ruling.
     (`docs/formal/README.md`, "What the #187 review added to the code and
     not to the model").
 
+## Amendment 2026-10-07: WP0(g) landed as ratified (OI-1003-Q104)
+
+The first gated gate (a) sample on the hermetic rig failed S1 (native
+initial copy 873 ms against rclone 362 ms). OI-1003-Q104 ruled that the
+first response is to build WP0(g), measuring first. This records what was
+built under OI-1003-Q20 and OI-1003-Q37. It changes no number and no
+ruling, and it is not an S1 result.
+
+- **What changed.** The SOURCE ledger's ROW commits run
+  `synchronous=NORMAL`, `fullfsync=OFF` (`LedgerSync::Relaxed`, the
+  default; `--source-ledger-sync=full` restores the old behaviour for
+  comparison). A power loss may lose the newest rows. A lost row costs at
+  most one more read of its seat (one more sniff for a remembered refusal,
+  #186), and only where the destination no longer holds that seat.
+  - A row commit that fails is counted (`source_ledger_commit_failed`,
+    `source_ledger_rows_dropped`) and the transfer goes on (#163).
+  - A ledger read that fails is a miss (`source_ledger_unreadable`): "a
+    corrupt or absent source ledger is treated as empty".
+  - `source_ledger_relaxed_commits` counts the relaxed commits, and
+    `source_ledger_miss_reads` the seats read because the ledger had no
+    row for them, an upper bound on the rows lost and re-read.
+- **What did not change.**
+  - The commit that creates a store, with its authority, is
+    `synchronous=FULL`, `fullfsync=ON`, on both sides, and the state root
+    is sealed first (#161, merged as #166).
+  - Every destination commit, file seal and directory seal, and the order
+    between them: `Held` still follows the destination's FULL commit
+    (R25, R-N58). The destination's commit path has no code change.
+  - A checkpoint on the relaxed connection is still a full flush
+    (`checkpoint_fullfsync=ON`).
+- **Which R25 reading holds.** The committed-row reading (OI-1003-Q40,
+  `R25_NoDurableReread`) holds with the relaxation (`MC_wp0g`,
+  `MC_wp0g_deep`). The strict reading (#169) holds too, within #169's
+  limits (`MC_wp0g_strict`). A relaxed authority still fails
+  (`MC_wp0g_authority`).
+- **Proof on the code.** P79 RELAXED-LEDGER-LOSS over generated crash
+  points, and `tests/power_loss.rs` over every WAL prefix of a real copy:
+  a seat the destination holds reads 0 bytes whatever the ledger lost; a
+  lost row costs its seat once, only at a seat a third party removed; the
+  authority survives every loss.
+- **Measured, informational** (`docs/evidence/s1-seal-breakdown-2026-10-07.md`;
+  mbp-13, corpus v1, no A control, not a gate sample): native initial
+  copy 880.3 ms before and 880.0 ms after, against rclone at about 350 ms.
+  The source row commits went from 35 ms summed to 0.2 ms; they were 4 %
+  of the copy and off its critical path. The destination's file syncs
+  (47 %), directory seals (9 %) and commits (15 %) are the rest, and this
+  ruling does not touch them. WP0(g) does not close the S1 gap; what
+  would is listed in that file for the operator and is not built.
+- **Not ruled.** A source store that cannot be opened at all is still a
+  refusal, not an empty ledger: opening it as empty would mint a new
+  authority, which is exactly `MC_wp0g_authority`. `--source-ledger-sync`
+  and its default are this change's; OI-1003-Q37 names the settings, not a
+  flag.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

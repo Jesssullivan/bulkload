@@ -107,6 +107,7 @@ Ranking is by payoff toward "the migration is just another trusted run", per uni
   3. Check the serve/copy state-vs-root overlap on canonical paths before any create. Add a proptest showing the source census is unchanged.
   4. Record the identity of the pack-dir listing with the authority. On a git child failure where that identity changed, classify as `DriftKind::ObjectStoreRewritten` rather than as a refusal.
   5. Behind ruling (g): set `FADV_DONTNEED`/`F_NOCACHE` after each consumed range on capture fds, and relax the source-ledger fsync.
+     - **2026-10-07 (OI-1003-Q104, OI-1003-Q37): the source-ledger half is built.** `LedgerSync::Relaxed` (the default) commits the ledger's rows `synchronous=NORMAL`, `fullfsync=OFF`; the authority's commit stays FULL; a failed row commit is counted, not fatal (#163). Proof: `MC_wp0g`, `MC_wp0g_deep`, `MC_wp0g_strict`, `MC_reach_wp0g_lost_row`, `MC_reach_wp0g_failed_commit`, `MC_wp0g_authority`; P79; `tests/power_loss.rs`. Measured, informational: [docs/evidence/s1-seal-breakdown-2026-10-07.md](../evidence/s1-seal-breakdown-2026-10-07.md). The `FADV_DONTNEED`/`F_NOCACHE` half is not built and was not in the ruling.
 - **Issues subsumed:** none directly; this advances #34. It is adjacent to #105 (same-build preflight) and to #134.
 
 ### WP2. One Git carry engine; make v1 incremental and accounted

@@ -22,6 +22,7 @@ MC_nv_core_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,
 MC_nv_ledger_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0g	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_wp0g_strict	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
 MC_supersede_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,ForeignDelete,ForeignWrite,GitRead,RenameReplace	-
 MC_supersede_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,GitRead,RenameReplace	-
@@ -36,6 +37,7 @@ MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003
 MC_reach_ledger_manifest	reach	Witness_LedgerManifest	*	-
 MC_reach_ledger_chunks	reach	Witness_LedgerChunkRead	*	-
 MC_reach_wp0g_lost_row	reach	Witness_LostRowRead	*	-
+MC_reach_wp0g_failed_commit	reach	Witness_FailedRowRead	*	-
 MC_wp0g_authority	fail	R25_NoDurableReread	*	-
 MC_store_root_unsealed	fail	R25_NoDurableReread	*	-
 MC_r25_unrowed_no_adopt	fail	R25_StrictNoDurableReread	*	-

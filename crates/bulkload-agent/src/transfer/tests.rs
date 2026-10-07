@@ -1851,6 +1851,7 @@ fn a_source_read_never_follows_a_swapped_directory() {
         state: &corpus.base,
         credit: &credit,
         retain: Arc::new(AtomicU64::new(0)),
+        ledger: LedgerSync::Relaxed,
     };
     let mut bytes_read = 0;
     let refused = capture_file(&work, &row, &mut bytes_read, &mut None, |_, _, _, _| {
@@ -2891,3 +2892,6 @@ fn a_recreated_source_store_adopts_from_capture_records() {
         (FILES as u64, 0, 0)
     );
 }
+
+// ---- WP0(g) (OI-1003-Q20, Q37, Q104): P79 RELAXED-LEDGER-LOSS --------------
+mod wp0g;

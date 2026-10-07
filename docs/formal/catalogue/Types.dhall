@@ -82,7 +82,11 @@ let Property =
       >
 
 let Witness =
-      < Witness_LedgerManifest | Witness_LedgerChunkRead | Witness_LostRowRead >
+      < Witness_LedgerManifest
+      | Witness_LedgerChunkRead
+      | Witness_LostRowRead
+      | Witness_FailedRowRead
+      >
 
 -- The 37 actions of Next, in the sorted order of configs.tsv's never column.
 let Action =
@@ -449,6 +453,7 @@ let witnessTable =
       { Witness_LedgerManifest = Witness.Witness_LedgerManifest
       , Witness_LedgerChunkRead = Witness.Witness_LedgerChunkRead
       , Witness_LostRowRead = Witness.Witness_LostRowRead
+      , Witness_FailedRowRead = Witness.Witness_FailedRowRead
       }
 
 let witnessSelf = \(w : Witness) -> merge witnessTable w
